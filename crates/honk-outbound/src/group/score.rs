@@ -937,7 +937,7 @@ fn score_snapshot(
                 family.throughput_confidence,
                 reliability_weight,
             ),
-            failures: global_score.failures + family.failures,
+            failures: global_score.failures.max(family.failures),
             selected_at: global_score.selected_at.max(family.selected_at),
             targeted: false,
             target_attempts: 0.0,
@@ -987,7 +987,7 @@ fn score_snapshot(
             exact.throughput_confidence,
             reliability_weight,
         ),
-        failures: aggregate_score.failures + exact.failures,
+        failures: aggregate_score.failures.max(exact.failures),
         selected_at: aggregate_score.selected_at.max(exact.selected_at),
         targeted: exact.completed >= MIN_TRAINED_EVIDENCE
             || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
@@ -1930,6 +1930,163 @@ mod tests {
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
         inner_update_response(&state, key(nodes[1].id), 1.0);
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
+    fn single_failure_layer_freshness_is_unchanged() {
+        // Given: one aggregate failure cell with exactly one half-life of age.
+        let node = node("leaf");
+        let context = context("example.com", IpVersion::V4);
+        let start = Instant::now();
+        let mut inner = StateInner::default();
+        inner.aggregate.put(
+            AggregateKey {
+                group: "score".into(),
+                network: SelectionNetwork::Tcp,
+                family: None,
+                node_id: node.id,
+            },
+            Stats {
+                setup_failure: 2.0,
+                updated_at: Some(start),
+                ..Default::default()
+            },
+        );
+
+        // When: the scorer snapshots the single layer after one half-life.
+        let score = score_snapshot(
+            &inner,
+            "score",
+            &context,
+            node.id,
+            start + SCORE_EVIDENCE_HALF_LIFE,
+        );
+
+        // Then: existing decay remains unchanged and no absent layer contributes.
+        println!("single failure layer envelope={:.12}", score.failures);
+        assert_close(score.failures, 1.0);
+    }
+
+    fn layered_failure_value(ages: [Option<Duration>; 3]) -> f64 {
+        let node = node("leaf");
+        let context = context("example.com", IpVersion::V4);
+        let start = Instant::now();
+        let now = start + Duration::from_secs(60);
+        let mut inner = StateInner::default();
+        for (index, age) in ages.into_iter().enumerate() {
+            let Some(age) = age else {
+                continue;
+            };
+            let stats = Stats {
+                setup_failure: 1.0,
+                updated_at: Some(now - age),
+                ..Default::default()
+            };
+            match index {
+                0 | 1 => {
+                    inner.aggregate.put(
+                        AggregateKey {
+                            group: "score".into(),
+                            network: SelectionNetwork::Tcp,
+                            family: (index == 1).then_some(IpVersion::V4),
+                            node_id: node.id,
+                        },
+                        stats,
+                    );
+                }
+                2 => {
+                    inner.exact.put(
+                        ExactKey {
+                            group: "score".into(),
+                            network: SelectionNetwork::Tcp,
+                            family: IpVersion::V4,
+                            target: context.target.clone().unwrap(),
+                            node_id: node.id,
+                        },
+                        stats,
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        score_snapshot(&inner, "score", &context, node.id, now).failures
+    }
+
+    fn assert_aged_failure_layers_count_once() {
+        // Given: the same 30-second-old failure appears in overlapping layers.
+        let age = Some(Duration::from_secs(30));
+
+        // When: one, two, and three layers are independently snapshotted.
+        let global_only = layered_failure_value([age, None, None]);
+        let global_family = layered_failure_value([age, age, None]);
+        let global_family_exact = layered_failure_value([age, age, age]);
+        println!(
+            "layered failure envelope: global_only={global_only:.12} global_family={global_family:.12} global_family_exact={global_family_exact:.12}"
+        );
+
+        // Then: replication does not increase the effective failure envelope.
+        assert_close(global_family, global_only);
+        assert_close(global_family_exact, global_only);
+        let aged = layered_failure_value([
+            Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
+            Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
+            Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
+        ]);
+        let incumbent = ScoreSnapshot {
+            attempts: 1.0,
+            completed: 1.0,
+            reliability: 0.8,
+            useful_completed: 1.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: aged,
+            selected_at: 1,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let challenger = ScoreSnapshot {
+            reliability: 0.805,
+            failures: 0.0,
+            selected_at: 0,
+            ..incumbent
+        };
+        let retained = keep_incumbent(&incumbent, &challenger);
+        println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
+        assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
+        assert!(retained);
+    }
+
+    #[test]
+    fn layered_failure_freshness_uses_one_envelope() {
+        assert_aged_failure_layers_count_once();
+    }
+
+    fn assert_larger_specific_failure_layer_still_wins() {
+        // Given: global, family, and exact evidence are respectively 30, 20, and 10 seconds old.
+        let global = evidence_decay(Duration::from_secs(30));
+        let family = evidence_decay(Duration::from_secs(20));
+        let exact = evidence_decay(Duration::from_secs(10));
+
+        // When: all three overlapping layers are snapshotted together.
+        let effective = layered_failure_value([
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(20)),
+            Some(Duration::from_secs(10)),
+        ]);
+        println!(
+            "specific failure envelope: global_30s={global:.12} family_20s={family:.12} exact_10s={exact:.12} effective={effective:.12}"
+        );
+
+        // Then: the freshest specific layer is the effective envelope.
+        assert_close(effective, exact);
+    }
+
+    #[test]
+    fn specific_failure_freshness_is_not_hidden() {
+        assert_larger_specific_failure_layer_still_wins();
     }
 
     #[test]
