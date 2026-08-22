@@ -729,7 +729,7 @@ impl PacketTransport for TuicUdpTransport {
         self.target
     }
     fn send_timeout_is_congestion(&self) -> bool {
-        true
+        !self.state.udp_over_stream
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
@@ -1016,6 +1016,7 @@ mod tests {
             .await
             .expect("dial_udp_transport should succeed");
         assert_eq!(transport.relay_addr(), target);
+        assert!(transport.send_timeout_is_congestion());
         transport.send_packet(b"dns-query").await.unwrap();
         let mut buf = [0u8; 256];
         let (n, src) =
@@ -1039,6 +1040,7 @@ mod tests {
             .dial_udp_transport(&node, target, None, Duration::from_secs(5))
             .await
             .expect("dial_udp_transport should succeed");
+        assert!(!transport.send_timeout_is_congestion());
         transport.send_packet(b"stream-query").await.unwrap();
         let mut buf = [0u8; 256];
         let (n, src) =
