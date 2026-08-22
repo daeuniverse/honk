@@ -334,11 +334,33 @@ struct StartedCells {
     exact: Option<u64>,
 }
 
+#[derive(Debug)]
+pub(super) struct ScoreAuthority;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SelectionCadenceKey {
+    group: String,
+    network: SelectionNetwork,
+    family: Option<IpVersion>,
+}
+
+impl SelectionCadenceKey {
+    fn new(group: &str, context: &ScoreSelectionContext) -> Self {
+        Self {
+            group: group.to_owned(),
+            network: context.network,
+            family: context.target_family,
+        }
+    }
+}
+
 struct StateInner {
     exact: LruCache<ExactKey, Stats>,
     aggregate: LruCache<AggregateKey, Stats>,
     valid: HashSet<(String, Uuid)>,
-    selection_counts: HashMap<String, u64>,
+    valid_groups: HashSet<String>,
+    selection_counts: HashMap<SelectionCadenceKey, u64>,
+    active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
 }
 
@@ -350,7 +372,9 @@ impl Default for StateInner {
                 NonZeroUsize::new(AGGREGATE_CAPACITY).expect("non-zero capacity"),
             ),
             valid: HashSet::new(),
+            valid_groups: HashSet::new(),
             selection_counts: HashMap::new(),
+            active_authority: None,
             tick: 0,
         }
     }
@@ -365,16 +389,25 @@ pub struct ScorePolicyState {
 impl ScorePolicyState {
     /// Atomically publish committed Score group/leaf membership and prune
     /// removed cells. Construction with a reused state never calls this.
-    pub fn publish_membership<I>(&self, membership: I)
-    where
+    pub(super) fn publish_generation<I, G>(
+        &self,
+        authority: Arc<ScoreAuthority>,
+        groups: G,
+        membership: I,
+    ) where
         I: IntoIterator<Item = (String, Uuid)>,
+        G: IntoIterator<Item = String>,
     {
         let mut inner = self.inner.lock();
+        inner.active_authority = Some(authority);
         inner.valid = membership.into_iter().collect();
-        let valid_groups: HashSet<_> = inner.valid.iter().map(|(group, _)| group.clone()).collect();
-        inner
-            .selection_counts
-            .retain(|group, _| valid_groups.contains(group));
+        inner.valid_groups = groups.into_iter().collect();
+        let StateInner {
+            selection_counts,
+            valid_groups,
+            ..
+        } = &mut *inner;
+        selection_counts.retain(|key, _| valid_groups.contains(&key.group));
         let invalid_exact: Vec<_> = inner
             .exact
             .iter()
@@ -396,6 +429,24 @@ impl ScorePolicyState {
     }
 
     #[cfg(test)]
+    fn publish_membership<I>(&self, membership: I)
+    where
+        I: IntoIterator<Item = (String, Uuid)>,
+    {
+        let membership: Vec<_> = membership.into_iter().collect();
+        let groups = membership.iter().map(|(group, _)| group.clone());
+        self.publish_generation(Arc::new(ScoreAuthority), groups, membership.clone());
+    }
+
+    fn is_current_authority(&self, authority: &Arc<ScoreAuthority>) -> bool {
+        self.inner
+            .lock()
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+    }
+
+    #[cfg(test)]
     fn start(
         &self,
         context: &ScoreSelectionContext,
@@ -404,13 +455,37 @@ impl ScorePolicyState {
         self.start_at(context, attributions, Instant::now())
     }
 
+    #[cfg(test)]
     fn start_at(
         &self,
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
         now: Instant,
     ) -> Vec<StartedCells> {
+        let authority = self
+            .inner
+            .lock()
+            .active_authority
+            .clone()
+            .unwrap_or_else(|| Arc::new(ScoreAuthority));
+        self.start_at_with_authority(&authority, context, attributions, now)
+    }
+
+    fn start_at_with_authority(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        now: Instant,
+    ) -> Vec<StartedCells> {
         let mut inner = self.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+        {
+            return vec![StartedCells::default(); attributions.len()];
+        }
         inner.tick = inner.tick.saturating_add(1);
         let tick = inner.tick;
         let mut cells = Vec::with_capacity(attributions.len());
@@ -459,6 +534,12 @@ impl ScorePolicyState {
         now: Instant,
     ) {
         let mut inner = self.inner.lock();
+        if !cells
+            .iter()
+            .any(|started| started.exact.is_some() || started.aggregate.iter().any(Option::is_some))
+        {
+            return;
+        }
         inner.tick = inner.tick.saturating_add(1);
         let tick = inner.tick;
         for (index, attribution) in attributions.iter().enumerate() {
@@ -501,11 +582,12 @@ impl ScorePolicyState {
 
     pub(super) fn rank(
         &self,
+        authority: &Arc<ScoreAuthority>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
     ) -> usize {
-        self.rank_at(group, context, nodes, Instant::now())
+        self.rank_at_with_authority(authority, group, context, nodes, Instant::now())
     }
 
     pub(super) fn peek_rank(
@@ -514,9 +596,10 @@ impl ScorePolicyState {
         context: &ScoreSelectionContext,
         nodes: &[&Node],
     ) -> usize {
-        self.rank_inner(group, context, nodes, Instant::now(), false)
+        self.rank_inner(None, group, context, nodes, Instant::now(), false)
     }
 
+    #[cfg(test)]
     fn rank_at(
         &self,
         group: &str,
@@ -524,11 +607,29 @@ impl ScorePolicyState {
         nodes: &[&Node],
         now: Instant,
     ) -> usize {
-        self.rank_inner(group, context, nodes, now, true)
+        let authority = self
+            .inner
+            .lock()
+            .active_authority
+            .clone()
+            .unwrap_or_else(|| Arc::new(ScoreAuthority));
+        self.rank_at_with_authority(&authority, group, context, nodes, now)
+    }
+
+    fn rank_at_with_authority(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        now: Instant,
+    ) -> usize {
+        self.rank_inner(Some(authority), group, context, nodes, now, true)
     }
 
     fn rank_inner(
         &self,
+        authority: Option<&Arc<ScoreAuthority>>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
@@ -539,16 +640,33 @@ impl ScorePolicyState {
             return 0;
         }
         let mut inner = self.inner.lock();
+        let authorized = apply
+            && authority.is_some_and(|authority| {
+                inner
+                    .active_authority
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, authority))
+            });
         let snapshots: Vec<_> = nodes
             .iter()
             .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
-        let selection_count = if apply {
-            let count = inner.selection_counts.entry(group.to_owned()).or_default();
+        let cadence_key = SelectionCadenceKey::new(group, context);
+        let selection_count = if authorized {
+            let count = inner.selection_counts.entry(cadence_key).or_default();
             *count = count.saturating_add(1);
             *count
         } else {
-            inner.selection_counts.get(group).copied().unwrap_or(0)
+            let count = inner
+                .selection_counts
+                .get(&cadence_key)
+                .copied()
+                .unwrap_or(0);
+            if apply {
+                count.saturating_add(1)
+            } else {
+                count
+            }
         };
         let (best, forced_exploration) = best_index(&snapshots, nodes, selection_count, apply);
         let incumbent = snapshots
@@ -569,7 +687,7 @@ impl ScorePolicyState {
                 .filter(|&index| keep_incumbent(&snapshots[index], &snapshots[best]))
                 .unwrap_or(best)
         };
-        if apply {
+        if authorized {
             inner.tick = inner.tick.saturating_add(1);
             let selection_tick = inner.tick;
             mark_selected(
@@ -1052,6 +1170,7 @@ fn utility(score: &ScoreSnapshot) -> f64 {
 #[derive(Clone)]
 pub struct ScoreFeedback {
     state: Arc<ScorePolicyState>,
+    authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
 }
@@ -1066,11 +1185,13 @@ impl std::fmt::Debug for ScoreFeedback {
 impl ScoreFeedback {
     pub(super) fn new(
         state: Arc<ScorePolicyState>,
+        authority: Arc<ScoreAuthority>,
         context: ScoreSelectionContext,
         attributions: Vec<ScoreAttribution>,
     ) -> Self {
         Self {
             state,
+            authority,
             context,
             attributions: attributions.into(),
         }
@@ -1108,12 +1229,16 @@ impl ScoreFeedback {
     /// Call only when the physical dial or logical stream actually starts.
     pub fn start(&self) -> ScoreReporter {
         let started = Instant::now();
-        let cells = self
-            .state
-            .start_at(&self.context, &self.attributions, started);
+        let cells = self.state.start_at_with_authority(
+            &self.authority,
+            &self.context,
+            &self.attributions,
+            started,
+        );
         ScoreReporter {
             shared: Arc::new(ReporterShared {
                 state: Arc::clone(&self.state),
+                authority: Arc::clone(&self.authority),
                 context: self.context.clone(),
                 attributions: Arc::clone(&self.attributions),
                 cells: cells.into(),
@@ -1136,6 +1261,7 @@ struct ReporterProgress {
 
 struct ReporterShared {
     state: Arc<ScorePolicyState>,
+    authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
     cells: Arc<[StartedCells]>,
@@ -1193,6 +1319,7 @@ impl ScoreReporter {
     pub fn feedback(&self) -> ScoreFeedback {
         ScoreFeedback {
             state: Arc::clone(&self.shared.state),
+            authority: Arc::clone(&self.shared.authority),
             context: self.shared.context.clone(),
             attributions: Arc::clone(&self.shared.attributions),
         }
@@ -1269,6 +1396,7 @@ impl super::GroupManager {
     /// Extant non-Score groups remain valid for reporters started before a
     /// policy change; new selection creates feedback only for Score groups.
     pub fn publish_score_membership(&self) {
+        let groups = self.groups.keys().cloned().collect::<Vec<_>>();
         let membership = self.groups.values().flat_map(|group| {
             let mut node_ids: HashSet<_> = self
                 .leaf_nodes_in_group(&group.name)
@@ -1281,7 +1409,8 @@ impl super::GroupManager {
                 .into_iter()
                 .map(move |node_id| (group.name.clone(), node_id))
         });
-        self.score_state.publish_membership(membership);
+        self.score_state
+            .publish_generation(Arc::clone(&self.score_authority), groups, membership);
     }
 
     fn collect_final_outbound_node_ids(
@@ -1340,8 +1469,15 @@ impl super::GroupManager {
                 node_id,
             })
             .collect();
-        (!attributions.is_empty())
-            .then(|| ScoreFeedback::new(Arc::clone(&self.score_state), context, attributions))
+        (!attributions.is_empty() && self.score_state.is_current_authority(&self.score_authority))
+            .then(|| {
+                ScoreFeedback::new(
+                    Arc::clone(&self.score_state),
+                    Arc::clone(&self.score_authority),
+                    context,
+                    attributions,
+                )
+            })
     }
 
     /// Feedback for a terminal `final` leaf attributed to one outer Honk
@@ -1355,9 +1491,11 @@ impl super::GroupManager {
         self.groups
             .get(group_name)
             .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
+            .filter(|_| self.score_state.is_current_authority(&self.score_authority))
             .map(|group| {
                 ScoreFeedback::new(
                     Arc::clone(&self.score_state),
+                    Arc::clone(&self.score_authority),
                     context,
                     vec![ScoreAttribution {
                         group: group.name.clone(),
@@ -1459,13 +1597,16 @@ impl super::GroupManager {
                         .into_iter()
                         .map(str::to_owned)
                         .collect();
-                    let feedback = (!attributions.is_empty()).then(|| {
-                        ScoreFeedback::new(
-                            Arc::clone(&self.score_state),
-                            context.clone(),
-                            attributions,
-                        )
-                    });
+                    let feedback = (!attributions.is_empty())
+                        .then(|| {
+                            ScoreFeedback::new(
+                                Arc::clone(&self.score_state),
+                                Arc::clone(&self.score_authority),
+                                context.clone(),
+                                attributions,
+                            )
+                        })
+                        .filter(|_| self.score_state.is_current_authority(&self.score_authority));
                     super::ScoreSelectionEntry {
                         node: candidate.node,
                         feedback,
@@ -1821,9 +1962,10 @@ mod tests {
                     },
                 );
             }
-            inner
-                .selection_counts
-                .insert("score".into(), exploration_period(nodes.len()) - 1);
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("score", &context),
+                exploration_period(nodes.len()) - 1,
+            );
         }
 
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
@@ -1880,16 +2022,294 @@ mod tests {
                     },
                 );
             }
-            inner
-                .selection_counts
-                .insert("score".into(), exploration_period(nodes.len()) - 1);
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("score", &context),
+                exploration_period(nodes.len()) - 1,
+            );
         }
 
         let selected = state.rank_at("score", &context, &node_refs, now);
         assert_eq!(selected, 1);
-        let count = state.inner.lock().selection_counts["score"];
+        let key = SelectionCadenceKey::new("score", &context);
+        let count = state.inner.lock().selection_counts[&key];
         assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
-        assert_eq!(state.inner.lock().selection_counts["score"], count);
+        assert_eq!(state.inner.lock().selection_counts[&key], count);
+    }
+
+    #[test]
+    fn same_scope_exploration_period_and_peek_are_unchanged() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let now = Instant::now();
+        {
+            let mut inner = state.inner.lock();
+            for (index, node) in nodes.iter().enumerate() {
+                inner.aggregate.put(
+                    AggregateKey {
+                        group: "score".into(),
+                        network: SelectionNetwork::Tcp,
+                        family: None,
+                        node_id: node.id,
+                    },
+                    Stats {
+                        setup_success: 8.0,
+                        useful_success: 8.0,
+                        first_response_ms: WeightedMean {
+                            sum: 800.0,
+                            weight: 8.0,
+                        },
+                        updated_at: Some(now),
+                        selected_at: u64::from(index == 0),
+                        ..Default::default()
+                    },
+                );
+            }
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("score", &context),
+                exploration_period(nodes.len()) - 1,
+            );
+        }
+
+        let selected = state.rank_at("score", &context, &node_refs, now);
+        assert_eq!(selected, 1);
+        assert_eq!(
+            state.inner.lock().selection_counts[&SelectionCadenceKey::new("score", &context)],
+            exploration_period(nodes.len())
+        );
+        assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
+        assert_eq!(
+            state.inner.lock().selection_counts[&SelectionCadenceKey::new("score", &context)],
+            exploration_period(nodes.len())
+        );
+    }
+
+    #[test]
+    fn periodic_exploration_is_scoped_by_network_and_family() {
+        let nodes = [node("a"), node("b")];
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let targeted = |network, family| ScoreSelectionContext {
+            network,
+            probe_domain: if network == SelectionNetwork::Tcp {
+                ProbeDomain::Tcp
+            } else {
+                ProbeDomain::DataUdp
+            },
+            target_family: Some(family),
+            health_family: family,
+            target: Some(ScoreTarget::domain("target.example", 443)),
+        };
+        let aggregate = |network| {
+            ScoreSelectionContext::aggregate(
+                network,
+                if network == SelectionNetwork::Tcp {
+                    ProbeDomain::Tcp
+                } else {
+                    ProbeDomain::DataUdp
+                },
+                IpVersion::V4,
+            )
+        };
+        let contexts = [
+            targeted(SelectionNetwork::Tcp, IpVersion::V4),
+            targeted(SelectionNetwork::Tcp, IpVersion::V6),
+            targeted(SelectionNetwork::Udp, IpVersion::V4),
+            targeted(SelectionNetwork::Udp, IpVersion::V6),
+            aggregate(SelectionNetwork::Tcp),
+            aggregate(SelectionNetwork::Udp),
+        ];
+        for context in &contexts {
+            let _ = manager.selection_plan_for_target("score", context);
+        }
+        let state = manager.score_state();
+        assert_eq!(state.inner.lock().selection_counts.len(), 6);
+        println!(
+            "cadence scope cardinality={}",
+            state.inner.lock().selection_counts.len()
+        );
+
+        let tcp_v4_key = SelectionCadenceKey::new("score", &contexts[0]);
+        state
+            .inner
+            .lock()
+            .selection_counts
+            .insert(tcp_v4_key.clone(), exploration_period(nodes.len()) - 1);
+        let _ = manager.selection_plan_for_target("score", &contexts[2]);
+        assert_eq!(
+            state.inner.lock().selection_counts[&tcp_v4_key],
+            exploration_period(nodes.len()) - 1,
+            "UDP-V4 must not consume TCP-V4 cadence"
+        );
+        let _ = manager.selection_plan_for_target("score", &contexts[0]);
+        assert_eq!(
+            state.inner.lock().selection_counts[&tcp_v4_key],
+            exploration_period(nodes.len())
+        );
+
+        let different_target = context("other.example", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("score", &different_target);
+        assert_eq!(state.inner.lock().selection_counts.len(), 6);
+    }
+
+    #[test]
+    fn selection_count_reload_lifecycle_matches_group_name() {
+        let nodes = [node("a"), node("b")];
+        let old = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let context = context("reload.example", IpVersion::V4);
+        let _ = old.selection_plan_for_target("score", &context);
+        let state = old.score_state();
+        let before: u64 = state.inner.lock().selection_counts.values().copied().sum();
+
+        let empty = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &[])],
+            &[],
+            None,
+            Arc::clone(&state),
+        );
+        empty.publish_score_membership();
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .selection_counts
+                .values()
+                .copied()
+                .sum::<u64>(),
+            before,
+            "a committed group name retains cadence through zero leaves"
+        );
+
+        let mut selector = group("score", &nodes);
+        selector.policy = GroupPolicy::Selector;
+        let non_score = super::super::GroupManager::with_alive_set_and_score_state(
+            &[selector],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        non_score.publish_score_membership();
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .selection_counts
+                .values()
+                .copied()
+                .sum::<u64>(),
+            before,
+            "a surviving name retains cadence through Score to non-Score"
+        );
+
+        let removed = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &[],
+            None,
+            Arc::clone(&state),
+        );
+        removed.publish_score_membership();
+        assert!(state.inner.lock().selection_counts.is_empty());
+    }
+
+    #[test]
+    fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
+        let survivor = node("survivor");
+        let removed = node("removed");
+        let replacement_node = node("replacement");
+        let old_nodes = [survivor.clone(), removed.clone()];
+        let old = super::super::GroupManager::new(&[group("score", &old_nodes)], &old_nodes);
+        let state = old.score_state();
+        let seeded_context = context("seeded.example", IpVersion::V4);
+        finish_success(&old.selection_plan_for_target("score", &seeded_context));
+
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &[],
+            None,
+            Arc::clone(&state),
+        );
+        deleted.publish_score_membership();
+        let replacement_nodes = [survivor.clone(), replacement_node];
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &replacement_nodes)],
+            &replacement_nodes,
+            None,
+            Arc::clone(&state),
+        );
+        replacement.publish_score_membership();
+        let before = {
+            let inner = state.inner.lock();
+            (
+                inner.tick,
+                inner.selection_counts.len(),
+                inner.aggregate.len(),
+                inner.exact.len(),
+            )
+        };
+        assert_eq!((before.1, before.2, before.3), (0, 0, 0));
+
+        let stale =
+            old.selection_plan_for_target("score", &context("stale.example", IpVersion::V4));
+        assert!(stale.entries[0].feedback.is_none());
+        assert!(
+            old.feedback_for_group_node("score", survivor.id, seeded_context.clone())
+                .is_none(),
+            "the surviving ID must not restore old-manager feedback authority"
+        );
+        assert!(
+            old.feedback_for_group_node("score", removed.id, seeded_context)
+                .is_none(),
+            "the replaced ID must not restore old-manager feedback authority"
+        );
+        let after_stale = {
+            let inner = state.inner.lock();
+            (
+                inner.tick,
+                inner.selection_counts.len(),
+                inner.aggregate.len(),
+                inner.exact.len(),
+            )
+        };
+        assert_eq!(after_stale, before);
+
+        let current = replacement
+            .selection_plan_for_target("score", &context("current.example", IpVersion::V4));
+        assert!(current.entries[0].feedback.is_some());
+        let after_current = state.inner.lock();
+        assert_eq!(after_current.selection_counts.len(), 1);
+        assert_eq!(after_current.aggregate.len(), 1);
+        assert!(after_current.tick > before.0);
+    }
+
+    #[test]
+    fn captured_feedback_requires_current_authority_at_start() {
+        let nodes = [node("a"), node("b")];
+        let old = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let context = context("captured.example", IpVersion::V4);
+        let feedback = old
+            .feedback_for_group_node("score", nodes[0].id, context.clone())
+            .unwrap();
+        let state = old.score_state();
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &nodes)],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        replacement.publish_score_membership();
+        let before_tick = state.inner.lock().tick;
+
+        let reporter = feedback.start();
+        reporter.setup_succeeded();
+        reporter.first_response();
+        reporter.tx(123);
+        reporter.rx(456);
+        reporter.finish(ScoreOutcome::Timeout);
+        drop(reporter);
+
+        assert!(!state.has_exact("score", &context, nodes[0].id));
+        assert_eq!(state.inner.lock().tick, before_tick);
     }
 
     #[test]

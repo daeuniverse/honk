@@ -172,6 +172,7 @@ pub struct GroupManager {
     /// Invoked on selection changes for groups with interrupt_connections.
     interrupt_callback: RwLock<Option<InterruptCallback>>,
     score_state: Arc<ScorePolicyState>,
+    score_authority: Arc<score::ScoreAuthority>,
 }
 
 impl GroupManager {
@@ -246,6 +247,7 @@ impl GroupManager {
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
             score_state,
+            score_authority: Arc::new(score::ScoreAuthority),
         }
     }
 
