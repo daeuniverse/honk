@@ -36,8 +36,8 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use state::UrlTestSelections;
 
 pub use score::{
-    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReporter,
-    ScoreSelectionContext, ScoreTarget,
+    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReasonCounters,
+    ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext, ScoreTarget,
 };
 pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 
@@ -210,6 +210,17 @@ pub struct GroupManager {
 }
 
 impl GroupManager {
+    pub fn score_reason_snapshot(&self) -> Vec<ScoreReasonGroupSnapshot> {
+        let mut group_names: Vec<_> = self
+            .groups
+            .values()
+            .filter(|group| group.policy == GroupPolicy::Score)
+            .map(|group| group.name.clone())
+            .collect();
+        group_names.sort_unstable();
+        self.score_state.reason_snapshot(group_names)
+    }
+
     pub fn new(groups: &[Group], nodes: &[Node]) -> Self {
         Self::with_alive_set(groups, nodes, None)
     }

@@ -409,6 +409,38 @@ struct SelectionReasonCounts {
     dead_filtered: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScoreReasonCounters {
+    pub cold_explore: u64,
+    pub periodic_explore: u64,
+    pub reliability_winner: u64,
+    pub performance_winner: u64,
+    pub incumbent_held: u64,
+    pub fresh_failure_bypass: u64,
+    pub dead_filtered: u64,
+}
+
+impl ScoreReasonCounters {
+    const fn from_private(counts: SelectionReasonCounts) -> Self {
+        Self {
+            cold_explore: counts.cold_explore,
+            periodic_explore: counts.periodic_explore,
+            reliability_winner: counts.reliability_winner,
+            performance_winner: counts.performance_winner,
+            incumbent_held: counts.incumbent_held,
+            fresh_failure_bypass: counts.fresh_failure_bypass,
+            dead_filtered: counts.dead_filtered,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoreReasonGroupSnapshot {
+    pub name: String,
+    pub tcp: ScoreReasonCounters,
+    pub udp: ScoreReasonCounters,
+}
+
 struct StateInner {
     exact: LruCache<ExactKey, Stats>,
     aggregate: LruCache<AggregateKey, Stats>,
@@ -446,6 +478,32 @@ pub struct ScorePolicyState {
 }
 
 impl ScorePolicyState {
+    pub(super) fn reason_snapshot(
+        &self,
+        group_names: Vec<String>,
+    ) -> Vec<ScoreReasonGroupSnapshot> {
+        let mut groups: Vec<_> = group_names
+            .into_iter()
+            .map(|name| ScoreReasonGroupSnapshot {
+                name,
+                tcp: ScoreReasonCounters::default(),
+                udp: ScoreReasonCounters::default(),
+            })
+            .collect();
+        let inner = self.inner.lock();
+        for (key, counts) in &inner.selection_reasons {
+            let Ok(index) = groups.binary_search_by(|group| group.name.cmp(&key.group)) else {
+                continue;
+            };
+            let destination = match key.network {
+                SelectionNetwork::Tcp => &mut groups[index].tcp,
+                SelectionNetwork::Udp => &mut groups[index].udp,
+            };
+            *destination = ScoreReasonCounters::from_private(*counts);
+        }
+        groups
+    }
+
     /// Atomically publish committed Score group/leaf membership and prune
     /// removed cells. Construction with a reused state never calls this.
     pub(super) fn publish_generation<I, G>(
@@ -3584,6 +3642,230 @@ group {
         assert_eq!(parent_counts.cold_explore, 1);
         assert_eq!(child_counts.dead_filtered, 0);
         assert_eq!(parent_counts.dead_filtered, 0);
+    }
+
+    #[test]
+    fn private_reason_counts_follow_committed_name_lifecycle() {
+        let nodes = [node("lifecycle-a"), node("lifecycle-b")];
+        let score = group("lifecycle", &nodes);
+        let manager = super::super::GroupManager::new(std::slice::from_ref(&score), &nodes);
+        let state = manager.score_state();
+        let target = context("private-lifecycle.example", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("lifecycle", &target);
+        let recorded = state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp);
+        assert_eq!(recorded.cold_explore, 1);
+
+        let selector = Group {
+            policy: GroupPolicy::Selector,
+            ..score.clone()
+        };
+        let hidden = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&selector),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        hidden.publish_score_membership();
+        assert_eq!(
+            state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp),
+            recorded
+        );
+
+        let restored = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        restored.publish_score_membership();
+        assert_eq!(
+            state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp),
+            recorded
+        );
+
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        deleted.publish_score_membership();
+        let recreated = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        recreated.publish_score_membership();
+        let reset = state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp);
+        println!(
+            "private lifecycle recorded={recorded:?} hidden={recorded:?} restored={recorded:?} recreated={reset:?}"
+        );
+        assert_eq!(reset, SelectionReasonCounts::default());
+    }
+
+    #[test]
+    fn score_reason_snapshot_is_sorted_fixed_and_private() {
+        let nodes = [node("private-node-alpha"), node("private-node-beta")];
+        let groups = [
+            group("z-score", &nodes),
+            Group {
+                name: "hidden-selector".into(),
+                policy: GroupPolicy::Selector,
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                ..Default::default()
+            },
+            group("a-score", &nodes),
+        ];
+        let manager = super::super::GroupManager::new(&groups, &nodes);
+        let mut tcp_target = context("private-target.internal", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("z-score", &tcp_target);
+        tcp_target.network = SelectionNetwork::Udp;
+        tcp_target.probe_domain = ProbeDomain::DataUdp;
+        let _ = manager.selection_plan_for_target("a-score", &tcp_target);
+
+        let state = manager.score_state();
+        let before_read = state.inner.lock().selection_reasons.clone();
+        let snapshot = manager.score_reason_snapshot();
+        assert_eq!(state.inner.lock().selection_reasons, before_read);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|group| group.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a-score", "z-score"]
+        );
+        assert_eq!(
+            snapshot[0].udp,
+            ScoreReasonCounters {
+                cold_explore: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            snapshot[1].tcp,
+            ScoreReasonCounters {
+                cold_explore: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(snapshot[0].tcp, ScoreReasonCounters::default());
+        assert_eq!(snapshot[1].udp, ScoreReasonCounters::default());
+
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("private-node-alpha"));
+        assert!(!debug.contains("private-node-beta"));
+        assert!(!debug.contains("private-target.internal"));
+        let ScoreReasonCounters {
+            cold_explore: _,
+            periodic_explore: _,
+            reliability_winner: _,
+            performance_winner: _,
+            incumbent_held: _,
+            fresh_failure_bypass: _,
+            dead_filtered: _,
+        } = snapshot[0].tcp;
+
+        let _ = manager.selection_plan_for_target(
+            "z-score",
+            &context("private-target.internal", IpVersion::V4),
+        );
+        let later = manager.score_reason_snapshot();
+        assert_eq!(snapshot[1].tcp.cold_explore, 1);
+        assert_eq!(later[1].tcp.cold_explore, 2);
+
+        let saturated = SelectionReasonCounts {
+            cold_explore: u64::MAX,
+            periodic_explore: u64::MAX,
+            reliability_winner: u64::MAX,
+            performance_winner: u64::MAX,
+            incumbent_held: u64::MAX,
+            fresh_failure_bypass: u64::MAX,
+            dead_filtered: u64::MAX,
+        };
+        state.inner.lock().selection_reasons.insert(
+            SelectionReasonKey::new("z-score", SelectionNetwork::Udp),
+            saturated,
+        );
+        let saturated_snapshot = manager.score_reason_snapshot();
+        assert_eq!(
+            saturated_snapshot[1].udp,
+            ScoreReasonCounters::from_private(saturated)
+        );
+        println!(
+            "owned score snapshot={snapshot:?} later={later:?} saturated={saturated_snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn score_reason_snapshot_reload_policy_is_name_based() {
+        let nodes = [node("private-reload-alpha"), node("private-reload-beta")];
+        let score = group("persist", &nodes);
+        let manager = super::super::GroupManager::new(std::slice::from_ref(&score), &nodes);
+        let state = manager.score_state();
+        let target = context("private-reload-target.internal", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("persist", &target);
+        let recorded = manager.score_reason_snapshot();
+        assert_eq!(recorded[0].tcp.cold_explore, 1);
+
+        let selector = Group {
+            policy: GroupPolicy::Selector,
+            ..score.clone()
+        };
+        let hidden = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&selector),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        hidden.publish_score_membership();
+        assert!(hidden.score_reason_snapshot().is_empty());
+        let _ = manager.selection_plan_for_target("persist", &target);
+        assert_eq!(
+            state.selection_reason_counts("persist", SelectionNetwork::Tcp),
+            SelectionReasonCounts {
+                cold_explore: 1,
+                ..Default::default()
+            }
+        );
+
+        let empty_score = group("persist", &[]);
+        let restored = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&empty_score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        restored.publish_score_membership();
+        assert_eq!(restored.score_reason_snapshot(), recorded);
+
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        deleted.publish_score_membership();
+        let recreated = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        recreated.publish_score_membership();
+        let reset = recreated.score_reason_snapshot();
+        assert_eq!(reset[0].tcp, ScoreReasonCounters::default());
+        let _ = manager.selection_plan_for_target("persist", &target);
+        assert_eq!(recreated.score_reason_snapshot(), reset);
+        let _ = recreated.selection_plan_for_target("persist", &target);
+        let current = recreated.score_reason_snapshot();
+        assert_eq!(current[0].tcp.cold_explore, 1);
+
+        let empty = super::super::GroupManager::new(&[], &nodes);
+        assert!(empty.score_reason_snapshot().is_empty());
+        println!(
+            "snapshot lifecycle recorded={recorded:?} hidden=[] restored={recorded:?} recreated={reset:?} current={current:?}"
+        );
     }
 
     #[test]
