@@ -51,9 +51,11 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：UDP 使用 UDP 分桶，TCP/DoT/DoH 使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶；现有的 proxied DoQ/DoH3 限制保持不变。每个周期 UDP 探测会为 Score 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
 
-排名首先计算可靠性下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不参与延迟与吞吐排名。在该区间内，已训练候选的 utility 偏向更低的衰减 setup/首响应延迟和有界的合格吞吐；普通健康探测会持续刷新未入选候选，因此 attempt 数不会获得路由 bonus。有效完成证据不足或随时间衰减到训练阈值以下的候选会重新视为冷候选。候选数不超过 4 时冷探索覆盖全部成员；更大的组探索 `ceil(sqrt(n)) + 1` 个成员，并每进行 `2n` 次选择重新检查尝试次数最少的非当前成员，间隔限制为 16–64 次选择。探索过程和其余平局均保持确定性，最后按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
+排名首先计算可靠性下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不参与延迟与吞吐排名。在该区间内，已训练候选的 utility 偏向更低的衰减 setup/首响应延迟和有界的合格吞吐；普通健康探测会持续刷新未入选候选，因此 attempt 数不会获得路由 bonus。有效完成证据不足或随时间衰减到训练阈值以下的候选会重新视为冷候选。候选数不超过 4 时冷探索覆盖全部成员；更大的组探索 `ceil(sqrt(n)) + 1` 个成员，并每进行 `2n` 次选择重新检查尝试次数最少的非当前成员，间隔限制为 16–64 次选择。这个周期 cadence 只按 `(group, TCP/UDP, 目标 IPv4/IPv6 地址族或 none)` 分域，绝不包含精确目标、节点、健康地址族、地址或端口。全局、目标地址族和精确目标的新鲜失败 envelope 在决定是否绕过现任余量前取 `max`，而不相加。探索过程和其余平局均保持确定性，最后按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
 
-共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
+共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。精确目标证据衡量 transport 质量，并不是语义解锁能力的结果；需要这种粗粒度 cohort 时，可用已有 routing 或 geosite 规则选择专用服务 Score 组。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
+
+一次已授权的多候选 Apply 按优先级恰好增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`。`deadFiltered` 独立计数被活性过滤移除的唯一叶候选，可以与该最终原因同时增加。Peek、proxy/stat 读取、单例旁路和最后尝试选择均保持中性。经鉴权的 `/stats.score.groups[]` 快照只公开这些按组的 TCP/UDP 计数，不包含 cell、节点、目标、cadence 或 manager authority。
 
 ### URLTest 排名与滞后
 

@@ -5,7 +5,7 @@
 //! HashMap storage.
 
 #[cfg(test)]
-use super::ProjectionMapOperation;
+use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
 use super::{
     EbpfBackend, LpmKeepSet, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
     UdpDecisionTransition, apply_udp_decision_transition, udp_state_is_legacy_userspace_owned,
@@ -200,6 +200,14 @@ pub struct MockEbpfBackend {
     projection_writes: Vec<ProjectionMapOperation>,
     #[cfg(test)]
     domain_bitmap_add_faults: usize,
+    #[cfg(test)]
+    datapath_flags_fault_nth: Option<usize>,
+    #[cfg(test)]
+    datapath_flags_writes_after_arm: usize,
+    #[cfg(test)]
+    datapath_flags_write_origin: DatapathFlagsWriteOrigin,
+    #[cfg(test)]
+    datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
 }
 
 impl MockEbpfBackend {
@@ -613,7 +621,55 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
         self.datapath_flags_writes.lock().unwrap().push(flags);
+        #[cfg(test)]
+        {
+            self.datapath_flags_writes_after_arm =
+                self.datapath_flags_writes_after_arm.saturating_add(1);
+            let ordinal = self.datapath_flags_writes_after_arm;
+            let failed = self.datapath_flags_fault_nth == Some(ordinal);
+            self.datapath_flags_write_trace
+                .push(DatapathFlagsWriteTrace {
+                    ordinal,
+                    origin: std::mem::take(&mut self.datapath_flags_write_origin),
+                    flags,
+                    failed,
+                });
+            if failed {
+                self.datapath_flags_fault_nth = None;
+                anyhow::bail!("injected datapath flags write failure at ordinal {ordinal}");
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn arm_datapath_flags_write_fault(&mut self, nth: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(nth != 0, "datapath flags write ordinal must be non-zero");
+        self.datapath_flags_fault_nth = Some(nth);
+        self.datapath_flags_writes_after_arm = 0;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_datapath_flags_write_origin(&mut self, origin: DatapathFlagsWriteOrigin) {
+        self.datapath_flags_write_origin = origin;
+    }
+
+    #[cfg(test)]
+    fn datapath_flags_write_log(&self) -> Vec<u32> {
+        self.datapath_flags_writes.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn datapath_flags_write_trace(&self) -> Vec<DatapathFlagsWriteTrace> {
+        self.datapath_flags_write_trace.clone()
+    }
+
+    #[cfg(test)]
+    fn clear_datapath_flags_write_log(&mut self) {
+        self.datapath_flags_writes.lock().unwrap().clear();
+        self.datapath_flags_write_trace.clear();
+        self.datapath_flags_writes_after_arm = 0;
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {

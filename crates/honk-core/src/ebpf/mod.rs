@@ -257,6 +257,25 @@ pub struct DynamicHooks {
     pub egress: bool,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathFlagsWriteOrigin {
+    #[default]
+    Other,
+    FenceNfqueue,
+    SetStatic,
+    ReopenNfqueue,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatapathFlagsWriteTrace {
+    pub ordinal: usize,
+    pub origin: DatapathFlagsWriteOrigin,
+    pub flags: u32,
+    pub failed: bool,
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
     fn inject_routing_fault(
@@ -318,6 +337,22 @@ pub trait EbpfBackend: Send + Sync {
     fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
         Ok(())
     }
+    #[cfg(test)]
+    fn arm_datapath_flags_write_fault(&mut self, _nth: usize) -> anyhow::Result<()> {
+        anyhow::bail!("datapath flag fault injection is unsupported")
+    }
+    #[cfg(test)]
+    fn mark_datapath_flags_write_origin(&mut self, _origin: DatapathFlagsWriteOrigin) {}
+    #[cfg(test)]
+    fn datapath_flags_write_log(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn datapath_flags_write_trace(&self) -> Vec<DatapathFlagsWriteTrace> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn clear_datapath_flags_write_log(&mut self) {}
 
     /// After READY has been cleared, wait for every kernel invocation that
     /// observed the prior fence to finish, then remove all unpublished or

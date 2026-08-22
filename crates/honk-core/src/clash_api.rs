@@ -846,6 +846,31 @@ fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> 
 /// standard; handy for headless ops.
 async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let snap = s.stats.snapshot();
+    let score_groups = {
+        let group_manager = s.group_manager.read();
+        group_manager.score_reason_snapshot()
+    };
+    let score_groups: Vec<_> = score_groups
+        .into_iter()
+        .map(|group| {
+            let counters = |counters: honk_outbound::group::ScoreReasonCounters| {
+                serde_json::json!({
+                    "coldExplore": counters.cold_explore,
+                    "periodicExplore": counters.periodic_explore,
+                    "reliabilityWinner": counters.reliability_winner,
+                    "performanceWinner": counters.performance_winner,
+                    "incumbentHeld": counters.incumbent_held,
+                    "freshFailureBypass": counters.fresh_failure_bypass,
+                    "deadFiltered": counters.dead_filtered,
+                })
+            };
+            serde_json::json!({
+                "name": group.name,
+                "tcp": counters(group.tcp),
+                "udp": counters(group.udp),
+            })
+        })
+        .collect();
     let per_outbound: Vec<serde_json::Value> = snap
         .iter()
         .map(|(name, v)| {
@@ -866,6 +891,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
     Json(serde_json::json!({
         "outbounds": per_outbound,
+        "score": { "groups": score_groups },
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,

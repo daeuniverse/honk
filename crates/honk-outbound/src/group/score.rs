@@ -334,23 +334,138 @@ struct StartedCells {
     exact: Option<u64>,
 }
 
+#[derive(Debug)]
+pub(super) struct ScoreAuthority;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SelectionCadenceKey {
+    group: String,
+    network: SelectionNetwork,
+    family: Option<IpVersion>,
+}
+
+impl SelectionCadenceKey {
+    fn new(group: &str, context: &ScoreSelectionContext) -> Self {
+        Self {
+            group: group.to_owned(),
+            network: context.network,
+            family: context.target_family,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionReason {
+    ColdExplore,
+    PeriodicExplore,
+    ReliabilityWinner,
+    PerformanceWinner,
+    IncumbentHeld,
+    FreshFailureBypass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldDecision {
+    Held,
+    FreshFailureBypass,
+    UseBest,
+}
+
+impl SelectionReason {
+    fn is_exploration(self) -> bool {
+        matches!(self, Self::ColdExplore | Self::PeriodicExplore)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RankedSelection {
+    index: usize,
+    reason: SelectionReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct SelectionReasonKey {
+    group: String,
+    network: SelectionNetwork,
+}
+
+impl SelectionReasonKey {
+    pub(super) fn new(group: &str, network: SelectionNetwork) -> Self {
+        Self {
+            group: group.to_owned(),
+            network,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SelectionReasonCounts {
+    cold_explore: u64,
+    periodic_explore: u64,
+    reliability_winner: u64,
+    performance_winner: u64,
+    incumbent_held: u64,
+    fresh_failure_bypass: u64,
+    dead_filtered: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScoreReasonCounters {
+    pub cold_explore: u64,
+    pub periodic_explore: u64,
+    pub reliability_winner: u64,
+    pub performance_winner: u64,
+    pub incumbent_held: u64,
+    pub fresh_failure_bypass: u64,
+    pub dead_filtered: u64,
+}
+
+impl ScoreReasonCounters {
+    const fn from_private(counts: SelectionReasonCounts) -> Self {
+        Self {
+            cold_explore: counts.cold_explore,
+            periodic_explore: counts.periodic_explore,
+            reliability_winner: counts.reliability_winner,
+            performance_winner: counts.performance_winner,
+            incumbent_held: counts.incumbent_held,
+            fresh_failure_bypass: counts.fresh_failure_bypass,
+            dead_filtered: counts.dead_filtered,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoreReasonGroupSnapshot {
+    pub name: String,
+    pub tcp: ScoreReasonCounters,
+    pub udp: ScoreReasonCounters,
+}
+
 struct StateInner {
     exact: LruCache<ExactKey, Stats>,
     aggregate: LruCache<AggregateKey, Stats>,
     valid: HashSet<(String, Uuid)>,
-    selection_counts: HashMap<String, u64>,
+    valid_groups: HashSet<String>,
+    selection_counts: HashMap<SelectionCadenceKey, u64>,
+    selection_reasons: HashMap<SelectionReasonKey, SelectionReasonCounts>,
+    active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
 }
 
 impl Default for StateInner {
     fn default() -> Self {
         Self {
+            // SAFE-EXPECT: both cache capacities are positive compile-time constants.
             exact: LruCache::new(NonZeroUsize::new(EXACT_CAPACITY).expect("non-zero capacity")),
             aggregate: LruCache::new(
+                // SAFE-EXPECT: both cache capacities are positive compile-time constants.
                 NonZeroUsize::new(AGGREGATE_CAPACITY).expect("non-zero capacity"),
             ),
             valid: HashSet::new(),
+            valid_groups: HashSet::new(),
             selection_counts: HashMap::new(),
+            selection_reasons: HashMap::new(),
+            active_authority: None,
             tick: 0,
         }
     }
@@ -363,18 +478,55 @@ pub struct ScorePolicyState {
 }
 
 impl ScorePolicyState {
+    pub(super) fn reason_snapshot(
+        &self,
+        group_names: Vec<String>,
+    ) -> Vec<ScoreReasonGroupSnapshot> {
+        let mut groups: Vec<_> = group_names
+            .into_iter()
+            .map(|name| ScoreReasonGroupSnapshot {
+                name,
+                tcp: ScoreReasonCounters::default(),
+                udp: ScoreReasonCounters::default(),
+            })
+            .collect();
+        let inner = self.inner.lock();
+        for (key, counts) in &inner.selection_reasons {
+            let Ok(index) = groups.binary_search_by(|group| group.name.cmp(&key.group)) else {
+                continue;
+            };
+            let destination = match key.network {
+                SelectionNetwork::Tcp => &mut groups[index].tcp,
+                SelectionNetwork::Udp => &mut groups[index].udp,
+            };
+            *destination = ScoreReasonCounters::from_private(*counts);
+        }
+        groups
+    }
+
     /// Atomically publish committed Score group/leaf membership and prune
     /// removed cells. Construction with a reused state never calls this.
-    pub fn publish_membership<I>(&self, membership: I)
-    where
+    pub(super) fn publish_generation<I, G>(
+        &self,
+        authority: Arc<ScoreAuthority>,
+        groups: G,
+        membership: I,
+    ) where
         I: IntoIterator<Item = (String, Uuid)>,
+        G: IntoIterator<Item = String>,
     {
         let mut inner = self.inner.lock();
+        inner.active_authority = Some(authority);
         inner.valid = membership.into_iter().collect();
-        let valid_groups: HashSet<_> = inner.valid.iter().map(|(group, _)| group.clone()).collect();
-        inner
-            .selection_counts
-            .retain(|group, _| valid_groups.contains(group));
+        inner.valid_groups = groups.into_iter().collect();
+        let StateInner {
+            selection_counts,
+            selection_reasons,
+            valid_groups,
+            ..
+        } = &mut *inner;
+        selection_counts.retain(|key, _| valid_groups.contains(&key.group));
+        selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
         let invalid_exact: Vec<_> = inner
             .exact
             .iter()
@@ -396,6 +548,85 @@ impl ScorePolicyState {
     }
 
     #[cfg(test)]
+    fn publish_membership<I>(&self, membership: I)
+    where
+        I: IntoIterator<Item = (String, Uuid)>,
+    {
+        let membership: Vec<_> = membership.into_iter().collect();
+        let groups = membership.iter().map(|(group, _)| group.clone());
+        self.publish_generation(Arc::new(ScoreAuthority), groups, membership.clone());
+    }
+
+    pub(super) fn is_current_authority(&self, authority: &Arc<ScoreAuthority>) -> bool {
+        self.inner
+            .lock()
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+    }
+
+    fn record_selection_reason(
+        inner: &mut StateInner,
+        group: &str,
+        network: SelectionNetwork,
+        selection: RankedSelection,
+    ) {
+        let counts = inner
+            .selection_reasons
+            .entry(SelectionReasonKey::new(group, network))
+            .or_default();
+        let counter = match selection.reason {
+            SelectionReason::ColdExplore => &mut counts.cold_explore,
+            SelectionReason::PeriodicExplore => &mut counts.periodic_explore,
+            SelectionReason::ReliabilityWinner => &mut counts.reliability_winner,
+            SelectionReason::PerformanceWinner => &mut counts.performance_winner,
+            SelectionReason::IncumbentHeld => &mut counts.incumbent_held,
+            SelectionReason::FreshFailureBypass => &mut counts.fresh_failure_bypass,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    pub(super) fn record_dead_filtered(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        key: SelectionReasonKey,
+        removed: u64,
+    ) {
+        if removed == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let authorized = inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+            && inner.valid_groups.contains(&key.group);
+        if !authorized {
+            return;
+        }
+        let counter = &mut inner
+            .selection_reasons
+            .entry(key)
+            .or_default()
+            .dead_filtered;
+        *counter = counter.saturating_add(removed);
+    }
+
+    #[cfg(test)]
+    fn selection_reason_counts(
+        &self,
+        group: &str,
+        network: SelectionNetwork,
+    ) -> SelectionReasonCounts {
+        self.inner
+            .lock()
+            .selection_reasons
+            .get(&SelectionReasonKey::new(group, network))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     fn start(
         &self,
         context: &ScoreSelectionContext,
@@ -404,13 +635,37 @@ impl ScorePolicyState {
         self.start_at(context, attributions, Instant::now())
     }
 
+    #[cfg(test)]
     fn start_at(
         &self,
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
         now: Instant,
     ) -> Vec<StartedCells> {
+        let authority = self
+            .inner
+            .lock()
+            .active_authority
+            .clone()
+            .unwrap_or_else(|| Arc::new(ScoreAuthority));
+        self.start_at_with_authority(&authority, context, attributions, now)
+    }
+
+    fn start_at_with_authority(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        now: Instant,
+    ) -> Vec<StartedCells> {
         let mut inner = self.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+        {
+            return vec![StartedCells::default(); attributions.len()];
+        }
         inner.tick = inner.tick.saturating_add(1);
         let tick = inner.tick;
         let mut cells = Vec::with_capacity(attributions.len());
@@ -459,6 +714,12 @@ impl ScorePolicyState {
         now: Instant,
     ) {
         let mut inner = self.inner.lock();
+        if !cells
+            .iter()
+            .any(|started| started.exact.is_some() || started.aggregate.iter().any(Option::is_some))
+        {
+            return;
+        }
         inner.tick = inner.tick.saturating_add(1);
         let tick = inner.tick;
         for (index, attribution) in attributions.iter().enumerate() {
@@ -501,11 +762,12 @@ impl ScorePolicyState {
 
     pub(super) fn rank(
         &self,
+        authority: &Arc<ScoreAuthority>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
     ) -> usize {
-        self.rank_at(group, context, nodes, Instant::now())
+        self.rank_at_with_authority(authority, group, context, nodes, Instant::now())
     }
 
     pub(super) fn peek_rank(
@@ -514,9 +776,10 @@ impl ScorePolicyState {
         context: &ScoreSelectionContext,
         nodes: &[&Node],
     ) -> usize {
-        self.rank_inner(group, context, nodes, Instant::now(), false)
+        self.rank_inner(None, group, context, nodes, Instant::now(), false)
     }
 
+    #[cfg(test)]
     fn rank_at(
         &self,
         group: &str,
@@ -524,11 +787,29 @@ impl ScorePolicyState {
         nodes: &[&Node],
         now: Instant,
     ) -> usize {
-        self.rank_inner(group, context, nodes, now, true)
+        let authority = self
+            .inner
+            .lock()
+            .active_authority
+            .clone()
+            .unwrap_or_else(|| Arc::new(ScoreAuthority));
+        self.rank_at_with_authority(&authority, group, context, nodes, now)
+    }
+
+    fn rank_at_with_authority(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        now: Instant,
+    ) -> usize {
+        self.rank_inner(Some(authority), group, context, nodes, now, true)
     }
 
     fn rank_inner(
         &self,
+        authority: Option<&Arc<ScoreAuthority>>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
@@ -539,18 +820,36 @@ impl ScorePolicyState {
             return 0;
         }
         let mut inner = self.inner.lock();
+        let authorized = apply
+            && authority.is_some_and(|authority| {
+                inner
+                    .active_authority
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, authority))
+            })
+            && inner.valid_groups.contains(group);
         let snapshots: Vec<_> = nodes
             .iter()
             .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
-        let selection_count = if apply {
-            let count = inner.selection_counts.entry(group.to_owned()).or_default();
+        let cadence_key = SelectionCadenceKey::new(group, context);
+        let selection_count = if authorized {
+            let count = inner.selection_counts.entry(cadence_key).or_default();
             *count = count.saturating_add(1);
             *count
         } else {
-            inner.selection_counts.get(group).copied().unwrap_or(0)
+            let count = inner
+                .selection_counts
+                .get(&cadence_key)
+                .copied()
+                .unwrap_or(0);
+            if apply {
+                count.saturating_add(1)
+            } else {
+                count
+            }
         };
-        let (best, forced_exploration) = best_index(&snapshots, nodes, selection_count, apply);
+        let best = best_index(&snapshots, nodes, selection_count, apply);
         let incumbent = snapshots
             .iter()
             .enumerate()
@@ -561,26 +860,37 @@ impl ScorePolicyState {
                     .then_with(|| left_index.cmp(right_index))
             })
             .map(|(index, _)| index);
-        let selected = if forced_exploration {
+        let selection = if best.reason.is_exploration() {
             best
         } else {
-            incumbent
-                .filter(|&index| index != best)
-                .filter(|&index| keep_incumbent(&snapshots[index], &snapshots[best]))
-                .unwrap_or(best)
+            match incumbent.filter(|&index| index != best.index) {
+                Some(index) => match hold_decision(&snapshots[index], &snapshots[best.index]) {
+                    HoldDecision::Held => RankedSelection {
+                        index,
+                        reason: SelectionReason::IncumbentHeld,
+                    },
+                    HoldDecision::FreshFailureBypass => RankedSelection {
+                        index: best.index,
+                        reason: SelectionReason::FreshFailureBypass,
+                    },
+                    HoldDecision::UseBest => best,
+                },
+                None => best,
+            }
         };
-        if apply {
+        if authorized {
+            Self::record_selection_reason(&mut inner, group, context.network, selection);
             inner.tick = inner.tick.saturating_add(1);
             let selection_tick = inner.tick;
             mark_selected(
                 &mut inner,
                 group,
                 context,
-                nodes[selected].id,
+                nodes[selection.index].id,
                 selection_tick,
             );
         }
-        selected
+        selection.index
     }
 
     #[cfg(test)]
@@ -689,7 +999,7 @@ fn best_index(
     nodes: &[&Node],
     selection_count: u64,
     explore: bool,
-) -> (usize, bool) {
+) -> RankedSelection {
     if explore {
         let candidate_count = snapshots.len();
         let target = exploration_target(candidate_count);
@@ -714,7 +1024,14 @@ fn best_index(
         if let Some(index) = cold
             && (explored < target || candidate_count <= target || periodic)
         {
-            return (index, true);
+            return RankedSelection {
+                index,
+                reason: if periodic && explored >= target && candidate_count > target {
+                    SelectionReason::PeriodicExplore
+                } else {
+                    SelectionReason::ColdExplore
+                },
+            };
         }
         if periodic {
             let incumbent = snapshots
@@ -734,7 +1051,10 @@ fn best_index(
                         .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
                 })
             {
-                return (index, true);
+                return RankedSelection {
+                    index,
+                    reason: SelectionReason::PeriodicExplore,
+                };
             }
         }
     }
@@ -742,28 +1062,43 @@ fn best_index(
         .iter()
         .map(|score| score.reliability)
         .fold(0.0_f64, f64::max);
-    (
-        snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
-            .max_by(|(left_index, left), (right_index, right)| {
-                utility(left)
-                    .total_cmp(&utility(right))
-                    .then_with(|| right_index.cmp(left_index))
-                    .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
-            })
-            .map(|(index, _)| index)
-            .unwrap_or(0),
-        false,
-    )
+    let index = snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+        .max_by(|(left_index, left), (right_index, right)| {
+            utility(left)
+                .total_cmp(&utility(right))
+                .then_with(|| right_index.cmp(left_index))
+                .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let reason = if snapshots
+        .iter()
+        .enumerate()
+        .filter(|(candidate, _)| *candidate != index)
+        .all(|(_, alternative)| {
+            snapshots[index].reliability - alternative.reliability > RELIABILITY_CLOSE
+        }) {
+        SelectionReason::ReliabilityWinner
+    } else {
+        SelectionReason::PerformanceWinner
+    };
+    RankedSelection { index, reason }
 }
 
-fn keep_incumbent(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> bool {
-    incumbent.completed >= MIN_TRAINED_EVIDENCE
-        && best.completed >= MIN_TRAINED_EVIDENCE
-        && incumbent.failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD
-        && utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN
+fn hold_decision(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> HoldDecision {
+    let trained =
+        incumbent.completed >= MIN_TRAINED_EVIDENCE && best.completed >= MIN_TRAINED_EVIDENCE;
+    let within_switch_margin = utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN;
+    if !trained || !within_switch_margin {
+        HoldDecision::UseBest
+    } else if incumbent.failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD {
+        HoldDecision::Held
+    } else {
+        HoldDecision::FreshFailureBypass
+    }
 }
 
 fn mark_selected(
@@ -937,7 +1272,7 @@ fn score_snapshot(
                 family.throughput_confidence,
                 reliability_weight,
             ),
-            failures: global_score.failures + family.failures,
+            failures: global_score.failures.max(family.failures),
             selected_at: global_score.selected_at.max(family.selected_at),
             targeted: false,
             target_attempts: 0.0,
@@ -987,7 +1322,7 @@ fn score_snapshot(
             exact.throughput_confidence,
             reliability_weight,
         ),
-        failures: aggregate_score.failures + exact.failures,
+        failures: aggregate_score.failures.max(exact.failures),
         selected_at: aggregate_score.selected_at.max(exact.selected_at),
         targeted: exact.completed >= MIN_TRAINED_EVIDENCE
             || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
@@ -1052,6 +1387,7 @@ fn utility(score: &ScoreSnapshot) -> f64 {
 #[derive(Clone)]
 pub struct ScoreFeedback {
     state: Arc<ScorePolicyState>,
+    authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
 }
@@ -1066,11 +1402,13 @@ impl std::fmt::Debug for ScoreFeedback {
 impl ScoreFeedback {
     pub(super) fn new(
         state: Arc<ScorePolicyState>,
+        authority: Arc<ScoreAuthority>,
         context: ScoreSelectionContext,
         attributions: Vec<ScoreAttribution>,
     ) -> Self {
         Self {
             state,
+            authority,
             context,
             attributions: attributions.into(),
         }
@@ -1108,12 +1446,16 @@ impl ScoreFeedback {
     /// Call only when the physical dial or logical stream actually starts.
     pub fn start(&self) -> ScoreReporter {
         let started = Instant::now();
-        let cells = self
-            .state
-            .start_at(&self.context, &self.attributions, started);
+        let cells = self.state.start_at_with_authority(
+            &self.authority,
+            &self.context,
+            &self.attributions,
+            started,
+        );
         ScoreReporter {
             shared: Arc::new(ReporterShared {
                 state: Arc::clone(&self.state),
+                authority: Arc::clone(&self.authority),
                 context: self.context.clone(),
                 attributions: Arc::clone(&self.attributions),
                 cells: cells.into(),
@@ -1136,6 +1478,7 @@ struct ReporterProgress {
 
 struct ReporterShared {
     state: Arc<ScorePolicyState>,
+    authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
     cells: Arc<[StartedCells]>,
@@ -1193,6 +1536,7 @@ impl ScoreReporter {
     pub fn feedback(&self) -> ScoreFeedback {
         ScoreFeedback {
             state: Arc::clone(&self.shared.state),
+            authority: Arc::clone(&self.shared.authority),
             context: self.shared.context.clone(),
             attributions: Arc::clone(&self.shared.attributions),
         }
@@ -1269,6 +1613,7 @@ impl super::GroupManager {
     /// Extant non-Score groups remain valid for reporters started before a
     /// policy change; new selection creates feedback only for Score groups.
     pub fn publish_score_membership(&self) {
+        let groups = self.groups.keys().cloned().collect::<Vec<_>>();
         let membership = self.groups.values().flat_map(|group| {
             let mut node_ids: HashSet<_> = self
                 .leaf_nodes_in_group(&group.name)
@@ -1281,7 +1626,8 @@ impl super::GroupManager {
                 .into_iter()
                 .map(move |node_id| (group.name.clone(), node_id))
         });
-        self.score_state.publish_membership(membership);
+        self.score_state
+            .publish_generation(Arc::clone(&self.score_authority), groups, membership);
     }
 
     fn collect_final_outbound_node_ids(
@@ -1340,8 +1686,15 @@ impl super::GroupManager {
                 node_id,
             })
             .collect();
-        (!attributions.is_empty())
-            .then(|| ScoreFeedback::new(Arc::clone(&self.score_state), context, attributions))
+        (!attributions.is_empty() && self.score_state.is_current_authority(&self.score_authority))
+            .then(|| {
+                ScoreFeedback::new(
+                    Arc::clone(&self.score_state),
+                    Arc::clone(&self.score_authority),
+                    context,
+                    attributions,
+                )
+            })
     }
 
     /// Feedback for a terminal `final` leaf attributed to one outer Honk
@@ -1355,9 +1708,11 @@ impl super::GroupManager {
         self.groups
             .get(group_name)
             .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
+            .filter(|_| self.score_state.is_current_authority(&self.score_authority))
             .map(|group| {
                 ScoreFeedback::new(
                     Arc::clone(&self.score_state),
+                    Arc::clone(&self.score_authority),
                     context,
                     vec![ScoreAttribution {
                         group: group.name.clone(),
@@ -1459,13 +1814,16 @@ impl super::GroupManager {
                         .into_iter()
                         .map(str::to_owned)
                         .collect();
-                    let feedback = (!attributions.is_empty()).then(|| {
-                        ScoreFeedback::new(
-                            Arc::clone(&self.score_state),
-                            context.clone(),
-                            attributions,
-                        )
-                    });
+                    let feedback = (!attributions.is_empty())
+                        .then(|| {
+                            ScoreFeedback::new(
+                                Arc::clone(&self.score_state),
+                                Arc::clone(&self.score_authority),
+                                context.clone(),
+                                attributions,
+                            )
+                        })
+                        .filter(|_| self.score_state.is_current_authority(&self.score_authority));
                     super::ScoreSelectionEntry {
                         node: candidate.node,
                         feedback,
@@ -1499,12 +1857,23 @@ impl super::GroupManager {
             0,
             super::SelectionEffects::Apply,
         );
+        let before_filter = (group.policy == honk_config::group::GroupPolicy::Score
+            && self.score_state.is_current_authority(&self.score_authority))
+        .then(|| super::unique_candidate_ids(&candidates))
+        .flatten();
         candidates = self.filter_alive_candidates(
             candidates,
             context.probe_domain,
             context.health_family,
             group.check_url.as_deref(),
         );
+        if let Some(before_filter) = before_filter {
+            self.score_state.record_dead_filtered(
+                &self.score_authority,
+                SelectionReasonKey::new(&group.name, context.network),
+                super::removed_unique_candidate_count(before_filter, &candidates),
+            );
+        }
         let (mode, candidates) = if candidates.is_empty() {
             let candidate = self.last_resort_candidate_for_target(
                 group,
@@ -1623,12 +1992,24 @@ impl super::GroupManager {
     ) -> Option<super::Candidate<'a>> {
         let mut candidates =
             self.flatten_candidates_for_target(group, context, visited, depth, effects);
+        let before_filter = (effects.applies()
+            && group.policy == honk_config::group::GroupPolicy::Score
+            && self.score_state.is_current_authority(&self.score_authority))
+        .then(|| super::unique_candidate_ids(&candidates))
+        .flatten();
         candidates = self.filter_alive_candidates(
             candidates,
             context.probe_domain,
             context.health_family,
             group.check_url.as_deref(),
         );
+        if let Some(before_filter) = before_filter {
+            self.score_state.record_dead_filtered(
+                &self.score_authority,
+                SelectionReasonKey::new(&group.name, context.network),
+                super::removed_unique_candidate_count(before_filter, &candidates),
+            );
+        }
         let mut candidate = if candidates.is_empty() {
             self.last_resort_candidate_for_target(group, context, visited, depth, effects)
         } else {
@@ -1780,6 +2161,70 @@ mod tests {
     }
 
     #[test]
+    fn hold_decision_classifies_every_boundary_once() {
+        let candidate = |completed, reliability, latency_ms, failures| ScoreSnapshot {
+            attempts: completed,
+            completed,
+            reliability,
+            useful_completed: completed,
+            latency_ms,
+            latency_confidence: f64::from(latency_ms.is_some()),
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let trained = MIN_TRAINED_EVIDENCE;
+        let incumbent = candidate(trained, 0.0, None, 0.0);
+
+        assert_eq!(
+            hold_decision(
+                &candidate(trained - f64::EPSILON, 0.0, None, 0.0),
+                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            hold_decision(
+                &incumbent,
+                &candidate(trained, SCORE_SWITCH_MARGIN, None, 0.0),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            hold_decision(
+                &incumbent,
+                &candidate(trained, SCORE_SWITCH_MARGIN * 2.0, None, 0.0),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            hold_decision(
+                &candidate(trained, 0.0, Some(1_048_576.0), 0.0),
+                &candidate(trained, 0.0, Some(1.0), 0.0),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            hold_decision(
+                &incumbent,
+                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            ),
+            HoldDecision::Held,
+        );
+        assert_eq!(
+            hold_decision(
+                &candidate(trained, 0.0, None, SCORE_FAILURE_FORGIVENESS_THRESHOLD,),
+                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            ),
+            HoldDecision::FreshFailureBypass,
+        );
+    }
+
+    #[test]
     fn exploration_budget_scales_with_candidate_count() {
         assert_eq!(exploration_target(3), 3);
         assert_eq!(exploration_target(4), 4);
@@ -1821,9 +2266,10 @@ mod tests {
                     },
                 );
             }
-            inner
-                .selection_counts
-                .insert("score".into(), exploration_period(nodes.len()) - 1);
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("score", &context),
+                exploration_period(nodes.len()) - 1,
+            );
         }
 
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
@@ -1880,16 +2326,294 @@ mod tests {
                     },
                 );
             }
-            inner
-                .selection_counts
-                .insert("score".into(), exploration_period(nodes.len()) - 1);
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("score", &context),
+                exploration_period(nodes.len()) - 1,
+            );
         }
 
         let selected = state.rank_at("score", &context, &node_refs, now);
         assert_eq!(selected, 1);
-        let count = state.inner.lock().selection_counts["score"];
+        let key = SelectionCadenceKey::new("score", &context);
+        let count = state.inner.lock().selection_counts[&key];
         assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
-        assert_eq!(state.inner.lock().selection_counts["score"], count);
+        assert_eq!(state.inner.lock().selection_counts[&key], count);
+    }
+
+    #[test]
+    fn same_scope_exploration_period_and_peek_are_unchanged() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let now = Instant::now();
+        {
+            let mut inner = state.inner.lock();
+            for (index, node) in nodes.iter().enumerate() {
+                inner.aggregate.put(
+                    AggregateKey {
+                        group: "score".into(),
+                        network: SelectionNetwork::Tcp,
+                        family: None,
+                        node_id: node.id,
+                    },
+                    Stats {
+                        setup_success: 8.0,
+                        useful_success: 8.0,
+                        first_response_ms: WeightedMean {
+                            sum: 800.0,
+                            weight: 8.0,
+                        },
+                        updated_at: Some(now),
+                        selected_at: u64::from(index == 0),
+                        ..Default::default()
+                    },
+                );
+            }
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("score", &context),
+                exploration_period(nodes.len()) - 1,
+            );
+        }
+
+        let selected = state.rank_at("score", &context, &node_refs, now);
+        assert_eq!(selected, 1);
+        assert_eq!(
+            state.inner.lock().selection_counts[&SelectionCadenceKey::new("score", &context)],
+            exploration_period(nodes.len())
+        );
+        assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
+        assert_eq!(
+            state.inner.lock().selection_counts[&SelectionCadenceKey::new("score", &context)],
+            exploration_period(nodes.len())
+        );
+    }
+
+    #[test]
+    fn periodic_exploration_is_scoped_by_network_and_family() {
+        let nodes = [node("a"), node("b")];
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let targeted = |network, family| ScoreSelectionContext {
+            network,
+            probe_domain: if network == SelectionNetwork::Tcp {
+                ProbeDomain::Tcp
+            } else {
+                ProbeDomain::DataUdp
+            },
+            target_family: Some(family),
+            health_family: family,
+            target: Some(ScoreTarget::domain("target.example", 443)),
+        };
+        let aggregate = |network| {
+            ScoreSelectionContext::aggregate(
+                network,
+                if network == SelectionNetwork::Tcp {
+                    ProbeDomain::Tcp
+                } else {
+                    ProbeDomain::DataUdp
+                },
+                IpVersion::V4,
+            )
+        };
+        let contexts = [
+            targeted(SelectionNetwork::Tcp, IpVersion::V4),
+            targeted(SelectionNetwork::Tcp, IpVersion::V6),
+            targeted(SelectionNetwork::Udp, IpVersion::V4),
+            targeted(SelectionNetwork::Udp, IpVersion::V6),
+            aggregate(SelectionNetwork::Tcp),
+            aggregate(SelectionNetwork::Udp),
+        ];
+        for context in &contexts {
+            let _ = manager.selection_plan_for_target("score", context);
+        }
+        let state = manager.score_state();
+        assert_eq!(state.inner.lock().selection_counts.len(), 6);
+        println!(
+            "cadence scope cardinality={}",
+            state.inner.lock().selection_counts.len()
+        );
+
+        let tcp_v4_key = SelectionCadenceKey::new("score", &contexts[0]);
+        state
+            .inner
+            .lock()
+            .selection_counts
+            .insert(tcp_v4_key.clone(), exploration_period(nodes.len()) - 1);
+        let _ = manager.selection_plan_for_target("score", &contexts[2]);
+        assert_eq!(
+            state.inner.lock().selection_counts[&tcp_v4_key],
+            exploration_period(nodes.len()) - 1,
+            "UDP-V4 must not consume TCP-V4 cadence"
+        );
+        let _ = manager.selection_plan_for_target("score", &contexts[0]);
+        assert_eq!(
+            state.inner.lock().selection_counts[&tcp_v4_key],
+            exploration_period(nodes.len())
+        );
+
+        let different_target = context("other.example", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("score", &different_target);
+        assert_eq!(state.inner.lock().selection_counts.len(), 6);
+    }
+
+    #[test]
+    fn selection_count_reload_lifecycle_matches_group_name() {
+        let nodes = [node("a"), node("b")];
+        let old = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let context = context("reload.example", IpVersion::V4);
+        let _ = old.selection_plan_for_target("score", &context);
+        let state = old.score_state();
+        let before: u64 = state.inner.lock().selection_counts.values().copied().sum();
+
+        let empty = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &[])],
+            &[],
+            None,
+            Arc::clone(&state),
+        );
+        empty.publish_score_membership();
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .selection_counts
+                .values()
+                .copied()
+                .sum::<u64>(),
+            before,
+            "a committed group name retains cadence through zero leaves"
+        );
+
+        let mut selector = group("score", &nodes);
+        selector.policy = GroupPolicy::Selector;
+        let non_score = super::super::GroupManager::with_alive_set_and_score_state(
+            &[selector],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        non_score.publish_score_membership();
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .selection_counts
+                .values()
+                .copied()
+                .sum::<u64>(),
+            before,
+            "a surviving name retains cadence through Score to non-Score"
+        );
+
+        let removed = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &[],
+            None,
+            Arc::clone(&state),
+        );
+        removed.publish_score_membership();
+        assert!(state.inner.lock().selection_counts.is_empty());
+    }
+
+    #[test]
+    fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
+        let survivor = node("survivor");
+        let removed = node("removed");
+        let replacement_node = node("replacement");
+        let old_nodes = [survivor.clone(), removed.clone()];
+        let old = super::super::GroupManager::new(&[group("score", &old_nodes)], &old_nodes);
+        let state = old.score_state();
+        let seeded_context = context("seeded.example", IpVersion::V4);
+        finish_success(&old.selection_plan_for_target("score", &seeded_context));
+
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &[],
+            None,
+            Arc::clone(&state),
+        );
+        deleted.publish_score_membership();
+        let replacement_nodes = [survivor.clone(), replacement_node];
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &replacement_nodes)],
+            &replacement_nodes,
+            None,
+            Arc::clone(&state),
+        );
+        replacement.publish_score_membership();
+        let before = {
+            let inner = state.inner.lock();
+            (
+                inner.tick,
+                inner.selection_counts.len(),
+                inner.aggregate.len(),
+                inner.exact.len(),
+            )
+        };
+        assert_eq!((before.1, before.2, before.3), (0, 0, 0));
+
+        let stale =
+            old.selection_plan_for_target("score", &context("stale.example", IpVersion::V4));
+        assert!(stale.entries[0].feedback.is_none());
+        assert!(
+            old.feedback_for_group_node("score", survivor.id, seeded_context.clone())
+                .is_none(),
+            "the surviving ID must not restore old-manager feedback authority"
+        );
+        assert!(
+            old.feedback_for_group_node("score", removed.id, seeded_context)
+                .is_none(),
+            "the replaced ID must not restore old-manager feedback authority"
+        );
+        let after_stale = {
+            let inner = state.inner.lock();
+            (
+                inner.tick,
+                inner.selection_counts.len(),
+                inner.aggregate.len(),
+                inner.exact.len(),
+            )
+        };
+        assert_eq!(after_stale, before);
+
+        let current = replacement
+            .selection_plan_for_target("score", &context("current.example", IpVersion::V4));
+        assert!(current.entries[0].feedback.is_some());
+        let after_current = state.inner.lock();
+        assert_eq!(after_current.selection_counts.len(), 1);
+        assert_eq!(after_current.aggregate.len(), 1);
+        assert!(after_current.tick > before.0);
+    }
+
+    #[test]
+    fn captured_feedback_requires_current_authority_at_start() {
+        let nodes = [node("a"), node("b")];
+        let old = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let context = context("captured.example", IpVersion::V4);
+        let feedback = old
+            .feedback_for_group_node("score", nodes[0].id, context.clone())
+            .unwrap();
+        let state = old.score_state();
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &nodes)],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        replacement.publish_score_membership();
+        let before_tick = state.inner.lock().tick;
+
+        let reporter = feedback.start();
+        reporter.setup_succeeded();
+        reporter.first_response();
+        reporter.tx(123);
+        reporter.rx(456);
+        reporter.finish(ScoreOutcome::Timeout);
+        drop(reporter);
+
+        assert!(!state.has_exact("score", &context, nodes[0].id));
+        assert_eq!(state.inner.lock().tick, before_tick);
     }
 
     #[test]
@@ -1930,6 +2654,163 @@ mod tests {
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
         inner_update_response(&state, key(nodes[1].id), 1.0);
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
+    fn single_failure_layer_freshness_is_unchanged() {
+        // Given: one aggregate failure cell with exactly one half-life of age.
+        let node = node("leaf");
+        let context = context("example.com", IpVersion::V4);
+        let start = Instant::now();
+        let mut inner = StateInner::default();
+        inner.aggregate.put(
+            AggregateKey {
+                group: "score".into(),
+                network: SelectionNetwork::Tcp,
+                family: None,
+                node_id: node.id,
+            },
+            Stats {
+                setup_failure: 2.0,
+                updated_at: Some(start),
+                ..Default::default()
+            },
+        );
+
+        // When: the scorer snapshots the single layer after one half-life.
+        let score = score_snapshot(
+            &inner,
+            "score",
+            &context,
+            node.id,
+            start + SCORE_EVIDENCE_HALF_LIFE,
+        );
+
+        // Then: existing decay remains unchanged and no absent layer contributes.
+        println!("single failure layer envelope={:.12}", score.failures);
+        assert_close(score.failures, 1.0);
+    }
+
+    fn layered_failure_value(ages: [Option<Duration>; 3]) -> f64 {
+        let node = node("leaf");
+        let context = context("example.com", IpVersion::V4);
+        let start = Instant::now();
+        let now = start + Duration::from_secs(60);
+        let mut inner = StateInner::default();
+        for (index, age) in ages.into_iter().enumerate() {
+            let Some(age) = age else {
+                continue;
+            };
+            let stats = Stats {
+                setup_failure: 1.0,
+                updated_at: Some(now - age),
+                ..Default::default()
+            };
+            match index {
+                0 | 1 => {
+                    inner.aggregate.put(
+                        AggregateKey {
+                            group: "score".into(),
+                            network: SelectionNetwork::Tcp,
+                            family: (index == 1).then_some(IpVersion::V4),
+                            node_id: node.id,
+                        },
+                        stats,
+                    );
+                }
+                2 => {
+                    inner.exact.put(
+                        ExactKey {
+                            group: "score".into(),
+                            network: SelectionNetwork::Tcp,
+                            family: IpVersion::V4,
+                            target: context.target.clone().unwrap(),
+                            node_id: node.id,
+                        },
+                        stats,
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        score_snapshot(&inner, "score", &context, node.id, now).failures
+    }
+
+    fn assert_aged_failure_layers_count_once() {
+        // Given: the same 30-second-old failure appears in overlapping layers.
+        let age = Some(Duration::from_secs(30));
+
+        // When: one, two, and three layers are independently snapshotted.
+        let global_only = layered_failure_value([age, None, None]);
+        let global_family = layered_failure_value([age, age, None]);
+        let global_family_exact = layered_failure_value([age, age, age]);
+        println!(
+            "layered failure envelope: global_only={global_only:.12} global_family={global_family:.12} global_family_exact={global_family_exact:.12}"
+        );
+
+        // Then: replication does not increase the effective failure envelope.
+        assert_close(global_family, global_only);
+        assert_close(global_family_exact, global_only);
+        let aged = layered_failure_value([
+            Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
+            Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
+            Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
+        ]);
+        let incumbent = ScoreSnapshot {
+            attempts: 1.0,
+            completed: 1.0,
+            reliability: 0.8,
+            useful_completed: 1.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: aged,
+            selected_at: 1,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let challenger = ScoreSnapshot {
+            reliability: 0.805,
+            failures: 0.0,
+            selected_at: 0,
+            ..incumbent
+        };
+        let retained = hold_decision(&incumbent, &challenger) == HoldDecision::Held;
+        println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
+        assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
+        assert!(retained);
+    }
+
+    #[test]
+    fn layered_failure_freshness_uses_one_envelope() {
+        assert_aged_failure_layers_count_once();
+    }
+
+    fn assert_larger_specific_failure_layer_still_wins() {
+        // Given: global, family, and exact evidence are respectively 30, 20, and 10 seconds old.
+        let global = evidence_decay(Duration::from_secs(30));
+        let family = evidence_decay(Duration::from_secs(20));
+        let exact = evidence_decay(Duration::from_secs(10));
+
+        // When: all three overlapping layers are snapshotted together.
+        let effective = layered_failure_value([
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(20)),
+            Some(Duration::from_secs(10)),
+        ]);
+        println!(
+            "specific failure envelope: global_30s={global:.12} family_20s={family:.12} exact_10s={exact:.12} effective={effective:.12}"
+        );
+
+        // Then: the freshest specific layer is the effective envelope.
+        assert_close(effective, exact);
+    }
+
+    #[test]
+    fn specific_failure_freshness_is_not_hidden() {
+        assert_larger_specific_failure_layer_still_wins();
     }
 
     #[test]
@@ -2247,6 +3128,24 @@ group {
         }
     }
 
+    fn group_with_children(name: &str, nodes: &[Node], groups: &[&str]) -> Group {
+        Group {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            policy: GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn selector_with_children(name: &str, nodes: &[Node], groups: &[&str]) -> Group {
+        Group {
+            policy: GroupPolicy::Selector,
+            ..group_with_children(name, nodes, groups)
+        }
+    }
+
     fn context(host: &str, family: IpVersion) -> ScoreSelectionContext {
         ScoreSelectionContext {
             network: SelectionNetwork::Tcp,
@@ -2254,6 +3153,20 @@ group {
             target_family: Some(family),
             health_family: IpVersion::V4,
             target: Some(ScoreTarget::domain(host, 443)),
+        }
+    }
+
+    fn trained_stats(successes: f64, latency_ms: f64, now: Instant) -> Stats {
+        Stats {
+            attempts: successes,
+            setup_success: successes,
+            useful_success: successes,
+            first_response_ms: WeightedMean {
+                sum: latency_ms * successes,
+                weight: successes,
+            },
+            updated_at: Some(now),
+            ..Default::default()
         }
     }
 
@@ -2281,6 +3194,678 @@ group {
         manager.selection_plan_for_target("score", context).entries[0]
             .node
             .id
+    }
+
+    #[test]
+    fn selection_reason_instrumentation_preserves_existing_winners() {
+        let nodes = [node("a"), node("b")];
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("baseline.example", IpVersion::V4);
+        let apply = selected(&manager, &target);
+        let peek = manager
+            .get_score_selection_for_network("score", SelectionNetwork::Tcp)
+            .expect("Score group has candidates");
+
+        let singleton = node("singleton");
+        let singleton_manager = super::super::GroupManager::new(
+            &[group("score", std::slice::from_ref(&singleton))],
+            std::slice::from_ref(&singleton),
+        );
+        let singleton_selected = selected(&singleton_manager, &target);
+
+        let last_resort = node("last-resort");
+        let alive = Arc::new(super::super::AliveDialerSet::new());
+        alive.report_unavailable_forced(last_resort.id, ProbeDomain::Tcp, IpVersion::V4);
+        let last_resort_manager = super::super::GroupManager::with_alive_set(
+            &[group("score", std::slice::from_ref(&last_resort))],
+            std::slice::from_ref(&last_resort),
+            Some(alive),
+        );
+        let last_resort_selected = selected(&last_resort_manager, &target);
+
+        println!(
+            "winner baseline apply={apply} peek={peek} singleton={singleton_selected} last_resort={last_resort_selected}"
+        );
+        assert_eq!(apply, nodes[0].id);
+        assert_eq!(peek, nodes[0].name);
+        assert_eq!(singleton_selected, singleton.id);
+        assert_eq!(last_resort_selected, last_resort.id);
+    }
+
+    #[test]
+    fn selection_reason_precedence_is_stable() {
+        let state = ScorePolicyState::default();
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let now = Instant::now();
+        let cold = [node("cold-a"), node("cold-b")];
+        let periodic: Vec<_> = (0..8)
+            .map(|index| node(&format!("periodic-{index}")))
+            .collect();
+        let held = [node("held-a"), node("held-b")];
+        let bypass = [node("bypass-a"), node("bypass-b")];
+        let reliable = [node("reliable-a"), node("reliable-b")];
+        let performance = [node("performance-a"), node("performance-b")];
+        let memberships = [
+            ("cold", cold.as_slice()),
+            ("periodic", periodic.as_slice()),
+            ("held", held.as_slice()),
+            ("bypass", bypass.as_slice()),
+            ("reliable", reliable.as_slice()),
+            ("performance", performance.as_slice()),
+        ];
+        state.publish_membership(
+            memberships
+                .iter()
+                .flat_map(|(group, nodes)| nodes.iter().map(|node| ((*group).to_owned(), node.id))),
+        );
+        {
+            let mut inner = state.inner.lock();
+            for (index, node) in periodic.iter().enumerate() {
+                inner.aggregate.put(
+                    AggregateKey {
+                        group: "periodic".into(),
+                        network: SelectionNetwork::Tcp,
+                        family: None,
+                        node_id: node.id,
+                    },
+                    Stats {
+                        selected_at: u64::from(index == 0),
+                        ..trained_stats(8.0, 100.0, now)
+                    },
+                );
+            }
+            inner.selection_counts.insert(
+                SelectionCadenceKey::new("periodic", &context),
+                exploration_period(periodic.len()) - 1,
+            );
+            for (group, nodes, stats) in [
+                (
+                    "held",
+                    held.as_slice(),
+                    [
+                        Stats {
+                            selected_at: 1,
+                            ..trained_stats(8.0, 100.0, now)
+                        },
+                        trained_stats(8.0, 99.0, now),
+                    ],
+                ),
+                (
+                    "bypass",
+                    bypass.as_slice(),
+                    [
+                        Stats {
+                            attempts: 257.0,
+                            useful_failure: 1.0,
+                            selected_at: 1,
+                            ..trained_stats(256.0, 100.0, now)
+                        },
+                        trained_stats(256.0, 100.0, now),
+                    ],
+                ),
+                (
+                    "reliable",
+                    reliable.as_slice(),
+                    [
+                        trained_stats(8.0, 100.0, now),
+                        Stats {
+                            attempts: 8.0,
+                            useful_failure: 4.0,
+                            ..trained_stats(4.0, 50.0, now)
+                        },
+                    ],
+                ),
+                (
+                    "performance",
+                    performance.as_slice(),
+                    [
+                        trained_stats(8.0, 200.0, now),
+                        trained_stats(8.0, 50.0, now),
+                    ],
+                ),
+            ] {
+                for (node, stats) in nodes.iter().zip(stats) {
+                    inner.aggregate.put(
+                        AggregateKey {
+                            group: group.into(),
+                            network: SelectionNetwork::Tcp,
+                            family: None,
+                            node_id: node.id,
+                        },
+                        stats,
+                    );
+                }
+            }
+        }
+
+        let winners = [
+            (
+                "cold",
+                state.rank_at("cold", &context, &cold.iter().collect::<Vec<_>>(), now),
+            ),
+            (
+                "periodic",
+                state.rank_at(
+                    "periodic",
+                    &context,
+                    &periodic.iter().collect::<Vec<_>>(),
+                    now,
+                ),
+            ),
+            (
+                "held",
+                state.rank_at("held", &context, &held.iter().collect::<Vec<_>>(), now),
+            ),
+            (
+                "bypass",
+                state.rank_at("bypass", &context, &bypass.iter().collect::<Vec<_>>(), now),
+            ),
+            (
+                "reliable",
+                state.rank_at(
+                    "reliable",
+                    &context,
+                    &reliable.iter().collect::<Vec<_>>(),
+                    now,
+                ),
+            ),
+            (
+                "performance",
+                state.rank_at(
+                    "performance",
+                    &context,
+                    &performance.iter().collect::<Vec<_>>(),
+                    now,
+                ),
+            ),
+        ];
+        assert_eq!(
+            winners,
+            [
+                ("cold", 0),
+                ("periodic", 1),
+                ("held", 0),
+                ("bypass", 1),
+                ("reliable", 0),
+                ("performance", 1)
+            ]
+        );
+
+        let expected = [
+            (
+                "cold",
+                SelectionReasonCounts {
+                    cold_explore: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "periodic",
+                SelectionReasonCounts {
+                    periodic_explore: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "held",
+                SelectionReasonCounts {
+                    incumbent_held: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "bypass",
+                SelectionReasonCounts {
+                    fresh_failure_bypass: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "reliable",
+                SelectionReasonCounts {
+                    reliability_winner: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "performance",
+                SelectionReasonCounts {
+                    performance_winner: 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+        println!("winner table={winners:?}");
+        for (group, counts) in expected {
+            assert_eq!(
+                state.selection_reason_counts(group, SelectionNetwork::Tcp),
+                counts
+            );
+        }
+    }
+
+    #[test]
+    fn selection_reason_counting_respects_apply_and_filter_boundaries() {
+        let dead = node("dead");
+        let live = [node("live-a"), node("live-b")];
+        let all_nodes = [dead.clone(), live[0].clone(), live[1].clone()];
+        let alive = Arc::new(super::super::AliveDialerSet::new());
+        alive.report_unavailable_forced(dead.id, ProbeDomain::Tcp, IpVersion::V4);
+        let groups = [
+            selector_with_children("dead-path", std::slice::from_ref(&dead), &[]),
+            group_with_children("target-top", &all_nodes, &["dead-path"]),
+            group("target-child", &all_nodes),
+            selector_with_children("target-parent", &[], &["target-child"]),
+            group("aggregate-top", &all_nodes),
+            group("aggregate-child", &all_nodes),
+            selector_with_children("aggregate-parent", &[], &["aggregate-child"]),
+            group("singleton", std::slice::from_ref(&live[0])),
+            group("last-resort", std::slice::from_ref(&dead)),
+        ];
+        let manager = super::super::GroupManager::with_alive_set(
+            &groups,
+            &all_nodes,
+            Some(Arc::clone(&alive)),
+        );
+        let target = context("boundaries.example", IpVersion::V4);
+
+        let _ = manager.selection_plan_for_target("target-top", &target);
+        let _ = manager.selection_plan_for_target("target-parent", &target);
+        let _ = manager.selection_plan_for_domain("aggregate-top", ProbeDomain::Tcp, IpVersion::V4);
+        let _ =
+            manager.selection_plan_for_domain("aggregate-parent", ProbeDomain::Tcp, IpVersion::V4);
+        let mut udp_target = target.clone();
+        udp_target.network = SelectionNetwork::Udp;
+        udp_target.probe_domain = ProbeDomain::DataUdp;
+        let _ = manager.selection_plan_for_target("target-top", &udp_target);
+        let _ = manager.selection_plan_for_domain(
+            "aggregate-parent",
+            ProbeDomain::DataUdp,
+            IpVersion::V4,
+        );
+        let _ = manager.selection_plan_for_target("singleton", &target);
+        let _ = manager.selection_plan_for_target("last-resort", &target);
+        let state = manager.score_state();
+        let applied = [
+            ("target-top", 1, 1),
+            ("target-child", 1, 1),
+            ("aggregate-top", 1, 1),
+            ("aggregate-child", 1, 1),
+        ];
+        for (group, cold_explore, dead_filtered) in applied {
+            let counts = state.selection_reason_counts(group, SelectionNetwork::Tcp);
+            assert_eq!(counts.cold_explore, cold_explore);
+            assert_eq!(counts.dead_filtered, dead_filtered);
+            assert_eq!(
+                counts.periodic_explore
+                    + counts.reliability_winner
+                    + counts.performance_winner
+                    + counts.incumbent_held
+                    + counts.fresh_failure_bypass,
+                0
+            );
+        }
+        for group in ["target-top", "aggregate-child"] {
+            assert_eq!(
+                state.selection_reason_counts(group, SelectionNetwork::Udp),
+                SelectionReasonCounts {
+                    cold_explore: 1,
+                    dead_filtered: 1,
+                    ..Default::default()
+                }
+            );
+        }
+        assert_eq!(
+            state.selection_reason_counts("singleton", SelectionNetwork::Tcp),
+            SelectionReasonCounts::default()
+        );
+        assert_eq!(
+            state.selection_reason_counts("last-resort", SelectionNetwork::Tcp),
+            SelectionReasonCounts {
+                dead_filtered: 1,
+                ..Default::default()
+            }
+        );
+
+        let before_peek = state.inner.lock().selection_reasons.clone();
+        let _ = manager.get_score_selection_for_network("target-top", SelectionNetwork::Tcp);
+        let _ = manager.get_score_selection_for_network("target-parent", SelectionNetwork::Tcp);
+        let _ = manager.peek_selection_plan_for_domain(
+            "aggregate-top",
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let _ = manager.peek_selection_plan_for_domain(
+            "aggregate-parent",
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        assert_eq!(state.inner.lock().selection_reasons, before_peek);
+        {
+            let inner = state.inner.lock();
+            assert!(inner.selection_reasons.len() <= inner.valid_groups.len() * 2);
+        }
+
+        let stale_group = group("stale", &all_nodes);
+        let stale = super::super::GroupManager::with_alive_set(
+            std::slice::from_ref(&stale_group),
+            &all_nodes,
+            Some(Arc::clone(&alive)),
+        );
+        let stale_state = stale.score_state();
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &all_nodes,
+            Some(Arc::clone(&alive)),
+            Arc::clone(&stale_state),
+        );
+        deleted.publish_score_membership();
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&stale_group),
+            &all_nodes,
+            Some(alive),
+            Arc::clone(&stale_state),
+        );
+        replacement.publish_score_membership();
+        let _ = stale.selection_plan_for_target("stale", &target);
+        assert_eq!(
+            stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
+            SelectionReasonCounts::default()
+        );
+        let _ = replacement.selection_plan_for_target("stale", &target);
+        assert_eq!(
+            stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
+            SelectionReasonCounts {
+                cold_explore: 1,
+                dead_filtered: 1,
+                ..Default::default()
+            }
+        );
+
+        let saturated = SelectionReasonCounts {
+            cold_explore: u64::MAX,
+            periodic_explore: u64::MAX,
+            reliability_winner: u64::MAX,
+            performance_winner: u64::MAX,
+            incumbent_held: u64::MAX,
+            fresh_failure_bypass: u64::MAX,
+            dead_filtered: u64::MAX,
+        };
+        stale_state.inner.lock().selection_reasons.insert(
+            SelectionReasonKey::new("stale", SelectionNetwork::Tcp),
+            saturated,
+        );
+        let _ = replacement.selection_plan_for_target("stale", &target);
+        assert_eq!(
+            stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
+            saturated
+        );
+        {
+            let inner = stale_state.inner.lock();
+            assert!(inner.selection_reasons.len() <= inner.valid_groups.len() * 2);
+        }
+        println!(
+            "counter table target-top-tcp={:?} target-top-udp={:?} target-child-tcp={:?} aggregate-top-tcp={:?} aggregate-child-tcp={:?} aggregate-child-udp={:?} singleton={:?} last-resort={:?} stale={:?}",
+            state.selection_reason_counts("target-top", SelectionNetwork::Tcp),
+            state.selection_reason_counts("target-top", SelectionNetwork::Udp),
+            state.selection_reason_counts("target-child", SelectionNetwork::Tcp),
+            state.selection_reason_counts("aggregate-top", SelectionNetwork::Tcp),
+            state.selection_reason_counts("aggregate-child", SelectionNetwork::Tcp),
+            state.selection_reason_counts("aggregate-child", SelectionNetwork::Udp),
+            state.selection_reason_counts("singleton", SelectionNetwork::Tcp),
+            state.selection_reason_counts("last-resort", SelectionNetwork::Tcp),
+            stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
+        );
+    }
+
+    #[test]
+    fn nested_score_groups_count_reasons_independently() {
+        let nodes = [node("parent-direct"), node("child-a"), node("child-b")];
+        let child = group("child", &nodes[1..]);
+        let parent = group_with_children("parent", std::slice::from_ref(&nodes[0]), &["child"]);
+        let manager = super::super::GroupManager::new(&[child, parent], &nodes);
+        let target = context("nested-reasons.example", IpVersion::V4);
+
+        let selected = manager.selection_plan_for_target("parent", &target).entries[0]
+            .node
+            .id;
+        let state = manager.score_state();
+        let child_counts = state.selection_reason_counts("child", SelectionNetwork::Tcp);
+        let parent_counts = state.selection_reason_counts("parent", SelectionNetwork::Tcp);
+        println!("nested winner={selected} child={child_counts:?} parent={parent_counts:?}");
+        assert_eq!(selected, nodes[0].id);
+        assert_eq!(child_counts.cold_explore, 1);
+        assert_eq!(parent_counts.cold_explore, 1);
+        assert_eq!(child_counts.dead_filtered, 0);
+        assert_eq!(parent_counts.dead_filtered, 0);
+    }
+
+    #[test]
+    fn private_reason_counts_follow_committed_name_lifecycle() {
+        let nodes = [node("lifecycle-a"), node("lifecycle-b")];
+        let score = group("lifecycle", &nodes);
+        let manager = super::super::GroupManager::new(std::slice::from_ref(&score), &nodes);
+        let state = manager.score_state();
+        let target = context("private-lifecycle.example", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("lifecycle", &target);
+        let recorded = state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp);
+        assert_eq!(recorded.cold_explore, 1);
+
+        let selector = Group {
+            policy: GroupPolicy::Selector,
+            ..score.clone()
+        };
+        let hidden = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&selector),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        hidden.publish_score_membership();
+        assert_eq!(
+            state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp),
+            recorded
+        );
+
+        let restored = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        restored.publish_score_membership();
+        assert_eq!(
+            state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp),
+            recorded
+        );
+
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        deleted.publish_score_membership();
+        let recreated = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        recreated.publish_score_membership();
+        let reset = state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp);
+        println!(
+            "private lifecycle recorded={recorded:?} hidden={recorded:?} restored={recorded:?} recreated={reset:?}"
+        );
+        assert_eq!(reset, SelectionReasonCounts::default());
+    }
+
+    #[test]
+    fn score_reason_snapshot_is_sorted_fixed_and_private() {
+        let nodes = [node("private-node-alpha"), node("private-node-beta")];
+        let groups = [
+            group("z-score", &nodes),
+            Group {
+                name: "hidden-selector".into(),
+                policy: GroupPolicy::Selector,
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                ..Default::default()
+            },
+            group("a-score", &nodes),
+        ];
+        let manager = super::super::GroupManager::new(&groups, &nodes);
+        let mut tcp_target = context("private-target.internal", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("z-score", &tcp_target);
+        tcp_target.network = SelectionNetwork::Udp;
+        tcp_target.probe_domain = ProbeDomain::DataUdp;
+        let _ = manager.selection_plan_for_target("a-score", &tcp_target);
+
+        let state = manager.score_state();
+        let before_read = state.inner.lock().selection_reasons.clone();
+        let snapshot = manager.score_reason_snapshot();
+        assert_eq!(state.inner.lock().selection_reasons, before_read);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|group| group.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a-score", "z-score"]
+        );
+        assert_eq!(
+            snapshot[0].udp,
+            ScoreReasonCounters {
+                cold_explore: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            snapshot[1].tcp,
+            ScoreReasonCounters {
+                cold_explore: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(snapshot[0].tcp, ScoreReasonCounters::default());
+        assert_eq!(snapshot[1].udp, ScoreReasonCounters::default());
+
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("private-node-alpha"));
+        assert!(!debug.contains("private-node-beta"));
+        assert!(!debug.contains("private-target.internal"));
+        let ScoreReasonCounters {
+            cold_explore: _,
+            periodic_explore: _,
+            reliability_winner: _,
+            performance_winner: _,
+            incumbent_held: _,
+            fresh_failure_bypass: _,
+            dead_filtered: _,
+        } = snapshot[0].tcp;
+
+        let _ = manager.selection_plan_for_target(
+            "z-score",
+            &context("private-target.internal", IpVersion::V4),
+        );
+        let later = manager.score_reason_snapshot();
+        assert_eq!(snapshot[1].tcp.cold_explore, 1);
+        assert_eq!(later[1].tcp.cold_explore, 2);
+
+        let saturated = SelectionReasonCounts {
+            cold_explore: u64::MAX,
+            periodic_explore: u64::MAX,
+            reliability_winner: u64::MAX,
+            performance_winner: u64::MAX,
+            incumbent_held: u64::MAX,
+            fresh_failure_bypass: u64::MAX,
+            dead_filtered: u64::MAX,
+        };
+        state.inner.lock().selection_reasons.insert(
+            SelectionReasonKey::new("z-score", SelectionNetwork::Udp),
+            saturated,
+        );
+        let saturated_snapshot = manager.score_reason_snapshot();
+        assert_eq!(
+            saturated_snapshot[1].udp,
+            ScoreReasonCounters::from_private(saturated)
+        );
+        println!(
+            "owned score snapshot={snapshot:?} later={later:?} saturated={saturated_snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn score_reason_snapshot_reload_policy_is_name_based() {
+        let nodes = [node("private-reload-alpha"), node("private-reload-beta")];
+        let score = group("persist", &nodes);
+        let manager = super::super::GroupManager::new(std::slice::from_ref(&score), &nodes);
+        let state = manager.score_state();
+        let target = context("private-reload-target.internal", IpVersion::V4);
+        let _ = manager.selection_plan_for_target("persist", &target);
+        let recorded = manager.score_reason_snapshot();
+        assert_eq!(recorded[0].tcp.cold_explore, 1);
+
+        let selector = Group {
+            policy: GroupPolicy::Selector,
+            ..score.clone()
+        };
+        let hidden = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&selector),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        hidden.publish_score_membership();
+        assert!(hidden.score_reason_snapshot().is_empty());
+        let _ = manager.selection_plan_for_target("persist", &target);
+        assert_eq!(
+            state.selection_reason_counts("persist", SelectionNetwork::Tcp),
+            SelectionReasonCounts {
+                cold_explore: 1,
+                ..Default::default()
+            }
+        );
+
+        let empty_score = group("persist", &[]);
+        let restored = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&empty_score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        restored.publish_score_membership();
+        assert_eq!(restored.score_reason_snapshot(), recorded);
+
+        let deleted = super::super::GroupManager::with_alive_set_and_score_state(
+            &[],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        deleted.publish_score_membership();
+        let recreated = super::super::GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&score),
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        recreated.publish_score_membership();
+        let reset = recreated.score_reason_snapshot();
+        assert_eq!(reset[0].tcp, ScoreReasonCounters::default());
+        let _ = manager.selection_plan_for_target("persist", &target);
+        assert_eq!(recreated.score_reason_snapshot(), reset);
+        let _ = recreated.selection_plan_for_target("persist", &target);
+        let current = recreated.score_reason_snapshot();
+        assert_eq!(current[0].tcp.cold_explore, 1);
+
+        let empty = super::super::GroupManager::new(&[], &nodes);
+        assert!(empty.score_reason_snapshot().is_empty());
+        println!(
+            "snapshot lifecycle recorded={recorded:?} hidden=[] restored={recorded:?} recreated={reset:?} current={current:?}"
+        );
     }
 
     #[test]
