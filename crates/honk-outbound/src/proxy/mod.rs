@@ -183,6 +183,60 @@ impl ProxyStream {
     }
 }
 
+/// Coarse classification for packet-send failures shared with the control plane.
+///
+/// Congestion is deliberately separate from a dead tunnel: dropping one UDP
+/// packet under backpressure must not demote an otherwise live outbound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketErrorClass {
+    Congestion,
+    ConnectionDead,
+    Other,
+}
+
+/// Classify an error returned by a [`PacketTransport`] operation.
+pub fn packet_error_class(error: &std::io::Error) -> PacketErrorClass {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(libc::ENOBUFS)
+    {
+        return PacketErrorClass::Congestion;
+    }
+
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(quic_error) = current.downcast_ref::<quinn::SendDatagramError>() {
+            return match quic_error {
+                quinn::SendDatagramError::ConnectionLost(_) => PacketErrorClass::ConnectionDead,
+                quinn::SendDatagramError::TooLarge => PacketErrorClass::Congestion,
+                quinn::SendDatagramError::UnsupportedByPeer
+                | quinn::SendDatagramError::Disabled => PacketErrorClass::Other,
+            };
+        }
+        source = current.source();
+    }
+
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+    ) {
+        PacketErrorClass::ConnectionDead
+    } else {
+        PacketErrorClass::Other
+    }
+}
+
 /// Framed UDP packet transport — the production UDP contract. Native UDP
 /// protocols wrap a real `UdpSocket`; tunnel protocols implement their
 /// framing directly on the tunnel instead of bouncing datagrams through a
@@ -194,6 +248,12 @@ pub trait PacketTransport: Send + Sync + Debug {
     /// Whether server-carried metadata may authoritatively name a logical
     /// reply source before the endpoint has observed its first response.
     fn allows_full_cone_replies(&self) -> bool {
+        false
+    }
+    /// Whether a driver send deadline is packet-local congestion rather than
+    /// evidence that the tunnel died. Stream-framed transports keep the safe
+    /// default of `false`; atomic datagram/QUIC waits opt in.
+    fn send_timeout_is_congestion(&self) -> bool {
         false
     }
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
@@ -263,6 +323,9 @@ impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
     }
     fn allows_full_cone_replies(&self) -> bool {
         self.inner.allows_full_cone_replies()
+    }
+    fn send_timeout_is_congestion(&self) -> bool {
+        self.inner.send_timeout_is_congestion()
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
@@ -378,6 +441,9 @@ impl UdpSocketTransport {
 impl PacketTransport for UdpSocketTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.relay_addr
+    }
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
     }
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
         self.socket.send_to(data, self.relay_addr).await?;
@@ -957,6 +1023,45 @@ mod tests {
         assert!(registry.find(NodeProtocol::VMess).is_some());
         assert!(registry.find(NodeProtocol::Tuic).is_some());
         assert!(registry.find(NodeProtocol::Juicity).is_some());
+    }
+    #[test]
+    fn packet_error_class_separates_backpressure_from_dead_tunnel() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            assert_eq!(
+                packet_error_class(&std::io::Error::new(kind, "backpressure")),
+                PacketErrorClass::Congestion
+            );
+        }
+        assert_eq!(
+            packet_error_class(&std::io::Error::from_raw_os_error(libc::ENOBUFS)),
+            PacketErrorClass::Congestion
+        );
+        assert_eq!(
+            packet_error_class(&std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            )),
+            PacketErrorClass::ConnectionDead
+        );
+        assert_eq!(
+            packet_error_class(&std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "operation timeout",
+            )),
+            PacketErrorClass::Other
+        );
+        let quic_error = std::io::Error::other(quinn::SendDatagramError::ConnectionLost(
+            quinn::ConnectionError::Reset,
+        ));
+        assert_eq!(
+            packet_error_class(&quic_error),
+            PacketErrorClass::ConnectionDead
+        );
+        let too_large = std::io::Error::other(quinn::SendDatagramError::TooLarge);
+        assert_eq!(packet_error_class(&too_large), PacketErrorClass::Congestion);
     }
 
     /// Without the `rprx` feature a parsed VLESS/VMess node must hit the

@@ -557,7 +557,11 @@ impl TuicHandler {
         }
         let max_datagram = state.conn.max_datagram_size().unwrap_or(1200);
         for pkt in fragment_udp_packets(session_id, packet_id, addr, data, max_datagram)? {
-            state.conn.send_datagram(bytes::Bytes::from(pkt))?;
+            state
+                .conn
+                .send_datagram_wait(bytes::Bytes::from(pkt))
+                .await
+                .map_err(io::Error::other)?;
         }
         Ok(())
     }
@@ -723,6 +727,9 @@ impl Drop for TuicUdpTransport {
 impl PacketTransport for TuicUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
+    }
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {

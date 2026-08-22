@@ -821,6 +821,9 @@ impl PacketTransport for Hy2UdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
     }
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
+    }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
         if data.len() > MAX_UDP_SIZE {
@@ -845,7 +848,8 @@ impl PacketTransport for Hy2UdpTransport {
         for packet in packets {
             self.state
                 .conn
-                .send_datagram(bytes::Bytes::from(packet))
+                .send_datagram_wait(bytes::Bytes::from(packet))
+                .await
                 .map_err(io::Error::other)?;
         }
         Ok(())
