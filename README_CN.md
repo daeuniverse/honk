@@ -14,7 +14,7 @@
 
 许可证：**GPL-3.0-only**。
 
-可靠性优先的 Score 组策略始终随程序编译；配置以 `policy: score` 显式选择它，省略 `policy` 时仍默认使用 Selector。Score 仅在实际经过 Score 组时按需创建反馈与评分 cell，从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载中学习；状态只存在于进程内存，不提供调节项，也不会写入日志、持久化或 API。详见 [Score 策略](doc/zh/reference/groups.md#score-策略)。
+可靠性优先的 Score 组策略始终随程序编译；配置以 `policy: score` 显式选择它，省略 `policy` 时仍默认使用 Selector。Score 仅在实际经过 Score 组时按需创建反馈与评分 cell，从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载中学习；状态只存在于进程内存，不提供调节项。经鉴权的 `GET /stats` 只导出按组汇总的安全选路原因计数；评分 cell、目标键和其他私有 scorer 数据不会进入日志、持久化或 API。详见 [Score 策略](doc/zh/reference/groups.md#score-策略)。
 
 ### 实验性首包保留 UDP 决策
 
