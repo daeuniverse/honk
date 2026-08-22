@@ -171,11 +171,7 @@ impl ControlPlaneHandle {
             use crate::control::packet_sniffer::QuicSniffOutcome;
             let sniffer_key =
                 crate::control::packet_sniffer::PacketSnifferKey::new(client_addr, original_dst);
-            let mut outcome = if self.sniffer_pool.is_dcid_failed(&sniffer_key) {
-                QuicSniffOutcome::NotQuic
-            } else {
-                self.sniffer_pool.feed_quic_initial(sniffer_key, &data)
-            };
+            let mut outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
             // A fragmented ClientHello: collect the rest of the Initial
             // flight before deciding which outbound owns the flow.
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
@@ -571,8 +567,8 @@ impl ControlPlaneHandle {
         driver.start_with_followers(first, sniffed_followers)?;
         self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         if let Err(error) = driver.wait_first_ack().await {
-            // PacketTransport Err and timeout are ambiguous: the winner may
-            // have received part of the initial flight, so never replay it.
+            // First-send failures are terminal for this endpoint; once the
+            // transport call starts, the packet is never replayed.
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
