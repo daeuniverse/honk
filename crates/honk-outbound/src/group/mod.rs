@@ -26,7 +26,7 @@
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
@@ -146,6 +146,40 @@ struct Candidate<'a> {
     node: &'a Node,
     attribution: Vec<&'a str>,
     selection_chain: Vec<&'a str>,
+}
+
+enum UniqueCandidateIds {
+    Single(uuid::Uuid),
+    Multiple(HashSet<uuid::Uuid>),
+}
+
+fn unique_candidate_ids(candidates: &[Candidate<'_>]) -> Option<UniqueCandidateIds> {
+    let mut ids = candidates.iter().map(|candidate| candidate.node.id);
+    let first = ids.next()?;
+    let mut multiple = None;
+    for id in ids.filter(|id| *id != first) {
+        multiple
+            .get_or_insert_with(|| HashSet::from([first]))
+            .insert(id);
+    }
+    Some(match multiple {
+        Some(ids) => UniqueCandidateIds::Multiple(ids),
+        None => UniqueCandidateIds::Single(first),
+    })
+}
+
+fn removed_unique_candidate_count(mut before: UniqueCandidateIds, after: &[Candidate<'_>]) -> u64 {
+    match &mut before {
+        UniqueCandidateIds::Single(id) => {
+            u64::from(!after.iter().any(|candidate| candidate.node.id == *id))
+        }
+        UniqueCandidateIds::Multiple(ids) => {
+            for candidate in after {
+                ids.remove(&candidate.node.id);
+            }
+            u64::try_from(ids.len()).unwrap_or(u64::MAX)
+        }
+    }
 }
 
 pub struct GroupManager {
@@ -453,9 +487,21 @@ impl GroupManager {
         }
         let mut visited = Vec::new();
         let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0, effects);
+        let before_filter = (effects.applies()
+            && group.policy == GroupPolicy::Score
+            && self.score_state.is_current_authority(&self.score_authority))
+        .then(|| unique_candidate_ids(&candidates))
+        .flatten();
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         let network = SelectionNetwork::from_probe_domain(domain);
+        if let Some(before_filter) = before_filter {
+            self.score_state.record_dead_filtered(
+                &self.score_authority,
+                score::SelectionReasonKey::new(&group.name, network),
+                removed_unique_candidate_count(before_filter, &candidates),
+            );
+        }
         // Measurements on UDP-dead nodes cannot make the surviving plan warm:
         // determine URLTest provenance only from eligible candidates. A cold
         // group stays cold with one (or zero) survivor.
