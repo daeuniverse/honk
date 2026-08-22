@@ -10,6 +10,54 @@ pub(super) const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Includes the eagerly-created original-destination socket. Reaching the
 /// bound fails the endpoint closed rather than replying from the wrong source.
 const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
+#[derive(Debug)]
+enum PacketSendFailure {
+    Congestion(io::Error),
+    Transport(io::Error),
+}
+/// Marker separating receiver-idle expiry from a transport send timeout.
+#[derive(Debug)]
+pub(super) struct ReplyIdleTimeout;
+
+impl std::fmt::Display for ReplyIdleTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UDP endpoint reply idle timeout")
+    }
+}
+
+impl std::error::Error for ReplyIdleTimeout {}
+
+fn is_reply_idle_timeout(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ReplyIdleTimeout>())
+        .is_some()
+}
+
+impl PacketSendFailure {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Congestion(error) => io::Error::new(io::ErrorKind::WouldBlock, error),
+            Self::Transport(error) => error,
+        }
+    }
+}
+
+fn classify_send_error(
+    transport: &dyn honk_outbound::proxy::PacketTransport,
+    error: io::Error,
+) -> PacketSendFailure {
+    if matches!(
+        honk_outbound::proxy::packet_error_class(&error),
+        honk_outbound::proxy::PacketErrorClass::Congestion
+    ) || (error.kind() == io::ErrorKind::TimedOut && transport.send_timeout_is_congestion())
+    {
+        PacketSendFailure::Congestion(error)
+    } else {
+        PacketSendFailure::Transport(error)
+    }
+}
+
 pub(super) struct TaskRegistry {
     pub(super) closed: bool,
     pub(super) tasks: tokio::task::JoinSet<()>,
@@ -211,7 +259,15 @@ pub(super) fn score_driver_outcome(
     }
     match result {
         Ok(()) => ScoreOutcome::Success,
-        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+        Err(error)
+            if matches!(
+                honk_outbound::proxy::packet_error_class(error),
+                honk_outbound::proxy::PacketErrorClass::Congestion
+            ) =>
+        {
+            ScoreOutcome::Cancelled
+        }
+        Err(error) if is_reply_idle_timeout(error) => {
             if endpoint.has_reply() {
                 ScoreOutcome::Success
             } else {
@@ -335,33 +391,43 @@ pub(super) async fn run_endpoint_driver(
     // Send that retained prefix before the untouched receiver queue so the
     // server sees the original flight in order without waiting for a PTO.
     let UdpDriverStart { first, followers } = initial;
-    let mut initial_result = send_one(&endpoint, &stats, &outbound_tracker, first, true).await;
-    if initial_result.is_ok() {
-        for follower in followers {
-            if let Err(error) =
-                send_one(&endpoint, &stats, &outbound_tracker, follower, false).await
-            {
-                initial_result = Err(error);
-                break;
-            }
+    if let Err(failure) = send_one(&endpoint, &stats, &outbound_tracker, first, true).await {
+        let congested = matches!(&failure, PacketSendFailure::Congestion(_));
+        let error = failure.into_io_error();
+        if !congested && !endpoint.dead.load(Ordering::Acquire) {
+            alive_set.report_unavailable_traffic(
+                endpoint.node_id,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                health_family,
+            );
         }
+        let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
+        return Err(error);
     }
-    match initial_result {
-        Ok(()) => {
-            let _ = first_ack.send(Ok(()));
-        }
-        Err(error) => {
-            if !endpoint.dead.load(Ordering::Acquire) {
-                alive_set.report_unavailable_traffic(
-                    endpoint.node_id,
-                    honk_outbound::alive::ProbeDomain::DataUdp,
-                    health_family,
+
+    for follower in followers {
+        match send_one(&endpoint, &stats, &outbound_tracker, follower, false).await {
+            Ok(()) => {}
+            Err(PacketSendFailure::Congestion(error)) => {
+                debug!(
+                    "UDP endpoint packet dropped under send congestion: {}",
+                    error
                 );
             }
-            let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
-            return Err(error);
+            Err(PacketSendFailure::Transport(error)) => {
+                if !endpoint.dead.load(Ordering::Acquire) {
+                    alive_set.report_unavailable_traffic(
+                        endpoint.node_id,
+                        honk_outbound::alive::ProbeDomain::DataUdp,
+                        health_family,
+                    );
+                }
+                let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
+                return Err(error);
+            }
         }
     }
+    let _ = first_ack.send(Ok(()));
 
     let sender = send_followers(
         Arc::clone(&endpoint),
@@ -385,7 +451,14 @@ pub(super) async fn run_endpoint_driver(
         result = &mut sender => result,
         result = &mut receiver => result,
     };
-    if result.is_err() && !endpoint.dead.load(Ordering::Acquire) {
+    if let Err(error) = &result
+        && !endpoint.dead.load(Ordering::Acquire)
+        && !matches!(
+            honk_outbound::proxy::packet_error_class(error),
+            honk_outbound::proxy::PacketErrorClass::Congestion
+        )
+        && !(is_reply_idle_timeout(error) && endpoint.has_reply())
+    {
         alive_set.report_unavailable_traffic(
             endpoint.node_id,
             honk_outbound::alive::ProbeDomain::DataUdp,
@@ -402,10 +475,19 @@ async fn send_followers(
     outbound_tracker: OutboundTracker,
 ) -> io::Result<()> {
     while let Some(packet) = queue_rx.recv().await {
-        send_one(&endpoint, &stats, &outbound_tracker, packet, false).await?;
+        match send_one(&endpoint, &stats, &outbound_tracker, packet, false).await {
+            Ok(()) => {}
+            Err(PacketSendFailure::Congestion(error)) => {
+                debug!(
+                    "UDP endpoint packet dropped under send congestion: {}",
+                    error
+                );
+            }
+            Err(PacketSendFailure::Transport(error)) => return Err(error),
+        }
     }
     Err(io::Error::new(
-        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::Interrupted,
         "UDP endpoint queue closed",
     ))
 }
@@ -416,11 +498,13 @@ async fn send_one(
     outbound_tracker: &OutboundTracker,
     packet: QueuedDatagram,
     first: bool,
-) -> io::Result<()> {
+) -> Result<(), PacketSendFailure> {
     // This is the application-send linearization point. Node death that wins
-    // before it prevents any transport call; death after it is ambiguous, so
-    // this driver never retries the packet or starts later followers.
-    endpoint.begin_send_attempt()?;
+    // before it prevents any transport call; congestion or a post-send error
+    // never causes this packet to be replayed.
+    endpoint
+        .begin_send_attempt()
+        .map_err(PacketSendFailure::Transport)?;
     let started = first.then(Instant::now);
     let sent = tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, async {
         if first {
@@ -434,10 +518,14 @@ async fn send_one(
     })
     .await;
     let result = match sent {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "UDP PacketTransport send timed out",
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(classify_send_error(endpoint.proxy_socket.as_ref(), error)),
+        Err(_) => Err(classify_send_error(
+            endpoint.proxy_socket.as_ref(),
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "UDP PacketTransport send timed out",
+            ),
         )),
     };
     if let Some(started) = started {
@@ -450,11 +538,11 @@ async fn send_one(
             outbound_tracker.add_bytes(packet.data.len() as u64, 0);
             Ok(())
         }
-        Err(error) => {
+        Err(failure) => {
             if first {
                 stats.record_udp_first_send_failure();
             }
-            Err(error)
+            Err(failure)
         }
     }
 }
@@ -485,10 +573,7 @@ async fn receive_loop(
             Ok(Ok(packet)) => packet,
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "UDP endpoint reply idle timeout",
-                ));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
             }
         };
         if source != endpoint.relay_addr

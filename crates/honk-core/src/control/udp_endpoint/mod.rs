@@ -399,7 +399,7 @@ use driver::{
 };
 #[cfg(test)]
 use driver::{
-    REPLY_IDLE_TIMEOUT, TRANSPORT_SEND_TIMEOUT, UdpDriverContext, UdpDriverStart,
+    REPLY_IDLE_TIMEOUT, ReplyIdleTimeout, TRANSPORT_SEND_TIMEOUT, UdpDriverContext, UdpDriverStart,
     run_endpoint_driver,
 };
 

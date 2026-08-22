@@ -262,10 +262,13 @@ impl PacketTransport for TrojanUdpTransport {
                 "trojan udp frame too large",
             ));
         }
-        // Drop instead of contending on the writer: parking the flow task
-        // behind another packet's TLS write costs more than the loss.
+        // The endpoint driver drops this packet on `WouldBlock` without
+        // treating writer contention as a dead tunnel.
         let Ok(mut writer) = self.writer.try_lock() else {
-            return Ok(());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "trojan UDP writer is busy",
+            ));
         };
         let mut frame = Vec::with_capacity(self.addr_header.len() + 4 + data.len());
         frame.extend_from_slice(&self.addr_header);

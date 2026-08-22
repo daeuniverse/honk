@@ -646,7 +646,7 @@ impl StatsManager {
         self.udp.first_send_latency.record(elapsed);
     }
 
-    /// Record a first-send error or timeout (both are ambiguous sends).
+    /// Record a first-send failure; the packet is never replayed.
     pub fn record_udp_first_send_failure(&self) {
         self.udp.first_send_failures.fetch_add(1, Ordering::Relaxed);
     }

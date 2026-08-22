@@ -473,6 +473,9 @@ impl PacketTransport for Socks5UdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target_addr
     }
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
+    }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
         let mut packet = Vec::with_capacity(self.destination_header.len() + data.len());

@@ -544,6 +544,9 @@ impl PacketTransport for SsUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
     }
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
+    }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
         // The endpoint driver already serializes this flow's sends. Receive
