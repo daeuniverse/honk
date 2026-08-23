@@ -295,6 +295,45 @@ fn test_resolve_password_fallback() {
 }
 
 #[tokio::test]
+async fn stalled_tls_session_dial_respects_its_own_deadline() {
+    // Given: the proxy accepts TCP but never sends a TLS ServerHello.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket_addr = listener.local_addr().unwrap();
+    let address = socket_addr.to_string();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let node = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "stalled-tls".into(),
+        protocol: NodeProtocol::AnyTLS,
+        address: address.clone(),
+        host: socket_addr.ip().to_string(),
+        port: socket_addr.port(),
+        sni: Some("localhost".into()),
+        skip_cert_verify: true,
+        ..Default::default()
+    };
+
+    // When: a pool-owned physical AnyTLS session dial reaches that server.
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        dial_session(&node, &address, Duration::from_millis(50), None),
+    )
+    .await;
+    server.abort();
+
+    // Then: the dial itself expires instead of relying on caller cancellation.
+    let outcome = result.expect("the AnyTLS dial must enforce an internal deadline");
+    let error = outcome.err().expect("the stalled TLS dial must fail");
+    assert!(
+        error.to_string().contains("AnyTLS session dial timed out"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn test_writer_batch_encoding_matches_sequential_frames() {
     let q = WriterQueue::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(2));

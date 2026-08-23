@@ -1644,9 +1644,14 @@ async fn dial_session(
     connect_timeout: Duration,
     tls_connector: Option<Arc<TlsConnector>>,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
-    let (read, write, auth, settings) =
-        connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
-    AnyTlsSession::establish(addr, read, write, &auth, &settings).await
+    let timeout = connect_timeout.saturating_mul(3);
+    tokio::time::timeout(timeout, async {
+        let (read, write, auth, settings) =
+            connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
+        AnyTlsSession::establish(addr, read, write, &auth, &settings).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("AnyTLS session dial timed out after {timeout:?}"))?
 }
 
 /// Connect to the AnyTLS server (using `tcp` when the caller provides a
