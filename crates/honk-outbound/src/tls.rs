@@ -133,6 +133,7 @@ pub(crate) const CHROME_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha
 // Chrome 131+: MLKEM hybrid first. Requires boring's `mlkem` feature.
 pub(crate) const CHROME_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384";
 pub(crate) const CHROME_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
+const HTTP11_ALPN_WIRE: &[u8] = b"\x08http/1.1";
 
 /// Chrome's TLS 1.2 cipher list (TLS 1.3 ciphers are implicit and always
 /// lead). Order is irrelevant to JA4 (it sorts), the set is not.
@@ -175,6 +176,7 @@ impl CertificateCompressor for BrotliCertCompression {
 pub struct TlsConnector {
     connector: SslConnector,
     chrome: bool,
+    alps: bool,
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// `ech_enabled` without a static config: discover via DNS HTTPS RR at
     /// connect time (best-effort, fail-open).
@@ -190,7 +192,9 @@ impl TlsConnector {
         if self.chrome {
             cfg.set_permute_extensions(true);
             set_chrome_key_shares(&mut cfg)?;
-            add_chrome_alps(&mut cfg)?;
+            if self.alps {
+                add_chrome_alps(&mut cfg)?;
+            }
         }
         match ech {
             Some(list) => cfg.set_ech_config_list(&list)?,
@@ -531,12 +535,17 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     }
     if chrome {
         apply_chrome_ctx(&mut builder)?;
-        builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+        builder.set_alpn_protos(if node.transport == "ws" {
+            HTTP11_ALPN_WIRE
+        } else {
+            CHROME_ALPN_WIRE
+        })?;
     }
 
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
+        alps: chrome && node.transport != "ws",
         ech_discovery: node.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
@@ -557,6 +566,7 @@ pub fn build_dns_connector(
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
+        alps: chrome && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
         ech_config_list: None,
         ech_discovery: false,
     })
