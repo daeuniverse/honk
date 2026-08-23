@@ -270,18 +270,13 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, cgroup v2, kernel BTF, and an eBPF build"]
+#[ignore = "requires root, cgroup v2, and an eBPF build"]
 async fn pname_uses_process_argv0_from_renamed_thread() {
-    let helper = aya::sys::BpfHelper::BPF_FUNC_get_current_task;
-    if process_name::detect().is_none()
-        || [
-            aya::programs::ProgramType::CgroupSock,
-            aya::programs::ProgramType::CgroupSockAddr,
-        ]
-        .into_iter()
-        .any(|program| !matches!(aya::sys::is_helper_supported(program, helper), Ok(true)))
-    {
-        eprintln!("skipping pname test: argv[0] capture is unavailable");
+    if matches!(
+        process_name::select_capture_mode(crate::DEFAULT_BPF_OBJECT, process_name::detect()),
+        process_name::PnameCaptureMode::Comm
+    ) {
+        eprintln!("skipping pname test: argv and userspace capture are unavailable");
         return;
     }
 
@@ -324,11 +319,20 @@ async fn pname_uses_process_argv0_from_renamed_thread() {
         std::io::Error::last_os_error()
     );
 
-    let actual = backend
-        .cookie_pid_lookup(cookie)
-        .expect("look up socket cookie")
-        .expect("socket has a PIDName entry")
-        .pname;
+    let actual = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(entry) = backend
+                .cookie_pid_lookup(cookie)
+                .expect("look up socket cookie")
+                && entry.pname.iter().any(|byte| *byte != 0)
+            {
+                break entry.pname;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pname resolver did not publish a name");
     let executable = std::env::current_exe().expect("resolve test executable");
     let basename = std::os::unix::ffi::OsStrExt::as_bytes(
         executable.file_name().expect("test executable basename"),

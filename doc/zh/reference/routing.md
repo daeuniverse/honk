@@ -36,7 +36,7 @@ routing {
 | `dport(...)` | 目的端口或闭区间 `start-end` | `port` |
 | `sport(...)` | 源端口或闭区间 `start-end` | `source_port` |
 | `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | `argv[0]` 的可执行文件 basename，最多 15 字节；无法读取 argv 时回退到调用线程的 `comm` | `process_name` |
+| `pname(...)` | `argv[0]` 的可执行文件 basename，最多 15 字节；运行时 BTF 偏移或 cgroup 验证拒绝内核 argv 读取时，用户空间读取 `/proc/<tgid>/cmdline`，最后回退到调用线程的 `comm` | `process_name` |
 | `mac(...)` | 源 MAC 地址 | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | DSCP 值 | `dscp` |

@@ -92,10 +92,10 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `LISTEN_SOCKET_MAP` | 16 槽 `SockMap`；key `0..=9` 保存两个 TCP 和八个 UDP 透明监听器。 |
 | `DATAPATH_STATE_MAP` | 单槽准入数组。零值不改动地放行流量；非零值启用分类与重定向。 |
 | `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
-| `COOKIE_PID_MAP` | 不预分配的 65,536 项套接字 cookie 到 PID/可执行文件 basename 的 hash，用于 `pname` 路由和识别控制平面；内核无法读取 argv 时回退到线程 `comm`。 |
+| `COOKIE_PID_MAP` | 不预分配的 65,536 项套接字 cookie 到 PID/可执行文件 basename 的 hash，用于 `pname` 路由和识别控制平面；验证通过时内核用 BTF 偏移读取 argv，否则通过 `EVENT_RINGBUF` 让用户空间读取 `/proc/<tgid>/cmdline`，最后才回退到线程 `comm`。 |
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 累计插入/eBPF 删除计数；结合用户空间删除计数估算占用率。 |
 | `BPF_STATS_MAP` | 五个计数器：UDP/TCP conn-state overflow，以及 redirect、handoff 和 cookie map 插入失败。 |
-| `EVENT_RINGBUF` | 262,144-byte ring buffer，承载固定布局的 blocked、conntrack overflow 和 UDP token exhausted 诊断事件。 |
+| `EVENT_RINGBUF` | 262,144-byte ring buffer，承载固定布局的 blocked、conntrack overflow、UDP token exhausted 和进程名解析事件。 |
 | `UDP_DECISION_SEQUENCE` | NFQUEUE 决策身份的单槽 pinned allocator 状态；协议细节见 [NFQUEUE](./nfqueue.md)。 |
 | `UDP_DECISION_EPOCH` | NFQUEUE 决策工作的单槽 grace-period selector；见 [NFQUEUE](./nfqueue.md)。 |
 | `UDP_DECISION_INFLIGHT` | NFQUEUE 决策工作的两槽 per-CPU reader 计数；见 [NFQUEUE](./nfqueue.md)。 |

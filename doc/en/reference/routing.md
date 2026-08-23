@@ -36,7 +36,7 @@ routing {
 | `dport(...)` | Destination port or inclusive `start-end` range | `port` |
 | `sport(...)` | Source port or inclusive `start-end` range | `source_port` |
 | `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | Executable basename from `argv[0]`, limited to 15 bytes; falls back to the calling thread's `comm` when argv access is unavailable | `process_name` |
+| `pname(...)` | Executable basename from `argv[0]`, limited to 15 bytes; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, userspace reads `/proc/<tgid>/cmdline`, with the calling thread's `comm` as the final fallback | `process_name` |
 | `mac(...)` | Source MAC address | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | DSCP value | `dscp` |
