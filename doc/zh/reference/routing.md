@@ -36,7 +36,7 @@ routing {
 | `dport(...)` | 目的端口或闭区间 `start-end` | `port` |
 | `sport(...)` | 源端口或闭区间 `start-end` | `source_port` |
 | `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | 进程名 | `process_name` |
+| `pname(...)` | `argv[0]` 的可执行文件 basename，最多 15 字节；无法读取 argv 时回退到调用线程的 `comm` | `process_name` |
 | `mac(...)` | 源 MAC 地址 | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | DSCP 值 | `dscp` |

@@ -92,7 +92,7 @@ TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifie
 | `LISTEN_SOCKET_MAP` | 16-slot `SockMap`; keys `0..=9` hold the two TCP and eight UDP transparent listeners. |
 | `DATAPATH_STATE_MAP` | One-slot admission array. Zero passes traffic untouched; nonzero enables classification and redirect. |
 | `DATAPATH_FLAGS_MAP` | One-slot runtime policy word: Rule/Direct offload properties plus `global.nfqueue_enable` and NFQUEUE ready fencing. New-flow classification reads it; established direct offload uses cached metadata. |
-| `COOKIE_PID_MAP` | Non-preallocated 65,536-entry socket-cookie to PID/`comm` hash for `pname` routing and control-plane recognition. |
+| `COOKIE_PID_MAP` | Non-preallocated 65,536-entry socket-cookie to PID/executable-basename hash for `pname` routing and control-plane recognition; argv-unavailable kernels fall back to thread `comm`. |
 | `CONN_STATE_OCCUPANCY` | Two-slot per-CPU cumulative insert/eBPF-delete counters used with userspace delete accounting to estimate occupancy. |
 | `BPF_STATS_MAP` | Five counters for UDP/TCP conn-state overflow and redirect, handoff, and cookie-map insertion failures. |
 | `EVENT_RINGBUF` | 262,144-byte ring buffer for fixed-layout blocked, conntrack-overflow, and UDP-token-exhaustion diagnostics. |

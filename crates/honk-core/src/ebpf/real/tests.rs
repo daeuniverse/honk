@@ -269,6 +269,86 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
 }
 
+#[tokio::test]
+#[ignore = "requires root, cgroup v2, kernel BTF, and an eBPF build"]
+async fn pname_uses_process_argv0_from_renamed_thread() {
+    let helper = aya::sys::BpfHelper::BPF_FUNC_get_current_task;
+    if process_name::detect().is_none()
+        || [
+            aya::programs::ProgramType::CgroupSock,
+            aya::programs::ProgramType::CgroupSockAddr,
+        ]
+        .into_iter()
+        .any(|program| !matches!(aya::sys::is_helper_supported(program, helper), Ok(true)))
+    {
+        eprintln!("skipping pname test: argv[0] capture is unavailable");
+        return;
+    }
+
+    let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-pname-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&pin_root);
+    std::fs::create_dir_all(&pin_root).expect("create test pin root");
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        TPROXY_MARK,
+        Some("lo"),
+        "lo",
+        true,
+    )
+    .await
+    .expect("load backend for pname test");
+
+    let socket = std::thread::Builder::new()
+        .name("worker-thread".into())
+        .spawn(|| std::net::UdpSocket::bind("127.0.0.1:0").expect("create worker socket"))
+        .expect("spawn named worker")
+        .join()
+        .expect("join named worker");
+    let mut cookie = 0u64;
+    let mut cookie_len = std::mem::size_of::<u64>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_COOKIE,
+            &mut cookie as *mut _ as *mut libc::c_void,
+            &mut cookie_len,
+        )
+    };
+    assert_eq!(
+        status,
+        0,
+        "read socket cookie: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let actual = backend
+        .cookie_pid_lookup(cookie)
+        .expect("look up socket cookie")
+        .expect("socket has a PIDName entry")
+        .pname;
+    let executable = std::env::current_exe().expect("resolve test executable");
+    let basename = std::os::unix::ffi::OsStrExt::as_bytes(
+        executable.file_name().expect("test executable basename"),
+    );
+    let mut expected = [0u8; TASK_COMM_LEN];
+    let len = basename.len().min(TASK_COMM_LEN - 1);
+    expected[..len].copy_from_slice(&basename[..len]);
+    assert_eq!(actual, expected);
+
+    drop(socket);
+    backend.detach_hooks().expect("detach pname test hooks");
+    backend
+        .cleanup()
+        .await
+        .expect("clean up pname test backend");
+    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
+        .expect("remove pname test allocator pin");
+    std::fs::remove_dir(&pin_root).expect("remove pname test pin root");
+}
+
 #[test]
 fn test_event_ip() {
     // IPv4-mapped (::ffff:8.8.8.8) in network-order u32 chunks.

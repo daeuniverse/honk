@@ -10,6 +10,21 @@ impl RealEbpfBackend {
         wan_ifname: &str,
         single_homed: bool,
     ) -> anyhow::Result<Self> {
+        let helper = aya::sys::BpfHelper::BPF_FUNC_get_current_task;
+        let process_name_offsets = [
+            aya::programs::ProgramType::CgroupSock,
+            aya::programs::ProgramType::CgroupSockAddr,
+        ]
+        .into_iter()
+        .all(|program| matches!(aya::sys::is_helper_supported(program, helper), Ok(true)))
+        .then(process_name::detect)
+        .flatten();
+        if process_name_offsets.is_some() {
+            info!("process-name routing uses argv[0] basename");
+        } else {
+            warn!("process-name routing falls back to the current thread name");
+        }
+
         info!("Loading eBPF programs ({} bytes)", obj.len());
         let dae0_ifindex = std::fs::read_to_string("/sys/class/net/dae0/ifindex")
             .ok()
@@ -85,6 +100,7 @@ impl RealEbpfBackend {
             wan_ifindex,
             dae0peer_mac,
             use_redirect_peer,
+            has_bpf_get_current_task: process_name_offsets.is_some() as u8,
             dae_socket_mark: DAE_BYPASS_MARK,
             control_plane_pid: std::process::id(),
             local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
@@ -109,6 +125,11 @@ impl RealEbpfBackend {
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
             .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
+        if let Some(offsets) = process_name_offsets.as_ref() {
+            loader
+                .override_global("TASK_MM_OFFSET", &offsets.task_mm, true)
+                .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
+        }
         let mut bpf = loader.load(obj)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         for (name, map) in bpf.maps() {

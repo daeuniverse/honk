@@ -28,14 +28,16 @@ fn get_pid_pname(pid_pname: &mut PIDName) -> i32 {
     pid_pname.last_seen_ns = unsafe { bpf_ktime_get_ns() };
     pid_pname.pid = (pid_tgid >> 32) as u32;
 
-    let ret = unsafe {
-        bpf_get_current_comm(
-            pid_pname.pname.as_mut_ptr() as *mut aya_ebpf_cty::c_void,
-            pid_pname.pname.len() as u32,
-        )
-    };
-    if ret != 0 {
-        pid_pname.pname[0] = 0;
+    if !crate::process_name::read_argv0_basename(&mut pid_pname.pname) {
+        let ret = unsafe {
+            bpf_get_current_comm(
+                pid_pname.pname.as_mut_ptr() as *mut aya_ebpf_cty::c_void,
+                pid_pname.pname.len() as u32,
+            )
+        };
+        if ret != 0 {
+            pid_pname.pname[0] = 0;
+        }
     }
     0
 }
