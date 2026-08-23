@@ -1,6 +1,7 @@
 use std::ops::Range;
 
-const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
+const VMLINUX_BTF_PATHS: [&str; 2] = ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
+const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
 const BTF_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,7 +11,13 @@ pub(super) struct ProcessNameOffsets {
 }
 
 pub(super) fn detect() -> Option<ProcessNameOffsets> {
-    find_offsets(&std::fs::read(VMLINUX_BTF).ok()?)
+    if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
+        return find_offsets(&std::fs::read(path).ok()?);
+    }
+    VMLINUX_BTF_PATHS.iter().find_map(|path| {
+        let data = std::fs::read(path).ok()?;
+        find_offsets(&data)
+    })
 }
 
 #[derive(Clone, Copy)]
