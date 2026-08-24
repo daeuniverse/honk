@@ -89,17 +89,17 @@ Reload advances a cancellation epoch before waiting. Initializers capture that e
 
 Each UDP flow retains at most 64 datagrams including its first packet. All flows share an exact 8 MiB payload-permit budget. Admission obtains per-flow slots and global byte permits before copying; FIFO saturation drops the newest datagram. NFQUEUE has a separate ingest actor bounded to 256 entries and 8 MiB of queued payload.
 
-At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 32,768. At that cap the fixed partition is:
+At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 1,048,576. At that cap the fixed partition is:
 
 | Owner | Capacity | Descriptor accounting |
 | --- | ---: | ---: |
 | Fixed/runtime reserve | 256 | 256 |
-| Accepted TCP flows | 1024 | 6 each = 6144 |
+| Accepted TCP flows | 16,384 | 6 each = 98,304 |
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
-| UDP endpoints | 7765 | 3 each = 23,295 |
-| **Total** |  | **32,767** |
-The remaining descriptor is partition-rounding slack. TCP starts with the descriptor-derived floor and elastically borrows idle non-TCP descriptor headroom up to twice that floor, while retaining half of the non-TCP budget as burst reserve; a 4,096-descriptor service can scale from 160 to 320 flow permits while that headroom is idle. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
+| UDP endpoints | 8192 | 3 each = 24,576 |
+| **Total** |  | **126,208** |
+The remaining descriptor headroom is deliberately unassigned: a high `RLIMIT_NOFILE` is not treated as proof of equivalent memory or scheduler capacity. TCP starts with a descriptor-derived fixed partition capped at 16,384 flows and elastically borrows idle non-TCP descriptor headroom while retaining half of the non-TCP budget as burst reserve. At the 1,048,576 cap that raises the current target to 18,688 when the reserved non-TCP owners are idle; a 4,096-descriptor service scales from 160 to 320. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
 
 A TCP flow budgets the accepted socket, outbound socket, and two two-FD splice pipes. A UDP endpoint budgets the worst common ownership shape: relay socket, SOCKS5 control stream, and anyfrom reply socket. Smaller `RLIMIT_NOFILE` values scale the same partition with saturating arithmetic.
 
@@ -107,7 +107,7 @@ Admission ceilings are distinct:
 
 | Admission | Ceiling |
 | --- | ---: |
-| TCP flow permits | Descriptor-derived floor; 1024 at the 32,768 cap, with elastic scaling up to 2048 |
+| TCP flow permits | Descriptor-derived floor; 16,384 at the 1,048,576 cap, reaching 18,688 from idle reserved headroom |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
