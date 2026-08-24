@@ -84,15 +84,17 @@ fn resize_tcp_admission(
     }
 
     let previous = *target;
-    if desired > previous {
-        semaphore.add_permits(desired - previous);
+    let previous_capacity = super::tcp_admission_capacity(previous);
+    let desired_capacity = super::tcp_admission_capacity(desired);
+    if desired_capacity > previous_capacity {
+        semaphore.add_permits(desired_capacity - previous_capacity);
         *target = desired;
     } else {
-        let removed = semaphore.forget_permits(previous - desired);
+        let removed = semaphore.forget_permits(previous_capacity - desired_capacity);
         if removed == 0 {
             return;
         }
-        *target = previous - removed;
+        *target = previous.saturating_sub(removed);
     }
     stats.set_tcp_flow_limit(*target);
     debug!(
@@ -1172,9 +1174,12 @@ mod tests {
     #[test]
     fn tcp_admission_resize_tracks_descriptor_headroom() {
         let budget = ResourceBudget::for_nofile(4_096);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(budget.active_tcp_flows));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(super::tcp_admission_capacity(
+            budget.active_tcp_flows,
+        )));
         let stats = StatsManager::with_tcp_flow_limit(budget.active_tcp_flows);
         let mut target = budget.active_tcp_flows;
+        let listener_reserve = semaphore.clone().try_acquire_owned().unwrap();
 
         resize_tcp_admission(
             &semaphore,
@@ -1186,6 +1191,7 @@ mod tests {
         assert_eq!(target, 320);
         assert_eq!(semaphore.available_permits(), 320);
         assert_eq!(stats.tcp_snapshot().limit, 320);
+        drop(listener_reserve);
 
         resize_tcp_admission(
             &semaphore,
@@ -1195,22 +1201,31 @@ mod tests {
             budget.effective_nofile,
         );
         assert_eq!(target, budget.active_tcp_flows);
-        assert_eq!(semaphore.available_permits(), budget.active_tcp_flows);
+        assert_eq!(semaphore.available_permits(), budget.active_tcp_flows + 1);
         assert_eq!(stats.tcp_snapshot().limit, budget.active_tcp_flows as u64);
+    }
+
+    #[test]
+    fn tcp_admission_capacity_keeps_zero_budget_closed() {
+        assert_eq!(super::tcp_admission_capacity(0), 0);
+        assert_eq!(super::tcp_admission_capacity(1), 2);
     }
 
     #[tokio::test]
     async fn tcp_admission_waits_before_accepting_when_full() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let limit = Arc::new(tokio::sync::Semaphore::new(1));
-        let held = limit.clone().try_acquire_owned().unwrap();
+        let limit = Arc::new(tokio::sync::Semaphore::new(2));
+        let held_flow = limit.clone().try_acquire_owned().unwrap();
+        let held_reserve = limit.clone().try_acquire_owned().unwrap();
         let stats = Arc::new(StatsManager::with_tcp_flow_limit(1));
         let task_stats = Arc::clone(&stats);
         let task_limit = Arc::clone(&limit);
         let mut task = tokio::spawn(async move {
             accept_tcp_with_admission(&listener, None, task_limit, task_stats).await
         });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while stats.tcp_snapshot().capacity_rejections == 0 {
                 tokio::task::yield_now().await;
@@ -1218,16 +1233,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(b"hello").await.unwrap();
 
         tokio::select! {
             _ = &mut task => panic!("accepted while admission was full"),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
-        drop(held);
+        drop(held_flow);
 
-        let (mut accepted, _, _, _) = tokio::time::timeout(Duration::from_secs(1), task)
+        let (mut accepted, _, _, _permit) = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .unwrap()
             .unwrap()
@@ -1236,5 +1249,6 @@ mod tests {
         accepted.read_exact(&mut payload).await.unwrap();
         assert_eq!(&payload, b"hello");
         assert_eq!(stats.tcp_snapshot().capacity_rejections, 1);
+        drop(held_reserve);
     }
 }

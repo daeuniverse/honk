@@ -93,6 +93,14 @@ use connection::*;
 use probers::*;
 use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
+const TCP_ACCEPT_RESERVE: usize = 1;
+const fn tcp_admission_capacity(flow_limit: usize) -> usize {
+    flow_limit.saturating_add(if flow_limit == 0 {
+        0
+    } else {
+        TCP_ACCEPT_RESERVE
+    })
+}
 use sockets::*;
 
 /// Re-send `NetworkChanged` with bounded backoff after a rejected refresh.
@@ -145,8 +153,8 @@ pub struct ControlPlane {
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
-    /// Active TCP flow admission. The permit target starts at the descriptor
-    /// floor and elastically borrows idle non-TCP headroom.
+    /// Active TCP flow admission, plus one slot reserved by the listener while
+    /// it waits for the next connection.
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
