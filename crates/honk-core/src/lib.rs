@@ -587,6 +587,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     };
     let resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
+    let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
+    if tcp_flow_max < 256 {
+        warn!(
+            nofile = resource_budget.effective_nofile,
+            tcp_floor = resource_budget.active_tcp_flows,
+            tcp_max = tcp_flow_max,
+            "Low TCP flow admission ceiling; raise RLIMIT_NOFILE in the service limits to avoid gateway-wide backpressure"
+        );
+    }
 
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular

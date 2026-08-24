@@ -17,6 +17,109 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
+// Reserve one shared slot before either listener accepts so full capacity leaves
+// unread client data in the kernel backlog instead of closing an accepted socket.
+async fn accept_tcp_with_admission(
+    tcp4_listener: &TcpListener,
+    tcp6_listener: Option<&TcpListener>,
+    concurrency_limit: Arc<tokio::sync::Semaphore>,
+    stats: Arc<StatsManager>,
+) -> io::Result<(
+    TcpStream,
+    SocketAddr,
+    &'static str,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    let permit = match concurrency_limit.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            stats.record_tcp_capacity_rejection();
+            concurrency_limit
+                .acquire_owned()
+                .await
+                .map_err(|_| io::Error::other("TCP flow admission closed"))?
+        }
+    };
+    let accepted = tokio::select! {
+        result = tcp4_listener.accept() => {
+            result.map(|(stream, addr)| (stream, addr, "v4"))
+        }
+        result = async {
+            match tcp6_listener {
+                Some(listener) => listener.accept().await,
+                None => std::future::pending::<io::Result<(TcpStream, SocketAddr)>>().await,
+            }
+        } => {
+            result.map(|(stream, addr)| (stream, addr, "v6"))
+        }
+    }?;
+    Ok((accepted.0, accepted.1, accepted.2, permit))
+}
+
+const TCP_ADMISSION_SCALE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+fn open_fd_count() -> Option<usize> {
+    // ponytail: one procfs scan per second avoids a platform-specific fd broker.
+    let count = std::fs::read_dir("/proc/self/fd").ok()?.count();
+    Some(count.saturating_sub(1))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_fd_count() -> Option<usize> {
+    None
+}
+
+fn resize_tcp_admission(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    target: &mut usize,
+    budget: ResourceBudget,
+    stats: &StatsManager,
+    open_fds: usize,
+) {
+    let active_permits = target.saturating_sub(semaphore.available_permits());
+    let desired = budget.elastic_tcp_flows(active_permits, open_fds);
+    if desired == *target {
+        return;
+    }
+
+    let previous = *target;
+    if desired > previous {
+        semaphore.add_permits(desired - previous);
+        *target = desired;
+    } else {
+        let removed = semaphore.forget_permits(previous - desired);
+        if removed == 0 {
+            return;
+        }
+        *target = previous - removed;
+    }
+    stats.set_tcp_flow_limit(*target);
+    debug!(
+        previous,
+        limit = *target,
+        active_permits,
+        open_fds,
+        "resized TCP flow admission budget"
+    );
+}
+
+async fn run_tcp_admission_scaler(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    budget: ResourceBudget,
+    stats: Arc<StatsManager>,
+) {
+    let mut target = budget.active_tcp_flows;
+    let mut interval = tokio::time::interval(TCP_ADMISSION_SCALE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if let Some(open_fds) = open_fd_count() {
+            resize_tcp_admission(&semaphore, &mut target, budget, &stats, open_fds);
+        }
+    }
+}
+
 #[cfg(feature = "ebpf")]
 pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut bool) {
     config.global.nfqueue_enable = false;
@@ -492,6 +595,12 @@ impl ControlPlane {
             return Err(anyhow::anyhow!("open eBPF datapath admission: {error}"));
         }
         info!("eBPF datapath admission opened after listener publication");
+        let tcp_scaler = tokio::spawn(run_tcp_admission_scaler(
+            Arc::clone(&self.concurrency_limit),
+            self.resource_budget,
+            Arc::clone(&self.stats),
+        ));
+        self.background_tasks.lock().await.push(tcp_scaler);
         #[cfg(target_os = "linux")]
         if let Err(error) =
             libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
@@ -500,6 +609,8 @@ impl ControlPlane {
         }
 
         let mut rx = self.command_rx.take().expect("command_rx already taken");
+        let tcp_concurrency_limit = Arc::clone(&self.concurrency_limit);
+        let tcp_stats = Arc::clone(&self.stats);
         let drain = self.drain_tracker.clone();
         let fatal_ebpf = Arc::clone(&self.ebpf);
         let mut fatal_error = None;
@@ -545,10 +656,15 @@ impl ControlPlane {
                     );
                     continue;
                 }
-                accept_result = tcp4_listener.accept() => {
+                accept_result = accept_tcp_with_admission(
+                    &tcp4_listener,
+                    tcp6_listener.as_ref(),
+                    Arc::clone(&tcp_concurrency_limit),
+                    Arc::clone(&tcp_stats),
+                ), if accepts_transparent_connection(&drain) => {
                     match accept_result {
-                        Ok((stream, addr)) => {
-                            debug!("Accepted TPROXY TCPv4 connection from {}", addr);
+                        Ok((stream, addr, family, permit)) => {
+                            debug!("Accepted TPROXY TCP{} connection from {}", family, addr);
                             if let Err(e) = set_so_mark_zero(&stream) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
@@ -556,76 +672,20 @@ impl ControlPlane {
                                 debug!("Rejecting new connection from {} (draining)", addr);
                                 continue;
                             }
-                            // try_acquire: never blocks the accept loop.
-                            let permit = match self.concurrency_limit.clone().try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    // At capacity — drop the connection
-                                    // immediately.  Holding the fd while
-                                    // waiting on the semaphore would exhaust
-                                    // the file-descriptor limit far faster
-                                    // than the limit's headroom allows.
-                                    debug!("Dropping TCPv4 from {} (at capacity)", addr);
-                                    continue;
-                                }
-                            };
+                            let tcp_flow = tcp_stats.track_tcp_flow();
+                            let guard = ConnectionGuard::new(Arc::clone(&drain));
                             let handle = self.spawn_handle();
-                            let drain = drain.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let _guard = ConnectionGuard::new(drain);
+                                let _tcp_flow = tcp_flow;
+                                let _guard = guard;
                                 if let Err(e) = handle.serve_connection(stream, addr).await {
-                                    warn!("Error handling TCPv4 from {}: {}", addr, e);
+                                    warn!("Error handling TCP{} from {}: {}", family, addr, e);
                                 }
                             });
                         }
                         Err(e) => {
-                            error!("TCPv4 accept error: {}", e);
-                            // On EMFILE, back off briefly to avoid a tight
-                            // spin that floods the log.
-                            if e.raw_os_error() == Some(libc::EMFILE) {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
-                        }
-                    }
-                }
-
-                accept6_result = async {
-                    if let Some(ref l) = tcp6_listener {
-                        l.accept().await
-                    } else {
-                        std::future::pending::<io::Result<(TcpStream, SocketAddr)>>().await
-                    }
-                } => {
-                    match accept6_result {
-                        Ok((stream, addr)) => {
-                            debug!("Accepted TPROXY TCPv6 connection from {}", addr);
-                            if let Err(e) = set_so_mark_zero(&stream) {
-                                warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
-                            }
-                            if !accepts_transparent_connection(&drain) {
-                                debug!("Rejecting new connection from {} (draining)", addr);
-                                continue;
-                            }
-                            let permit = match self.concurrency_limit.clone().try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    debug!("Dropping TCPv6 from {} (at capacity)", addr);
-                                    continue;
-                                }
-                            };
-                            let handle = self.spawn_handle();
-                            let drain = drain.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let _guard = ConnectionGuard::new(drain);
-                                if let Err(e) = handle.serve_connection(stream, addr).await {
-                                    warn!("Error handling TCPv6 from {}: {}", addr, e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("TCPv6 accept error: {}", e);
+                            error!("TPROXY TCP accept error: {}", e);
                             if e.raw_os_error() == Some(libc::EMFILE) {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
@@ -1102,5 +1162,79 @@ pub(super) fn try_admit_udp_slow_path(
             stats.record_udp_slow_permit_rejected();
             None
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn tcp_admission_resize_tracks_descriptor_headroom() {
+        let budget = ResourceBudget::for_nofile(4_096);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(budget.active_tcp_flows));
+        let stats = StatsManager::with_tcp_flow_limit(budget.active_tcp_flows);
+        let mut target = budget.active_tcp_flows;
+
+        resize_tcp_admission(
+            &semaphore,
+            &mut target,
+            budget,
+            &stats,
+            budget.fixed_reserve,
+        );
+        assert_eq!(target, 320);
+        assert_eq!(semaphore.available_permits(), 320);
+        assert_eq!(stats.tcp_snapshot().limit, 320);
+
+        resize_tcp_admission(
+            &semaphore,
+            &mut target,
+            budget,
+            &stats,
+            budget.effective_nofile,
+        );
+        assert_eq!(target, budget.active_tcp_flows);
+        assert_eq!(semaphore.available_permits(), budget.active_tcp_flows);
+        assert_eq!(stats.tcp_snapshot().limit, budget.active_tcp_flows as u64);
+    }
+
+    #[tokio::test]
+    async fn tcp_admission_waits_before_accepting_when_full() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = limit.clone().try_acquire_owned().unwrap();
+        let stats = Arc::new(StatsManager::with_tcp_flow_limit(1));
+        let task_stats = Arc::clone(&stats);
+        let task_limit = Arc::clone(&limit);
+        let mut task = tokio::spawn(async move {
+            accept_tcp_with_admission(&listener, None, task_limit, task_stats).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.tcp_snapshot().capacity_rejections == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
+
+        tokio::select! {
+            _ = &mut task => panic!("accepted while admission was full"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        drop(held);
+
+        let (mut accepted, _, _, _) = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut payload = [0u8; 5];
+        accepted.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"hello");
+        assert_eq!(stats.tcp_snapshot().capacity_rejections, 1);
     }
 }

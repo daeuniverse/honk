@@ -145,8 +145,8 @@ pub struct ControlPlane {
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
-    /// Active TCP flow admission. Each permit accounts for the accepted
-    /// client socket and one outbound socket in the descriptor budget.
+    /// Active TCP flow admission. The permit target starts at the descriptor
+    /// floor and elastically borrows idle non-TCP headroom.
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,

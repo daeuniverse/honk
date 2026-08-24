@@ -85,7 +85,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 ## `GET /stats`
 
-`GET /stats` 是用户态快照，而不是 eBPF `OUTBOUND_STATS` map，也不暴露该 map 的报文 counter。固定 UDP/NFQUEUE schema 不创建动态的逐节点 label。
+`GET /stats` 是用户态快照，而不是 eBPF `OUTBOUND_STATS` map，也不暴露该 map 的报文 counter。固定 TCP、UDP 和 NFQUEUE schema 不创建动态的逐节点 label。
 
 ```text
 {
@@ -94,6 +94,9 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
   warm: {
     nodes: { preconnect, health, udp, selector, traffic },
     sessions: { anytls, vless, tuic, juicity, hysteria2 }
+  },
+  tcp: {
+    activeFlows, limit, capacity: { rejected }
   },
   score: {
     groups: [{ name, tcp: R, udp: R }]
@@ -125,6 +128,14 @@ R = {
   incumbentHeld, freshFailureBypass, deadFiltered
 } // R 的每个值均为 u64 计数
 ```
+
+### TCP 字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `activeFlows` | 当前持有 TCP admission permit 的透明 TCP 流。 |
+| `limit` | 当前进程级 TCP 流准入上限；从描述符导出的 floor 开始，并随空闲描述符余量动态扩缩。 |
+| `capacity.rejected` | 因 TCP 预算已满而等待 permit 的 accept-loop 单调计数；accepted socket 保留在内核 backlog 中，不会被丢弃。 |
 
 ### Score 选路原因字段
 

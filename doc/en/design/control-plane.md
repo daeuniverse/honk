@@ -99,6 +99,7 @@ At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the a
 | Transient outbound dials | 1008 | 1 each = 1008 |
 | UDP endpoints | 3024 | 3 each = 9072 |
 | **Total** |  | **16,384** |
+TCP starts with the descriptor-derived floor and elastically borrows idle non-TCP descriptor headroom up to twice that floor, while retaining half of the non-TCP budget as burst reserve; a 4,096-descriptor service can scale from 160 to 320 flow permits while that headroom is idle. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
 
 A TCP flow budgets the accepted socket, outbound socket, and two two-FD splice pipes. A UDP endpoint budgets the worst common ownership shape: relay socket, SOCKS5 control stream, and anyfrom reply socket. Smaller `RLIMIT_NOFILE` values scale the same partition with saturating arithmetic.
 
@@ -106,12 +107,14 @@ Admission ceilings are distinct:
 
 | Admission | Ceiling |
 | --- | ---: |
-| TCP flow permits | Descriptor-derived; 672 at the 16,384 cap, with a compile-time maximum of 1024 |
+| TCP flow permits | Descriptor-derived floor; 672 at the 16,384 cap, with elastic scaling up to 1344 |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
 
 There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The endpoint-removal channel is bounded to 1024 messages and drains in batches of 128. If nonblocking delivery finds it full, a deduplicating `removal_dirty` set retains compensation; the worker flushes that set after each batch before acknowledging exact endpoint tombstones.
+
+Transparent TCP reserves one shared permit before either IP-family listener accepts. When all permits are occupied, new connections remain in the kernel listen backlog instead of being accepted and closed with unread data. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
 
 ## TCP relay and conn-state ownership
 
