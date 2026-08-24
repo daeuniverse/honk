@@ -70,7 +70,6 @@ impl ResourceBudget {
     pub(crate) fn clamp_dials(self, requested: usize) -> usize {
         requested.max(1).min(self.transient_dials)
     }
-
     /// Returns the TCP permit target after borrowing currently idle non-TCP headroom.
     pub(crate) fn elastic_tcp_flows(self, active_permits: usize, open_fds: usize) -> usize {
         let floor = self.active_tcp_flows;
@@ -95,6 +94,7 @@ impl ResourceBudget {
             .min(floor.saturating_mul(2))
             .max(active_permits)
     }
+
     #[cfg(test)]
     fn accounted_descriptors(self) -> usize {
         self.fixed_reserve

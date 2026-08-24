@@ -100,7 +100,7 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 | 临时出站 dial | 1024 | 每个 1 = 1024 |
 | UDP endpoint | 7765 | 每个 3 = 23,295 |
 | **合计** |  | **32,767** |
-剩余 1 个描述符是分区取整余量。TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量内动态扩容，最多达到该 floor 的两倍，同时保留一半 non-TCP 预算作为突发余量；4,096 描述符服务在余量空闲时可从 160 个流 permit 扩展到 320 个。已有流不会被切断，固定预留用于保护控制平面描述符。
+剩余 1 个描述符是分区取整余量。TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量内动态扩容，最多达到该 floor 的两倍，同时保留一半 non-TCP 预算作为突发余量。准入 semaphore 额外保留一个 slot 给等待下一条连接的监听器，该 slot 不计入流上限。已有流不会被切断，固定预留用于保护控制平面描述符。
 
 一个 TCP 流为 accepted socket、outbound socket 和两组各含两个 FD 的 splice pipe 记账。一个 UDP endpoint 按常见最坏所有权形态记账：relay socket、SOCKS5 控制流和 anyfrom reply socket。较小的 `RLIMIT_NOFILE` 值以相同的饱和算术缩放分区。
 
@@ -115,7 +115,7 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 
 不存在单独的 256 条 TCP slow-path 上限。TCP accept 使用由描述符导出的流预算。Endpoint-removal channel 限制为 1024 条消息，每批排空 128 条。非阻塞投递遇到满队列时，去重的 `removal_dirty` 集保留补偿；worker 每批完成后刷新该集合，再确认精确 endpoint tombstone。
 
-透明 TCP 在任一 IP 族监听器 accept 之前预留一个共享 permit。所有 permit 占用时，新连接留在内核 listen backlog 中，不会先 accept 再关闭含有未读数据的 socket。`/stats` 的 `tcp` 对象提供 `activeFlows`、`limit` 和 `capacity.rejected`；后者统计等待 permit 的 accept-loop，而不是 accept 后被丢弃的连接。动态上限低于 256 时启动会告警；网关部署应提高服务的 `RLIMIT_NOFILE` 限制。
+透明 TCP 在任一 IP 族监听器 accept 之前预留一个共享 semaphore slot。semaphore 额外包含一个监听器 slot，因此配置的流上限可完整用于活动流。当所有流 permit 占用时，新连接留在内核 listen backlog 中，不会先 accept 再关闭含有未读数据的 socket。`/stats` 的 `tcp` 对象提供 `activeFlows`、`limit` 和 `capacity.rejected`；后者统计等待 permit 的 accept-loop，而不是 accept 后被丢弃的连接。动态上限低于 256 时启动会告警；网关部署应提高服务的 `RLIMIT_NOFILE` 限制。
 
 ## TCP 中继与 conn-state 所有权
 
