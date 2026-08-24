@@ -17,11 +17,9 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
-// Reserve one shared slot before either listener accepts so full capacity leaves
-// unread client data in the kernel backlog instead of closing an accepted socket.
 async fn accept_tcp_with_admission(
-    tcp4_listener: &TcpListener,
-    tcp6_listener: Option<&TcpListener>,
+    tcp4_listener: &tokio::io::unix::AsyncFd<std::net::TcpListener>,
+    tcp6_listener: Option<&tokio::io::unix::AsyncFd<std::net::TcpListener>>,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     stats: Arc<StatsManager>,
 ) -> io::Result<(
@@ -30,30 +28,40 @@ async fn accept_tcp_with_admission(
     &'static str,
     tokio::sync::OwnedSemaphorePermit,
 )> {
-    let permit = match concurrency_limit.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            stats.record_tcp_capacity_rejection();
-            concurrency_limit
-                .acquire_owned()
-                .await
-                .map_err(|_| io::Error::other("TCP flow admission closed"))?
-        }
-    };
-    let accepted = tokio::select! {
-        result = tcp4_listener.accept() => {
-            result.map(|(stream, addr)| (stream, addr, "v4"))
-        }
-        result = async {
-            match tcp6_listener {
-                Some(listener) => listener.accept().await,
-                None => std::future::pending::<io::Result<(TcpStream, SocketAddr)>>().await,
+    loop {
+        let (mut ready, family) = tokio::select! {
+            result = tcp4_listener.readable() => {
+                (result?, "v4")
             }
-        } => {
-            result.map(|(stream, addr)| (stream, addr, "v6"))
+            result = async {
+                match tcp6_listener {
+                    Some(listener) => listener.readable().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                (result?, "v6")
+            }
+        };
+        let permit = match concurrency_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                stats.record_tcp_capacity_rejection();
+                concurrency_limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| io::Error::other("TCP flow admission closed"))?
+            }
+        };
+        match ready.try_io(|listener| listener.get_ref().accept()) {
+            Ok(Ok((stream, addr))) => {
+                stream.set_nonblocking(true)?;
+                return Ok((TcpStream::from_std(stream)?, addr, family, permit));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_would_block) => continue,
         }
-    }?;
-    Ok((accepted.0, accepted.1, accepted.2, permit))
+    }
 }
 
 const TCP_ADMISSION_SCALE_INTERVAL: Duration = Duration::from_secs(1);
@@ -84,17 +92,15 @@ fn resize_tcp_admission(
     }
 
     let previous = *target;
-    let previous_capacity = super::tcp_admission_capacity(previous);
-    let desired_capacity = super::tcp_admission_capacity(desired);
-    if desired_capacity > previous_capacity {
-        semaphore.add_permits(desired_capacity - previous_capacity);
+    if desired > previous {
+        semaphore.add_permits(desired - previous);
         *target = desired;
     } else {
-        let removed = semaphore.forget_permits(previous_capacity - desired_capacity);
+        let removed = semaphore.forget_permits(previous - desired);
         if removed == 0 {
             return;
         }
-        *target = previous.saturating_sub(removed);
+        *target = previous - removed;
     }
     stats.set_tcp_flow_limit(*target);
     debug!(
@@ -167,10 +173,13 @@ impl ControlPlane {
         let udp4_addr = tcp4_addr;
         let udp6_addr = tcp6_addr;
 
-        let tcp4_listener = bind_tproxy_tcp(tcp4_addr, tproxy_mark)?;
+        let tcp4_listener =
+            tokio::io::unix::AsyncFd::new(bind_tproxy_tcp(tcp4_addr, tproxy_mark)?)?;
         info!("Control plane listening for TPROXY TCPv4 on {}", tcp4_addr);
 
-        let tcp6_listener = match bind_tproxy_tcp(tcp6_addr, tproxy_mark) {
+        let tcp6_listener = match bind_tproxy_tcp(tcp6_addr, tproxy_mark).and_then(|listener| {
+            tokio::io::unix::AsyncFd::new(listener).map_err(anyhow::Error::from)
+        }) {
             Ok(l) => {
                 info!("Control plane listening for TPROXY TCPv6 on {}", tcp6_addr);
                 Some(l)
@@ -1174,12 +1183,9 @@ mod tests {
     #[test]
     fn tcp_admission_resize_tracks_descriptor_headroom() {
         let budget = ResourceBudget::for_nofile(4_096);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(super::tcp_admission_capacity(
-            budget.active_tcp_flows,
-        )));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(budget.active_tcp_flows));
         let stats = StatsManager::with_tcp_flow_limit(budget.active_tcp_flows);
         let mut target = budget.active_tcp_flows;
-        let listener_reserve = semaphore.clone().try_acquire_owned().unwrap();
 
         resize_tcp_admission(
             &semaphore,
@@ -1191,7 +1197,6 @@ mod tests {
         assert_eq!(target, 320);
         assert_eq!(semaphore.available_permits(), 320);
         assert_eq!(stats.tcp_snapshot().limit, 320);
-        drop(listener_reserve);
 
         resize_tcp_admission(
             &semaphore,
@@ -1201,23 +1206,18 @@ mod tests {
             budget.effective_nofile,
         );
         assert_eq!(target, budget.active_tcp_flows);
-        assert_eq!(semaphore.available_permits(), budget.active_tcp_flows + 1);
+        assert_eq!(semaphore.available_permits(), budget.active_tcp_flows);
         assert_eq!(stats.tcp_snapshot().limit, budget.active_tcp_flows as u64);
     }
 
-    #[test]
-    fn tcp_admission_capacity_keeps_zero_budget_closed() {
-        assert_eq!(super::tcp_admission_capacity(0), 0);
-        assert_eq!(super::tcp_admission_capacity(1), 2);
-    }
-
     #[tokio::test]
-    async fn tcp_admission_waits_before_accepting_when_full() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn tcp_listener_readiness_does_not_exceed_active_flow_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let limit = Arc::new(tokio::sync::Semaphore::new(2));
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::io::unix::AsyncFd::new(listener).unwrap();
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let held_flow = limit.clone().try_acquire_owned().unwrap();
-        let held_reserve = limit.clone().try_acquire_owned().unwrap();
         let stats = Arc::new(StatsManager::with_tcp_flow_limit(1));
         let task_stats = Arc::clone(&stats);
         let task_limit = Arc::clone(&limit);
@@ -1226,18 +1226,22 @@ mod tests {
         });
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(b"hello").await.unwrap();
+
         tokio::time::timeout(Duration::from_secs(1), async {
-            while stats.tcp_snapshot().capacity_rejections == 0 {
-                tokio::task::yield_now().await;
+            tokio::select! {
+                result = &mut task => {
+                    let _accepted = result.unwrap().unwrap();
+                    panic!("listener reserve became a second active flow while the configured limit was one");
+                }
+                _ = async {
+                    while stats.tcp_snapshot().capacity_rejections == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
             }
         })
         .await
         .unwrap();
-
-        tokio::select! {
-            _ = &mut task => panic!("accepted while admission was full"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
         drop(held_flow);
 
         let (mut accepted, _, _, _permit) = tokio::time::timeout(Duration::from_secs(1), task)
@@ -1249,6 +1253,5 @@ mod tests {
         accepted.read_exact(&mut payload).await.unwrap();
         assert_eq!(&payload, b"hello");
         assert_eq!(stats.tcp_snapshot().capacity_rejections, 1);
-        drop(held_reserve);
     }
 }

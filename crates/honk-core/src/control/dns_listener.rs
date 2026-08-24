@@ -133,9 +133,7 @@ impl BoundDnsListener {
         let tcp = tcp.map(TcpListener::from_std).transpose()?;
         let (phase, phase_rx) = watch::channel(ListenerPhase::Running);
         let standalone_tcp_limit = Arc::new(Semaphore::new(standalone_tcp_capacity(
-            connection_limit
-                .available_permits()
-                .saturating_sub(super::TCP_ACCEPT_RESERVE),
+            connection_limit.available_permits(),
         )));
         let mut supervisors = JoinSet::new();
 
