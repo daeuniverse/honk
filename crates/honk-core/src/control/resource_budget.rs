@@ -3,7 +3,7 @@
 use crate::control::udp_endpoint::MAX_ENDPOINTS;
 use crate::pool::MAX_TOTAL_ENTRIES;
 
-pub(crate) const MAX_EFFECTIVE_NOFILE: usize = 16_384;
+pub(crate) const MAX_EFFECTIVE_NOFILE: usize = 32_768;
 const MAX_FIXED_RESERVE: usize = 256;
 const MAX_ACTIVE_TCP_FLOWS: usize = 1_024;
 const MAX_TRANSIENT_DIALS: usize = 1_024;
@@ -184,12 +184,12 @@ mod tests {
         assert_eq!(
             ResourceBudget::for_nofile(usize::MAX),
             ResourceBudget {
-                effective_nofile: 16_384,
+                effective_nofile: 32_768,
                 fixed_reserve: 256,
-                active_tcp_flows: 672,
-                tcp_pool_entries: 2_016,
-                transient_dials: 1_008,
-                udp_endpoints: 3_024,
+                active_tcp_flows: 1_024,
+                tcp_pool_entries: 2_048,
+                transient_dials: 1_024,
+                udp_endpoints: 7_765,
                 udp_slow_path: 256,
                 dns_slow_path: 256,
             }
@@ -216,7 +216,7 @@ mod tests {
         let cap_tcp_only_fds = cap.fixed_reserve + cap.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST;
         assert_eq!(
             cap.elastic_tcp_flows(cap.active_tcp_flows, cap_tcp_only_fds),
-            1_344
+            2_048
         );
     }
     #[test]

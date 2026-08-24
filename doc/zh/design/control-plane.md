@@ -90,17 +90,17 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 
 每个 UDP 流最多保留 64 个 datagram，包括首包。所有流共享精确的 8 MiB payload permit 预算。准入在复制前取得每流 slot 和全局 byte permit；FIFO 饱和时丢弃最新 datagram。NFQUEUE 有独立 ingest actor，限制为 256 个条目和 8 MiB 排队 payload。
 
-启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 16,384。在该上限处，不可变分区为：
+启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 32,768。在该上限处，固定分区为：
 
 | 所有者 | 容量 | 描述符记账 |
 | --- | ---: | ---: |
 | 固定/运行时预留 | 256 | 256 |
-| 已接受 TCP 流 | 672 | 每个 6 = 4032 |
-| 保留 TCP pool | 2016 | 每个 1 = 2016 |
-| 临时出站 dial | 1008 | 每个 1 = 1008 |
-| UDP endpoint | 3024 | 每个 3 = 9072 |
-| **合计** |  | **16,384** |
-TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量内动态扩容，最多达到该 floor 的两倍，同时保留一半 non-TCP 预算作为突发余量；4,096 描述符服务在余量空闲时可从 160 个流 permit 扩展到 320 个。已有流不会被切断，固定预留用于保护控制平面描述符。
+| 已接受 TCP 流 | 1024 | 每个 6 = 6144 |
+| 保留 TCP pool | 2048 | 每个 1 = 2048 |
+| 临时出站 dial | 1024 | 每个 1 = 1024 |
+| UDP endpoint | 7765 | 每个 3 = 23,295 |
+| **合计** |  | **32,767** |
+剩余 1 个描述符是分区取整余量。TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量内动态扩容，最多达到该 floor 的两倍，同时保留一半 non-TCP 预算作为突发余量；4,096 描述符服务在余量空闲时可从 160 个流 permit 扩展到 320 个。已有流不会被切断，固定预留用于保护控制平面描述符。
 
 一个 TCP 流为 accepted socket、outbound socket 和两组各含两个 FD 的 splice pipe 记账。一个 UDP endpoint 按常见最坏所有权形态记账：relay socket、SOCKS5 控制流和 anyfrom reply socket。较小的 `RLIMIT_NOFILE` 值以相同的饱和算术缩放分区。
 
@@ -108,7 +108,7 @@ TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量
 
 | 准入 | 上限 |
 | --- | ---: |
-| TCP 流 permit | 描述符导出的 floor；16,384 上限时为 672，动态扩容最多到 1344 |
+| TCP 流 permit | 描述符导出的 floor；32,768 上限时为 1024，动态扩容最多到 2048 |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | 端口 53 入口 slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
