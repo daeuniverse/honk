@@ -1310,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_name_value_matches_kernel_comm_truncation() {
+    fn test_process_name_value_matches_kernel_pname_truncation() {
         let value = RoutingMatcherBuilder::process_name_value("systemd-resolved");
         let bytes: Vec<u8> = value.into_iter().flat_map(u32::to_ne_bytes).collect();
         assert_eq!(bytes.as_slice(), b"systemd-resolve\0");

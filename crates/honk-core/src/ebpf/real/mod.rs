@@ -112,6 +112,7 @@ impl RealEbpfBackend {
 mod attach;
 mod events;
 mod iface_watch;
+mod process_name;
 mod syscall;
 
 pub use events::*;
