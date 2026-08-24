@@ -10,7 +10,6 @@ use honk_config::types::NodeProtocol;
 use quinn::EndpointConfig;
 use std::time::Instant;
 
-use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -121,12 +120,26 @@ async fn start_server_with_response(
     response_delay: Duration,
     response_status: u8,
 ) -> SocketAddr {
+    start_server_config(password, response_delay, response_status, true).await
+}
+
+async fn start_server_with_udp(password: &'static str, udp_enabled: bool) -> SocketAddr {
+    start_server_config(password, Duration::ZERO, 0, udp_enabled).await
+}
+
+async fn start_server_config(
+    password: &'static str,
+    response_delay: Duration,
+    response_status: u8,
+    udp_enabled: bool,
+) -> SocketAddr {
     let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
-                handle_connection(conn, password, response_delay, response_status).await;
+                handle_connection(conn, password, response_delay, response_status, udp_enabled)
+                    .await;
             });
         }
     });
@@ -138,11 +151,11 @@ async fn start_obfs_server(password: &'static str, obfs_password: &'static [u8])
     let config = testutil::server_config(&[b"h3"], true).unwrap();
     let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     std_socket.set_nonblocking(true).unwrap();
-    let socket = Arc::new(Hy2UdpSocket {
-        socket: Arc::new(tokio::net::UdpSocket::from_std(std_socket).unwrap()),
-        obfs: Some(Arc::from(obfs_password)),
-        hop: Mutex::new(None),
-    });
+    let socket = Arc::new(Hy2UdpSocket::from_socket(
+        tokio::net::UdpSocket::from_std(std_socket).unwrap(),
+        Some(Arc::from(obfs_password)),
+        None,
+    ));
     let runtime = quinn::default_runtime().unwrap();
     let endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
@@ -156,7 +169,7 @@ async fn start_obfs_server(password: &'static str, obfs_password: &'static [u8])
         while let Some(incoming) = endpoint.accept().await {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
-                handle_connection(conn, password, Duration::ZERO, 0).await;
+                handle_connection(conn, password, Duration::ZERO, 0, true).await;
             });
         }
     });
@@ -168,6 +181,7 @@ async fn handle_connection(
     password: &'static str,
     response_delay: Duration,
     response_status: u8,
+    udp_enabled: bool,
 ) {
     let authenticated = Arc::new(AtomicBool::new(false));
     // Uni streams: the client preface (control + QPACK encoder/decoder).
@@ -194,8 +208,16 @@ async fn handle_connection(
             };
             let auth = Arc::clone(&bi_auth);
             tokio::spawn(async move {
-                handle_server_stream(send, recv, auth, password, response_delay, response_status)
-                    .await;
+                handle_server_stream(
+                    send,
+                    recv,
+                    auth,
+                    password,
+                    response_delay,
+                    response_status,
+                    udp_enabled,
+                )
+                .await;
             });
         }
     });
@@ -215,13 +237,14 @@ async fn handle_server_stream(
     password: &str,
     response_delay: Duration,
     response_status: u8,
+    udp_enabled: bool,
 ) {
     let Ok(frame_type) = read_varint_stream(&mut recv).await else {
         return;
     };
     match frame_type {
         H3_FRAME_HEADERS => {
-            handle_auth_request(&mut send, &mut recv, authenticated, password).await
+            handle_auth_request(&mut send, &mut recv, authenticated, password, udp_enabled).await
         }
         FRAME_TYPE_TCP_REQUEST if authenticated.load(Ordering::Relaxed) => {
             handle_tcp_request(&mut send, &mut recv, response_delay, response_status).await
@@ -235,6 +258,7 @@ async fn handle_auth_request(
     recv: &mut quinn::RecvStream,
     authenticated: Arc<AtomicBool>,
     password: &str,
+    server_udp_enabled: bool,
 ) {
     let Ok(len) = read_varint_stream(recv).await else {
         return;
@@ -260,7 +284,7 @@ async fn handle_auth_request(
         && get(":path") == Some(URL_PATH)
         && get(HEADER_AUTH) == Some(password);
     let (status, udp_enabled) = if authed {
-        (STATUS_AUTH_OK, true)
+        (STATUS_AUTH_OK, server_udp_enabled)
     } else {
         (404u16, false)
     };
@@ -524,6 +548,37 @@ fn test_salamander_roundtrip() {
     assert_eq!(salamander_open(password, &mut short), None);
 }
 
+#[tokio::test]
+async fn test_salamander_receives_quic_go_initial_size() {
+    let password: Arc<[u8]> = Arc::from(&b"obfs-password"[..]);
+    let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    std_socket.set_nonblocking(true).unwrap();
+    let socket = Arc::new(Hy2UdpSocket::from_socket(
+        tokio::net::UdpSocket::from_std(std_socket).unwrap(),
+        Some(Arc::clone(&password)),
+        None,
+    ));
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = vec![0x5a; 1280];
+    let packet = salamander_seal(&password, &payload);
+    sender
+        .send_to(&packet, socket.local_addr().unwrap())
+        .await
+        .unwrap();
+
+    let mut output = vec![0; 1252 * socket.max_receive_segments()];
+    let mut meta = [quinn::udp::RecvMeta::default()];
+    let count = {
+        let mut bufs = [std::io::IoSliceMut::new(&mut output)];
+        std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap()
+    };
+    assert_eq!(count, 1);
+    assert_eq!(meta[0].len, payload.len());
+    assert_eq!(&output[..payload.len()], payload);
+}
+
 #[test]
 fn test_udp_message_codec_roundtrip() {
     let pkt = encode_udp_message(0xdead_beef, 42, 0, 1, "8.8.8.8:53", b"payload");
@@ -554,6 +609,62 @@ fn test_fragmentation_and_defrag() {
             .or(out);
     }
     assert_eq!(out.expect("reassembled payload"), data);
+}
+
+#[test]
+fn test_udp_message_rejects_invalid_fragments() {
+    let mut zero_total = encode_udp_message(1, 2, 0, 1, "x:1", b"payload");
+    zero_total[7] = 0;
+    assert!(decode_udp_message(&zero_total).is_none());
+
+    let out_of_range = encode_udp_message(1, 2, 1, 1, "x:1", b"payload");
+    assert!(decode_udp_message(&out_of_range).is_none());
+
+    let empty = encode_udp_message(1, 2, 0, 1, "x:1", b"");
+    assert!(decode_udp_message(&empty).is_none());
+}
+
+#[tokio::test]
+async fn test_short_salamander_password_rejected_before_dial() {
+    let mut node = test_node(443, TEST_PASSWORD);
+    node.hy2_obfs = Some("abc".to_string());
+    let result = Hysteria2Handler::new().build_client(&node).await;
+    let error = match result {
+        Ok(_) => panic!("short Salamander password must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("at least 4 bytes"));
+}
+
+#[tokio::test]
+async fn test_invalid_port_hopping_rejected_before_dial() {
+    let mut node = test_node(443, TEST_PASSWORD);
+    node.hy2_port_hopping = Some("0-10".to_string());
+    let error = match Hysteria2Handler::new().build_client(&node).await {
+        Ok(_) => panic!("invalid port hopping list must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid port hopping list"));
+}
+
+#[tokio::test]
+async fn test_downlink_mbps_is_serialized_as_bytes_per_second() {
+    let mut node = test_node(443, TEST_PASSWORD);
+    node.hy2_down_mbps = Some(1);
+    let client = Hysteria2Handler::new().build_client(&node).await.unwrap();
+    let frame = auth_request_frame(TEST_PASSWORD, client.rx_bytes_per_second);
+    let mut offset = 0;
+    assert_eq!(parse_varint(&frame, &mut offset), Some(H3_FRAME_HEADERS));
+    let section_len = parse_varint(&frame, &mut offset).unwrap() as usize;
+    let section = &frame[offset..offset + section_len];
+    let fields = qpack_decode_field_section(section).unwrap();
+    assert_eq!(
+        fields
+            .iter()
+            .find(|(name, _)| name == HEADER_CC_RX)
+            .map(|(_, value)| value.as_str()),
+        Some("125000")
+    );
 }
 
 #[test]
@@ -695,6 +806,21 @@ async fn test_wrong_password_rejected() {
 }
 
 #[tokio::test]
+async fn test_udp_disabled_server_rejected() {
+    let server_addr = start_server_with_udp(TEST_PASSWORD, false).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let error = match Hysteria2Handler::new()
+        .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+        .await
+    {
+        Ok(_) => panic!("UDP-disabled server must reject packet transport"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("UDP disabled by server"));
+}
+
+#[tokio::test]
 async fn test_udp_transport_datagram_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
@@ -727,9 +853,8 @@ async fn test_udp_transport_fragmented_echo() {
         .dial_udp_transport(&node, target, None, Duration::from_secs(5))
         .await
         .expect("dial_udp_transport should succeed");
-    // 3000 bytes exceeds the QUIC datagram MTU: fragmented on send and
-    // reassembled on receive.
-    let payload = vec![0x5au8; 3000];
+    // Exercise the protocol's inclusive maximum across multiple fragments.
+    let payload = vec![0x5au8; MAX_UDP_SIZE];
     transport.send_packet(&payload).await.unwrap();
     let mut buf = vec![0u8; 4096];
     let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
@@ -818,6 +943,12 @@ async fn test_salamander_wrong_obfs_password_rejected() {
 //   HONK_HY2_SERVER=host:port   (required; tests skip silently without it)
 //   HONK_HY2_PASSWORD=...       (server auth password)
 //   HONK_HY2_OBFS=...           (optional salamander obfs password)
+//   HONK_HY2_PIN=...            (optional leaf certificate SHA-256)
+//   HONK_HY2_INSECURE=1         (optional, only for self-signed fixtures)
+//   HONK_HY2_MTU=1252          (optional QUIC UDP payload cap)
+//   HONK_HY2_ECHO_TARGET=host:port / HONK_HY2_ECHO_BYTES=3000
+//   HONK_HY2_EXPECT_UDP_DISABLED=1 (run the disabled-UDP refusal check)
+//   HONK_HY2_EXPECT_CONNECT_FAILURE=auth|pin|obfs
 
 fn e2e_node() -> Option<Node> {
     let _ = tracing_subscriber::fmt()
@@ -860,10 +991,43 @@ fn e2e_node() -> Option<Node> {
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .map(|v| v == 1),
-        // Deployed with a self-signed certificate.
-        skip_cert_verify: true,
+        quic_mtu: std::env::var("HONK_HY2_MTU")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        skip_cert_verify: std::env::var("HONK_HY2_INSECURE")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .is_some_and(|v| v == 1),
         ..Default::default()
     })
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_expected_connect_failure() {
+    let Ok(mode) = std::env::var("HONK_HY2_EXPECT_CONNECT_FAILURE") else {
+        eprintln!("HONK_HY2_EXPECT_CONNECT_FAILURE unset; skipping negative e2e");
+        return;
+    };
+    let mut node = e2e_node().expect("HONK_HY2_SERVER required for negative e2e");
+    match mode.as_str() {
+        "auth" => node.hy2_auth = Some("known-invalid-auth".to_string()),
+        "pin" => node.tls_pin_sha256 = Some("00".repeat(32)),
+        "obfs" => node.hy2_obfs = Some("known-invalid-obfs".to_string()),
+        _ => panic!("HONK_HY2_EXPECT_CONNECT_FAILURE must be auth, pin, or obfs"),
+    }
+    let target: SocketAddr = "104.18.0.204:80".parse().unwrap();
+    assert!(
+        Hysteria2Handler::new()
+            .dial(
+                &node,
+                target,
+                Some("www.gstatic.com"),
+                Duration::from_secs(10),
+            )
+            .await
+            .is_err(),
+        "{mode} failure must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -904,6 +1068,56 @@ async fn test_e2e_real_server_tcp_http() {
         "expected 204 from generate_204, got: {}",
         &head[..head.len().min(200)]
     );
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_udp_disabled() {
+    if std::env::var("HONK_HY2_EXPECT_UDP_DISABLED").as_deref() != Ok("1") {
+        eprintln!("HONK_HY2_EXPECT_UDP_DISABLED != 1; skipping disabled-UDP e2e");
+        return;
+    }
+    let node = e2e_node().expect("HONK_HY2_SERVER required for disabled-UDP e2e");
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let error = match Hysteria2Handler::new()
+        .dial_udp_transport(&node, target, None, Duration::from_secs(10))
+        .await
+    {
+        Ok(_) => panic!("UDP-disabled server must reject packet transport"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("UDP disabled by server"));
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_udp_echo() {
+    let Ok(target) = std::env::var("HONK_HY2_ECHO_TARGET").map(|value| {
+        value
+            .parse::<SocketAddr>()
+            .expect("invalid HONK_HY2_ECHO_TARGET")
+    }) else {
+        eprintln!("HONK_HY2_ECHO_TARGET unset; skipping UDP echo e2e");
+        return;
+    };
+    let node = e2e_node().expect("HONK_HY2_SERVER required for UDP echo e2e");
+    let bytes = std::env::var("HONK_HY2_ECHO_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3000usize);
+    assert!(bytes <= MAX_UDP_SIZE);
+    let payload: Vec<u8> = (0..bytes).map(|index| index as u8).collect();
+    let transport = Hysteria2Handler::new()
+        .dial_udp_transport(&node, target, None, Duration::from_secs(10))
+        .await
+        .expect("remote UDP echo transport should connect");
+    transport.send_packet(&payload).await.unwrap();
+    let mut response = vec![0; MAX_UDP_SIZE];
+    let (received, source) =
+        tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut response))
+            .await
+            .expect("remote UDP echo timed out")
+            .unwrap();
+    assert_eq!(source, target);
+    assert_eq!(&response[..received], payload);
 }
 
 #[tokio::test]
@@ -1088,29 +1302,26 @@ fn test_parse_port_hopping() {
     assert_eq!(parse_port_hopping(""), None);
     assert_eq!(parse_port_hopping("abc"), None);
     assert_eq!(parse_port_hopping("9000-8000"), None);
+    assert_eq!(parse_port_hopping("0"), None);
+    assert_eq!(parse_port_hopping("0-10"), None);
 }
 
 #[test]
 fn test_hop_state_rotation() {
-    // Empty list keeps the base port.
     let mut hop = HopState::new(vec![], Duration::from_millis(10));
     assert_eq!(hop.port(8443), 8443);
 
-    // Single port: hops to it immediately (the base port differs).
     let mut hop = HopState::new(vec![20000], Duration::from_millis(10));
-    hop.last_hop = Instant::now() - Duration::from_secs(1);
     assert_eq!(hop.port(8443), 20000);
-    // Within the interval the port stays put.
     assert_eq!(hop.port(8443), 20000);
 
-    // Multiple ports: a hop always lands in the list and off the current port.
     let mut hop = HopState::new(vec![20000, 20001, 20002], Duration::from_millis(10));
     let mut seen = std::collections::HashSet::new();
     for _ in 0..10 {
         hop.last_hop = Instant::now() - Duration::from_secs(1);
-        let p = hop.port(8443);
-        assert!((20000..=20002).contains(&p));
-        seen.insert(p);
+        let port = hop.port(8443);
+        assert!((20000..=20002).contains(&port));
+        seen.insert(port);
     }
     assert!(seen.len() > 1, "hops should visit multiple ports: {seen:?}");
 }
