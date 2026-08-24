@@ -138,8 +138,8 @@ VLESS 已完成以下 live 互通验证：TCP+REALITY+Vision、TCP+REALITY、TCP
 | --- | --- |
 | userinfo 密钥 | `username`、`password` 与 `hy2_auth` |
 | `obfs=salamander&obfs-password=...` | 非空密码成为 `hy2_obfs`；其他/不完整 obfs 输入保持关闭 |
-| `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`；`upmbps` 为正值时启用 brutal，否则使用 BBR |
-| `mport` / `mhop` | 端口列表/范围与以秒为单位的跳跃间隔；间隔默认 30，且最小钳制为 1 |
+| `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`；`upmbps` 为正值时启用 Brutal，否则使用 BBR；下载值按 bytes/s 通告 |
+| `mport` / `mhop` | 端口列表/范围与以秒为单位的跳跃间隔；间隔默认 30，并钳制到上游规定的最小值 5 |
 | `pinSHA256` | `tls_pin_sha256`，替代 PKI/主机名校验 |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收窗口覆盖值 |
 | `disablePathMTUDiscovery` | 值为 `1`/`true` 时关闭 QUIC PMTU 发现 |

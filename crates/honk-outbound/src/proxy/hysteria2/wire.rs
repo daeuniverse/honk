@@ -129,6 +129,9 @@ pub(super) fn decode_udp_message(data: &[u8]) -> Option<UdpInbound> {
     let packet_id = u16::from_be_bytes(data[4..6].try_into().expect("len checked"));
     let frag_id = data[6];
     let frag_total = data[7];
+    if frag_total == 0 || frag_id >= frag_total {
+        return None;
+    }
     // Address vstring: QUIC varint length + bytes.
     let first = data[8];
     let len_len = 1usize << (first >> 6);
@@ -143,8 +146,10 @@ pub(super) fn decode_udp_message(data: &[u8]) -> Option<UdpInbound> {
         return None;
     }
     let start = 8 + len_len;
-    let end = start + addr_len as usize;
-    if data.len() < end {
+    let addr_len = usize::try_from(addr_len).ok()?;
+    let end = start.checked_add(addr_len)?;
+    // The upstream parser requires at least one payload byte after the address.
+    if data.len() <= end {
         return None;
     }
     let _addr = std::str::from_utf8(&data[start..end]).ok()?;
