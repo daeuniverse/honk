@@ -85,7 +85,7 @@ The download follows honk's current traffic routing decision. A `direct` result 
 
 ## `GET /stats`
 
-`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed UDP/NFQUEUE schema creates no dynamic per-node labels.
+`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed TCP, UDP, and NFQUEUE schemas create no dynamic per-node labels.
 
 ```text
 {
@@ -94,6 +94,9 @@ The download follows honk's current traffic routing decision. A `direct` result 
   warm: {
     nodes: { preconnect, health, udp, selector, traffic },
     sessions: { anytls, vless, tuic, juicity, hysteria2 }
+  },
+  tcp: {
+    activeFlows, limit, capacity: { rejected }
   },
   score: {
     groups: [{ name, tcp: R, udp: R }]
@@ -125,6 +128,14 @@ R = {
   incumbentHeld, freshFailureBypass, deadFiltered
 } // every R value is a u64 count
 ```
+
+### TCP fields
+
+| Field | Meaning |
+| --- | --- |
+| `activeFlows` | Accepted transparent TCP flows currently holding an admission permit. |
+| `limit` | Current process-wide TCP-flow admission ceiling; it starts at the descriptor-derived floor and scales with idle descriptor headroom. |
+| `capacity.rejected` | Monotonic count of accept-loop iterations that waited for a permit because the TCP budget was full; accepted sockets remain in the kernel backlog rather than being dropped. |
 
 ### Score selection-reason fields
 

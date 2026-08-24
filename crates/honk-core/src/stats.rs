@@ -143,6 +143,23 @@ impl UdpLatencyHistogramSnapshot {
 }
 
 #[derive(Debug, Default)]
+struct TcpStats {
+    limit: AtomicU64,
+    active_flows: AtomicU64,
+    /// Admission-loop attempts that found all TCP permits occupied.
+    capacity_rejections: AtomicU64,
+}
+
+#[cfg(any(feature = "clash-api", test))]
+/// Fixed TCP admission metrics exposed by `/stats`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TcpStatsSnapshot {
+    pub limit: u64,
+    pub active_flows: u64,
+    pub capacity_rejections: u64,
+}
+
+#[derive(Debug, Default)]
 struct UdpNfqueueStats {
     received: AtomicU64,
     active_flows: AtomicU64,
@@ -348,11 +365,26 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+pub(crate) struct TcpFlowGuard {
+    stats: Arc<StatsManager>,
+}
+
+impl Drop for TcpFlowGuard {
+    fn drop(&mut self) {
+        let _ = self.stats.tcp.active_flows.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |active| Some(active.saturating_sub(1)),
+        );
+    }
+}
+
 /// Statistics manager that tracks per-outbound metrics.
 #[derive(Debug)]
 pub struct StatsManager {
     trackers: DashMap<String, OutboundTracker>,
     udp: UdpStats,
+    tcp: TcpStats,
     /// Warm-reason attribution bits per node id, pruned at snapshot time to
     /// nodes that still hold warm resources.
     warm_marks: DashMap<uuid::Uuid, AtomicU8>,
@@ -425,8 +457,30 @@ impl StatsManager {
         Self {
             trackers: DashMap::new(),
             udp: UdpStats::default(),
+            tcp: TcpStats::default(),
             warm_marks: DashMap::new(),
         }
+    }
+
+    pub(crate) fn with_tcp_flow_limit(limit: usize) -> Self {
+        let stats = Self::new();
+        stats.set_tcp_flow_limit(limit);
+        stats
+    }
+
+    pub(crate) fn set_tcp_flow_limit(&self, limit: usize) {
+        self.tcp.limit.store(limit as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn track_tcp_flow(self: &Arc<Self>) -> TcpFlowGuard {
+        self.tcp.active_flows.fetch_add(1, Ordering::Relaxed);
+        TcpFlowGuard {
+            stats: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn record_tcp_capacity_rejection(&self) {
+        self.tcp.capacity_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Attribute a node's current warm resources to a reason.
@@ -886,6 +940,14 @@ impl StatsManager {
     pub fn udp_snapshot(&self) -> UdpStatsSnapshot {
         self.udp.snapshot()
     }
+    #[cfg(any(feature = "clash-api", test))]
+    pub(crate) fn tcp_snapshot(&self) -> TcpStatsSnapshot {
+        TcpStatsSnapshot {
+            limit: self.tcp.limit.load(Ordering::Relaxed),
+            active_flows: self.tcp.active_flows.load(Ordering::Relaxed),
+            capacity_rejections: self.tcp.capacity_rejections.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Default for StatsManager {
@@ -979,6 +1041,25 @@ mod tests {
         assert_eq!(tracker.total_conns, 1);
         assert_eq!(tracker.active_conns, 0);
         assert_eq!(tracker.errors, 0);
+    }
+
+    #[test]
+    fn tcp_admission_stats_track_active_flows_and_capacity_waits() {
+        let manager = Arc::new(StatsManager::with_tcp_flow_limit(3));
+        manager.record_tcp_capacity_rejection();
+        let guard = manager.track_tcp_flow();
+
+        assert_eq!(
+            manager.tcp_snapshot(),
+            TcpStatsSnapshot {
+                limit: 3,
+                active_flows: 1,
+                capacity_rejections: 1,
+            }
+        );
+
+        drop(guard);
+        assert_eq!(manager.tcp_snapshot().active_flows, 0);
     }
 
     #[test]

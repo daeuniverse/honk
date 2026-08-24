@@ -135,6 +135,7 @@ impl ControlPlane {
             nofile = resource_budget.effective_nofile,
             fixed = resource_budget.fixed_reserve,
             tcp_flows = resource_budget.active_tcp_flows,
+            tcp_max = resource_budget.active_tcp_flows.saturating_mul(2),
             tcp_pool = resource_budget.tcp_pool_entries,
             dials = dial_limit,
             dial_ceiling = resource_budget.transient_dials,
@@ -237,7 +238,9 @@ impl ControlPlane {
             dns_controller,
             group_manager,
             runtime_registry,
-            stats: Arc::new(StatsManager::new()),
+            stats: Arc::new(StatsManager::with_tcp_flow_limit(
+                resource_budget.active_tcp_flows,
+            )),
             drain_tracker: Arc::new(DrainTracker::new()),
             udp_pool: Arc::new(UdpEndpointPool::with_capacity_limit(
                 resource_budget.udp_endpoints,

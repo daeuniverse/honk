@@ -885,6 +885,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         })
         .collect();
     let pool = s.connection_pool.ready_metrics();
+    let tcp = s.stats.tcp_snapshot();
     let udp = s.stats.udp_snapshot();
     let warm = s
         .stats
@@ -911,6 +912,13 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "tuic": warm.tuic_clients,
                 "juicity": warm.juicity_clients,
                 "hysteria2": warm.hysteria2_clients,
+            },
+        },
+        "tcp": {
+            "activeFlows": tcp.active_flows,
+            "limit": tcp.limit,
+            "capacity": {
+                "rejected": tcp.capacity_rejections,
             },
         },
         "udp": {

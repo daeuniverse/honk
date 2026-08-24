@@ -1979,6 +1979,11 @@ async fn stats_exposes_udp_metrics() {
     assert!(body["outbounds"].is_array());
     assert!(body["pool"].is_object());
 
+    let tcp = &body["tcp"];
+    assert!(tcp["activeFlows"].is_u64());
+    assert!(tcp["limit"].is_u64());
+    assert_eq!(tcp["capacity"]["rejected"], 0);
+
     let udp = &body["udp"];
     assert_eq!(udp["endpoint"]["hits"], 1);
     assert_eq!(udp["endpoint"]["misses"], 0);
