@@ -31,7 +31,7 @@ AnyTLS.
 ## Usage
 
 The script runs **on an engine host** (`10.10.10.49` x86-64 or
-`10.10.10.45` ARM64):
+`10.10.10.118` ARM64):
 
 ```bash
 scp bench/lab-bench.sh bench/latency_stability.py root@10.10.10.49:/root/
@@ -40,8 +40,8 @@ ssh root@10.10.10.49 \
    'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
 
 # ARM comparison uses the common protocol surface.
-scp bench/lab-bench.sh bench/latency_stability.py root@10.10.10.45:/root/
-ssh root@10.10.10.45 \
+scp bench/lab-bench.sh bench/latency_stability.py root@10.10.10.118:/root/
+ssh root@10.10.10.118 \
   "HONK_BIN=/root/honk-candidate bash /root/lab-bench.sh \
    'honk dae' 'hy2 tuic ss2022 trojan'"
 
@@ -52,6 +52,11 @@ ssh root@10.10.10.49 \
    'honk' 'vless-vision vless-reality vmess'"
 # args: [engines] [protocols] — both are space lists inside one arg
 ```
+
+When `LAB_HOLDER_PID` is unset, the harness keeps the client `lab` namespace
+alive across engine teardown and recreates its named mount automatically. Set
+`LAB_HOLDER_PID` only when an external namespace holder already owns that
+lifecycle.
 
 Stdout contains the conventional throughput table followed by the loaded
 latency-stability table. Standard rows append to `TSV` (default

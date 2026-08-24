@@ -1,0 +1,6 @@
+# host=OpenWrt arch=aarch64 kernel=6.12.94
+# honk_bin=/root/honk-candidate sha256=123c2e33fbab5943874bfae78154c2e84104d22d21c01dc5b0e3a80ab93720f4
+# dae_bin=/usr/bin/dae sha256=a4213cd7d4edd3d780af5f4429e63782573a1e22f074389f1157c82c018e9f53
+# lab-bench 2026-08-24T16:17:55Z engines=(honk dae) protos=(hy2 tuic ss2022 trojan)
+# engine=honk
+# engine=dae

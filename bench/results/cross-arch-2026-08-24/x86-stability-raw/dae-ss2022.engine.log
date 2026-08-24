@@ -1,0 +1,252 @@
+time="Aug 24 15:26:07" level=info msg="Include config files: [/root/dae-lab.dae]"
+time="Aug 24 15:26:07" level=info msg="Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)"
+time="Aug 24 15:26:07" level=warning msg="so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture"
+time="Aug 24 15:26:07" level=info msg="purging stale TC filters before startup"
+time="Aug 24 15:26:07" level=info msg="Waiting for network..."
+time="Aug 24 15:26:07" level=info msg="Network online."
+time="Aug 24 15:26:07" level=info msg="Building control plane and routing rules..."
+time="Aug 24 15:26:07" level=info msg="Kernel v7.1.8 supports Netkit, attempting to create Netkit device pair"
+time="Aug 24 15:26:07" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)"
+time="Aug 24 15:26:07" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer using netlink API"
+time="Aug 24 15:26:07" level=info msg="Successfully created Netkit device pair (performance mode)"
+time="Aug 24 15:26:07" level=info msg="Loading eBPF programs and maps into the kernel..."
+time="Aug 24 15:26:07" level=info msg="The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure."
+time="Aug 24 15:26:07" level=info msg="Safely enabled bpf_redirect_peer() (kernel v7.1.8, netkit+scrub=NONE)"
+time="Aug 24 15:26:07" level=info msg="sysctl /proc/sys/net/ipv4/conf/dae0/rp_filter has unexpected value 2, expected 0"
+time="Aug 24 15:26:07" level=info msg="Loaded eBPF programs and maps"
+time="Aug 24 15:26:07" level=warning msg="AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on."
+time="Aug 24 15:26:07" level=info msg="Optimizing and loading routing rules (this may take a while for large rule sets)..."
+time="Aug 24 15:26:07" level=info msg="Building routing matcher..."
+time="Aug 24 15:26:07" level=info msg="Loading routing rules into kernel space (BPF)..."
+time="Aug 24 15:26:07" level=info msg="Routing match set len: 25/1024"
+time="Aug 24 15:26:07" level=info msg="Building userspace routing matcher..."
+time="Aug 24 15:26:07" level=info msg="Health check will only verify 7 outbounds referenced by routing rules: [trojan anytls-sb anytls-go direct hy2 tuic ss2022]"
+time="Aug 24 15:26:07" level=info msg="Memory usage after routing build: Alloc=2MiB, Sys=25MiB, HeapObjects=11851"
+time="Aug 24 15:26:07" level=info msg="Bind to LAN: veth-lab"
+time="Aug 24 15:26:07" level=info msg="Bind to WAN: ens3"
+time="Aug 24 15:26:07" level=info msg="Control plane built in 139.515839ms"
+time="Aug 24 15:26:07" level=info msg="Total startup time: 225.427016ms"
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46506 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46520 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46532 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46542 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46548 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46552 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46558 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46560 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46572 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46580 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46590 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46594 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46600 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46612 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46618 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:46634 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:32810 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:10" level=info msg="192.168.222.2:32820 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:18" level=info msg="192.168.222.2:44352 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:18" level=info msg="192.168.222.2:44356 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:26" level=info msg="192.168.222.2:45688 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:26" level=info msg="192.168.222.2:45696 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:34" level=info msg="192.168.222.2:45712 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:34" level=info msg="192.168.222.2:45720 <-> 10.10.10.70:5203" dialer=ss2022 dscp=0 ip="10.10.10.70:5203" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:35" level=info msg="192.168.222.2:36484 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:35" level=info msg="192.168.222.2:36494 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:36" level=info msg="192.168.222.2:36508 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:36" level=info msg="192.168.222.2:36512 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:36" level=info msg="192.168.222.2:36520 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:36" level=info msg="192.168.222.2:36524 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:37" level=info msg="192.168.222.2:36530 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:37" level=info msg="192.168.222.2:36542 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:37" level=info msg="192.168.222.2:36548 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:37" level=info msg="192.168.222.2:36564 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:38" level=info msg="192.168.222.2:36568 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:38" level=info msg="192.168.222.2:36574 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:38" level=info msg="192.168.222.2:36580 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:38" level=info msg="192.168.222.2:36584 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:39" level=info msg="192.168.222.2:36596 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:39" level=info msg="192.168.222.2:36606 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:39" level=info msg="192.168.222.2:36610 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:39" level=info msg="192.168.222.2:36622 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:40" level=info msg="192.168.222.2:36630 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:40" level=info msg="192.168.222.2:36642 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:40" level=info msg="192.168.222.2:36644 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:40" level=info msg="192.168.222.2:36650 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:41" level=info msg="192.168.222.2:36664 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:41" level=info msg="192.168.222.2:36670 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:41" level=info msg="192.168.222.2:36674 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:41" level=info msg="192.168.222.2:36684 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:42" level=info msg="192.168.222.2:36694 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:42" level=info msg="192.168.222.2:36704 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:42" level=info msg="192.168.222.2:36708 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:42" level=info msg="192.168.222.2:36710 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:43" level=info msg="192.168.222.2:36714 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:43" level=info msg="192.168.222.2:36720 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:43" level=info msg="192.168.222.2:36722 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:43" level=info msg="192.168.222.2:36726 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:44" level=info msg="192.168.222.2:36738 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:44" level=info msg="192.168.222.2:36754 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:44" level=info msg="192.168.222.2:36760 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:44" level=info msg="192.168.222.2:36774 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:45" level=info msg="192.168.222.2:54882 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:45" level=info msg="192.168.222.2:54890 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:45" level=info msg="192.168.222.2:54892 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:45" level=info msg="192.168.222.2:54902 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:46" level=info msg="192.168.222.2:54910 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:46" level=info msg="192.168.222.2:54924 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:46" level=info msg="192.168.222.2:54934 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:46" level=info msg="192.168.222.2:54936 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:47" level=info msg="192.168.222.2:54946 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:47" level=info msg="192.168.222.2:54950 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:47" level=info msg="192.168.222.2:54952 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:47" level=info msg="192.168.222.2:54954 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:48" level=info msg="192.168.222.2:54966 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:48" level=info msg="192.168.222.2:54976 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:48" level=info msg="192.168.222.2:54980 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:48" level=info msg="192.168.222.2:54982 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:49" level=info msg="192.168.222.2:54986 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:49" level=info msg="192.168.222.2:54990 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:49" level=info msg="192.168.222.2:55000 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:49" level=info msg="192.168.222.2:55010 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:50" level=info msg="192.168.222.2:55014 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:50" level=info msg="192.168.222.2:55018 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:50" level=info msg="192.168.222.2:55028 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:50" level=info msg="192.168.222.2:55044 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:51" level=info msg="192.168.222.2:55050 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:51" level=info msg="192.168.222.2:55064 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:51" level=info msg="192.168.222.2:55078 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:51" level=info msg="192.168.222.2:55080 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:52" level=info msg="192.168.222.2:55096 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:52" level=info msg="192.168.222.2:55112 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:52" level=info msg="192.168.222.2:55116 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:52" level=info msg="192.168.222.2:55126 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:53" level=info msg="192.168.222.2:55136 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:53" level=info msg="192.168.222.2:55142 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:53" level=info msg="192.168.222.2:55150 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:53" level=info msg="192.168.222.2:55164 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:54" level=info msg="192.168.222.2:55170 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:54" level=info msg="192.168.222.2:55176 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:54" level=info msg="192.168.222.2:55178 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:54" level=info msg="192.168.222.2:55180 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:55" level=info msg="192.168.222.2:34722 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:55" level=info msg="192.168.222.2:34728 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:55" level=info msg="192.168.222.2:34732 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:55" level=info msg="192.168.222.2:34744 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:56" level=info msg="192.168.222.2:34758 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:56" level=info msg="192.168.222.2:34772 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:56" level=info msg="192.168.222.2:34788 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:56" level=info msg="192.168.222.2:34802 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:57" level=info msg="192.168.222.2:34818 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:57" level=info msg="192.168.222.2:34826 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:57" level=info msg="192.168.222.2:34828 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:57" level=info msg="192.168.222.2:34842 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:58" level=info msg="192.168.222.2:34844 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:58" level=info msg="192.168.222.2:34850 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:58" level=info msg="192.168.222.2:34860 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:58" level=info msg="192.168.222.2:34864 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:59" level=info msg="192.168.222.2:34878 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:59" level=info msg="192.168.222.2:34888 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:59" level=info msg="192.168.222.2:34896 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:26:59" level=info msg="192.168.222.2:34910 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:00" level=info msg="192.168.222.2:34914 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:00" level=info msg="192.168.222.2:34924 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:00" level=info msg="192.168.222.2:34934 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:00" level=info msg="192.168.222.2:34940 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:01" level=info msg="192.168.222.2:34952 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:01" level=info msg="192.168.222.2:34958 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:01" level=info msg="192.168.222.2:34962 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:01" level=info msg="192.168.222.2:34964 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:02" level=info msg="192.168.222.2:34980 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:02" level=info msg="192.168.222.2:34994 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:02" level=info msg="192.168.222.2:35004 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:02" level=info msg="192.168.222.2:35020 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:03" level=info msg="192.168.222.2:35034 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:03" level=info msg="192.168.222.2:35048 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:03" level=info msg="192.168.222.2:35052 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:03" level=info msg="192.168.222.2:35062 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:04" level=info msg="192.168.222.2:35072 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:04" level=info msg="192.168.222.2:35078 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:04" level=info msg="192.168.222.2:35088 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:04" level=info msg="192.168.222.2:35102 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:05" level=info msg="192.168.222.2:42802 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:05" level=info msg="192.168.222.2:42804 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:05" level=info msg="192.168.222.2:42814 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:05" level=info msg="192.168.222.2:42816 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:06" level=info msg="192.168.222.2:42830 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:06" level=info msg="192.168.222.2:42840 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:06" level=info msg="192.168.222.2:42848 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:06" level=info msg="192.168.222.2:42860 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:07" level=info msg="192.168.222.2:42874 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:07" level=info msg="192.168.222.2:42876 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:07" level=info msg="192.168.222.2:42890 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:07" level=info msg="192.168.222.2:42898 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:08" level=info msg="192.168.222.2:42908 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:08" level=info msg="192.168.222.2:42924 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:08" level=info msg="192.168.222.2:42928 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:08" level=info msg="192.168.222.2:42936 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:09" level=info msg="192.168.222.2:42946 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:09" level=info msg="192.168.222.2:42948 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:09" level=info msg="192.168.222.2:42956 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:09" level=info msg="192.168.222.2:42960 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:10" level=info msg="192.168.222.2:42974 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:10" level=info msg="192.168.222.2:42982 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:10" level=info msg="192.168.222.2:42994 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:10" level=info msg="192.168.222.2:43004 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:11" level=info msg="192.168.222.2:43012 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:11" level=info msg="192.168.222.2:43018 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:11" level=info msg="192.168.222.2:43020 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:11" level=info msg="192.168.222.2:43026 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:12" level=info msg="192.168.222.2:43034 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:12" level=info msg="192.168.222.2:43046 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:12" level=info msg="192.168.222.2:43052 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:12" level=info msg="192.168.222.2:43066 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:13" level=info msg="192.168.222.2:43080 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:13" level=info msg="192.168.222.2:43094 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:13" level=info msg="192.168.222.2:43106 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:13" level=info msg="192.168.222.2:43110 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:14" level=info msg="192.168.222.2:43120 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:14" level=info msg="192.168.222.2:43134 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:14" level=info msg="192.168.222.2:43144 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:14" level=info msg="192.168.222.2:43160 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:15" level=info msg="192.168.222.2:44186 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:15" level=info msg="192.168.222.2:44194 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:15" level=info msg="192.168.222.2:44206 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:15" level=info msg="192.168.222.2:44208 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:16" level=info msg="192.168.222.2:44216 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:16" level=info msg="192.168.222.2:44226 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:16" level=info msg="192.168.222.2:44236 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:16" level=info msg="192.168.222.2:44246 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:17" level=info msg="192.168.222.2:44260 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:17" level=info msg="192.168.222.2:44276 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:17" level=info msg="192.168.222.2:44290 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:17" level=info msg="192.168.222.2:44300 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:18" level=info msg="192.168.222.2:44304 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:18" level=info msg="192.168.222.2:44320 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:18" level=info msg="192.168.222.2:44326 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:18" level=info msg="192.168.222.2:44342 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:19" level=info msg="192.168.222.2:44344 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:19" level=info msg="192.168.222.2:44360 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:19" level=info msg="192.168.222.2:44374 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:19" level=info msg="192.168.222.2:44376 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:20" level=info msg="192.168.222.2:44392 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:20" level=info msg="192.168.222.2:44406 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:20" level=info msg="192.168.222.2:44412 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:20" level=info msg="192.168.222.2:44422 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:21" level=info msg="192.168.222.2:44432 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:21" level=info msg="192.168.222.2:44442 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:21" level=info msg="192.168.222.2:44458 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:21" level=info msg="192.168.222.2:44468 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:22" level=info msg="192.168.222.2:44484 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:22" level=info msg="192.168.222.2:44492 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:22" level=info msg="192.168.222.2:44500 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:22" level=info msg="192.168.222.2:44512 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:23" level=info msg="192.168.222.2:44528 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:23" level=info msg="192.168.222.2:44538 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:23" level=info msg="192.168.222.2:44550 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:23" level=info msg="192.168.222.2:44566 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:24" level=info msg="192.168.222.2:44580 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:24" level=info msg="192.168.222.2:44594 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:24" level=info msg="192.168.222.2:44608 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:24" level=info msg="192.168.222.2:44624 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:25" level=info msg="192.168.222.2:46280 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=
+time="Aug 24 15:27:25" level=info msg="192.168.222.2:46288 <-> 10.10.10.70:8003" dialer=ss2022 dscp=0 ip="10.10.10.70:8003" mac="2a:52:25:db:f0:27" network=tcp4 outbound=ss2022 pname= policy=fixed sniffed=

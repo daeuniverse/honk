@@ -1,0 +1,242 @@
+time="Aug 25 00:33:34" level=info msg="Include config files: [/root/dae-lab.dae]"
+time="Aug 25 00:33:34" level=info msg="Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)"
+time="Aug 25 00:33:34" level=warning msg="so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture"
+time="Aug 25 00:33:34" level=info msg="purging stale TC filters before startup"
+time="Aug 25 00:33:34" level=info msg="Building control plane and routing rules..."
+time="Aug 25 00:33:34" level=info msg="Kernel v6.12.94 supports Netkit, attempting to create Netkit device pair"
+time="Aug 25 00:33:34" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)"
+time="Aug 25 00:33:34" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer using netlink API"
+time="Aug 25 00:33:34" level=info msg="Successfully created Netkit device pair (performance mode)"
+time="Aug 25 00:33:34" level=info msg="Loading eBPF programs and maps into the kernel..."
+time="Aug 25 00:33:34" level=info msg="The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure."
+time="Aug 25 00:33:34" level=info msg="Safely enabled bpf_redirect_peer() (kernel v6.12.94, netkit+scrub=NONE)"
+time="Aug 25 00:33:34" level=warning msg="Kernel does not support bpf_get_current_task helper: FnGetCurrentTask for program type CGroupSockAddr not supported; process names may be truncated or less accurate (degraded to bpf_get_current_comm)"
+time="Aug 25 00:33:35" level=info msg="Loaded eBPF programs and maps"
+time="Aug 25 00:33:35" level=warning msg="AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on."
+time="Aug 25 00:33:35" level=info msg="Optimizing and loading routing rules (this may take a while for large rule sets)..."
+time="Aug 25 00:33:35" level=info msg="Building routing matcher..."
+time="Aug 25 00:33:35" level=info msg="Loading routing rules into kernel space (BPF)..."
+time="Aug 25 00:33:35" level=info msg="Routing match set len: 17/1024"
+time="Aug 25 00:33:35" level=info msg="Building userspace routing matcher..."
+time="Aug 25 00:33:35" level=info msg="Health check will only verify 5 outbounds referenced by routing rules: [tuic ss2022 trojan direct hy2]"
+time="Aug 25 00:33:35" level=info msg="Memory usage after routing build: Alloc=2MiB, Sys=33MiB, HeapObjects=11670"
+time="Aug 25 00:33:35" level=info msg="Bind to LAN: veth-lab"
+time="Aug 25 00:33:35" level=info msg="Bind to WAN: eth0"
+time="Aug 25 00:33:35" level=info msg="Control plane built in 1.20233722s"
+time="Aug 25 00:33:35" level=info msg="Total startup time: 1.202841235s"
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46058 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46072 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46086 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46088 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46090 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46096 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46102 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46108 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46116 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46120 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46134 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46148 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46156 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46170 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46178 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:37" level=info msg="192.168.222.2:46188 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:38" level=info msg="192.168.222.2:44804 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:38" level=info msg="192.168.222.2:44814 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:46" level=info msg="192.168.222.2:43608 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:46" level=info msg="192.168.222.2:43612 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:55" level=info msg="192.168.222.2:45322 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:33:55" level=info msg="192.168.222.2:45326 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:03" level=info msg="192.168.222.2:52874 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:03" level=info msg="192.168.222.2:52884 <-> 10.10.10.70:5201" dialer=hy2 dscp=0 ip="10.10.10.70:5201" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:06" level=info msg="192.168.222.2:56980 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:06" level=info msg="192.168.222.2:56988 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:06" level=info msg="192.168.222.2:57002 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:07" level=info msg="192.168.222.2:57014 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:07" level=info msg="192.168.222.2:57020 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:07" level=info msg="192.168.222.2:57024 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:07" level=info msg="192.168.222.2:57026 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:08" level=info msg="192.168.222.2:57028 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:08" level=info msg="192.168.222.2:57036 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:08" level=info msg="192.168.222.2:57052 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:08" level=info msg="192.168.222.2:57062 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:09" level=info msg="192.168.222.2:57068 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:09" level=info msg="192.168.222.2:57084 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:09" level=info msg="192.168.222.2:57096 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:09" level=info msg="192.168.222.2:57102 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:10" level=info msg="192.168.222.2:57106 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:10" level=info msg="192.168.222.2:57114 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:10" level=info msg="192.168.222.2:57122 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:10" level=info msg="192.168.222.2:57136 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:11" level=info msg="192.168.222.2:57144 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:11" level=info msg="192.168.222.2:57160 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:11" level=info msg="192.168.222.2:57166 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:11" level=info msg="192.168.222.2:57172 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:12" level=info msg="192.168.222.2:57184 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:12" level=info msg="192.168.222.2:57188 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:12" level=info msg="192.168.222.2:54278 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:12" level=info msg="192.168.222.2:54286 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:13" level=info msg="192.168.222.2:54298 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:13" level=info msg="192.168.222.2:54310 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:13" level=info msg="192.168.222.2:54314 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:13" level=info msg="192.168.222.2:54316 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:14" level=info msg="192.168.222.2:54322 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:14" level=info msg="192.168.222.2:54338 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:14" level=info msg="192.168.222.2:54352 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:14" level=info msg="192.168.222.2:54366 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:15" level=info msg="192.168.222.2:54382 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:15" level=info msg="192.168.222.2:54386 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:15" level=info msg="192.168.222.2:54390 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:15" level=info msg="192.168.222.2:54396 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:16" level=info msg="192.168.222.2:54410 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:16" level=info msg="192.168.222.2:54422 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:16" level=info msg="192.168.222.2:54432 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:16" level=info msg="192.168.222.2:54446 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:17" level=info msg="192.168.222.2:54456 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:17" level=info msg="192.168.222.2:54464 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:17" level=info msg="192.168.222.2:54478 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:17" level=info msg="192.168.222.2:54494 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:18" level=info msg="192.168.222.2:54496 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:18" level=info msg="192.168.222.2:54498 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:18" level=info msg="192.168.222.2:54506 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:18" level=info msg="192.168.222.2:54508 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:19" level=info msg="192.168.222.2:54518 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:19" level=info msg="192.168.222.2:54534 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:19" level=info msg="192.168.222.2:54536 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:19" level=info msg="192.168.222.2:54540 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:20" level=info msg="192.168.222.2:54554 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:20" level=info msg="192.168.222.2:54570 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:20" level=info msg="192.168.222.2:54586 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:20" level=info msg="192.168.222.2:54588 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:21" level=info msg="192.168.222.2:54602 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:21" level=info msg="192.168.222.2:54606 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:21" level=info msg="192.168.222.2:54620 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:21" level=info msg="192.168.222.2:54636 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:22" level=info msg="192.168.222.2:54652 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:22" level=info msg="192.168.222.2:54660 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:22" level=info msg="192.168.222.2:33884 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:22" level=info msg="192.168.222.2:33900 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:23" level=info msg="192.168.222.2:33902 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:23" level=info msg="192.168.222.2:33916 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:23" level=info msg="192.168.222.2:33918 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:23" level=info msg="192.168.222.2:33928 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:24" level=info msg="192.168.222.2:33940 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:24" level=info msg="192.168.222.2:33952 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:24" level=info msg="192.168.222.2:33958 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:24" level=info msg="192.168.222.2:33964 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:25" level=info msg="192.168.222.2:33978 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:25" level=info msg="192.168.222.2:33988 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:25" level=info msg="192.168.222.2:33990 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:25" level=info msg="192.168.222.2:34002 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:26" level=info msg="192.168.222.2:34014 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:26" level=info msg="192.168.222.2:34022 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:26" level=info msg="192.168.222.2:34028 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:26" level=info msg="192.168.222.2:34036 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:27" level=info msg="192.168.222.2:34050 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:27" level=info msg="192.168.222.2:34052 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:27" level=info msg="192.168.222.2:34066 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:27" level=info msg="192.168.222.2:34076 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:28" level=info msg="192.168.222.2:34078 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:28" level=info msg="192.168.222.2:34092 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:28" level=info msg="192.168.222.2:34108 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:28" level=info msg="192.168.222.2:34122 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:29" level=info msg="192.168.222.2:34124 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:29" level=info msg="192.168.222.2:34140 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:29" level=info msg="192.168.222.2:34144 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:29" level=info msg="192.168.222.2:34154 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:30" level=info msg="192.168.222.2:34160 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:30" level=info msg="192.168.222.2:34166 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:30" level=info msg="192.168.222.2:34180 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:30" level=info msg="192.168.222.2:34184 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:31" level=info msg="192.168.222.2:34188 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:31" level=info msg="192.168.222.2:34190 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:31" level=info msg="192.168.222.2:34202 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:31" level=info msg="192.168.222.2:34210 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:32" level=info msg="192.168.222.2:34224 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:32" level=info msg="192.168.222.2:34232 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:32" level=info msg="192.168.222.2:58550 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:32" level=info msg="192.168.222.2:58560 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:33" level=info msg="192.168.222.2:58568 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:33" level=info msg="192.168.222.2:58578 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:33" level=info msg="192.168.222.2:58584 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:33" level=info msg="192.168.222.2:58590 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:34" level=info msg="192.168.222.2:58606 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:34" level=info msg="192.168.222.2:58622 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:34" level=info msg="192.168.222.2:58626 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:34" level=info msg="192.168.222.2:58640 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:35" level=info msg="192.168.222.2:58654 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:35" level=info msg="192.168.222.2:58668 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:35" level=info msg="192.168.222.2:58676 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:35" level=info msg="192.168.222.2:58690 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:36" level=info msg="192.168.222.2:58694 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:36" level=info msg="192.168.222.2:58698 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:36" level=info msg="192.168.222.2:58706 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:36" level=info msg="192.168.222.2:58718 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:37" level=info msg="192.168.222.2:58730 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:37" level=info msg="192.168.222.2:58738 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:37" level=info msg="192.168.222.2:58744 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:37" level=info msg="192.168.222.2:58746 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:38" level=info msg="192.168.222.2:58756 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:38" level=info msg="192.168.222.2:58768 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:38" level=info msg="192.168.222.2:58784 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:38" level=info msg="192.168.222.2:58800 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:39" level=info msg="192.168.222.2:58806 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:39" level=info msg="192.168.222.2:58822 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:39" level=info msg="192.168.222.2:58836 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:39" level=info msg="192.168.222.2:58840 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:40" level=info msg="192.168.222.2:58846 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:40" level=info msg="192.168.222.2:58852 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:40" level=info msg="192.168.222.2:58862 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:40" level=info msg="192.168.222.2:58876 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:41" level=info msg="192.168.222.2:58878 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:41" level=info msg="192.168.222.2:58886 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:41" level=info msg="192.168.222.2:58894 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:41" level=info msg="192.168.222.2:58900 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:42" level=info msg="192.168.222.2:58906 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:42" level=info msg="192.168.222.2:58910 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:42" level=info msg="192.168.222.2:56962 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:42" level=info msg="192.168.222.2:56978 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:43" level=info msg="192.168.222.2:56994 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:43" level=info msg="192.168.222.2:57008 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:44" level=info msg="192.168.222.2:57050 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:44" level=info msg="192.168.222.2:57056 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:45" level=info msg="192.168.222.2:57074 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:45" level=info msg="192.168.222.2:57088 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:45" level=info msg="192.168.222.2:57092 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:46" level=info msg="192.168.222.2:57118 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:46" level=info msg="192.168.222.2:57124 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:46" level=info msg="192.168.222.2:57140 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:47" level=info msg="192.168.222.2:57148 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:47" level=info msg="192.168.222.2:57150 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:47" level=info msg="192.168.222.2:57154 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:47" level=info msg="192.168.222.2:57156 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:48" level=info msg="192.168.222.2:57158 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:48" level=info msg="192.168.222.2:57170 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:48" level=info msg="192.168.222.2:57176 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:49" level=info msg="192.168.222.2:57190 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:49" level=info msg="192.168.222.2:57194 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:49" level=info msg="192.168.222.2:57208 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:50" level=info msg="192.168.222.2:57210 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:50" level=info msg="192.168.222.2:57214 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:50" level=info msg="192.168.222.2:57226 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:50" level=info msg="192.168.222.2:57234 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:51" level=info msg="192.168.222.2:57242 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:51" level=info msg="192.168.222.2:57250 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:51" level=info msg="192.168.222.2:57266 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:51" level=info msg="192.168.222.2:57270 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:52" level=info msg="192.168.222.2:57286 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:52" level=info msg="192.168.222.2:57290 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:52" level=info msg="192.168.222.2:50960 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:52" level=info msg="192.168.222.2:50974 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:53" level=info msg="192.168.222.2:50976 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:53" level=info msg="192.168.222.2:50986 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:53" level=info msg="192.168.222.2:50996 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:53" level=info msg="192.168.222.2:51012 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:54" level=info msg="192.168.222.2:51028 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:54" level=info msg="192.168.222.2:51034 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:54" level=info msg="192.168.222.2:51046 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:54" level=info msg="192.168.222.2:51056 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:55" level=info msg="192.168.222.2:51072 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:55" level=info msg="192.168.222.2:51082 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:55" level=info msg="192.168.222.2:51090 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:55" level=info msg="192.168.222.2:51094 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=
+time="Aug 25 00:34:56" level=info msg="192.168.222.2:51110 <-> 10.10.10.70:8001" dialer=hy2 dscp=0 ip="10.10.10.70:8001" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=hy2 pname= policy=fixed sniffed=

@@ -1,7 +1,7 @@
 #!/bin/bash
 # lab-bench.sh — honk vs dae vs sing-box A/B protocol benchmark on the lab.
 #
-# Runs ON an engine host (10.10.10.49 x86-64 or 10.10.10.45 ARM).
+# Runs ON an engine host (10.10.10.49 x86-64 or 10.10.10.118 ARM64).
 # Client traffic originates in netns "lab", so every measurement crosses the real datapath (eBPF/TPROXY for honk/dae;
 # a TUN client inside the netns for sing-box). One script replaces the old
 # bench.sh / bench-cold.sh / bench-cpu.sh / bench-honest.sh set.
@@ -51,6 +51,28 @@ STABILITY_COLLECTOR=${STABILITY_COLLECTOR:-$SCRIPT_DIR/latency_stability.py}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 STABILITY_DIR=${STABILITY_DIR:-/root/bench-stability-$RUN_ID}
 STABILITY_TSV=${STABILITY_TSV:-/root/bench-stability-results.tsv}
+LAB_HOLDER_PID=${LAB_HOLDER_PID:-}
+LAB_HOLDER_OWNED=0
+
+start_lab_holder() {
+    [ -n "$LAB_HOLDER_PID" ] && return 0
+    [ -e "/var/run/netns/$N" ] || {
+        echo "client namespace is missing: $N" >&2
+        return 1
+    }
+    ip netns exec "$N" sleep 86400 >/dev/null 2>&1 &
+    LAB_HOLDER_PID=$!
+    LAB_HOLDER_OWNED=1
+}
+
+stop_lab_holder() {
+    [ "$LAB_HOLDER_OWNED" -eq 1 ] || return 0
+    kill "$LAB_HOLDER_PID" 2>/dev/null || true
+    wait "$LAB_HOLDER_PID" 2>/dev/null || true
+    LAB_HOLDER_PID=
+}
+
+trap stop_lab_holder EXIT
 STABILITY_ROWS=$(mktemp "${TMPDIR:-/tmp}/honk-stability-rows.XXXXXX")
 mkdir -p "$STABILITY_DIR"
 
@@ -84,6 +106,11 @@ cpu_ticks() {
     }
     awk '{print $14+$15}' /proc/"$1"/stat 2>/dev/null || echo 0
 }
+
+now_ns() {
+    python3 -c 'import time; print(time.monotonic_ns())'
+}
+
 rss_mb() {
     [ -n "$1" ] || {
         echo 0
@@ -138,6 +165,11 @@ stop_engines() {
     [ -n "$sb_running" ] && bash /root/setup-netns.sh >/dev/null 2>&1
 }
 
+repair_lab_namespace() {
+    [ -n "$LAB_HOLDER_PID" ] || return 0
+    [ -e "/var/run/netns/$N" ] || ip netns attach "$N" "$LAB_HOLDER_PID" 2>/dev/null || true
+}
+
 start_engine() { # engine → prints pid
     stop_engines
     case $1 in
@@ -148,11 +180,23 @@ start_engine() { # engine → prints pid
             sleep 1
         done
         # pgrep can match a second instance parked on the singleton flock
-        # (zero CPU, misleading metrics) — anchor on the clash API listener.
-        # (.50 grep has no -P; use sed.)
-        ss -tlnp | grep ':9090 ' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1
+        repair_lab_namespace
+
+        # Anchor on the Clash API listener; a parked second instance has no listener.
+        local api_pid
+        if command -v ss >/dev/null 2>&1; then
+            api_pid=$(ss -tlnp | grep ':9090 ' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+        else
+            api_pid=$(process_pids honk | head -1)
+        fi
+        [ -n "$api_pid" ] || {
+            echo "honk failed to expose Clash API" >&2
+            return 1
+        }
+        printf '%s\n' "$api_pid"
         ;;
     dae)
+        chmod 600 "$DAE_CONFIG"
         setsid "$DAE_BIN" run -c "$DAE_CONFIG" >/root/dae.log 2>&1 </dev/null &
         for _ in $(seq 1 30); do
             ip link show dae0 >/dev/null 2>&1 && ip netns list | grep -q '^daens' && break
@@ -160,7 +204,14 @@ start_engine() { # engine → prints pid
             sleep 1
         done
         sleep 2
-        process_pids dae | head -1
+        repair_lab_namespace
+        local dae_pid
+        dae_pid=$(process_pids dae | head -1)
+        [ -n "$dae_pid" ] || {
+            echo "dae failed to start; see /root/dae.log" >&2
+            return 1
+        }
+        printf '%s\n' "$dae_pid"
         ;;
     sing-box)
         # sing-box runs INSIDE the lab netns as a TUN client (not a
@@ -226,18 +277,18 @@ hot_latency() { # port → "p50 p95" over HOT_N requests (first is warmup)
 
 bandwidth() { # pid iperf_port → "median_mbps cpu_cores"
     local pid=$1 port=$2
-    local results="" i bw ticks0 ticks1 ms0 ms1 cores
+    local results="" i bw ticks0 ticks1 ns0 ns1 cores
     for i in $(seq 1 $BW_RUNS); do
         ticks0=$(cpu_ticks "$pid")
-        ms0=$(date +%s%N)
+        ns0=$(now_ns)
         bw=$(ip netns exec $N iperf3 -c $T -p "$port" -t $BW_TIME -R -J 2>/dev/null |
             python3 -c 'import json,sys
 try:
     d=json.load(sys.stdin); print(int(d["end"]["sum_received"]["bits_per_second"]/1e6))
 except Exception: print(0)')
-        ms1=$(date +%s%N)
+        ns1=$(now_ns)
         ticks1=$(cpu_ticks "$pid")
-        cores=$(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ms1-$ms0)/1e9):.2f}')")
+        cores=$(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ns1-$ns0)/1e9):.2f}')")
         results="$results$bw:$cores\n"
     done
     # median by bandwidth; report that run's cpu alongside
@@ -371,9 +422,9 @@ PY
 # (~1448) would measure the cap, not the tunnel.
 udp_bandwidth() { # pid iperf_port → "mbps(loss%) cores"
     local pid=$1 port=$2
-    local ticks0 ticks1 ms0 ms1 res
+    local ticks0 ticks1 ns0 ns1 res
     ticks0=$(cpu_ticks "$pid")
-    ms0=$(date +%s%N)
+    ns0=$(now_ns)
     res=$(ip netns exec $N iperf3 -c $T -p "$port" -u -b 10G -l 1200 -t $BW_TIME -R -J 2>/dev/null |
         python3 -c 'import json,sys
 try:
@@ -382,16 +433,17 @@ try:
     loss = e["sum"]["lost_percent"]
     print("%d(%.1f%%)" % (mbps, loss))
 except Exception: print("0(-)")')
-    ms1=$(date +%s%N)
+    ns1=$(now_ns)
     ticks1=$(cpu_ticks "$pid")
-    echo "$res $(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ms1-$ms0)/1e9):.2f}')")"
+    echo "$res $(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ns1-$ns0)/1e9):.2f}')")"
 }
 
 if [ "$LATENCY_STABILITY" = 1 ] && [ ! -r "$STABILITY_COLLECTOR" ]; then
     echo "latency stability collector not found: $STABILITY_COLLECTOR" >&2
     exit 2
 fi
-echo "# host=$(hostname) arch=$(uname -m) kernel=$(uname -r)" >&2
+start_lab_holder
+echo "# host=$(uname -n) arch=$(uname -m) kernel=$(uname -r)" >&2
 echo "# honk_bin=$HONK_BIN sha256=$(sha256sum "$HONK_BIN" 2>/dev/null | awk '{print $1}')" >&2
 echo "# dae_bin=$DAE_BIN sha256=$(sha256sum "$DAE_BIN" 2>/dev/null | awk '{print $1}')" >&2
 echo "# lab-bench $(date -u +%Y-%m-%dT%H:%M:%SZ) engines=($ENGINES) protos=($PROTOS)" >&2

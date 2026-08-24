@@ -1,0 +1,6 @@
+# host=archlinux arch=x86_64 kernel=7.1.8-arch1-3
+# honk_bin=/root/honk-candidate sha256=7e16ca7a42d17c35a1a3abd33abd71b27b7d6386cf27657f690fba235c9a5041
+# dae_bin=/root/dae sha256=f2dc44b5fa96cd1041ed54082d753a75f81e400b2fe40b7817df0acfae36c2d7
+# lab-bench 2026-08-24T15:08:14Z engines=(honk dae) protos=(hy2 tuic ss2022 trojan anytls-sb anytls-go)
+# engine=honk
+# engine=dae

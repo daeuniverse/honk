@@ -12,7 +12,7 @@ repo so the setup and the numbers stay in sync with the code.
 │ Engine host (one selected per run)   │       │ 10.10.10.70 (physical, 50G) │
 │                                      │       │                             │
 │ x86: 10.10.10.49, 4 vCPU / 2 GiB    │  LAN  │ Protocol servers:           │
-│ ARM: 10.10.10.45, R2S / 1 GiB       ├──────►│  hy2/tuic/SS/Trojan/AnyTLS │
+│ ARM: 10.10.10.118, R2S / 1 GiB       ├──────►│  hy2/tuic/SS/Trojan/AnyTLS │
 │                                      │       │ Targets:                    │
 │  ┌───────────────┐                   │       │  HTTP  :8001-8006,8080      │
 │  │ netns "lab"   │ veth              │       │  iperf:5201-5206,5300      │
@@ -28,10 +28,10 @@ repo so the setup and the numbers stay in sync with the code.
   i5-13600K vCPUs and 2 GiB RAM, with `ens3` as WAN. Its client lives in
   network namespace `lab` (`veth-lab` ↔ `veth-client`, 192.168.222.0/24,
   nftables masquerade). The direct control reaches about 9.4 Gbps.
-- **ARM engine host (`10.10.10.45`)**: NanoPi R2S, RK3328 with four
-  Cortex-A53 cores, 968 MiB usable RAM, and the 1 GbE USB adapter
-  `enxbada2e0076a1` as WAN. It uses the identical `lab` namespace topology;
-  the direct control is approximately 0.8–0.9 Gbps.
+- **ARM engine host (`10.10.10.118`)**: NanoPi R2S, RK3328 with four
+  Cortex-A53 cores, 968 MiB usable RAM, and `eth0` as WAN. It uses the
+  identical `lab` namespace topology; the direct control is approximately
+  0.8–0.9 Gbps.
 - **Real datapath**: both hosts run either honk or dae, never both. Every
   measured client flow crosses the engine's real eBPF/TPROXY path; no
   loopback shortcut is measured.
@@ -44,9 +44,9 @@ repo so the setup and the numbers stay in sync with the code.
 ### Known lab limits
 
 - Cross-architecture absolute throughput is intentionally not normalized:
-  `.49` has a virtual multi-gigabit path while `.45` is capped by USB GbE and
-  A53 CPU. Compare honk-vs-dae on the **same host**; use the two hosts to show
-  whether conclusions survive the architecture change.
+  `.118` is capped by USB GbE and A53 CPU. Compare honk-vs-dae on the
+  **same host**; use the two hosts to show whether conclusions survive the
+  architecture change.
 - The loaded-latency phase deliberately runs one reverse iperf3 stream on the
   same route. Its tail includes engine scheduling, crypto, softirq contention,
   and the host's NIC ceiling; it is not an unloaded network RTT measurement.
@@ -130,8 +130,8 @@ ssh root@10.10.10.49 \
    'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
 
 # ARM uses the protocol surface shared with its dae build.
-scp bench/lab-bench.sh bench/latency_stability.py root@10.10.10.45:/root/
-ssh root@10.10.10.45 \
+scp bench/lab-bench.sh bench/latency_stability.py root@10.10.10.118:/root/
+ssh root@10.10.10.118 \
   "HONK_BIN=/root/honk-candidate bash /root/lab-bench.sh \
    'honk dae' 'hy2 tuic ss2022 trojan'"
 ```
@@ -166,6 +166,135 @@ ssh root@10.10.10.50 \
 Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
+
+## Results (2026-08-24, current cross-architecture A/B)
+
+This is the current paired run: x86 `10.10.10.49` and ARM `10.10.10.118`.
+The ARM run uses the updated kdae config (`eth0` plus
+`disable_waiting_network: true`) and kdae
+`unstable-20260824.r1142.ec957346`. The candidate is main
+`39f92eb51c62a9a330f56612c6671ae678a03585`; binary, kernel, config, harness,
+and result hashes are authoritative in
+[`metadata.txt`](../bench/results/cross-arch-2026-08-24/metadata.txt).
+
+Both engines ran one at a time through the real datapath. Standard rows are
+3 cold requests, 15 hot requests, and the median of three 8-second bandwidth
+runs. Loaded rows are a separate 200-request, 250-ms-cadence run with one
+reverse iperf3 stream on the same route. The ARM namespace holder stayed alive
+through engine teardown and recreation; this prevents the client namespace
+from disappearing when honk removes its `daens` namespace.
+
+### x86-64 (`10.10.10.49`, 4 vCPU / 2 GiB)
+
+#### TCP standard
+
+Cold and hot latency are milliseconds; bandwidth is Mbps; CPU is cores; RSS is
+MiB.
+
+| Protocol | honk cold / hot p50 / hot p95 | dae cold / hot p50 / hot p95 | honk Mbps / cores / RSS | dae Mbps / cores / RSS | bw ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| direct | 3.772 / – / – | 1.789 / – / – | 9403 / 0.00 / 46 | 9403 / 0.00 / 39 | 1.00× |
+| hy2 | 1.627 / 0.870 / 2.347 | 3.060 / 0.719 / 0.930 | 6140 / 0.61 / 48 | 6466 / 0.79 / 51 | 0.95× |
+| tuic | 1.708 / 0.795 / 3.429 | 18.096 / 16.352 / 16.921 | 3350 / 0.34 / 43 | 3877 / 0.52 / 54 | 0.86× |
+| ss2022 | 3.310 / 1.174 / 1.385 | 2.080 / 1.083 / 2.241 | 9401 / 0.31 / 48 | 9368 / 0.37 / 53 | 1.00× |
+| trojan | 5.320 / 0.891 / 7.515 | 2.208 / 1.381 / 2.961 | 9288 / 0.36 / 43 | 9381 / 0.44 / 46 | 0.99× |
+| anytls-sb | 1.833 / 0.724 / 1.972 | 5.431 / 0.738 / 2.097 | 9361 / 0.43 / 46 | 9352 / 0.43 / 52 | 1.00× |
+| anytls-go | 2.926 / 0.761 / 3.287 | 4.332 / 1.175 / 2.490 | 9391 / 0.47 / 42 | 9200 / 0.44 / 54 | 1.02× |
+
+#### UDP saturation
+
+| Protocol | honk RTT ms | dae RTT ms | honk Mbps / loss / cores | dae Mbps / loss / cores | bw ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hy2 | 0.112 | 0.158 | 823 / 79.8% / 0.43 | 902 / 78.0% / 0.45 | 0.91× |
+| tuic | 0.090 | 0.103 | 1049 / 75.3% / 0.47 | 937 / 76.7% / 0.48 | 1.12× |
+| ss2022 | 0.079 | 0.154 | 1814 / 52.6% / 0.67 | 2513 / 34.3% / 0.64 | 0.72× |
+| trojan | 0.112 | 0.070 | 1572 / 59.4% / 0.67 | 2870 / 23.7% / 0.60 | 0.55× |
+| anytls-sb | 0.147 | 0.109 | 1156 / 68.0% / 0.43 | 1104 / 66.1% / 0.29 | 1.05× |
+| anytls-go | 0.082 | 0.109 | 1299 / 64.7% / 0.48 | 1418 / 64.7% / 0.34 | 0.92× |
+
+#### Loaded stability
+
+Each percentile is successful HTTP latency; failures remain explicit.
+
+| Engine | Protocol | load Mbps | p50 / p95 / p99 / max ms | failures |
+| --- | --- | ---: | ---: | ---: |
+| honk | direct | 9408 | 1.517 / 1.994 / 2.475 / 3.426 | 0/200 |
+| honk | hy2 | 6033 | 1.708 / 3.005 / 8.075 / 9.802 | 3/200 |
+| honk | tuic | 3366 | 1.400 / 2.061 / 2.609 / 2.767 | 0/200 |
+| honk | ss2022 | 9403 | 1.885 / 3.177 / 4.869 / 6.013 | 4/200 |
+| honk | trojan | 9323 | 1.671 / 4.362 / 7.895 / 11.469 | 0/200 |
+| honk | anytls-sb | 9317 | 1.625 / 2.863 / 2089.764 / 3107.546 | 0/200 |
+| honk | anytls-go | 9304 | 2.121 / 4.875 / 8.950 / 11.094 | 0/200 |
+| dae | direct | 9406 | 1.687 / 2.306 / 2.551 / 4.937 | 0/200 |
+| dae | hy2 | 6083 | 2.106 / 4.457 / 7.427 / 7.786 | 6/200 |
+| dae | tuic | 4014 | 16.179 / 17.111 / 17.637 / 18.310 | 0/200 |
+| dae | ss2022 | 9404 | 2.244 / 4.025 / 5.689 / 13.743 | 0/200 |
+| dae | trojan | 9390 | 3.454 / 7.135 / 12.618 / 17.764 | 0/200 |
+| dae | anytls-sb | 8770 | 1.626 / 3.889 / 42.709 / 58.435 | 4/200 |
+| dae | anytls-go | 9244 | 2.278 / 11.220 / 16.807 / 20.968 | 2/200 |
+
+On x86, honk is within 1% of dae for SS2022, Trojan, and sing-box AnyTLS,
+while using no more CPU on any TCP proxy row. It gives up 5% on HY2 and 14% on
+TUIC throughput, but its TUIC hot p95 is 3.429 ms versus 16.921 ms. UDP is
+mixed: honk leads TUIC and sing-box AnyTLS slightly, but trails dae on HY2,
+SS2022, Trojan, and Go AnyTLS. The 2.09-second honk AnyTLS-sing-box p99 is a
+real outlier in the retained raw samples, not a formatting omission.
+
+### ARM64 (`10.10.10.118`, NanoPi R2S / 1 GiB)
+
+#### TCP standard
+
+| Protocol | honk cold / hot p50 / hot p95 | dae cold / hot p50 / hot p95 | honk Mbps / cores / RSS | dae Mbps / cores / RSS | bw ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| direct | 3.544 / – / – | 3.379 / – / – | 862 / 0.02 / 22 | 860 / 0.01 / 41 | 1.00× |
+| hy2 | 6.827 / 5.557 / 18.128 | 21.981 / 5.782 / 7.017 | 344 / 1.27 / 39 | 218 / 0.80 / 45 | 1.58× |
+| tuic | 5.912 / 5.445 / 6.854 | 32.721 / 21.513 / 22.089 | 233 / 0.93 / 29 | 238 / 0.81 / 43 | 0.98× |
+| ss2022 | 5.939 / 4.889 / 31.721 | 8.166 / 6.855 / 7.625 | 430 / 0.76 / 28 | 281 / 0.82 / 36 | 1.53× |
+| trojan | 59.571 / 13.261 / 59.743 | 15.561 / 15.397 / 17.603 | 416 / 0.79 / 30 | 205 / 0.79 / 40 | 2.03× |
+
+#### UDP saturation
+
+| Protocol | honk RTT ms | dae RTT ms | honk Mbps / loss / cores | dae Mbps / loss / cores | bw ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hy2 | 2.176 | 2.434 | 2 / 87.1% / 1.56 | 99 / 97.1% / 0.86 | 0.02× |
+| tuic | 2.428 | 2.601 | 2 / 88.2% / 1.52 | 101 / 97.2% / 0.86 | 0.02× |
+| ss2022 | 1.807 | 2.101 | 95 / 91.6% / 0.90 | 117 / 93.9% / 0.79 | 0.81× |
+| trojan | 1.626 | 2.340 | 106 / 97.2% / 0.91 | 171 / 95.6% / 0.79 | 0.62× |
+
+#### Loaded stability
+
+| Engine | Protocol | load Mbps | p50 / p95 / p99 / max ms | failures |
+| --- | --- | ---: | ---: | ---: |
+| honk | direct | 866 | 12.155 / 49.531 / 74.952 / 139.534 | 0/200 |
+| honk | hy2 | 344 | 51.847 / 104.086 / 123.511 / 133.456 | 3/200 |
+| honk | tuic | 263 | 21.895 / 32.327 / 39.561 / 58.102 | 0/200 |
+| honk | ss2022 | 458 | 16.002 / 27.524 / 40.067 / 72.338 | 0/200 |
+| honk | trojan | 392 | 11.988 / 21.573 / 31.547 / 73.303 | 0/200 |
+| dae | direct | 524 | 8.907 / 50.834 / 84.706 / 91.599 | 0/200 |
+| dae | hy2 | 216 | 35.539 / 56.397 / 74.111 / 74.429 | 8/200 |
+| dae | tuic | 237 | 48.835 / 60.541 / 64.923 / 80.709 | 0/200 |
+| dae | ss2022 | 279 | 14.374 / 20.924 / 24.875 / 47.538 | 0/200 |
+| dae | trojan | 202 | 22.171 / 35.989 / 45.613 / 60.581 | 3/200 |
+
+On ARM, honk leads TCP HY2, SS2022, and Trojan throughput, is effectively tied
+on TUIC, and uses less RSS on every proxy row. Its hot tail is not uniformly
+better: TUIC is substantially lower, while HY2, SS2022, and Trojan are higher.
+The UDP result is a clear honk regression on this run: HY2/TUIC receive only
+2 Mbps at the fixed 10-Gbps offer, versus 99/101 Mbps for dae; SS2022 and
+Trojan also trail. Loaded runs show fewer honk failures (3 versus 8 on HY2 and
+0 versus 3 on Trojan), but higher p99 on HY2 and SS2022. These are measured
+capacity-edge outcomes, not claims about unloaded WAN latency.
+
+Artifacts: [x86 standard TSV](../bench/results/cross-arch-2026-08-24/x86-standard.tsv),
+[x86 loaded TSV](../bench/results/cross-arch-2026-08-24/x86-stability.tsv),
+[x86 raw](../bench/results/cross-arch-2026-08-24/x86-stability-raw/),
+[ARM standard TSV](../bench/results/cross-arch-2026-08-24/arm64-standard.tsv),
+[ARM loaded TSV](../bench/results/cross-arch-2026-08-24/arm64-stability.tsv),
+[ARM raw](../bench/results/cross-arch-2026-08-24/arm64-stability-raw/), and
+[captured inputs](../bench/results/cross-arch-2026-08-24/arm64-inputs/).
+
+The older sections below are historical records. Their `.45`/`.43` ARM
+addresses describe superseded lab hosts; the current ARM host is `.118` above.
 
 ## Results (2026-08-08, paired x86-64 + ARM64 A/B and loaded tails)
 

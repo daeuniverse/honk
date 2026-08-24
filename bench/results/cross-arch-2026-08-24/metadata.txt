@@ -1,0 +1,67 @@
+# 2026-08-24 cross-architecture A/B benchmark
+run_date_utc=2026-08-24
+run_x86_utc=2026-08-24T15:08:14Z
+run_arm_utc=2026-08-24T16:17:55Z
+
+[source]
+main_commit=39f92eb51c62a9a330f56612c6671ae678a03585
+main_base=v0.0.1.beta.59 (bb4e8f888099a1ed9fd925c80e39e59439eea841)
+bench_commit_at_run=d9b5deef99b4953d3dbffcb0c0161620d4e32541
+
+[method]
+cold_runs=3 (median)
+hot_requests=15 (p50/p95)
+bandwidth_runs=3 (median)
+bandwidth_time_s=8
+udp_offer=10Gbit/s
+udp_payload_bytes=1200
+stability_samples=200
+stability_interval_ms=250
+stability_timeout_s=5
+stability_retries=2
+stability_load=one reverse iperf3 stream on the same route
+
+[x86]
+host=10.10.10.49
+hostname=archlinux
+arch=x86_64
+kernel=7.1.8-arch1-3
+honk_sha256=7e16ca7a42d17c35a1a3abd33abd71b27b7d6386cf27657f690fba235c9a5041
+dae_sha256=f2dc44b5fa96cd1041ed54082d753a75f81e400b2fe40b7817df0acfae36c2d7
+dae_version=unstable-20260824.r1142.ec957346
+honk_version=0.0.1-alpha
+honk_config_sha256=959969bcd4d27e31b25279046f0b7e4622fb231f156a027521d191cc60436a95
+dae_config_sha256=b2faf384e8519d666ce8013dab02cdffbd30ab8a25fbf38d213a300bc62990c6
+harness_sha256=ec18271639b8b34538e5cfe3ab392acabc16a7dbfc66d68f8b3bf75c87d9c11d
+collector_sha256=aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575
+protocols=hy2,tuic,ss2022,trojan,anytls-sb,anytls-go
+
+[arm64]
+host=10.10.10.118
+hostname=OpenWrt
+arch=aarch64
+kernel=6.12.94
+wan_interface=eth0
+honk_sha256=123c2e33fbab5943874bfae78154c2e84104d22d21c01dc5b0e3a80ab93720f4
+dae_sha256=a4213cd7d4edd3d780af5f4429e63782573a1e22f074389f1157c82c018e9f53
+dae_version=unstable-20260824.r1142.ec957346
+honk_version=0.0.1-alpha
+honk_config_sha256=5b7048c2831512eef4e8c8acda8b503fd6788a7defdfce0f5833df129382f90b
+dae_config_sha256=95be27966ed8a95b798d49ed2b9d9f7f5d05abc089737324b403c701cc269740
+harness_sha256=6d650f4f52a943bb2732aa99907c194f90730a1115d4be245a2cd48d989cffdc
+collector_sha256=aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575
+protocols=hy2,tuic,ss2022,trojan
+kdae_config=bench/dae-lab-arm.dae
+kdae_config_changes=eth0; disable_waiting_network=true
+namespace_holder=enabled for the complete run
+
+[artifacts]
+x86_standard_sha256=212845490c0e39ac7de657b2f382c3e43d0305f38f211613b010e0193f7dae9a
+x86_stability_sha256=d4d5f65d44d59a8530c0e995b1027456879df27092fc854f2ba1a5962b0a5709
+arm64_standard_sha256=a944939dd6974ab9fbb96ac53c75fb07d9ab038657d87194db69c07d48ae7da7
+arm64_stability_sha256=2646cdc728a20b3d353fdc7b0d15934b53202d469cce02aa48dcc269dfcedf92
+
+[notes]
+The x86 run used the pre-holder harness revision ec182716; the holder change is ARM namespace lifecycle only and does not alter measurement formulas.
+ARM production honk was restarted after the run; benchmark-created veth/netns/firewall/NAT resources were removed.
+UDP Mbps/loss values use a fixed 10 Gbit/s offered load and are saturation measurements, not internet loss rates.

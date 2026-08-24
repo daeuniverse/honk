@@ -1,0 +1,250 @@
+time="Aug 25 00:36:17" level=info msg="Include config files: [/root/dae-lab.dae]"
+time="Aug 25 00:36:17" level=info msg="Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)"
+time="Aug 25 00:36:17" level=warning msg="so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture"
+time="Aug 25 00:36:17" level=info msg="purging stale TC filters before startup"
+time="Aug 25 00:36:17" level=info msg="Building control plane and routing rules..."
+time="Aug 25 00:36:17" level=info msg="Kernel v6.12.94 supports Netkit, attempting to create Netkit device pair"
+time="Aug 25 00:36:17" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)"
+time="Aug 25 00:36:17" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer using netlink API"
+time="Aug 25 00:36:17" level=info msg="Successfully created Netkit device pair (performance mode)"
+time="Aug 25 00:36:17" level=info msg="Loading eBPF programs and maps into the kernel..."
+time="Aug 25 00:36:17" level=info msg="The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure."
+time="Aug 25 00:36:17" level=info msg="Safely enabled bpf_redirect_peer() (kernel v6.12.94, netkit+scrub=NONE)"
+time="Aug 25 00:36:17" level=warning msg="Kernel does not support bpf_get_current_task helper: FnGetCurrentTask for program type CGroupSockAddr not supported; process names may be truncated or less accurate (degraded to bpf_get_current_comm)"
+time="Aug 25 00:36:18" level=info msg="Loaded eBPF programs and maps"
+time="Aug 25 00:36:18" level=warning msg="AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on."
+time="Aug 25 00:36:18" level=info msg="Optimizing and loading routing rules (this may take a while for large rule sets)..."
+time="Aug 25 00:36:18" level=info msg="Building routing matcher..."
+time="Aug 25 00:36:18" level=info msg="Loading routing rules into kernel space (BPF)..."
+time="Aug 25 00:36:18" level=info msg="Routing match set len: 17/1024"
+time="Aug 25 00:36:18" level=info msg="Building userspace routing matcher..."
+time="Aug 25 00:36:18" level=info msg="Health check will only verify 5 outbounds referenced by routing rules: [ss2022 trojan direct hy2 tuic]"
+time="Aug 25 00:36:18" level=info msg="Memory usage after routing build: Alloc=2MiB, Sys=33MiB, HeapObjects=11681"
+time="Aug 25 00:36:18" level=info msg="Bind to LAN: veth-lab"
+time="Aug 25 00:36:18" level=info msg="Bind to WAN: eth0"
+time="Aug 25 00:36:18" level=info msg="Control plane built in 1.20784469s"
+time="Aug 25 00:36:18" level=info msg="Total startup time: 1.208285994s"
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53764 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53766 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53772 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53786 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53792 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53796 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53802 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53816 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53832 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53834 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53840 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53852 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:20" level=info msg="192.168.222.2:53858 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:21" level=info msg="192.168.222.2:53868 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:21" level=info msg="192.168.222.2:53884 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:21" level=info msg="192.168.222.2:53900 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:21" level=info msg="192.168.222.2:51484 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:21" level=info msg="192.168.222.2:51496 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:30" level=info msg="192.168.222.2:37066 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:30" level=info msg="192.168.222.2:37074 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:38" level=info msg="192.168.222.2:55730 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:38" level=info msg="192.168.222.2:55738 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:47" level=info msg="192.168.222.2:38304 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:47" level=info msg="192.168.222.2:38308 <-> 10.10.10.70:5202" dialer=tuic dscp=0 ip="10.10.10.70:5202" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:49" level=info msg="192.168.222.2:42562 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:49" level=info msg="192.168.222.2:42566 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:50" level=info msg="192.168.222.2:42570 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:50" level=info msg="192.168.222.2:42578 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:50" level=info msg="192.168.222.2:42582 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:50" level=info msg="192.168.222.2:42590 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:51" level=info msg="192.168.222.2:42594 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:51" level=info msg="192.168.222.2:42610 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:51" level=info msg="192.168.222.2:42622 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:51" level=info msg="192.168.222.2:42626 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:52" level=info msg="192.168.222.2:42634 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:52" level=info msg="192.168.222.2:42640 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:52" level=info msg="192.168.222.2:41978 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:52" level=info msg="192.168.222.2:41990 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:53" level=info msg="192.168.222.2:41994 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:53" level=info msg="192.168.222.2:42006 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:53" level=info msg="192.168.222.2:42016 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:53" level=info msg="192.168.222.2:42020 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:54" level=info msg="192.168.222.2:42022 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:54" level=info msg="192.168.222.2:42030 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:54" level=info msg="192.168.222.2:42038 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:54" level=info msg="192.168.222.2:42044 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:55" level=info msg="192.168.222.2:42048 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:55" level=info msg="192.168.222.2:42054 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:55" level=info msg="192.168.222.2:42060 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:55" level=info msg="192.168.222.2:42062 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:56" level=info msg="192.168.222.2:42068 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:56" level=info msg="192.168.222.2:42076 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:56" level=info msg="192.168.222.2:42080 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:56" level=info msg="192.168.222.2:42092 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:57" level=info msg="192.168.222.2:42106 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:57" level=info msg="192.168.222.2:42110 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:57" level=info msg="192.168.222.2:42122 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:57" level=info msg="192.168.222.2:42136 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:58" level=info msg="192.168.222.2:42142 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:58" level=info msg="192.168.222.2:42156 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:58" level=info msg="192.168.222.2:42164 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:58" level=info msg="192.168.222.2:42176 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:59" level=info msg="192.168.222.2:42190 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:59" level=info msg="192.168.222.2:42206 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:59" level=info msg="192.168.222.2:42208 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:36:59" level=info msg="192.168.222.2:42214 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:00" level=info msg="192.168.222.2:42226 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:00" level=info msg="192.168.222.2:42236 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:00" level=info msg="192.168.222.2:42252 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:00" level=info msg="192.168.222.2:42266 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:01" level=info msg="192.168.222.2:42278 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:01" level=info msg="192.168.222.2:42280 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:01" level=info msg="192.168.222.2:42288 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:01" level=info msg="192.168.222.2:42298 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:02" level=info msg="192.168.222.2:42310 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:02" level=info msg="192.168.222.2:42316 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:02" level=info msg="192.168.222.2:41068 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:02" level=info msg="192.168.222.2:41076 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:03" level=info msg="192.168.222.2:41080 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:03" level=info msg="192.168.222.2:41086 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:03" level=info msg="192.168.222.2:41096 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:03" level=info msg="192.168.222.2:41106 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:04" level=info msg="192.168.222.2:41114 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:04" level=info msg="192.168.222.2:41118 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:04" level=info msg="192.168.222.2:41120 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:04" level=info msg="192.168.222.2:41134 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:05" level=info msg="192.168.222.2:41136 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:05" level=info msg="192.168.222.2:41148 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:05" level=info msg="192.168.222.2:41162 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:05" level=info msg="192.168.222.2:41164 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:06" level=info msg="192.168.222.2:41174 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:06" level=info msg="192.168.222.2:41186 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:06" level=info msg="192.168.222.2:41192 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:06" level=info msg="192.168.222.2:41208 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:07" level=info msg="192.168.222.2:41216 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:07" level=info msg="192.168.222.2:41226 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:07" level=info msg="192.168.222.2:41230 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:07" level=info msg="192.168.222.2:41240 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:08" level=info msg="192.168.222.2:41248 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:08" level=info msg="192.168.222.2:41254 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:08" level=info msg="192.168.222.2:41258 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:08" level=info msg="192.168.222.2:41272 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:09" level=info msg="192.168.222.2:41282 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:09" level=info msg="192.168.222.2:41288 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:09" level=info msg="192.168.222.2:41294 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:09" level=info msg="192.168.222.2:41304 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:10" level=info msg="192.168.222.2:41312 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:10" level=info msg="192.168.222.2:41322 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:10" level=info msg="192.168.222.2:41328 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:10" level=info msg="192.168.222.2:41340 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:11" level=info msg="192.168.222.2:41344 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:11" level=info msg="192.168.222.2:41346 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:11" level=info msg="192.168.222.2:41354 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:11" level=info msg="192.168.222.2:41366 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:12" level=info msg="192.168.222.2:41380 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:12" level=info msg="192.168.222.2:41390 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:12" level=info msg="192.168.222.2:57704 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:12" level=info msg="192.168.222.2:57708 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:13" level=info msg="192.168.222.2:57720 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:13" level=info msg="192.168.222.2:57730 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:13" level=info msg="192.168.222.2:57744 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:13" level=info msg="192.168.222.2:57750 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:14" level=info msg="192.168.222.2:57754 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:14" level=info msg="192.168.222.2:57764 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:14" level=info msg="192.168.222.2:57774 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:14" level=info msg="192.168.222.2:57790 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:15" level=info msg="192.168.222.2:57794 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:15" level=info msg="192.168.222.2:57800 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:15" level=info msg="192.168.222.2:57802 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:15" level=info msg="192.168.222.2:57814 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:16" level=info msg="192.168.222.2:57830 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:16" level=info msg="192.168.222.2:57836 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:16" level=info msg="192.168.222.2:57844 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:16" level=info msg="192.168.222.2:57860 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:17" level=info msg="192.168.222.2:57874 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:17" level=info msg="192.168.222.2:57890 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:17" level=info msg="192.168.222.2:57904 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:17" level=info msg="192.168.222.2:57906 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:18" level=info msg="192.168.222.2:57918 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:18" level=info msg="192.168.222.2:57926 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:18" level=info msg="192.168.222.2:57928 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:18" level=info msg="192.168.222.2:57944 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:19" level=info msg="192.168.222.2:57956 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:19" level=info msg="192.168.222.2:57960 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:19" level=info msg="192.168.222.2:57974 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:19" level=info msg="192.168.222.2:57984 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:20" level=info msg="192.168.222.2:57992 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:20" level=info msg="192.168.222.2:57998 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:20" level=info msg="192.168.222.2:58014 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:20" level=info msg="192.168.222.2:58026 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:21" level=info msg="192.168.222.2:58040 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:21" level=info msg="192.168.222.2:58042 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:21" level=info msg="192.168.222.2:58054 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:21" level=info msg="192.168.222.2:58070 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:22" level=info msg="192.168.222.2:58082 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:22" level=info msg="192.168.222.2:58096 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:22" level=info msg="192.168.222.2:40474 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:22" level=info msg="192.168.222.2:40486 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:23" level=info msg="192.168.222.2:40488 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:23" level=info msg="192.168.222.2:40496 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:23" level=info msg="192.168.222.2:40508 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:23" level=info msg="192.168.222.2:40522 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:24" level=info msg="192.168.222.2:40528 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:24" level=info msg="192.168.222.2:40536 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:24" level=info msg="192.168.222.2:40552 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:24" level=info msg="192.168.222.2:40554 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:25" level=info msg="192.168.222.2:40562 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:25" level=info msg="192.168.222.2:40566 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:25" level=info msg="192.168.222.2:40572 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:25" level=info msg="192.168.222.2:40588 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:26" level=info msg="192.168.222.2:40592 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:26" level=info msg="192.168.222.2:40598 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:26" level=info msg="192.168.222.2:40606 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:26" level=info msg="192.168.222.2:40610 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:27" level=info msg="192.168.222.2:40620 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:27" level=info msg="192.168.222.2:40630 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:27" level=info msg="192.168.222.2:40642 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:27" level=info msg="192.168.222.2:40646 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:28" level=info msg="192.168.222.2:40660 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:28" level=info msg="192.168.222.2:40672 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:28" level=info msg="192.168.222.2:40686 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:28" level=info msg="192.168.222.2:40702 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:29" level=info msg="192.168.222.2:40706 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:29" level=info msg="192.168.222.2:40708 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:29" level=info msg="192.168.222.2:40716 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:29" level=info msg="192.168.222.2:40720 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:30" level=info msg="192.168.222.2:40734 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:30" level=info msg="192.168.222.2:40736 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:30" level=info msg="192.168.222.2:40742 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:30" level=info msg="192.168.222.2:40746 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:31" level=info msg="192.168.222.2:40760 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:31" level=info msg="192.168.222.2:40770 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:31" level=info msg="192.168.222.2:40776 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:31" level=info msg="192.168.222.2:40790 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:32" level=info msg="192.168.222.2:40802 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:32" level=info msg="192.168.222.2:40816 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:32" level=info msg="192.168.222.2:58700 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:32" level=info msg="192.168.222.2:58702 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:33" level=info msg="192.168.222.2:58710 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:33" level=info msg="192.168.222.2:58726 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:33" level=info msg="192.168.222.2:58740 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:33" level=info msg="192.168.222.2:58754 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:34" level=info msg="192.168.222.2:58764 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:34" level=info msg="192.168.222.2:58770 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:34" level=info msg="192.168.222.2:58780 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:34" level=info msg="192.168.222.2:58792 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:35" level=info msg="192.168.222.2:58802 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:35" level=info msg="192.168.222.2:58814 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:35" level=info msg="192.168.222.2:58816 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:35" level=info msg="192.168.222.2:58826 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:36" level=info msg="192.168.222.2:58840 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:36" level=info msg="192.168.222.2:58844 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:36" level=info msg="192.168.222.2:58848 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:36" level=info msg="192.168.222.2:58850 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:37" level=info msg="192.168.222.2:58856 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:37" level=info msg="192.168.222.2:58860 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:37" level=info msg="192.168.222.2:58872 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:37" level=info msg="192.168.222.2:58884 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:38" level=info msg="192.168.222.2:58894 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:38" level=info msg="192.168.222.2:58896 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:38" level=info msg="192.168.222.2:58906 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:38" level=info msg="192.168.222.2:58918 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:39" level=info msg="192.168.222.2:58926 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
+time="Aug 25 00:37:39" level=info msg="192.168.222.2:58928 <-> 10.10.10.70:8002" dialer=tuic dscp=0 ip="10.10.10.70:8002" mac="12:3a:09:74:8e:3f" network=tcp4 outbound=tuic pname= policy=fixed sniffed=
