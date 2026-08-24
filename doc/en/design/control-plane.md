@@ -99,7 +99,7 @@ At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the a
 | Transient outbound dials | 1024 | 1 each = 1024 |
 | UDP endpoints | 7765 | 3 each = 23,295 |
 | **Total** |  | **32,767** |
-The remaining descriptor is partition-rounding slack. TCP starts with the descriptor-derived floor and elastically borrows idle non-TCP descriptor headroom up to twice that floor, while retaining half of the non-TCP budget as burst reserve. The admission semaphore keeps one extra slot for the listener while it waits for the next connection; that slot is not counted in the flow limit. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
+The remaining descriptor is partition-rounding slack. TCP starts with the descriptor-derived floor and elastically borrows idle non-TCP descriptor headroom up to twice that floor, while retaining half of the non-TCP budget as burst reserve; a 4,096-descriptor service can scale from 160 to 320 flow permits while that headroom is idle. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
 
 A TCP flow budgets the accepted socket, outbound socket, and two two-FD splice pipes. A UDP endpoint budgets the worst common ownership shape: relay socket, SOCKS5 control stream, and anyfrom reply socket. Smaller `RLIMIT_NOFILE` values scale the same partition with saturating arithmetic.
 
@@ -114,7 +114,7 @@ Admission ceilings are distinct:
 
 There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The endpoint-removal channel is bounded to 1024 messages and drains in batches of 128. If nonblocking delivery finds it full, a deduplicating `removal_dirty` set retains compensation; the worker flushes that set after each batch before acknowledging exact endpoint tombstones.
 
-Transparent TCP reserves one shared semaphore slot before either IP-family listener accepts. The semaphore has one additional listener slot, so the configured flow limit remains available for active flows. When all flow permits are occupied, new connections remain in the kernel listen backlog instead of being accepted and closed with unread data. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
+Transparent TCP waits for either IP-family listener to become readable before reserving a shared flow permit, then completes the accept with a nonblocking syscall. An idle listener therefore consumes no flow capacity, while connections that arrive at the limit remain in the kernel listen backlog. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
 
 ## TCP relay and conn-state ownership
 

@@ -17,7 +17,10 @@ fn set_ip_transparent(socket: &Socket, is_v6: bool) -> io::Result<()> {
 /// Real mode creates and configures the socket inside daens. Mock mode binds
 /// an ordinary host-netns listener so the process remains runnable without
 /// `CAP_NET_ADMIN`; no datapath can deliver transparent traffic in that mode.
-pub(super) fn bind_tproxy_tcp(addr: SocketAddr, _mark: u32) -> anyhow::Result<TcpListener> {
+pub(super) fn bind_tproxy_tcp(
+    addr: SocketAddr,
+    _mark: u32,
+) -> anyhow::Result<std::net::TcpListener> {
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
         return crate::with_daens_netns("bind TPROXY TCP listener", || {
@@ -36,7 +39,7 @@ fn daens_netns_exists() -> bool {
     crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
 }
 
-fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<TcpListener> {
+fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -63,7 +66,7 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<TcpLi
     socket.bind(&addr.into())?;
     socket.listen(128)?;
 
-    Ok(TcpListener::from_std(socket.into())?)
+    Ok(socket.into())
 }
 
 /// Clear the inherited bypass mark on an accepted transparent socket.

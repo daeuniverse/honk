@@ -260,7 +260,7 @@ impl ControlPlane {
             outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
-                super::tcp_admission_capacity(resource_budget.active_tcp_flows),
+                resource_budget.active_tcp_flows,
             )),
             udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.udp_slow_path,
