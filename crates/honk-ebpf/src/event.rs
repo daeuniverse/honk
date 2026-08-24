@@ -37,23 +37,3 @@ pub fn send_dae_event(
 
     EVENT_RINGBUF.output(e, 0).map(|_| 0).unwrap_or(-1)
 }
-
-/// Ask userspace to resolve a socket's process name when kernel argv access
-/// is unavailable. The request keeps the existing DaeEvent ABI: the 64-bit
-/// socket cookie occupies the first two `sip` words for this event kind.
-#[inline(always)]
-pub fn send_pname_resolve(cookie: u64, pid: u32) -> i32 {
-    let mut event: DaeEvent = unsafe { core::mem::zeroed() };
-    event.timestamp = unsafe { bpf_ktime_get_ns() };
-    event.type_ = honk_ebpf_common::event::DaeEventType::PnameResolve as u32;
-    event.pid = pid;
-    event.sip[0] = cookie as u32;
-    event.sip[1] = (cookie >> 32) as u32;
-    let _ = unsafe {
-        aya_ebpf_bindings::helpers::bpf_get_current_comm(
-            event.pname.as_mut_ptr() as *mut aya_ebpf_cty::c_void,
-            event.pname.len() as u32,
-        )
-    };
-    EVENT_RINGBUF.output(event, 0).map(|_| 0).unwrap_or(-1)
-}

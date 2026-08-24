@@ -11,7 +11,7 @@ impl RealEbpfBackend {
         single_homed: bool,
     ) -> anyhow::Result<Self> {
         let process_name_offsets = process_name::detect();
-        let mut pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
+        let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
         let dae0_ifindex = std::fs::read_to_string("/sys/class/net/dae0/ifindex")
@@ -145,28 +145,12 @@ impl RealEbpfBackend {
                 debug!("pinned '{}'", name);
             }
         }
-        let mut pname_map = None;
-        if matches!(pname_mode, process_name::PnameCaptureMode::Userspace) {
-            match open_pname_map(&pin_root.join("COOKIE_PID_MAP")) {
-                Ok(map) => pname_map = Some(map),
-                Err(error) => {
-                    warn!(
-                        "pname ringbuf resolver unavailable; using thread comm: {}",
-                        error
-                    );
-                    pname_mode = process_name::PnameCaptureMode::Comm;
-                }
-            }
-        }
         match pname_mode {
             process_name::PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")
             }
-            process_name::PnameCaptureMode::Userspace => {
-                warn!("kernel argv capture unavailable; resolving names through /proc")
-            }
             process_name::PnameCaptureMode::Comm => {
-                warn!("process-name argv and ringbuf paths unavailable; using thread comm")
+                warn!("kernel argv capture unavailable; using thread comm")
             }
         }
         // Install a complete generation-0 fallback before any TC hook is
@@ -232,15 +216,6 @@ impl RealEbpfBackend {
                             "tproxy_wan_cg_connect6",
                             "tproxy_wan_cg_sendmsg4",
                             "tproxy_wan_cg_sendmsg6",
-                        ],
-                    ),
-                    process_name::PnameCaptureMode::Userspace => (
-                        "tproxy_wan_cg_sock_create_userspace",
-                        [
-                            "tproxy_wan_cg_connect4_userspace",
-                            "tproxy_wan_cg_connect6_userspace",
-                            "tproxy_wan_cg_sendmsg4_userspace",
-                            "tproxy_wan_cg_sendmsg6_userspace",
                         ],
                     ),
                     process_name::PnameCaptureMode::Comm => (
@@ -571,10 +546,7 @@ impl RealEbpfBackend {
                 None
             }
         };
-        // Spawn the DaeEvent consumer for diagnostics and userspace pname
-        // resolution. The map is taken out of the Ebpf object so the task
-        // owns it outright; the pinned copy under pin_root remains for
-        // external inspection.
+        // Spawn the DaeEvent consumer for diagnostics.
         let event_flush_handle = match bpf.take_map("EVENT_RINGBUF") {
             Some(map) => match aya::maps::RingBuf::try_from(map) {
                 Ok(ring_buf) => {
@@ -582,7 +554,7 @@ impl RealEbpfBackend {
                         ring_buf,
                         tokio::io::Interest::READABLE,
                     ) {
-                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(async_fd, pname_map))),
+                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(async_fd))),
                         Err(e) => {
                             warn!(
                                 "DaeEvent ringbuf AsyncFd setup failed (events will not be drained): {}",

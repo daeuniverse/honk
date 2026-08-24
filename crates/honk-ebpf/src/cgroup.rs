@@ -84,49 +84,8 @@ fn update_map_elem_by_cookie_argv0(cookie: u64) -> i32 {
     ret
 }
 
-/// Capture only the TGID and ask userspace to fill the process name.
-#[inline(always)]
-fn update_map_elem_by_cookie_userspace(cookie: u64) -> i32 {
-    if cookie == 0 {
-        return 0;
-    }
 
-    if let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(cookie) {
-        let now = unsafe { bpf_ktime_get_ns() };
-        let entry = unsafe { &mut *ptr };
-        let refresh = now.wrapping_sub(entry.last_seen_ns) >= AUXILIARY_MAP_REFRESH_INTERVAL_NS;
-        if refresh {
-            entry.last_seen_ns = now;
-        }
-        if refresh && entry.pname == [0; honk_ebpf_common::TASK_COMM_LEN] {
-            match crate::event::send_pname_resolve(cookie, entry.pid) {
-                0 => {}
-                _ => fill_thread_comm(entry),
-            }
-        }
-        return 0;
-    }
-
-    let mut value: PIDName = unsafe { mem::zeroed() };
-    init_pid_name(&mut value);
-    let ret = insert_with_comm_fallback(cookie, value);
-    if ret != 0 {
-        return ret;
-    }
-    if crate::event::send_pname_resolve(cookie, value.pid) != 0
-        && let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(cookie)
-    {
-        let entry = unsafe { &mut *ptr };
-        if entry.pid == value.pid && entry.pname == [0; honk_ebpf_common::TASK_COMM_LEN] {
-            fill_thread_comm(entry);
-        }
-    }
-    info!((), target: "honk", "setup_mapping: cookie={} pid={}", cookie, value.pid);
-    0
-}
-
-/// Guaranteed last-resort capture when neither kernel argv access nor the
-/// userspace request channel can be used.
+/// Guaranteed last-resort capture when kernel argv access is unavailable.
 #[inline(always)]
 fn update_map_elem_by_cookie_comm(cookie: u64) -> i32 {
     if cookie == 0 {
@@ -158,12 +117,6 @@ pub fn tproxy_wan_cg_sock_create(ctx: SockContext) -> i32 {
     CGROUP_ALLOW
 }
 
-#[cgroup_sock(sock_create)]
-pub fn tproxy_wan_cg_sock_create_userspace(ctx: SockContext) -> i32 {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock as *mut aya_ebpf_cty::c_void) };
-    update_map_elem_by_cookie_userspace(cookie);
-    CGROUP_ALLOW
-}
 
 #[cgroup_sock(sock_create)]
 pub fn tproxy_wan_cg_sock_create_comm(ctx: SockContext) -> i32 {
@@ -188,12 +141,6 @@ pub fn tproxy_wan_cg_connect4(ctx: SockAddrContext) -> i32 {
     CGROUP_ALLOW
 }
 
-#[cgroup_sock_addr(connect4)]
-pub fn tproxy_wan_cg_connect4_userspace(ctx: SockAddrContext) -> i32 {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
-    update_map_elem_by_cookie_userspace(cookie);
-    CGROUP_ALLOW
-}
 
 #[cgroup_sock_addr(connect4)]
 pub fn tproxy_wan_cg_connect4_comm(ctx: SockAddrContext) -> i32 {
@@ -209,12 +156,6 @@ pub fn tproxy_wan_cg_connect6(ctx: SockAddrContext) -> i32 {
     CGROUP_ALLOW
 }
 
-#[cgroup_sock_addr(connect6)]
-pub fn tproxy_wan_cg_connect6_userspace(ctx: SockAddrContext) -> i32 {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
-    update_map_elem_by_cookie_userspace(cookie);
-    CGROUP_ALLOW
-}
 
 #[cgroup_sock_addr(connect6)]
 pub fn tproxy_wan_cg_connect6_comm(ctx: SockAddrContext) -> i32 {
@@ -230,12 +171,6 @@ pub fn tproxy_wan_cg_sendmsg4(ctx: SockAddrContext) -> i32 {
     CGROUP_ALLOW
 }
 
-#[cgroup_sock_addr(sendmsg4)]
-pub fn tproxy_wan_cg_sendmsg4_userspace(ctx: SockAddrContext) -> i32 {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
-    update_map_elem_by_cookie_userspace(cookie);
-    CGROUP_ALLOW
-}
 
 #[cgroup_sock_addr(sendmsg4)]
 pub fn tproxy_wan_cg_sendmsg4_comm(ctx: SockAddrContext) -> i32 {
@@ -251,12 +186,6 @@ pub fn tproxy_wan_cg_sendmsg6(ctx: SockAddrContext) -> i32 {
     CGROUP_ALLOW
 }
 
-#[cgroup_sock_addr(sendmsg6)]
-pub fn tproxy_wan_cg_sendmsg6_userspace(ctx: SockAddrContext) -> i32 {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
-    update_map_elem_by_cookie_userspace(cookie);
-    CGROUP_ALLOW
-}
 
 #[cgroup_sock_addr(sendmsg6)]
 pub fn tproxy_wan_cg_sendmsg6_comm(ctx: SockAddrContext) -> i32 {

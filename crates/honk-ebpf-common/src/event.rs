@@ -6,13 +6,11 @@ pub enum DaeEventType {
     UdpConnOverflow = 1, // DAE_EVENT_UDP_CONN_OVERFLOW
     TcpConnOverflow = 2, // DAE_EVENT_TCP_CONN_OVERFLOW
     UdpDecisionTokenExhausted = 3,
-    PnameResolve = 4, // userspace argv[0] resolution request
 }
 
 const _DAE_EVENT_TYPE_SIZE: () = assert!(core::mem::size_of::<DaeEventType>() == 4);
 const _UDP_DECISION_TOKEN_EXHAUSTED_EVENT_VALUE: () =
     assert!(DaeEventType::UdpDecisionTokenExhausted as u32 == 3);
-const _PNAME_RESOLVE_EVENT_VALUE: () = assert!(DaeEventType::PnameResolve as u32 == 4);
 
 // Matches the C struct dae_event.
 // Total size 72 bytes, alignment 8 bytes.

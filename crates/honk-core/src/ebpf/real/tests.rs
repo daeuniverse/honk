@@ -271,15 +271,8 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
 
 #[tokio::test]
 #[ignore = "requires root, cgroup v2, and an eBPF build"]
-async fn pname_uses_process_argv0_from_renamed_thread() {
-    if matches!(
-        process_name::select_capture_mode(crate::DEFAULT_BPF_OBJECT, process_name::detect()),
-        process_name::PnameCaptureMode::Comm
-    ) {
-        eprintln!("skipping pname test: argv and userspace capture are unavailable");
-        return;
-    }
-
+async fn pname_is_ready_before_first_packet() {
+    let mode = process_name::select_capture_mode(crate::DEFAULT_BPF_OBJECT, process_name::detect());
     let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-pname-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&pin_root);
     std::fs::create_dir_all(&pin_root).expect("create test pin root");
@@ -295,54 +288,66 @@ async fn pname_uses_process_argv0_from_renamed_thread() {
     .await
     .expect("load backend for pname test");
 
-    let socket = std::thread::Builder::new()
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let worker = std::thread::Builder::new()
         .name("worker-thread".into())
-        .spawn(|| std::net::UdpSocket::bind("127.0.0.1:0").expect("create worker socket"))
-        .expect("spawn named worker")
-        .join()
-        .expect("join named worker");
-    let mut cookie = 0u64;
-    let mut cookie_len = std::mem::size_of::<u64>() as libc::socklen_t;
-    let status = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_COOKIE,
-            &mut cookie as *mut _ as *mut libc::c_void,
-            &mut cookie_len,
-        )
-    };
-    assert_eq!(
-        status,
-        0,
-        "read socket cookie: {}",
-        std::io::Error::last_os_error()
+        .spawn(move || {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("create worker socket");
+            let mut cookie = 0u64;
+            let mut cookie_len = std::mem::size_of::<u64>() as libc::socklen_t;
+            let status = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_COOKIE,
+                    &mut cookie as *mut _ as *mut libc::c_void,
+                    &mut cookie_len,
+                )
+            };
+            assert_eq!(
+                status,
+                0,
+                "read socket cookie: {}",
+                std::io::Error::last_os_error()
+            );
+            ready_tx.send(cookie).expect("publish socket cookie");
+            release_rx.recv().expect("release worker socket");
+            drop(socket);
+        })
+        .expect("spawn named worker");
+    let cookie = ready_rx.recv().expect("receive socket cookie");
+
+    let entry = backend
+        .cookie_pid_lookup(cookie)
+        .expect("look up socket cookie")
+        .expect("pname map entry must exist before the first packet");
+    assert!(
+        entry.pname.iter().any(|byte| *byte != 0),
+        "pname must never be empty at first-packet lookup"
     );
 
-    let actual = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(entry) = backend
-                .cookie_pid_lookup(cookie)
-                .expect("look up socket cookie")
-                && entry.pname.iter().any(|byte| *byte != 0)
-            {
-                break entry.pname;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let expected = match mode {
+        process_name::PnameCaptureMode::Argv0 => {
+            let executable = std::env::current_exe().expect("resolve test executable");
+            let basename = std::os::unix::ffi::OsStrExt::as_bytes(
+                executable.file_name().expect("test executable basename"),
+            );
+            let mut expected = [0u8; TASK_COMM_LEN];
+            let len = basename.len().min(TASK_COMM_LEN - 1);
+            expected[..len].copy_from_slice(&basename[..len]);
+            expected
         }
-    })
-    .await
-    .expect("pname resolver did not publish a name");
-    let executable = std::env::current_exe().expect("resolve test executable");
-    let basename = std::os::unix::ffi::OsStrExt::as_bytes(
-        executable.file_name().expect("test executable basename"),
-    );
-    let mut expected = [0u8; TASK_COMM_LEN];
-    let len = basename.len().min(TASK_COMM_LEN - 1);
-    expected[..len].copy_from_slice(&basename[..len]);
-    assert_eq!(actual, expected);
+        process_name::PnameCaptureMode::Comm => {
+            let mut expected = [0u8; TASK_COMM_LEN];
+            expected[.."worker-thread".len()].copy_from_slice(b"worker-thread");
+            expected
+        }
+    };
+    assert_eq!(entry.pname, expected);
 
-    drop(socket);
+    release_tx.send(()).expect("release worker");
+    worker.join().expect("join named worker");
     backend.detach_hooks().expect("detach pname test hooks");
     backend
         .cleanup()

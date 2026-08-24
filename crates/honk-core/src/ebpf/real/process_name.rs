@@ -11,7 +11,6 @@ const BTF_HEADER_LEN: usize = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PnameCaptureMode {
     Argv0,
-    Userspace,
     Comm,
 }
 
@@ -26,53 +25,36 @@ pub(super) fn select_capture_mode(
         && probe_pair(
             obj,
             offsets,
-            true,
             "tproxy_wan_cg_sock_create",
             "tproxy_wan_cg_connect4",
         )
     {
         return PnameCaptureMode::Argv0;
     }
-    if probe_pair(
-        obj,
-        None,
-        false,
-        "tproxy_wan_cg_sock_create_userspace",
-        "tproxy_wan_cg_connect4_userspace",
-    ) {
-        PnameCaptureMode::Userspace
-    } else {
-        PnameCaptureMode::Comm
-    }
+    PnameCaptureMode::Comm
 }
 
 fn probe_pair(
     obj: &[u8],
     offsets: Option<ProcessNameOffsets>,
-    argv0: bool,
     sock_name: &str,
     sock_addr_name: &str,
 ) -> bool {
     let param = DaeParam {
-        has_bpf_get_current_task: argv0 as u8,
+        has_bpf_get_current_task: 1,
         ..Default::default()
     };
     let task_mm_offset = offsets.map(|value| value.task_mm).unwrap_or_default();
     let mm_arg_start_offset = offsets.map(|value| value.mm_arg_start).unwrap_or_default();
     let mut loader = EbpfLoader::new();
-    loader.override_global("PARAM", &param, true);
-    if argv0 {
-        loader
-            .override_global("TASK_MM_OFFSET", &task_mm_offset, true)
-            .override_global("MM_ARG_START_OFFSET", &mm_arg_start_offset, true);
-    }
+    loader
+        .override_global("PARAM", &param, true)
+        .override_global("TASK_MM_OFFSET", &task_mm_offset, true)
+        .override_global("MM_ARG_START_OFFSET", &mm_arg_start_offset, true);
     let mut bpf = match loader.load(obj) {
         Ok(bpf) => bpf,
         Err(_) => return false,
     };
-    if !argv0 && bpf.map("EVENT_RINGBUF").is_none() {
-        return false;
-    }
     let sock_ok = bpf
         .program_mut(sock_name)
         .and_then(|program| {

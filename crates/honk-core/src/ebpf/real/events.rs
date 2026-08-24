@@ -1,60 +1,5 @@
 use super::*;
-use aya::maps::{HashMap as AyaHashMap, Map as AyaMap, MapData as AyaMapData};
-use honk_ebpf_common::{
-    event::{DaeEvent, DaeEventType},
-    redirect_need::PIDName,
-};
-use std::path::Path;
-
-type PnameMap = AyaHashMap<AyaMapData, u64, PIDName>;
-
-pub fn open_pname_map(path: &Path) -> anyhow::Result<PnameMap> {
-    let data = AyaMapData::from_pin(path)
-        .map_err(|error| anyhow::anyhow!("open pname map '{}': {error}", path.display()))?;
-    AyaHashMap::try_from(
-        AyaMap::from_map_data(data)
-            .map_err(|error| anyhow::anyhow!("open pname map '{}': {error}", path.display()))?,
-    )
-    .map_err(|error| anyhow::anyhow!("open pname map '{}': {error}", path.display()))
-}
-
-fn process_name_from_cmdline(command: &[u8]) -> Option<[u8; honk_ebpf_common::TASK_COMM_LEN]> {
-    let argv0 = command.split(|byte| *byte == 0).next()?;
-    let name = argv0.rsplit(|byte| *byte == b'/').next()?;
-    if name.is_empty() {
-        return None;
-    }
-    let mut pname = [0; honk_ebpf_common::TASK_COMM_LEN];
-    let len = name.len().min(pname.len().saturating_sub(1));
-    pname[..len].copy_from_slice(&name[..len]);
-    Some(pname)
-}
-
-fn read_process_name(pid: u32) -> Option<[u8; honk_ebpf_common::TASK_COMM_LEN]> {
-    let command = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    process_name_from_cmdline(&command)
-}
-
-fn resolve_process_name(map: &mut PnameMap, event: &DaeEvent) {
-    let cookie = (event.sip[0] as u64) | ((event.sip[1] as u64) << 32);
-    let mut entry = match map.get(&cookie, 0) {
-        Ok(entry) => entry,
-        Err(_) => return,
-    };
-    if entry.pid != event.pid || entry.pname.iter().any(|byte| *byte != 0) {
-        return;
-    }
-    let Some(pname) = read_process_name(event.pid).or_else(|| {
-        let pname = event.pname;
-        pname.iter().any(|byte| *byte != 0).then_some(pname)
-    }) else {
-        return;
-    };
-    entry.pname = pname;
-    if let Err(error) = map.insert(cookie, entry, 0) {
-        debug!(target: "honk-ebpf", cookie, error = %error, "could not publish process name");
-    }
-}
+use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
 /// Format a `DaeEvent` IP field — four u32 chunks of a 16-byte address in
 /// network order, IPv4-mapped for v4 flows — as an `IpAddr` for logging.
@@ -75,10 +20,9 @@ pub fn event_ip(chunks: &[u32; 4]) -> std::net::IpAddr {
 /// so a conntrack overflow burst cannot storm the log.
 pub const EVENT_LOG_MAX_PER_SEC: u32 = 32;
 
-/// Drain `EVENT_RINGBUF` into rate-limited structured logs and pname updates.
+/// Drain `EVENT_RINGBUF` into rate-limited structured logs.
 pub async fn consume_dae_events(
     mut async_fd: tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>,
-    mut pname_map: Option<PnameMap>,
 ) {
     let mut window = std::time::Instant::now();
     let mut emitted: u32 = 0;
@@ -100,12 +44,6 @@ pub async fn consume_dae_events(
                 }
                 let ev: DaeEvent =
                     unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DaeEvent) };
-                if ev.type_ == DaeEventType::PnameResolve as u32 {
-                    if let Some(map) = pname_map.as_mut() {
-                        resolve_process_name(map, &ev);
-                    }
-                    continue;
-                }
                 if window.elapsed() >= std::time::Duration::from_secs(1) {
                     if suppressed > 0 {
                         warn!(
@@ -153,21 +91,5 @@ pub async fn consume_dae_events(
             }
         }
         guard.clear_ready();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::process_name_from_cmdline;
-
-    #[test]
-    fn process_name_uses_argv0_basename() {
-        let name = process_name_from_cmdline(b"/usr/bin/python3\0worker\0").unwrap();
-        assert_eq!(&name[..8], b"python3\0");
-        assert!(name[8..].iter().all(|byte| *byte == 0));
-
-        let name = process_name_from_cmdline(b"/tmp/abcdefghijklmnop\0").unwrap();
-        assert_eq!(&name[..15], b"abcdefghijklmno");
-        assert_eq!(name[15], 0);
     }
 }
