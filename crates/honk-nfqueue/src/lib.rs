@@ -24,6 +24,23 @@ pub const NFQUEUE_PENDING_MARK: u32 = 0x8000_0000;
 pub const NFQUEUE_SIGNATURE_MARK: u32 = 0xc000_0000;
 pub const NFQUEUE_TOKEN_MASK: u32 = 0x3fff_ffff;
 
+#[derive(Debug, thiserror::Error)]
+pub enum PreflightError {
+    #[error("NFQUEUE netlink unavailable: {0}")]
+    Queue(#[source] io::Error),
+    #[error("NFQUEUE {QUEUE_NUM} is already bound")]
+    QueueBusy,
+}
+
+/// Check fixed queue ownership before binding. The process-wide honk lock
+/// reserves the nftables names; installation reclaims stale owned state.
+pub fn preflight() -> Result<(), PreflightError> {
+    queue::preflight().map_err(|error| match error {
+        queue::QueueError::Busy => PreflightError::QueueBusy,
+        queue::QueueError::Io(error) => PreflightError::Queue(error),
+    })
+}
+
 pub type PacketCallback = Arc<dyn Fn(QueuedPacket, VerdictGuard) + Send + Sync + 'static>;
 pub type FatalReceiver = tokio::sync::oneshot::Receiver<FatalError>;
 

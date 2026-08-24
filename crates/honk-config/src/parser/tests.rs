@@ -27,6 +27,7 @@ global {
     log_level: info
     log_file: '/var/log/honk/honk.log'
     dial_mode: domain
+    nfqueue_enable: false
 }
 "#;
         let config = parse_dae_config(input).unwrap();
@@ -34,6 +35,8 @@ global {
         assert_eq!(config.global.log_level, "info");
         assert_eq!(config.global.log_file, "/var/log/honk/honk.log");
         assert_eq!(config.global.dial_mode, "domain");
+        assert!(!config.global.nfqueue_enable);
+        assert!(parse_dae_config("global {}").unwrap().global.nfqueue_enable);
     }
 
     #[test]
@@ -644,9 +647,6 @@ experimental {
         store_fakeip: true
         store_dns: true
     }
-    udp_nfqueue {
-        enabled: true
-    }
 }
 "#;
         let config = parse_dae_config(input).unwrap();
@@ -662,28 +662,96 @@ experimental {
         assert_eq!(config.experimental.cache_file.cache_id, "router1");
         assert!(config.experimental.cache_file.store_fakeip);
         assert!(config.experimental.cache_file.store_dns);
-        assert!(config.experimental.udp_nfqueue.enabled);
-
-        let defaulted = parse_dae_config("experimental {\n    udp_nfqueue {\n    }\n}").unwrap();
-        assert!(!defaulted.experimental.udp_nfqueue.enabled);
     }
 
     #[test]
-    fn test_udp_nfqueue_rejects_unknown_or_invalid_settings() {
-        for input in [
-            "experimental {\n    other {\n        enabled: true\n    }\n}",
-            "experimental {\n    udp_nfqueue {\n        workers: 4\n    }\n}",
-            "experimental {\n    udp_nfqueue {\n        enabled: maybe\n    }\n}",
+    fn test_legacy_nfqueue_setting_migrates_to_global() {
+        for (enabled, expected) in [("true", true), ("false", false), ("", false)] {
+            let input = if enabled.is_empty() {
+                "experimental {\n    udp_nfqueue {\n    }\n}".to_string()
+            } else {
+                format!(
+                    "experimental {{\n    udp_nfqueue {{\n        enabled: {enabled}\n    }}\n}}"
+                )
+            };
+            let config = parse_dae_config(&input).unwrap();
+            assert_eq!(config.global.nfqueue_enable, expected);
+        }
+
+        let structured =
+            crate::Config::from_json_str(r#"{"experimental":{"udp_nfqueue":{"enabled":true}}}"#)
+                .unwrap();
+        assert!(structured.global.nfqueue_enable);
+        assert!(!structured.to_json_string().unwrap().contains("udp_nfqueue"));
+        for (suffix, body) in [
+            (".toml", "[experimental.udp_nfqueue]\nenabled = false\n"),
+            (
+                ".yaml",
+                "experimental:\n  udp_nfqueue:\n    enabled: true\n",
+            ),
         ] {
-            let error = parse_dae_config(input).expect_err("unsupported NFQUEUE config must fail");
+            let file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            std::fs::write(file.path(), body).unwrap();
+            let loaded = crate::Config::from_file(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(loaded.global.nfqueue_enable, suffix == ".yaml");
+        }
+
+        for input in [
+            "experimental {\n    udp_nfqueue {\n        enabled: maybe\n    }\n}",
+            "experimental {\n    udp_nfqueue {\n        workers: 4\n    }\n}",
+        ] {
+            let error =
+                parse_dae_config(input).expect_err("invalid legacy NFQUEUE config must fail");
             assert!(matches!(error, crate::ConfigError::Parse(_)), "{error}");
         }
 
-        let error = crate::Config::from_json_str(
-            r#"{"experimental":{"udp_nfqueue":{"enabled":true,"workers":4}}}"#,
-        )
-        .expect_err("structured config must expose only enabled");
+        let error =
+            crate::Config::from_json_str(r#"{"experimental":{"udp_nfqueue":{"workers":4}}}"#)
+                .expect_err("unknown structured legacy NFQUEUE setting must fail");
         assert!(matches!(error, crate::ConfigError::Parse(_)));
+
+        let config = crate::Config::from_json_str(r#"{"global":{"nfqueue_enable":false}}"#)
+            .expect("structured global NFQUEUE setting");
+        assert!(!config.global.nfqueue_enable);
+    }
+
+    #[test]
+    fn test_canonical_nfqueue_setting_wins_over_legacy() {
+        let dae = parse_dae_config(
+            "global {\n    nfqueue_enable: false\n}\nexperimental {\n    udp_nfqueue {\n        enabled: true\n    }\n}",
+        )
+        .unwrap();
+        assert!(!dae.global.nfqueue_enable);
+
+        let dae = parse_dae_config(
+            "global {\n    nfqueue_enable: true\n}\nexperimental {\n    udp_nfqueue {\n        enabled: false\n    }\n}",
+        )
+        .unwrap();
+        assert!(dae.global.nfqueue_enable);
+
+        let json = crate::Config::from_json_str(
+            r#"{"global":{"nfqueue_enable":false},"experimental":{"udp_nfqueue":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(!json.global.nfqueue_enable);
+
+        for (suffix, body, expected) in [
+            (
+                ".toml",
+                "[global]\nnfqueue_enable = false\n[experimental.udp_nfqueue]\nenabled = true\n",
+                false,
+            ),
+            (
+                ".yaml",
+                "global:\n  nfqueue_enable: true\nexperimental:\n  udp_nfqueue:\n    enabled: false\n",
+                true,
+            ),
+        ] {
+            let file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            std::fs::write(file.path(), body).unwrap();
+            let loaded = crate::Config::from_file(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(loaded.global.nfqueue_enable, expected, "{suffix}");
+        }
     }
 }
 
@@ -992,6 +1060,21 @@ fn test_dae_dns_rules_are_not_silently_dropped_by_structured_writer() {
     assert!(matches!(error, crate::ConfigError::Serialization(_)));
     assert!(error.to_string().contains("dns.routing.request"));
     assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "original");
+}
+
+#[test]
+fn test_dae_writer_rejects_dae_extension_without_touching_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.dae");
+    let source = "# keep this comment\nglobal {\n    log_level: debug\n}\n";
+    let config = parse_dae_config(source).unwrap();
+    std::fs::write(&path, source).unwrap();
+
+    let error = config.to_file(path.to_str().unwrap()).unwrap_err();
+
+    assert!(matches!(error, crate::ConfigError::Serialization(_)));
+    assert!(error.to_string().contains("refusing to rewrite .dae"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
 }
 
 #[test]

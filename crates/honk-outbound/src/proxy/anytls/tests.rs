@@ -295,6 +295,45 @@ fn test_resolve_password_fallback() {
 }
 
 #[tokio::test]
+async fn stalled_tls_session_dial_respects_its_own_deadline() {
+    // Given: the proxy accepts TCP but never sends a TLS ServerHello.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket_addr = listener.local_addr().unwrap();
+    let address = socket_addr.to_string();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let node = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "stalled-tls".into(),
+        protocol: NodeProtocol::AnyTLS,
+        address: address.clone(),
+        host: socket_addr.ip().to_string(),
+        port: socket_addr.port(),
+        sni: Some("localhost".into()),
+        skip_cert_verify: true,
+        ..Default::default()
+    };
+
+    // When: a pool-owned physical AnyTLS session dial reaches that server.
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        dial_session(&node, &address, Duration::from_millis(50), None),
+    )
+    .await;
+    server.abort();
+
+    // Then: the dial itself expires instead of relying on caller cancellation.
+    let outcome = result.expect("the AnyTLS dial must enforce an internal deadline");
+    let error = outcome.err().expect("the stalled TLS dial must fail");
+    assert!(
+        error.to_string().contains("AnyTLS session dial timed out"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn test_writer_batch_encoding_matches_sequential_frames() {
     let q = WriterQueue::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(2));
@@ -983,7 +1022,7 @@ async fn test_registration_commit_moves_permit() {
     };
     let permit = guard.commit();
     assert_eq!(session.active_streams(), 1);
-    session.end_stream(sid, false).await;
+    session.end_stream(sid, false);
     assert_eq!(
         session.active_streams(),
         1,
@@ -1036,6 +1075,7 @@ async fn test_synack_with_data_surfaces_open_error() {
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
     assert!(err.to_string().contains("refused"));
     assert!(!session.is_closed(), "target refusal keeps the session");
+    assert!(!session.streams.lock().unwrap().contains_key(&stream.sid));
 }
 
 #[tokio::test]
@@ -1052,7 +1092,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
         .overflow
         .lock()
         .push_back(31, StreamEvent::Data(vec![1; 17]));
-    session.end_stream(31, false).await;
+    session.end_stream(31, false);
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 
     let (drop_tx, _drop_rx) = mpsc::channel(STREAM_QUEUE_CAP);
@@ -1530,6 +1570,144 @@ async fn overflow_preserves_data_before_fin() {
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 }
 
+/// A FIN delivered through a sender cloned before watchdog retirement must
+/// preserve the stream reset instead of turning the retirement into EOF.
+#[tokio::test]
+async fn stale_remote_fin_after_overflow_kill_is_reset() {
+    let (session, _server) = establish_test_session("127.0.0.1:443").await;
+    let sid = 82;
+    let (tx, rx) = mpsc::channel(1);
+    tx.try_send(StreamEvent::Data(vec![1])).unwrap();
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let permit = session.try_reserve().unwrap();
+    let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
+
+    let stale_tx = match session.streams.lock().unwrap().get(&sid).cloned() {
+        Some(StreamSink::Tcp(tx)) => tx,
+        _ => panic!("registered TCP stream"),
+    };
+    session.dispatch_data(sid, vec![2]).await;
+    session.dispatch_fin(sid).await;
+    assert!(session.remote_fin.lock().contains(&sid));
+
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    session.kill_overflow_victim(victim);
+    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+
+    let mut byte = [0u8; 1];
+    stream.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, [1]);
+    stale_tx.try_send(StreamEvent::Fin).unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .expect("stale FIN read")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
+    session.close();
+}
+
+#[tokio::test]
+async fn killed_stream_tombstone_follows_stream_owner() {
+    let (session, _server) = establish_test_session("127.0.0.1:443").await;
+
+    let sid = 83;
+    let (tx, rx) = mpsc::channel(1);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+    session
+        .overflow
+        .lock()
+        .push_back(sid, StreamEvent::Data(vec![1]));
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    session.kill_overflow_victim(victim);
+    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+    drop(stream);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
+
+    let sid = 84;
+    let (tx, rx) = mpsc::channel(1);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+    session
+        .overflow
+        .lock()
+        .push_back(sid, StreamEvent::Data(vec![1]));
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    drop(stream);
+    session.kill_overflow_victim(victim);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
+    session.close();
+}
+
+#[tokio::test]
+async fn session_close_preserves_killed_reset_until_owner_reads() {
+    let (session, _server) = establish_test_session("127.0.0.1:443").await;
+    let sid = 85;
+    let (tx, rx) = mpsc::channel(1);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let mut stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+    session
+        .overflow
+        .lock()
+        .push_back(sid, StreamEvent::Data(vec![1]));
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    session.kill_overflow_victim(victim);
+    session.close();
+    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0; 1]))
+        .await
+        .expect("killed stream read")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
+}
+
 /// 3B-2: a stalled stream is first parked in the session overflow
 /// (non-blocking); parking past the session soft cap still does not
 /// kill, but past the stall grace the watchdog reaps just that
@@ -1995,6 +2173,65 @@ async fn test_server_fin_closes_only_that_stream() {
 
     assert!(!session.is_closed());
     assert_eq!(session.active_streams(), 1);
+}
+
+#[tokio::test]
+async fn stream_drop_unregisters_before_returning() {
+    let (session, mut server) = establish_test_session("127.0.0.1:1443").await;
+    expect_handshake(&mut server).await;
+    let sid = 44;
+    let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+
+    drop(stream);
+    assert!(!session.streams.lock().unwrap().contains_key(&sid));
+    let (cmd, got_sid, _) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut server))
+        .await
+        .expect("drop FIN")
+        .unwrap();
+    assert_eq!((cmd, got_sid), (CMD_FIN, sid));
+    session.close();
+}
+
+#[tokio::test]
+async fn remote_fin_drop_does_not_enqueue_a_second_fin() {
+    let (session, mut server) = establish_test_session("127.0.0.1:1443").await;
+    expect_handshake(&mut server).await;
+
+    let target = vec![0x01, 127, 0, 0, 1, 0x00, 0x50];
+    let stream = session
+        .open_stream_direct(target, session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    let sid = stream.sid;
+    let (cmd, got_sid, _) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, got_sid), (CMD_SYN, sid));
+    let (cmd, got_sid, _) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, got_sid), (CMD_PSH, sid));
+
+    session.dispatch_fin(sid).await;
+    assert!(session.remote_fin.lock().contains(&sid));
+    drop(stream);
+
+    assert!(!session.streams.lock().unwrap().contains_key(&sid));
+    assert!(!session.remote_fin.lock().contains(&sid));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), read_frame(&mut server))
+            .await
+            .is_err(),
+        "dropping a remotely closed stream must not send a duplicate FIN"
+    );
+    session.close();
 }
 
 #[tokio::test]

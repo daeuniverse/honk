@@ -6,6 +6,7 @@ use crate::group::Group;
 use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
+use crate::types::DialMode;
 
 /// Stable identity of the built-in `direct` node across reloads and restarts.
 pub const DIRECT_NODE_ID: uuid::Uuid =
@@ -64,6 +65,10 @@ pub struct GlobalConfig {
     pub wan_interface: Vec<String>,
     #[serde(default)]
     pub auto_config_kernel_parameter: bool,
+    /// Enable held-first-packet NFQUEUE staging for ambiguous LAN-forwarded UDP.
+    /// This process-scoped setting requires the real eBPF backend and a restart.
+    #[serde(default = "crate::types::default_true")]
+    pub nfqueue_enable: bool,
     /// Root for generated state and relative runtime-supplied assets.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
@@ -319,6 +324,7 @@ impl Default for GlobalConfig {
             lan_interface: vec![],
             wan_interface: vec![],
             auto_config_kernel_parameter: false,
+            nfqueue_enable: true,
             data_dir: default_data_dir(),
             store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),
@@ -467,6 +473,21 @@ impl Config {
         changed
     }
 
+    /// Apply the removed experimental NFQUEUE setting without retaining it in
+    /// the active configuration schema.
+    pub(crate) fn apply_legacy_nfqueue(&mut self, canonical_present: bool) {
+        let Some(legacy) = self.experimental.legacy_udp_nfqueue.take() else {
+            return;
+        };
+        eprintln!(
+            "warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: {}",
+            legacy.enabled
+        );
+        if !canonical_present {
+            self.global.nfqueue_enable = legacy.enabled;
+        }
+    }
+
     pub fn from_file(path: &str) -> Result<Self, crate::ConfigError> {
         let content = std::fs::read_to_string(path)?;
 
@@ -510,6 +531,12 @@ impl Config {
             .map(str::to_ascii_lowercase);
 
         let content = match ext.as_deref() {
+            Some("dae") => {
+                return Err(crate::ConfigError::Serialization(
+                    "refusing to rewrite .dae configuration: source formatting, comments, and includes cannot be preserved; edit the dae source directly or use .toml/.yaml/.json"
+                        .into(),
+                ));
+            }
             Some("json") => self.to_json_string()?,
             Some("yaml") | Some("yml") => serde_yaml::to_string(self)
                 .map_err(|e| crate::ConfigError::Serialization(e.to_string()))?,
@@ -528,8 +555,10 @@ impl Config {
 
     /// Parse a configuration from a JSON string.
     pub fn from_json_str(s: &str) -> Result<Self, crate::ConfigError> {
+        let canonical_present = json_has_global_nfqueue_enable(s);
         let mut config: Self =
             serde_json::from_str(s).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+        config.apply_legacy_nfqueue(canonical_present);
         config.derive_node_ids();
         Ok(config)
     }
@@ -548,6 +577,13 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.global.dial_mode.parse::<DialMode>().is_err() {
+            return Err(crate::ConfigError::Validation(format!(
+                "global.dial_mode must be one of: ip, domain, domain+, domain++ (got '{}')",
+                self.global.dial_mode
+            )));
+        }
+
         let data_dir = std::path::Path::new(&self.global.data_dir);
         if self.global.data_dir.is_empty() || !data_dir.is_absolute() {
             return Err(crate::ConfigError::Validation(
@@ -684,15 +720,48 @@ impl Config {
         Ok(())
     }
 }
-
 /// Parse a configuration from a TOML string.
 fn parse_toml(content: &str) -> Result<Config, crate::ConfigError> {
-    toml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))
+    let canonical_present = toml_has_global_nfqueue_enable(content);
+    let mut config: Config =
+        toml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+    config.apply_legacy_nfqueue(canonical_present);
+    Ok(config)
 }
 
 /// Parse a configuration from a YAML string.
 fn parse_yaml(content: &str) -> Result<Config, crate::ConfigError> {
-    serde_yaml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))
+    let canonical_present = yaml_has_global_nfqueue_enable(content);
+    let mut config: Config =
+        serde_yaml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+    config.apply_legacy_nfqueue(canonical_present);
+    Ok(config)
+}
+
+fn json_has_global_nfqueue_enable(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|root| root.get("global").cloned())
+        .and_then(|global| global.as_object().cloned())
+        .is_some_and(|global| global.contains_key("nfqueue_enable"))
+}
+
+fn toml_has_global_nfqueue_enable(content: &str) -> bool {
+    toml::from_str::<toml::Value>(content)
+        .ok()
+        .and_then(|root| root.get("global").cloned())
+        .and_then(|global| global.as_table().cloned())
+        .is_some_and(|global| global.contains_key("nfqueue_enable"))
+}
+
+fn yaml_has_global_nfqueue_enable(content: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(content)
+        .ok()
+        .and_then(|root| root.get("global").cloned())
+        .and_then(|global| global.as_mapping().cloned())
+        .is_some_and(|global| {
+            global.contains_key(serde_yaml::Value::String("nfqueue_enable".into()))
+        })
 }
 
 #[cfg(test)]
@@ -704,6 +773,14 @@ mod builtin_nodes_tests {
         let mut config = Config::default();
         config.dns.bind = "tcp+udp://localhost:0".into();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_dial_mode() {
+        let mut config = Config::default();
+        config.global.dial_mode = "domain???".into();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("global.dial_mode"));
     }
 
     #[test]

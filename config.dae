@@ -16,6 +16,8 @@ global {
     bootstrap_resolver: '1.1.1.1:53'
     # 保存成功获取的订阅正文到运行目录 .sub,启动/重载时可离线恢复
     store_subscribe: true
+    # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
+    nfqueue_enable: true
 
     # Group will switch node only when new_latency <= old_latency - tolerance.
     check_tolerance: 30ms

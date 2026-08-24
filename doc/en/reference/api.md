@@ -38,7 +38,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | DELETE | `/connections/{id}` | Close one tracked connection. |
 | GET | `/traffic` | Stream per-second traffic JSON over WebSocket or chunked JSON lines. |
 | GET | `/memory` | Stream process RSS JSON over WebSocket or chunked JSON lines. |
-| GET | `/stats` | Return the userspace outbound, ready-pool, warm-resource, and UDP snapshot documented below. |
+| GET | `/stats` | Return the userspace outbound, ready-pool, warm-resource, Score selection-reason, and UDP snapshot documented below. |
 | GET | `/logs` | Stream tracing events over WebSocket or chunked JSON lines; `?level=` defaults to `info`. |
 | GET | `/dns/query` | Resolve `?name=` through honk DNS and return DoH-style JSON; `?type=` defaults to `A`. |
 | POST | `/cache/fakeip/flush` | Flush persisted FakeIP-prefixed cache entries when the cache database exists. |
@@ -61,7 +61,7 @@ Each delay-test exchange through a proxy or built-in `direct` leaf reports its r
 
 ### Score group representation
 
-A configured `policy: score` group is represented as Clash `type: "url_test"` for compatibility. Its `all` list keeps the same direct member tags as other groups, while `now` reports the current aggregate TCP winner rather than any one exact target's private selection. Score remains automatic and authoritative: `PUT /proxies/{name}` is rejected rather than pinning a member. No score cell or scorer-only target data is added to proxy documents, `/stats`, logs, or `cache.db`; `/connections` retains its established destination metadata.
+A configured `policy: score` group is represented as Clash `type: "url_test"` for compatibility. Its `all` list keeps the same direct member tags as other groups, while `now` reports the current aggregate TCP winner rather than any one exact target's private selection. Score remains automatic and authoritative: `PUT /proxies/{name}` is rejected rather than pinning a member. No score cell or scorer-only target data is added to proxy documents; `/stats.score` contains only the safe aggregate counters documented below. `/connections` retains its established destination metadata.
 
 ## Mode and selector mutations
 
@@ -85,7 +85,7 @@ The download follows honk's current traffic routing decision. A `direct` result 
 
 ## `GET /stats`
 
-`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed UDP/NFQUEUE schema creates no dynamic per-node labels.
+`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed TCP, UDP, and NFQUEUE schemas create no dynamic per-node labels.
 
 ```text
 {
@@ -94,6 +94,12 @@ The download follows honk's current traffic routing decision. A `direct` result 
   warm: {
     nodes: { preconnect, health, udp, selector, traffic },
     sessions: { anytls, vless, tuic, juicity, hysteria2 }
+  },
+  tcp: {
+    activeFlows, limit, capacity: { rejected }
+  },
+  score: {
+    groups: [{ name, tcp: R, udp: R }]
   },
   udp: {
     endpoint: { hits, misses },
@@ -117,7 +123,29 @@ The download follows honk's current traffic routing decision. A `direct` result 
   }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
+R = {
+  coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
+  incumbentHeld, freshFailureBypass, deadFiltered
+} // every R value is a u64 count
 ```
+
+### TCP fields
+
+| Field | Meaning |
+| --- | --- |
+| `activeFlows` | Accepted transparent TCP flows currently holding an admission permit. |
+| `limit` | Current process-wide TCP-flow admission ceiling; it starts at the descriptor-derived floor and scales with idle descriptor headroom. |
+| `capacity.rejected` | Monotonic count of accept-loop iterations that waited for a permit because the TCP budget was full; accepted sockets remain in the kernel backlog rather than being dropped. |
+
+### Score selection-reason fields
+
+`score.groups` is an additive part of the authenticated `/stats` response. It is an empty array when no group currently uses `policy: score`; otherwise it contains every current Score group, including groups with no resolved leaves, sorted lexicographically by `name`. Each group always has both `tcp` and `udp` objects, and each object always has every `R` field above. Missing network activity is represented by zeroes, never omitted fields.
+
+Each value is a saturating `u64` count, not a latency, byte, duration, target, or health metric. The first six fields classify one authorized multi-candidate Score **Apply** in this fixed precedence: `coldExplore` for initial-budget exploration; `periodicExplore` for a periodic forced cold non-incumbent; `incumbentHeld` for a successful incumbent hold; `freshFailureBypass` when fresh failure evidence alone breaks a small trained utility-margin hold; `reliabilityWinner` when every alternative is outside the selected reliability band; otherwise `performanceWinner`. `deadFiltered` is independent: it counts unique leaf candidates removed by liveness filtering during an authorized Apply and can increase beside one of the first six fields. Peek, `/proxies`, `/stats`, singleton bypasses, and last-resort selection do not count.
+
+Counters begin at zero on process start and accumulate in process memory only. They survive a successful reload while the group name remains configured, including zero-leaf and temporary Score-to-non-Score-to-Score transitions; non-Score groups are hidden from this response. A committed deletion prunes that name's counters, and a recreated name starts at zero. Generation-fenced superseded managers cannot mutate counters after replacement, including after same-name recreation. The snapshot is copied before JSON serialization, so reading it cannot mutate selection state.
+
+`/stats.score` exposes only a group name and the fourteen TCP/UDP aggregate counts. It never contains a node, node ID/tag, target/domain/IP/port, target family, score cell, cadence key, manager authority, credential, or other scorer-private value; those values are also excluded from new Score logs and persistence. This addition does not change established node names in `/proxies` or `/stats.outbounds`, or established destination metadata in `/connections`.
 
 ### Outbound and ready-pool fields
 

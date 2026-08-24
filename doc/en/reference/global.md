@@ -18,6 +18,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. That setup pins `net.ipv6.conf.all.forwarding=1` and therefore also writes `net.ipv6.conf.<wan>.accept_ra=2` on every resolved WAN interface (including late-attached ones), so an SLAAC/RA-learned IPv6 default route survives the forwarding pin. Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in the WAN `.network` file. |
+| `nfqueue_enable` | `nfqueue_enable` | `true` | Hold ambiguous LAN-forwarded UDP originals in NFQUEUE until userspace reaches a terminal decision. The setting requires the real eBPF backend; after the singleton instance handoff, an unavailable fixed queue or a pre-admission queue/rules/health failure logs a warning and disables it for the process without rewriting the config. Persistent token-generation recovery failures remain fatal. Installation reclaims the reserved nftables table. Changing it requires restart. New configurations should use this key; the deprecated `experimental.udp_nfqueue.enabled` spelling is accepted with a migration warning, but this canonical key wins when both are present. |
 | `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively; each candidate must pass a private create-new/remove probe. An unusable candidate falls back to the equally probed working directory. A change requires restart. |
 | `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `data_dir/.sub` for startup and reload recovery. A change requires restart. |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The current health loop uses the first value; an empty list falls back to a plain TCP check. |
@@ -59,10 +60,12 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 | Mode | Sniffing | Domain verification | Routing and dial behavior |
 | ---- | -------- | ------------------- | ------------------------- |
-| `ip` | No | Not applicable | Resolve locally and dial the proxy by numeric IP. |
-| `domain` | Yes | The sniffed name must resolve to the original destination IP. | Dial by the verified domain; do not re-run routing solely because of sniffing. |
-| `domain+` | Yes | No | Use the sniffed domain without destination-IP verification; do not re-run routing. |
-| `domain++` | Forced | No | Re-evaluate routing from the sniffed SNI/Host, then dial using the resulting domain decision. |
+| `ip` | No | Not applicable | Keep the original destination IP; do not sniff or re-run routing. |
+| `domain` | Yes | The sniffed name must pass the destination-IP reality check. | A verified name may re-run routing; if no domain rule matches, normal IP/port rules still decide. Proxy outbounds may dial by the verified name. |
+| `domain+` | Yes | No | Keep the initial IP-rule decision, but let proxy outbounds use the sniffed domain as their target. |
+| `domain++` | Yes | No | Re-evaluate non-reserved decisions from the sniffed SNI/Host, then use the resulting proxy domain target. |
+
+Direct, block, `must`, and other reserved handoffs remain final and keep the original IP target.
 
 ## Data directory and asset paths
 
@@ -102,6 +105,7 @@ global {
     log_file: 'honk.log'
     data_dir: '/var/share/honk'
     store_subscribe: true
+    nfqueue_enable: true
 
     lan_interface: br0
     wan_interface: auto

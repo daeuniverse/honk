@@ -66,15 +66,14 @@ pub enum DialMode {
     /// IP mode: resolve domain to IP locally, then dial proxy by IP.
     /// Sniffing is disabled in this mode.
     Ip,
-    /// Domain mode: sniff domain, verify it resolves to the destination IP,
-    /// then dial the proxy using the domain name.
+    /// Domain mode: verify a sniffed name against the destination, then
+    /// re-run routing when verification succeeds; otherwise keep IP routing.
     Domain,
-    /// Domain+: like domain but skip reality verification of the sniffed domain.
+    /// Domain+: use a sniffed domain for dialing but never re-run routing.
     /// Useful when DNS does not go through dae.
     #[serde(rename = "domain+")]
     DomainPlus,
-    /// Domain++: like domain+ but force sniffing and re-route the connection
-    /// based on the sniffed domain.
+    /// Domain++: use a sniffed domain and always re-run routing.
     #[serde(rename = "domain++")]
     DomainPlusPlus,
 }

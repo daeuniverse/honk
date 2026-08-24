@@ -38,7 +38,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | DELETE | `/connections/{id}` | 关闭一个已跟踪连接。 |
 | GET | `/traffic` | 通过 WebSocket 或分块 JSON 行推送每秒流量。 |
 | GET | `/memory` | 通过 WebSocket 或分块 JSON 行推送进程 RSS。 |
-| GET | `/stats` | 返回下文所述的用户态出站、ready pool、热资源和 UDP 快照。 |
+| GET | `/stats` | 返回下文所述的用户态出站、ready pool、热资源、Score 选路原因和 UDP 快照。 |
 | GET | `/logs` | 通过 WebSocket 或分块 JSON 行推送 tracing event；`?level=` 默认为 `info`。 |
 | GET | `/dns/query` | 经 honk DNS 解析 `?name=` 并返回 DoH 风格 JSON；`?type=` 默认为 `A`。 |
 | POST | `/cache/fakeip/flush` | cache database 存在时，清除持久化的 FakeIP 前缀条目。 |
@@ -61,7 +61,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 ### Score 组表示
 
-配置为 `policy: score` 的组始终可用，并为兼容 Clash 表示成 `type: "url_test"`。其 `all` 列表与其他组一样保留直接成员 tag，`now` 则报告当前聚合 TCP 胜者，而不是泄露某个精确目标的私有选择。Score 始终保持自动且权威：`PUT /proxies/{name}` 会被拒绝，不会固定成员。评分 cell 与仅由 scorer 持有的目标数据不会新增到 proxy 文档、`/stats`、日志或 `cache.db`；`/connections` 只保留原有的目标元数据。
+配置为 `policy: score` 的组始终可用，并为兼容 Clash 表示成 `type: "url_test"`。其 `all` 列表与其他组一样保留直接成员 tag，`now` 则报告当前聚合 TCP 胜者，而不是泄露某个精确目标的私有选择。Score 始终保持自动且权威：`PUT /proxies/{name}` 会被拒绝，不会固定成员。评分 cell 与仅由 scorer 持有的目标数据不会新增到 proxy 文档；`/stats.score` 只包含下文的安全聚合计数。`/connections` 只保留原有的目标元数据。
 
 ## 模式与 Selector 修改
 
@@ -85,7 +85,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 ## `GET /stats`
 
-`GET /stats` 是用户态快照，而不是 eBPF `OUTBOUND_STATS` map，也不暴露该 map 的报文 counter。固定 UDP/NFQUEUE schema 不创建动态的逐节点 label。
+`GET /stats` 是用户态快照，而不是 eBPF `OUTBOUND_STATS` map，也不暴露该 map 的报文 counter。固定 TCP、UDP 和 NFQUEUE schema 不创建动态的逐节点 label。
 
 ```text
 {
@@ -94,6 +94,12 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
   warm: {
     nodes: { preconnect, health, udp, selector, traffic },
     sessions: { anytls, vless, tuic, juicity, hysteria2 }
+  },
+  tcp: {
+    activeFlows, limit, capacity: { rejected }
+  },
+  score: {
+    groups: [{ name, tcp: R, udp: R }]
   },
   udp: {
     endpoint: { hits, misses },
@@ -117,7 +123,29 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
   }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
+R = {
+  coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
+  incumbentHeld, freshFailureBypass, deadFiltered
+} // R 的每个值均为 u64 计数
 ```
+
+### TCP 字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `activeFlows` | 当前持有 TCP admission permit 的透明 TCP 流。 |
+| `limit` | 当前进程级 TCP 流准入上限；从描述符导出的 floor 开始，并随空闲描述符余量动态扩缩。 |
+| `capacity.rejected` | 因 TCP 预算已满而等待 permit 的 accept-loop 单调计数；accepted socket 保留在内核 backlog 中，不会被丢弃。 |
+
+### Score 选路原因字段
+
+`score.groups` 是经鉴权 `/stats` 响应中的附加部分。当前没有任何组使用 `policy: score` 时它为 `[]`；否则它包含每个当前 Score 组（包括没有解析出叶节点的组），按 `name` 的字典序排列。每组始终都有 `tcp` 和 `udp` 对象，且每个对象始终包含全部 `R` 字段；没有网络活动时以零表示，绝不省略字段。
+
+每个值都是饱和的 `u64` 计数，不是延迟、字节、时长、目标或健康度量。前六个字段以如下固定优先级分类一次已授权的多候选 Score **Apply**：初始预算探索为 `coldExplore`；周期边界强制的冷非现任为 `periodicExplore`；成功保持现任为 `incumbentHeld`；只有新鲜失败证据打破已训练且效用差距很小的保持条件时为 `freshFailureBypass`；所有备选均在所选可靠性带之外时为 `reliabilityWinner`；其余情况为 `performanceWinner`。`deadFiltered` 独立计数：它记录已授权 Apply 中被活性过滤移除的唯一叶候选，因此可以与前六项中的一项同时增加。Peek、`/proxies`、`/stats`、单例旁路与最后尝试选择都不会计数。
+
+计数在进程启动时从零开始，只在进程内存中累积。只要组名仍在已提交配置中，成功 reload 会保留它们，包括零叶节点以及临时 Score→非 Score→Score 转换；非 Score 组不会显示在此响应中。已提交的删除会清除该名称的计数，之后重新创建同名组从零开始。受 generation fence 约束的已淘汰 manager 在被替换后不能再修改计数，即使同名组随后被重新创建。快照在 JSON 序列化前复制，读取不会改变选路状态。
+
+`/stats.score` 只公开组名和 TCP/UDP 的十四个聚合计数。它绝不包含节点、节点 ID/tag、目标/domain/IP/port、目标地址族、评分 cell、cadence 键、manager authority、凭据或其他 scorer 私有值；这些值也不会进入新的 Score 日志或持久化。此新增内容不改变 `/proxies` 或 `/stats.outbounds` 中既有的节点名，也不改变 `/connections` 中既有的目标元数据。
 
 ### 出站与 ready pool 字段
 

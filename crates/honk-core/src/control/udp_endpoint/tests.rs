@@ -42,6 +42,29 @@ async fn explicit_retirement_is_neutral_until_a_reply_makes_it_useful() {
     );
 }
 
+#[tokio::test]
+async fn send_timeout_after_reply_is_not_idle_success() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay = "127.0.0.1:53".parse().unwrap();
+    let endpoint = UdpEndpoint::new(transport(socket, relay), relay, uuid::Uuid::new_v4());
+    endpoint.has_reply.store(true, Ordering::Relaxed);
+
+    let send_timeout = Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "UDP PacketTransport send timed out",
+    ));
+    assert_eq!(
+        score_driver_outcome(&endpoint, &send_timeout),
+        ScoreOutcome::Io(io::ErrorKind::TimedOut)
+    );
+
+    let idle_timeout = Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle_timeout),
+        ScoreOutcome::Success
+    );
+}
+
 async fn recv_and_ack(
     pool: &UdpEndpointPool,
     rx: &mut mpsc::Receiver<EndpointRemoval>,
@@ -133,6 +156,7 @@ fn make_addr(ip: &str, port: u16) -> SocketAddr {
 enum DriverSendAction {
     Ok,
     Error,
+    Congestion,
     Panic,
     Pending,
     WaitThenOk(Arc<tokio::sync::Notify>),
@@ -232,6 +256,10 @@ impl honk_outbound::proxy::PacketTransport for ScriptedPacketTransport {
         match action {
             DriverSendAction::Ok => Ok(()),
             DriverSendAction::Error => Err(io::Error::other("scripted UDP send failure")),
+            DriverSendAction::Congestion => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scripted UDP send congestion",
+            )),
             DriverSendAction::Panic => panic!("scripted UDP send panic"),
             DriverSendAction::Pending => std::future::pending::<io::Result<()>>().await,
             DriverSendAction::WaitThenOk(release) => {
@@ -1247,7 +1275,7 @@ async fn udp_endpoint_worker_sends_first_then_fifo_followers() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn udp_endpoint_worker_times_out_first_send_after_five_seconds() {
+async fn udp_endpoint_worker_treats_stream_send_timeout_as_connection_dead() {
     let pool = Arc::new(UdpEndpointPool::new());
     let stats = Arc::new(StatsManager::new());
     let client = make_addr("10.0.0.1", 12345);
@@ -1283,13 +1311,15 @@ async fn udp_endpoint_worker_times_out_first_send_after_five_seconds() {
         worker.await.unwrap().unwrap_err().kind(),
         io::ErrorKind::TimedOut
     );
+
     assert_eq!(stats.udp_snapshot().first_send_failures, 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn udp_endpoint_worker_times_out_steady_send_after_five_seconds() {
+async fn udp_endpoint_worker_keeps_flow_alive_on_congested_steady_send() {
     let pool = Arc::new(UdpEndpointPool::new());
     let stats = Arc::new(StatsManager::new());
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let relay = make_addr("192.168.1.1", 1080);
@@ -1297,7 +1327,7 @@ async fn udp_endpoint_worker_times_out_steady_send_after_five_seconds() {
         reserve_driver_packets(&pool, &stats, client, dst, b"first", &[b"steady"]);
     let transport = Arc::new(ScriptedPacketTransport::new(
         relay,
-        [DriverSendAction::Ok, DriverSendAction::Pending],
+        [DriverSendAction::Ok, DriverSendAction::Congestion],
     ));
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
     let (first_ack_tx, first_ack_rx) = oneshot::channel();
@@ -1307,21 +1337,30 @@ async fn udp_endpoint_worker_times_out_steady_send_after_five_seconds() {
         test_reply_socket().await,
         client,
         dst,
-        Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+        Arc::clone(&alive),
         Arc::clone(&stats),
         "test-node".to_owned(),
         first,
         first_ack_tx,
     ));
 
-    first_ack_rx.await.unwrap().unwrap();
+    assert!(first_ack_rx.await.unwrap().is_ok());
     transport.wait_for_send_count(2).await;
-    tokio::time::advance(TRANSPORT_SEND_TIMEOUT).await;
     assert_eq!(
         worker.await.unwrap().unwrap_err().kind(),
-        io::ErrorKind::TimedOut
+        io::ErrorKind::Interrupted
     );
     assert_eq!(stats.udp_snapshot().first_send_failures, 0);
+    assert!(
+        alive
+            .get_probe_history(
+                TEST_NODE_ID,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                honk_outbound::alive::IpVersion::V4,
+            )
+            .is_empty(),
+        "send congestion must not report the node unavailable"
+    );
 }
 
 #[tokio::test]

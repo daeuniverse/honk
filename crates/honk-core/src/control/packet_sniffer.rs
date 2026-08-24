@@ -28,6 +28,8 @@ const NO_SNI_BYPASS_TTL: Duration = Duration::from_secs(1);
 /// Upper bound on Initial packets sniffed per flow while a ClientHello
 /// stays fragmented; beyond it the flow is treated as unresolvable.
 const MAX_INITIAL_SNIFF_PACKETS: u32 = 8;
+/// Keep unrelated Initial decryptions off one pool mutex.
+const SNIFFER_SHARDS: usize = 32;
 
 /// Outcome of feeding one datagram to the QUIC Initial sniffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,10 +140,6 @@ impl SnifferSession {
         }
     }
 
-    fn is_expired(&self) -> bool {
-        Instant::now() > self.expires_at
-    }
-
     fn should_bypass(&self) -> bool {
         self.no_sni_count >= NO_SNI_THRESHOLD
     }
@@ -149,24 +147,62 @@ impl SnifferSession {
 
 /// Pool of packet sniffers with DCID negative caching.
 pub struct PacketSnifferPool {
-    sessions: Mutex<HashMap<PacketSnifferKey, SnifferSession>>,
-    failed_dcids: Mutex<HashMap<PacketSnifferKey, Instant>>,
+    sessions: Box<[Mutex<HashMap<PacketSnifferKey, SnifferSession>>]>,
+    failed_dcids: Box<[Mutex<HashMap<PacketSnifferKey, Instant>>]>,
 }
 
 impl PacketSnifferPool {
     pub fn new() -> Self {
+        let sessions = (0..SNIFFER_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        let failed_dcids = (0..SNIFFER_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
         Self {
-            sessions: Mutex::new(HashMap::new()),
-            failed_dcids: Mutex::new(HashMap::new()),
+            sessions,
+            failed_dcids,
         }
+    }
+
+    fn shard_index(key: &PacketSnifferKey) -> usize {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in key.src_ip.iter().chain(key.dst_ip.iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for value in [key.src_port, key.dst_port] {
+            hash ^= u64::from(value);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        (hash as usize) & (SNIFFER_SHARDS - 1)
+    }
+
+    fn terminal_outcome(&self, shard: usize, key: &PacketSnifferKey) -> Option<QuicSniffOutcome> {
+        let sessions = self.sessions[shard].lock();
+        let session = sessions.get(key)?;
+        if !session.done {
+            return None;
+        }
+        Some(
+            session
+                .domain
+                .clone()
+                .map(QuicSniffOutcome::Domain)
+                .unwrap_or(QuicSniffOutcome::CompleteNoDomain),
+        )
+    }
+
+    fn is_dcid_failed_at(&self, shard: usize, key: &PacketSnifferKey) -> bool {
+        self.failed_dcids[shard]
+            .lock()
+            .get(key)
+            .is_some_and(|expires_at| Instant::now() < *expires_at)
     }
 
     /// Check if a DCID is in the failed cache (should skip sniffing).
     pub fn is_dcid_failed(&self, key: &PacketSnifferKey) -> bool {
-        self.failed_dcids
-            .lock()
-            .get(key)
-            .is_some_and(|expires_at| Instant::now() < *expires_at)
+        self.is_dcid_failed_at(Self::shard_index(key), key)
     }
 
     /// Record a failed DCID with a soft bypass duration.
@@ -179,12 +215,17 @@ impl PacketSnifferPool {
         self.mark_dcid_failed_for(key, Duration::from_secs(30));
     }
 
-    fn mark_dcid_failed_for(&self, key: PacketSnifferKey, ttl: Duration) {
-        let mut cache = self.failed_dcids.lock();
-        cache.insert(key, Instant::now() + ttl);
-        if cache.len() > 16_384 {
-            cache.retain(|_, expires_at| Instant::now() < *expires_at);
+    fn mark_dcid_failed_for_shard(&self, shard: usize, key: PacketSnifferKey, ttl: Duration) {
+        let mut cache = self.failed_dcids[shard].lock();
+        let now = Instant::now();
+        cache.insert(key, now + ttl);
+        if cache.len() > 512 {
+            cache.retain(|_, expires_at| *expires_at > now);
         }
+    }
+
+    fn mark_dcid_failed_for(&self, key: PacketSnifferKey, ttl: Duration) {
+        self.mark_dcid_failed_for_shard(Self::shard_index(&key), key, ttl);
     }
 
     /// Feed a UDP datagram (expected to carry QUIC Initial packet(s)) to the
@@ -192,16 +233,21 @@ impl PacketSnifferPool {
     /// a genuine QUIC Initial, carrying the SNI hostname when extraction
     /// succeeded — see [`QuicSniffOutcome`].
     pub fn feed_quic_initial(&self, key: PacketSnifferKey, data: &[u8]) -> QuicSniffOutcome {
-        if self.is_dcid_failed(&key) {
+        let shard = Self::shard_index(&key);
+        if self.is_dcid_failed_at(shard, &key) {
             return QuicSniffOutcome::NotQuic;
         }
+        if let Some(outcome) = self.terminal_outcome(shard, &key) {
+            return outcome;
+        }
 
-        // Decrypt the Initial packet(s) first (stateless, no lock needed).
+        // Decrypt the Initial packet(s) without holding a pool lock.
         let fragments = quic::decrypt_initial_datagram(data);
 
-        let mut sessions = self.sessions.lock();
+        let mut sessions = self.sessions[shard].lock();
         let session = sessions.entry(key).or_insert_with(SnifferSession::new);
 
+        // Another packet on this flow may have completed while decryption ran.
         if session.done {
             return session
                 .domain
@@ -218,7 +264,7 @@ impl PacketSnifferPool {
             // open — marking it done would later read as CompleteNoDomain
             // and make an unresolved flow offloadable.
             drop(sessions);
-            self.mark_dcid_failed_soft(key);
+            self.mark_dcid_failed_for_shard(shard, key, NO_SNI_BYPASS_TTL);
             debug!("QUIC ClientHello never completed; flow bypassed");
             return QuicSniffOutcome::NotQuic;
         }
@@ -236,7 +282,7 @@ impl PacketSnifferPool {
                 drop(sessions);
                 if failed {
                     debug!("QUIC sniffing bypassed after repeated decrypt failures: {err:?}");
-                    self.mark_dcid_failed_decrypt(key);
+                    self.mark_dcid_failed_for_shard(shard, key, Duration::from_secs(30));
                 }
                 return QuicSniffOutcome::NotQuic;
             }
@@ -267,7 +313,7 @@ impl PacketSnifferPool {
                 // a domain.
                 session.done = true;
                 drop(sessions);
-                self.mark_dcid_failed_soft(key);
+                self.mark_dcid_failed_for_shard(shard, key, NO_SNI_BYPASS_TTL);
                 debug!("QUIC ClientHello carried no SNI; flow bypassed");
                 QuicSniffOutcome::CompleteNoDomain
             }
@@ -285,7 +331,7 @@ impl PacketSnifferPool {
                 }
                 drop(sessions);
                 if should_bypass {
-                    self.mark_dcid_failed_soft(key);
+                    self.mark_dcid_failed_for_shard(shard, key, NO_SNI_BYPASS_TTL);
                     debug!("QUIC DCID marked failed after no-SNI threshold");
                 }
                 QuicSniffOutcome::CompleteNoDomain
@@ -295,20 +341,23 @@ impl PacketSnifferPool {
 
     /// Run a janitor cycle: remove expired sessions.
     pub fn janitor_cycle(&self) -> usize {
-        let mut sessions = self.sessions.lock();
-        let before = sessions.len();
-        sessions.retain(|_, s| !s.is_expired());
-        let removed = before - sessions.len();
+        let now = Instant::now();
+        let mut removed = 0;
+        for shard in &self.sessions {
+            let mut sessions = shard.lock();
+            let before = sessions.len();
+            sessions.retain(|_, session| now <= session.expires_at);
+            removed += before - sessions.len();
+        }
+        for shard in &self.failed_dcids {
+            shard.lock().retain(|_, expires_at| *expires_at > now);
+        }
         if removed > 0 {
             debug!(
                 "Packet sniffer janitor removed {} expired sessions",
                 removed
             );
         }
-
-        let mut dcids = self.failed_dcids.lock();
-        dcids.retain(|_, expires_at| Instant::now() < *expires_at);
-
         removed
     }
 

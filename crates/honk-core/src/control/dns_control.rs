@@ -223,22 +223,27 @@ impl DnsController {
         use crate::dns::projection::{ProjectionFreshness, ProjectionObservation};
 
         let domain = outcome.domain();
-        let observation = match (outcome.status(), outcome.response_class()) {
-            (OutcomeStatus::Accepted, ResponseClass::Positive) => ProjectionObservation::Positive {
-                domain,
-                ips: outcome.answer_ips(),
-                advertised_ttl: outcome.expiry().ttl(),
-                freshness: if outcome.provenance() == Provenance::Stale {
-                    ProjectionFreshness::Stale
-                } else {
-                    ProjectionFreshness::Fresh
-                },
-            },
-            (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {
-                ProjectionObservation::Clear { domain }
-            }
-            (OutcomeStatus::Accepted, ResponseClass::Servfail) | (OutcomeStatus::Rejected, _) => {
-                ProjectionObservation::Retain
+        let observation = if crate::dns::response::is_truncated(outcome.reusable()) {
+            ProjectionObservation::Retain
+        } else {
+            match (outcome.status(), outcome.response_class()) {
+                (OutcomeStatus::Accepted, ResponseClass::Positive) => {
+                    ProjectionObservation::Positive {
+                        domain,
+                        ips: outcome.answer_ips(),
+                        advertised_ttl: outcome.expiry().ttl(),
+                        freshness: if outcome.provenance() == Provenance::Stale {
+                            ProjectionFreshness::Stale
+                        } else {
+                            ProjectionFreshness::Fresh
+                        },
+                    }
+                }
+                (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {
+                    ProjectionObservation::Clear { domain }
+                }
+                (OutcomeStatus::Accepted, ResponseClass::Servfail)
+                | (OutcomeStatus::Rejected, _) => ProjectionObservation::Retain,
             }
         };
         self.routing_projection

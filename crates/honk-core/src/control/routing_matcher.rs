@@ -103,9 +103,10 @@ pub struct RoutingPushPlan {
     domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
     lpm: LpmPushPlan,
     group_bitmaps: RoutingGroupBitmaps,
-    /// Any route references a domain-class matcher (negated or not), so a
-    /// kernel decision made without the destination domain is not final.
-    /// Drives the `DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` static flag.
+    /// Any route references a domain-class matcher (negated or not). Modes
+    /// that can re-evaluate a sniffed name must keep direct decisions in
+    /// userspace until the destination is domain-judged; the control-plane
+    /// mode policy combines this bit with `dial_mode`.
     pub has_domain_rules: bool,
 }
 
@@ -219,10 +220,11 @@ impl RoutingMatcherBuilder {
     /// treats `ControlPlaneRouting` as a logical composition marker, so the
     /// fallback must be a real outbound (Direct, Block, or a user group).
     ///
-    /// In `domain`/`domain+`/`domain++` dial modes, generic port-based proxy
-    /// rules are pushed with `ControlPlaneRouting` as their final outbound so
-    /// that the userspace control plane can sniff the domain first.  eBPF will
-    /// still fast-path the flow once DNS snooping populates `DOMAIN_ROUTING_MAP`.
+    /// In `domain++` mode, generic port-based proxy rules are pushed with
+    /// `ControlPlaneRouting` as their final outbound so that the userspace
+    /// control plane can sniff the domain first.  `domain` and `domain+`
+    /// preserve the initial IP-rule decision when no domain decision is
+    /// available, so their port rules remain kernel-routable.
     ///
     /// ## Two-phase commit
     ///
@@ -287,11 +289,11 @@ impl RoutingMatcherBuilder {
                 .copied()
                 .unwrap_or(OutboundIndex::Direct as u8);
 
-            // In domain-aware dial modes, generic port-based proxy rules (no
-            // domain/geosite/process condition) cannot be finalized by eBPF
-            // because the domain is not known until userspace sniffs it.  Punt
-            // those rules to the control plane so domain rules take precedence.
-            let punt_to_control_plane = dial_mode != DialMode::Ip
+            // Only domain++ must defer generic proxy rules until userspace
+            // can inspect the domain.  `domain` may re-route after a
+            // successful reality check, while `domain+` never re-routes;
+            // neither needs a control-plane marker for the initial route.
+            let punt_to_control_plane = dial_mode == DialMode::DomainPlusPlus
                 && !route.ports.is_empty()
                 && route.domain_suffixes.is_empty()
                 && route.domain_keywords.is_empty()
@@ -1308,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_name_value_matches_kernel_comm_truncation() {
+    fn test_process_name_value_matches_kernel_pname_truncation() {
         let value = RoutingMatcherBuilder::process_name_value("systemd-resolved");
         let bytes: Vec<u8> = value.into_iter().flat_map(u32::to_ne_bytes).collect();
         assert_eq!(bytes.as_slice(), b"systemd-resolve\0");
@@ -1433,9 +1435,8 @@ mod tests {
                 .unwrap();
         assert!(plan.has_domain_rules);
 
-        // Negated domain matchers also constrain offload: with an unknown
-        // domain the kernel evaluates them as non-matching, while userspace
-        // after SNI sniffing could veto the rule.
+        // Negated domain matchers also set the metadata bit: in modes that
+        // permit SNI re-evaluation, userspace could veto this kernel result.
         let mut negated_route = make_route("negated", "direct");
         negated_route.not_domain_keywords = vec!["ads".into()];
         let plan =
@@ -1507,6 +1508,38 @@ mod tests {
             OutboundIndex::ControlPlaneRouting as u8,
             "port-based proxy rule should be punted to userspace in domain++ mode"
         );
+    }
+
+    #[test]
+    fn test_push_port_rule_stays_kernel_routable_without_forced_reroute() {
+        for dial_mode in [DialMode::Domain, DialMode::DomainPlus] {
+            let mut backend = MockEbpfBackend::new();
+            let route = CompiledRoute {
+                ports: vec![crate::routing::PortRange {
+                    start: 443,
+                    end: 443,
+                }],
+                ..make_route("https", "proxy")
+            };
+            let mut outbound_map = HashMap::new();
+            outbound_map.insert("proxy".to_string(), OutboundIndex::UserBase as u8);
+            outbound_map.insert("direct".to_string(), OutboundIndex::Direct as u8);
+
+            RoutingMatcherBuilder::build_and_push(
+                &mut backend,
+                &[route],
+                &outbound_map,
+                "direct",
+                dial_mode,
+            )
+            .unwrap();
+
+            assert_eq!(
+                backend.active_routing_rule(0).unwrap().outbound,
+                OutboundIndex::UserBase as u8,
+                "{dial_mode:?} must preserve the initial port decision"
+            );
+        }
     }
 
     #[test]

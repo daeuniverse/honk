@@ -49,7 +49,8 @@ fn config_for_upstream(address: std::net::SocketAddr, protocol: DnsProtocol) -> 
     config
 }
 
-fn control_plane(config: Config, forwarder: Arc<DnsForwarder>) -> ControlPlane {
+fn control_plane(mut config: Config, forwarder: Arc<DnsForwarder>) -> ControlPlane {
+    config.global.nfqueue_enable = false;
     ControlPlane::new(
         config.clone(),
         Box::new(MockEbpfBackend::new()),
@@ -59,6 +60,23 @@ fn control_plane(config: Config, forwarder: Arc<DnsForwarder>) -> ControlPlane {
         forwarder,
     )
     .expect("control plane")
+}
+
+async fn reload_config(control: &ControlPlane, config: Config) {
+    assert!(
+        control.reload_runtime_config(config).await,
+        "runtime reload should publish"
+    );
+}
+
+async fn reload_current(control: &ControlPlane) {
+    let config = control.config_handle().read().await.clone();
+    reload_config(control, config).await;
+}
+
+async fn try_reload_current(control: &ControlPlane) -> bool {
+    let config = control.config_handle().read().await.clone();
+    control.reload_runtime_config(config).await
 }
 
 #[tokio::test]
@@ -102,16 +120,10 @@ async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file(
     );
     let service = control.dns_service();
     let query = build_dns_query("reload-hosts.test", 1);
-    let subscription_id = uuid::Uuid::new_v4();
 
-    {
-        let config_handle = control.config_handle();
-        let mut active = config_handle.write().await;
-        active.dns.hosts = vec![file.path().to_string_lossy().into_owned()];
-    }
-    control
-        .merge_subscription_nodes(subscription_id, vec![])
-        .await;
+    let mut candidate = control.config_handle().read().await.clone();
+    candidate.dns.hosts = vec![file.path().to_string_lossy().into_owned()];
+    reload_config(&control, candidate).await;
     let initial = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -119,9 +131,7 @@ async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file(
     assert_eq!(initial, a_response_with_ttl(&query, [192, 0, 2, 60], 60));
 
     std::fs::write(file.path(), "full:reload-hosts.test 192.0.2.61\n").expect("replace hosts file");
-    control
-        .merge_subscription_nodes(subscription_id, vec![])
-        .await;
+    reload_current(&control).await;
     let replaced = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -129,9 +139,7 @@ async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file(
     assert_eq!(replaced, a_response_with_ttl(&query, [192, 0, 2, 61], 60));
 
     std::fs::write(file.path(), "full:reload-hosts.test not-an-ip\n").expect("corrupt hosts file");
-    control
-        .merge_subscription_nodes(subscription_id, vec![])
-        .await;
+    assert!(!try_reload_current(&control).await);
     let retained = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -157,9 +165,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         .expect("initial internal query");
     assert_eq!(first, a_response(&query, [192, 0, 2, 10]));
 
-    control
-        .merge_subscription_nodes(uuid::Uuid::new_v4(), vec![])
-        .await;
+    reload_current(&control).await;
     let unchanged = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -179,10 +185,9 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
     assert_eq!(udp_response, a_response(&query, [192, 0, 2, 20]));
     assert_eq!(udp.calls(), 1, "ingress profiles must not share cache keys");
 
-    control.config_handle().write().await.dns.cache.ttl = 301;
-    control
-        .merge_subscription_nodes(uuid::Uuid::new_v4(), vec![])
-        .await;
+    let mut candidate = control.config_handle().read().await.clone();
+    candidate.dns.cache.ttl = 301;
+    reload_config(&control, candidate).await;
     let changed = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -190,16 +195,11 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
     assert_eq!(changed, a_response_with_ttl(&query, [192, 0, 2, 20], 301));
     assert_eq!(udp.calls(), 2);
 
-    {
-        let config_handle = control.config_handle();
-        let mut active = config_handle.write().await;
-        active.dns.cache.ttl = 302;
-        active.dns.upstream[0].address = tcp.address.to_string();
-        active.dns.upstream[0].protocol = DnsProtocol::Tcp;
-    }
-    control
-        .merge_subscription_nodes(uuid::Uuid::new_v4(), vec![])
-        .await;
+    let mut candidate = control.config_handle().read().await.clone();
+    candidate.dns.cache.ttl = 302;
+    candidate.dns.upstream[0].address = tcp.address.to_string();
+    candidate.dns.upstream[0].protocol = DnsProtocol::Tcp;
+    reload_config(&control, candidate).await;
     let tcp_query = build_dns_query("tcp.reload.example", 1);
     let tcp_response = service
         .resolve(&tcp_query, IngressProfile::Tcp)

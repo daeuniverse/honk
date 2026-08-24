@@ -42,7 +42,7 @@ Destination CIDRs, source CIDRs, and MAC prefixes live in separate LPM tries. Ea
 
 The kernel cannot see a hostname at TCP SYN time. Domain and geosite conditions compile to `DomainSet` placeholders. `DOMAIN_ROUTING_MAP` maps a DNS-learned destination IP to the corresponding per-generation rule bitmap; a present entry also sets `DomainKnown`, proving that all domain-set checks in this pass used a complete learned bitmap.
 
-In `domain`, `domain+`, and `domain++` modes, a generic proxy rule with a destination-port condition is changed to `ControlPlaneRouting` when it has no domain/geosite, process, MAC, or DSCP constraint and is not `direct` or `block`. This prevents a port decision from finalizing before userspace can inspect the domain. A learned `DOMAIN_ROUTING_MAP` entry can still make later flows kernel-decidable.
+In `domain++` mode, a generic proxy rule with a destination-port condition is changed to `ControlPlaneRouting` when it has no domain/geosite, process, MAC, or DSCP constraint and is not `direct` or `block`. `domain` and `domain+` keep the initial port/IP decision in the kernel. A learned `DOMAIN_ROUTING_MAP` entry can still make later flows kernel-decidable.
 
 ## Atomic routing publication
 
@@ -87,18 +87,16 @@ TCP sniffing extracts TLS SNI or HTTP `Host` and returns the buffered prefix for
 
 UDP sniffing handles QUIC v1 and v2 Initial packets. It derives Initial keys, removes header protection, decrypts the payload, collects CRYPTO frames, reassembles them across fragments or packets, and runs the shared TLS ClientHello parser. Per-flow sessions and negative caches bound repeated attempts. An incomplete ClientHello is not treated as a final no-domain result because later Initial fragments may change routing.
 
-In every domain-aware dial mode, a usable sniffed name re-runs userspace routing for a handoff that is neither `must` nor `block`. `must` and `block` remain final. `ip` mode never sniffs. A negative-cache hit skips name extraction and keeps the userspace path rather than claiming that a domain decision is complete.
+The initial IP-based decision and the optional domain target are separate. A sniffed name can affect routing only for an accepted `domain` reality check or in `domain++`; `domain+` never changes the route. `must`, `block`, and reserved direct decisions remain final. A negative-cache hit skips name extraction and keeps the existing path.
 
 ### Dial modes
 
-| Mode | Sniff | Verify name against destination IP | Re-run routing from name | Dial behavior |
+| Mode | Sniff | Verify name against destination IP | Re-run routing | Dial behavior |
 | --- | --- | --- | --- | --- |
-| `ip` | No | Not applicable | No | Use the original destination IP |
-| `domain` | Yes, unless a final/negative-cache path skips it | Yes; discard a same-family mismatch | Yes when the name remains usable | Pass the name to domain-capable outbounds; otherwise resolve a target |
-| `domain+` | Yes, with the same skips | No | Yes | Use the sniffed name without the reality check |
-| `domain++` | Yes, with the same skips | No | Yes | Use the sniffed name without the reality check |
-
-The current control-plane branches treat `domain+` and `domain++` identically for sniffing and re-routing. Only `domain` performs the destination-IP reality check; an answer containing only the other address family is accepted rather than treated as a mismatch.
+| `ip` | No | Not applicable | No | Use the original destination IP. |
+| `domain` | Yes, unless a final/negative-cache path skips it | Yes; discard a mismatch | Only after verification succeeds | Use the verified name for proxy dialing; an unmatched domain rule falls through to later IP/port rules. |
+| `domain+` | Yes, with the same skips | No | No | Use the sniffed name for proxy dialing while preserving the initial route. |
+| `domain++` | Yes, with the same skips | No | Yes for non-reserved decisions | Re-run routing from SNI/HTTP Host and use the resulting proxy target. |
 
 ## Clash modes and direct offload
 
@@ -106,7 +104,7 @@ The current control-plane branches treat `domain+` and `domain++` identically fo
 
 | Mode | Userspace override | Route-time kernel policy |
 | --- | --- | --- |
-| `Rule` | Keep the routed outbound | Offload a plain `direct` result only when SNI cannot change it: `dial_mode: ip`, no domain-class rule exists, or this flow set `DomainKnown` through `DOMAIN_ROUTING_MAP`; otherwise hand off to userspace |
+| `Rule` | Keep the routed outbound | Offload a plain `direct` result only when SNI cannot change it: `dial_mode: ip` or `domain+`, no domain-class rule exists, or this flow set `DomainKnown` through `DOMAIN_ROUTING_MAP`; otherwise hand off to userspace |
 | `Global` | Use the current GLOBAL selection when it resolves | Normally hand off to userspace. The exact lowercase GLOBAL selection `direct` is a special case that publishes `OFFLOAD_ALL` because every non-final result converges to direct |
 | `Direct` | Force `direct` | Offload every non-`must`, non-`block` result and normalize its cached outbound to `Direct` |
 

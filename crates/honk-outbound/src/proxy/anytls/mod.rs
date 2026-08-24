@@ -479,15 +479,13 @@ enum StreamSink {
 }
 
 impl StreamSink {
-    /// Deliver a payload frame. A false result makes the caller retire the
-    /// stream; UoT must never continue after losing a byte-stream chunk.
+    #[cfg(test)]
     async fn send_data(&self, data: Vec<u8>) -> bool {
         match self {
             StreamSink::Tcp(tx) => tx.send(StreamEvent::Data(data)).await.is_ok(),
             StreamSink::Uot(tx) => tx.try_send(StreamEvent::Data(data)).is_ok(),
         }
     }
-
     #[cfg(test)]
     async fn send_fin(&self) {
         match self {
@@ -532,13 +530,7 @@ impl Drop for StreamRegistration {
         if self.committed {
             return;
         }
-        self.session.streams.lock().unwrap().remove(&self.sid);
-        self.session.discard_overflow(self.sid);
-        if self.frame_started {
-            let _ = self
-                .session
-                .enqueue_control(CMD_FIN, self.sid, bytes::Bytes::new());
-        }
+        self.session.end_stream(self.sid, self.frame_started);
     }
 }
 
@@ -739,6 +731,8 @@ pub(crate) struct AnyTlsSession {
     writer_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Open streams: sid → demux delivery channel.
     streams: Mutex<HashMap<u32, StreamSink>>,
+    /// Remote FINs suppress the local Drop notification.
+    remote_fin: parking_lot::Mutex<HashSet<u32>>,
     /// Stream id allocator (sing `streamId`); first stream gets sid 1.
     next_sid: AtomicU32,
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
@@ -754,7 +748,8 @@ pub(crate) struct AnyTlsSession {
     /// never a clean EOF.
     terminal_error: std::sync::OnceLock<Arc<anyhow::Error>>,
     /// Streams killed locally (HOL slow-consumer): their readers see a
-    /// reset after the queued data drains, not a clean EOF.
+    /// reset after the queued data drains, not a clean EOF. A tombstone
+    /// survives map/session teardown until the owning stream reads or drops.
     killed_streams: Mutex<HashSet<u32>>,
     /// Per-stream ordered overflow for full TCP queues, with exact session
     /// and stream frame/byte accounting.
@@ -795,6 +790,7 @@ impl AnyTlsSession {
             writer_q: Arc::new(WriterQueue::new()),
             writer_task: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
+            remote_fin: parking_lot::Mutex::new(HashSet::new()),
             next_sid: AtomicU32::new(0),
             closed: AtomicBool::new(false),
             created: Instant::now(),
@@ -1067,29 +1063,72 @@ impl AnyTlsSession {
         Ok(AnyTlsStream::new(Arc::clone(self), sid, rx, permit))
     }
 
-    /// Unregister a UoT stream (FIN to the server), mirroring
-    /// [`Self::end_stream`]. Stream capacity is the permit's business
-    /// (released when the transport drops it), never this map's.
-    fn end_uot_stream(&self, sid: u32) {
-        let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
-        if was_registered {
+    /// Unregister a UoT stream, optionally notifying the server with FIN.
+    /// Stream capacity is released by the transport permit, not this map.
+    fn end_uot_stream(&self, sid: u32, notify_fin: bool) {
+        let (was_registered, received_fin) = {
+            let mut remote_fin = self.remote_fin.lock();
+            let received_fin = remote_fin.remove(&sid);
+            let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
+            (was_registered, received_fin)
+        };
+        if notify_fin && was_registered && !received_fin {
             let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} uot stream ended", self.seq, sid);
     }
 
-    /// Unregister a stream, optionally notifying the server with FIN, and
-    /// restart the idle clock when the last stream is gone. Called exactly
-    /// once per stream task.
-    async fn end_stream(&self, sid: u32, notify_fin: bool) {
-        let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
+    /// Unregister a stream, optionally notifying the server with FIN. This is
+    /// synchronous so cleanup is ordered before the stream permit is dropped.
+    /// Returns whether the watchdog had killed this stream.
+    fn end_stream(&self, sid: u32, notify_fin: bool) -> bool {
+        let (was_registered, received_fin, was_killed) = {
+            let mut remote_fin = self.remote_fin.lock();
+            let mut killed_streams = self.killed_streams.lock().unwrap();
+            let received_fin = remote_fin.remove(&sid);
+            let was_killed = killed_streams.remove(&sid);
+            let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
+            (was_registered, received_fin, was_killed)
+        };
 
         self.discard_overflow(sid);
-
-        if notify_fin && was_registered {
+        if notify_fin && was_registered && !received_fin {
             let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
+        was_killed
+    }
+
+    fn kill_stream(&self, sid: u32) -> Option<usize> {
+        let queue_capacity = {
+            let mut remote_fin = self.remote_fin.lock();
+            let mut killed_streams = self.killed_streams.lock().unwrap();
+            let mut streams = self.streams.lock().unwrap();
+            let Some(StreamSink::Tcp(tx)) = streams.get(&sid).cloned() else {
+                return None;
+            };
+            if tx.is_closed() {
+                return None;
+            }
+            streams.remove(&sid);
+            remote_fin.remove(&sid);
+            killed_streams.insert(sid);
+            tx.capacity()
+        };
+
+        self.discard_overflow(sid);
+        Some(queue_capacity)
+    }
+
+    /// Mark a registered stream before queueing its remote FIN event. The
+    /// lock order matches the end_* methods so Drop cannot race the marker.
+    fn mark_remote_fin(&self, sid: u32) -> Option<StreamSink> {
+        let mut remote_fin = self.remote_fin.lock();
+        let sink = self.streams.lock().unwrap().get(&sid).cloned();
+        if sink.is_some() {
+            remote_fin.insert(sid);
+        }
+        sink
     }
 
     /// Record the first physical-failure reason and close: streams
@@ -1112,6 +1151,7 @@ impl AnyTlsSession {
             crate::session::SessionState::Closed as usize,
             Ordering::Release,
         );
+        self.remote_fin.lock().clear();
         self.streams.lock().unwrap().clear();
         self.clear_overflow();
         if let Some(handle) = self.demux.lock().unwrap().take() {
@@ -1138,29 +1178,26 @@ impl AnyTlsSession {
     /// the demux waits bounded rounds for that progress (see
     /// [`Self::park_overflow`]). A saturated UoT sink retires only its sid.
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
-        if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Data(data)).await;
-            return;
-        }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
-            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Data(data)) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(ev)) => {
-                    self.park_overflow(sid, ev).await;
+            Some(StreamSink::Tcp(tx)) => {
+                if self.overflow_has(sid) {
+                    self.park_overflow(sid, StreamEvent::Data(data)).await;
+                    return;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
-            },
-            Some(sink) => {
-                if !sink.send_data(data).await {
-                    let removed = self.streams.lock().unwrap().remove(&sid).is_some();
-                    self.discard_overflow(sid);
-                    if removed {
-                        let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
+                match tx.try_send(StreamEvent::Data(data)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(ev)) => {
+                        self.park_overflow(sid, ev).await;
                     }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.end_stream(sid, false);
+                    }
+                }
+            }
+            Some(StreamSink::Uot(tx)) => {
+                if tx.try_send(StreamEvent::Data(data)).is_err() {
+                    self.end_uot_stream(sid, true);
                 }
             }
             None => {
@@ -1174,15 +1211,43 @@ impl AnyTlsSession {
         }
     }
 
-    fn overflow_sink_is_live(&self, sid: u32) -> bool {
-        let live = matches!(
-            self.streams.lock().unwrap().get(&sid),
-            Some(StreamSink::Tcp(tx)) if !tx.is_closed()
-        );
-        if !live {
-            self.streams.lock().unwrap().remove(&sid);
+    async fn dispatch_fin(self: &Arc<Self>, sid: u32) {
+        if self.overflow_has(sid) {
+            if self.mark_remote_fin(sid).is_some() {
+                self.park_overflow(sid, StreamEvent::Fin).await;
+            }
+            return;
         }
-        live
+        let sink = self.mark_remote_fin(sid);
+        match sink {
+            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Fin) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.park_overflow(sid, event).await;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.end_stream(sid, false);
+                }
+            },
+            Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Fin) {
+                Ok(()) => {}
+                Err(_) => self.end_uot_stream(sid, false),
+            },
+            None => {}
+        }
+    }
+
+    fn overflow_sink_is_live(&self, sid: u32) -> bool {
+        let closed = match self.streams.lock().unwrap().get(&sid) {
+            Some(StreamSink::Tcp(tx)) => tx.is_closed(),
+            Some(StreamSink::Uot(_)) | None => return false,
+        };
+        if closed {
+            self.end_stream(sid, false);
+            false
+        } else {
+            true
+        }
     }
 
     fn overflow_has(&self, sid: u32) -> bool {
@@ -1198,11 +1263,10 @@ impl AnyTlsSession {
     }
 
     fn kill_overflow_victim(&self, victim: OverflowVictim) {
-        let stall_ms = u64::try_from(victim.stalled_for.as_millis()).unwrap_or(u64::MAX);
-        let queue_capacity = match self.streams.lock().unwrap().get(&victim.sid) {
-            Some(StreamSink::Tcp(tx)) => tx.capacity(),
-            Some(StreamSink::Uot(_)) | None => 0,
+        let Some(queue_capacity) = self.kill_stream(victim.sid) else {
+            return;
         };
+        let stall_ms = u64::try_from(victim.stalled_for.as_millis()).unwrap_or(u64::MAX);
         warn!(
             session = self.seq,
             victim_sid = victim.sid,
@@ -1216,8 +1280,6 @@ impl AnyTlsSession {
             queue_capacity,
             "AnyTLS overflow killed stream"
         );
-        self.killed_streams.lock().unwrap().insert(victim.sid);
-        self.streams.lock().unwrap().remove(&victim.sid);
         if self
             .enqueue_control(CMD_FIN, victim.sid, bytes::Bytes::new())
             .is_err()
@@ -1357,67 +1419,34 @@ impl AnyTlsSession {
                     overflow.remove_stream(sid);
                     overflow.cancel_flush(sid);
                     drop(overflow);
-                    self.streams.lock().unwrap().remove(&sid);
+                    self.end_stream(sid, false);
                     return moved;
                 }
             }
         }
     }
 
-    async fn dispatch_fin(self: &Arc<Self>, sid: u32) {
-        if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Fin).await;
-            return;
-        }
-        let sink = self.streams.lock().unwrap().get(&sid).cloned();
-        match sink {
-            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Fin) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(event)) => {
-                    self.park_overflow(sid, event).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
-            },
-            Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Fin) {
-                Ok(()) => {}
-                Err(_) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
-            },
-            None => {}
-        }
-    }
-
     async fn dispatch_error(self: &Arc<Self>, sid: u32, message: Arc<str>) {
-        if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Error(message)).await;
-            return;
-        }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
             Some(StreamSink::Tcp(tx)) => {
-                let event = StreamEvent::Error(message);
-                match tx.try_send(event) {
+                if self.overflow_has(sid) {
+                    self.park_overflow(sid, StreamEvent::Error(message)).await;
+                    return;
+                }
+                match tx.try_send(StreamEvent::Error(message)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(event)) => {
                         self.park_overflow(sid, event).await;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        self.streams.lock().unwrap().remove(&sid);
-                        self.discard_overflow(sid);
+                        self.end_stream(sid, false);
                     }
                 }
             }
             Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Error(message)) {
                 Ok(()) => {}
-                Err(_) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
+                Err(_) => self.end_uot_stream(sid, false),
             },
             None => {}
         }
@@ -1615,9 +1644,14 @@ async fn dial_session(
     connect_timeout: Duration,
     tls_connector: Option<Arc<TlsConnector>>,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
-    let (read, write, auth, settings) =
-        connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
-    AnyTlsSession::establish(addr, read, write, &auth, &settings).await
+    let timeout = connect_timeout.saturating_mul(3);
+    tokio::time::timeout(timeout, async {
+        let (read, write, auth, settings) =
+            connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
+        AnyTlsSession::establish(addr, read, write, &auth, &settings).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("AnyTLS session dial timed out after {timeout:?}"))?
 }
 
 /// Connect to the AnyTLS server (using `tcp` when the caller provides a
@@ -1949,9 +1983,7 @@ impl std::fmt::Debug for AnyTlsStream {
 
 impl Drop for AnyTlsStream {
     fn drop(&mut self) {
-        let session = Arc::clone(&self.session);
-        let sid = self.sid;
-        tokio::spawn(async move { session.end_stream(sid, true).await });
+        self.session.end_stream(self.sid, true);
     }
 }
 
@@ -2006,8 +2038,15 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     got_any = true;
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Error(e))) => {
-                    let err =
-                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e.to_string());
+                    let killed = this.session.end_stream(this.sid, true);
+                    let err = if killed {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "stream killed: slow consumer (HOL)",
+                        )
+                    } else {
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e.to_string())
+                    };
 
                     if got_any {
                         this.read_err = Some(err);
@@ -2018,24 +2057,34 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     return std::task::Poll::Ready(Err(err));
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
+                    let killed = this.session.end_stream(this.sid, false);
+                    if killed {
+                        // A cloned sender can outlive watchdog removal and carry this FIN.
+                        let err = std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "stream killed: slow consumer (HOL)",
+                        );
+                        if got_any {
+                            this.read_err = Some(err);
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        this.read_eof = true;
+                        this.release_permit();
+                        return std::task::Poll::Ready(Err(err));
+                    }
                     this.read_eof = true;
                     this.release_permit();
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Ready(None) => {
+                    let killed = this.session.end_stream(this.sid, false);
                     let pending: Option<std::io::Error> =
                         if let Some(e) = this.session.terminal_error.get() {
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionAborted,
                                 e.to_string(),
                             ))
-                        } else if this
-                            .session
-                            .killed_streams
-                            .lock()
-                            .unwrap()
-                            .remove(&this.sid)
-                        {
+                        } else if killed {
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionReset,
                                 "stream killed: slow consumer (HOL)",

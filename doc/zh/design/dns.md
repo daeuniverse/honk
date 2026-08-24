@@ -45,6 +45,45 @@ flowchart LR
 
 已绑定的本地 `:53` 监听器按 TCP、UDP transport 分别优先于透明拦截。具体地址的 bind 对相应 transport 优先。通配 bind 仅在完整 FIB 查询报告 `NOT_FWDED` 时优先，避免远程 resolver 流量绕过透明 DNS。将 `dns.bind` 留空会保留透明 TCP 与 UDP 拦截。
 
+## DNS 所有权状态机
+
+下表针对 LAN 客户端，并明确区分**第一接收者**、**真正的应答来源**与**最终回包者**。`Honk bind` 是 host network namespace 中的普通监听器；绑定 `:54` 不会占用 `:53`。`透明 Honk` 依赖真实 eBPF datapath 与已挂载的接口 hook；mock 模式没有这条路径。
+
+| dnsmasq 状态 | Honk `dns.bind` | 查询目标 | 第一接收者 | 真正的应答来源 | 最终回包者 |
+| --- | --- | --- | --- | --- | --- |
+| 运行于 `:53`；命中本地/DHCP/缓存 | 任意不冲突的 bind | 网关 `:53` | dnsmasq | dnsmasq 本地数据或缓存 | dnsmasq |
+| 运行于 `:53`；未命中并转发到 `127.0.0.1#54` | `:54` 运行 | 网关 `:53` | dnsmasq | Honk 缓存/hosts/策略或 Honk 上游 | dnsmasq |
+| 运行于 `:53`；未命中且 dnsmasq 没有可用上游 | 任意 | 网关 `:53` | dnsmasq | 无 | dnsmasq 返回 `SERVFAIL` 或超时 |
+| 运行于 `:53`；转发目标 `127.0.0.1#54` 已停止 | `:54` 停止 | 网关 `:53` | dnsmasq | 无 | dnsmasq 返回 `SERVFAIL` 或超时 |
+| 运行于 `:53` | `:54` 运行 | 外部 `:53`（例如 `8.8.8.8:53`） | 启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
+| 已停止 | `:54` 运行 | 网关 `:54` | Honk bind | Honk 缓存/hosts/策略或 Honk 上游 | Honk bind |
+| 已停止 | `:54` 运行 | 网关 `:53` | 启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
+| 已停止 | bind 关闭 | 网关或外部 `:53` | 启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
+| 已停止或没有占用 `:53` | `:53` 运行 | 网关 `:53` | Honk bind | Honk 缓存/hosts/策略或 Honk 上游 | Honk bind |
+| 已占用 `:53` | 尝试绑定 `:53` | 网关 `:53` | 启动时 bind 冲突 | 在只剩一个所有者前无 | 没有确定的所有者；一个服务必须失败 |
+| 任意 | bind 关闭或已停止 | 网关 `:54` | 没有 Honk listener | 无 | 连接拒绝或超时 |
+| 任意 | 任意 | 非 DNS 端口 | 普通路由路径 | 选中的出站 | 普通流 |
+
+每种 transport 的优先级转移如下：
+
+```text
+gateway:53 数据包
+  -> 匹配的 host-network listener（dnsmasq 或 Honk bind）
+  -> 否则 Honk 透明 53 路径
+  -> 否则普通内核路由 / 没有 DNS 服务
+```
+
+本地 listener 检查按 TCP、UDP transport 分开执行。具体地址的本地 `:53` socket 优先；通配 socket 只有在完整 FIB 查询报告 `NOT_FWDED` 时优先，转发或结果不明确的目的地址仍走透明路径。因此，停止 dnsmasq 不会让 Honk `:54` 自动占用 `:53`；实际观察到的接管来自透明拦截。若要让 Honk 成为普通网关 `:53` 服务，应停止或迁移 dnsmasq，并将 `bind` 配置为 `tcp+udp://:53`。
+
+OpenWrt 最常见的转发状态是：
+
+```text
+LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
+            <- dnsmasq :53 <- 127.0.0.1:54 <----------------------
+```
+
+如果 Honk 选择的上游也是 dnsmasq `127.0.0.1:53`，而 dnsmasq 又把未命中请求转发到 Honk `:54`，两个服务会形成递归环。应使用真正的外部 Honk 上游，或让 dnsmasq 自己处理该上游。
+
 ## 解析管线
 
 生产路径顺序如下：

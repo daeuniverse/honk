@@ -129,6 +129,48 @@ fn test_domain_suffix_route() {
 }
 
 #[test]
+fn test_sniffed_domain_miss_falls_through_to_ip_rule() {
+    let rules = vec![
+        RoutingRule {
+            name: "known-domain".into(),
+            condition: RoutingCondition {
+                domain_suffix: vec!["known.example".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("proxy".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        },
+        RoutingRule {
+            name: "https-by-port".into(),
+            condition: RoutingCondition {
+                port: vec!["443".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: 1,
+            must: false,
+            mark: 0,
+        },
+    ];
+    let router = Router::new(&rules, "block").unwrap();
+    let conn = ConnectionInfo {
+        domain: Some("other.example".into()),
+        dst_ip: "203.0.113.10".parse().unwrap(),
+        dst_port: 443,
+        src_ip: "192.0.2.10".parse().unwrap(),
+        src_port: 12345,
+        protocol: "tcp",
+        process_name: None,
+        mac: None,
+        dscp: None,
+    };
+
+    assert_eq!(router.route(&conn), "direct");
+}
+
+#[test]
 fn test_ip_cidr_route() {
     let rules = vec![RoutingRule {
         name: "private-direct".into(),

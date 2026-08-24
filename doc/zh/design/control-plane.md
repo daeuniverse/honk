@@ -12,17 +12,19 @@
 
 启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
 
-1. 加载并校验配置，选择 `global.data_dir`，在 mock 或非 `ebpf` 构建上拒绝启用的 `experimental.udp_nfqueue`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
+1. 加载并校验配置、选择 `global.data_dir`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
 2. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 3. 选择后端。真实模式取得 `/run/honk-core.lock`，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。Mock 模式不取得进程全局锁。
-4. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
-5. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
-6. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
-7. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
-8. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环，再启动可选 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和统计采样器。
-9. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制平面 supervisor 中运行。
+4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
+5. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
+6. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
+7. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
+8. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
+9. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环；仅当生效开关仍开启时，才启动 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和统计采样器。
+10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
+`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
-`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制平面接口。使用 `--mock-ebpf` 或 `honk-core` 构建时未启用 `ebpf` feature，都会拒绝启用的 `experimental.udp_nfqueue`。
+当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
@@ -42,7 +44,7 @@
 
 ## 嗅探与流初始化
 
-TCP 嗅探最多读取 4096 字节，并提取 TLS SNI 或 HTTP `Host`。返回的缓冲区属于流状态，并在中继开始前写入已选出站，因此嗅探不会消费应用数据。`dial_mode: ip`、最终的非控制平面 `must` handoff 或命中 TCP negative cache 时跳过 TCP 嗅探。连续三次失败会抑制同一目的地址/出站签名十分钟；嗅探成功会移除 negative 条目。
+TCP 嗅探最多读取 4096 字节，并提取 TLS SNI 或 HTTP `Host`。返回的缓冲区属于流状态，并在中继开始前写入已选出站，因此嗅探不会消费应用数据。`dial_mode: ip`、最终的 direct/block 或 `must` handoff，或命中 TCP negative cache 时跳过 TCP 嗅探。连续三次失败会抑制同一目的地址/出站签名十分钟；嗅探成功会移除 negative 条目。
 
 UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并解析 TLS ClientHello SNI。每流 session 五秒过期，最多检查八个 Initial packet，并把 CRYPTO stream 限制为 64 KiB。首个 ClientHello 分片时，initializer 最多保留八个 FIFO follower，最多等待 250 ms。failed-DCID cache 限制对非 QUIC 或不可解密流量的重复工作。
 
@@ -88,16 +90,17 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 
 每个 UDP 流最多保留 64 个 datagram，包括首包。所有流共享精确的 8 MiB payload permit 预算。准入在复制前取得每流 slot 和全局 byte permit；FIFO 饱和时丢弃最新 datagram。NFQUEUE 有独立 ingest actor，限制为 256 个条目和 8 MiB 排队 payload。
 
-启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 16,384。在该上限处，不可变分区为：
+启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 32,768。在该上限处，固定分区为：
 
 | 所有者 | 容量 | 描述符记账 |
 | --- | ---: | ---: |
 | 固定/运行时预留 | 256 | 256 |
-| 已接受 TCP 流 | 672 | 每个 6 = 4032 |
-| 保留 TCP pool | 2016 | 每个 1 = 2016 |
-| 临时出站 dial | 1008 | 每个 1 = 1008 |
-| UDP endpoint | 3024 | 每个 3 = 9072 |
-| **合计** |  | **16,384** |
+| 已接受 TCP 流 | 1024 | 每个 6 = 6144 |
+| 保留 TCP pool | 2048 | 每个 1 = 2048 |
+| 临时出站 dial | 1024 | 每个 1 = 1024 |
+| UDP endpoint | 7765 | 每个 3 = 23,295 |
+| **合计** |  | **32,767** |
+剩余 1 个描述符是分区取整余量。TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量内动态扩容，最多达到该 floor 的两倍，同时保留一半 non-TCP 预算作为突发余量；4,096 描述符服务在余量空闲时可从 160 个流 permit 扩展到 320 个。已有流不会被切断，固定预留用于保护控制平面描述符。
 
 一个 TCP 流为 accepted socket、outbound socket 和两组各含两个 FD 的 splice pipe 记账。一个 UDP endpoint 按常见最坏所有权形态记账：relay socket、SOCKS5 控制流和 anyfrom reply socket。较小的 `RLIMIT_NOFILE` 值以相同的饱和算术缩放分区。
 
@@ -105,12 +108,14 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 
 | 准入 | 上限 |
 | --- | ---: |
-| TCP 流 permit | 由描述符导出；16,384 上限时为 672，编译期最大值为 1024 |
+| TCP 流 permit | 描述符导出的 floor；32,768 上限时为 1024，动态扩容最多到 2048 |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | 端口 53 入口 slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
 
 不存在单独的 256 条 TCP slow-path 上限。TCP accept 使用由描述符导出的流预算。Endpoint-removal channel 限制为 1024 条消息，每批排空 128 条。非阻塞投递遇到满队列时，去重的 `removal_dirty` 集保留补偿；worker 每批完成后刷新该集合，再确认精确 endpoint tombstone。
+
+透明 TCP 在任一 IP 族监听器 accept 之前预留一个共享 permit。所有 permit 占用时，新连接留在内核 listen backlog 中，不会先 accept 再关闭含有未读数据的 socket。`/stats` 的 `tcp` 对象提供 `activeFlows`、`limit` 和 `capacity.rejected`；后者统计等待 permit 的 accept-loop，而不是 accept 后被丢弃的连接。动态上限低于 256 时启动会告警；网关部署应提高服务的 `RLIMIT_NOFILE` 限制。
 
 ## TCP 中继与 conn-state 所有权
 
@@ -149,17 +154,15 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode` |
 | 持久化 | 任意 `experimental.cache_file` 变更 |
-| NFQUEUE | `experimental.udp_nfqueue.enabled` |
+| NFQUEUE | `global.nfqueue_enable` |
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 
-## 订阅编排
+启动时先解析已存正文，再开始网络刷新。有效且非空的恢复结果立即提供节点，并从五秒首次拉取等待中移除该订阅；缺失、无效或空正文只会在共享 grace 期间等待。之后所有订阅仍在后台刷新。
 
-启用 `global.store_subscribe` 时，已校验的原始正文存储在 `<global.data_dir>/.sub` 下。数据目录切换期间会继续使用已有的旧 `./.sub`，直到运维人员将其移动。目录必须是 mode `0700` 的非 symlink 目录；文件使用 mode `0600`，名称是根据请求 URL、user agent 和 header 得到的 URL-safe SHA-256。写入使用新临时文件、`sync_all`、原子 rename 和目录 sync。
+`SIGHUP` 会按 URL 稳定订阅 ID，并把活动订阅节点带入候选配置。只有启用订阅且当前没有活动节点时才恢复缓存，随后安排立即网络刷新。网络、解析或没有可用节点的失败会保留活动节点，不替换上一次有效正文。持久化失败不是致命错误：校验成功的节点仍可合并，旧正文仍可恢复。定期刷新与立即刷新使用同一串行的 runtime 发布路径，订阅节点不会写回配置文件。
 
-启动时在网络刷新前解析已存正文。有效恢复会立即提供节点，并从五秒首次拉取等待中移除该订阅；缺失或无效存储只在共享宽限期内等待。之后所有拉取继续在后台运行。
-
-收到 `SIGHUP` 时，订阅 ID 按 URL 稳定化，活动订阅节点被带入候选配置。只有已启用订阅的活动节点集为空时才恢复 cache，随后安排一次立即网络刷新。网络或解析失败保留活动节点，并且不会替换最后有效正文。持久化失败不是致命错误：已校验节点仍可合并，而之前存储的正文仍可用。周期刷新和立即刷新使用同一条串行运行时发布路径，订阅节点永远不会写回配置文件。
+当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
 ## Clash API 与 cache DB
 

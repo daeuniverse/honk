@@ -1,20 +1,18 @@
 # NFQUEUE 持有首包的 UDP 路径
 
-本文说明可选的 fail-closed 路径：它持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户空间得到 direct、proxy 或 block 终态决策。
+本文说明 fail-closed 路径：它持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户空间得到 direct、proxy 或 block 终态决策。
 
 ## 启用与范围
 
-完整配置面如下：
+该路径通过 `global.nfqueue_enable` 默认开启。设置为 `false` 可关闭：
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: false
 }
 ```
 
-`enabled` 默认为 `false`。修改它必须重启进程；reload 会拒绝该变更。启用后，启动要求带 `ebpf` feature 的构建和真实 eBPF 后端。不带 `ebpf` 的构建和 `--mock-ebpf` 都会直接启动失败，而不是静默回退。配置键表见[实验性配置参考](../reference/experimental.md)。
+修改该设置必须重启进程；reload 会拒绝该变更。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建、固定队列前置检查失败，或数据路径准入前的队列/规则/健康检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。持久化 token generation 恢复失败仍为 fatal，因为分配器状态已无法确定。真实模式会先取得单实例锁，再执行该前置检查，因此正常交接会等待旧队列所有者，不会误降级；保留的 nftables table 会在绑定队列后由安装阶段回收。服务准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。进程级配置项见[全局配置参考](../reference/global.md)。
 
 该 hook 的范围刻意保持狭窄：
 
@@ -52,7 +50,7 @@ flowchart LR
 | nftables 所有权 | 单个原子事务独占精确的 `inet honk_nfqueue` / `udp_decision`，即优先级 `-250` 的 `inet prerouting` filter chain；只有携带 Pending 签名的 UDP 才进入队列 |
 | 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。输入畸形或截断、`ENOBUFS`、listener 意外退出以及 verdict socket 失败均为 fatal |
 
-服务先绑定队列 `320`，再发布 nftables 事务。最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。honk 运行期间，同一网络命名空间的防火墙管理器不得修改任一自有 nftables 对象。
+服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
 
 ## 决策 token 协议
 
@@ -136,4 +134,4 @@ Retirement 以 `BPF_NOEXIST` 插入 `UDP_DECISION_RETIRE_FENCE[tuple] = token`�
 
 - [eBPF 数据路径](./datapath.md)
 - [控制平面](./control-plane.md)
-- [实验性配置参考](../reference/experimental.md)
+- [全局配置参考](../reference/global.md)

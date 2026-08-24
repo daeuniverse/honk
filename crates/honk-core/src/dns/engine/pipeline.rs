@@ -34,11 +34,10 @@ mod flight {
         {
             return Ok(outcome);
         }
-        let response = template.render(context.prepared.query())?;
         context.forwarder.outcome_from_wire(
             context.engine,
             context.prepared,
-            response,
+            template.wire(),
             None,
             OutcomeStatus::Accepted,
             Provenance::Upstream,

@@ -1297,4 +1297,29 @@ protocol = "udp"
             Some(42)
         );
     }
+    #[test]
+    fn test_mode_command_rejects_dae_without_rewriting() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("config.dae");
+        let source = "# preserve the dae source\nglobal {\n    log_level: info\n}\n";
+        std::fs::write(&path, source).expect("write dae source");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_honk-core"))
+            .args([
+                "--config",
+                path.to_str().expect("utf-8 config path"),
+                "mode",
+                "direct",
+            ])
+            .output()
+            .expect("run mode command");
+
+        assert!(!output.status.success(), "mode unexpectedly rewrote .dae");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(".dae"),
+            "unexpected mode error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

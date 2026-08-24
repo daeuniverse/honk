@@ -1,6 +1,6 @@
 # Experimental 配置参考
 
-本文档说明 `experimental { ... }` 下支持的三个嵌套 section。
+本文档说明 `experimental { ... }` 下当前支持的两个嵌套 section。
 
 ## Section 概览
 
@@ -8,9 +8,8 @@
 | --- | --- |
 | `clash_api` | Clash 兼容 HTTP API 与外部 dashboard |
 | `cache_file` | 用 SQLite 持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
-| `udp_nfqueue` | 对仍有歧义的 LAN 转发 UDP 使用保留首包决策路径 |
 
-在嵌套 section 这一层，dae 解析器只将 `clash_api`、`cache_file` 和 `udp_nfqueue` 列入白名单；`experimental` 下不接受其他 section 名称。
+`udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，打印迁移 warning，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
 
 ## `clash_api`
 
@@ -59,31 +58,6 @@
 
 只有未过期，并且 key digest、规范 query wire、response wire identity 与当前 DNS policy 全部匹配的 v2 行才会恢复。exact key 还保留 ingress profile、request scope 和 operation，防止在不同 DNS 上下文之间复用。
 
-## `udp_nfqueue`
-
-| 字段 | 默认值 | 含义 |
-| --- | --- | --- |
-| `enabled` | `false` | 为仍有歧义的 LAN 转发 UDP 决策启用 NFQUEUE 暂存。 |
-
-`enabled` 是唯一接受的设置。不存在 queue number、worker、bypass、fanout 或 fail-open 配置项。修改该值后必须重启进程；SIGHUP 会拒绝候选配置。以 `enabled: true` 启动时，构建必须带 `ebpf` feature 并使用真实 eBPF 后端。不带 `ebpf` 的构建或使用 `--mock-ebpf` 的运行会被拒绝。
-
-### 流量范围
-
-该路径只暂存仍有歧义的 LAN 转发 UDP 首包，位置在 LAN TC 之后、conntrack/NAT 之前。本机发起的 WAN 出站仍走 TPROXY 路径；DNS 53 端口、内部或特殊流量、反向流量、`must` 与 `block` 结果，以及已经可以安全直连的决策都不入队。机制和终态转换见 [NFQUEUE 设计](../design/nfqueue.md)。
-
-### 所有权与生命周期
-
-honk 独占 NFQUEUE 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`。honk 运行时，同一网络命名空间中的防火墙管理器不得创建、替换、flush 或删除这些对象。普通重启和清理会保留固定的 `UDP_DECISION_SEQUENCE` 分配器，避免复用 decision token。
-
-### 损坏 pin 的恢复
-
-分配器 pin 位于 `<bpf-pin-root>/UDP_DECISION_SEQUENCE`，通常是 `/sys/fs/bpf/UDP_DECISION_SEQUENCE`。只要仍有进程可能暂存报文，或仍可能存在存活的 token 绑定状态，就绝不能删除它。恢复损坏或不兼容的 pin 时：
-
-1. 保持 NFQUEUE staging fenced；不得接纳新的暂存流。
-2. 停止使用该网络命名空间和 pin root 的所有 honk 进程。
-3. 确认队列 `320` 已无 listener，且 token 绑定 map `CONN_STATE_MAP`、`ROUTING_HANDOFF_MAP`、`REDIRECT_TRACK` 和 `UDP_DECISION_RETIRE_FENCE` 均已消失。只要仍有任一 map，就不得删除分配器 pin。
-4. 仅删除 `UDP_DECISION_SEQUENCE`，且只删除一次。
-5. 重启 honk，由它创建新的分配器。
 
 ## 示例
 
@@ -101,9 +75,6 @@ experimental {
         cache_id: 'gateway-main'
         store_fakeip: false
         store_dns: true
-    }
-    udp_nfqueue {
-        enabled: true
     }
 }
 ```

@@ -18,6 +18,7 @@
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
 | `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。 |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此向每个已解析的 WAN 接口（含运行期晚挂载的）写入 `net.ipv6.conf.<wan>.accept_ra=2`，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
+| `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
 | `data_dir` | `data_dir` | `"/var/share/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录；修改后需重启。 |
 | `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。当前健康检查循环使用第一个值；空列表退回普通 TCP 检查。 |
@@ -59,10 +60,12 @@
 
 | 模式 | 嗅探 | 域名校验 | 路由与拨号行为 |
 | ---- | ---- | -------- | -------------- |
-| `ip` | 否 | 不适用 | 在本地解析，并让代理按数字 IP 拨号。 |
-| `domain` | 是 | 嗅探到的名称必须解析到原始目的 IP。 | 按已校验域名拨号；不会仅因嗅探而重新执行路由。 |
-| `domain+` | 是 | 否 | 使用嗅探域名但不校验目的 IP；不重新执行路由。 |
-| `domain++` | 强制 | 否 | 根据嗅探到的 SNI/Host 重新计算路由，再按所得域名决策拨号。 |
+| `ip` | 否 | 不适用 | 保留原始目的 IP；不嗅探，也不重新执行路由。 |
+| `domain` | 是 | 嗅探到的名称必须通过目的 IP reality check。 | 校验通过后可按域名重新执行路由；没有域名规则命中时，仍由普通 IP/端口规则决定。代理出站可按已校验域名拨号。 |
+| `domain+` | 是 | 否 | 保留初始 IP 规则决策，但允许代理出站使用嗅探域名作为目标。 |
+| `domain++` | 是 | 否 | 根据嗅探到的 SNI/Host 重新计算非保留决策，再使用所得代理域名目标。 |
+
+直连、阻断、`must` 及其他保留 handoff 保持最终决策，并保留原始 IP 目标。
 
 ## 数据目录与资源路径
 
@@ -102,6 +105,7 @@ global {
     log_file: 'honk.log'
     data_dir: '/var/share/honk'
     store_subscribe: true
+    nfqueue_enable: true
 
     lan_interface: br0
     wan_interface: auto

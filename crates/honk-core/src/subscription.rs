@@ -37,6 +37,14 @@ impl reqwest::dns::Resolve for BootstrapDnsResolve {
 }
 
 const SUBSCRIPTION_STORE_DIR: &str = ".sub";
+const DEFAULT_SUBSCRIPTION_USER_AGENT: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));
+
+fn effective_subscription_user_agent(sub: &Subscription) -> &str {
+    sub.user_agent
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT)
+}
 
 fn default_store_root() -> PathBuf {
     honk_config::paths::resolve_artifact_path_with_legacy(
@@ -119,6 +127,11 @@ impl SubscriptionStore {
     }
 }
 
+fn subscription_cache_user_agent(sub: &Subscription) -> &str {
+    // The request UA may change with the binary; the cache identity must not.
+    sub.user_agent.as_deref().unwrap_or_default()
+}
+
 fn subscription_filename(sub: &Subscription) -> String {
     fn add_part(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
@@ -127,10 +140,7 @@ fn subscription_filename(sub: &Subscription) -> String {
 
     let mut hasher = Sha256::new();
     add_part(&mut hasher, sub.url.as_bytes());
-    add_part(
-        &mut hasher,
-        sub.user_agent.as_deref().unwrap_or_default().as_bytes(),
-    );
+    add_part(&mut hasher, subscription_cache_user_agent(sub).as_bytes());
     for header in &sub.headers {
         add_part(&mut hasher, header.key.as_bytes());
         add_part(&mut hasher, header.value.as_bytes());
@@ -230,11 +240,10 @@ impl SubscriptionManager {
         sub: &Subscription,
         store: Option<&SubscriptionStore>,
     ) -> anyhow::Result<Vec<Node>> {
-        let mut request = self.client.get(&sub.url);
-
-        if let Some(ref ua) = sub.user_agent {
-            request = request.header("User-Agent", ua);
-        }
+        let mut request = self
+            .client
+            .get(&sub.url)
+            .header("User-Agent", effective_subscription_user_agent(sub));
 
         for header in &sub.headers {
             request = request.header(&header.key, &header.value);
@@ -270,10 +279,14 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     }?;
 
     let mut seen = std::collections::HashSet::new();
-    Ok(nodes
+    let mut had_duplicate = false;
+    let nodes = nodes
         .into_iter()
         .filter(|node| {
-            seen.insert(node.id) || {
+            if seen.insert(node.id) {
+                true
+            } else {
+                had_duplicate = true;
                 tracing::warn!(
                     node = %node.name,
                     "skipping subscription node with a duplicate endpoint identity"
@@ -281,7 +294,14 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
                 false
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    if nodes.is_empty() {
+        anyhow::bail!("no usable nodes found in subscription");
+    }
+    if had_duplicate && nodes.len() == 1 {
+        anyhow::bail!("subscription contains only duplicate endpoint identities");
+    }
+    Ok(nodes)
 }
 
 fn parse_base64_subscription(
@@ -840,6 +860,54 @@ mod tests {
         let result = parse_base64_subscription(&encoded, None, "test");
         assert!(result.is_err());
     }
+    #[test]
+    fn test_parse_subscription_rejects_duplicate_only_simple_payload() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let uri = "socks5://127.0.0.1:1080#same";
+        let content = format!("{uri}\n{uri}");
+        let error = parse_subscription_content(&sub, &content).unwrap_err();
+        assert!(error.to_string().contains("duplicate endpoint identities"));
+    }
+
+    #[test]
+    fn test_parse_subscription_keeps_unique_nodes_with_duplicates() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let content = concat!(
+            "socks5://127.0.0.1:1080#same\n",
+            "socks5://127.0.0.1:1080#same-again\n",
+            "socks5://127.0.0.1:1081#unique"
+        );
+        let nodes = parse_subscription_content(&sub, content).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "same");
+        assert_eq!(nodes[1].name, "unique");
+    }
+
+    #[test]
+    fn test_parse_subscription_rejects_duplicate_only_clash_payload() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Clash,
+            ..Default::default()
+        };
+        let yaml = r#"proxies:
+  - name: first
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: second
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+"#;
+        let error = parse_subscription_content(&sub, yaml).unwrap_err();
+        assert!(error.to_string().contains("duplicate endpoint identities"));
+    }
 
     #[test]
     fn test_parse_clash_subscription() {
@@ -1173,6 +1241,113 @@ not-proxies: []
         let result = parse_clash_subscription(yaml, None);
         assert!(result.is_err());
     }
+    #[test]
+    fn subscription_user_agent_defaults_and_allows_override() {
+        let mut sub = Subscription::default();
+        assert_eq!(
+            effective_subscription_user_agent(&sub),
+            DEFAULT_SUBSCRIPTION_USER_AGENT
+        );
+
+        sub.user_agent = Some("provider/1.0".into());
+        assert_eq!(effective_subscription_user_agent(&sub), "provider/1.0");
+
+        sub.user_agent = Some(String::new());
+        assert_eq!(
+            effective_subscription_user_agent(&sub),
+            DEFAULT_SUBSCRIPTION_USER_AGENT
+        );
+    }
+
+    #[test]
+    fn subscription_cache_identity_is_stable_with_default_user_agent() {
+        let mut sub = Subscription {
+            url: "https://example.test/subscription".into(),
+            ..Subscription::default()
+        };
+        let unset = subscription_filename(&sub);
+        sub.user_agent = Some(String::new());
+        assert_eq!(subscription_filename(&sub), unset);
+        sub.user_agent = Some("provider/1.0".into());
+        assert_ne!(subscription_filename(&sub), unset);
+    }
+
+    #[tokio::test]
+    async fn subscription_store_loads_pre_default_user_agent_key() {
+        fn pre_default_filename(sub: &Subscription) -> String {
+            fn add_part(hasher: &mut Sha256, value: &[u8]) {
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value);
+            }
+
+            let mut hasher = Sha256::new();
+            add_part(&mut hasher, sub.url.as_bytes());
+            add_part(&mut hasher, b"");
+            for header in &sub.headers {
+                add_part(&mut hasher, header.key.as_bytes());
+                add_part(&mut hasher, header.value.as_bytes());
+            }
+            use base64::Engine as _;
+            format!(
+                "{}.sub",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+            )
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+        let sub = Subscription {
+            name: "provider".into(),
+            url: "https://example.test/subscription".into(),
+            ..Subscription::default()
+        };
+        let content = "socks5://127.0.0.1:1080#stored";
+        let old_path = store.root().join(pre_default_filename(&sub));
+        write_store_file(store.root(), &old_path, content.as_bytes()).unwrap();
+
+        let restored = store.load_nodes(&sub).await.unwrap().unwrap();
+        assert_eq!(restored[0].name, "stored");
+
+        let mut explicit_empty = sub.clone();
+        explicit_empty.user_agent = Some(String::new());
+        assert!(store.load_nodes(&explicit_empty).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn subscription_cache_identity_isolates_explicit_default_user_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+        let default_sub = Subscription {
+            name: "provider".into(),
+            url: "https://example.test/subscription".into(),
+            ..Subscription::default()
+        };
+        let mut explicit_default = default_sub.clone();
+        explicit_default.user_agent = Some(DEFAULT_SUBSCRIPTION_USER_AGENT.into());
+        assert_ne!(
+            store.path_for(&default_sub),
+            store.path_for(&explicit_default)
+        );
+
+        let mut with_header = default_sub.clone();
+        with_header
+            .headers
+            .push(honk_config::subscription::SubscriptionHeader {
+                key: "X-Test".into(),
+                value: "1".into(),
+            });
+        assert_ne!(store.path_for(&default_sub), store.path_for(&with_header));
+
+        write_store_file(
+            store.root(),
+            &store.path_for(&explicit_default),
+            b"socks5://127.0.0.1:1080#explicit",
+        )
+        .unwrap();
+        assert!(store.load_nodes(&default_sub).await.unwrap().is_none());
+        assert!(store.load_nodes(&explicit_default).await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn fetch_error_chain_redacts_subscription_url() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1182,8 +1357,21 @@ not-proxies: []
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).await.unwrap();
+            let mut request = Vec::with_capacity(1024);
+            let mut chunk = [0_u8; 256];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0, "HTTP request ended before its headers");
+                request.extend_from_slice(&chunk[..size]);
+                assert!(request.len() <= 16 * 1024, "HTTP request headers too large");
+            }
+            let request = String::from_utf8_lossy(&request);
+            let expected = format!("user-agent: {DEFAULT_SUBSCRIPTION_USER_AGENT}");
+            assert!(
+                request
+                    .lines()
+                    .any(|line| { line.trim_end_matches('\r').eq_ignore_ascii_case(&expected) })
+            );
             stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

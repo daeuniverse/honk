@@ -846,6 +846,31 @@ fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> 
 /// standard; handy for headless ops.
 async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let snap = s.stats.snapshot();
+    let score_groups = {
+        let group_manager = s.group_manager.read();
+        group_manager.score_reason_snapshot()
+    };
+    let score_groups: Vec<_> = score_groups
+        .into_iter()
+        .map(|group| {
+            let counters = |counters: honk_outbound::group::ScoreReasonCounters| {
+                serde_json::json!({
+                    "coldExplore": counters.cold_explore,
+                    "periodicExplore": counters.periodic_explore,
+                    "reliabilityWinner": counters.reliability_winner,
+                    "performanceWinner": counters.performance_winner,
+                    "incumbentHeld": counters.incumbent_held,
+                    "freshFailureBypass": counters.fresh_failure_bypass,
+                    "deadFiltered": counters.dead_filtered,
+                })
+            };
+            serde_json::json!({
+                "name": group.name,
+                "tcp": counters(group.tcp),
+                "udp": counters(group.udp),
+            })
+        })
+        .collect();
     let per_outbound: Vec<serde_json::Value> = snap
         .iter()
         .map(|(name, v)| {
@@ -860,12 +885,14 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         })
         .collect();
     let pool = s.connection_pool.ready_metrics();
+    let tcp = s.stats.tcp_snapshot();
     let udp = s.stats.udp_snapshot();
     let warm = s
         .stats
         .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
     Json(serde_json::json!({
         "outbounds": per_outbound,
+        "score": { "groups": score_groups },
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,
@@ -885,6 +912,13 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "tuic": warm.tuic_clients,
                 "juicity": warm.juicity_clients,
                 "hysteria2": warm.hysteria2_clients,
+            },
+        },
+        "tcp": {
+            "activeFlows": tcp.active_flows,
+            "limit": tcp.limit,
+            "capacity": {
+                "rejected": tcp.capacity_rejections,
             },
         },
         "udp": {
@@ -971,6 +1005,12 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
     connections_json_tracker(&s.connection_tracker)
 }
 
+fn connection_addr_parts(raw: &str) -> (String, String) {
+    raw.parse::<std::net::SocketAddr>()
+        .map(|addr| (addr.ip().to_string(), addr.port().to_string()))
+        .unwrap_or_default()
+}
+
 fn connections_json_tracker(
     tracker: &crate::connection_tracker::ConnectionTracker,
 ) -> serde_json::Value {
@@ -978,16 +1018,8 @@ fn connections_json_tracker(
     let connections: Vec<serde_json::Value> = snapshots
         .iter()
         .map(|e| {
-            let source_ip: Vec<&str> = e.source.rsplitn(2, ':').collect();
-            let dest_ip: Vec<&str> = e.destination.rsplitn(2, ':').collect();
-            let src_port = source_ip.first().copied().unwrap_or("");
-            let dst_port = dest_ip.first().copied().unwrap_or("");
-            let src_ip = if source_ip.len() > 1 {
-                source_ip[1]
-            } else {
-                ""
-            };
-            let dst_ip = if dest_ip.len() > 1 { dest_ip[1] } else { "" };
+            let (src_ip, src_port) = connection_addr_parts(&e.source);
+            let (dst_ip, dst_port) = connection_addr_parts(&e.destination);
             let start = std::time::SystemTime::now()
                 .checked_sub(e.start_time.elapsed())
                 .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())

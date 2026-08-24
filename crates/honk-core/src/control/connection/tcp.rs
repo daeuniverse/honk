@@ -1,4 +1,4 @@
-use super::routing::connection_chains;
+use super::routing::{build_connection_info, connection_chains};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 use honk_config::types::NodeProtocol;
@@ -154,27 +154,27 @@ impl ControlPlaneHandle {
                     .global
                     .dial_mode
                     .parse::<DialMode>()
-                    .ok()
-                    .unwrap_or(DialMode::DomainPlusPlus),
+                    .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?,
                 Duration::from_millis(connect_timeout_ms),
                 Duration::from_millis(config.global.dns_resolve_timeout_ms),
                 Duration::from_millis((connect_timeout_ms.max(1000) * 4).max(10000)),
             )
         };
 
-        // Skip sniffing if eBPF routing already decided with must flag
-        // (must rules are final — no domain sniffing needed, matches Go dae).
-        // In ip mode we never sniff because we always dial by original_dst.
+        // Skip sniffing when the datapath already made a final decision.
+        // In ip mode we always dial by original_dst.
         let mut skip_sniff = matches!(dial_mode, DialMode::Ip);
         if let Some(ref ho) = handoff {
-            // Must-rules: eBPF already made a final routing decision.
-            // Domain sniffing is unnecessary and costly — skip it.
-            if !skip_sniff
-                && ho.must != 0
-                && ho.outbound != OutboundIndex::ControlPlaneRouting as u8
-            {
+            let final_handoff = matches!(
+                ho.outbound,
+                x if x == OutboundIndex::Direct as u8
+                    || x == OutboundIndex::Block as u8
+                    || x == OutboundIndex::MustRules as u8
+            ) || (ho.must != 0
+                && ho.outbound != OutboundIndex::ControlPlaneRouting as u8);
+            if !skip_sniff && final_handoff {
                 debug!(
-                    "Skip TCP sniffing by must-rule for {} (outbound={})",
+                    "Skip TCP sniffing by final eBPF handoff for {} (outbound={})",
                     original_dst, ho.outbound
                 );
                 skip_sniff = true;
@@ -192,28 +192,18 @@ impl ControlPlaneHandle {
         } else {
             sniffing::sniff_tcp(flow.stream_mut()).await
         };
-        let mut domain = sniff_result.domain.clone();
-        if let Some(ref d) = domain {
-            debug!("SNI sniffed domain: {}", d);
+        let sniffed_domain = sniff_result.domain.clone();
+        if let Some(ref domain) = sniffed_domain {
+            debug!("SNI sniffed domain: {}", domain);
         }
-
-        // Domain mode verifies that the sniffed domain actually resolves to the
-        // original destination IP. If not, fall back to IP mode for this flow.
-        if matches!(dial_mode, DialMode::Domain)
-            && let Some(ref d) = domain
-        {
-            let verified = self
-                .verify_domain_reality(d, original_dst.ip(), client_addr.ip())
-                .await;
-            if !verified {
-                debug!(
-                    "Sniffed domain {} failed reality check against {}, falling back to IP",
-                    d,
-                    original_dst.ip()
-                );
-                domain = None;
-            }
-        }
+        let (domain, domain_verified) = self
+            .apply_domain_reality_check(
+                dial_mode,
+                sniffed_domain,
+                original_dst.ip(),
+                client_addr.ip(),
+            )
+            .await;
 
         if !skip_sniff && let Some(ref ho) = handoff {
             let cache_key = (original_dst, ho.outbound);
@@ -225,54 +215,19 @@ impl ControlPlaneHandle {
             }
         }
 
-        let conn_info = ConnectionInfo {
-            domain: domain.clone(),
-            dst_ip: original_dst.ip(),
-            dst_port: original_dst.port(),
-            src_ip: client_addr.ip(),
-            src_port: client_addr.port(),
-            protocol: "tcp",
-            process_name: handoff.as_ref().and_then(|ho| ho.process_name()),
-            mac: handoff.as_ref().and_then(|ho| ho.mac_address()),
-            dscp: handoff.as_ref().map(|ho| ho.dscp),
-        };
-
-        // prefer all 'direct' need handoff, even if in complex chain select 'direct' outbound
-        let reroute_by_sniffed_domain =
-            Self::should_reroute_sniffed_domain(dial_mode, domain.as_deref(), handoff.as_ref());
-        let (userspace_outbound, userspace_must, matched_rule) = {
-            let router = self.router.read().await;
-            match router.route_full(&conn_info) {
-                Some(matched) => (
-                    matched.outbound_name.to_owned(),
-                    matched.must,
-                    Some((
-                        matched.rule_type.to_owned(),
-                        matched.rule_payload.to_owned(),
-                    )),
-                ),
-                None => (router.default_outbound().to_owned(), false, None),
-            }
-        };
-        let (outbound_name, must) = if let Some(ho) = &handoff {
-            debug!(
-                "eBPF handoff: outbound={}, mark=0x{:x}, dscp={}",
-                ho.outbound, ho.mark, ho.dscp
-            );
-            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
-            {
-                (userspace_outbound, userspace_must)
-            } else {
-                (self.outbound_index_to_name(ho.outbound).await, ho.must != 0)
-            }
-        } else {
-            (userspace_outbound, userspace_must)
-        };
-
-        // Clash mode override (Direct/Global); no-op when the clash API is
-        // disabled or mode is Rule. Must-rule and block results are never
-        // overridden.
-        let outbound_name = self.apply_mode_override(outbound_name, must).await;
+        let conn_info = build_connection_info(
+            domain.clone(),
+            original_dst,
+            client_addr,
+            "tcp",
+            handoff.as_ref(),
+        );
+        let route = self
+            .prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
+            .await;
+        let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
+        let matched_rule = route.matched_rule;
+        let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
 
         // For userspace-routed flows with a sniffed domain, write the resolved
         // IP back into eBPF DOMAIN_ROUTING_MAP so the next connection to the
@@ -370,10 +325,12 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        // SOCKS5, Trojan, Shadowsocks, and AnyTLS support domain-based routing
-        // (ATYP_DOMAIN). They resolve the domain on the proxy server side, so
-        // client-side DNS is unnecessary. Direct/block use the original_dst IP
-        // directly — no DNS needed.
+        // Domain targets are meaningful only for non-reserved proxy
+        // outbounds. Direct and block always use the original IP.
+        let domain_target_allowed = !matches!(
+            outbound_name.as_str(),
+            "direct" | "block" | "must_rules" | "control_plane_routing"
+        );
         let all_domain_capable = candidates.iter().all(|node| {
             matches!(
                 node.protocol,
@@ -386,65 +343,68 @@ impl ControlPlaneHandle {
             )
         });
 
-        // Resolve the target IP for dialing. Pass the sniffed domain to the
-        // proxy when available (used for domain-based routing in SOCKS5 etc.).
-        let (resolved_target, target_domain) = if let Some(ref domain) = domain {
-            if all_domain_capable {
-                debug!(
-                    "Skipping DNS for {} (domain-capable proxy, {} candidates)",
-                    domain,
-                    candidates.len()
-                );
-                (original_dst, Some(domain.clone()))
-            } else {
-                // One or more candidates are direct/block — need DNS resolution.
-                // Resolve both IPv4 and IPv6, preferring the version that
-                // matches original_dst. Apply configurable timeout.
-                let is_v6 = original_dst.is_ipv6();
-                match tokio::time::timeout(
-                    dns_resolve_timeout,
-                    self.dns_resolver
-                        .resolve_for_source(domain, client_addr.ip()),
-                )
-                .await
-                {
-                    Ok(Ok(resolved)) => {
-                        // Prefer AAAA records for v6 original_dst, A records for v4.
-                        let preferred_ip = if is_v6 {
-                            resolved
-                                .ipv6
-                                .first()
-                                .or_else(|| resolved.ipv4.first())
-                                .copied()
-                        } else {
-                            resolved
-                                .ipv4
-                                .first()
-                                .or_else(|| resolved.ipv6.first())
-                                .copied()
-                        };
-                        match preferred_ip {
-                            Some(ip) => {
-                                let resolved_addr = SocketAddr::new(ip, original_dst.port());
-                                debug!(
-                                    "DNS resolved {} -> {} ({})",
-                                    domain,
-                                    resolved_addr,
-                                    if is_v6 { "v6-prefer" } else { "v4-prefer" }
-                                );
-                                (resolved_addr, Some(domain.clone()))
-                            }
-                            None => {
-                                debug!("DNS returned no IPs for {}, using original dst", domain);
-                                (original_dst, Some(domain.clone()))
+        // Resolve the target IP for dialing. Domain-capable proxies receive
+        // the sniffed name; other proxy paths resolve it locally.
+        let (resolved_target, target_domain) = if domain_target_allowed {
+            if let Some(ref domain) = domain {
+                if all_domain_capable {
+                    debug!(
+                        "Skipping DNS for {} (domain-capable proxy, {} candidates)",
+                        domain,
+                        candidates.len()
+                    );
+                    (original_dst, Some(domain.clone()))
+                } else {
+                    let is_v6 = original_dst.is_ipv6();
+                    match tokio::time::timeout(
+                        dns_resolve_timeout,
+                        self.dns_resolver
+                            .resolve_for_source(domain, client_addr.ip()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resolved)) => {
+                            let preferred_ip = if is_v6 {
+                                resolved
+                                    .ipv6
+                                    .first()
+                                    .or_else(|| resolved.ipv4.first())
+                                    .copied()
+                            } else {
+                                resolved
+                                    .ipv4
+                                    .first()
+                                    .or_else(|| resolved.ipv6.first())
+                                    .copied()
+                            };
+                            match preferred_ip {
+                                Some(ip) => {
+                                    let resolved_addr = SocketAddr::new(ip, original_dst.port());
+                                    debug!(
+                                        "DNS resolved {} -> {} ({})",
+                                        domain,
+                                        resolved_addr,
+                                        if is_v6 { "v6-prefer" } else { "v4-prefer" }
+                                    );
+                                    (resolved_addr, Some(domain.clone()))
+                                }
+                                None => {
+                                    debug!(
+                                        "DNS returned no IPs for {}, using original dst",
+                                        domain
+                                    );
+                                    (original_dst, Some(domain.clone()))
+                                }
                             }
                         }
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        debug!("DNS timed out or failed for {}, using original dst", domain);
-                        (original_dst, Some(domain.clone()))
+                        Ok(Err(_)) | Err(_) => {
+                            debug!("DNS timed out or failed for {}, using original dst", domain);
+                            (original_dst, Some(domain.clone()))
+                        }
                     }
                 }
+            } else {
+                (original_dst, None)
             }
         } else {
             (original_dst, None)

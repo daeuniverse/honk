@@ -55,7 +55,6 @@ pub(crate) enum RulesError {
     #[error("nftables netlink: {0}")]
     Io(#[from] io::Error),
 }
-
 pub(crate) struct NftRuleset {
     socket: OwnedFd,
     sequence: u32,
@@ -70,6 +69,8 @@ impl NftRuleset {
             sequence: 1,
             installed: false,
         };
+        // The singleton process lock reserves these names; reclaim a stale
+        // table before publishing the replacement transaction.
         ruleset.remove_owned_table()?;
         let sequence = ruleset.next_sequence();
         let request = build_install_batch(sequence);

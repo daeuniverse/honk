@@ -45,6 +45,45 @@ The standalone listener has these lifecycle and admission invariants:
 
 A bound local `:53` listener takes precedence over transparent interception independently for TCP and UDP. A specific-address bind wins for that transport. A wildcard bind wins only when the full FIB lookup reports `NOT_FWDED`, preventing remote resolver traffic from bypassing transparent DNS. Leaving `dns.bind` empty preserves transparent TCP and UDP interception.
 
+## DNS ownership state machine
+
+This matrix is for a LAN client and separates the **first receiver**, the **actual answer source**, and the **final reply sender**. `Honk bind` is an ordinary host-network listener; binding `:54` does not claim `:53`. `Transparent Honk` requires the real eBPF datapath and an attached interface hook; it is unavailable in mock mode.
+
+| dnsmasq state | Honk `dns.bind` | Query target | First receiver | Actual answer source | Final reply sender |
+| --- | --- | --- | --- | --- | --- |
+| Running on `:53`; local/DHCP/cache hit | Any non-conflicting bind | Gateway `:53` | dnsmasq | dnsmasq local data or cache | dnsmasq |
+| Running on `:53`; miss forwarded to `127.0.0.1#54` | `:54` running | Gateway `:53` | dnsmasq | Honk cache/hosts/policy or Honk upstream | dnsmasq |
+| Running on `:53`; miss has no reachable dnsmasq upstream | Any | Gateway `:53` | dnsmasq | None | dnsmasq returns `SERVFAIL` or times out |
+| Running on `:53`; forwarding target `127.0.0.1#54` is stopped | `:54` stopped | Gateway `:53` | dnsmasq | None | dnsmasq returns `SERVFAIL` or times out |
+| Running on `:53` | `:54` running | External `:53` (for example `8.8.8.8:53`) | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
+| Stopped | `:54` running | Gateway `:54` | Honk bind | Honk cache/hosts/policy or Honk upstream | Honk bind |
+| Stopped | `:54` running | Gateway `:53` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
+| Stopped | Bind disabled | Gateway or external `:53` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
+| Stopped or does not own `:53` | `:53` running | Gateway `:53` | Honk bind | Honk cache/hosts/policy or Honk upstream | Honk bind |
+| Owns `:53` | Attempts `:53` | Gateway `:53` | Bind conflict during startup | None until one owner remains | No deterministic owner; one service must fail |
+| Any | Bind disabled or stopped | Gateway `:54` | No Honk listener | None | Connection refusal or timeout |
+| Any | Any | Non-DNS port | Normal routing path | Selected outbound | Normal flow |
+
+The precedence transition for each transport is:
+
+```text
+gateway:53 packet
+  -> matching host-network listener (dnsmasq or Honk bind)
+  -> otherwise Honk transparent port-53 path
+  -> otherwise ordinary kernel routing / no DNS service
+```
+
+The local-listener check is per TCP/UDP transport. A specifically addressed local `:53` socket wins. A wildcard socket wins only when the complete FIB lookup says `NOT_FWDED`; a forwarded or ambiguous destination remains on the transparent path. Therefore, stopping dnsmasq does not make Honk `:54` automatically own `:53`: the observed takeover is transparent interception. To make Honk the ordinary gateway `:53` service, stop or move dnsmasq and configure `bind` for `tcp+udp://:53`.
+
+The common OpenWrt forwarding state is:
+
+```text
+LAN client -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS policy/upstream
+            <- dnsmasq :53 <- 127.0.0.1:54 <----------------------
+```
+
+If Honk's selected upstream is also dnsmasq `127.0.0.1:53` while dnsmasq forwards misses to Honk `:54`, the two services form a recursion loop. Use a genuinely external Honk upstream or let dnsmasq handle that upstream itself.
+
 ## Resolution pipeline
 
 The production path is ordered as follows:

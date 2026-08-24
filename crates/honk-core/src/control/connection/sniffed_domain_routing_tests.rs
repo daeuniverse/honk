@@ -21,64 +21,84 @@ fn udp_direct_mark_preserves_rule_and_clears_override() {
 }
 
 #[test]
-fn udp_domain_modes_reroute_preliminary_group_handoffs() {
-    let group = handoff(OutboundIndex::UserBase as u8, 0);
-    for mode in [
+fn udp_domain_modes_select_routing_identity() {
+    assert!(ControlPlaneHandle::should_route_with_sniffed_domain(
         DialMode::Domain,
-        DialMode::DomainPlus,
-        DialMode::DomainPlusPlus,
-    ] {
-        assert!(ControlPlaneHandle::should_reroute_sniffed_domain(
-            mode,
-            Some("www.youtube.com"),
-            Some(&group)
-        ));
-    }
-}
-
-#[test]
-fn tcp_domain_writeback_includes_preliminary_handoffs() {
-    for outbound in [OutboundIndex::Direct as u8, OutboundIndex::UserBase as u8] {
-        assert!(ControlPlaneHandle::should_write_sniffed_domain_bitmap(
-            Some(&handoff(outbound, 0)),
-            true,
-        ));
-    }
-    assert!(ControlPlaneHandle::should_write_sniffed_domain_bitmap(
-        Some(&handoff(OutboundIndex::ControlPlaneRouting as u8, 0)),
-        false,
-    ));
-    assert!(ControlPlaneHandle::should_write_sniffed_domain_bitmap(
-        None, false,
-    ));
-    assert!(!ControlPlaneHandle::should_write_sniffed_domain_bitmap(
-        Some(&handoff(OutboundIndex::Direct as u8, 0)),
-        false,
-    ));
-}
-
-#[test]
-fn udp_domain_reroute_preserves_final_decisions() {
-    let group = handoff(OutboundIndex::UserBase as u8, 0);
-    assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
-        DialMode::Ip,
         Some("www.youtube.com"),
-        Some(&group)
+        true,
+    ));
+    assert!(!ControlPlaneHandle::should_route_with_sniffed_domain(
+        DialMode::Domain,
+        Some("www.youtube.com"),
+        false,
+    ));
+    assert!(!ControlPlaneHandle::should_route_with_sniffed_domain(
+        DialMode::DomainPlus,
+        Some("www.youtube.com"),
+        true,
+    ));
+    assert!(ControlPlaneHandle::should_route_with_sniffed_domain(
+        DialMode::DomainPlusPlus,
+        Some("www.youtube.com"),
+        false,
+    ));
+}
+
+#[test]
+fn udp_domain_modes_reroute_only_eligible_handoffs() {
+    let group = handoff(OutboundIndex::UserBase as u8, 0);
+    assert!(ControlPlaneHandle::should_reroute_sniffed_domain(
+        DialMode::Domain,
+        Some("www.youtube.com"),
+        true,
+        Some(&group),
+    ));
+    assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+        DialMode::Domain,
+        Some("www.youtube.com"),
+        false,
+        Some(&group),
+    ));
+    assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+        DialMode::DomainPlus,
+        Some("www.youtube.com"),
+        true,
+        Some(&group),
+    ));
+    assert!(ControlPlaneHandle::should_reroute_sniffed_domain(
+        DialMode::DomainPlusPlus,
+        Some("www.youtube.com"),
+        false,
+        Some(&group),
+    ));
+}
+
+#[test]
+fn udp_domain_reroute_preserves_reserved_and_final_decisions() {
+    for outbound in [
+        OutboundIndex::Direct as u8,
+        OutboundIndex::Block as u8,
+        OutboundIndex::MustRules as u8,
+        OutboundIndex::ControlPlaneRouting as u8,
+    ] {
+        assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+            DialMode::DomainPlusPlus,
+            Some("www.youtube.com"),
+            false,
+            Some(&handoff(outbound, 0)),
+        ));
+    }
+    assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+        DialMode::DomainPlusPlus,
+        Some("www.youtube.com"),
+        false,
+        Some(&handoff(OutboundIndex::UserBase as u8, 1)),
     ));
     assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
         DialMode::DomainPlusPlus,
         None,
-        Some(&group)
-    ));
-    assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
-        DialMode::DomainPlusPlus,
-        Some("www.youtube.com"),
-        Some(&handoff(OutboundIndex::Block as u8, 0))
-    ));
-    assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
-        DialMode::DomainPlusPlus,
-        Some("www.youtube.com"),
-        Some(&handoff(OutboundIndex::UserBase as u8, 1))
+        false,
+        Some(&handoff(OutboundIndex::UserBase as u8, 0)),
     ));
 }
 

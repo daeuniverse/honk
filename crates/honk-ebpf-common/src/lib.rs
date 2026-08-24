@@ -425,12 +425,12 @@ pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
 pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
 
 /// `DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES`: static routing property pushed
-/// together with the mode — `dial_mode: ip`, or the routing config contains
-/// no domain-class rule (domain/geosite, negated or not).  Only then is a
-/// non-`must` `direct` routing decision provably free of SNI re-evaluation;
-/// otherwise offload additionally requires the flow itself to have been
-/// domain-judged via `DOMAIN_ROUTING_MAP` (DNS-learned bitmap).  Meaningful
-/// only together with `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`.
+/// together with the mode — `dial_mode: ip` or `domain+`, or the routing
+/// config contains no domain-class rule (domain/geosite, negated or not).
+/// Only then is a non-`must` `direct` routing decision provably free of SNI
+/// re-evaluation; otherwise offload additionally requires the flow itself to
+/// have been domain-judged via `DOMAIN_ROUTING_MAP`. Meaningful only together
+/// with `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`.
 ///
 /// `Global` with the exact `direct` selection pushes `OFFLOAD_ALL`, because
 /// every non-final route converges to direct without userspace re-evaluation.

@@ -452,12 +452,12 @@ impl ControlPlane {
     pub(super) async fn start_nfqueue_runtime(
         &mut self,
         enabled: bool,
+        sequence_ready: bool,
     ) -> anyhow::Result<Option<NfqueueRuntime>> {
         if !enabled {
             return Ok(None);
         }
 
-        let sequence_ready = self.rotate_udp_decision_generation().await?;
         if !sequence_ready {
             self.stats.record_udp_nfqueue_token_exhaustion();
             warn!("all UDP decision token generations are live; starting with NFQUEUE fenced");

@@ -21,6 +21,35 @@ pub(super) fn final_udp_rule_mark(
     }
 }
 
+#[derive(Debug)]
+pub(super) struct RoutingDecision {
+    pub(super) outbound: String,
+    pub(super) must: bool,
+    pub(super) mark: u32,
+    pub(super) matched_rule: Option<(String, String)>,
+    pub(super) reroute_by_sniffed_domain: bool,
+}
+
+pub(super) fn build_connection_info(
+    domain: Option<String>,
+    original_dst: std::net::SocketAddr,
+    client_addr: std::net::SocketAddr,
+    protocol: &'static str,
+    handoff: Option<&HandoffResult>,
+) -> ConnectionInfo {
+    ConnectionInfo {
+        domain,
+        dst_ip: original_dst.ip(),
+        dst_port: original_dst.port(),
+        src_ip: client_addr.ip(),
+        src_port: client_addr.port(),
+        protocol,
+        process_name: handoff.and_then(|ho| ho.process_name()),
+        mac: handoff.and_then(|ho| ho.mac_address()),
+        dscp: handoff.map(|ho| ho.dscp),
+    }
+}
+
 impl ControlPlaneHandle {
     /// Verify that a sniffed domain actually resolves to the given IP address.
     ///
@@ -82,15 +111,69 @@ impl ControlPlaneHandle {
         }
     }
 
+    pub(super) async fn apply_domain_reality_check(
+        &self,
+        dial_mode: DialMode,
+        domain: Option<String>,
+        original_dst: std::net::IpAddr,
+        client_addr: std::net::IpAddr,
+    ) -> (Option<String>, bool) {
+        let domain = match (dial_mode, domain) {
+            (DialMode::Domain, Some(domain)) => {
+                if self
+                    .verify_domain_reality(&domain, original_dst, client_addr)
+                    .await
+                {
+                    Some(domain)
+                } else {
+                    debug!(
+                        domain = %domain,
+                        destination = %original_dst,
+                        "sniffed domain failed reality check; falling back to IP"
+                    );
+                    None
+                }
+            }
+            (_, domain) => domain,
+        };
+        let verified = matches!(dial_mode, DialMode::Domain) && domain.is_some();
+        (domain, verified)
+    }
+
+    /// Whether a sniffed domain should participate in userspace routing.
+    /// `domain_verified` gates `domain`; `domain+` preserves the initial
+    /// IP-rule decision, while `domain++` always re-evaluates it.
+    pub(super) fn should_route_with_sniffed_domain(
+        dial_mode: DialMode,
+        domain: Option<&str>,
+        domain_verified: bool,
+    ) -> bool {
+        domain.is_some()
+            && match dial_mode {
+                DialMode::Domain => domain_verified,
+                DialMode::DomainPlusPlus => true,
+                DialMode::Ip | DialMode::DomainPlus => false,
+            }
+    }
+
+    /// Whether a sniffed domain is allowed to replace an eBPF handoff.
+    /// Reserved handoffs and local `must` decisions remain final.
     pub(super) fn should_reroute_sniffed_domain(
         dial_mode: DialMode,
         domain: Option<&str>,
+        domain_verified: bool,
         handoff: Option<&HandoffResult>,
     ) -> bool {
-        !matches!(dial_mode, DialMode::Ip)
-            && domain.is_some()
+        Self::should_route_with_sniffed_domain(dial_mode, domain, domain_verified)
             && handoff.is_some_and(|handoff| {
-                handoff.must == 0 && handoff.outbound != OutboundIndex::Block as u8
+                handoff.must == 0
+                    && !matches!(
+                        handoff.outbound,
+                        x if x == OutboundIndex::Direct as u8
+                            || x == OutboundIndex::Block as u8
+                            || x == OutboundIndex::MustRules as u8
+                            || x == OutboundIndex::ControlPlaneRouting as u8
+                    )
             })
     }
 
@@ -102,6 +185,75 @@ impl ControlPlaneHandle {
             || handoff
                 .map(|handoff| handoff.outbound == OutboundIndex::ControlPlaneRouting as u8)
                 .unwrap_or(true)
+    }
+
+    pub(super) async fn prepare_routing(
+        &self,
+        dial_mode: DialMode,
+        conn_info: &ConnectionInfo,
+        domain_verified: bool,
+        handoff: Option<&HandoffResult>,
+    ) -> RoutingDecision {
+        let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
+            dial_mode,
+            conn_info.domain.as_deref(),
+            domain_verified,
+            handoff,
+        );
+        let route_with_domain = Self::should_route_with_sniffed_domain(
+            dial_mode,
+            conn_info.domain.as_deref(),
+            domain_verified,
+        ) && (handoff.is_none()
+            || handoff.is_some_and(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
+            || reroute_by_sniffed_domain);
+        let mut routing_conn_info = conn_info.clone();
+        if !route_with_domain {
+            routing_conn_info.domain = None;
+        }
+        let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
+            let router = self.router.read().await;
+            match router.route_full(&routing_conn_info) {
+                Some(route) => (
+                    route.outbound_name.to_string(),
+                    route.must,
+                    route.mark,
+                    Some((route.rule_type.to_string(), route.rule_payload.to_string())),
+                ),
+                None => (router.default_outbound().to_string(), false, 0, None),
+            }
+        };
+        let (outbound, must, mark) = match handoff {
+            Some(ho) => {
+                debug!(
+                    outbound = ho.outbound,
+                    mark = ho.mark,
+                    must = ho.must,
+                    dscp = ho.dscp,
+                    decision_token = ho.decision_token,
+                    "eBPF routing handoff"
+                );
+                if ho.outbound == OutboundIndex::ControlPlaneRouting as u8
+                    || reroute_by_sniffed_domain
+                {
+                    (userspace_outbound, userspace_must, userspace_mark)
+                } else {
+                    (
+                        self.outbound_index_to_name(ho.outbound).await,
+                        ho.must != 0,
+                        ho.mark,
+                    )
+                }
+            }
+            None => (userspace_outbound, userspace_must, userspace_mark),
+        };
+        RoutingDecision {
+            outbound,
+            must,
+            mark,
+            matched_rule,
+            reroute_by_sniffed_domain,
+        }
     }
 
     /// Publish the matched sniffed-domain bitmap so later route-time

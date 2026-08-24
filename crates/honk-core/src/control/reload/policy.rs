@@ -54,6 +54,9 @@ pub(crate) fn restart_required_changes(
     if old_global.store_subscribe != new_global.store_subscribe {
         changed.push("global.store_subscribe");
     }
+    if old_global.nfqueue_enable != new_global.nfqueue_enable {
+        changed.push("global.nfqueue_enable");
+    }
 
     let old_api = &current.experimental.clash_api;
     let new_api = &candidate.experimental.clash_api;
@@ -73,9 +76,6 @@ pub(crate) fn restart_required_changes(
         != serde_json::to_value(&candidate.experimental.cache_file).ok()
     {
         changed.push("experimental.cache_file");
-    }
-    if current.experimental.udp_nfqueue.enabled != candidate.experimental.udp_nfqueue.enabled {
-        changed.push("experimental.udp_nfqueue.enabled");
     }
     changed
 }

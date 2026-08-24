@@ -176,11 +176,12 @@ impl DnsEngine {
         wire: Vec<u8>,
         strict: bool,
     ) -> Result<ResponseDirective, EngineError> {
+        let truncated = super::response::is_truncated(&wire);
         let strict_reusable = if strict {
             ResponseTemplate::check(&prepared.query, &wire)?;
-            true
+            !truncated
         } else {
-            ResponseTemplate::check(&prepared.query, &wire).is_ok()
+            ResponseTemplate::check(&prepared.query, &wire).is_ok() && !truncated
         };
         let class = classify_response(&wire);
         if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
@@ -194,7 +195,11 @@ impl DnsEngine {
                 traversal,
             });
         }
-        let answer_ips = super::forwarder::extract_answer_ips(&wire);
+        let answer_ips = if truncated {
+            Vec::new()
+        } else {
+            super::forwarder::extract_answer_ips(&wire)
+        };
         let current_traversal = traversal.clone();
         let planned = self.planner.plan_response(
             ResponseContext {

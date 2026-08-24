@@ -1,4 +1,5 @@
 use super::*;
+use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
 /// Format a `DaeEvent` IP field — four u32 chunks of a 16-byte address in
 /// network order, IPv4-mapped for v4 flows — as an `IpAddr` for logging.
@@ -23,7 +24,6 @@ pub const EVENT_LOG_MAX_PER_SEC: u32 = 32;
 pub async fn consume_dae_events(
     mut async_fd: tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>,
 ) {
-    use honk_ebpf_common::event::{DaeEvent, DaeEventType};
     let mut window = std::time::Instant::now();
     let mut emitted: u32 = 0;
     let mut suppressed: u64 = 0;

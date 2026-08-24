@@ -71,3 +71,5 @@ bench
 doc/zh/design/af-xdp-dataplane-proposal.md
 doc/zh/design/outbound-vs-dae.md
 af-xdp-dataplane-proposal.md
+doc/en/design/owned-udp-nat-xdp-proposal.md
+doc/zh/design/owned-udp-nat-xdp-proposal.md

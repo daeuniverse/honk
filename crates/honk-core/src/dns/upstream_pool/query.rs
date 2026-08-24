@@ -138,7 +138,7 @@ impl UpstreamPool {
         let response = transport
             .exchange(raw_query, route.feedback.as_ref())
             .await?;
-        let response = if response.len() >= 4 && response[2] & 0x02 != 0 {
+        let response = if crate::dns::response::is_truncated(&response) {
             let tcp_feedback = self.tcp_feedback_for_route(entry, route);
             debug!(
                 "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
@@ -170,7 +170,7 @@ impl UpstreamPool {
     ) -> anyhow::Result<Vec<u8>> {
         let (response, _admission, injected) = exchange;
         let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
-        let response = if response.len() >= 4 && response[2] & 0x02 != 0 {
+        let response = if crate::dns::response::is_truncated(&response) {
             debug!(
                 "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
                 upstream_name

@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock};
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
 use boring::error::ErrorStack;
-use boring::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode, SslVersion};
+use boring::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
 use bytes::BytesMut;
 use foreign_types::ForeignTypeRef;
 use hkdf::Hkdf;
@@ -583,7 +583,7 @@ impl BoringQuicClientConfig {
             pin_sha256,
             ticket_key,
         } = options;
-        let mut builder = SslContext::builder(SslMethod::tls())?;
+        let mut builder = SslContextBuilder::new(SslMethod::tls())?;
         // QUIC mandates TLS 1.3.
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -601,10 +601,7 @@ impl BoringQuicClientConfig {
             builder.set_verify_cert_store(crate::tls::root_store()?)?;
         }
         if chrome {
-            builder.set_grease_enabled(true);
-            builder.set_sigalgs_list(crate::tls::CHROME_SIGALGS)?;
-            builder.set_curves_list(crate::tls::CHROME_CURVES)?;
-            builder.add_certificate_compression_algorithm(crate::tls::BrotliCertCompression)?;
+            crate::tls::apply_chrome_ctx(&mut builder)?;
         }
         // Client-side TLS 1.3 session ticket cache: a repeat connection to
         // the same server can resume (and offer 0-RTT early data when the

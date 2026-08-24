@@ -16,21 +16,19 @@ It is **not** a line-for-line port of either project. The kernel path follows da
 
 License: **GPL-3.0-only**.
 
-The always-compiled, reliability-first Score group policy is selected explicitly with `policy: score`; omitted policy still defaults to Selector. Score learns only in process memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads, without logging, persisting, or exporting scorer target keys. See the [group reference](doc/en/reference/groups.md#score-policy).
+The always-compiled, reliability-first Score group policy is selected explicitly with `policy: score`; omitted policy still defaults to Selector. Score learns only in process memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads. Authenticated `GET /stats` exports only safe aggregate selection-reason counters by group; scorer cells, target keys, and other private scorer data are never logged, persisted, or exported. See the [group reference](doc/en/reference/groups.md#score-policy).
 
 ## Experimental held-first-packet UDP decisions
 
-The default-off UDP NFQUEUE path holds only ambiguous **LAN-forwarded** first packets after LAN TC and before conntrack/NAT. Enable it with a process configuration change:
+The UDP NFQUEUE path is enabled by default. It holds only ambiguous **LAN-forwarded** first packets after LAN TC and before conntrack/NAT. Disable it with a process configuration change:
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: false
 }
 ```
 
-Changing `experimental.udp_nfqueue.enabled` requires a restart. Enabled startup requires a build with the `ebpf` feature and the real eBPF backend; `--mock-ebpf` and builds without `ebpf` are rejected. Host-originated WAN egress remains on the canonical TPROXY path. DNS port 53, `must`, `block`, and already-safe route-time direct decisions never enter NFQUEUE; only decisions that can still change in userspace are staged.
+Changing `global.nfqueue_enable` requires a restart. If NFQUEUE is requested with `--mock-ebpf`, a build without `ebpf`, or an unavailable fixed queue, honk logs a warning and runs with NFQUEUE staging disabled for that process; it does not rewrite the config file. Real startup waits for the singleton instance handoff before probing the queue and reclaims the reserved nftables table during installation. Host-originated WAN egress remains on the canonical TPROXY path. DNS port 53, `must`, `block`, and already-safe route-time direct decisions never enter NFQUEUE; only decisions that can still change in userspace are staged.
 
 The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. The ingest actor is bounded to 256 packets and 8 MiB of payload, and every packet keeps a three-second absolute deadline from listener receipt. With the Clash API enabled, `/stats.udp.nfqueue` exposes actor depth/bytes/oldest age plus explicit kernel-stat availability and read failures. See the [NFQUEUE design](doc/en/design/nfqueue.md) and [API reference](doc/en/reference/api.md) for invariants and the full metric schema.
 

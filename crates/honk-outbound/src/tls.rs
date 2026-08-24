@@ -24,7 +24,7 @@ use base64::engine::general_purpose;
 use boring::error::ErrorStack;
 use boring::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ConnectConfiguration, SslConnector,
-    SslMethod, SslVerifyMode, SslVersion,
+    SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
 };
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
@@ -133,6 +133,7 @@ pub(crate) const CHROME_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha
 // Chrome 131+: MLKEM hybrid first. Requires boring's `mlkem` feature.
 pub(crate) const CHROME_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384";
 pub(crate) const CHROME_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
+const HTTP11_ALPN_WIRE: &[u8] = b"\x08http/1.1";
 
 /// Chrome's TLS 1.2 cipher list (TLS 1.3 ciphers are implicit and always
 /// lead). Order is irrelevant to JA4 (it sorts), the set is not.
@@ -175,6 +176,7 @@ impl CertificateCompressor for BrotliCertCompression {
 pub struct TlsConnector {
     connector: SslConnector,
     chrome: bool,
+    alps: bool,
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// `ech_enabled` without a static config: discover via DNS HTTPS RR at
     /// connect time (best-effort, fail-open).
@@ -190,7 +192,9 @@ impl TlsConnector {
         if self.chrome {
             cfg.set_permute_extensions(true);
             set_chrome_key_shares(&mut cfg)?;
-            add_chrome_alps(&mut cfg)?;
+            if self.alps {
+                add_chrome_alps(&mut cfg)?;
+            }
         }
         match ech {
             Some(list) => cfg.set_ech_config_list(&list)?,
@@ -295,7 +299,21 @@ pub(crate) fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<
 }
 
 /// Mozilla root CAs (full DER certs) loaded into a BoringSSL store.
+///
+/// The store is built once per process (~150 parsed certs, ~0.8 MiB) and
+/// every caller gets a refcounted clone (`X509_STORE_up_ref`) — with a
+/// per-node-per-probe-cycle call pattern, building it fresh each time would
+/// pin hundreds of megabytes in connector caches.
 pub(crate) fn root_store() -> Result<boring::x509::store::X509Store, ErrorStack> {
+    static ROOT_STORE: LazyLock<Option<boring::x509::store::X509Store>> =
+        LazyLock::new(|| build_root_store().ok());
+    match &*ROOT_STORE {
+        Some(store) => Ok(store.clone()),
+        None => build_root_store(),
+    }
+}
+
+fn build_root_store() -> Result<boring::x509::store::X509Store, ErrorStack> {
     let mut builder = X509StoreBuilder::new()?;
     for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
         if let Ok(cert) = X509::from_der(der.as_ref()) {
@@ -488,7 +506,7 @@ pub fn pin_sha256_custom_verify(
     }
 }
 
-fn apply_chrome_ctx(builder: &mut boring::ssl::SslConnectorBuilder) -> anyhow::Result<()> {
+pub(crate) fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Result<()> {
     builder.set_grease_enabled(true);
     builder.set_sigalgs_list(CHROME_SIGALGS)?;
     builder.set_curves_list(CHROME_CURVES)?;
@@ -517,12 +535,17 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     }
     if chrome {
         apply_chrome_ctx(&mut builder)?;
-        builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+        builder.set_alpn_protos(if node.transport == "ws" {
+            HTTP11_ALPN_WIRE
+        } else {
+            CHROME_ALPN_WIRE
+        })?;
     }
 
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
+        alps: chrome && node.transport != "ws",
         ech_discovery: node.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
@@ -543,6 +566,7 @@ pub fn build_dns_connector(
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
+        alps: chrome && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
         ech_config_list: None,
         ech_discovery: false,
     })
@@ -564,6 +588,14 @@ pub fn build_http_probe_connector(skip_cert_verify: bool) -> anyhow::Result<TlsC
 mod tests {
     use super::*;
     use boring::pkey::PKey;
+
+    #[test]
+    fn root_store_clones_share_one_store() {
+        use foreign_types::ForeignType;
+        let a = root_store().unwrap();
+        let b = root_store().unwrap();
+        assert_eq!(a.as_ptr(), b.as_ptr());
+    }
     use boring::ssl::{SslAcceptor, SslStream};
     use std::io::Read;
     use std::net::TcpListener;

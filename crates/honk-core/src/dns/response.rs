@@ -12,6 +12,12 @@ const TC: u16 = 0x0200;
 const OPCODE_MASK: u16 = 0x7800;
 const RA: u16 = 0x0080;
 const QUERY_ECHO_MASK: u16 = OPCODE_MASK | 0x0110;
+pub(crate) fn is_truncated(response: &[u8]) -> bool {
+    let Some(flags) = response.get(2..4) else {
+        return false;
+    };
+    u16::from_be_bytes([flags[0], flags[1]]) & TC != 0
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResponseError {
@@ -80,6 +86,9 @@ impl ResponseTemplate {
             question_end,
             records,
         })
+    }
+    pub(crate) fn wire(&self) -> Bytes {
+        self.wire.clone()
     }
 
     pub fn render(&self, caller: &QueryContext) -> Result<Vec<u8>, ResponseError> {

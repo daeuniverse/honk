@@ -1,20 +1,18 @@
 # NFQUEUE held-first-packet UDP
 
-This document explains the optional fail-closed path that holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision.
+This document explains the fail-closed path that holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision.
 
 ## Activation and scope
 
-The complete configuration surface is:
+The path is enabled by default through `global.nfqueue_enable`. Set that key to `false` to disable it:
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: false
 }
 ```
 
-`enabled` defaults to `false`. Changing it requires a process restart; reload rejects the change. Enabled startup requires an `ebpf`-feature build and the real eBPF backend. A build without `ebpf` and `--mock-ebpf` both fail startup instead of silently falling back. See the [experimental configuration reference](../reference/experimental.md) for the knob table.
+Changing the setting requires a process restart; reload rejects the change. Startup treats NFQUEUE as best-effort: mock mode, a build without `ebpf`, a failed fixed-queue preflight, or a queue/rules/health failure before datapath admission logs a warning and disables staging for that process without rewriting the config file. Persistent token-generation recovery failures remain fatal because allocator state is ambiguous. Real mode acquires the singleton instance lock before that preflight, so a normal handoff waits for the old queue owner instead of degrading spuriously. The reserved nftables table is reclaimed during installation after queue binding. Once the service is admitted, listener, queue, watchdog, verdict, cleanup, and retirement failures remain fatal. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
 
 The hook is deliberately narrow:
 
@@ -52,7 +50,7 @@ flowchart LR
 | nftables ownership | One atomic transaction owns exact `inet honk_nfqueue` / `udp_decision`, an `inet prerouting` filter chain at priority `-250`; only UDP carrying the pending signature reaches the queue |
 | Failure policy | No queue bypass, fanout, or fail-open flag. Malformed or truncated input, `ENOBUFS`, unexpected listener exit, and verdict-socket failure are fatal |
 
-The service binds queue `320` before publishing the nftables transaction. On an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either owned nftables object while honk runs.
+The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 
 ## Decision-token protocol
 
@@ -136,4 +134,4 @@ With the API enabled, `GET /stats` exposes `udp.nfqueue` (the documented dotted 
 
 - [eBPF datapath](./datapath.md)
 - [Control plane](./control-plane.md)
-- [Experimental configuration reference](../reference/experimental.md)
+- [Global configuration reference](../reference/global.md)

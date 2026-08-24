@@ -16,6 +16,17 @@ fn test_put_get() {
 }
 
 #[test]
+fn truncated_responses_are_not_cached() {
+    let mut cache = DnsCache::new(10);
+    let mut response = make_test_response([192, 0, 2, 1], 300);
+    response[2..4].copy_from_slice(&0x8380_u16.to_be_bytes());
+
+    cache.put("truncated.example:1".into(), response, 300);
+
+    assert!(cache.get("truncated.example:1").is_none());
+}
+
+#[test]
 fn legacy_negative_replaces_the_positive_for_the_same_key() {
     let mut cache = DnsCache::new(10);
     let key = "negative.example:1";

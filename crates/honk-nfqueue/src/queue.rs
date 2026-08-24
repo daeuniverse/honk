@@ -27,10 +27,33 @@ const POLL_TIMEOUT_MS: libc::c_int = 100;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QueueError {
-    #[error("NFQUEUE netlink socket: {0}")]
+    #[error("NFQUEUE preflight: {0}")]
     Io(#[from] io::Error),
     #[error("NFQUEUE 320 is already bound")]
     Busy,
+}
+
+pub(crate) fn preflight() -> Result<(), QueueError> {
+    let _socket = netlink::open_socket(false)?;
+    match std::fs::read_to_string("/proc/thread-self/net/netfilter/nfnetlink_queue") {
+        Ok(contents) if queue_row(&contents).is_some() => Err(QueueError::Busy),
+        Ok(_) => Ok(()),
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn queue_row(contents: &str) -> Option<(u64, u64, u64)> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let queue = fields.next()?.parse::<u16>().ok()?;
+        let _peer_port = fields.next()?;
+        let depth = fields.next()?.parse().ok()?;
+        let _copy_mode = fields.next()?;
+        let _copy_range = fields.next()?;
+        let dropped = fields.next()?.parse().ok()?;
+        let user_dropped = fields.next()?.parse().ok()?;
+        (queue == QUEUE_NUM).then_some((depth, dropped, user_dropped))
+    })
 }
 
 pub(crate) struct QueueSocket {
@@ -385,6 +408,12 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn queue_row_finds_owned_queue() {
+        let input = "319 10 1 2 65535 3 4 8\n320 20 17 2 65535 5 6 9\n";
+        assert_eq!(queue_row(input), Some((17, 5, 6)));
+    }
 
     const NFQA_CFG_MASK: u16 = 4;
     const NFQA_CFG_FLAGS: u16 = 5;

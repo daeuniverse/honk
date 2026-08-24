@@ -115,8 +115,10 @@ impl DnsForwarder {
             Some(template) => template.render(query)?,
             None => patch_txid(reusable.to_vec(), query.txid().get()),
         };
+        let truncated = crate::dns::response::is_truncated(&reusable);
         let response_class = crate::dns::engine::classify_response(&reusable);
-        let answer_ips = if status == OutcomeStatus::Accepted
+        let answer_ips = if !truncated
+            && status == OutcomeStatus::Accepted
             && response_class == crate::dns::outcome::ResponseClass::Positive
         {
             match analyzed_answer_ips {
@@ -221,7 +223,7 @@ impl DnsForwarder {
         match ingress {
             IngressProfile::Udp { .. } => {
                 let response = self.query_asis_udp(raw_query, destination).await?;
-                if response.get(2).is_some_and(|flags| flags & 0x02 != 0) {
+                if crate::dns::response::is_truncated(&response) {
                     debug!(
                         destination = %destination,
                         "DNS forwarder: truncated asis UDP response, retrying over TCP"

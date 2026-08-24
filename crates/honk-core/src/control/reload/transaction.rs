@@ -1,6 +1,38 @@
 use super::*;
 
+#[cfg(test)]
+type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
+
+#[cfg(test)]
+static PRE_DNS_PUBLICATION_HOOK: std::sync::LazyLock<
+    parking_lot::Mutex<Option<(usize, PreDnsPublicationHook)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+#[cfg(test)]
+pub(in crate::control) struct PreDnsPublicationHookGuard {
+    owner: usize,
+}
+
+#[cfg(test)]
+impl Drop for PreDnsPublicationHookGuard {
+    fn drop(&mut self) {
+        let mut hook = PRE_DNS_PUBLICATION_HOOK.lock();
+        if hook.as_ref().map(|(owner, _)| *owner) == Some(self.owner) {
+            hook.take();
+        }
+    }
+}
+
 impl ControlPlane {
+    #[cfg(test)]
+    pub(in crate::control) fn set_pre_dns_publication_hook(
+        &self,
+        hook: impl FnOnce(&Arc<GroupManager>) + Send + 'static,
+    ) -> PreDnsPublicationHookGuard {
+        let owner = self as *const Self as usize;
+        *PRE_DNS_PUBLICATION_HOOK.lock() = Some((owner, Box::new(hook)));
+        PreDnsPublicationHookGuard { owner }
+    }
     /// Atomically publish a rebuilt router, config, group manager, outbound
     /// runtime generation, DNS runtime, and exact eBPF routing plan. Build
     /// failures leave the current generation untouched; an eBPF push failure
@@ -13,6 +45,13 @@ impl ControlPlane {
     ) -> bool {
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
         self.apply_resolved_runtime_config(new_config, drain).await
+    }
+
+    /// Publish an explicit runtime configuration through the same transaction
+    /// used by SIGHUP and subscription refreshes.
+    pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
+        self.apply_runtime_config(new_config, &DrainTracker::new())
+            .await
     }
 
     pub(in crate::control) async fn apply_resolved_runtime_config(
@@ -168,9 +207,7 @@ impl ControlPlane {
         let datapath_flags = if let Some(handle) = self.datapath_flags.clone() {
             handle
         } else {
-            if current_config.experimental.udp_nfqueue.enabled
-                || new_config.experimental.udp_nfqueue.enabled
-            {
+            if current_config.global.nfqueue_enable || new_config.global.nfqueue_enable {
                 error!("datapath flags writer is unavailable during NFQUEUE reload");
                 return false;
             }
@@ -187,6 +224,11 @@ impl ControlPlane {
             }
             handle
         };
+        #[cfg(test)]
+        self.ebpf
+            .write()
+            .await
+            .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::FenceNfqueue);
         if let Err(error) = datapath_flags.fence_nfqueue().await {
             error!(%error, "failed to fence NFQUEUE before reload");
             self.datapath_healthy
@@ -309,11 +351,19 @@ impl ControlPlane {
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.
                 old_registry.mark_moved_out(reused_runtime_ids);
+                new_group_manager.publish_score_membership();
+                #[cfg(test)]
+                if let Some(hook) = {
+                    let mut hook = PRE_DNS_PUBLICATION_HOOK.lock();
+                    (hook.as_ref().map(|(owner, _)| *owner) == Some(self as *const Self as usize))
+                        .then(|| hook.take().expect("matching hook exists").1)
+                } {
+                    hook(&new_group_manager);
+                }
                 publication.commit();
                 *router_guard = new_router;
                 *config_guard = new_config;
                 *group_guard = Arc::clone(&new_group_manager);
-                new_group_manager.publish_score_membership();
                 *outbound_guard = new_outbound_id_map;
                 *plan_guard = Arc::clone(&new_plan);
                 // The projection worker takes eBPF before its generation fence;
@@ -370,15 +420,25 @@ impl ControlPlane {
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
+        #[cfg(test)]
+        self.ebpf
+            .write()
+            .await
+            .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::SetStatic);
         if let Err(error) = datapath_flags.set_static(new_static_flags).await {
             error!(%error, "failed to publish reloaded datapath flags");
             self.datapath_healthy
                 .store(false, std::sync::atomic::Ordering::Release);
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return false;
+            return true;
         }
         self.open_pending_udp_admission();
+        #[cfg(test)]
+        self.ebpf
+            .write()
+            .await
+            .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::ReopenNfqueue);
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after reload");
             self.close_and_drain_pending_udp_admission().await;
@@ -386,7 +446,7 @@ impl ControlPlane {
                 .store(false, std::sync::atomic::Ordering::Release);
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return false;
+            return true;
         }
         info!("Configuration applied — {} routes active", route_count);
 
@@ -400,6 +460,11 @@ impl ControlPlane {
         old_static_flags: u32,
         drain: &DrainTracker,
     ) {
+        #[cfg(test)]
+        self.ebpf
+            .write()
+            .await
+            .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::SetStatic);
         if let Err(error) = datapath_flags.set_static(old_static_flags).await {
             error!(%error, "failed to restore datapath flags after rejected reload");
             self.datapath_healthy
@@ -414,6 +479,11 @@ impl ControlPlane {
             return;
         }
         self.open_pending_udp_admission();
+        #[cfg(test)]
+        self.ebpf
+            .write()
+            .await
+            .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::ReopenNfqueue);
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after rejected reload");
             self.close_and_drain_pending_udp_admission().await;

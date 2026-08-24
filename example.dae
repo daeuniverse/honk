@@ -20,6 +20,8 @@ global {
     log_file: 'honk.log'
     # 保存成功获取的订阅正文到运行目录 .sub（默认开启）
     store_subscribe: true
+    # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
+    nfqueue_enable: true
 
     # 健康检查：TCP 用 HTTPS 探测，UDP 用 DNS 探测（经节点自身隧道）
     tcp_check_url: 'https://www.gstatic.com/generate_204'

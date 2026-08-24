@@ -198,6 +198,9 @@ impl DnsCacheService {
         min_ttl: u32,
         strict_reusable: bool,
     ) -> bool {
+        if crate::dns::response::is_truncated(&response) {
+            return false;
+        }
         let ttl = min_ttl.max(1);
         let entry = CachedEntry {
             response,

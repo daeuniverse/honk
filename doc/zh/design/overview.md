@@ -75,10 +75,10 @@ flowchart TB
 1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。`direct(must)` 与路由时已安全的 direct 决策留在 Linux 原生路径；仍需用户态处理的决策不会卸载。
 2. [DNS 路径](./dns.md)让 TCP 和 UDP 目的端口 `53` 进入快速路径，跳过通用匹配循环并重定向到控制面。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
-4. 显式启用时，[NFQUEUE 暂存](./nfqueue.md)仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
+4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
 5. [控制面](./control-plane.md)恢复原始目的地址并消费 eBPF 路由 handoff。handoff 缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
-7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。显式选择 Score 时，它只在健康合格成员中按目标的 TCP/UDP 与目标地址族评分排名；省略策略仍使用 Selector。
+7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。显式选择 Score 时，它只在健康合格成员中按目标的 TCP/UDP 与目标地址族 transport-quality 评分排名；服务特定的语义解锁应由 routing 或 geosite 选择专用 Score 组表达。省略策略仍使用 Selector。
 8. [出站层](./outbound.md)拨号该叶节点，并中继 TCP 或数据报。嗅探得到的 TCP 字节先于后续流量转发。
 9. 控制面出口携带 `DAE_BYPASS_MARK`（`0x100`），避免再次被 WAN TC 拦截。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
@@ -94,7 +94,7 @@ flowchart TB
 - **`must`/`block` 终结性：** Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
 - **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。TCP 与 UDP 端口 `53` 例外；`honk-core` 在启动、重载和接口拓扑变化时注入 `dip(<每个 LAN/WAN 接口地址>) -> direct(must)`，使本机管理流量不依赖代理健康状态。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
-- **Score 隔离：** Score 用业务目标地址族评分，用代理服务器地址族过滤健康状态；其权威单叶选择不能让死亡成员重新入选。所有历史计数与加权和按固定 30 分钟半衰期指数衰减；延迟取衰减加权均值，吞吐量只接纳持续至少 1 秒且主导方向至少传输 64 KiB 的成功双向交换。精确目标键与聚合先验只存在于两个各 4,096 项的进程内 LRU，通过共享状态跨成功 reload 保留，进程重启即清空，且不会进入日志、Clash API 或 `cache.db`；该策略没有配置旋钮。
+- **Score 隔离与原因：** Score 用业务目标地址族评分，用代理服务器地址族过滤健康状态；其权威单叶选择不能让死亡成员重新入选。周期探索按 `(group, TCP/UDP, 目标 IP 地址族或 none)` 分域；全局、地址族与精确目标的新鲜失败 envelope 取最大值而非相加。每次已授权的多候选 Apply 按优先级只记录一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`；同时独立以 `deadFiltered` 计数唯一的死亡叶节点。精确目标键与聚合先验只存在于两个各 4,096 项的进程内 LRU，通过共享状态跨成功 reload 保留，进程重启即清空，且不会进入日志或持久化。经鉴权的 `/stats.score` 只导出组名和这些聚合 TCP/UDP 计数，绝不导出 cell、节点、目标、cadence 或 authority；既有 `/proxies`、`/stats.outbounds` 与 `/connections` 元数据契约保持不变。
 - **Score 反馈覆盖：** 评分器始终编译，但仅在计划经过 Score 组时按需创建 `ScoreReporter` 和评分 cell；非 Score 路径不创建它们。实际 attempt 会报告 setup、首响应、双向字节和一个紧凑终态，包括透明 TCP/UDP、受支持的 DNS transport、健康与 delay 探测、preconnect/session/UDP 预热，以及直连或经代理的 UI 下载；没有业务目标的任务只更新聚合 setup 证据。
 - **内部与特殊流量：** honk 的内部链路地址范围 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
 
@@ -109,7 +109,7 @@ flowchart TB
 | `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
-`mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。该模式不能运行 `experimental.udp_nfqueue.enabled = true`。
+`mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。若请求 `global.nfqueue_enable = true`，启动会记录 warning，仅在本进程关闭 NFQUEUE 暂存，配置文件保持不变。
 
 ## 作者与分工说明
 

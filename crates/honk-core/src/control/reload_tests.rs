@@ -7,8 +7,8 @@ use super::*;
 
 use crate::control::udp_endpoint::{EndpointReservation, UdpEndpoint};
 use crate::dns;
-use crate::ebpf::RoutingPushPhase;
 use crate::ebpf::mock::MockEbpfBackend;
+use crate::ebpf::{DatapathFlagsWriteOrigin, RoutingPushPhase};
 use crate::stats::StatsManager;
 fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
     let current_log_file = crate::resolved_log_file_path(current, None);
@@ -37,11 +37,11 @@ fn subscription_store_toggle_requires_restart() {
 fn udp_nfqueue_toggle_requires_restart() {
     let current = Config::default();
     let mut replacement = current.clone();
-    replacement.experimental.udp_nfqueue.enabled = !current.experimental.udp_nfqueue.enabled;
+    replacement.global.nfqueue_enable = !current.global.nfqueue_enable;
 
     assert_eq!(
         restart_required_changes(&current, &replacement),
-        vec!["experimental.udp_nfqueue.enabled"]
+        vec!["global.nfqueue_enable"]
     );
 }
 
@@ -266,6 +266,253 @@ async fn test_cp() -> ControlPlane {
         .await
         .unwrap();
     control_plane
+}
+
+fn score_reload_config(interval: u64) -> Config {
+    let nodes = ["score-a", "score-b"].map(|name| Node {
+        id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
+        name: name.into(),
+        protocol: NodeProtocol::Socks5,
+        address: "127.0.0.1:9".into(),
+        ..Default::default()
+    });
+    let mut config = Config::default();
+    config.global.check_interval_secs = interval;
+    config.nodes = nodes.to_vec();
+    config.groups = vec![Group {
+        name: "score".into(),
+        policy: GroupPolicy::Score,
+        nodes: nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    }];
+    config
+}
+
+fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
+    honk_outbound::group::ScoreSelectionContext {
+        network: honk_outbound::group::SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(honk_outbound::group::ScoreTarget::domain(
+            "reload.example",
+            443,
+        )),
+    }
+}
+
+#[tokio::test]
+async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
+    let cp = test_cp().await;
+    let first_interval = Config::default().global.check_interval_secs + 1;
+    assert!(
+        cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new(),)
+            .await
+    );
+    let provider = cp.dns_controller.runtime_provider();
+    let before_dns = provider.current_generation();
+    let old_manager = cp.group_manager.read().clone();
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_at_hook = Arc::clone(&observed);
+    let _hook_guard = cp.set_pre_dns_publication_hook(move |new_manager| {
+        let first = new_manager.selection_plan_for_target("score", &score_reload_context());
+        let first_id = first.entries[0].node.id;
+        let reporter = first.entries[0].feedback.as_ref().unwrap().start();
+        reporter.setup_succeeded();
+        reporter.tx(1);
+        reporter.rx(1);
+        reporter.finish(honk_outbound::group::ScoreOutcome::Success);
+        assert_ne!(
+            new_manager
+                .selection_plan_for_target("score", &score_reload_context())
+                .entries[0]
+                .node
+                .id,
+            first_id,
+            "the published replacement authority must accept Score writes"
+        );
+        assert!(
+            old_manager
+                .selection_plan_for_target("score", &score_reload_context())
+                .entries[0]
+                .feedback
+                .is_none()
+        );
+        observed_at_hook.store(true, std::sync::atomic::Ordering::Release);
+        println!("replacement Score authority accepted writes before DNS publication");
+    });
+
+    let result = cp
+        .apply_runtime_config(
+            score_reload_config(first_interval + 1),
+            &DrainTracker::new(),
+        )
+        .await;
+
+    assert!(result);
+    assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+    assert_ne!(provider.current_generation(), before_dns);
+    assert!(
+        cp.group_manager
+            .read()
+            .selection_plan_for_target("score", &score_reload_context())
+            .entries[0]
+            .feedback
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn failed_reload_keeps_old_score_authority() {
+    let cp = test_cp().await;
+    let interval = Config::default().global.check_interval_secs + 1;
+    assert!(
+        cp.apply_runtime_config(score_reload_config(interval), &DrainTracker::new())
+            .await
+    );
+    let provider = cp.dns_controller.runtime_provider();
+    let before_dns = provider.current_generation();
+    let before_manager = cp.group_manager.read().clone();
+    let mut invalid = score_reload_config(interval + 1);
+    invalid.dns.upstream[0].address = "://invalid".into();
+
+    assert!(!cp.apply_runtime_config(invalid, &DrainTracker::new()).await);
+
+    assert_eq!(provider.current_generation(), before_dns);
+    assert!(Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
+    assert_eq!(cp.config.read().await.global.check_interval_secs, interval);
+    let feedback = before_manager
+        .selection_plan_for_target("score", &score_reload_context())
+        .entries[0]
+        .feedback
+        .clone();
+    assert!(feedback.is_some());
+    println!("rejected reload preserved DNS generation and old Score authority");
+    feedback
+        .unwrap()
+        .start()
+        .setup_failed(honk_outbound::group::ScoreOutcome::Timeout);
+}
+
+#[tokio::test]
+async fn post_publication_datapath_failure_is_committed_degraded() {
+    for failed_ordinal in [2, 3] {
+        let cp = test_cp().await;
+        assert!(cp.datapath_flags.is_some());
+        let first_interval = Config::default().global.check_interval_secs + 1;
+        assert!(
+            cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new(),)
+                .await
+        );
+        let provider = cp.dns_controller.runtime_provider();
+        let before_dns = provider.current_generation();
+        let before_manager = cp.group_manager.read().clone();
+        let expected_flags;
+        {
+            let mut ebpf = cp.ebpf.write().await;
+            expected_flags = *ebpf.datapath_flags_write_log().last().unwrap();
+            ebpf.clear_datapath_flags_write_log();
+            ebpf.arm_datapath_flags_write_fault(failed_ordinal).unwrap();
+            assert!(ebpf.datapath_flags_write_log().is_empty());
+        }
+        let interval = first_interval + failed_ordinal as u64;
+        let drain = DrainTracker::new();
+        let expected_new_flags =
+            expected_flags & !honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES;
+        assert_ne!(expected_new_flags, expected_flags);
+        let mut replacement = score_reload_config(interval);
+        replacement
+            .routing
+            .rules
+            .push(honk_config::routing::RoutingRule {
+                name: "distinct-static-flags".into(),
+                condition: honk_config::routing::RoutingCondition {
+                    domain: vec!["static-flags.example".into()],
+                    ..Default::default()
+                },
+                outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            });
+
+        let result = cp.apply_runtime_config(replacement, &drain).await;
+        let ebpf = cp.ebpf.read().await;
+        let writes = ebpf.datapath_flags_write_log();
+        let trace = ebpf.datapath_flags_write_trace();
+        drop(ebpf);
+
+        let expected_writes = if failed_ordinal == 2 {
+            vec![expected_flags, expected_new_flags]
+        } else {
+            vec![expected_flags, expected_new_flags, expected_new_flags]
+        };
+        assert_eq!(writes, expected_writes);
+        assert_eq!(trace.len(), failed_ordinal);
+        let expected_origins = if failed_ordinal == 2 {
+            vec![
+                DatapathFlagsWriteOrigin::FenceNfqueue,
+                DatapathFlagsWriteOrigin::SetStatic,
+            ]
+        } else {
+            vec![
+                DatapathFlagsWriteOrigin::FenceNfqueue,
+                DatapathFlagsWriteOrigin::SetStatic,
+                DatapathFlagsWriteOrigin::ReopenNfqueue,
+            ]
+        };
+        for (index, write) in trace.iter().enumerate() {
+            assert_eq!(write.ordinal, index + 1);
+            assert_eq!(write.flags, expected_writes[index]);
+            assert_eq!(write.origin, expected_origins[index]);
+            assert_eq!(write.failed, index + 1 == failed_ordinal);
+        }
+        let labelled_trace: Vec<_> = trace
+            .iter()
+            .map(|write| (write.origin, write.flags, write.failed))
+            .collect();
+        assert!(labelled_trace.last().unwrap().2);
+        println!("failed_ordinal={failed_ordinal} stage_trace={labelled_trace:?}");
+        assert!(
+            result,
+            "post-publication failure {failed_ordinal} is committed"
+        );
+        assert_ne!(provider.current_generation(), before_dns);
+        assert_eq!(cp.config.read().await.global.check_interval_secs, interval);
+        assert!(!Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
+        assert!(!cp.is_datapath_healthy());
+        assert!(drain.should_reject());
+        assert!(cp.drain_tracker.should_reject());
+        assert!(
+            before_manager
+                .selection_plan_for_target("score", &score_reload_context())
+                .entries[0]
+                .feedback
+                .is_none()
+        );
+        assert!(
+            cp.group_manager
+                .read()
+                .selection_plan_for_target("score", &score_reload_context())
+                .entries[0]
+                .feedback
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_subscription_merge_does_not_publish_runtime() {
+    let cp = test_cp().await;
+    let provider = cp.dns_controller.runtime_provider();
+    let before_generation = provider.current_generation();
+    let before_retired = provider.retired_count();
+
+    cp.merge_subscription_nodes(uuid::Uuid::new_v4(), Vec::new())
+        .await;
+
+    assert_eq!(provider.current_generation(), before_generation);
+    assert_eq!(provider.retired_count(), before_retired);
 }
 
 #[tokio::test]

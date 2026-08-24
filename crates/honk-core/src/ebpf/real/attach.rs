@@ -10,6 +10,9 @@ impl RealEbpfBackend {
         wan_ifname: &str,
         single_homed: bool,
     ) -> anyhow::Result<Self> {
+        let process_name_offsets = process_name::detect();
+        let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
+
         info!("Loading eBPF programs ({} bytes)", obj.len());
         let dae0_ifindex = std::fs::read_to_string("/sys/class/net/dae0/ifindex")
             .ok()
@@ -85,6 +88,8 @@ impl RealEbpfBackend {
             wan_ifindex,
             dae0peer_mac,
             use_redirect_peer,
+            has_bpf_get_current_task: matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
+                as u8,
             dae_socket_mark: DAE_BYPASS_MARK,
             control_plane_pid: std::process::id(),
             local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
@@ -109,6 +114,13 @@ impl RealEbpfBackend {
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
             .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
+        if matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
+            && let Some(offsets) = process_name_offsets.as_ref()
+        {
+            loader
+                .override_global("TASK_MM_OFFSET", &offsets.task_mm, true)
+                .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
+        }
         let mut bpf = loader.load(obj)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         for (name, map) in bpf.maps() {
@@ -131,6 +143,14 @@ impl RealEbpfBackend {
                 warn!("pin '{}': {}", name, e);
             } else {
                 debug!("pinned '{}'", name);
+            }
+        }
+        match pname_mode {
+            process_name::PnameCaptureMode::Argv0 => {
+                info!("process-name routing uses argv[0] basename")
+            }
+            process_name::PnameCaptureMode::Comm => {
+                warn!("kernel argv capture unavailable; using thread comm")
             }
         }
         // Install a complete generation-0 fallback before any TC hook is
@@ -188,7 +208,27 @@ impl RealEbpfBackend {
             Ok(cgroup_path) => {
                 let cgroup_file = std::fs::File::open(&cgroup_path)
                     .map_err(|e| anyhow::anyhow!("open cgroup {}: {}", cgroup_path, e))?;
-                let cg_sock_names = ["tproxy_wan_cg_sock_create", "tproxy_wan_cg_sock_release"];
+                let (create_name, cg_addr_names) = match pname_mode {
+                    process_name::PnameCaptureMode::Argv0 => (
+                        "tproxy_wan_cg_sock_create",
+                        [
+                            "tproxy_wan_cg_connect4",
+                            "tproxy_wan_cg_connect6",
+                            "tproxy_wan_cg_sendmsg4",
+                            "tproxy_wan_cg_sendmsg6",
+                        ],
+                    ),
+                    process_name::PnameCaptureMode::Comm => (
+                        "tproxy_wan_cg_sock_create_comm",
+                        [
+                            "tproxy_wan_cg_connect4_comm",
+                            "tproxy_wan_cg_connect6_comm",
+                            "tproxy_wan_cg_sendmsg4_comm",
+                            "tproxy_wan_cg_sendmsg6_comm",
+                        ],
+                    ),
+                };
+                let cg_sock_names = [create_name, "tproxy_wan_cg_sock_release"];
                 for name in &cg_sock_names {
                     let p: &mut aya::programs::CgroupSock = bpf
                         .program_mut(name)
@@ -199,12 +239,6 @@ impl RealEbpfBackend {
                         p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
                     cgroup_sock_links.push(p.take_link(link_id)?);
                 }
-                let cg_addr_names = [
-                    "tproxy_wan_cg_connect4",
-                    "tproxy_wan_cg_connect6",
-                    "tproxy_wan_cg_sendmsg4",
-                    "tproxy_wan_cg_sendmsg6",
-                ];
                 for name in &cg_addr_names {
                     let p: &mut aya::programs::CgroupSockAddr = bpf
                         .program_mut(name)
@@ -512,12 +546,7 @@ impl RealEbpfBackend {
                 None
             }
         };
-
-        // Spawn the DaeEvent consumer: conntrack overflow events produced by
-        // the eBPF datapath arrive on EVENT_RINGBUF (contrack.rs).  Same
-        // AsyncFd readiness pattern as the aya-log flush task above.  The map
-        // is taken out of the Ebpf object so the task owns it outright; the
-        // pinned copy under pin_root remains for external inspection.
+        // Spawn the DaeEvent consumer for diagnostics.
         let event_flush_handle = match bpf.take_map("EVENT_RINGBUF") {
             Some(map) => match aya::maps::RingBuf::try_from(map) {
                 Ok(ring_buf) => {

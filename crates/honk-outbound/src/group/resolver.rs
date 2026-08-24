@@ -30,8 +30,21 @@ impl GroupManager {
         effects: SelectionEffects,
     ) -> Option<Candidate<'a>> {
         let candidates = self.flatten_candidates(group, domain, ipver, visited, depth, effects);
+        let before_filter = (effects.applies()
+            && group.policy == GroupPolicy::Score
+            && self.score_state.is_current_authority(&self.score_authority))
+        .then(|| unique_candidate_ids(&candidates))
+        .flatten();
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
+        let network = SelectionNetwork::from_probe_domain(domain);
+        if let Some(before_filter) = before_filter {
+            self.score_state.record_dead_filtered(
+                &self.score_authority,
+                score::SelectionReasonKey::new(&group.name, network),
+                removed_unique_candidate_count(before_filter, &candidates),
+            );
+        }
         if candidates.is_empty() {
             return self
                 .last_resort_tcp_leaf(group, domain)
@@ -42,7 +55,6 @@ impl GroupManager {
                     selection_chain: vec![node.name.as_str()],
                 });
         }
-        let network = SelectionNetwork::from_probe_domain(domain);
         let candidate = match group.policy {
             GroupPolicy::Selector => self.pick_selector(&candidates, group),
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),

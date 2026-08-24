@@ -216,6 +216,52 @@ fn http_client() -> reqwest::Client {
         .unwrap()
 }
 
+const SCORE_STATS_FIXTURE_LINES: &[&str] = &[
+    "global {",
+    "wan_interface: lo",
+    "lan_interface: lo",
+    "log_level: info",
+    "auto_config_kernel_parameter: false",
+    "nfqueue_enable: false",
+    "data_dir: '__HONK_SCORE_QA_DATA_DIR__'",
+    "}",
+    "node {",
+    "private-node-alpha: 'socks5://private-user:private-pass@private-node-alpha.invalid:16543'",
+    "private-node-beta: 'socks5://private-user-2:private-pass-2@203.0.113.88:26543'",
+    "}",
+    "group {",
+    "z-score {",
+    "filter: name('private-node-alpha','private-node-beta')",
+    "policy: score",
+    "}",
+    "a-score {",
+    "filter: name('private-node-alpha','private-node-beta')",
+    "policy: score",
+    "}",
+    "}",
+    "routing {",
+    "fallback: direct",
+    "}",
+    "experimental {",
+    "clash_api {",
+    "external_controller: '127.0.0.1:19090'",
+    "secret: 'score-review-secret'",
+    "}",
+    "}",
+];
+
+fn normalized_fixture_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+fn score_stats_fixture_matches(source: &str) -> bool {
+    normalized_fixture_lines(source) == SCORE_STATS_FIXTURE_LINES
+}
+
 #[tokio::test]
 async fn test_auth_open_when_no_secret() {
     let app = spawn_app("", "").await;
@@ -489,6 +535,247 @@ async fn test_score_proxy_contract_and_put_rejection() {
         .await
         .unwrap();
     assert_eq!(body["now"], "node-b");
+}
+
+#[tokio::test]
+async fn score_stats_are_authenticated_deterministic_and_private() {
+    use honk_config::group::GroupPolicy;
+    use honk_outbound::group::{ScoreSelectionContext, ScoreTarget, SelectionNetwork};
+
+    let fixture = include_str!("fixtures/score_stats_manual.dae");
+    assert!(score_stats_fixture_matches(fixture));
+    let missing_default = fixture.replacen("    log_level: info\n", "", 1);
+    assert!(!score_stats_fixture_matches(&missing_default));
+
+    let config = honk_config::parser::parse_dae_config(fixture).unwrap();
+    assert_eq!(
+        config.experimental.clash_api.external_controller,
+        "127.0.0.1:19090"
+    );
+    assert_eq!(config.experimental.clash_api.secret, "score-review-secret");
+    assert_eq!(config.global.lan_interface, ["lo"]);
+    assert_eq!(config.global.wan_interface, ["lo"]);
+    assert_eq!(config.global.log_level, "info");
+    assert!(!config.global.auto_config_kernel_parameter);
+    assert!(!config.global.nfqueue_enable);
+    assert_eq!(config.global.data_dir, "__HONK_SCORE_QA_DATA_DIR__");
+    assert_eq!(config.routing.default_outbound, "direct");
+    assert_eq!(
+        config
+            .groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect::<Vec<_>>(),
+        ["z-score", "a-score"]
+    );
+    assert!(
+        config
+            .groups
+            .iter()
+            .all(|group| group.policy == GroupPolicy::Score)
+    );
+    assert_eq!(
+        config
+            .nodes
+            .iter()
+            .map(|node| (
+                node.name.as_str(),
+                node.protocol,
+                node.address.as_str(),
+                node.port,
+                node.username.as_deref(),
+                node.password.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "private-node-alpha",
+                NodeProtocol::Socks5,
+                "private-node-alpha.invalid:16543",
+                16543,
+                Some("private-user"),
+                Some("private-pass"),
+            ),
+            (
+                "private-node-beta",
+                NodeProtocol::Socks5,
+                "203.0.113.88:26543",
+                26543,
+                Some("private-user-2"),
+                Some("private-pass-2"),
+            ),
+        ]
+    );
+    let expected_members: std::collections::HashSet<_> =
+        config.nodes.iter().map(|node| node.id).collect();
+    for group in &config.groups {
+        assert_eq!(
+            group
+                .nodes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected_members,
+            "{} must resolve exactly the two fixture nodes",
+            group.name
+        );
+    }
+
+    let selector = spawn_app("", "").await;
+    let selector_stats: serde_json::Value = http_client()
+        .get(selector.url("/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(selector_stats["score"]["groups"], serde_json::json!([]));
+
+    let app = spawn_app_with_config(config.clone(), "score-review-secret", "").await;
+    let client = http_client();
+    let no_auth_status = client.get(app.url("/stats")).send().await.unwrap().status();
+    assert_eq!(no_auth_status, 401);
+    let wrong_auth_status = client
+        .get(app.url("/stats"))
+        .bearer_auth("wrong")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(wrong_auth_status, 401);
+
+    let context = ScoreSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(ScoreTarget::domain("private-target.example", 443)),
+    };
+    let manager = app.state.group_manager.read().clone();
+    for group in ["z-score", "a-score"] {
+        assert!(
+            !manager
+                .selection_plan_for_target(group, &context)
+                .entries
+                .is_empty()
+        );
+    }
+
+    let first_response = client
+        .get(app.url("/stats"))
+        .bearer_auth("score-review-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), 200);
+    let first: serde_json::Value = first_response.json().await.unwrap();
+    let score = first["score"].clone();
+    let expected_score = serde_json::json!({
+        "groups": [
+            {
+                "name": "a-score",
+                "tcp": {
+                    "coldExplore": 1,
+                    "periodicExplore": 0,
+                    "reliabilityWinner": 0,
+                    "performanceWinner": 0,
+                    "incumbentHeld": 0,
+                    "freshFailureBypass": 0,
+                    "deadFiltered": 0,
+                },
+                "udp": {
+                    "coldExplore": 0,
+                    "periodicExplore": 0,
+                    "reliabilityWinner": 0,
+                    "performanceWinner": 0,
+                    "incumbentHeld": 0,
+                    "freshFailureBypass": 0,
+                    "deadFiltered": 0,
+                },
+            },
+            {
+                "name": "z-score",
+                "tcp": {
+                    "coldExplore": 1,
+                    "periodicExplore": 0,
+                    "reliabilityWinner": 0,
+                    "performanceWinner": 0,
+                    "incumbentHeld": 0,
+                    "freshFailureBypass": 0,
+                    "deadFiltered": 0,
+                },
+                "udp": {
+                    "coldExplore": 0,
+                    "periodicExplore": 0,
+                    "reliabilityWinner": 0,
+                    "performanceWinner": 0,
+                    "incumbentHeld": 0,
+                    "freshFailureBypass": 0,
+                    "deadFiltered": 0,
+                },
+            },
+        ],
+    });
+    assert_eq!(score, expected_score);
+    let mut unexpected_counter = expected_score.clone();
+    unexpected_counter["groups"][0]["udp"]["periodicExplore"] = serde_json::json!(1);
+    assert_ne!(score, unexpected_counter);
+    assert!(first["outbounds"].is_array());
+    let connections = client
+        .get(app.url("/connections"))
+        .bearer_auth("score-review-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(connections.status(), 200);
+
+    let mut private_values: Vec<String> = [
+        "private-target.example",
+        "443",
+        "private-node-alpha",
+        "private-node-beta",
+        "private-user",
+        "private-pass",
+        "private-user-2",
+        "private-pass-2",
+        "private-node-alpha.invalid",
+        "203.0.113.88",
+        "16543",
+        "26543",
+        "score-review-secret",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    private_values.extend(config.nodes.iter().map(|node| node.id.to_string()));
+    let encoded_score = score.to_string();
+    assert!(
+        private_values
+            .iter()
+            .all(|value| !encoded_score.contains(value))
+    );
+
+    let proxies = client
+        .get(app.url("/proxies"))
+        .bearer_auth("score-review-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(proxies.status(), 200);
+    let second: serde_json::Value = client
+        .get(app.url("/stats"))
+        .bearer_auth("score-review-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["score"], score);
+    println!(
+        "score_stats status=no_auth:{no_auth_status} wrong_auth:{wrong_auth_status} correct:200 schema={score}"
+    );
 }
 
 /// Dashboards (metacubexd/zashboard) send PUT/PATCH without a JSON
@@ -788,8 +1075,8 @@ async fn test_connections_snapshot_and_delete() {
     // A LAN-forwarded flow carries no process attribution.
     app.state.connection_tracker.register(ConnectionEntry {
         id: "conn-2".into(),
-        source: "192.168.1.10:4321".into(),
-        destination: "1.1.1.1:443".into(),
+        source: "[2001:db8::10]:4321".into(),
+        destination: "[2001:db8::20]:443".into(),
         proxy: "proxy".into(),
         rule: "Match".into(),
         rule_payload: String::new(),
@@ -837,6 +1124,10 @@ async fn test_connections_snapshot_and_delete() {
     let c2 = conns.iter().find(|c| c["id"] == "conn-2").unwrap();
     assert_eq!(c2["metadata"]["process"], "");
     assert_eq!(c2["metadata"]["processPath"], "");
+    assert_eq!(c2["metadata"]["sourceIP"], "2001:db8::10");
+    assert_eq!(c2["metadata"]["destinationIP"], "2001:db8::20");
+    assert_eq!(c2["metadata"]["sourcePort"], "4321");
+    assert_eq!(c2["metadata"]["destinationPort"], "443");
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
@@ -1687,6 +1978,11 @@ async fn stats_exposes_udp_metrics() {
     // UDP is additive: existing dashboard keys retain their shapes.
     assert!(body["outbounds"].is_array());
     assert!(body["pool"].is_object());
+
+    let tcp = &body["tcp"];
+    assert!(tcp["activeFlows"].is_u64());
+    assert!(tcp["limit"].is_u64());
+    assert_eq!(tcp["capacity"]["rejected"], 0);
 
     let udp = &body["udp"];
     assert_eq!(udp["endpoint"]["hits"], 1);

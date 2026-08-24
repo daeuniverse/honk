@@ -144,7 +144,7 @@ pub(super) const UOT_DRAIN_QUEUE_CAP: usize = 4096;
 
 impl Drop for AnyTlsUotTransport {
     fn drop(&mut self) {
-        self.session.end_uot_stream(self.sid);
+        self.session.end_uot_stream(self.sid, true);
     }
 }
 

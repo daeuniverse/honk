@@ -104,7 +104,7 @@ impl DnsUpstreamPool for SnapshotUpstream {
     }
 }
 
-fn a_response(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
+pub(super) fn a_response(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
     let mut response = query.to_vec();
     response[2] = 0x81;
     response[3] = 0x80;

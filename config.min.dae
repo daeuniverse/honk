@@ -5,6 +5,8 @@ global {
     dial_mode: domain
     allow_insecure: false
     auto_config_kernel_parameter: true
+    # Mock development cannot enable the real NFQUEUE backend.
+    nfqueue_enable: false
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'

@@ -19,7 +19,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-b`, `--bpf-object PATH` | Embedded object | Override the object embedded by an `ebpf` build. Used only by the real backend. |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | Root for pinned eBPF maps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
-| `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. A configuration with UDP NFQUEUE enabled is rejected. |
+| `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
 
 Clap also provides `-h`/`--help` and `-V`/`--version`.
 
@@ -41,7 +41,7 @@ See the [global configuration reference](./global.md) for `log_level`.
 | Command | Current behavior | Persistence / runtime effect |
 | --- | --- | --- |
 | `reload` | Reads the PID from the locked `/run/honk-core.lock` and sends `SIGHUP`. | Reports successful signal delivery only. The running process later logs `applied` or `rejected`. Mock instances do not own the lock. |
-| `mode <rule\|global\|direct>` | Loads `--config`, assigns the supplied string to `global.dial_mode`, validates, and rewrites the file. | File-only; it does not contact the running engine or change Clash mode. The accepted strings differ from the normal dial-mode values `ip`, `domain`, `domain+`, and `domain++`. |
+| `mode <rule\|global\|direct>` | Loads `--config`, assigns the supplied string to `experimental.clash_api.default_mode`, and validates before rewriting structured-format files. `.dae` files are rejected unchanged because the writer cannot preserve dae syntax, comments, or includes; edit those sources directly or use `.toml`, `.yaml`, or `.json`. | File-only; it does not contact the running engine or change dial mode. The accepted strings differ from the normal dial-mode values `ip`, `domain`, `domain+`, and `domain++`. |
 | `proxy <group> <node>` | Checks that the group and node names each exist, then prints the requested selection. It does not check membership. | Nothing is written and no running engine is contacted. |
 | `delay <node> [-u\|--url HOST:PORT]` | Opens one raw TCP connection with a five-second timeout and prints elapsed milliseconds. Without `--url`, it uses the node server address. | Not proxied, not an HTTP URLTest, and no running engine is contacted. |
 
@@ -55,15 +55,17 @@ A real-datapath process holds the lock for its lifetime. `reload` verifies that 
 | `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Overrides the dashboard zip URL used when a configured external-UI directory needs downloading. |
 | `HONK_POOL_DISABLE=1` | `honk-core` | Bypasses both ready-stream and bare-TCP pools and performs fresh dials. The code also accepts case-insensitive `true`; the value is cached on first use. |
 | `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |
+| `HONK_VMLINUX_BTF` | `honk-core` with `ebpf` | Overrides the raw kernel BTF file used to resolve process-name offsets. Without it, honk checks `/sys/kernel/btf/vmlinux` and then `/usr/lib/debug/boot/vmlinux`; if runtime BTF offsets or verifier-safe kernel argv access are unavailable, pname synchronously falls back to the calling thread's `comm`. |
 | `DAE_LOCATION_ASSET` | Geo loading in both binaries | Directory checked first for `geoip.dat` and `geosite.dat`. |
 
-UDP NFQUEUE has no environment-variable switch. It is enabled only by `experimental.udp_nfqueue.enabled`; see the [experimental configuration reference](./experimental.md).
+UDP NFQUEUE has no environment-variable switch. It is enabled by default through `global.nfqueue_enable`; set that key to `false` to disable it. See the [global configuration reference](./global.md) and [NFQUEUE design](../design/nfqueue.md).
 
 ## eBPF and runtime paths
 
 | Item | Control | Current invariant |
 | --- | --- | --- |
 | eBPF object | Embedded object or `--bpf-object PATH` | With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`; the option replaces those bytes at runtime. Builds without `ebpf` use the mock backend. |
+| Kernel BTF | `HONK_VMLINUX_BTF` or common-path search | Used only to resolve `pname` kernel-field offsets. Without an override, honk tries `/sys/kernel/btf/vmlinux` followed by `/usr/lib/debug/boot/vmlinux`. |
 | Pin root | `--bpf-pin-root PATH` | Defaults to `/sys/fs/bpf` and is passed to the real backend for pinned maps. |
 | Bypass mark | Compiled constant | `DAE_BYPASS_MARK = 0x100`; control-plane dials, probes, and DNS upstream sockets use it to avoid re-interception. |
 | TPROXY mark | Compiled constant plus validated config | `TPROXY_MARK = 0x08000000`; `global.tproxy_mark` must equal this value. |

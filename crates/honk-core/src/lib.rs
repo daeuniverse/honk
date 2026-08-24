@@ -220,7 +220,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             }
             let config = Config::from_file(cli.config.to_str().unwrap())?;
             let mut config = config;
-            config.global.dial_mode = mode.clone();
+            config.experimental.clash_api.default_mode = mode.clone();
             config.validate()?;
             config.to_file(cli.config.to_str().unwrap())?;
             println!("Mode set to {}", mode);
@@ -386,17 +386,34 @@ fn acquire_instance_lock(
     }
 }
 
-fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Result<()> {
-    if !enabled {
-        return Ok(());
+fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
+    if !config.global.nfqueue_enable {
+        return;
     }
-    if mock_ebpf {
-        anyhow::bail!("experimental.udp_nfqueue requires the real eBPF backend");
+
+    let reason = if mock_mode {
+        Some("the mock eBPF backend was selected".to_string())
+    } else {
+        #[cfg(not(feature = "ebpf"))]
+        {
+            Some("honk-core was built without the ebpf feature".to_string())
+        }
+        #[cfg(feature = "ebpf")]
+        {
+            honk_nfqueue::preflight()
+                .err()
+                .map(|error| error.to_string())
+        }
+    };
+
+    if let Some(reason) = reason {
+        warn!(
+            requested = true,
+            %reason,
+            "NFQUEUE is unavailable at startup; continuing with NFQUEUE staging disabled"
+        );
+        config.global.nfqueue_enable = false;
     }
-    #[cfg(not(feature = "ebpf"))]
-    anyhow::bail!("experimental.udp_nfqueue requires a build with the ebpf feature");
-    #[cfg(feature = "ebpf")]
-    Ok(())
 }
 
 fn probe_runtime_data_dir(path: &std::path::Path) -> std::io::Result<()> {
@@ -494,7 +511,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // effect and config log_level was silently ignored).
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
-    validate_udp_nfqueue_runtime(config.experimental.udp_nfqueue.enabled, cli.mock_ebpf)?;
     let requested_data_dir = PathBuf::from(&config.global.data_dir);
     let (runtime_data_dir, data_dir_creation_error) =
         prepare_runtime_data_dir(&requested_data_dir)?;
@@ -571,6 +587,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     };
     let resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
+    let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
+    if tcp_flow_max < 256 {
+        warn!(
+            nofile = resource_budget.effective_nofile,
+            tcp_floor = resource_budget.active_tcp_flows,
+            tcp_max = tcp_flow_max,
+            "Low TCP flow admission ceiling; raise RLIMIT_NOFILE in the service limits to avoid gateway-wide backpressure"
+        );
+    }
 
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular
@@ -756,6 +781,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         Some(acquire_instance_lock(&cli.bpf_pin_root)?)
     };
+
+    // The old instance owns queue 320 until this lock is released. Check
+    // NFQUEUE only after the handoff so a transient busy result cannot turn
+    // a healthy restart into a permanently degraded process.
+    prepare_nfqueue_startup(&mut config, mock_mode);
 
     // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
@@ -2060,22 +2090,26 @@ fn is_mountpoint(path: &str) -> bool {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, open_log_file, prepare_runtime_data_dir,
+        ClashCommand, Cli, open_log_file, prepare_nfqueue_startup, prepare_runtime_data_dir,
         prepare_runtime_data_dir_with_fallback, publish_instance_pid, running_instance_pid,
-        validate_udp_nfqueue_runtime,
     };
     use clap::Parser;
 
     #[test]
-    fn udp_nfqueue_rejects_mock_backend() {
-        assert!(validate_udp_nfqueue_runtime(true, true).is_err());
-        assert!(validate_udp_nfqueue_runtime(false, true).is_ok());
+    fn nfqueue_requested_with_mock_backend_falls_back_to_disabled() {
+        let mut config = honk_config::Config::default();
+        config.global.nfqueue_enable = true;
+        prepare_nfqueue_startup(&mut config, true);
+        assert!(!config.global.nfqueue_enable);
     }
 
     #[cfg(not(feature = "ebpf"))]
     #[test]
-    fn udp_nfqueue_rejects_build_without_ebpf() {
-        assert!(validate_udp_nfqueue_runtime(true, false).is_err());
+    fn nfqueue_requested_without_ebpf_falls_back_to_disabled() {
+        let mut config = honk_config::Config::default();
+        config.global.nfqueue_enable = true;
+        prepare_nfqueue_startup(&mut config, false);
+        assert!(!config.global.nfqueue_enable);
     }
 
     #[test]

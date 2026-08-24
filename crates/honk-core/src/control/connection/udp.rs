@@ -1,6 +1,6 @@
-use super::routing::connection_chains;
 #[cfg(feature = "ebpf")]
 use super::routing::final_udp_rule_mark;
+use super::routing::{build_connection_info, connection_chains};
 use crate::control::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::control::*;
@@ -89,8 +89,7 @@ impl ControlPlaneHandle {
                 .global
                 .dial_mode
                 .parse::<DialMode>()
-                .ok()
-                .unwrap_or(DialMode::DomainPlusPlus)
+                .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?
         };
 
         // These checks remain after reservation because DNS and sniffing
@@ -144,22 +143,37 @@ impl ControlPlaneHandle {
             }
         }
 
-        let mut quic_domain: Option<String>;
+        let tuples = build_tuples_key(
+            original_dst.ip(),
+            original_dst.port(),
+            client_addr.ip(),
+            client_addr.port(),
+            17, // UDP
+        );
+        let handoff = self
+            .lookup_udp_handoff(&tuples, lease.decision_token())
+            .await?;
+        let skip_sniff = matches!(dial_mode, DialMode::Ip)
+            || handoff.as_ref().is_some_and(|ho| {
+                ho.must != 0
+                    || matches!(
+                        ho.outbound,
+                        x if x == OutboundIndex::Direct as u8
+                            || x == OutboundIndex::Block as u8
+                            || x == OutboundIndex::MustRules as u8
+                    )
+            });
         let mut follower_rx = None;
         let mut sniffed_followers = Vec::new();
-        {
+        let quic_domain: Option<String> = if skip_sniff {
+            None
+        } else {
             use crate::control::packet_sniffer::QuicSniffOutcome;
             let sniffer_key =
                 crate::control::packet_sniffer::PacketSnifferKey::new(client_addr, original_dst);
-            let mut outcome = if self.sniffer_pool.is_dcid_failed(&sniffer_key) {
-                QuicSniffOutcome::NotQuic
-            } else {
-                self.sniffer_pool.feed_quic_initial(sniffer_key, &data)
-            };
+            let mut outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
             // A fragmented ClientHello: collect the rest of the Initial
-            // flight from the follower queue before deciding.  Deciding on
-            // an Incomplete CH could offload or relay a flow whose SNI —
-            // still in flight — would have picked another outbound.
+            // flight before deciding which outbound owns the flow.
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
                 follower_rx = lease.take_queue_receiver();
                 if let Some(rx) = follower_rx.as_mut() {
@@ -178,84 +192,40 @@ impl ControlPlaneHandle {
                 }
                 return Ok(());
             }
-            quic_domain = outcome.into_domain();
-        }
-        if matches!(dial_mode, DialMode::Domain)
-            && let Some(domain) = &quic_domain
-            && !self
-                .verify_domain_reality(domain, original_dst.ip(), client_addr.ip())
-                .await
-        {
-            debug!(
-                "QUIC domain {} failed reality check against {}, falling back to IP",
-                domain,
-                original_dst.ip()
-            );
-            quic_domain = None;
-        }
+            outcome.into_domain()
+        };
+        let (quic_domain, domain_verified) = self
+            .apply_domain_reality_check(dial_mode, quic_domain, original_dst.ip(), client_addr.ip())
+            .await;
 
         let route_started_at = std::time::Instant::now();
-        let tuples = build_tuples_key(
-            original_dst.ip(),
-            original_dst.port(),
-            client_addr.ip(),
-            client_addr.port(),
-            17, // UDP
-        );
-        let handoff = self
-            .lookup_udp_handoff(&tuples, lease.decision_token())
-            .await?;
-        let conn_info = ConnectionInfo {
-            domain: quic_domain.clone(),
-            dst_ip: original_dst.ip(),
-            dst_port: original_dst.port(),
-            src_ip: client_addr.ip(),
-            src_port: client_addr.port(),
-            protocol: "udp",
-            process_name: handoff.as_ref().and_then(|ho| ho.process_name()),
-            mac: handoff.as_ref().and_then(|ho| ho.mac_address()),
-            dscp: handoff.as_ref().map(|ho| ho.dscp),
-        };
-
-        let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
-            dial_mode,
-            quic_domain.as_deref(),
+        let conn_info = build_connection_info(
+            quic_domain.clone(),
+            original_dst,
+            client_addr,
+            "udp",
             handoff.as_ref(),
         );
-        let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
-            let router = self.router.read().await;
-            if let Some(route) = router.route_full(&conn_info) {
-                (
-                    route.outbound_name.to_string(),
-                    route.must,
-                    route.mark,
-                    Some((route.rule_type.to_string(), route.rule_payload.to_string())),
-                )
-            } else {
-                (router.route(&conn_info).to_string(), false, 0, None)
-            }
-        };
-        let (routed_outbound, must, routed_mark) = if let Some(ho) = &handoff {
-            debug!(
-                "eBPF handoff UDP: outbound={}, token={}",
-                ho.outbound, ho.decision_token
-            );
-            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
-            {
-                (userspace_outbound, userspace_must, userspace_mark)
-            } else {
-                (
-                    self.outbound_index_to_name(ho.outbound).await,
-                    ho.must != 0,
-                    ho.mark,
-                )
-            }
-        } else {
-            (userspace_outbound, userspace_must, userspace_mark)
-        };
+        let route = self
+            .prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
+            .await;
+        #[cfg(feature = "ebpf")]
+        let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
+        let matched_rule = route.matched_rule;
+        let routed_outbound = route.outbound;
+        let must = route.must;
+        let routed_mark = route.mark;
         #[cfg(feature = "ebpf")]
         let routed_direct = routed_outbound == "direct";
         let outbound_name = self.apply_mode_override(routed_outbound, must).await;
+        let target_domain = if matches!(
+            outbound_name.as_str(),
+            "direct" | "block" | "must_rules" | "control_plane_routing"
+        ) {
+            None
+        } else {
+            quic_domain.clone()
+        };
         #[cfg(feature = "ebpf")]
         let final_rule_mark = final_udp_rule_mark(routed_direct, &outbound_name, routed_mark);
         #[cfg(not(feature = "ebpf"))]
@@ -313,7 +283,7 @@ impl ControlPlaneHandle {
                     probe_domain: ProbeDomain::DataUdp,
                     target_family: Some(requested_ipver),
                     health_family: requested_ipver,
-                    target: Some(match quic_domain.as_deref() {
+                    target: Some(match target_domain.as_deref() {
                         Some(domain) => {
                             crate::group::ScoreTarget::domain(domain, original_dst.port())
                         }
@@ -365,6 +335,7 @@ impl ControlPlaneHandle {
                 let runtime_generation = Arc::clone(&prepare_generation);
                 let feedback = feedback.get(index).cloned().flatten();
                 let selection_chain = selection_chains.get(index).cloned().unwrap_or_default();
+                let target_domain = target_domain.clone();
                 Box::pin(async move {
                     let reporter = feedback.map(|feedback| feedback.start());
                     let dial_started_at = std::time::Instant::now();
@@ -374,7 +345,7 @@ impl ControlPlaneHandle {
                                 Arc::clone(&runtime_generation),
                                 node.id,
                                 original_dst,
-                                None,
+                                target_domain.as_deref(),
                                 connect_timeout,
                             )
                             .await
@@ -384,7 +355,7 @@ impl ControlPlaneHandle {
                                 Arc::clone(&runtime_generation),
                                 node.id,
                                 original_dst,
-                                None,
+                                target_domain.as_deref(),
                                 connect_timeout,
                             )
                             .await
@@ -596,8 +567,8 @@ impl ControlPlaneHandle {
         driver.start_with_followers(first, sniffed_followers)?;
         self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         if let Err(error) = driver.wait_first_ack().await {
-            // PacketTransport Err and timeout are ambiguous: the winner may
-            // have received part of the initial flight, so never replay it.
+            // First-send failures are terminal for this endpoint; once the
+            // transport call starts, the packet is never replayed.
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }

@@ -26,7 +26,7 @@ dae 配置面只设置订阅 tag（`name`）和 `url`。其他所有字段都保
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
 | `update_interval` | u64 | `86400` | 否 | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
-| `user_agent` | string 或 null | null | 否 | 可选的 `User-Agent` 覆盖值。 |
+| `user_agent` | string 或 null | `honk/<version>` | 否 | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
 | `headers` | `{key,value}[]` | `[]` | 否 | 有序的额外请求 header。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不会恢复、拉取或刷新。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型元数据；当前 core runtime 不更新它。 |
@@ -46,14 +46,14 @@ dae 配置面只设置订阅 tag（`name`）和 `url`。其他所有字段都保
 
 ## 拉取、持久化与恢复
 
-`global.store_subscribe` 默认为 `true`。启用后，runtime 会打开私有订阅存储并立即拉取每个已启用订阅。非零 `update_interval` 会安排后续刷新。
+`global.store_subscribe` 默认为 `true`。启用后，runtime 会打开私有订阅存储并立即拉取每个已启用订阅。请求默认使用 `honk/<version>`，可由 `user_agent` 覆盖。非零 `update_interval` 会安排后续刷新。
 
 | 属性 | 当前行为 |
 | --- | --- |
 | 首选位置 | `<data_dir>/.sub`；`data_dir` 默认值为 `/var/share/honk`。 |
 | 旧位置 | 若首选目录不存在而 `./.sub` 存在，则继续使用旧目录，直至手动迁移。两者同时存在时优先使用首选目录。 |
 | 权限 | 目录 mode 为 `0700`，文件 mode 为 `0600`。拒绝符号链接形式的存储目录。 |
-| 文件名 | 对带长度边界的 URL、user agent 及有序 header key/value 对计算 SHA-256，再用 URL-safe Base64 编码并添加 `.sub`。请求身份不会以明文暴露。 |
+| 文件名 | 对带长度边界的 URL、配置中的 user agent 覆盖值（未设置或为空时为空）及有序 header key/value 对计算 SHA-256，再用 URL-safe Base64 编码并添加 `.sub`。版本化的默认请求 UA 不参与 key，因此默认订阅升级后仍保留缓存。请求身份不会以明文暴露。 |
 | 写入边界 | 只有 HTTP 成功且解析成功后才写入原始响应正文。临时文件完成 sync 后原子 rename，随后对目录执行 sync。 |
 
 订阅正文及其产生的节点都只属于 runtime 状态；两者都不会写回 dae 配置。
@@ -64,15 +64,15 @@ SIGHUP 时，URL 相同的订阅保留 runtime ID。重载会沿用仍处于启�
 
 失败处理会保留可用 runtime，而不会清空它：
 
-- HTTP 或解析失败不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。
+- HTTP、解析或没有可用节点的失败不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。
 - 持久化写入在解析成功后失败属于非致命错误：新解析出的节点仍会返回用于发布，而原子写入路径绝不会安装只写了一部分的正文。下次重启因此可以恢复磁盘上保留的任一完整有效正文。
-- 单个不支持的分享链接或 Clash proxy 会被跳过。只有没有剩余受支持节点时，整个正文才失败。
+- 单个不支持的分享链接或 Clash proxy 会被跳过。只有没有剩余受支持节点时，整个正文才失败；空结果绝不会清空上一代节点。
 
 通过 SIGHUP 修改 `global.store_subscribe` 会因需要重启而被拒绝。
 
 ## 订阅正文格式
 
-所有接受的节点都会获得订阅 ID。解析结束后会丢弃重复的派生节点 ID，并保留第一次出现的节点。
+所有接受的节点都会获得订阅 ID。解析结束后会丢弃重复的派生节点 ID，并保留第一次出现的节点。如果正文中的受支持条目最终全部折叠为同一个重复身份，则拒绝正文，不会替换活动订阅。
 
 ### `simple`
 

@@ -90,7 +90,8 @@ impl GroupManager {
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
         let index = if effects.applies() {
-            self.score_state.rank(&group.name, context, &nodes)
+            self.score_state
+                .rank(&self.score_authority, &group.name, context, &nodes)
         } else {
             self.score_state.peek_rank(&group.name, context, &nodes)
         };

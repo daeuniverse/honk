@@ -42,7 +42,7 @@
 
 TCP SYN 时内核看不到主机名。域名与 geosite 条件编译为 `DomainSet` 占位符。`DOMAIN_ROUTING_MAP` 把 DNS 学习到的目的 IP 映射到对应的、按 generation 划分的规则 bitmap；条目存在时还会设置 `DomainKnown`，证明本轮所有 domain-set 检查均使用了完整的已学习 bitmap。
 
-在 `domain`、`domain+` 与 `domain++` 模式中，如果一条通用代理规则带有目的端口条件，但没有 domain/geosite、进程、MAC 或 DSCP 限制，且出站不是 `direct` 或 `block`，编译器会把它改为 `ControlPlaneRouting`。这样可防止用户态检查域名前就由端口决策终结路由。`DOMAIN_ROUTING_MAP` 学习到条目后，后续流仍可由内核完成决策。
+在 `domain++` 模式中，如果通用代理规则带有目的端口条件，但没有 domain/geosite、进程、MAC 或 DSCP 限制，且出站不是 `direct` 或 `block`，编译器会把它改为 `ControlPlaneRouting`。`domain` 与 `domain+` 在内核中保留初始端口/IP 决策。`DOMAIN_ROUTING_MAP` 学到条目后，后续流仍可由内核完成决策。
 
 ## 原子路由发布
 
@@ -87,18 +87,16 @@ TCP 嗅探提取 TLS SNI 或 HTTP `Host`，并返回缓冲的前缀供转发。�
 
 UDP 嗅探处理 QUIC v1 与 v2 Initial 包。它派生 Initial key、移除 header protection、解密 payload、收集 CRYPTO frame、跨 fragment 或 packet 重组，再运行共享的 TLS ClientHello parser。每流 session 与 negative cache 限制重复尝试。ClientHello 未完成时不会把结果视为最终无域名，因为后续 Initial fragment 仍可能改变路由。
 
-在所有域名感知拨号模式中，只要嗅探到可用名称，既非 `must` 又非 `block` 的交接就会重新执行用户态路由。`must` 与 `block` 保持最终决策。`ip` 模式绝不嗅探。negative-cache 命中会跳过名称提取并保留用户态路径，而不会宣称域名决策已经完整。
+初始的 IP 路由决策与可选的域名拨号目标彼此独立。只有 `domain` 的 reality check 通过，或处于 `domain++` 时，嗅探名称才会影响路由；`domain+` 不会改变路由。`must`、`block` 与保留的直连决策保持最终状态。negative-cache 命中会跳过名称提取并保留现有路径。
 
 ### 拨号模式
 
-| 模式 | 嗅探 | 对目的 IP 校验名称 | 按名称重新执行路由 | 拨号行为 |
+| 模式 | 嗅探 | 对目的 IP 校验名称 | 重新执行路由 | 拨号行为 |
 | --- | --- | --- | --- | --- |
-| `ip` | 否 | 不适用 | 否 | 使用原始目的 IP |
-| `domain` | 是，除非最终决策或 negative cache 跳过 | 是；同地址族不匹配时丢弃名称 | 名称仍可用时是 | 向支持域名的出站传递名称；否则解析目标 |
-| `domain+` | 是，跳过条件相同 | 否 | 是 | 使用嗅探名称，不做 reality check |
-| `domain++` | 是，跳过条件相同 | 否 | 是 | 使用嗅探名称，不做 reality check |
-
-当前控制平面对 `domain+` 与 `domain++` 使用相同的嗅探和重路由分支。只有 `domain` 执行目的 IP reality check；如果应答只有另一个地址族，则接受该名称，而不把它视为不匹配。
+| `ip` | 否 | 不适用 | 否 | 使用原始目的 IP。 |
+| `domain` | 是，除非最终决策或 negative cache 跳过 | 是；不匹配则丢弃名称 | 仅校验通过后 | 代理按已校验名称拨号；域名规则未命中时继续匹配后续 IP/端口规则。 |
+| `domain+` | 是，跳过条件相同 | 否 | 否 | 代理使用嗅探名称拨号，同时保留初始路由。 |
+| `domain++` | 是，跳过条件相同 | 否 | 是，仅针对非保留决策 | 根据 SNI/HTTP Host 重新路由，再使用所得代理目标。 |
 
 ## Clash 模式与直连卸载
 
@@ -106,7 +104,7 @@ UDP 嗅探处理 QUIC v1 与 v2 Initial 包。它派生 Initial key、移除 hea
 
 | 模式 | 用户态 override | 路由时内核策略 |
 | --- | --- | --- |
-| `Rule` | 保留路由得到的出站 | 仅当 SNI 无法改变结果时卸载普通 `direct`：`dial_mode: ip`、不存在 domain-class 规则，或该流通过 `DOMAIN_ROUTING_MAP` 设置了 `DomainKnown`；否则交给用户态 |
+| `Rule` | 保留路由得到的出站 | 仅当 SNI 无法改变结果时卸载普通 `direct`：`dial_mode: ip` 或 `domain+`、不存在 domain-class 规则，或该流通过 `DOMAIN_ROUTING_MAP` 设置了 `DomainKnown`；否则交给用户态 |
 | `Global` | 当前 GLOBAL 选择可解析时使用该选择 | 通常交给用户态。GLOBAL 选择恰好是小写 `direct` 时例外：此时发布 `OFFLOAD_ALL`，因为每个非最终结果都会收敛到直连 |
 | `Direct` | 强制 `direct` | 卸载每个非 `must`、非 `block` 结果，并把缓存出站规范化为 `Direct` |
 

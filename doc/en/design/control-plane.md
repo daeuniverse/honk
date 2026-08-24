@@ -12,17 +12,18 @@ The main implementation is `crates/honk-core/src/control/`. It consumes `EbpfBac
 
 Startup keeps kernel admission closed until userspace can receive every redirected flow:
 
-1. Load and validate the configuration, select `global.data_dir`, reject an enabled `experimental.udp_nfqueue` on a mock or non-`ebpf` build, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
+1. Load and validate the configuration, select `global.data_dir`, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
 2. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
 3. Select the backend. Real mode takes `/run/honk-core.lock` and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. Mock mode does not take the process-global lock.
-4. In real mode, create the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through scoped `setns` calls.
-5. Load the BPF object and attach the real datapath. The default object is embedded with `include_bytes!`; `--bpf-object` supplies a runtime override. With the `ebpf` feature, `build.rs` locates the object, rejects stale or BTF-less output, rebuilds it with nightly after removing inherited `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, verifies `.BTF`, and copies it into `OUT_DIR` for embedding.
-6. Reuse or create the pinned `UDP_DECISION_SEQUENCE` allocator and validate its map ABI, BTF, locked value, token range, and exhaustion state. NFQUEUE startup rechecks the locked allocator status and leaves staging fenced if no rollback-safe generation is available.
-7. Build the userspace router, outbound runtime registry, DNS runtime, group manager, cache DB, optional Clash API, and control-plane supervisors.
-8. Bind the transparent TCP/UDP listeners, publish the complete listener FD set, start the standalone DNS and UDP receive loops, then start the optional NFQUEUE service and its ingest actor, correlator, watchdog, and statistics sampler.
-9. Check NFQUEUE health, publish its ready state, open pending verdict admission, and set `DATAPATH_STATE_MAP[0]` ready last. The TCP accept loop then runs in the control-plane supervisor.
+4. After the real-instance lock handoff, probe the fixed NFQUEUE queue prerequisites. Mock/no-`ebpf` mode or a failed preflight logs a warning and disables NFQUEUE for this process; the preflight does not reject the reserved nftables table because installation reclaims stale owned state.
+5. In real mode, create the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through scoped `setns` calls.
+6. Load the BPF object and attach the real datapath. The default object is embedded with `include_bytes!`; `--bpf-object` supplies a runtime override. With the `ebpf` feature, `build.rs` locates the object, rejects stale or BTF-less output, rebuilds it with nightly after removing inherited `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, verifies `.BTF`, and copies it into `OUT_DIR` for embedding.
+7. Reuse or create the pinned `UDP_DECISION_SEQUENCE` allocator and validate its map ABI, BTF, locked value, token range, and exhaustion state. NFQUEUE startup rechecks the locked allocator status and leaves staging fenced if no rollback-safe generation is available.
+8. Build the userspace router, outbound runtime registry, DNS runtime, group manager, cache DB, optional Clash API, and control-plane supervisors.
+9. Bind the transparent TCP/UDP listeners, publish the complete listener FD set, start the standalone DNS and UDP receive loops, then start the NFQUEUE service and its ingest actor, correlator, watchdog, and statistics sampler when the effective flag remains enabled.
+10. Check NFQUEUE health, publish its ready state, open pending verdict admission, and set `DATAPATH_STATE_MAP[0]` ready last. The TCP accept loop then runs in the control-plane supervisor.
 
-`RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. An enabled `experimental.udp_nfqueue` is rejected with `--mock-ebpf` and when `honk-core` is built without the `ebpf` feature.
+`RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. A requested NFQUEUE path that cannot pass the post-lock fixed-queue preflight is disabled with a warning; failures after the service is admitted remain fatal.
 
 Shutdown reverses ownership before resources disappear: fence NFQUEUE, close datapath admission, reject new userspace work, cancel and drain held verdicts and UDP initializers, stop UDP drivers and removal processing, stop the interface watcher, detach BPF hooks, drain accepted flows for up to five seconds, retire the outbound runtime, stop NFQUEUE, stop the DNS controller and persistence, and clean up generation-owned BPF state. Ordinary cleanup preserves the pinned allocator. Listener and `daens`/link-pair ownership then falls out of scope.
 
@@ -42,7 +43,7 @@ After forming the canonical tuple, userspace consumes `ROUTING_HANDOFF_MAP` with
 
 ## Sniffing and flow initialization
 
-TCP sniffing reads at most 4096 bytes and extracts TLS SNI or HTTP `Host`. The returned buffer is part of the flow state and is written to the selected outbound before relay starts, so sniffing consumes no application bytes. TCP sniffing is skipped for `dial_mode: ip`, a final non-control-plane `must` handoff, or a TCP negative-cache hit. Three consecutive failures suppress the same destination/outbound signature for ten minutes; a successful sniff removes the negative entry.
+TCP sniffing reads at most 4096 bytes and extracts TLS SNI or HTTP `Host`. The returned buffer is part of the flow state and is written to the selected outbound before relay starts, so sniffing consumes no application bytes. TCP sniffing is skipped for `dial_mode: ip`, a final direct/block or `must` handoff, or a TCP negative-cache hit. Three consecutive failures suppress the same destination/outbound signature for ten minutes; a successful sniff removes the negative entry.
 
 UDP domain discovery decrypts QUIC v1/v2 Initial packets, reassembles CRYPTO fragments, and parses the TLS ClientHello SNI. Per-flow sessions expire after five seconds, inspect at most eight Initial packets, and cap the CRYPTO stream at 64 KiB. When the first ClientHello is fragmented, the initializer retains up to eight FIFO followers for at most 250 ms. Failed-DCID caches bound repeated non-QUIC or undecryptable work.
 
@@ -88,16 +89,17 @@ Reload advances a cancellation epoch before waiting. Initializers capture that e
 
 Each UDP flow retains at most 64 datagrams including its first packet. All flows share an exact 8 MiB payload-permit budget. Admission obtains per-flow slots and global byte permits before copying; FIFO saturation drops the newest datagram. NFQUEUE has a separate ingest actor bounded to 256 entries and 8 MiB of queued payload.
 
-At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 16,384. At that cap the immutable partition is:
+At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 32,768. At that cap the fixed partition is:
 
 | Owner | Capacity | Descriptor accounting |
 | --- | ---: | ---: |
 | Fixed/runtime reserve | 256 | 256 |
-| Accepted TCP flows | 672 | 6 each = 4032 |
-| Retained TCP pool | 2016 | 1 each = 2016 |
-| Transient outbound dials | 1008 | 1 each = 1008 |
-| UDP endpoints | 3024 | 3 each = 9072 |
-| **Total** |  | **16,384** |
+| Accepted TCP flows | 1024 | 6 each = 6144 |
+| Retained TCP pool | 2048 | 1 each = 2048 |
+| Transient outbound dials | 1024 | 1 each = 1024 |
+| UDP endpoints | 7765 | 3 each = 23,295 |
+| **Total** |  | **32,767** |
+The remaining descriptor is partition-rounding slack. TCP starts with the descriptor-derived floor and elastically borrows idle non-TCP descriptor headroom up to twice that floor, while retaining half of the non-TCP budget as burst reserve; a 4,096-descriptor service can scale from 160 to 320 flow permits while that headroom is idle. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
 
 A TCP flow budgets the accepted socket, outbound socket, and two two-FD splice pipes. A UDP endpoint budgets the worst common ownership shape: relay socket, SOCKS5 control stream, and anyfrom reply socket. Smaller `RLIMIT_NOFILE` values scale the same partition with saturating arithmetic.
 
@@ -105,12 +107,14 @@ Admission ceilings are distinct:
 
 | Admission | Ceiling |
 | --- | ---: |
-| TCP flow permits | Descriptor-derived; 672 at the 16,384 cap, with a compile-time maximum of 1024 |
+| TCP flow permits | Descriptor-derived floor; 1024 at the 32,768 cap, with elastic scaling up to 2048 |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
 
 There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The endpoint-removal channel is bounded to 1024 messages and drains in batches of 128. If nonblocking delivery finds it full, a deduplicating `removal_dirty` set retains compensation; the worker flushes that set after each batch before acknowledging exact endpoint tombstones.
+
+Transparent TCP reserves one shared permit before either IP-family listener accepts. When all permits are occupied, new connections remain in the kernel listen backlog instead of being accepted and closed with unread data. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
 
 ## TCP relay and conn-state ownership
 
@@ -149,17 +153,17 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
 | Clash API | `experimental.clash_api.external_controller`, `external_ui`, `secret`, `default_mode` |
 | Persistence | Any `experimental.cache_file` change |
-| NFQUEUE | `experimental.udp_nfqueue.enabled` |
+| NFQUEUE | `global.nfqueue_enable` |
 
 Semantic comparison of `dns.bind` uses the parsed bind endpoint when both old and new values parse, so spelling-only changes that describe the same endpoint do not force a restart.
 
 ## Subscription orchestration
 
-When `global.store_subscribe` is enabled, validated raw bodies are stored under `<global.data_dir>/.sub`. An existing legacy `./.sub` is retained during the data-directory cutover until the operator moves it. The directory is a non-symlink directory with mode `0700`; files use mode `0600` and URL-safe SHA-256 names derived from the request URL, user agent, and headers. Writes use a new temporary file, `sync_all`, atomic rename, and directory sync.
+When `global.store_subscribe` is enabled, validated raw bodies are stored under `<global.data_dir>/.sub`. An existing legacy `./.sub` is retained during the data-directory cutover until the operator moves it. The directory is a non-symlink directory with mode `0700`; files use mode `0600` and URL-safe SHA-256 names derived from the request URL, the configured user-agent override (unset or empty contributes an empty component), and headers. Requests identify as `honk/<version>` unless a subscription override is configured. Writes use a new temporary file, `sync_all`, atomic rename, and directory sync.
 
-Startup parses stored bodies before starting network refresh. A valid restore immediately supplies nodes and removes that subscription from the five-second first-fetch wait; missing or invalid stores wait only within that shared grace. All fetches continue in the background afterward.
+Startup parses stored bodies before starting network refresh. A valid non-empty restore immediately supplies nodes and removes that subscription from the five-second first-fetch wait; missing, invalid, or empty stores wait only within that shared grace. All fetches continue in the background afterward.
 
-On `SIGHUP`, subscription IDs are stabilized by URL and active subscription nodes are carried into the candidate config. Cache restore runs only for an enabled subscription whose active node set is empty, then an immediate network refresh is scheduled. Network or parse failures keep active nodes and do not replace the last valid body. A persistence failure is non-fatal: validated nodes may still be merged, while the previous stored body remains available. Periodic and immediate refreshes use the same serialized runtime-publication path, and subscription nodes are never written back to the config file.
+On `SIGHUP`, subscription IDs are stabilized by URL and active subscription nodes are carried into the candidate config. Cache restore runs only for an enabled subscription whose active node set is empty, then an immediate network refresh is scheduled. Network, parse, or no-usable-node failures keep active nodes and do not replace the last valid body. A persistence failure is non-fatal: validated nodes may still be merged, while the previous stored body remains available. Periodic and immediate refreshes use the same serialized runtime-publication path, and subscription nodes are never written back to the config file.
 
 ## Clash API and cache DB
 

@@ -26,7 +26,7 @@
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
@@ -36,8 +36,8 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use state::UrlTestSelections;
 
 pub use score::{
-    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReporter,
-    ScoreSelectionContext, ScoreTarget,
+    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReasonCounters,
+    ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext, ScoreTarget,
 };
 pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 
@@ -148,6 +148,40 @@ struct Candidate<'a> {
     selection_chain: Vec<&'a str>,
 }
 
+enum UniqueCandidateIds {
+    Single(uuid::Uuid),
+    Multiple(HashSet<uuid::Uuid>),
+}
+
+fn unique_candidate_ids(candidates: &[Candidate<'_>]) -> Option<UniqueCandidateIds> {
+    let mut ids = candidates.iter().map(|candidate| candidate.node.id);
+    let first = ids.next()?;
+    let mut multiple = None;
+    for id in ids.filter(|id| *id != first) {
+        multiple
+            .get_or_insert_with(|| HashSet::from([first]))
+            .insert(id);
+    }
+    Some(match multiple {
+        Some(ids) => UniqueCandidateIds::Multiple(ids),
+        None => UniqueCandidateIds::Single(first),
+    })
+}
+
+fn removed_unique_candidate_count(mut before: UniqueCandidateIds, after: &[Candidate<'_>]) -> u64 {
+    match &mut before {
+        UniqueCandidateIds::Single(id) => {
+            u64::from(!after.iter().any(|candidate| candidate.node.id == *id))
+        }
+        UniqueCandidateIds::Multiple(ids) => {
+            for candidate in after {
+                ids.remove(&candidate.node.id);
+            }
+            u64::try_from(ids.len()).unwrap_or(u64::MAX)
+        }
+    }
+}
+
 pub struct GroupManager {
     groups: HashMap<String, Group>,
     /// Node lookup by UUID.
@@ -172,9 +206,21 @@ pub struct GroupManager {
     /// Invoked on selection changes for groups with interrupt_connections.
     interrupt_callback: RwLock<Option<InterruptCallback>>,
     score_state: Arc<ScorePolicyState>,
+    score_authority: Arc<score::ScoreAuthority>,
 }
 
 impl GroupManager {
+    pub fn score_reason_snapshot(&self) -> Vec<ScoreReasonGroupSnapshot> {
+        let mut group_names: Vec<_> = self
+            .groups
+            .values()
+            .filter(|group| group.policy == GroupPolicy::Score)
+            .map(|group| group.name.clone())
+            .collect();
+        group_names.sort_unstable();
+        self.score_state.reason_snapshot(group_names)
+    }
+
     pub fn new(groups: &[Group], nodes: &[Node]) -> Self {
         Self::with_alive_set(groups, nodes, None)
     }
@@ -246,6 +292,7 @@ impl GroupManager {
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
             score_state,
+            score_authority: Arc::new(score::ScoreAuthority),
         }
     }
 
@@ -451,9 +498,21 @@ impl GroupManager {
         }
         let mut visited = Vec::new();
         let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0, effects);
+        let before_filter = (effects.applies()
+            && group.policy == GroupPolicy::Score
+            && self.score_state.is_current_authority(&self.score_authority))
+        .then(|| unique_candidate_ids(&candidates))
+        .flatten();
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         let network = SelectionNetwork::from_probe_domain(domain);
+        if let Some(before_filter) = before_filter {
+            self.score_state.record_dead_filtered(
+                &self.score_authority,
+                score::SelectionReasonKey::new(&group.name, network),
+                removed_unique_candidate_count(before_filter, &candidates),
+            );
+        }
         // Measurements on UDP-dead nodes cannot make the surviving plan warm:
         // determine URLTest provenance only from eligible candidates. A cold
         // group stays cold with one (or zero) survivor.

@@ -12,7 +12,7 @@ honk 使用 dae 配置语法。下表列出运行时分段与 CLI 入口；`incl
 | `routing` | 应用有序流量规则与默认出站。 | [路由参考](./reference/routing.md) |
 | `dns` | 配置监听、上游、请求/响应策略与缓存行为。 | [DNS 参考](./reference/dns.md) |
 | `subscription` | 获取远程节点列表。 | [订阅参考](./reference/subscription.md) |
-| `experimental` | 启用 Clash API、持久化缓存或 UDP NFQUEUE 路径。 | [Experimental 参考](./reference/experimental.md) |
+| `experimental` | 启用 Clash API 或持久化缓存。 | [Experimental 参考](./reference/experimental.md) |
 | CLI | 选择配置、后端、目标文件或本地命令。 | [CLI 参考](./reference/cli.md) |
 
 内置出站 `direct` 与 `block` 会在启动时注入，可用于组和路由规则。
@@ -195,9 +195,9 @@ experimental {
 | 模式 | 适用场景 |
 | --- | --- |
 | `ip` | 仅按 IP 元数据路由；关闭域名嗅探。 |
-| `domain` | 默认：嗅探域名，校验其是否解析到目的 IP，再按域名拨号。 |
-| `domain+` | 客户端 DNS 不经过 honk 时，嗅探但不执行目的 IP 真实性校验。 |
-| `domain++` | 强制嗅探，并按 SNI/HTTP Host 重新执行路由。 |
+| `domain` | 默认：嗅探域名并校验目的 IP；仅在校验通过后重新执行路由。未命中时继续使用普通 IP/端口规则。代理出站可按已校验名称拨号。 |
+| `domain+` | 嗅探但不执行目的 IP reality check；保留初始路由，仅把嗅探名称作为代理目标。 |
+| `domain++` | 嗅探但不校验，并强制根据 SNI/HTTP Host 重新执行非保留决策。 |
 
 详见 [Global 参考](./reference/global.md)。
 
@@ -251,19 +251,19 @@ dns {
 
 ## 订阅
 
-每个来源写作 `tag: 'url'`；`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。启动时先恢复有效存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或写入失败会保留活动节点与上一次有效正文。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
+每个来源写作 `tag: 'url'`；`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。请求默认使用 `honk/<version>`，可由订阅的可选 `user_agent` 覆盖；缓存 key 使用配置中的覆盖值（未设置或为空时保持稳定），因此版本化的默认请求 header 不会在升级时使已存正文失效。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
 
 详见 [订阅参考](./reference/subscription.md)。
 
-## 启用 Clash API、缓存文件与 UDP NFQUEUE
+## 启用 Clash API、缓存文件与首包保留 UDP
 
 **Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 通过 `data_dir` 解析，缺失时可在后台下载。
 
 **缓存文件。** 设置 `experimental.cache_file.enabled: true` 可持久化 Selector 选择与 Clash 模式；`store_dns: true` 还会持久化符合条件的 DNS 应答。相对 `path` 使用 `data_dir`，并遵循前述旧路径规则。
 
-**UDP NFQUEUE。** `experimental.udp_nfqueue.enabled: true` 仅为有歧义的 LAN 转发 UDP 启用首包保留路径。它要求 root、带 `ebpf` 的构建和真实后端；mock 启动会被拒绝。该设置修改后需重启，并执行 fail-closed。honk 独占队列 `320` 以及 nftables `inet honk_nfqueue` / `udp_decision`；honk 运行期间，防火墙管理器不得修改这些对象。
+**首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。若使用 mock eBPF、不带 `ebpf` 的构建，或固定队列前置检查失败，honk 会记录 warning，仅在本进程关闭 NFQUEUE，不会改写配置文件。真实实例取得锁后，启动会绑定队列 `320`，并在发布 `inet honk_nfqueue` / `udp_decision` 前回收残留的自有 nftables table；honk 运行期间，防火墙管理器不得修改这些保留对象。
 
-详见 [Experimental 参考](./reference/experimental.md)与 [UDP NFQUEUE 设计](./design/nfqueue.md)。
+详见 [Global 参考](./reference/global.md)、[Experimental 参考](./reference/experimental.md)与 [UDP NFQUEUE 设计](./design/nfqueue.md)。
 
 ## 预热与拨号预算
 
@@ -304,7 +304,7 @@ cargo run --release -p honk-core -- \
 2. 确保每个路由规则/`fallback`、DNS `fallback`、组 `final` 与 `->` 代理目标都按场景指向已有的组、节点、`direct` 或 `block`。
 3. 对首连域名规则使用 `dial_mode: domain`/`domain++`，或确保客户端 DNS 经过 honk 以填充域名路由 map。
 4. 修改组或策略后，SIGHUP 会重建 `GroupManager`；仍有效的 Selector 选择会迁移到 replacement generation。
-5. 修改 `experimental.udp_nfqueue.enabled` 后需重启；确认已启用真实 eBPF 后端，且防火墙管理器不修改 `inet honk_nfqueue` / `udp_decision`。
+5. 修改 `global.nfqueue_enable` 后需重启；若希望启用暂存，确认真实 eBPF 后端和启动前置条件可用，并确保防火墙管理器不修改 `inet honk_nfqueue` / `udp_decision`。
 6. 增加或修改配置 fixture 时，运行 `cargo test -p honk-config` 以保持解析器示例有效。
 
 ## 相关文档

@@ -376,6 +376,10 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
     }
 
     let sections = merge_top_level_sections(split_sections(&input)?);
+    let canonical_nfqueue_present = sections
+        .iter()
+        .filter(|section| section.name == "global")
+        .any(|section| parse_kv_pairs(&section.body).contains_key("nfqueue_enable"));
     let mut config = Config::default();
 
     for section in &sections {
@@ -398,11 +402,14 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
                     config.subscriptions.push(sub);
                 }
             }
-            "experimental" => config.experimental = parse_experimental_section(section)?,
+            "experimental" => {
+                config.experimental = parse_experimental_section(section)?;
+            }
             "include" => {}
             _ => {}
         }
     }
+    config.apply_legacy_nfqueue(canonical_nfqueue_present);
 
     for group in &mut config.groups {
         if group.policy == crate::node::GroupPolicy::URLTest {
@@ -799,6 +806,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     }
     if let Some(v) = kv.get("dial_mode") {
         cfg.dial_mode = v.clone();
+    }
+    if let Some(v) = kv.get("nfqueue_enable") {
+        cfg.nfqueue_enable = parse_checked_bool(v, "global.nfqueue_enable")?;
     }
     if let Some(v) = kv.get("allow_insecure") {
         cfg.allow_insecure = parse_bool(v);
@@ -1764,10 +1774,13 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                         "unknown experimental.udp_nfqueue setting: {key}"
                     )));
                 }
-                if let Some(v) = kv.get("enabled") {
-                    cfg.udp_nfqueue.enabled =
-                        parse_checked_bool(v, "experimental.udp_nfqueue.enabled")?;
-                }
+                let enabled = kv
+                    .get("enabled")
+                    .map(|value| parse_checked_bool(value, "experimental.udp_nfqueue.enabled"))
+                    .transpose()?
+                    .unwrap_or(false);
+                cfg.legacy_udp_nfqueue =
+                    Some(crate::experimental::LegacyUdpNfqueueConfig { enabled });
             }
             _ => {}
         }

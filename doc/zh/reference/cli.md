@@ -19,7 +19,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-b`, `--bpf-object PATH` | 内嵌目标文件 | 覆盖 `ebpf` 构建内嵌的目标文件。仅真实后端使用。 |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | eBPF map 的 pin 根目录。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |
-| `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。启用 UDP NFQUEUE 的配置会被拒绝。 |
+| `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录 warning 并仅在本进程关闭 NFQUEUE 暂存。 |
 
 Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 
@@ -41,7 +41,7 @@ Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 | 命令 | 当前行为 | 持久化 / 运行时影响 |
 | --- | --- | --- |
 | `reload` | 从已加锁的 `/run/honk-core.lock` 读取 PID 并发送 `SIGHUP`。 | 只报告信号成功送达；运行中进程随后记录 `applied` 或 `rejected`。mock 实例不持有该锁。 |
-| `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `global.dial_mode`，校验并重写文件。 | 仅修改文件；不联系运行中的引擎，也不更改 Clash mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
+| `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
 | `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
 
@@ -55,15 +55,17 @@ Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 | `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | 当已配置的外部 UI 目录需要下载内容时，覆盖 dashboard zip URL。 |
 | `HONK_POOL_DISABLE=1` | `honk-core` | 绕过 Ready stream 与裸 TCP 两类池，每次全新拨号。代码也接受不区分大小写的 `true`；首次使用后缓存该值。 |
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
+| `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖解析进程名字段偏移所用的原始内核 BTF 文件。未设置时，honk 依次检查 `/sys/kernel/btf/vmlinux` 与 `/usr/lib/debug/boot/vmlinux`；若运行时 BTF 偏移或内核 argv 访问无法通过 verifier，pname 同步回退到调用线程的 `comm`。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
 
-UDP NFQUEUE 没有环境变量开关，只能通过 `experimental.udp_nfqueue.enabled` 启用；见 [Experimental 配置参考](./experimental.md)。
+UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启；设置为 `false` 可关闭。见[全局配置参考](./global.md)与 [NFQUEUE 设计](../design/nfqueue.md)。
 
 ## eBPF 与运行时路径
 
 | 项 | 控制方式 | 当前不变量 |
 | --- | --- | --- |
 | eBPF 目标文件 | 内嵌目标文件或 `--bpf-object PATH` | 启用 `ebpf` feature 时，`build.rs` 提供由 `include_bytes!` 内嵌的目标文件；该参数在运行时替换这些字节。未启用 `ebpf` 的构建使用 mock 后端。 |
+| 内核 BTF | `HONK_VMLINUX_BTF` 或常用路径搜索 | 仅用于解析 `pname` 的内核字段偏移。未覆盖时，honk 先尝试 `/sys/kernel/btf/vmlinux`，再尝试 `/usr/lib/debug/boot/vmlinux`。 |
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
 | Bypass mark | 编译期常量 | `DAE_BYPASS_MARK = 0x100`；控制面拨号、探测与 DNS 上游 socket 使用该值以避免再次拦截。 |
 | TPROXY mark | 编译期常量与配置校验 | `TPROXY_MARK = 0x08000000`；`global.tproxy_mark` 必须等于该值。 |
