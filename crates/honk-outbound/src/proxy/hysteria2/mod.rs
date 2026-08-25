@@ -26,13 +26,11 @@
 //! - **Salamander obfuscation** (`salamander.go`): when `hy2_obfs` is set,
 //!   every UDP datagram on the wire gets an 8-byte random salt prefix and the
 //!   payload XORed with `BLAKE2b-256(password ++ salt)` repeated. Implemented
-//!   as a custom quinn `AsyncUdpSocket` (`SalamanderSocket`).
+//!   as a custom quinn `AsyncUdpSocket` (`Hy2UdpSocket`).
 //! - **Congestion control**: without bandwidth hints the connection runs BBR
-//!   and sends `Hysteria-CC-RX: 0` (sing-quic's non-brutal default,
-//!   `client.go:580-588`). When `hy2_up_mbps` is set the send side uses a
-//!   fixed-rate brutal sender ([`crate::quic::BrutalConfig`]); when
-//!   `hy2_down_mbps` is set it is advertised via `Hysteria-CC-RX` so the
-//!   server's brutal sender paces the downlink.
+//!   and sends `Hysteria-CC-RX: 0`. `hy2_up_mbps` selects the fixed-rate
+//!   Brutal sender. `hy2_down_mbps` is serialized as bytes/s in
+//!   `Hysteria-CC-RX` so the server can pace its sender.
 //!
 //! ## HTTP/3 layer
 //!
@@ -90,10 +88,9 @@ use wire::{
 };
 
 /// Auth request: HEADERS frame for `POST https://hysteria/auth`
-/// (`client.go:540-549`, `protocol/http.go:41-45`). `rx_bps` is our receive
-/// bandwidth in bits/s; 0 = unset (server falls back to its configured
-/// congestion controller instead of brutal).
-fn auth_request_frame(password: &str, rx_bps: u64) -> Vec<u8> {
+/// (`client.go:540-549`, `protocol/http.go:41-45`). The receive limit is
+/// bytes/s; 0 asks the server to use its configured congestion controller.
+fn auth_request_frame(password: &str, rx_bytes_per_second: u64) -> Vec<u8> {
     let padding = random_padding(AUTH_PADDING_MIN, AUTH_PADDING_MAX);
     let section = qpack_encode_request_fields(&[
         (":authority", URL_HOST),
@@ -101,7 +98,7 @@ fn auth_request_frame(password: &str, rx_bps: u64) -> Vec<u8> {
         (":path", URL_PATH),
         (":scheme", "https"),
         (HEADER_AUTH, password),
-        (HEADER_CC_RX, &rx_bps.to_string()),
+        (HEADER_CC_RX, &rx_bytes_per_second.to_string()),
         (HEADER_PADDING, padding.as_str()),
         ("content-length", "0"),
     ]);
@@ -390,8 +387,8 @@ impl AsyncWrite for Hy2TcpStream {
 struct Hy2Client {
     quic: QuicClient<Hy2ConnState>,
     password: String,
-    /// Receive bandwidth advertised in the auth exchange, bits/s (0 = unset).
-    rx_bps: u64,
+    /// Receive bandwidth advertised in the auth exchange, bytes/s (0 = unset).
+    rx_bytes_per_second: u64,
 }
 
 #[async_trait]
@@ -415,10 +412,10 @@ impl Hy2Client {
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<Hy2ConnState>)> {
         let password = self.password.clone();
-        let rx_bps = self.rx_bps;
+        let rx_bytes_per_second = self.rx_bytes_per_second;
         self.quic
             .connection_with(connect_timeout, move |conn| async move {
-                authenticate(&conn, &password, rx_bps, connect_timeout).await
+                authenticate(&conn, &password, rx_bytes_per_second, connect_timeout).await
             })
             .await
     }
@@ -430,7 +427,7 @@ impl Hy2Client {
 async fn authenticate(
     conn: &quinn::Connection,
     password: &str,
-    rx_bps: u64,
+    rx_bytes_per_second: u64,
     timeout: Duration,
 ) -> anyhow::Result<Hy2ConnState> {
     tokio::time::timeout(timeout, async {
@@ -466,7 +463,7 @@ async fn authenticate(
             .open_bi()
             .await
             .context("Hysteria2: open auth stream")?;
-        send.write_all(&auth_request_frame(password, rx_bps))
+        send.write_all(&auth_request_frame(password, rx_bytes_per_second))
             .await
             .context("Hysteria2: send auth request")?;
         send.finish().context("Hysteria2: finish auth request")?;
@@ -527,25 +524,31 @@ impl Hysteria2Handler {
     async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
         let password = Self::resolve_password(node);
         let obfs = node.hy2_obfs.as_deref().filter(|s| !s.is_empty());
-        // Receive bandwidth for the auth header, bits/s (0 = unset).
-        let rx_bps = u64::from(node.hy2_down_mbps.unwrap_or(0)) * 1_000_000;
+        if let Some(obfs) = obfs
+            && obfs.len() < SALAMANDER_MIN_PSK_LEN
+        {
+            anyhow::bail!(
+                "Hysteria2: Salamander password must be at least {SALAMANDER_MIN_PSK_LEN} bytes"
+            );
+        }
+        // Hysteria-CC-RX is bytes/s; configuration uses decimal Mbit/s.
+        let rx_bytes_per_second = u64::from(node.hy2_down_mbps.unwrap_or(0)) * 125_000;
         // Port hopping (`mport`/`mhop`): destination port rotates among the
         // list every interval (default 30s, official client parity).
         let hop = node
             .hy2_port_hopping
             .as_deref()
-            .and_then(parse_port_hopping)
-            .map(|ports| {
-                (
+            .map(|spec| {
+                let ports = parse_port_hopping(spec)
+                    .ok_or_else(|| anyhow!("Hysteria2: invalid port hopping list"))?;
+                Ok::<_, anyhow::Error>((
                     ports,
-                    Duration::from_secs(node.hy2_hop_interval.unwrap_or(30).max(1)),
-                )
-            });
+                    Duration::from_secs(node.hy2_hop_interval.unwrap_or(30).max(5)),
+                ))
+            })
+            .transpose()?;
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        // ALPN "h3" (hysteria2 runs its auth over HTTP/3, `client.go:100-102`).
-        // With `hy2_up_mbps` the send side runs a fixed-rate brutal sender;
-        // otherwise BBR — sing-quic's default when no bandwidth is
-        // configured (`client.go:580-588`).
+        // A positive upload hint selects the fixed-rate sender; no hint uses BBR.
         let factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
             match node.hy2_up_mbps {
                 Some(mbps) if mbps > 0 => Arc::new(crate::quic::BrutalConfig::from_bps(
@@ -587,7 +590,7 @@ impl Hysteria2Handler {
         Ok(Arc::new(Hy2Client {
             quic,
             password: password.to_string(),
-            rx_bps,
+            rx_bytes_per_second,
         }))
     }
 

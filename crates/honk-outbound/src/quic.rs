@@ -203,16 +203,25 @@ pub async fn client_config(
         }
         None => None,
     };
+    let pin_sha256 = node
+        .tls_pin_sha256
+        .as_deref()
+        .map(|pin| {
+            crate::tls::parse_pin_sha256(pin).ok_or_else(|| {
+                anyhow!(
+                    "node '{}': invalid tls_pin_sha256 (expected 64 hex chars)",
+                    node.name
+                )
+            })
+        })
+        .transpose()?;
     let crypto =
         crate::quic_boring::BoringQuicClientConfig::new(crate::quic_boring::BoringQuicOptions {
             alpn_wire,
             skip_cert_verify: node.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
             ech_config_list: ech,
-            pin_sha256: node
-                .tls_pin_sha256
-                .as_deref()
-                .and_then(crate::tls::parse_pin_sha256),
+            pin_sha256,
             // Tickets belong to a specific service, not a hostname:
             // address|port|SNI|ALPN — different protocols, different
             // servers behind one certificate, and reloaded configs never
@@ -1141,6 +1150,19 @@ mod brutal_tests {
 #[cfg(test)]
 mod client_tests {
     use super::*;
+    #[tokio::test]
+    async fn client_config_rejects_invalid_pin() {
+        let node = honk_config::node::Node {
+            name: "bad-pin".to_string(),
+            tls_pin_sha256: Some("not-a-pin".to_string()),
+            ..Default::default()
+        };
+        let error = match client_config(&node, &[b"h3"], QuicClientOptions::default()).await {
+            Ok(_) => panic!("invalid pin must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid tls_pin_sha256"));
+    }
 
     async fn test_client(port: u16) -> QuicClient<()> {
         let node = honk_config::node::Node {

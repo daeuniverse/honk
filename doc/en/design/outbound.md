@@ -451,7 +451,7 @@ Dropping final warm ownership removes future reuse without cutting active flows.
 | --- | --- | --- | --- |
 | TUIC v5 | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, with node overrides |
 | Juicity | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records | BBR by default; 8 MiB stream and 8 MiB connection receive windows |
-| Hysteria2 | ALPN `h3`; minimal HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | Brutal fixed-rate sender when upload Mbps is set, otherwise BBR; receive bandwidth in `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
+| Hysteria2 | ALPN `h3`; minimal HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | Upload Mbps selects the Brutal fixed-rate sender, otherwise BBR; receive bandwidth is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
 
 Hysteria2's HTTP/3 layer is deliberately local and minimal: control/QPACK
 unidirectional streams, static-table QPACK, and enough HEADERS handling for

@@ -107,19 +107,43 @@ pub(super) fn blake2b256(data: &[u8]) -> [u8; 32] {
 // Salamander obfuscation (sing-quic hysteria2/salamander.go).
 
 pub(super) const SALAMANDER_SALT_LEN: usize = 8;
+pub(super) const SALAMANDER_MIN_PSK_LEN: usize = 4;
+
+#[inline]
+fn salamander_key(password: &[u8], salt: &[u8; SALAMANDER_SALT_LEN]) -> [u8; 32] {
+    // Hysteria passwords are normally short. Keep the common key derivation
+    // allocation-free; retain the heap fallback for unusually long secrets.
+    const STACK_INPUT_LEN: usize = 128;
+    if password.len() <= STACK_INPUT_LEN - SALAMANDER_SALT_LEN {
+        let mut input = [0u8; STACK_INPUT_LEN];
+        input[..password.len()].copy_from_slice(password);
+        input[password.len()..password.len() + SALAMANDER_SALT_LEN].copy_from_slice(salt);
+        return blake2b256(&input[..password.len() + SALAMANDER_SALT_LEN]);
+    }
+    let mut input = Vec::with_capacity(password.len() + SALAMANDER_SALT_LEN);
+    input.extend_from_slice(password);
+    input.extend_from_slice(salt);
+    blake2b256(&input)
+}
+
+fn salamander_seal_into(password: &[u8], data: &[u8], out: &mut Vec<u8>) {
+    out.resize(SALAMANDER_SALT_LEN + data.len(), 0);
+    rand::rng().fill_bytes(&mut out[..SALAMANDER_SALT_LEN]);
+    let salt: [u8; SALAMANDER_SALT_LEN] = out[..SALAMANDER_SALT_LEN]
+        .try_into()
+        .expect("fixed salt length");
+    let key = salamander_key(password, &salt);
+    for (index, byte) in data.iter().enumerate() {
+        out[SALAMANDER_SALT_LEN + index] = byte ^ key[index % 32];
+    }
+}
 
 /// Encrypt one datagram: 8-byte random salt, then payload XORed with
 /// BLAKE2b-256(password ++ salt) cycled (`salamander.go:57-70`).
+#[cfg(test)]
 pub(super) fn salamander_seal(password: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut salt = [0u8; SALAMANDER_SALT_LEN];
-    rand::rng().fill_bytes(&mut salt);
-    let mut key_input = Vec::with_capacity(password.len() + SALAMANDER_SALT_LEN);
-    key_input.extend_from_slice(password);
-    key_input.extend_from_slice(&salt);
-    let key = blake2b256(&key_input);
     let mut out = Vec::with_capacity(SALAMANDER_SALT_LEN + data.len());
-    out.extend_from_slice(&salt);
-    out.extend(data.iter().enumerate().map(|(i, b)| b ^ key[i % 32]));
+    salamander_seal_into(password, data, &mut out);
     out
 }
 
@@ -129,10 +153,8 @@ pub(super) fn salamander_open(password: &[u8], buf: &mut [u8]) -> Option<usize> 
     if buf.len() <= SALAMANDER_SALT_LEN {
         return None;
     }
-    let mut key_input = Vec::with_capacity(password.len() + SALAMANDER_SALT_LEN);
-    key_input.extend_from_slice(password);
-    key_input.extend_from_slice(&buf[..SALAMANDER_SALT_LEN]);
-    let key = blake2b256(&key_input);
+    let salt: [u8; SALAMANDER_SALT_LEN] = buf[..SALAMANDER_SALT_LEN].try_into().ok()?;
+    let key = salamander_key(password, &salt);
     let len = buf.len() - SALAMANDER_SALT_LEN;
     for i in 0..len {
         buf[i] = buf[i + SALAMANDER_SALT_LEN] ^ key[i % 32];
@@ -147,12 +169,10 @@ pub(super) fn salamander_open(password: &[u8], buf: &mut [u8]) -> Option<usize> 
 /// `Transmit`/`RecvMeta` carries exactly one datagram to (de)obfuscate.
 #[derive(Debug)]
 pub(super) struct Hy2UdpSocket {
-    // pub(super): hysteria2 tests construct the socket directly for the
-    // obfuscated-server fixture.
-    pub(super) socket: Arc<tokio::net::UdpSocket>,
-    /// Salamander obfuscation password; `None` sends/receives plaintext.
-    pub(super) obfs: Option<Arc<[u8]>>,
-    pub(super) hop: Mutex<Option<HopState>>,
+    socket: Arc<tokio::net::UdpSocket>,
+    obfs: Option<Arc<[u8]>>,
+    obfs_send: Option<Mutex<Vec<u8>>>,
+    hop: Mutex<Option<HopState>>,
 }
 
 impl Hy2UdpSocket {
@@ -161,13 +181,22 @@ impl Hy2UdpSocket {
         obfs: Option<Arc<[u8]>>,
         hop: Option<(Vec<u16>, Duration)>,
     ) -> io::Result<Self> {
-        let std_socket = crate::quic::marked_udp_socket(ipv6)?;
-        let socket = tokio::net::UdpSocket::from_std(std_socket)?;
-        Ok(Self {
+        let socket = tokio::net::UdpSocket::from_std(crate::quic::marked_udp_socket(ipv6)?)?;
+        Ok(Self::from_socket(socket, obfs, hop))
+    }
+
+    pub(super) fn from_socket(
+        socket: tokio::net::UdpSocket,
+        obfs: Option<Arc<[u8]>>,
+        hop: Option<(Vec<u16>, Duration)>,
+    ) -> Self {
+        let obfs_send = obfs.as_ref().map(|_| Mutex::new(Vec::with_capacity(2048)));
+        Self {
             socket: Arc::new(socket),
             obfs,
+            obfs_send,
             hop: Mutex::new(hop.map(|(ports, interval)| HopState::new(ports, interval))),
-        })
+        }
     }
 }
 
@@ -201,10 +230,8 @@ impl HopState {
     }
 
     /// Destination port for the next outbound datagram. The very first call
-    /// already hops (official client parity: the initial handshake dials a
-    /// random port from the hopping list, never the base port — mixing a
-    /// direct base-port flow with DNAT'd hop flows makes NAT clash
-    /// resolution remap the source port mid-connection).
+    /// already hops, so the connection never mixes the base port with the
+    /// redirected range.
     pub(super) fn port(&mut self, base: u16) -> u16 {
         if self.ports.is_empty() {
             return base;
@@ -220,9 +247,9 @@ impl HopState {
         } else {
             let mut rng = rand::rng();
             loop {
-                let p = self.ports[rng.random_range(0..self.ports.len())];
-                if Some(p) != self.current {
-                    break p;
+                let port = self.ports[rng.random_range(0..self.ports.len())];
+                if Some(port) != self.current {
+                    break port;
                 }
             }
         };
@@ -249,12 +276,18 @@ pub(super) fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
             Some((lo, hi)) => {
                 let lo: u16 = lo.trim().parse().ok()?;
                 let hi: u16 = hi.trim().parse().ok()?;
-                if hi < lo {
+                if lo == 0 || hi < lo {
                     return None;
                 }
                 ports.extend(lo..=hi);
             }
-            None => ports.push(part.parse().ok()?),
+            None => {
+                let port: u16 = part.parse().ok()?;
+                if port == 0 {
+                    return None;
+                }
+                ports.push(port);
+            }
         }
     }
     (!ports.is_empty()).then_some(ports)
@@ -279,20 +312,21 @@ impl AsyncUdpSocket for Hy2UdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
-        let dest = match &mut *self.hop.lock() {
-            Some(state) => SocketAddr::new(
+        let destination = match &mut *self.hop.lock() {
+            Some(hop) => SocketAddr::new(
                 transmit.destination.ip(),
-                state.port(transmit.destination.port()),
+                hop.port(transmit.destination.port()),
             ),
             None => transmit.destination,
         };
-        match &self.obfs {
-            Some(password) => {
-                let packet = salamander_seal(password, transmit.contents);
-                self.socket.try_send_to(&packet, dest)?;
+        match (&self.obfs, &self.obfs_send) {
+            (Some(password), Some(send_buffer)) => {
+                let mut packet = send_buffer.lock();
+                salamander_seal_into(password, transmit.contents, &mut packet);
+                self.socket.try_send_to(&packet, destination)?;
             }
-            None => {
-                self.socket.try_send_to(transmit.contents, dest)?;
+            _ => {
+                self.socket.try_send_to(transmit.contents, destination)?;
             }
         }
         Ok(())
@@ -304,6 +338,7 @@ impl AsyncUdpSocket for Hy2UdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        let base_port = self.hop.lock().as_ref().and_then(HopState::base_port);
         let mut count = 0;
         for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
             let mut read_buf = ReadBuf::new(&mut buf[..]);
@@ -314,11 +349,8 @@ impl AsyncUdpSocket for Hy2UdpSocket {
                         None => Some(read_buf.filled().len()),
                     };
                     if let Some(len) = len {
-                        // With port hopping, DNAT on the server side rewrites
-                        // reply sources to the current hop port; present the
-                        // nominal remote to QUIC instead (see `HopState`).
-                        let addr = match self.hop.lock().as_ref().and_then(|h| h.base_port()) {
-                            Some(base) => SocketAddr::new(addr.ip(), base),
+                        let addr = match base_port {
+                            Some(port) => SocketAddr::new(addr.ip(), port),
                             None => addr,
                         };
                         *meta_slot = quinn::udp::RecvMeta {
@@ -330,11 +362,10 @@ impl AsyncUdpSocket for Hy2UdpSocket {
                         };
                         count += 1;
                     }
-                    // Malformed obfuscated packets are dropped.
                 }
-                Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(error)) => {
                     return if count == 0 {
-                        Poll::Ready(Err(e))
+                        Poll::Ready(Err(error))
                     } else {
                         Poll::Ready(Ok(count))
                     };
@@ -353,6 +384,13 @@ impl AsyncUdpSocket for Hy2UdpSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+    /// Salamander adds eight wire bytes, and quic-go can send 1280-byte
+    /// handshake packets despite a smaller advertised peer maximum. Giving
+    /// Quinn two receive segments enlarges its buffer without raising that
+    /// advertised steady-state MTU; each `RecvMeta` still describes one packet.
+    fn max_receive_segments(&self) -> usize {
+        2
     }
 
     /// The tokio socket does not set DONTFRAG; reporting `true` also keeps
