@@ -378,6 +378,7 @@ routing {
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();
+    app.state.mode_state.write().global_selection = "Proxy".to_string();
 
     let body: serde_json::Value = client
         .get(app.url("/proxies"))
@@ -406,13 +407,14 @@ async fn test_proxies_structure_and_selector_switch() {
     // GLOBAL synthetic group exists with the mode-state selection.
     assert_eq!(proxies["GLOBAL"]["type"], "selector");
     assert_eq!(proxies["GLOBAL"]["now"], "proxy");
-    assert_eq!(proxies["GLOBAL"]["all"][0], "Proxy");
-    // GLOBAL contains the group and both nodes, without duplicates.
+    // Every GLOBAL member is concrete, unique, and resolves to a top-level
+    // proxy document; stale virtual selections fall back to the first member.
     let global_all = proxies["GLOBAL"]["all"].as_array().unwrap();
     let unique: std::collections::HashSet<_> = global_all.iter().collect();
     assert_eq!(global_all.len(), unique.len());
-    for expected in ["Proxy", "proxy", "node-a", "node-b"] {
-        assert!(global_all.iter().any(|n| n == expected));
+    assert!(!global_all.iter().any(|name| name == "Proxy"));
+    for member in global_all {
+        assert!(proxies.get(member.as_str().unwrap()).is_some());
     }
 
     // Switch the selector to node-b.
@@ -939,14 +941,16 @@ async fn test_global_selection_and_mode_persisted() {
     assert_eq!(resp.status(), 204);
     assert_eq!(app.state.mode_state.read().global_selection, "proxy");
 
-    // Unknown GLOBAL target → 400.
-    let resp = client
-        .put(app.url("/proxies/GLOBAL"))
-        .json(&serde_json::json!({"name": "nope"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+    // Virtual and unknown GLOBAL targets do not resolve.
+    for invalid in ["Proxy", "nope"] {
+        let resp = client
+            .put(app.url("/proxies/GLOBAL"))
+            .json(&serde_json::json!({"name": invalid}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
 
     // Switch mode to Global (case-insensitive).
     let resp = client

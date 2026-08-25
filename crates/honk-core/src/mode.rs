@@ -16,8 +16,7 @@ type SharedEbpfBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBacken
 pub struct ModeState {
     /// Canonical clash mode: `"Rule"` | `"Global"` | `"Direct"`.
     pub mode: String,
-    /// Current GLOBAL selection: a group name, a node name, or the virtual
-    /// `"Proxy"` entry dashboards send for the default selection.
+    /// Current GLOBAL selection: a configured group or node name.
     pub global_selection: String,
 }
 

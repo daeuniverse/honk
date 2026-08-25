@@ -75,7 +75,7 @@ The mode update goes through `DatapathFlagsHandle`, the sole serialized writer f
 
 `PUT /proxies/{name}` accepts the body regardless of `Content-Type`. For a configured Selector group, the target must be a direct member tag; a leaf reachable only through a nested group is not a direct member. An actual choice change invokes the group manager's cache callback, so an enabled `cache_file` persists the choice in `cache.db`. If that group sets `interrupt_connections`, honk removes tracked connections associated with the group, its member tags, and reachable leaves so subsequent traffic redials through the new choice. Writing the existing choice does nothing. URLTest, LoadBalance, Fallback, and Score groups reject the mutation.
 
-`GLOBAL` is synthetic. `PUT /proxies/GLOBAL` accepts `Proxy`, any configured group, or any configured node and updates it through the same `DatapathFlagsHandle`; the cache database stores it under the `GLOBAL` selector key when enabled.
+`GLOBAL` is synthetic, but every member in its `all` list is a concrete configured group or node with a matching top-level proxy document. `PUT /proxies/GLOBAL` accepts only one of those names and updates it through the same `DatapathFlagsHandle`; the cache database stores it under the `GLOBAL` selector key when enabled. Empty, removed, unknown, and legacy virtual selections fall back to the first concrete member.
 
 ## External UI hosting
 
