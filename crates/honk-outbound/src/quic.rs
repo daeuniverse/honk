@@ -423,6 +423,15 @@ pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
 fn default_gso_enabled(max_udp_payload_size: u16) -> bool {
     max_udp_payload_size > 1252
 }
+const MAX_QUIC_GSO_SEGMENTS: usize = 16;
+
+fn gso_transmit_segments(enabled: bool, kernel_max: usize) -> usize {
+    if enabled {
+        kernel_max.min(MAX_QUIC_GSO_SEGMENTS)
+    } else {
+        1
+    }
+}
 
 /// [`client_endpoint`] with an explicit advertised `max_udp_payload_size`.
 ///
@@ -458,11 +467,11 @@ pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
     Ok(config)
 }
 
-/// quinn's stock tokio socket behavior (ECN, GRO, cmsgs) with a conservative
 /// GSO policy. The safe 1252-byte default sends one datagram per syscall,
 /// dodging PPPoE uplinks that drop later segments of a GSO super-packet.
-/// Explicit larger MTUs enable GSO because those paths have already opted out
-/// of the black-hole-safe default. `HONK_QUIC_GSO=0|1` forces either mode.
+/// Explicit larger MTUs enable batches capped at 16 segments because those
+/// paths have already opted out of the black-hole-safe default.
+/// `HONK_QUIC_GSO=0|1` forces either mode.
 ///
 /// This is quinn's own `runtime/tokio.rs` socket with only
 /// [`max_transmit_segments`](quinn::AsyncUdpSocket::max_transmit_segments)
@@ -514,11 +523,7 @@ impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        if self.gso {
-            self.inner.max_gso_segments()
-        } else {
-            1
-        }
+        gso_transmit_segments(self.gso, self.inner.max_gso_segments())
     }
 
     fn max_receive_segments(&self) -> usize {
@@ -1162,6 +1167,13 @@ mod client_tests {
         assert!(!default_gso_enabled(1252));
         assert!(default_gso_enabled(1253));
         assert!(default_gso_enabled(1452));
+    }
+
+    #[test]
+    fn gso_batches_are_bounded() {
+        assert_eq!(gso_transmit_segments(false, 64), 1);
+        assert_eq!(gso_transmit_segments(true, 8), 8);
+        assert_eq!(gso_transmit_segments(true, 64), MAX_QUIC_GSO_SEGMENTS);
     }
 
     #[tokio::test]
