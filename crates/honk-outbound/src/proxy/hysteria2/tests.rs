@@ -782,9 +782,9 @@ async fn test_dial_tcp_domain_echo() {
         .await
         .expect("dial should succeed");
     stream.stream.write_all(b"domain").await.unwrap();
-    let mut buf = [0u8; 16];
-    let n = stream.stream.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"domain");
+    let mut buf = [0u8; 6];
+    stream.stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"domain");
 }
 
 #[tokio::test]
