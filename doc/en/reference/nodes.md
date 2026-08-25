@@ -66,7 +66,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 `mport` list and `mhop` seconds; effective interval is 30 s |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC receive windows; effective defaults are 8 MiB / 8 MiB (the conn window doubles as the per-connection memory budget: slow consumers buffer up to ~3× it; RSS ≈ active connections × 3 × conn window) |
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
-| `quic_mtu` | u16? | null | QUIC UDP payload size from `mtu`; effective default 1252, accepted link range 1200–65527 |
+| `quic_mtu` | u16? | null | QUIC UDP payload size from `mtu`; default 1252, accepted range 1200–65527; explicit values above 1252 enable GSO unless `HONK_QUIC_GSO=0` |
 | `tls_pin_sha256` | string? | null | Leaf-certificate SHA-256 pin from `pinSHA256` or `pin_sha256` |
 | `tuic_uuid` / `tuic_password` | string? | null | Dedicated TUIC credentials; handlers fall back to generic userinfo fields |
 | `tuic_congestion` / `tuic_alpn` | string? | null | TUIC `congestion_control` and comma-separated `alpn` |
