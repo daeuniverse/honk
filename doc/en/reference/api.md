@@ -125,7 +125,7 @@ The download follows honk's current traffic routing decision. A `direct` result 
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, freshFailureBypass, deadFiltered
+  incumbentHeld, freshFailureBypass, deadFiltered, switchFlap
 } // every R value is a u64 count
 ```
 
@@ -141,11 +141,11 @@ R = {
 
 `score.groups` is an additive part of the authenticated `/stats` response. It is an empty array when no group currently uses `policy: score`; otherwise it contains every current Score group, including groups with no resolved leaves, sorted lexicographically by `name`. Each group always has both `tcp` and `udp` objects, and each object always has every `R` field above. Missing network activity is represented by zeroes, never omitted fields.
 
-Each value is a saturating `u64` count, not a latency, byte, duration, target, or health metric. The first six fields classify one authorized multi-candidate Score **Apply** in this fixed precedence: `coldExplore` for initial-budget exploration; `periodicExplore` for a periodic forced cold non-incumbent; `incumbentHeld` for a successful incumbent hold; `freshFailureBypass` when fresh failure evidence alone breaks a small trained utility-margin hold; `reliabilityWinner` when every alternative is outside the selected reliability band; otherwise `performanceWinner`. `deadFiltered` is independent: it counts unique leaf candidates removed by liveness filtering during an authorized Apply and can increase beside one of the first six fields. Peek, `/proxies`, `/stats`, singleton bypasses, and last-resort selection do not count.
+Each value is a saturating `u64` count, not a latency, byte, duration, target, or health metric. The first six fields classify one authorized multi-candidate Score **Apply** in this fixed precedence: `coldExplore` for initial-budget exploration; `periodicExplore` for a periodic upper-confidence non-incumbent; `incumbentHeld` for a successful incumbent hold; `freshFailureBypass` when fresh failure evidence alone breaks a small trained utility-margin hold; `reliabilityWinner` when every alternative is outside the selected reliability band; otherwise `performanceWinner`. `deadFiltered` independently counts unique leaf candidates removed by liveness filtering. `switchFlap` independently counts a committed winner returning to its prior winner within eight selections; intentional cold and periodic exploration do not change that regret window. Peek, `/proxies`, `/stats`, singleton bypasses, and last-resort selection do not count.
 
 Counters begin at zero on process start and accumulate in process memory only. They survive a successful reload while the group name remains configured, including zero-leaf and temporary Score-to-non-Score-to-Score transitions; non-Score groups are hidden from this response. A committed deletion prunes that name's counters, and a recreated name starts at zero. Generation-fenced superseded managers cannot mutate counters after replacement, including after same-name recreation. The snapshot is copied before JSON serialization, so reading it cannot mutate selection state.
 
-`/stats.score` exposes only a group name and the fourteen TCP/UDP aggregate counts. It never contains a node, node ID/tag, target/domain/IP/port, target family, score cell, cadence key, manager authority, credential, or other scorer-private value; those values are also excluded from new Score logs and persistence. This addition does not change established node names in `/proxies` or `/stats.outbounds`, or established destination metadata in `/connections`.
+`/stats.score` exposes only a group name and the sixteen TCP/UDP aggregate counts. It never contains a node, node ID/tag, target/domain/IP/port, target family, score cell, cadence key, manager authority, credential, or other scorer-private value; those values are also excluded from new Score logs and persistence. This addition does not change established node names in `/proxies` or `/stats.outbounds`, or established destination metadata in `/connections`.
 
 ### Outbound and ready-pool fields
 

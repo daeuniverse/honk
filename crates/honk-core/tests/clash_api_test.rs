@@ -683,6 +683,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -692,6 +693,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
             },
             {
@@ -704,6 +706,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -713,6 +716,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
             },
         ],
