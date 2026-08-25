@@ -125,7 +125,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, freshFailureBypass, deadFiltered
+  incumbentHeld, freshFailureBypass, deadFiltered, switchFlap
 } // R 的每个值均为 u64 计数
 ```
 
@@ -141,11 +141,11 @@ R = {
 
 `score.groups` 是经鉴权 `/stats` 响应中的附加部分。当前没有任何组使用 `policy: score` 时它为 `[]`；否则它包含每个当前 Score 组（包括没有解析出叶节点的组），按 `name` 的字典序排列。每组始终都有 `tcp` 和 `udp` 对象，且每个对象始终包含全部 `R` 字段；没有网络活动时以零表示，绝不省略字段。
 
-每个值都是饱和的 `u64` 计数，不是延迟、字节、时长、目标或健康度量。前六个字段以如下固定优先级分类一次已授权的多候选 Score **Apply**：初始预算探索为 `coldExplore`；周期边界强制的冷非现任为 `periodicExplore`；成功保持现任为 `incumbentHeld`；只有新鲜失败证据打破已训练且效用差距很小的保持条件时为 `freshFailureBypass`；所有备选均在所选可靠性带之外时为 `reliabilityWinner`；其余情况为 `performanceWinner`。`deadFiltered` 独立计数：它记录已授权 Apply 中被活性过滤移除的唯一叶候选，因此可以与前六项中的一项同时增加。Peek、`/proxies`、`/stats`、单例旁路与最后尝试选择都不会计数。
+每个值都是饱和的 `u64` 计数，不是延迟、字节、时长、目标或健康度量。前六个字段按固定优先级分类一次已授权的多候选 Score **Apply**：初始预算探索为 `coldExplore`；周期上置信界非现任为 `periodicExplore`；成功保持现任为 `incumbentHeld`；只有新鲜失败证据打破已训练且效用差距很小的保持条件时为 `freshFailureBypass`；所有备选均在所选可靠性带之外时为 `reliabilityWinner`；其余为 `performanceWinner`。`deadFiltered` 独立计数活性过滤移除的唯一叶候选。`switchFlap` 独立计数已提交胜者在八次选择内切回前一胜者；有意的冷探索和周期探索不改变这段后悔窗口。Peek、`/proxies`、`/stats`、单例旁路和最后尝试选择均不计数。
 
 计数在进程启动时从零开始，只在进程内存中累积。只要组名仍在已提交配置中，成功 reload 会保留它们，包括零叶节点以及临时 Score→非 Score→Score 转换；非 Score 组不会显示在此响应中。已提交的删除会清除该名称的计数，之后重新创建同名组从零开始。受 generation fence 约束的已淘汰 manager 在被替换后不能再修改计数，即使同名组随后被重新创建。快照在 JSON 序列化前复制，读取不会改变选路状态。
 
-`/stats.score` 只公开组名和 TCP/UDP 的十四个聚合计数。它绝不包含节点、节点 ID/tag、目标/domain/IP/port、目标地址族、评分 cell、cadence 键、manager authority、凭据或其他 scorer 私有值；这些值也不会进入新的 Score 日志或持久化。此新增内容不改变 `/proxies` 或 `/stats.outbounds` 中既有的节点名，也不改变 `/connections` 中既有的目标元数据。
+`/stats.score` 只公开组名和 TCP/UDP 的十六个聚合计数。它绝不包含节点、节点 ID/tag、目标/domain/IP/port、目标地址族、评分 cell、cadence 键、manager authority、凭据或其他 scorer 私有值；这些值也不会进入新的 Score 日志或持久化。此新增内容不改变 `/proxies` 或 `/stats.outbounds` 中既有的节点名，也不改变 `/connections` 中既有的目标元数据。
 
 ### 出站与 ready pool 字段
 

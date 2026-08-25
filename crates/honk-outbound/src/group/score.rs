@@ -14,9 +14,12 @@ use uuid::Uuid;
 const EXACT_CAPACITY: usize = 4096;
 const AGGREGATE_CAPACITY: usize = 4096;
 const RELIABILITY_CLOSE: f64 = 0.05;
+const RELIABILITY_CONFIDENCE_Z: f64 = 1.64;
 const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_MARGIN: f64 = 0.01;
+const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
+const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
@@ -200,7 +203,7 @@ impl Stats {
         self.useful_success + self.useful_failure
     }
 
-    fn reliability(&self, factor: f64) -> f64 {
+    fn reliability_bounds(&self, factor: f64) -> (f64, f64) {
         // Setup failure is already a useful failure. Counting two additional
         // failures makes it the strongest negative signal without a knob.
         let successes = self.useful_success * factor;
@@ -210,7 +213,10 @@ impl Stats {
         let sum = a + b;
         let mean = a / sum;
         let deviation = (a * b / (sum * sum * (sum + 1.0))).sqrt();
-        (mean - 1.64 * deviation).clamp(0.0, 1.0)
+        (
+            (mean - RELIABILITY_CONFIDENCE_Z * deviation).clamp(0.0, 1.0),
+            (mean + RELIABILITY_CONFIDENCE_Z * deviation).clamp(0.0, 1.0),
+        )
     }
 
     fn decay_to(&mut self, now: Instant) {
@@ -354,6 +360,13 @@ impl SelectionCadenceKey {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SelectionHistory {
+    current: Uuid,
+    previous: Option<Uuid>,
+    switched_at: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionReason {
     ColdExplore,
@@ -407,6 +420,7 @@ struct SelectionReasonCounts {
     incumbent_held: u64,
     fresh_failure_bypass: u64,
     dead_filtered: u64,
+    switch_flap: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -418,6 +432,7 @@ pub struct ScoreReasonCounters {
     pub incumbent_held: u64,
     pub fresh_failure_bypass: u64,
     pub dead_filtered: u64,
+    pub switch_flap: u64,
 }
 
 impl ScoreReasonCounters {
@@ -430,6 +445,7 @@ impl ScoreReasonCounters {
             incumbent_held: counts.incumbent_held,
             fresh_failure_bypass: counts.fresh_failure_bypass,
             dead_filtered: counts.dead_filtered,
+            switch_flap: counts.switch_flap,
         }
     }
 }
@@ -447,6 +463,7 @@ struct StateInner {
     valid: HashSet<(String, Uuid)>,
     valid_groups: HashSet<String>,
     selection_counts: HashMap<SelectionCadenceKey, u64>,
+    selection_history: HashMap<SelectionCadenceKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, SelectionReasonCounts>,
     active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
@@ -464,6 +481,7 @@ impl Default for StateInner {
             valid: HashSet::new(),
             valid_groups: HashSet::new(),
             selection_counts: HashMap::new(),
+            selection_history: HashMap::new(),
             selection_reasons: HashMap::new(),
             active_authority: None,
             tick: 0,
@@ -522,11 +540,27 @@ impl ScorePolicyState {
         let StateInner {
             selection_counts,
             selection_reasons,
+            selection_history,
+            valid,
             valid_groups,
             ..
         } = &mut *inner;
         selection_counts.retain(|key, _| valid_groups.contains(&key.group));
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
+        selection_history.retain(|key, history| {
+            if !valid_groups.contains(&key.group)
+                || !valid.contains(&(key.group.clone(), history.current))
+            {
+                return false;
+            }
+            if history
+                .previous
+                .is_some_and(|node_id| !valid.contains(&(key.group.clone(), node_id)))
+            {
+                history.previous = None;
+            }
+            true
+        });
         let invalid_exact: Vec<_> = inner
             .exact
             .iter()
@@ -584,6 +618,48 @@ impl ScorePolicyState {
             SelectionReason::FreshFailureBypass => &mut counts.fresh_failure_bypass,
         };
         *counter = counter.saturating_add(1);
+    }
+
+    fn record_switch_flap(
+        inner: &mut StateInner,
+        cadence_key: &SelectionCadenceKey,
+        selection_count: u64,
+        node_id: Uuid,
+        reason: SelectionReason,
+    ) {
+        if reason.is_exploration() {
+            return;
+        }
+        let Some(history) = inner.selection_history.get_mut(cadence_key) else {
+            inner.selection_history.insert(
+                cadence_key.clone(),
+                SelectionHistory {
+                    current: node_id,
+                    previous: None,
+                    switched_at: selection_count,
+                },
+            );
+            return;
+        };
+        if history.current == node_id {
+            return;
+        }
+        let switch_flap = history.previous == Some(node_id)
+            && selection_count.saturating_sub(history.switched_at) <= SCORE_SWITCH_FLAP_WINDOW;
+        history.previous = Some(history.current);
+        history.current = node_id;
+        history.switched_at = selection_count;
+        if switch_flap {
+            let counter = &mut inner
+                .selection_reasons
+                .entry(SelectionReasonKey::new(
+                    &cadence_key.group,
+                    cadence_key.network,
+                ))
+                .or_default()
+                .switch_flap;
+            *counter = counter.saturating_add(1);
+        }
     }
 
     pub(super) fn record_dead_filtered(
@@ -832,9 +908,13 @@ impl ScorePolicyState {
             .iter()
             .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
+        let performance = performance_baseline(&snapshots);
         let cadence_key = SelectionCadenceKey::new(group, context);
         let selection_count = if authorized {
-            let count = inner.selection_counts.entry(cadence_key).or_default();
+            let count = inner
+                .selection_counts
+                .entry(cadence_key.clone())
+                .or_default();
             *count = count.saturating_add(1);
             *count
         } else {
@@ -849,7 +929,7 @@ impl ScorePolicyState {
                 count
             }
         };
-        let best = best_index(&snapshots, nodes, selection_count, apply);
+        let best = best_index(&snapshots, nodes, selection_count, apply, performance);
         let incumbent = snapshots
             .iter()
             .enumerate()
@@ -864,22 +944,31 @@ impl ScorePolicyState {
             best
         } else {
             match incumbent.filter(|&index| index != best.index) {
-                Some(index) => match hold_decision(&snapshots[index], &snapshots[best.index]) {
-                    HoldDecision::Held => RankedSelection {
-                        index,
-                        reason: SelectionReason::IncumbentHeld,
-                    },
-                    HoldDecision::FreshFailureBypass => RankedSelection {
-                        index: best.index,
-                        reason: SelectionReason::FreshFailureBypass,
-                    },
-                    HoldDecision::UseBest => best,
-                },
+                Some(index) => {
+                    match hold_decision(&snapshots[index], &snapshots[best.index], performance) {
+                        HoldDecision::Held => RankedSelection {
+                            index,
+                            reason: SelectionReason::IncumbentHeld,
+                        },
+                        HoldDecision::FreshFailureBypass => RankedSelection {
+                            index: best.index,
+                            reason: SelectionReason::FreshFailureBypass,
+                        },
+                        HoldDecision::UseBest => best,
+                    }
+                }
                 None => best,
             }
         };
         if authorized {
             Self::record_selection_reason(&mut inner, group, context.network, selection);
+            Self::record_switch_flap(
+                &mut inner,
+                &cadence_key,
+                selection_count,
+                nodes[selection.index].id,
+                selection.reason,
+            );
             inner.tick = inner.tick.saturating_add(1);
             let selection_tick = inner.tick;
             mark_selected(
@@ -999,6 +1088,7 @@ fn best_index(
     nodes: &[&Node],
     selection_count: u64,
     explore: bool,
+    performance: PerformanceBaseline,
 ) -> RankedSelection {
     if explore {
         let candidate_count = snapshots.len();
@@ -1022,15 +1112,11 @@ fn best_index(
             && selection_count != 0
             && selection_count.is_multiple_of(exploration_period(candidate_count));
         if let Some(index) = cold
-            && (explored < target || candidate_count <= target || periodic)
+            && (explored < target || candidate_count <= target)
         {
             return RankedSelection {
                 index,
-                reason: if periodic && explored >= target && candidate_count > target {
-                    SelectionReason::PeriodicExplore
-                } else {
-                    SelectionReason::ColdExplore
-                },
+                reason: SelectionReason::ColdExplore,
             };
         }
         if periodic {
@@ -1044,11 +1130,14 @@ fn best_index(
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| Some(*index) != incumbent)
-                .min_by(|(left_index, left), (right_index, right)| {
-                    exploration_attempts(left)
-                        .total_cmp(&exploration_attempts(right))
-                        .then_with(|| left_index.cmp(right_index))
-                        .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+                .max_by(|(left_index, left), (right_index, right)| {
+                    left.reliability_upper
+                        .total_cmp(&right.reliability_upper)
+                        .then_with(|| {
+                            exploration_attempts(right).total_cmp(&exploration_attempts(left))
+                        })
+                        .then_with(|| right_index.cmp(left_index))
+                        .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
                 })
             {
                 return RankedSelection {
@@ -1067,8 +1156,8 @@ fn best_index(
         .enumerate()
         .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
         .max_by(|(left_index, left), (right_index, right)| {
-            utility(left)
-                .total_cmp(&utility(right))
+            utility(left, performance)
+                .total_cmp(&utility(right, performance))
                 .then_with(|| right_index.cmp(left_index))
                 .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
         })
@@ -1088,10 +1177,20 @@ fn best_index(
     RankedSelection { index, reason }
 }
 
-fn hold_decision(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> HoldDecision {
+fn switch_margin(completed: f64) -> f64 {
+    SCORE_SWITCH_MARGIN * (completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0)
+}
+
+fn hold_decision(
+    incumbent: &ScoreSnapshot,
+    best: &ScoreSnapshot,
+    performance: PerformanceBaseline,
+) -> HoldDecision {
     let trained =
         incumbent.completed >= MIN_TRAINED_EVIDENCE && best.completed >= MIN_TRAINED_EVIDENCE;
-    let within_switch_margin = utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN;
+    let margin = switch_margin(incumbent.hysteresis_completed);
+    let within_switch_margin =
+        utility(best, performance) - utility(incumbent, performance) < margin;
     if !trained || !within_switch_margin {
         HoldDecision::UseBest
     } else if incumbent.failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD {
@@ -1201,7 +1300,9 @@ fn record_aggregate_finish(
 struct ScoreSnapshot {
     attempts: f64,
     completed: f64,
+    hysteresis_completed: f64,
     reliability: f64,
+    reliability_upper: f64,
     useful_completed: f64,
     latency_ms: Option<f64>,
     latency_confidence: f64,
@@ -1250,10 +1351,20 @@ fn score_snapshot(
         ScoreSnapshot {
             attempts: family.attempts,
             completed: global_score.completed + family.completed,
+            hysteresis_completed: if family.completed > 0.0 {
+                family.hysteresis_completed
+            } else {
+                global_score.hysteresis_completed
+            },
             useful_completed: global_score.useful_completed + family.useful_completed,
             reliability: blend(
                 global_score.reliability,
                 family.reliability,
+                reliability_weight,
+            ),
+            reliability_upper: blend(
+                global_score.reliability_upper,
+                family.reliability_upper,
                 reliability_weight,
             ),
             latency_ms: blend_option(global_score.latency_ms, family.latency_ms, setup_weight),
@@ -1300,10 +1411,20 @@ fn score_snapshot(
     ScoreSnapshot {
         attempts: exact.attempts,
         completed: aggregate_score.completed + exact.completed,
+        hysteresis_completed: if exact.completed > 0.0 {
+            exact.hysteresis_completed
+        } else {
+            aggregate_score.hysteresis_completed
+        },
         useful_completed: aggregate_score.useful_completed + exact.useful_completed,
         reliability: blend(
             aggregate_score.reliability,
             exact.reliability,
+            reliability_weight,
+        ),
+        reliability_upper: blend(
+            aggregate_score.reliability_upper,
+            exact.reliability_upper,
             reliability_weight,
         ),
         latency_ms: blend_option(aggregate_score.latency_ms, exact.latency_ms, setup_weight),
@@ -1339,16 +1460,17 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         .mean()
         .map(|mean| (Some(mean), stats.first_response_ms.weight))
         .unwrap_or_else(|| (stats.setup_ms.mean(), stats.setup_ms.weight));
-    let throughput = (stats.throughput_seconds > 0.0).then(|| {
-        (1.0 + stats.throughput_bytes / stats.throughput_seconds)
-            .log2()
-            .clamp(0.0, 30.0)
-    });
+    // Dominant-direction bytes per second; utility normalizes this within the group.
+    let throughput =
+        (stats.throughput_seconds > 0.0).then(|| stats.throughput_bytes / stats.throughput_seconds);
+    let (reliability, reliability_upper) = stats.reliability_bounds(factor);
     ScoreSnapshot {
         attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
+        hysteresis_completed: stats.completed() * factor,
         useful_completed: stats.useful_completed() * factor,
-        reliability: stats.reliability(factor),
+        reliability,
+        reliability_upper,
         latency_ms,
         latency_confidence: (latency_weight * factor / 8.0).clamp(0.0, 1.0),
         throughput,
@@ -1372,15 +1494,46 @@ fn blend_option(base: Option<f64>, exact: Option<f64>, exact_weight: f64) -> Opt
     }
 }
 
-fn utility(score: &ScoreSnapshot) -> f64 {
-    let latency_penalty = score
-        .latency_ms
-        .map(|latency| latency.max(1.0).log2().min(20.0) / 20.0 * 0.03 * score.latency_confidence)
-        .unwrap_or(0.0);
-    let throughput_bonus = score
-        .throughput
-        .map(|throughput| throughput / 30.0 * 0.02 * score.throughput_confidence)
-        .unwrap_or(0.0);
+#[derive(Clone, Copy)]
+struct PerformanceBaseline {
+    latency_ms: Option<f64>,
+    throughput: Option<f64>,
+}
+
+fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBaseline {
+    let best_reliability = snapshots
+        .iter()
+        .map(|score| score.reliability)
+        .fold(0.0_f64, f64::max);
+    let eligible = || {
+        snapshots
+            .iter()
+            .filter(|score| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+    };
+    PerformanceBaseline {
+        latency_ms: eligible()
+            .filter_map(|score| score.latency_ms)
+            .map(|latency| latency.max(1.0))
+            .min_by(f64::total_cmp),
+        throughput: eligible()
+            .filter_map(|score| score.throughput)
+            .max_by(f64::total_cmp),
+    }
+}
+
+fn utility(score: &ScoreSnapshot, baseline: PerformanceBaseline) -> f64 {
+    let latency_penalty = match (score.latency_ms, baseline.latency_ms) {
+        (Some(latency), Some(best)) => {
+            (1.0 - best / latency.max(1.0)).clamp(0.0, 1.0) * 0.03 * score.latency_confidence
+        }
+        _ => 0.0,
+    };
+    let throughput_bonus = match (score.throughput, baseline.throughput) {
+        (Some(throughput), Some(best)) if best > 0.0 => {
+            (throughput / best).clamp(0.0, 1.0) * 0.02 * score.throughput_confidence
+        }
+        _ => 0.0,
+    };
     score.reliability + throughput_bonus - latency_penalty
 }
 
@@ -2142,7 +2295,9 @@ mod tests {
         let candidate = |attempts, latency_ms| ScoreSnapshot {
             attempts,
             completed: 8.0,
+            hysteresis_completed: 8.0,
             reliability: 0.9,
+            reliability_upper: 0.9,
             useful_completed: 8.0,
             latency_ms: Some(latency_ms),
             latency_confidence: 1.0,
@@ -2155,17 +2310,52 @@ mod tests {
             target_completed: 0.0,
         };
 
-        let faster_incumbent = candidate(100.0, 50.0);
-        let underused_slow_node = candidate(8.0, 500.0);
-        assert!(utility(&faster_incumbent) > utility(&underused_slow_node));
+        let scores = [candidate(100.0, 50.0), candidate(8.0, 500.0)];
+        let baseline = performance_baseline(&scores);
+        assert!(utility(&scores[0], baseline) > utility(&scores[1], baseline));
     }
 
     #[test]
-    fn hold_decision_classifies_every_boundary_once() {
+    fn relative_performance_is_scale_invariant() {
+        let candidate = |latency_ms, throughput| ScoreSnapshot {
+            attempts: 8.0,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability: 0.9,
+            reliability_upper: 0.9,
+            useful_completed: 8.0,
+            latency_ms: Some(latency_ms),
+            latency_confidence: 1.0,
+            throughput: Some(throughput),
+            throughput_confidence: 1.0,
+            failures: 0.0,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let local = [candidate(30.0, 20_000_000.0), candidate(60.0, 10_000_000.0)];
+        let remote = [
+            candidate(300.0, 200_000_000.0),
+            candidate(600.0, 100_000_000.0),
+        ];
+        let local_baseline = performance_baseline(&local);
+        let remote_baseline = performance_baseline(&remote);
+
+        assert_close(
+            utility(&local[0], local_baseline) - utility(&local[1], local_baseline),
+            utility(&remote[0], remote_baseline) - utility(&remote[1], remote_baseline),
+        );
+    }
+
+    #[test]
+    fn hold_decision_scales_margin_with_incumbent_evidence() {
         let candidate = |completed, reliability, latency_ms, failures| ScoreSnapshot {
             attempts: completed,
             completed,
+            hysteresis_completed: completed,
             reliability,
+            reliability_upper: reliability,
             useful_completed: completed,
             latency_ms,
             latency_confidence: f64::from(latency_ms.is_some()),
@@ -2177,50 +2367,109 @@ mod tests {
             target_attempts: 0.0,
             target_completed: 0.0,
         };
+        let decision = |incumbent: ScoreSnapshot, best: ScoreSnapshot| {
+            let performance = performance_baseline(&[incumbent, best]);
+            hold_decision(&incumbent, &best, performance)
+        };
         let trained = MIN_TRAINED_EVIDENCE;
+        let low_margin = switch_margin(trained);
         let incumbent = candidate(trained, 0.0, None, 0.0);
+        let proven = candidate(SCORE_SWITCH_FULL_EVIDENCE, 0.0, None, 0.0);
 
         assert_eq!(
-            hold_decision(
-                &candidate(trained - f64::EPSILON, 0.0, None, 0.0),
-                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            decision(
+                candidate(trained - f64::EPSILON, 0.0, None, 0.0),
+                candidate(trained, low_margin / 2.0, None, 0.0),
             ),
             HoldDecision::UseBest,
         );
         assert_eq!(
-            hold_decision(
-                &incumbent,
-                &candidate(trained, SCORE_SWITCH_MARGIN, None, 0.0),
-            ),
+            decision(incumbent, candidate(trained, low_margin * 1.01, None, 0.0),),
             HoldDecision::UseBest,
         );
         assert_eq!(
-            hold_decision(
-                &incumbent,
-                &candidate(trained, SCORE_SWITCH_MARGIN * 2.0, None, 0.0),
-            ),
-            HoldDecision::UseBest,
+            decision(incumbent, candidate(trained, low_margin / 2.0, None, 0.0),),
+            HoldDecision::Held,
         );
         assert_eq!(
-            hold_decision(
-                &candidate(trained, 0.0, Some(1_048_576.0), 0.0),
-                &candidate(trained, 0.0, Some(1.0), 0.0),
-            ),
-            HoldDecision::UseBest,
-        );
-        assert_eq!(
-            hold_decision(
-                &incumbent,
-                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            decision(
+                proven,
+                candidate(
+                    SCORE_SWITCH_FULL_EVIDENCE,
+                    SCORE_SWITCH_MARGIN / 2.0,
+                    None,
+                    0.0,
+                ),
             ),
             HoldDecision::Held,
         );
         assert_eq!(
-            hold_decision(
-                &candidate(trained, 0.0, None, SCORE_FAILURE_FORGIVENESS_THRESHOLD,),
-                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            decision(
+                proven,
+                candidate(
+                    SCORE_SWITCH_FULL_EVIDENCE,
+                    SCORE_SWITCH_MARGIN * 1.01,
+                    None,
+                    0.0,
+                ),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            decision(
+                candidate(trained, 0.0, Some(1_048_576.0), 0.0),
+                candidate(trained, 0.0, Some(1.0), 0.0),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            decision(
+                candidate(trained, 0.0, None, SCORE_FAILURE_FORGIVENESS_THRESHOLD,),
+                candidate(trained, low_margin / 2.0, None, 0.0),
             ),
             HoldDecision::FreshFailureBypass,
+        );
+    }
+
+    #[test]
+    fn hysteresis_evidence_counts_each_reporter_completion_once() {
+        let assert_near = |actual: f64, expected: f64| {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        };
+        let node = node("only");
+        let manager = super::super::GroupManager::new(
+            &[group("score", std::slice::from_ref(&node))],
+            std::slice::from_ref(&node),
+        );
+        let context = context("evidence.example", IpVersion::V4);
+        for _ in 0..3 {
+            finish_success(&manager.selection_plan_for_target("score", &context));
+        }
+        let score = {
+            let state = manager.score_state();
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, node.id, Instant::now())
+        };
+        assert_near(score.completed, 9.0);
+        assert_near(score.hysteresis_completed, 3.0);
+        assert_near(
+            switch_margin(score.hysteresis_completed),
+            SCORE_SWITCH_MARGIN * 3.0 / SCORE_SWITCH_FULL_EVIDENCE,
+        );
+
+        for _ in 3..8 {
+            finish_success(&manager.selection_plan_for_target("score", &context));
+        }
+        let score = {
+            let state = manager.score_state();
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, node.id, Instant::now())
+        };
+        assert_near(score.completed, 24.0);
+        assert_near(score.hysteresis_completed, 8.0);
+        assert_near(
+            switch_margin(score.hysteresis_completed),
+            SCORE_SWITCH_MARGIN,
         );
     }
 
@@ -2273,6 +2522,45 @@ mod tests {
         }
 
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
+    fn periodic_exploration_prefers_reliability_upper_bound() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let candidate = |attempts, reliability_upper, selected_at| ScoreSnapshot {
+            attempts,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability: 0.2,
+            reliability_upper,
+            useful_completed: 8.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            selected_at,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let mut snapshots = vec![candidate(8.0, 0.2, 0); nodes.len()];
+        snapshots[0] = candidate(8.0, 0.9, 1);
+        snapshots[1] = candidate(1.0, 0.3, 0);
+        snapshots[2] = candidate(8.0, 0.8, 0);
+        let performance = performance_baseline(&snapshots);
+
+        let selected = best_index(
+            &snapshots,
+            &node_refs,
+            exploration_period(nodes.len()),
+            true,
+            performance,
+        );
+
+        assert_eq!(selected.index, 2);
+        assert_eq!(selected.reason, SelectionReason::PeriodicExplore);
     }
 
     #[test]
@@ -2759,7 +3047,9 @@ mod tests {
         let incumbent = ScoreSnapshot {
             attempts: 1.0,
             completed: 1.0,
+            hysteresis_completed: 1.0,
             reliability: 0.8,
+            reliability_upper: 0.8,
             useful_completed: 1.0,
             latency_ms: None,
             latency_confidence: 0.0,
@@ -2772,12 +3062,17 @@ mod tests {
             target_completed: 0.0,
         };
         let challenger = ScoreSnapshot {
-            reliability: 0.805,
+            reliability: 0.8005,
+            reliability_upper: 0.8005,
             failures: 0.0,
             selected_at: 0,
             ..incumbent
         };
-        let retained = hold_decision(&incumbent, &challenger) == HoldDecision::Held;
+        let retained = hold_decision(
+            &incumbent,
+            &challenger,
+            performance_baseline(&[incumbent, challenger]),
+        ) == HoldDecision::Held;
         println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
         assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
         assert!(retained);
@@ -2867,8 +3162,12 @@ mod tests {
                 .iter()
                 .all(|score| score.completed >= MIN_TRAINED_EVIDENCE)
         );
-        assert!(utility(&snapshots[1]) > utility(&snapshots[0]));
-        assert!(utility(&snapshots[1]) - utility(&snapshots[0]) < SCORE_SWITCH_MARGIN);
+        let performance = performance_baseline(&snapshots);
+        assert!(utility(&snapshots[1], performance) > utility(&snapshots[0], performance));
+        assert!(
+            utility(&snapshots[1], performance) - utility(&snapshots[0], performance)
+                < switch_margin(snapshots[0].completed)
+        );
 
         // When: the scorer ranks the candidates.
         let selected = state.rank_at("score", &context, &node_refs, now);
@@ -2918,7 +3217,7 @@ mod tests {
         assert_close(stats.throughput_seconds, 4.0);
         assert_close(stats.throughput_windows, 2.0);
         let score = snapshot(&stats, now);
-        assert_close(score.throughput.unwrap(), (1.0_f64 + 49_152.0).log2());
+        assert_close(score.throughput.unwrap(), 49_152.0);
         assert_close(score.throughput_confidence, 0.25);
     }
 
@@ -3230,6 +3529,148 @@ group {
         assert_eq!(peek, nodes[0].name);
         assert_eq!(singleton_selected, singleton.id);
         assert_eq!(last_resort_selected, last_resort.id);
+    }
+
+    #[test]
+    fn switch_flap_counts_only_quick_committed_reversals() {
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let key = SelectionCadenceKey::new("score", &context);
+        let first = node("first").id;
+        let second = node("second").id;
+        let mut inner = StateInner::default();
+
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key,
+            1,
+            first,
+            SelectionReason::PerformanceWinner,
+        );
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key,
+            2,
+            second,
+            SelectionReason::PeriodicExplore,
+        );
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key,
+            3,
+            second,
+            SelectionReason::PerformanceWinner,
+        );
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key,
+            3 + SCORE_SWITCH_FLAP_WINDOW,
+            first,
+            SelectionReason::ReliabilityWinner,
+        );
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key,
+            4 + SCORE_SWITCH_FLAP_WINDOW * 2,
+            second,
+            SelectionReason::PerformanceWinner,
+        );
+
+        assert_eq!(
+            inner
+                .selection_reasons
+                .get(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+                .unwrap()
+                .switch_flap,
+            1
+        );
+    }
+
+    #[test]
+    fn applied_score_selection_records_switch_flap() {
+        let nodes = [node("first"), node("second")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".to_owned(), node.id)));
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let now = Instant::now();
+        let keys = nodes.each_ref().map(|node| AggregateKey {
+            group: "score".to_owned(),
+            network: SelectionNetwork::Tcp,
+            family: None,
+            node_id: node.id,
+        });
+        {
+            let mut inner = state.inner.lock();
+            inner
+                .aggregate
+                .put(keys[0].clone(), trained_stats(8.0, 50.0, now));
+            inner
+                .aggregate
+                .put(keys[1].clone(), trained_stats(8.0, 200.0, now));
+        }
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+
+        inner_update_response(&state, keys[0].clone(), 200.0);
+        inner_update_response(&state, keys[1].clone(), 50.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+
+        inner_update_response(&state, keys[0].clone(), 50.0);
+        inner_update_response(&state, keys[1].clone(), 200.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+        assert_eq!(
+            state
+                .selection_reason_counts("score", SelectionNetwork::Tcp)
+                .switch_flap,
+            1
+        );
+    }
+
+    #[test]
+    fn score_reload_prunes_removed_switch_history_members() {
+        let state = ScorePolicyState::default();
+        let first = node("first").id;
+        let second = node("second").id;
+        state.publish_membership([("score".to_owned(), first), ("score".to_owned(), second)]);
+        let removed_key =
+            SelectionCadenceKey::new("score", &context("removed.example", IpVersion::V4));
+        let retained_key =
+            SelectionCadenceKey::new("score", &context("retained.example", IpVersion::V6));
+        {
+            let mut inner = state.inner.lock();
+            inner.selection_history.insert(
+                removed_key.clone(),
+                SelectionHistory {
+                    current: first,
+                    previous: Some(second),
+                    switched_at: 1,
+                },
+            );
+            inner.selection_history.insert(
+                retained_key.clone(),
+                SelectionHistory {
+                    current: second,
+                    previous: Some(first),
+                    switched_at: 1,
+                },
+            );
+        }
+
+        state.publish_membership([("score".to_owned(), second)]);
+
+        let inner = state.inner.lock();
+        assert!(!inner.selection_history.contains_key(&removed_key));
+        assert_eq!(
+            inner.selection_history.get(&retained_key).unwrap().previous,
+            None
+        );
     }
 
     #[test]
@@ -3594,6 +4035,7 @@ group {
             incumbent_held: u64::MAX,
             fresh_failure_bypass: u64::MAX,
             dead_filtered: u64::MAX,
+            switch_flap: u64::MAX,
         };
         stale_state.inner.lock().selection_reasons.insert(
             SelectionReasonKey::new("stale", SelectionNetwork::Tcp),
@@ -3764,6 +4206,7 @@ group {
             incumbent_held: _,
             fresh_failure_bypass: _,
             dead_filtered: _,
+            switch_flap: _,
         } = snapshot[0].tcp;
 
         let _ = manager.selection_plan_for_target(
@@ -3782,6 +4225,7 @@ group {
             incumbent_held: u64::MAX,
             fresh_failure_bypass: u64::MAX,
             dead_filtered: u64::MAX,
+            switch_flap: u64::MAX,
         };
         state.inner.lock().selection_reasons.insert(
             SelectionReasonKey::new("z-score", SelectionNetwork::Udp),
