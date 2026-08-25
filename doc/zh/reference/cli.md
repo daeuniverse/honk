@@ -54,6 +54,7 @@ Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 | `RUST_LOG` | 两个二进制 | Tracing filter。对 `honk-core` 采用上述当前有效优先级；`honk-tool` 在未设置时默认 `warn`。 |
 | `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | 当已配置的外部 UI 目录需要下载内容时，覆盖 dashboard zip URL。 |
 | `HONK_POOL_DISABLE=1` | `honk-core` | 绕过 Ready stream 与裸 TCP 两类池，每次全新拨号。代码也接受不区分大小写的 `true`；首次使用后缓存该值。 |
+| `HONK_QUIC_GSO=0|1` | QUIC 出站 | 强制关闭/开启 UDP GSO。未覆盖时，保守的 1252-byte MTU 保持关闭；显式设置更大的 `mtu` 时自动开启。 |
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
 | `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖解析进程名字段偏移所用的原始内核 BTF 文件。未设置时，honk 依次检查 `/sys/kernel/btf/vmlinux` 与 `/usr/lib/debug/boot/vmlinux`；若运行时 BTF 偏移或内核 argv 访问无法通过 verifier，pname 同步回退到调用线程的 `comm`。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
