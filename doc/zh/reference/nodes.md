@@ -66,7 +66,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 `mport` 列表与 `mhop` 秒数；有效间隔为 30 秒 |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC 接收窗口；有效默认值为 8 MiB / 8 MiB（conn 窗口同时是每连接内存预算，慢消费者最多缓冲约 3 倍该值；内存占用 ≈ 活跃连接数 × 3 × conn 窗口） |
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
-| `quic_mtu` | u16? | null | 来自 `mtu` 的 QUIC UDP payload 大小；有效默认值 1252，链接接受范围 1200–65527 |
+| `quic_mtu` | u16? | null | 来自 `mtu` 的 QUIC UDP payload 大小；默认 1252，接受范围 1200–65527；显式设置大于 1252 时启用 GSO，`HONK_QUIC_GSO=0` 可强制关闭 |
 | `tls_pin_sha256` | string? | null | 来自 `pinSHA256` 或 `pin_sha256` 的叶证书 SHA-256 pin |
 | `tuic_uuid` / `tuic_password` | string? | null | TUIC 专用凭据；handler 会回退到通用 userinfo 字段 |
 | `tuic_congestion` / `tuic_alpn` | string? | null | TUIC `congestion_control` 与逗号分隔的 `alpn` |
@@ -138,8 +138,8 @@ VLESS 已完成以下 live 互通验证：TCP+REALITY+Vision、TCP+REALITY、TCP
 | --- | --- |
 | userinfo 密钥 | `username`、`password` 与 `hy2_auth` |
 | `obfs=salamander&obfs-password=...` | 非空密码成为 `hy2_obfs`；其他/不完整 obfs 输入保持关闭 |
-| `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`；`upmbps` 为正值时启用 brutal，否则使用 BBR |
-| `mport` / `mhop` | 端口列表/范围与以秒为单位的跳跃间隔；间隔默认 30，且最小钳制为 1 |
+| `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`；`upmbps` 为正值时启用 Brutal，否则使用 BBR；下载值按 bytes/s 通告 |
+| `mport` / `mhop` | 端口列表/范围与以秒为单位的跳跃间隔；间隔默认 30，并钳制到上游规定的最小值 5 |
 | `pinSHA256` | `tls_pin_sha256`，替代 PKI/主机名校验 |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收窗口覆盖值 |
 | `disablePathMTUDiscovery` | 值为 `1`/`true` 时关闭 QUIC PMTU 发现 |

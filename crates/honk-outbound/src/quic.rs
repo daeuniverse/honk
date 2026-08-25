@@ -203,16 +203,25 @@ pub async fn client_config(
         }
         None => None,
     };
+    let pin_sha256 = node
+        .tls_pin_sha256
+        .as_deref()
+        .map(|pin| {
+            crate::tls::parse_pin_sha256(pin).ok_or_else(|| {
+                anyhow!(
+                    "node '{}': invalid tls_pin_sha256 (expected 64 hex chars)",
+                    node.name
+                )
+            })
+        })
+        .transpose()?;
     let crypto =
         crate::quic_boring::BoringQuicClientConfig::new(crate::quic_boring::BoringQuicOptions {
             alpn_wire,
             skip_cert_verify: node.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
             ech_config_list: ech,
-            pin_sha256: node
-                .tls_pin_sha256
-                .as_deref()
-                .and_then(crate::tls::parse_pin_sha256),
+            pin_sha256,
             // Tickets belong to a specific service, not a hostname:
             // address|port|SNI|ALPN — different protocols, different
             // servers behind one certificate, and reloaded configs never
@@ -411,19 +420,36 @@ pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
     client_endpoint_with_mtu(ipv6, 1252)
 }
 
+fn default_gso_enabled(max_udp_payload_size: u16) -> bool {
+    max_udp_payload_size > 1252
+}
+const MAX_QUIC_GSO_SEGMENTS: usize = 16;
+
+fn gso_transmit_segments(enabled: bool, kernel_max: usize) -> usize {
+    if enabled {
+        kernel_max.min(MAX_QUIC_GSO_SEGMENTS)
+    } else {
+        1
+    }
+}
+
 /// [`client_endpoint`] with an explicit advertised `max_udp_payload_size`.
+///
+/// An explicit MTU above the conservative 1252 default opts into UDP GSO:
+/// the operator has already declared that the path carries larger datagrams.
+/// `HONK_QUIC_GSO=0|1` overrides that policy process-wide.
 pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Result<Endpoint> {
     let socket = marked_udp_socket(ipv6)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let io = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
     let inner = quinn::udp::UdpSocketState::new((&*io).into())?;
-    static GSO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let gso = *GSO.get_or_init(|| {
+    static GSO_OVERRIDE: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         std::env::var("HONK_QUIC_GSO")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .ok()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     });
+    let gso = (*GSO_OVERRIDE).unwrap_or_else(|| default_gso_enabled(max_udp_payload_size));
     let socket = Arc::new(NoGsoUdpSocket { io, inner, gso });
     Endpoint::new_with_abstract_socket(
         endpoint_config_with_mtu(max_udp_payload_size)?,
@@ -441,16 +467,15 @@ pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
     Ok(config)
 }
 
-/// quinn's stock tokio socket behavior (ECN, GRO, cmsgs) with **GSO
-/// disabled** (`max_transmit_segments = 1`): every datagram goes out on its
-/// own, dodging PPPoE uplinks that drop later segments of a GSO
-/// super-packet. This is quinn's own `runtime/tokio.rs` socket with a
-/// one-line change, so nothing else (ECN signaling, GRO receives, pktinfo)
-/// diverges from the stock path.
+/// GSO policy. The safe 1252-byte default sends one datagram per syscall,
+/// dodging PPPoE uplinks that drop later segments of a GSO super-packet.
+/// Explicit larger MTUs enable batches capped at 16 segments because those
+/// paths have already opted out of the black-hole-safe default.
+/// `HONK_QUIC_GSO=0|1` forces either mode.
 ///
-/// `HONK_QUIC_GSO=1` opts back into kernel UDP GSO (a 10-20% single-flow
-/// throughput win on non-PPPoE paths; keep it off where the uplink drops
-/// GSO segments).
+/// This is quinn's own `runtime/tokio.rs` socket with only
+/// [`max_transmit_segments`](quinn::AsyncUdpSocket::max_transmit_segments)
+/// made policy-driven; ECN, GRO receives, and pktinfo stay unchanged.
 #[derive(Debug)]
 struct NoGsoUdpSocket {
     io: Arc<tokio::net::UdpSocket>,
@@ -498,11 +523,7 @@ impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        if self.gso {
-            self.inner.max_gso_segments()
-        } else {
-            1
-        }
+        gso_transmit_segments(self.gso, self.inner.max_gso_segments())
     }
 
     fn max_receive_segments(&self) -> usize {
@@ -1141,6 +1162,33 @@ mod brutal_tests {
 #[cfg(test)]
 mod client_tests {
     use super::*;
+    #[test]
+    fn explicit_large_mtu_enables_gso_by_default() {
+        assert!(!default_gso_enabled(1252));
+        assert!(default_gso_enabled(1253));
+        assert!(default_gso_enabled(1452));
+    }
+
+    #[test]
+    fn gso_batches_are_bounded() {
+        assert_eq!(gso_transmit_segments(false, 64), 1);
+        assert_eq!(gso_transmit_segments(true, 8), 8);
+        assert_eq!(gso_transmit_segments(true, 64), MAX_QUIC_GSO_SEGMENTS);
+    }
+
+    #[tokio::test]
+    async fn client_config_rejects_invalid_pin() {
+        let node = honk_config::node::Node {
+            name: "bad-pin".to_string(),
+            tls_pin_sha256: Some("not-a-pin".to_string()),
+            ..Default::default()
+        };
+        let error = match client_config(&node, &[b"h3"], QuicClientOptions::default()).await {
+            Ok(_) => panic!("invalid pin must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid tls_pin_sha256"));
+    }
 
     async fn test_client(port: u16) -> QuicClient<()> {
         let node = honk_config::node::Node {
