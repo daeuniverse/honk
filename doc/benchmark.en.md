@@ -167,6 +167,71 @@ Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
 
+## Results (2026-08-25, Hysteria2 interoperability and bounded QUIC GSO)
+
+This follow-up validates candidate `c1b8749` against an official Hysteria
+v2.12.2 server and measures the shared QUIC socket change. It supplements,
+rather than replaces, the paired 2026-08-24 honk/dae baseline below. The
+throughput fixture is plain HY2/TUIC with an explicit **1452-byte QUIC UDP
+payload**; it does not exercise Salamander, port hopping, or Juicity.
+
+The official-server matrix covers PKI and pinned TLS, self-signed TLS,
+Salamander, authentication failures, bandwidth hints, UDP-disabled refusal,
+MTU/PMTUD/windows, UDP fragmentation, and the public-path port-hopping limit.
+See the
+[sanitized feature matrix](../bench/results/quic-gso-2026-08-25/remote-hy2-feature-matrix.txt).
+
+### x86 bounded-GSO decision
+
+The two enabled arms and the disabled control use the same final musl binary
+(`dadefe68...`) and configuration. `HONK_QUIC_GSO=0` disables GSO for the
+control; the enabled arms leave it unset, so the explicit 1452-byte payload
+selects GSO with an application cap of 16 segments. TCP bandwidth is Mbps,
+CPU is cores, RSS is MiB, and loaded cells are
+`Mbps / p99 ms / failures out of 200`.
+
+| Mode | HY2 TCP / CPU / RSS | TUIC TCP / CPU / RSS | HY2 loaded | TUIC loaded |
+| --- | ---: | ---: | ---: | ---: |
+| documented 2026-08-24 baseline | 6140 / 0.61 / 48 | 3350 / 0.34 / 43 | 6033 / 8.075 / 3 | 3366 / 2.609 / 0 |
+| final binary, GSO off | 6479 / 0.63 / 50 | 3273 / 0.33 / 42 | 6570 / 6.387 / 2 | 3335 / 2.574 / 0 |
+| final binary, GSO cap 16, arm A | 6845 / 0.63 / 55 | 3176 / 0.32 / 52 | 6568 / 3.879 / 0 | 3246 / 3.243 / 0 |
+| final binary, GSO cap 16, arm B | 6713 / 0.64 / 48 | 3264 / 0.31 / 43 | 6563 / 3.685 / 0 | 3199 / 2.328 / 4 |
+
+Against the same-binary control, bounded GSO raises HY2 TCP capacity by
+3.6–5.6% while the direct anchor stays at 9401–9406 Mbps. TUIC TCP is within
+the known run-level spread, so no TCP speedup is claimed. At the deliberately
+saturating 10-Gbps UDP offer, HY2 moves from 831 Mbps / 81.1% loss to
+902–935 Mbps / 77.3–78.6%; TUIC moves from 814 / 80.3% to 979–1079 /
+74.4–77.6%. These are overload-capacity results, not WAN loss rates.
+
+RSS spans 48–55 MiB for enabled HY2 and 43–52 MiB for enabled TUIC; the
+second arm returns to the documented 48/43 MiB baseline. That rules out a
+persistent RSS regression in this sample, not an allocation-count change.
+Sparse loaded failures vary by arm and remain reported rather than averaged
+away.
+
+### ARM exploratory toggle
+
+The ARM board used the pre-auto-GSO candidate and its existing
+`HONK_QUIC_GSO=0|1` switch, not the final 16-segment binary:
+
+| Mode | HY2 TCP / RSS; UDP | HY2 loaded Mbps / p99 / failures | TUIC TCP / RSS; UDP | TUIC loaded Mbps / p99 / failures |
+| --- | ---: | ---: | ---: | ---: |
+| GSO off | 345 / 39; 2 Mbps (83.1%) | 344 / 125.828 / 0 | 245 / 25; 3 Mbps (91.6%) | 257 / 37.010 / 0 |
+| GSO on | 346 / 42; 1 Mbps (84.7%) | 344 / 125.411 / 8 | 254 / 29; 1 Mbps (92.4%) | 253 / 43.357 / 2 |
+
+This board provides no GSO throughput win and shows more sparse failures in
+the enabled arm. It is retained as a negative, board-specific signal; it is
+not evidence for final cap-16 ARM performance. The shipped policy therefore
+keeps the black-hole-safe 1252-byte default scalar, enables bounded GSO only
+after an operator selects a larger MTU, and retains `HONK_QUIC_GSO=0` as the
+escape hatch. The shared path covers plain HY2, TUIC, and Juicity, but no
+Juicity performance claim is made without a reachable benchmark endpoint.
+
+Full provenance, hashes, TSVs, loaded-run JSON/samples, exploratory arms, and
+cleanup status are under
+[`quic-gso-2026-08-25`](../bench/results/quic-gso-2026-08-25/).
+
 ## Results (2026-08-24, current cross-architecture A/B)
 
 This is the current paired run: x86 `10.10.10.49` and ARM `10.10.10.118`.

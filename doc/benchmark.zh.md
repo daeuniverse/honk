@@ -147,6 +147,64 @@ ssh root@10.10.10.50 \
 候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
 点估计回退不超过 3% 时通过。
 
+## 结果(2026-08-25,Hysteria2 互操作与有界 QUIC GSO)
+
+本轮以官方 Hysteria v2.12.2 服务端验证候选 `c1b8749`,并测量共享 QUIC
+socket 改动。它补充而不替代下方 2026-08-24 honk/dae 配对基线。吞吐 fixture
+使用明文 HY2/TUIC 与显式 **1452 字节 QUIC UDP payload**；不覆盖
+Salamander、端口跳跃或 Juicity。
+
+官方服务端矩阵覆盖 PKI 与证书 pin、自签名 TLS、Salamander、认证失败、
+带宽提示、禁用 UDP 的明确拒绝、MTU/PMTUD/window、UDP 分片及公网端口
+跳跃限制。见
+[脱敏功能矩阵](../bench/results/quic-gso-2026-08-25/remote-hy2-feature-matrix.txt)。
+
+### x86 有界 GSO 决策
+
+两个启用 arm 与禁用 control 使用同一个最终 musl 二进制
+(`dadefe68...`)及相同配置。control 以 `HONK_QUIC_GSO=0` 禁用 GSO；
+启用 arm 不设置该变量,因此显式 1452 字节 payload 选择 GSO,应用层最多
+16 个 segment。TCP 带宽单位为 Mbps,CPU 为核,RSS 为 MiB；loaded 单元格为
+`Mbps / p99 ms / 200 次中的失败数`。
+
+| 模式 | HY2 TCP / CPU / RSS | TUIC TCP / CPU / RSS | HY2 loaded | TUIC loaded |
+| --- | ---: | ---: | ---: | ---: |
+| 文档中的 2026-08-24 基线 | 6140 / 0.61 / 48 | 3350 / 0.34 / 43 | 6033 / 8.075 / 3 | 3366 / 2.609 / 0 |
+| 最终二进制,GSO off | 6479 / 0.63 / 50 | 3273 / 0.33 / 42 | 6570 / 6.387 / 2 | 3335 / 2.574 / 0 |
+| 最终二进制,GSO cap 16,arm A | 6845 / 0.63 / 55 | 3176 / 0.32 / 52 | 6568 / 3.879 / 0 | 3246 / 3.243 / 0 |
+| 最终二进制,GSO cap 16,arm B | 6713 / 0.64 / 48 | 3264 / 0.31 / 43 | 6563 / 3.685 / 0 | 3199 / 2.328 / 4 |
+
+相对同二进制 control,有界 GSO 将 HY2 TCP 容量提高 3.6–5.6%,同时 direct
+锚点保持 9401–9406 Mbps。TUIC TCP 落在已知的 run-level 波动范围内,因此
+不声称 TCP 加速。在刻意饱和的 10-Gbps UDP offer 下,HY2 从
+831 Mbps / 81.1% loss 变为 902–935 Mbps / 77.3–78.6%；TUIC 从
+814 / 80.3% 变为 979–1079 / 74.4–77.6%。这是过载容量结果,不是 WAN
+丢包率。
+
+启用时 HY2 RSS 为 48–55 MiB,TUIC 为 43–52 MiB；第二个 arm 回到文档基线
+的 48/43 MiB。这排除了本样本中的持续 RSS 回退,并不等同于 allocation
+计数结论。loaded 的稀疏失败随 arm 波动,表中原样保留而未取平均隐藏。
+
+### ARM 探索性开关
+
+ARM 板使用 pre-auto-GSO 候选及其已有 `HONK_QUIC_GSO=0|1` 开关,不是
+最终 16-segment 二进制：
+
+| 模式 | HY2 TCP / RSS；UDP | HY2 loaded Mbps / p99 / 失败 | TUIC TCP / RSS；UDP | TUIC loaded Mbps / p99 / 失败 |
+| --- | ---: | ---: | ---: | ---: |
+| GSO off | 345 / 39；2 Mbps (83.1%) | 344 / 125.828 / 0 | 245 / 25；3 Mbps (91.6%) | 257 / 37.010 / 0 |
+| GSO on | 346 / 42；1 Mbps (84.7%) | 344 / 125.411 / 8 | 254 / 29；1 Mbps (92.4%) | 253 / 43.357 / 2 |
+
+该板没有呈现 GSO 吞吐收益,启用 arm 的稀疏失败更多。本结果保留为板级
+负面信号,不能证明最终 cap-16 的 ARM 性能。因此交付策略继续让抗黑洞的
+1252 字节默认值使用 scalar send,仅在操作者选择更大 MTU 后启用有界 GSO,
+并保留 `HONK_QUIC_GSO=0` 逃生开关。共享路径覆盖明文 HY2、TUIC 与
+Juicity,但没有可用 Juicity benchmark endpoint,故不作其性能声明。
+
+完整 provenance、hash、TSV、loaded-run JSON/sample、探索性 arm 与清理状态
+位于
+[`quic-gso-2026-08-25`](../bench/results/quic-gso-2026-08-25/)。
+
 ## 结果(2026-08-24,当前跨架构配对 A/B)
 
 这是当前配对轮：x86 `10.10.10.49` 与 ARM `10.10.10.118`。ARM 使用更新后的

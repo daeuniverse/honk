@@ -1,0 +1,11 @@
+{
+	"start":	{
+		"connected":	[],
+		"version":	"iperf 3.20",
+		"system_info":	"Linux OpenWrt 6.12.94 #0 SMP Mon Jun 29 12:59:20 2026 aarch64"
+	},
+	"intervals":	[],
+	"end":	{
+	},
+	"error":	"the server is busy running a test. try again later"
+}

@@ -1,0 +1,78 @@
+# 2026-08-25 Hysteria2 / QUIC GSO follow-up
+run_date_utc=2026-08-25
+run_x86_cap16_a_utc=2026-08-25T02:39:01Z
+run_x86_cap16_b_utc=2026-08-25T02:46:56Z
+run_x86_same_binary_gso_off_utc=2026-08-25T03:06:06Z
+
+[source]
+base_commit=131e71b8db5cb9fea00eade259e47d75c277f2d7
+hysteria_interop_commit=676ce350047913c820805408a1e8e9e6a3e7fe46
+large_mtu_auto_gso_commit=1926fffa86ca3c4c412d863e93a164b512bb303e
+bounded_gso_commit=4c9f961ff6b74c23c41ae4c33868ae8ca8f1f3df
+candidate_commit=c1b8749f70f4ddf8d24ed998a0c78b784f7fd3c5
+
+[method]
+cold_runs=3 (median)
+hot_requests=15 (p50/p95)
+bandwidth_runs=3 (median)
+bandwidth_time_s=8
+udp_offer=10Gbit/s
+udp_payload_bytes=1200
+stability_samples=200
+stability_interval_ms=250
+stability_timeout_s=5
+stability_retries=2
+stability_load=one reverse iperf3 stream on the same route
+protocols=plain Hysteria2 and TUIC; no Salamander obfuscation or port hopping
+configured_quic_udp_payload_bytes=1452
+
+[x86]
+host=10.10.10.49
+hostname=archlinux
+arch=x86_64
+kernel=7.1.8-arch1-3
+final_binary_sha256=dadefe6873c5f6f2a75f455a73fe09984230abc9a8fe1c4f8b296ca1d9a5e83a
+pre_auto_gso_binary_sha256=e5c0f4cfbb515e88560f862ee15df414b453e3205fc91ec99810af9399e74961
+auto_unbounded_binary_sha256=09d5b5f8b581c7b758111e1b10b6f5bc0bb41ed6627d83f55d9e55c9ac81651d
+honk_config_sha256=959969bcd4d27e31b25279046f0b7e4622fb231f156a027521d191cc60436a95
+harness_sha256=6d650f4f52a943bb2732aa99907c194f90730a1115d4be245a2cd48d989cffdc
+collector_sha256=aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575
+cap16_a_gso=automatic (HONK_QUIC_GSO unset; explicit 1452-byte payload)
+cap16_b_gso=automatic (HONK_QUIC_GSO unset; explicit 1452-byte payload)
+same_binary_control_gso=disabled (HONK_QUIC_GSO=0)
+quinn_linux_gso_probe=64 segments when UDP_SEGMENT is supported, otherwise 1; runtime value was not separately logged
+application_gso_cap=16 segments
+
+[arm64_exploratory_toggle]
+host=10.10.10.118
+hostname=OpenWrt
+arch=aarch64
+kernel=6.12.94
+binary_sha256=4cfe743cf94c0dc0fe439e388a3b335a2fea3c22063a2fdbb62d219bcaa74a20
+source=pre-auto endpoint with HONK_QUIC_GSO=0/1 override; not the final 16-segment binary
+honk_config_sha256=5b7048c2831512eef4e8c8acda8b503fd6788a7defdfce0f5833df129382f90b
+harness_sha256=6d650f4f52a943bb2732aa99907c194f90730a1115d4be245a2cd48d989cffdc
+collector_sha256=aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575
+production_service_restored_after_run=true
+benchmark_netns_veth_nat_firewall_removed=true
+
+[artifact_sha256]
+x86_cap16_a_standard=28fc5cc66a9b518f595a5684633efe84a5a73174b12a7ae81757fc28af274e8a
+x86_cap16_a_stability=888deb8480f3ca1ba878856c438fbe4bee237367134a7c9509c891d201fc17a8
+x86_cap16_b_standard=6d1953cf20d6ab800f1706a3e9f08390e2da99fed197aae74a199ddfc4a60f2a
+x86_cap16_b_stability=a4478a0f2f0c2ab2351602e2b7013fdee47a87eb8ef6dab7ef5d39851018ea66
+x86_same_binary_gso_off_standard=e52df460a8251754c03760665ae1e68cd037183ebdf9957653c2989e0c48d07f
+x86_same_binary_gso_off_stability=96d58906459d26654bf2ec34c3e041bea5f4e9aad20c55d2d43eb03aae711835
+arm64_gso_off_standard=c9aa5a71e5cc1384cf733c54189fd5f41d28d1c2c2f6ec0e955d0f39964683c7
+arm64_gso_off_stability=8b44665a381aba3e42e1827580314c4f9898904b44cef32eaa4ab15b431e176d
+arm64_gso_on_standard=539a075653cfb81b1d5427c29bdf9d7500ecc2c4d3761ff7f63f72af67bdb6e3
+arm64_gso_on_stability=d8282a9a4239542bb62de4b930a40ae850fe78011e4e9035f04308e8cf5aa4e5
+remote_feature_matrix=7289eaa307ba09774de0d82f1714c42c04d204c12a9b73682a4595713844c953
+
+[notes]
+The 2026-08-24 documented baseline is a separate binary/run and is used only as a historical comparison.
+The same-binary x86 control is the causal comparison for final bounded GSO: HY2 TCP rose from 6479 Mbps with GSO disabled to 6713-6845 Mbps with bounded GSO; TUIC stayed within run variance (3273 disabled versus 3176-3264 enabled).
+Final x86 repeat RSS returned to 48 MiB for HY2 and 43 MiB for TUIC, matching the historical baseline; the first enabled arm read 55/52 MiB, so RSS is reported as a range rather than an allocation-count claim.
+The ARM toggle showed no throughput benefit and more sparse loaded failures with GSO enabled. Its GSO-on arm predates the final 16-segment cap and does not prove final ARM performance.
+UDP Mbps/loss values use a fixed 10-Gbit/s offered load and are saturation measurements, not internet loss rates or GSO evidence.
+The separate remote feature matrix covers official-server interoperability. The throughput harness does not exercise Salamander, port hopping, or Juicity.

@@ -1,0 +1,50 @@
+# 2026-08-25 Hysteria2 remote feature matrix
+
+server=wr.iriswo.com (103.26.8.157)
+server_binary=official Hysteria v2.12.2, quic-go v0.61.1-0.20260806010916-184d081eef3e
+candidate_commit=c1b8749f70f4ddf8d24ed998a0c78b784f7fd3c5
+candidate_x86_musl_sha256=dadefe6873c5f6f2a75f455a73fe09984230abc9a8fe1c4f8b296ca1d9a5e83a
+secrets=redacted
+
+[production endpoint :443]
+ACME hostname verification + exact SHA-256 pin=PASS
+Salamander obfuscation=PASS
+password authentication=PASS
+BBR/no client bandwidth hint=PASS
+client up/down bandwidth hints=PASS (down hint encoded as bytes/s)
+TCP HTTP exchange=PASS
+UDP DNS exchange=PASS
+reusable generation-owned connection=PASS
+
+[temporary isolated endpoints]
+plain valid-PKI :444 TCP/UDP=PASS
+self-signed :446 with insecure=PASS
+self-signed :446 with exact certificate pin=PASS
+UDP-disabled :18445 explicit refusal=PASS
+20/40-Mbps server :447 TCP=PASS; server recorded tx=2500000 bytes/s
+wrong password=REJECTED
+wrong Salamander password=REJECTED
+wrong certificate pin=REJECTED
+
+[transport tuning]
+MTU 1200 + PMTUD disabled + explicit receive windows=PASS
+3000-byte UDP echo through official server=PASS
+4000-byte UDP echo through official server=PASS
+4096-byte UDP request reached the target; official server could not return the same payload because its 4096-byte message buffer must also contain the Hysteria UDP header. The Rust loopback fixture passes a full 4096-byte round trip. This is an official-server interoperability ceiling, not a claimed honk success.
+fragment total=0, fragment id>=total, empty fragment, and length overflow=REJECTED by unit coverage
+
+[port hopping]
+Every redirected UDP port 20000-20010 was individually reachable by the official client.
+End-to-end migration across that public NAT path was lossy for both clients: the official client lost 78/90 UDP probes and its TCP transfer stopped after 15067416/16777216 bytes; honk also observed loss while hopping. No port-hopping performance or reliability claim is made for this environment. Hop intervals below the official 5-second minimum are clamped; malformed ranges and port 0 fail closed.
+
+[integration gateway 10.10.10.50]
+installed_binary_sha256=dadefe6873c5f6f2a75f455a73fe09984230abc9a8fe1c4f8b296ca1d9a5e83a
+TCP generate_204=HTTP 204 in 0.111275 s
+UDP 1200-byte echo=20 sent, 0 lost
+Clash group delay=107 ms
+outbound errors=0
+UDP endpoint hits/misses=19/1
+retained Hysteria2 sessions=1
+
+[cleanup]
+Temporary services, certificates, port-redirection table, and target processes were removed after testing. The production hysteria-server.service remained active on v2.12.2.
