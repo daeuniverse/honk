@@ -469,9 +469,8 @@ fn delay_history_entry(ms: u64, at: std::time::SystemTime) -> serde_json::Value 
     })
 }
 
-/// Build the synthetic GLOBAL selector group: every group plus every node
-/// (clash semantics), with a virtual "Proxy" entry first for dashboard
-/// compatibility. `now` comes from the shared mode state.
+/// Build the synthetic GLOBAL selector from concrete configured groups and
+/// nodes. Every `all` member resolves to a top-level proxy document.
 fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_json::Value {
     let mut all: Vec<String> = Vec::new();
     let mut push_unique = |name: &str| {
@@ -485,14 +484,12 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
     for node in &config.nodes {
         push_unique(&node.name);
     }
-    if !all.is_empty() {
-        all.insert(0, "Proxy".to_string());
-    }
-    let now = if global_selection.is_empty() {
-        "Proxy"
-    } else {
-        global_selection
-    };
+    let now = all
+        .iter()
+        .find(|name| name.as_str() == global_selection)
+        .or_else(|| all.first())
+        .map(String::as_str)
+        .unwrap_or("");
     serde_json::json!({
         "name": "GLOBAL",
         "type": "selector",
@@ -570,8 +567,7 @@ async fn put_proxy(
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
         let config = s.config.read().await;
-        let valid = body.name == "Proxy"
-            || config.groups.iter().any(|g| g.name == body.name)
+        let valid = config.groups.iter().any(|g| g.name == body.name)
             || config.nodes.iter().any(|n| n.name == body.name);
         drop(config);
         if !valid {

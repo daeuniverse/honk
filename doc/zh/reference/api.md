@@ -75,7 +75,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 `PUT /proxies/{name}` 不要求特定 `Content-Type`。对已配置的 Selector 组，目标必须是直接成员 tag；只能经嵌套组到达的叶节点并非直接成员。选择确实发生变化时会调用 group manager 的 cache callback，因此启用 `cache_file` 后会把选择持久化到 `cache.db`。若该组设置了 `interrupt_connections`，honk 会移除与该组、其成员 tag 及可达叶节点关联的已跟踪连接，使后续流量通过新选择重新拨号。写入已有选择不会触发操作。URLTest、LoadBalance、Fallback 及 Score 组都会拒绝该修改。
 
-`GLOBAL` 是合成 Selector。`PUT /proxies/GLOBAL` 接受 `Proxy`、任意已配置组或任意已配置节点，并通过同一个 `DatapathFlagsHandle` 更新；启用 cache database 时，以 `GLOBAL` Selector key 保存该值。
+`GLOBAL` 是合成 Selector，但其 `all` 中每个成员都是具体的已配置组或节点，并有对应的顶层 proxy 文档。`PUT /proxies/GLOBAL` 只接受其中的名称，并通过同一个 `DatapathFlagsHandle` 更新；启用 cache database 时以 `GLOBAL` Selector key 保存。空值、已移除、未知及旧虚拟选择都会回退到第一个具体成员。
 
 ## 外部 UI hosting
 

@@ -1152,18 +1152,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .unwrap_or_else(|| "Rule".to_string());
     #[cfg(not(feature = "clash-api"))]
     let mode = "Rule".to_string();
-    let default_selection = {
+    let (default_selection, valid_global_selections) = {
         let config = control_plane.config_handle();
         let config = config.read().await;
-        config
+        let selections = config
             .groups
-            .first()
+            .iter()
             .map(|group| group.name.clone())
-            .unwrap_or_else(|| "Proxy".to_string())
+            .chain(config.nodes.iter().map(|node| node.name.clone()))
+            .collect::<Vec<_>>();
+        let default = selections.first().cloned().unwrap_or_default();
+        (default, selections)
     };
     let global_selection = cache_db
         .as_ref()
         .and_then(|db| db.load_selector_choice("GLOBAL"))
+        .filter(|selection| {
+            valid_global_selections
+                .iter()
+                .any(|valid| valid == selection)
+        })
         .unwrap_or(default_selection);
     let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
         mode::ModeState::new(&mode, global_selection),
