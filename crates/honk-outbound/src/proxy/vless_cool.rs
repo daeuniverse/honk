@@ -34,6 +34,8 @@ const TCP_QUEUE_CAPACITY: usize = 1024;
 const UDP_QUEUE_CAPACITY: usize = 64;
 const WRITER_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RECEIVE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+// A line-rate burst can fill the budget before its reader task is first scheduled.
+const RECEIVE_BACKPRESSURE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 const READER_YIELD_INTERVAL: usize = 16;
 
 const STATUS_NEW: u8 = 0x01;
@@ -346,7 +348,12 @@ impl VlessCoolSession {
         }
     }
 
-    fn dispatch(self: &Arc<Self>, frame: IncomingFrame) -> io::Result<()> {
+    fn fail_slow_tcp(self: &Arc<Self>, id: u16, message: &'static str) -> io::Result<()> {
+        self.fail_child(id, Failure::new(io::ErrorKind::ConnectionReset, message));
+        self.schedule_end(id)
+    }
+
+    async fn dispatch(self: &Arc<Self>, frame: IncomingFrame) -> io::Result<()> {
         if frame.status == STATUS_KEEPALIVE {
             return Ok(());
         }
@@ -411,36 +418,47 @@ impl VlessCoolSession {
         match delivery {
             Delivery::Tcp(_) if payload.is_empty() => {}
             Delivery::Tcp(tx) => {
-                let permit = match Arc::clone(&self.receive_budget)
-                    .try_acquire_many_owned(payload.len() as u32)
+                let deadline = Instant::now() + RECEIVE_BACKPRESSURE_WAIT;
+                let budget = Arc::clone(&self.receive_budget);
+                let permit = match Arc::clone(&budget).try_acquire_many_owned(payload.len() as u32)
                 {
                     Ok(permit) => permit,
-                    Err(_) => {
-                        self.fail_child(
-                            frame.id,
-                            Failure::new(
-                                io::ErrorKind::ConnectionReset,
-                                "Mux.Cool logical TCP receive budget exhausted",
-                            ),
-                        );
-                        self.schedule_end(frame.id)?;
-                        return Ok(());
-                    }
+                    Err(_) => match tokio::time::timeout_at(
+                        deadline,
+                        budget.acquire_many_owned(payload.len() as u32),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) | Err(_) => {
+                            self.fail_slow_tcp(
+                                frame.id,
+                                "Mux.Cool logical TCP receive budget stalled",
+                            )?;
+                            return Ok(());
+                        }
+                    },
                 };
-                match tx.try_send(QueuedPayload {
+                let queued = QueuedPayload {
                     payload,
                     _permit: permit,
-                }) {
+                };
+                match tx.try_send(queued) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        self.fail_child(
-                            frame.id,
-                            Failure::new(
-                                io::ErrorKind::ConnectionReset,
-                                "Mux.Cool logical TCP consumer stopped draining",
-                            ),
-                        );
-                        self.schedule_end(frame.id)?;
+                    Err(mpsc::error::TrySendError::Full(queued)) => {
+                        match tokio::time::timeout_at(deadline, tx.send(queued)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                self.remove_child(frame.id);
+                                self.schedule_end(frame.id)?;
+                            }
+                            Err(_) => {
+                                self.fail_slow_tcp(
+                                    frame.id,
+                                    "Mux.Cool logical TCP consumer stopped draining",
+                                )?;
+                            }
+                        }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         self.remove_child(frame.id);
@@ -609,7 +627,7 @@ async fn run_reader<R: AsyncRead + Unpin>(
         let Some(session) = session.upgrade() else {
             return;
         };
-        if let Err(error) = session.dispatch(frame) {
+        if let Err(error) = session.dispatch(frame).await {
             session.fail(Failure::from_io(error, "invalid Mux.Cool frame"));
             return;
         }
@@ -1521,6 +1539,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_receive_budget_waits_for_transient_reader_backpressure() {
+        let (client, mut wire) = tokio::io::duplex(1 << 16);
+        let session = connect(Box::new(client)).await.unwrap();
+        let mut stream = open_tcp(
+            Arc::clone(&session),
+            session.try_reserve().unwrap(),
+            "93.184.216.34:443".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("TCP stream must open"));
+        assert_eq!(read_wire_frame(&mut wire).await.id, 1);
+
+        let held = Arc::clone(&session.receive_budget)
+            .acquire_many_owned(RECEIVE_BYTE_BUDGET as u32)
+            .await
+            .unwrap();
+        let dispatch = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                session
+                    .dispatch(IncomingFrame {
+                        metadata: base_metadata(1, STATUS_KEEP, OPTION_DATA).freeze(),
+                        id: 1,
+                        status: STATUS_KEEP,
+                        options: OPTION_DATA,
+                        payload: Some(Bytes::from_static(b"ready")),
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!dispatch.is_finished());
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), dispatch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut output = [0; 5];
+        stream.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"ready");
+        session.close();
+    }
+
+    #[tokio::test]
     async fn unread_tcp_child_does_not_block_siblings() {
         let (client, mut wire) = tokio::io::duplex(1 << 16);
         let session = connect(Box::new(client)).await.unwrap();
@@ -2101,6 +2166,7 @@ mod tests {
                     options: OPTION_DATA,
                     payload: Some(Bytes::from_static(b"forged")),
                 })
+                .await
                 .is_err()
         );
         assert!(!session.ending_ids.lock().contains(&128));
@@ -2113,6 +2179,7 @@ mod tests {
                 options: OPTION_DATA,
                 payload: Some(Bytes::from_static(b"orphan")),
             })
+            .await
             .unwrap();
         gate.open();
         blocker.await.unwrap().unwrap();
