@@ -1497,6 +1497,7 @@ impl TransportQuinnSocket {
                 }
             }
         });
+        let allows_full_cone_replies = transport.allows_full_cone_replies();
         let receiver = tokio::spawn({
             let recv_error = Arc::clone(&recv_error);
             let recv_waker = Arc::clone(&recv_waker);
@@ -1514,7 +1515,7 @@ impl TransportQuinnSocket {
                     if n == 0 {
                         continue;
                     }
-                    if source != remote {
+                    if source != remote && !allows_full_cone_replies {
                         continue;
                     }
                     if n > buf.len() {
@@ -1952,12 +1953,17 @@ mod probe_tests {
     struct SequencePacketTransport {
         remote: SocketAddr,
         packets: Mutex<std::collections::VecDeque<(Vec<u8>, SocketAddr)>>,
+        full_cone: bool,
     }
 
     #[async_trait::async_trait]
     impl PacketTransport for SequencePacketTransport {
         fn relay_addr(&self) -> SocketAddr {
             self.remote
+        }
+
+        fn allows_full_cone_replies(&self) -> bool {
+            self.full_cone
         }
 
         async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
@@ -2111,6 +2117,7 @@ mod probe_tests {
         let socket = TransportQuinnSocket::new(
             Arc::new(SequencePacketTransport {
                 remote,
+                full_cone: false,
                 packets: Mutex::new(std::collections::VecDeque::from([
                     (b"wrong".to_vec(), wrong),
                     (vec![0; 65], remote),
@@ -2150,6 +2157,40 @@ mod probe_tests {
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(&data[..meta[0].len], b"accepted");
+        assert_eq!(meta[0].addr, remote);
+    }
+
+    #[tokio::test]
+    async fn packet_transport_socket_accepts_full_cone_reply_metadata() {
+        let remote: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let reply_source: SocketAddr = "[2001:db8::3]:443".parse().unwrap();
+        let socket = TransportQuinnSocket::new(
+            Arc::new(SequencePacketTransport {
+                remote,
+                packets: Mutex::new(std::collections::VecDeque::from([(
+                    b"accepted".to_vec(),
+                    reply_source,
+                )])),
+                full_cone: true,
+            }),
+            remote,
+        );
+        let mut data = [0; 64];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+
+        let received = tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
+                quinn::AsyncUdpSocket::poll_recv(&*socket, cx, &mut bufs, &mut meta)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
         assert_eq!(received, 1);
         assert_eq!(&data[..meta[0].len], b"accepted");
         assert_eq!(meta[0].addr, remote);
