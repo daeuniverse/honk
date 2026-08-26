@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use honk_config::dns::{DnsRouting, DnsUpstream};
 use honk_config::node::Node;
-use honk_config::types::DnsProtocol;
+use honk_config::types::{DnsProtocol, NodeProtocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -97,8 +97,7 @@ async fn tcp_transport_lifecycle_is_single_flight_and_closes_once() {
 }
 
 #[tokio::test]
-async fn proxied_quic_transports_fail_before_direct_dial() {
-    // Given
+async fn proxied_quic_transports_use_packet_outbound() {
     let router = Arc::new(
         DnsRouter::new(&DnsRouting {
             fallback: "doq".to_string(),
@@ -108,6 +107,7 @@ async fn proxied_quic_transports_fail_before_direct_dial() {
     );
     let proxy = Node {
         name: "proxy".to_string(),
+        protocol: NodeProtocol::Block,
         ..Default::default()
     };
     let upstreams = [
@@ -126,26 +126,57 @@ async fn proxied_quic_transports_fail_before_direct_dial() {
             outbound: Some("proxy".to_string()),
         },
     ];
-    let pool = UpstreamPool::new_with_proxy(&upstreams, router, None, vec![proxy], Vec::new())
-        .expect("pool");
+    let registry = Arc::new(crate::proxy::ProxyRegistry::default_resolver().expect("registry"));
+    let pool =
+        UpstreamPool::new_with_proxy(&upstreams, router, Some(registry), vec![proxy], Vec::new())
+            .expect("pool");
     let query = [0_u8; 12];
 
-    // When
-    let doq = pool.query("doq", &query).await;
-    let doh3 = pool.query("doh3", &query).await;
+    let doq = pool.query("doq", &query).await.expect_err("blocked DoQ");
+    let doh3 = pool.query("doh3", &query).await.expect_err("blocked DoH3");
 
-    // Then
     assert!(
-        doq.expect_err("DoQ proxy rejected")
-            .to_string()
-            .contains("does not support outbound")
+        doq.to_string().contains("UDP connection blocked"),
+        "{doq:#}"
     );
     assert!(
-        doh3.expect_err("DoH3 proxy rejected")
-            .to_string()
-            .contains("does not support outbound")
+        doh3.to_string().contains("UDP connection blocked"),
+        "{doh3:#}"
     );
-    assert_eq!(pool.lifecycle_stats().init_count, 0);
+    assert!(!doq.to_string().contains("does not support outbound"));
+    assert!(!doh3.to_string().contains("does not support outbound"));
+    assert_eq!(pool.lifecycle_stats().init_count, 2);
+}
+
+#[tokio::test]
+async fn proxied_quic_without_registry_fails_closed() {
+    let upstream = DnsUpstream {
+        name: "doq".into(),
+        address: "127.0.0.1:853".into(),
+        protocol: DnsProtocol::Quic,
+        tls_server_name: Some("dns.test".into()),
+        outbound: Some("proxy".into()),
+    };
+    let proxy = Node {
+        name: "proxy".into(),
+        protocol: NodeProtocol::Block,
+        ..Default::default()
+    };
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            fallback: "doq".into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let pool =
+        UpstreamPool::new_with_proxy(&[upstream], router, None, vec![proxy], vec![]).unwrap();
+
+    let error = pool.query("doq", &[0; 12]).await.unwrap_err();
+    assert!(
+        error.to_string().contains("without a proxy registry"),
+        "{error:#}"
+    );
 }
 
 #[tokio::test]

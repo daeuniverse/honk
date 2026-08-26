@@ -101,8 +101,8 @@ A trailing `-> tag` forces the upstream through that node or group. Without it, 
 | TCP | Supported through the outbound TCP stream. |
 | DoT | Supported; TLS runs over the outbound TCP stream. |
 | DoH | Supported; TLS and HTTP/2 run over the outbound TCP stream. |
-| DoQ | Not supported; direct only. |
-| DoH3 | Not supported; direct only. |
+| DoQ | Supported through the outbound's UDP-capable `PacketTransport`. |
+| DoH3 | Supported through the outbound's UDP-capable `PacketTransport`. |
 
 ## DNS routing
 

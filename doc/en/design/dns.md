@@ -177,10 +177,10 @@ When `store_dns` enables persistence, a bounded actor mirrors retained positive 
 | TCP | Idle RFC 7766 stream pool. | Supported through the selected node or group leaf. |
 | DoT | Idle TLS stream pool. | Supported over a proxied TCP base stream. |
 | DoH | One long-lived, multiplexed HTTP/2-only TLS session. | Supported over a proxied TCP base stream. |
-| DoQ | One long-lived QUIC connection; one bidirectional stream per query. | Direct only. |
-| DoH3 | One long-lived QUIC and HTTP/3 session. | Direct only. |
+| DoQ | One long-lived QUIC connection; one bidirectional stream per query. | Supported through the selected leaf's `PacketTransport`. |
+| DoH3 | One long-lived QUIC and HTTP/3 session. | Supported through the selected leaf's `PacketTransport`. |
 
-DoQ and DoH3 are direct-only because their clients create a quinn endpoint on a native bypass-marked UDP socket, while the DNS proxy dial path currently provides only a boxed TCP byte stream. QUIC cannot run over that stream. Proxy support requires adapting the selected outbound's `PacketTransport` to quinn's `AsyncUdpSocket` interface while preserving datagram boundaries, address metadata, MTU behavior, generation ownership, reconnects, and shutdown. Until that adapter exists, a proxy-selected DoQ or DoH3 upstream fails before dialing rather than silently bypassing the selected route; use DoT or DoH for proxied encrypted DNS.
+Proxied DoQ and DoH3 adapt the generation-pinned leaf `PacketTransport` to quinn's `AsyncUdpSocket`. Each pooled QUIC connection or HTTP/3 session owns one bounded adapter and client endpoint until retry or shutdown closes it; datagram boundaries and peer metadata remain intact, and the inner QUIC payload cap is 1252 bytes. A missing proxy registry or packet capability fails closed instead of bypassing to direct. Direct QUIC keeps the reusable native bypass-marked endpoint.
 
 `-> node-or-group` forces one generation-pinned dial leaf. Without an explicit target, the upstream endpoint is passed through the pinned traffic router and group snapshot. UDP+proxy deliberately uses TCP-DNS; this policy is separate from the SOCKS5 RFC 1928 UDP transport used by ordinary proxied UDP flows.
 

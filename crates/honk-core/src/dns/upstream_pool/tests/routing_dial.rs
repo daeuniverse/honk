@@ -43,7 +43,9 @@ fn dial_context_pins_its_outbound_runtime_generation() {
     .with_runtime_generation(Arc::clone(&generation));
 
     let entry = pool.entries.get("proxy").unwrap();
-    let context = pool.dial_context(entry, Some(&node), "1.1.1.1:53".parse().unwrap());
+    let context = pool
+        .dial_context(entry, Some(&node), "1.1.1.1:53".parse().unwrap())
+        .expect("proxy registry");
     let captured = context
         .proxy
         .and_then(|proxy| proxy.generation)
@@ -105,6 +107,50 @@ async fn resolve_dial_leaf_implicit_uses_traffic_router() {
 }
 
 #[tokio::test]
+async fn implicit_quic_routes_match_udp_traffic_rules() {
+    let node = test_node("proxy-leaf");
+    let group = test_group("proxy", GroupPolicy::Score, vec![node.id]);
+    let manager = GroupManager::new(&[group], std::slice::from_ref(&node)).into_shared();
+    let traffic = Arc::new(RwLock::new(
+        Router::new(
+            &[RoutingRule {
+                name: "udp-dns".into(),
+                condition: RoutingCondition {
+                    protocol: vec!["udp".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("proxy".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            }],
+            "direct",
+        )
+        .unwrap(),
+    ));
+    let upstreams = [
+        make_upstream("quic", "192.0.2.53:853", DnsProtocol::Quic),
+        make_upstream("h3", "192.0.2.53:443", DnsProtocol::H3),
+    ];
+    let pool =
+        UpstreamPool::new_with_proxy(&upstreams, make_router(), None, vec![node.clone()], vec![])
+            .unwrap()
+            .with_group_manager(manager)
+            .with_traffic_router(traffic);
+
+    for name in ["quic", "h3"] {
+        let route = pool.resolve_dial_route(&pool.entries[name]).await.unwrap();
+        assert_eq!(route.node.as_ref().expect("UDP traffic route").id, node.id);
+        let context = route.feedback.expect("Score feedback").context().clone();
+        assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Udp);
+        assert_eq!(
+            context.probe_domain,
+            honk_outbound::alive::ProbeDomain::DnsUdp
+        );
+    }
+}
+
+#[tokio::test]
 async fn resolve_dial_leaf_implicit_direct_when_route_is_direct() {
     let traffic = Arc::new(RwLock::new(
         Router::new(&[route("223.5.5.5/32", "direct")], "proxy").unwrap(),
@@ -116,6 +162,40 @@ async fn resolve_dial_leaf_implicit_direct_when_route_is_direct() {
 
     let entry = pool.entries.get("alidns").unwrap();
     assert!(pool.resolve_dial_leaf(entry).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn block_routes_fail_closed() {
+    let forced = DnsUpstream {
+        outbound: Some("block".into()),
+        ..make_upstream("forced", "192.0.2.53:853", DnsProtocol::Quic)
+    };
+    let forced_pool =
+        UpstreamPool::new_with_proxy(&[forced], make_router(), None, vec![], vec![]).unwrap();
+    let forced_error = match forced_pool
+        .resolve_dial_route(&forced_pool.entries["forced"])
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("forced block route must fail"),
+    };
+    assert!(forced_error.to_string().contains("rejected"));
+
+    let routed = make_upstream("routed", "192.0.2.53:443", DnsProtocol::H3);
+    let traffic = Arc::new(RwLock::new(
+        Router::new(&[route("192.0.2.53/32", "block")], "direct").unwrap(),
+    ));
+    let routed_pool = UpstreamPool::new_with_proxy(&[routed], make_router(), None, vec![], vec![])
+        .unwrap()
+        .with_traffic_router(traffic);
+    let routed_error = match routed_pool
+        .resolve_dial_route(&routed_pool.entries["routed"])
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("traffic block route must fail"),
+    };
+    assert!(routed_error.to_string().contains("selected block"));
 }
 
 #[tokio::test]

@@ -353,14 +353,6 @@ impl DnsUpstreamPool for UpstreamPool {
                 route.node.as_ref().map(|node| node.name.as_str()),
                 entry.outbound.is_some()
             );
-            if matches!(entry.protocol, DnsProtocol::Quic | DnsProtocol::H3) && route.node.is_some()
-            {
-                anyhow::bail!(
-                    "DNS upstream '{}' protocol {:?} does not support outbound proxy yet",
-                    upstream_name,
-                    entry.protocol
-                );
-            }
             let injected = if route.node.is_none() {
                 self.prepare_generated_ecs(raw_query)
             } else {

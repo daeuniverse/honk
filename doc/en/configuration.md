@@ -223,7 +223,7 @@ See the [routing reference](./reference/routing.md).
 
 ## DNS setup
 
-Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`udp+tcp://`, `tls://`, `https://`, `quic://`, and `h3://`. Add `-> node-or-group` to force the dial path; TCP, UDP, DoT, and DoH can use a proxy outbound, while DoQ and DoH3 are direct-only. Request routing chooses `reject`, `asis`, or a named upstream; response routing chooses `accept`, `reject`, or a named upstream for a bounded re-query:
+Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`udp+tcp://`, `tls://`, `https://`, `quic://`, and `h3://`. Add `-> node-or-group` to force the dial path; every listed transport can use a proxy outbound when the selected leaf supplies its required capability. DoQ and DoH3 require the leaf's UDP-capable `PacketTransport`; a missing proxy registry or packet capability fails closed. Request routing chooses `reject`, `asis`, or a named upstream; response routing chooses `accept`, `reject`, or a named upstream for a bounded re-query:
 
 ```dae
 dns {

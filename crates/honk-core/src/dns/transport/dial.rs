@@ -12,7 +12,7 @@ pub struct DialContext {
     pub endpoint: DnsEndpoint,
     pub query_timeout: Duration,
     pub dial_timeout: Duration,
-    /// When set, TCP/TLS is established through this proxy to `endpoint`.
+    /// When set, TCP/TLS/QUIC is established through this proxy to `endpoint`.
     pub proxy: Option<ProxyDial>,
 }
 
@@ -147,6 +147,44 @@ impl DialContext {
         }
         let stream = self.dial_tcp_until(deadline).await?;
         Ok(Box::new(stream))
+    }
+    /// Open a proxy packet transport before constructing a QUIC endpoint.
+    pub(super) async fn dial_packet_transport_until(
+        &self,
+        remote: std::net::SocketAddr,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
+        let Some(proxy) = &self.proxy else {
+            anyhow::bail!("packet transport requested without proxy")
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("DNS proxy packet setup deadline elapsed")
+        }
+        let transport = if let Some(generation) = &proxy.generation {
+            tokio::time::timeout_at(
+                deadline,
+                proxy.registry.dial_udp_transport_runtime(
+                    Arc::clone(generation),
+                    proxy.node.id,
+                    remote,
+                    None,
+                    remaining,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("DNS proxy packet setup timed out"))??
+        } else {
+            tokio::time::timeout_at(
+                deadline,
+                proxy
+                    .registry
+                    .dial_udp_transport(&proxy.node, remote, None, remaining),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("DNS proxy packet setup timed out"))??
+        };
+        Ok(transport)
     }
 }
 
