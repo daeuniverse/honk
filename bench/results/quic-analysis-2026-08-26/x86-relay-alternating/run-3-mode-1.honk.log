@@ -1,0 +1,10 @@
+[2m2026-08-26T14:16:47.599438Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay started: 192.168.222.2:58636 → 10.10.10.70:5202
+[2m2026-08-26T14:16:47.603941Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay started: 192.168.222.2:58640 → 10.10.10.70:5202
+[2m2026-08-26T14:16:48.646533Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay complete: 192.168.222.2:58636 → 10.10.10.70:5202 (844 bytes in 1047ms)
+[2m2026-08-26T14:16:48.649914Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay started: 192.168.222.2:58642 → 10.10.10.70:5202
+[2m2026-08-26T14:16:48.650345Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay started: 192.168.222.2:58656 → 10.10.10.70:5202
+[2m2026-08-26T14:16:56.692906Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay complete: 192.168.222.2:58642 → 10.10.10.70:5202 (848 bytes in 8042ms)
+[2m2026-08-26T14:16:57.720719Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay started: 192.168.222.2:33676 → 10.10.10.70:5202
+[2m2026-08-26T14:16:57.722380Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay started: 192.168.222.2:33690 → 10.10.10.70:5202
+[2m2026-08-26T14:17:05.764940Z[0m [33m WARN[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay error for 192.168.222.2:33690 → 10.10.10.70:5202: sending stopped by peer: error 0
+[2m2026-08-26T14:17:05.765512Z[0m [34mDEBUG[0m [2mhonk_core::relay::quic[0m[2m:[0m QUIC chunk relay complete: 192.168.222.2:33676 → 10.10.10.70:5202 (833 bytes in 8044ms)

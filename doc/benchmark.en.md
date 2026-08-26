@@ -167,6 +167,131 @@ Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
 
+## Results (2026-08-26, QUIC profile and optimization gate)
+
+This follow-up profiles the current bounded-GSO implementation at source
+`0bd6135` plus the isolated Juicity candidate `429c540`. The x86 host used one
+musl binary (`e8750633...`), one 1452-byte configuration, 8-second iperf3
+windows, and alternating five-run arms. `reverse` is server-to-client
+download; `forward` is client-to-server upload. Hardware PMU events were not
+available, so the profile evidence is userspace `cpu-clock` sampling,
+process task-clock, syscall counts, and the end-to-end throughput/CPU result.
+
+The full harness reproduction uses the existing 3-cold / 15-hot /
+median-of-3 bandwidth / 200-loaded-stream contract:
+
+| Route | Cold / hot p50 / p95 ms | Bandwidth Mbps / CPU / RSS MiB | Loaded Mbps / p99 / max ms / failures |
+| --- | ---: | ---: | ---: |
+| direct | 16.225 / - / - | 9403 / 0.00 / 45 | 8918 / 8.177 / 13.614 / 0 |
+| HY2 | 8.561 / 1.076 / 3.060 | 6037 / 0.55 / 52 | 5852 / 6.462 / 10.375 / 6 |
+| TUIC | 2.759 / 1.101 / 1.988 | 3355 / 0.34 / 43 | 3428 / 4.189 / 11.539 / 0 |
+
+### Measured bottleneck
+
+| Protocol / direction | Baseline median Mbps / CPU cores | Largest userspace self samples |
+| --- | ---: | --- |
+| HY2 reverse | 6369 / 0.636 | AES-GCM decrypt 14.0%; `memcpy` 12.9% |
+| HY2 forward | 5035 / 1.037 | `memcpy` 15.6%; AES-GCM encrypt 10.7%; mutex contention 6.9% |
+| TUIC reverse | 3758 / 0.367 | `memcpy` 13.7%; AES-GCM decrypt 11.7% |
+| TUIC forward | 5279 / 0.855 | `memcpy` 12.3%; mutex contention 9.3%; AES-GCM encrypt 8.5% |
+
+The remaining leading samples are Quinn packet assembly/decoding, connection
+driver work, and receive reassembly. This places the primary cost in shared
+QUIC crypto and buffer movement rather than one protocol's framing. The
+diagnostic `strace` arms observed roughly 95–102 thousand `sendmsg` and 78–93
+thousand `recvmmsg` calls in one forward window, but tracing reduced throughput
+to about 1.1–1.2 Gbps; those counts are not used as a production comparison.
+
+The instrumented endpoint reported MTU 1452, kernel GSO capacity 64, the
+application cap 16, and GRO 64. Across 43 connection snapshots, neither
+connection nor stream flow-control blocking advanced. This confirms the
+effective GSO cap and gives no measured basis for enlarging receive windows.
+
+### GSO and MTU
+
+The authoritative x86 comparison alternated disabled, cap-4, and cap-16 modes
+within every repetition. Deltas are the median of paired same-run percentage
+changes, not a ratio of aggregate medians.
+
+| Mode | HY2 Mbps / CPU | HY2 paired delta | TUIC Mbps / CPU | TUIC paired delta |
+| --- | ---: | ---: | ---: | ---: |
+| GSO off | 6365 / 0.628 | control | 3319 / 0.343 | control |
+| GSO cap 4 | 6231 / 0.618 | +1.88% | 3280 / 0.328 | -7.65% |
+| GSO cap 16 | 6576 / 0.635 | +3.63% | 3367 / 0.340 | -0.15% |
+
+Cap 16 repeats the existing HY2 gain, but does not improve CPU and does not
+produce the same gain for TUIC. The single-pass cap-8 arm was noisy and the
+cap-32 HY2 arm produced no valid throughput. Nothing justifies widening the
+existing cap or changing the black-hole-safe 1252-byte scalar default.
+
+The final ARM arm used the same binary/config contract and a monotonic
+nanosecond clock for process CPU:
+
+| Mode | HY2 Mbps / CPU | HY2 paired delta | TUIC Mbps / CPU | TUIC paired delta |
+| --- | ---: | ---: | ---: | ---: |
+| GSO off | 334 / 1.419 | control | 249 / 1.059 | control |
+| GSO cap 4 | 330 / 1.440 | -1.29% | 227 / 1.001 | -8.99% |
+| GSO cap 16 | 335 / 1.423 | -0.10% | 233 / 1.020 | -7.73% |
+
+ARM shows no GSO gain. Its TUIC samples are variable, but both enabled medians
+are lower; their lower CPU follows lower delivered throughput and is not an
+efficiency improvement.
+
+### Owned QUIC stream relay prototype
+
+The prototype replaced generic `AsyncRead` buffering only for concrete Quinn
+streams, using `RecvStream::read_chunk` and `SendStream::write_chunk`. It kept
+the current half-close, byte accounting, cancellation, and idle-drain rules.
+
+| TUIC mode / direction | Median Mbps / CPU | Paired throughput delta |
+| --- | ---: | ---: |
+| current relay, reverse | 3368 / 0.344 | control |
+| owned-chunk relay, reverse | 3327 / 0.334 | -1.22% |
+| current relay, forward | 5611 / 0.952 | control |
+| owned-chunk relay, forward | 5852 / 0.957 | +0.01% |
+
+The reverse regression, unchanged paired forward throughput, and only 2.6–2.9%
+CPU reductions fail the no-regression and 10% CPU gates. The prototype was
+reverted; concrete QUIC streams continue through the existing relay.
+
+### Controlled TUIC congestion sweep
+
+| Algorithm | Reverse Mbps / CPU / retransmits | Forward Mbps / CPU / retransmits |
+| --- | ---: | ---: |
+| cubic | 3474 / 0.346 / 1 | 5709 / 0.924 / 9 |
+| BBR | 3454 / 0.337 / 0 | 5488 / 1.042 / 154 |
+| New Reno | 3511 / 0.353 / 0 | 5407 / 0.867 / 15 |
+
+Cubic keeps the highest forward median. BBR costs more CPU and retransmits in
+that direction; New Reno lowers forward throughput. TUIC therefore retains its
+current cubic default. No window, ACK, PMTUD, fairness, or buffer tuning was
+promoted without a changed bottleneck metric.
+
+### Allocation cleanup and final decision
+
+Juicity candidate `429c540` passes an encoded frame to Quinn with
+`write_chunk(Bytes)` and decodes UDP payloads directly into the caller's
+buffer. Three paired 500-packet allocation runs measured approximately 4,828
+versus 5,839 allocation calls, 17.3% fewer calls and about 15% fewer allocated
+bytes. The focused receive test also keeps one caller buffer across 4096
+frames. This allocation-specific cleanup was merged as `d4fd31a` in
+[PR #73](https://github.com/daeuniverse/honk/pull/73).
+Its four focused tests and all 546 `honk-outbound` tests passed; formatting and
+Clippy were clean.
+
+The local end-to-end Juicity arm was too noisy for a throughput claim. The
+surrounding UDP endpoint receive path already reuses one fixed buffer and sends
+from it directly; broader ownership changes would add API and lifetime
+complexity without removing a measured allocation, so none were made.
+Salamander was not present in the throughput fixture and likewise received no
+speculative optimization.
+
+No other end-to-end candidate reached at least 3% median throughput or 10% CPU
+reduction in one stable direction without regressing another, so no further
+performance PR was opened. Full hashes, raw JSON, profiles, alternating rows,
+focused test evidence, and the exact runners are under
+[`quic-analysis-2026-08-26`](../bench/results/quic-analysis-2026-08-26/).
+
 ## Results (2026-08-25, Hysteria2 interoperability and bounded QUIC GSO)
 
 This follow-up validates candidate `c1b8749` against an official Hysteria

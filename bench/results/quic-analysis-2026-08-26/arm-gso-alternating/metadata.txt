@@ -1,0 +1,5 @@
+2026-08-26T14:56:19Z
+Linux OpenWrt 6.12.94 #0 SMP Mon Jun 29 12:59:20 2026 aarch64 GNU/Linux
+1f8d7d06f1d7f000ff7e6e9a61f294d8392532f94d8f9eea96e64fedc81deb8b  /root/honk-quic-profile2-429c540-musl
+5b7048c2831512eef4e8c8acda8b503fd6788a7defdfce0f5833df129382f90b  /root/honk-lab.dae
+target=10.10.10.70 netns=lab duration=8 runs=5

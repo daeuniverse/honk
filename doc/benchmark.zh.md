@@ -147,6 +147,121 @@ ssh root@10.10.10.50 \
 候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
 点估计回退不超过 3% 时通过。
 
+## 结果(2026-08-26,QUIC profile 与优化门槛)
+
+本轮对 source `0bd6135` 的现有有界 GSO 实现及独立 Juicity 候选
+`429c540` 进行 profile。x86 主机固定使用同一个 musl 二进制
+(`e8750633...`)、同一份 1452 字节配置、8 秒 iperf3 窗口及 5 轮交替 arm。
+`reverse` 是 server-to-client 下载,`forward` 是 client-to-server 上传。
+硬件 PMU event 不可用,故 profile 证据由 userspace `cpu-clock` sample、进程
+task-clock、syscall 计数及端到端吞吐/CPU 结果组成。
+
+完整 harness 复现沿用现有 3-cold / 15-hot / bandwidth 3 轮中位数 /
+200-loaded-stream contract：
+
+| 路径 | Cold / hot p50 / p95 ms | Bandwidth Mbps / CPU / RSS MiB | Loaded Mbps / p99 / max ms / 失败 |
+| --- | ---: | ---: | ---: |
+| direct | 16.225 / - / - | 9403 / 0.00 / 45 | 8918 / 8.177 / 13.614 / 0 |
+| HY2 | 8.561 / 1.076 / 3.060 | 6037 / 0.55 / 52 | 5852 / 6.462 / 10.375 / 6 |
+| TUIC | 2.759 / 1.101 / 1.988 | 3355 / 0.34 / 43 | 3428 / 4.189 / 11.539 / 0 |
+
+### 实测瓶颈
+
+| 协议/方向 | 基线中位数 Mbps / CPU 核 | 最大 userspace self sample |
+| --- | ---: | --- |
+| HY2 reverse | 6369 / 0.636 | AES-GCM decrypt 14.0%；`memcpy` 12.9% |
+| HY2 forward | 5035 / 1.037 | `memcpy` 15.6%；AES-GCM encrypt 10.7%；mutex contention 6.9% |
+| TUIC reverse | 3758 / 0.367 | `memcpy` 13.7%；AES-GCM decrypt 11.7% |
+| TUIC forward | 5279 / 0.855 | `memcpy` 12.3%；mutex contention 9.3%；AES-GCM encrypt 8.5% |
+
+其余领先 sample 为 Quinn packet assembly/decoding、connection driver 及
+receive reassembly。主要成本因此位于共享 QUIC crypto 与 buffer movement,
+而非某一个协议的 framing。诊断用 `strace` arm 在一个 forward 窗口内观测到
+约 9.5–10.2 万次 `sendmsg` 与 7.8–9.3 万次 `recvmmsg`,但 tracing 将吞吐降至
+约 1.1–1.2 Gbps；这些计数不作为生产性能对比。
+
+Instrumented endpoint 实报 MTU 1452、kernel GSO capacity 64、application cap
+16 及 GRO 64。在 43 个 connection snapshot 中,connection 与 stream
+flow-control blocked counter 均未增长。这既确认实际 GSO cap,也没有为扩大
+receive window 提供实测依据。
+
+### GSO 与 MTU
+
+权威 x86 对比在每轮中交替执行 disabled、cap-4 与 cap-16。delta 是同轮
+配对百分比变化的中位数,不是聚合中位数的比值。
+
+| 模式 | HY2 Mbps / CPU | HY2 配对 delta | TUIC Mbps / CPU | TUIC 配对 delta |
+| --- | ---: | ---: | ---: | ---: |
+| GSO off | 6365 / 0.628 | control | 3319 / 0.343 | control |
+| GSO cap 4 | 6231 / 0.618 | +1.88% | 3280 / 0.328 | -7.65% |
+| GSO cap 16 | 6576 / 0.635 | +3.63% | 3367 / 0.340 | -0.15% |
+
+Cap 16 重现现有 HY2 增益,但未改善 CPU,TUIC 也没有同等增益。单次 cap-8
+arm 噪声较大,cap-32 HY2 arm 未产生有效吞吐。没有证据支持放宽现有 cap,
+也没有证据支持改变抗黑洞的 1252 字节 scalar 默认值。
+
+最终 ARM arm 使用同一二进制/配置 contract,并以 monotonic nanosecond
+clock 计算进程 CPU：
+
+| 模式 | HY2 Mbps / CPU | HY2 配对 delta | TUIC Mbps / CPU | TUIC 配对 delta |
+| --- | ---: | ---: | ---: | ---: |
+| GSO off | 334 / 1.419 | control | 249 / 1.059 | control |
+| GSO cap 4 | 330 / 1.440 | -1.29% | 227 / 1.001 | -8.99% |
+| GSO cap 16 | 335 / 1.423 | -0.10% | 233 / 1.020 | -7.73% |
+
+ARM 未呈现 GSO 增益。TUIC sample 波动较大,但两个启用模式的中位数都更低；
+其 CPU 降低伴随 delivered throughput 降低,不构成效率改善。
+
+### Owned QUIC stream relay 原型
+
+该原型仅对 concrete Quinn stream 以 `RecvStream::read_chunk` 与
+`SendStream::write_chunk` 替换 generic `AsyncRead` buffering,并保留现有
+half-close、字节计数、取消及 idle-drain 语义。
+
+| TUIC 模式/方向 | 中位数 Mbps / CPU | 配对吞吐 delta |
+| --- | ---: | ---: |
+| 现有 relay,reverse | 3368 / 0.344 | control |
+| owned-chunk relay,reverse | 3327 / 0.334 | -1.22% |
+| 现有 relay,forward | 5611 / 0.952 | control |
+| owned-chunk relay,forward | 5852 / 0.957 | +0.01% |
+
+reverse 回退、配对 forward 吞吐不变且 CPU 仅降低 2.6–2.9%,未通过无回退及
+10% CPU 门槛。原型已回滚；concrete QUIC stream 继续使用现有 relay。
+
+### TUIC congestion 受控 sweep
+
+| 算法 | Reverse Mbps / CPU / retransmits | Forward Mbps / CPU / retransmits |
+| --- | ---: | ---: |
+| cubic | 3474 / 0.346 / 1 | 5709 / 0.924 / 9 |
+| BBR | 3454 / 0.337 / 0 | 5488 / 1.042 / 154 |
+| New Reno | 3511 / 0.353 / 0 | 5407 / 0.867 / 15 |
+
+Cubic 保持最高 forward 中位数。BBR 在该方向消耗更多 CPU 且 retransmit
+更多；New Reno 的 forward 吞吐更低。因此 TUIC 保留现有 cubic 默认值。
+在没有 changed bottleneck metric 时,未推广 window、ACK、PMTUD、fairness
+或 buffer tuning。
+
+### Allocation 清理与最终决策
+
+Juicity 候选 `429c540` 以 `write_chunk(Bytes)` 将编码 frame 交给 Quinn,
+并把 UDP payload 直接解码到调用方 buffer。3 轮配对的 500-packet allocation
+实验约测得 4,828 对 5,839 次 allocation call,即 call 减少 17.3%、allocated
+bytes 约减少 15%。聚焦 receive 测试也在 4096 个 frame 间保持同一个调用方
+buffer。该 allocation-specific cleanup 作为 `d4fd31a` 由
+[PR #73](https://github.com/daeuniverse/honk/pull/73) 合并。
+4 个聚焦测试与全部 546 个 `honk-outbound` 测试均通过,format 与 Clippy
+也保持 clean。
+
+本地 Juicity 端到端 arm 噪声过大,不足以声称吞吐增益。外围 UDP endpoint
+receive path 已复用一个固定 buffer 并直接从中发送；更广泛的 ownership
+改动只会增加 API 与 lifetime 复杂度,却不能删除已测 allocation,故未修改。
+吞吐 fixture 也不含 Salamander,因此未作推测性优化。
+
+其他端到端候选均未能在一个稳定方向达到至少 3% 中位吞吐或 10% CPU
+改善且不让另一方向回退,故未再开 performance PR。完整 hash、raw JSON、
+profile、交替结果、聚焦测试证据及原样 runner 位于
+[`quic-analysis-2026-08-26`](../bench/results/quic-analysis-2026-08-26/)。
+
 ## 结果(2026-08-25,Hysteria2 互操作与有界 QUIC GSO)
 
 本轮以官方 Hysteria v2.12.2 服务端验证候选 `c1b8749`,并测量共享 QUIC

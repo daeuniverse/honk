@@ -1,0 +1,7 @@
+2026-08-26T14:19:21Z
+Linux archlinux 7.1.8-arch1-3 #1 SMP PREEMPT_DYNAMIC Tue, 11 Aug 2026 09:16:08 +0000 x86_64 GNU/Linux
+e87506330bb5e35701b488e61cd3d32577b1afd9453be6a137f61d87ee0be02a  /root/honk-quic-profile2-429c540-musl
+26d4a151097e7bd8537da3e3e748bb3f7cca78fe75fd93f1d5780e20a01bb96c  /root/honk-lab-tuic-bbr.dae
+959969bcd4d27e31b25279046f0b7e4622fb231f156a027521d191cc60436a95  /root/honk-lab-tuic-cubic.dae
+3429a5f1dcee67e720b2aa65be6ace7bc9f545337fb5b4e31174a1d5c504672f  /root/honk-lab-tuic-new-reno.dae
+target=10.10.10.70 netns=lab duration=8 runs=5

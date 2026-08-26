@@ -1,0 +1,15 @@
+experiment	protocol_or_direction	candidate	throughput_delta_pct	cpu_delta_pct	efficiency_delta_pct	decision
+x86-gso	hy2	cap4	1.88	0.36	1.52	reject
+x86-gso	hy2	cap16	3.63	1.20	2.16	retain-current-cap16
+x86-gso	tuic	cap4	-7.65	-9.05	1.54	reject
+x86-gso	tuic	cap16	-0.15	-0.03	1.27	retain-current-cap16
+arm-gso	hy2	cap4	-1.29	0.13	-1.41	reject
+arm-gso	hy2	cap16	-0.10	-0.37	-0.92	no-policy-change
+arm-gso	tuic	cap4	-8.99	-5.50	-3.69	reject
+arm-gso	tuic	cap16	-7.73	-3.73	-3.78	no-policy-change
+quic-chunk-relay	reverse	enabled	-1.22	-2.88	2.99	reject
+quic-chunk-relay	forward	enabled	0.01	-2.62	4.17	reject
+tuic-congestion	reverse	bbr	-1.27	-1.81	0.57	reject
+tuic-congestion	forward	bbr	-5.45	12.72	-15.28	reject
+tuic-congestion	reverse	new-reno	0.37	1.19	0.41	reject
+tuic-congestion	forward	new-reno	-5.45	-3.77	0.15	reject

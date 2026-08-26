@@ -1,0 +1,7 @@
+arm	status
+mtu1252	0
+gso-off	0
+gso-cap4	0
+gso-cap8	0
+gso-cap16	0
+gso-cap32	0

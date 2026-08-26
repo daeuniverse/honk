@@ -1,0 +1,17 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cpu-clock:u'
+# Event count (approx.): 4651302568
+#
+# Overhead  Command          Shared Object                    Symbol      IPC   [IPC Coverage]
+# ........  ...............  ...............................  ..........  ....................
+#
+    15.60%  tokio-rt-worker  honk-quic-profile2-429c540-musl  [.] memcpy  -      -
+
+
+#
+# (Tip: Customize output of perf script with: perf script -F event,ip,sym)
+#

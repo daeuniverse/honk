@@ -1,0 +1,5 @@
+# host=archlinux arch=x86_64 kernel=7.1.8-arch1-3
+# honk_bin=/root/honk-quic-profile2-429c540-musl sha256=e87506330bb5e35701b488e61cd3d32577b1afd9453be6a137f61d87ee0be02a
+# dae_bin=/root/dae sha256=f2dc44b5fa96cd1041ed54082d753a75f81e400b2fe40b7817df0acfae36c2d7
+# lab-bench 2026-08-26T13:25:27Z engines=(honk) protos=(hy2 tuic)
+# engine=honk

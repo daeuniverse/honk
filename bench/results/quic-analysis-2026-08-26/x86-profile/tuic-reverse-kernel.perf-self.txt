@@ -1,0 +1,1836 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 717  of event 'cpu-clock:k'
+# Event count (approx.): 1436873736
+#
+# Overhead  Command          Shared Object                                     Symbol                                                IPC   [IPC Coverage]
+# ........  ...............  ................................................  ....................................................  ....................
+#
+    11.58%  tokio-rt-worker  [kernel.kallsyms]                                 [k] _copy_to_iter                                     -      -
+            |
+            ---_copy_to_iter
+               __skb_datagram_iter
+               skb_copy_datagram_iter
+               udp_recvmsg
+               |
+               |--6.00%--sock_recvmsg
+               |          ____sys_recvmsg
+               |          ___sys_recvmsg
+               |          do_recvmmsg
+               |          __x64_sys_recvmmsg
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --5.58%--____sys_recvmsg
+                          ___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     7.81%  tokio-rt-worker  [kernel.kallsyms]                                 [k] finish_task_switch.isra.0                         -      -
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               |
+               |--5.86%--schedule
+               |          |
+               |          |--4.74%--schedule_hrtimeout_range_clock
+               |          |          do_epoll_wait
+               |          |          do_epoll_pwait.part.0
+               |          |          __x64_sys_epoll_pwait
+               |          |          do_syscall_64
+               |          |          entry_SYSCALL_64_after_hwframe
+               |          |          __syscall6 (inlined)
+               |          |          sccp
+               |          |          |
+               |          |          |--0.84%--0x4c000000f0c68149
+               |          |          |
+               |          |          |--0.56%--0x89493050ff08408b
+               |          |          |
+               |          |          |--0.42%--0x3c824bc8d48ed
+               |          |          |
+               |          |          |--0.28%--0x6ed7e061ed58f5a7
+               |          |          |
+               |          |           --0.28%--0x30404ff01010f1d
+               |          |
+               |          |--0.70%--irqentry_exit
+               |          |          |
+               |          |          |--0.42%--asm_sysvec_call_function_single
+               |          |          |
+               |          |           --0.28%--asm_sysvec_apic_timer_interrupt
+               |          |
+               |           --0.42%--futex_do_wait
+               |                     __futex_wait
+               |                     futex_wait
+               |                     do_futex
+               |                     __x64_sys_futex
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     syscall
+               |
+               |--1.67%--preempt_schedule
+               |          preempt_schedule_thunk
+               |          __local_bh_enable_ip
+               |          __dev_queue_xmit
+               |          ip_finish_output2
+               |          ip_output
+               |          __ip_queue_xmit
+               |          __tcp_transmit_skb
+               |          tcp_write_xmit
+               |          |
+               |          |--1.12%--__tcp_push_pending_frames
+               |          |          tcp_sendmsg_locked
+               |          |          tcp_sendmsg
+               |          |          __sys_sendto
+               |          |          __x64_sys_sendto
+               |          |          do_syscall_64
+               |          |          entry_SYSCALL_64_after_hwframe
+               |          |          __syscall6 (inlined)
+               |          |          sccp
+               |          |
+               |           --0.56%--tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.28%--preempt_schedule_irq
+                          irqentry_exit
+                          asm_sysvec_apic_timer_interrupt
+
+     6.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] _raw_spin_unlock_irqrestore                       -      -
+            |
+            ---_raw_spin_unlock_irqrestore
+               |
+               |--5.44%--sock_def_readable
+               |          tcp_data_queue
+               |          tcp_rcv_established
+               |          tcp_v4_do_rcv
+               |          tcp_v4_rcv
+               |          ip_protocol_deliver_rcu
+               |          ip_local_deliver_finish
+               |          __netif_receive_skb_one_core
+               |          process_backlog
+               |          __napi_poll
+               |          net_rx_action
+               |          handle_softirqs
+               |          do_softirq.part.0
+               |          __local_bh_enable_ip
+               |          __dev_queue_xmit
+               |          ip_finish_output2
+               |          ip_output
+               |          __ip_queue_xmit
+               |          __tcp_transmit_skb
+               |          tcp_write_xmit
+               |          |
+               |          |--3.77%--__tcp_push_pending_frames
+               |          |          tcp_sendmsg_locked
+               |          |          tcp_sendmsg
+               |          |          __sys_sendto
+               |          |          __x64_sys_sendto
+               |          |          do_syscall_64
+               |          |          entry_SYSCALL_64_after_hwframe
+               |          |          __syscall6 (inlined)
+               |          |          sccp
+               |          |
+               |           --1.67%--tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+               |--0.42%--__mod_timer
+               |          sk_reset_timer
+               |          |
+               |           --0.28%--tcp_schedule_loss_probe
+               |                     tcp_write_xmit
+               |                     __tcp_push_pending_frames
+               |                     tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.42%--try_to_wake_up
+                          wake_up_q
+                          futex_wake
+                          do_futex
+                          __x64_sys_futex
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          syscall
+                          0
+                          0x1
+
+     5.86%  tokio-rt-worker  [kernel.kallsyms]                                 [k] iowrite16                                         -      -
+            |
+            ---iowrite16
+               vp_notify
+               virtqueue_notify
+               start_xmit
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     3.49%  tokio-rt-worker  [kernel.kallsyms]                                 [k] kernel_init_pages                                 -      -
+            |
+            ---kernel_init_pages
+               get_page_from_freelist
+               __alloc_frozen_pages_noprof
+               alloc_pages_mpol
+               alloc_pages_noprof
+               skb_page_frag_refill
+               sk_page_frag_refill
+               tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     3.07%  tokio-rt-worker  bpf_prog_4f9302ba65b90ccd_memset                  [k] bpf_prog_4f9302ba65b90ccd_memset                  -      -
+            |
+            |--1.53%--bpf_prog_4f9302ba65b90ccd_memset
+            |          |
+            |           --1.39%--bpf_prog_5187604199dc2f96_do_tproxy_dae0_ingress
+            |                     bpf_prog_59ae615414c5ced6_dae0_ingress
+            |                     __netif_receive_skb_core.constprop.0
+            |                     __netif_receive_skb_one_core
+            |                     process_backlog
+            |                     __napi_poll
+            |                     net_rx_action
+            |                     handle_softirqs
+            |                     do_softirq.part.0
+            |                     __local_bh_enable_ip
+            |                     __dev_queue_xmit
+            |                     ip_finish_output2
+            |                     ip_output
+            |                     __ip_queue_xmit
+            |                     __tcp_transmit_skb
+            |                     tcp_write_xmit
+            |                     |
+            |                      --1.26%--__tcp_push_pending_frames
+            |                                |
+            |                                 --1.12%--tcp_sendmsg_locked
+            |                                           tcp_sendmsg
+            |                                           __sys_sendto
+            |                                           __x64_sys_sendto
+            |                                           do_syscall_64
+            |                                           entry_SYSCALL_64_after_hwframe
+            |                                           __syscall6 (inlined)
+            |                                           sccp
+            |
+            |--0.98%--bpf_prog_4f9302ba65b90ccd_memset
+            |          |
+            |           --0.84%--bpf_prog_507ee4de981de8bb_do_tproxy_lan_egress
+            |                     bpf_prog_946a9a2855aade2b_lan_egress_l2
+            |                     __dev_queue_xmit
+            |                     __bpf_redirect
+            |                     __netif_receive_skb_core.constprop.0
+            |                     __netif_receive_skb_one_core
+            |                     process_backlog
+            |                     __napi_poll
+            |                     net_rx_action
+            |                     handle_softirqs
+            |                     do_softirq.part.0
+            |                     __local_bh_enable_ip
+            |                     __dev_queue_xmit
+            |                     ip_finish_output2
+            |                     ip_output
+            |                     __ip_queue_xmit
+            |                     __tcp_transmit_skb
+            |                     tcp_write_xmit
+            |                     |
+            |                     |--0.56%--__tcp_push_pending_frames
+            |                     |          tcp_sendmsg_locked
+            |                     |          tcp_sendmsg
+            |                     |          __sys_sendto
+            |                     |          __x64_sys_sendto
+            |                     |          do_syscall_64
+            |                     |          entry_SYSCALL_64_after_hwframe
+            |                     |          __syscall6 (inlined)
+            |                     |          sccp
+            |                     |
+            |                      --0.28%--tcp_sendmsg_locked
+            |                                tcp_sendmsg
+            |                                __sys_sendto
+            |                                __x64_sys_sendto
+            |                                do_syscall_64
+            |                                entry_SYSCALL_64_after_hwframe
+            |                                __syscall6 (inlined)
+            |                                sccp
+            |
+             --0.56%--bpf_prog_4f9302ba65b90ccd_memset
+                       |
+                        --0.42%--bpf_prog_aa0144c908950a98_wan_egress_l2
+                                  __dev_queue_xmit
+                                  ip_finish_output2
+                                  ip_output
+                                  ip_send_skb
+                                  udp_send_skb
+                                  udp_sendmsg
+                                  ____sys_sendmsg
+                                  ___sys_sendmsg
+                                  __sys_sendmsg
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __syscall6 (inlined)
+                                  sccp
+
+     2.93%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __check_object_size                               -      -
+            |
+            ---__check_object_size
+               |
+                --2.65%--simple_copy_to_iter
+                          __skb_datagram_iter
+                          skb_copy_datagram_iter
+                          udp_recvmsg
+                          |
+                          |--1.53%--____sys_recvmsg
+                          |          ___sys_recvmsg
+                          |          do_recvmmsg
+                          |          __x64_sys_recvmmsg
+                          |          do_syscall_64
+                          |          entry_SYSCALL_64_after_hwframe
+                          |          __syscall6 (inlined)
+                          |          sccp
+                          |
+                           --1.12%--sock_recvmsg
+                                     ____sys_recvmsg
+                                     ___sys_recvmsg
+                                     do_recvmmsg
+                                     __x64_sys_recvmmsg
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     __syscall6 (inlined)
+                                     sccp
+
+     2.93%  tokio-rt-worker  [kernel.kallsyms]                                 [k] _copy_from_iter                                   -      -
+            |
+            ---_copy_from_iter
+               |
+                --2.79%--tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     1.53%  tokio-rt-worker  [kernel.kallsyms]                                 [k] fdget                                             -      -
+            |
+            ---fdget
+               |
+               |--0.56%--do_recvmmsg
+               |          __x64_sys_recvmmsg
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+               |--0.42%--__sys_sendmsg
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --0.42%--do_epoll_wait
+                          do_epoll_pwait.part.0
+                          __x64_sys_epoll_pwait
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     1.53%  tokio-rt-worker  bpf_prog_62f0517ee3d81067_memmove                 [k] bpf_prog_62f0517ee3d81067_memmove                 -      -
+            |
+            |--0.56%--bpf_prog_62f0517ee3d81067_memmove
+            |          bpf_prog_5187604199dc2f96_do_tproxy_dae0_ingress
+            |          bpf_prog_59ae615414c5ced6_dae0_ingress
+            |          __netif_receive_skb_core.constprop.0
+            |          __netif_receive_skb_one_core
+            |          process_backlog
+            |          __napi_poll
+            |          net_rx_action
+            |          handle_softirqs
+            |          do_softirq.part.0
+            |          __local_bh_enable_ip
+            |          __dev_queue_xmit
+            |          ip_finish_output2
+            |          ip_output
+            |          __ip_queue_xmit
+            |          __tcp_transmit_skb
+            |          tcp_write_xmit
+            |          __tcp_push_pending_frames
+            |          |
+            |           --0.42%--tcp_sendmsg_locked
+            |                     tcp_sendmsg
+            |                     __sys_sendto
+            |                     __x64_sys_sendto
+            |                     do_syscall_64
+            |                     entry_SYSCALL_64_after_hwframe
+            |                     __syscall6 (inlined)
+            |                     sccp
+            |
+            |--0.56%--bpf_prog_62f0517ee3d81067_memmove
+            |          |
+            |          |--0.28%--bpf_prog_aa0144c908950a98_wan_egress_l2
+            |          |          __dev_queue_xmit
+            |          |          ip_finish_output2
+            |          |          ip_output
+            |          |          ip_send_skb
+            |          |          udp_send_skb
+            |          |          udp_sendmsg
+            |          |          ____sys_sendmsg
+            |          |          ___sys_sendmsg
+            |          |          __sys_sendmsg
+            |          |          do_syscall_64
+            |          |          entry_SYSCALL_64_after_hwframe
+            |          |          __syscall6 (inlined)
+            |          |          sccp
+            |          |
+            |           --0.28%--__dev_queue_xmit
+            |                     ip_finish_output2
+            |                     ip_output
+            |                     ip_send_skb
+            |                     udp_send_skb
+            |                     udp_sendmsg
+            |                     ____sys_sendmsg
+            |                     ___sys_sendmsg
+            |                     __sys_sendmsg
+            |                     do_syscall_64
+            |                     entry_SYSCALL_64_after_hwframe
+            |                     __syscall6 (inlined)
+            |                     sccp
+            |
+             --0.42%--bpf_prog_62f0517ee3d81067_memmove
+                       bpf_prog_507ee4de981de8bb_do_tproxy_lan_egress
+                       bpf_prog_946a9a2855aade2b_lan_egress_l2
+                       __dev_queue_xmit
+                       __bpf_redirect
+                       __netif_receive_skb_core.constprop.0
+                       __netif_receive_skb_one_core
+                       process_backlog
+                       __napi_poll
+                       net_rx_action
+                       handle_softirqs
+                       do_softirq.part.0
+                       __local_bh_enable_ip
+                       __dev_queue_xmit
+                       ip_finish_output2
+                       ip_output
+                       __ip_queue_xmit
+                       __tcp_transmit_skb
+                       tcp_write_xmit
+                       __tcp_push_pending_frames
+                       tcp_sendmsg_locked
+                       tcp_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __syscall6 (inlined)
+                       sccp
+
+     1.39%  tokio-rt-worker  [kernel.kallsyms]                                 [k] _raw_spin_unlock_irq                              -      -
+            |
+            ---_raw_spin_unlock_irq
+               |
+                --1.26%--process_backlog
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+                          |
+                          |--0.98%--__tcp_push_pending_frames
+                          |          |
+                          |          |--0.70%--tcp_sendmsg_locked
+                          |          |          tcp_sendmsg
+                          |          |          __sys_sendto
+                          |          |          __x64_sys_sendto
+                          |          |          do_syscall_64
+                          |          |          entry_SYSCALL_64_after_hwframe
+                          |          |          __syscall6 (inlined)
+                          |          |          sccp
+                          |          |
+                          |           --0.28%--tcp_rcv_established
+                          |                     tcp_v4_do_rcv
+                          |                     __release_sock
+                          |                     release_sock
+                          |                     tcp_sendmsg
+                          |                     __sys_sendto
+                          |                     __x64_sys_sendto
+                          |                     do_syscall_64
+                          |                     entry_SYSCALL_64_after_hwframe
+                          |                     __syscall6 (inlined)
+                          |                     sccp
+                          |
+                           --0.28%--tcp_sendmsg_locked
+                                     tcp_sendmsg
+                                     __sys_sendto
+                                     __x64_sys_sendto
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     __syscall6 (inlined)
+                                     sccp
+
+     1.39%  tokio-rt-worker  [kernel.kallsyms]                                 [k] put_cmsg                                          -      -
+            |
+            ---put_cmsg
+               |
+               |--0.98%--ip_cmsg_recv_offset
+               |          udp_recvmsg
+               |          |
+               |          |--0.56%--sock_recvmsg
+               |          |          ____sys_recvmsg
+               |          |          ___sys_recvmsg
+               |          |          do_recvmmsg
+               |          |          __x64_sys_recvmmsg
+               |          |          do_syscall_64
+               |          |          entry_SYSCALL_64_after_hwframe
+               |          |          __syscall6 (inlined)
+               |          |          sccp
+               |          |
+               |           --0.42%--____sys_recvmsg
+               |                     ___sys_recvmsg
+               |                     do_recvmmsg
+               |                     __x64_sys_recvmmsg
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.42%--udp_recvmsg
+                          ____sys_recvmsg
+                          ___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     1.39%  tokio-rt-worker  [kernel.kallsyms]                                 [k] pvclock_clocksource_read_nowd                     -      -
+            |
+            ---pvclock_clocksource_read_nowd
+               kvm_clock_get_cycles
+               |
+               |--0.70%--ktime_get
+               |          |
+               |           --0.42%--tcp_write_xmit
+               |                     __tcp_push_pending_frames
+               |                     tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.56%--ktime_get_ts64
+                          |
+                          |--0.28%--__x64_sys_epoll_pwait
+                          |          do_syscall_64
+                          |          entry_SYSCALL_64_after_hwframe
+                          |          __syscall6 (inlined)
+                          |          sccp
+                          |
+                           --0.28%--select_estimate_accuracy
+                                     do_epoll_wait
+                                     do_epoll_pwait.part.0
+                                     __x64_sys_epoll_pwait
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     __syscall6 (inlined)
+                                     sccp
+
+     1.26%  tokio-rt-worker  [kernel.kallsyms]                                 [k] handle_softirqs                                   -      -
+            |
+            ---handle_softirqs
+               |
+               |--0.98%--__irq_exit_rcu
+               |          |
+               |           --0.84%--common_interrupt
+               |                     asm_common_interrupt
+               |                     |
+               |                      --0.28%--tcp_sendmsg_locked
+               |                                tcp_sendmsg
+               |                                __sys_sendto
+               |                                __x64_sys_sendto
+               |                                do_syscall_64
+               |                                entry_SYSCALL_64_after_hwframe
+               |                                __syscall6 (inlined)
+               |                                sccp
+               |
+                --0.28%--do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+
+     1.26%  tokio-rt-worker  [kernel.kallsyms]                                 [k] kfree                                             -      -
+            |
+            ---kfree
+               |
+               |--0.84%--skb_release_data
+               |          |
+               |          |--0.42%--__kfree_skb
+               |          |          |
+               |          |           --0.28%--tcp_ack
+               |          |                     tcp_rcv_established
+               |          |                     tcp_v4_do_rcv
+               |          |                     __release_sock
+               |          |                     release_sock
+               |          |                     tcp_sendmsg
+               |          |                     __sys_sendto
+               |          |                     __x64_sys_sendto
+               |          |                     do_syscall_64
+               |          |                     entry_SYSCALL_64_after_hwframe
+               |          |                     __syscall6 (inlined)
+               |          |                     sccp
+               |          |
+               |           --0.28%--napi_consume_skb
+               |                     skb_defer_free_flush
+               |                     net_rx_action
+               |                     handle_softirqs
+               |                     do_softirq.part.0
+               |                     __local_bh_enable_ip
+               |                     __dev_queue_xmit
+               |                     ip_finish_output2
+               |                     ip_output
+               |                     __ip_queue_xmit
+               |                     __tcp_transmit_skb
+               |                     tcp_write_xmit
+               |                     __tcp_push_pending_frames
+               |                     tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.28%--___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     1.12%  tokio-rt-worker  [kernel.kallsyms]                                 [k] do_syscall_64                                     -      -
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     1.12%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_sendmsg_locked                                -      -
+            |
+            ---tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.98%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __raw_callee_save___pv_queued_spin_unlock         -      -
+            |
+            ---__raw_callee_save___pv_queued_spin_unlock
+               |
+               |--0.70%--_raw_spin_unlock_bh
+               |          |
+               |          |--0.42%--__skb_recv_udp
+               |          |          udp_recvmsg
+               |          |          ____sys_recvmsg
+               |          |          ___sys_recvmsg
+               |          |          do_recvmmsg
+               |          |          __x64_sys_recvmmsg
+               |          |          do_syscall_64
+               |          |          entry_SYSCALL_64_after_hwframe
+               |          |          __syscall6 (inlined)
+               |          |          sccp
+               |          |
+               |           --0.28%--tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.28%--_raw_spin_unlock
+                          tcp_v4_rcv
+                          ip_protocol_deliver_rcu
+                          ip_local_deliver_finish
+                          __netif_receive_skb_one_core
+                          process_backlog
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+
+     0.98%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __skb_datagram_iter                               -      -
+            |
+            ---__skb_datagram_iter
+               skb_copy_datagram_iter
+               udp_recvmsg
+               |
+               |--0.56%--____sys_recvmsg
+               |          ___sys_recvmsg
+               |          do_recvmmsg
+               |          __x64_sys_recvmmsg
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --0.42%--sock_recvmsg
+                          ____sys_recvmsg
+                          ___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.84%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __virt_addr_valid                                 -      -
+            |
+            ---__virt_addr_valid
+               __check_object_size
+               simple_copy_to_iter
+               __skb_datagram_iter
+               skb_copy_datagram_iter
+               udp_recvmsg
+               |
+                --0.70%--sock_recvmsg
+                          ____sys_recvmsg
+                          ___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.84%  tokio-rt-worker  [kernel.kallsyms]                                 [k] pskb_expand_head                                  -      -
+            |
+            ---pskb_expand_head
+               __pskb_pull_tail
+               skb_ensure_writable
+               bpf_skb_pull_data
+               bpf_prog_5187604199dc2f96_do_tproxy_dae0_ingress
+               bpf_prog_59ae615414c5ced6_dae0_ingress
+               __netif_receive_skb_core.constprop.0
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               |
+               |--0.56%--__tcp_push_pending_frames
+               |          |
+               |           --0.42%--tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.28%--tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.84%  tokio-rt-worker  [kernel.kallsyms]                                 [k] skb_defer_free_flush                              -      -
+            |
+            ---skb_defer_free_flush
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               |
+               |--0.56%--__tcp_push_pending_frames
+               |          |
+               |           --0.42%--tcp_sendmsg_locked
+               |                     tcp_sendmsg
+               |                     __sys_sendto
+               |                     __x64_sys_sendto
+               |                     do_syscall_64
+               |                     entry_SYSCALL_64_after_hwframe
+               |                     __syscall6 (inlined)
+               |                     sccp
+               |
+                --0.28%--tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __inet_lookup_established                         -      -
+            |
+            ---__inet_lookup_established
+               ip_rcv_finish_core
+               ip_rcv
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               |
+                --0.56%--__tcp_push_pending_frames
+                          tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __sk_mem_raise_allocated                          -      -
+            |
+            ---__sk_mem_raise_allocated
+               __sk_mem_schedule
+               |
+               |--0.42%--tcp_wmem_schedule
+               |          tcp_sendmsg_locked
+               |          tcp_sendmsg
+               |          __sys_sendto
+               |          __x64_sys_sendto
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --0.28%--tcp_try_rmem_schedule
+                          tcp_data_queue
+                          tcp_rcv_established
+                          tcp_v4_do_rcv
+                          tcp_v4_rcv
+                          ip_protocol_deliver_rcu
+                          ip_local_deliver_finish
+                          __netif_receive_skb_one_core
+                          process_backlog
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __tcp_transmit_skb                                -      -
+            |
+            ---__tcp_transmit_skb
+               |
+                --0.56%--tcp_write_xmit
+                          __tcp_push_pending_frames
+                          tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] fib_table_lookup                                  -      -
+            |
+            ---fib_table_lookup
+               fib4_rule_action
+               fib_rules_lookup
+               __fib_lookup
+               |
+                --0.56%--ip_route_output_key_hash_rcu
+                          ip_route_output_flow
+                          udp_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] kmem_cache_alloc_node_noprof                      -      -
+            |
+            ---kmem_cache_alloc_node_noprof
+               |
+               |--0.42%--__alloc_skb
+               |          tcp_stream_alloc_skb
+               |          tcp_sendmsg_locked
+               |          tcp_sendmsg
+               |          __sys_sendto
+               |          __x64_sys_sendto
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --0.28%--kmalloc_reserve
+                          __alloc_skb
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] sock_poll                                         -      -
+            |
+            ---sock_poll
+               ep_item_poll.isra.0
+               ep_send_events
+               do_epoll_wait
+               do_epoll_pwait.part.0
+               __x64_sys_epoll_pwait
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+               |
+                --0.28%--0x4800000d30248c89
+
+     0.70%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_rcv_established                               -      -
+            |
+            ---tcp_rcv_established
+               tcp_v4_do_rcv
+               |
+                --0.56%--tcp_v4_rcv
+                          ip_protocol_deliver_rcu
+                          ip_local_deliver_finish
+                          __netif_receive_skb_one_core
+                          process_backlog
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+                          |
+                           --0.42%--__tcp_push_pending_frames
+                                     tcp_sendmsg_locked
+                                     tcp_sendmsg
+                                     __sys_sendto
+                                     __x64_sys_sendto
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     __syscall6 (inlined)
+                                     sccp
+
+     0.70%  tokio-rt-worker  bpf_prog_507ee4de981de8bb_do_tproxy_lan_egress    [k] bpf_prog_507ee4de981de8bb_do_tproxy_lan_egress    -      -
+            |
+            ---bpf_prog_507ee4de981de8bb_do_tproxy_lan_egress
+               bpf_prog_946a9a2855aade2b_lan_egress_l2
+               __dev_queue_xmit
+               __bpf_redirect
+               __netif_receive_skb_core.constprop.0
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               |
+                --0.56%--__tcp_push_pending_frames
+                          tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __pi_memset                                       -      -
+            |
+            ---__pi_memset
+               kmem_cache_alloc_node_noprof
+               |
+               |--0.28%--__alloc_skb
+               |          tcp_stream_alloc_skb
+               |          tcp_sendmsg_locked
+               |          tcp_sendmsg
+               |          __sys_sendto
+               |          __x64_sys_sendto
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --0.28%--kmalloc_reserve
+                          __alloc_skb
+                          tcp_stream_alloc_skb
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __rcu_read_unlock                                 -      -
+            |
+            ---__rcu_read_unlock
+               |
+                --0.28%--ip_output
+                          ip_send_skb
+                          udp_send_skb
+                          udp_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] _copy_from_user                                   -      -
+            |
+            ---_copy_from_user
+               |
+                --0.42%--copy_msghdr_from_user
+                          ___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] do_recvmmsg                                       -      -
+            |
+            ---do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] irqentry_exit                                     -      -
+            |
+            ---irqentry_exit
+               asm_sysvec_call_function_single
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] netif_skb_features                                -      -
+            |
+            ---netif_skb_features
+               validate_xmit_skb
+               __dev_queue_xmit
+               |
+               |--0.28%--ip_finish_output2
+               |          ip_output
+               |          __ip_queue_xmit
+               |          __tcp_transmit_skb
+               |          tcp_write_xmit
+               |          __tcp_push_pending_frames
+               |          tcp_sendmsg_locked
+               |          tcp_sendmsg
+               |          __sys_sendto
+               |          __x64_sys_sendto
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          __syscall6 (inlined)
+               |          sccp
+               |
+                --0.28%--__bpf_redirect
+                          __netif_receive_skb_core.constprop.0
+                          __netif_receive_skb_one_core
+                          process_backlog
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+                          __tcp_push_pending_frames
+                          tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_ack                                           -      -
+            |
+            ---tcp_ack
+               tcp_rcv_established
+               tcp_v4_do_rcv
+               |
+                --0.42%--__release_sock
+                          release_sock
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __netif_receive_skb_core.constprop.0              -      -
+            |
+            ---__netif_receive_skb_core.constprop.0
+               |
+                --0.28%--__netif_receive_skb_one_core
+                          process_backlog
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          tcp_write_xmit
+                          __tcp_push_pending_frames
+                          tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __put_user_nocheck_4                              -      -
+            |
+            ---__put_user_nocheck_4
+               ____sys_recvmsg
+               ___sys_recvmsg
+               do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __sk_mem_schedule                                 -      -
+            |
+            ---__sk_mem_schedule
+               tcp_wmem_schedule
+               tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __skb_recv_udp                                    -      -
+            |
+            ---__skb_recv_udp
+               udp_recvmsg
+               ____sys_recvmsg
+               ___sys_recvmsg
+               do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] _raw_spin_lock_bh                                 -      -
+            |
+            ---_raw_spin_lock_bh
+               |
+                --0.28%--__skb_recv_udp
+                          udp_recvmsg
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] conntrack_mt_v3                                   -      -
+            |
+            ---conntrack_mt_v3
+               nft_match_eval
+               nft_do_chain
+               |
+                --0.28%--nf_route_table_hook4
+                          nf_hook_slow
+                          __ip_local_out
+                          ip_send_skb
+                          udp_send_skb
+                          udp_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] fib_get_table                                     -      -
+            |
+            ---fib_get_table
+               fib4_rule_action
+               fib_rules_lookup
+               __fib_lookup
+               ip_route_output_key_hash_rcu
+               ip_route_output_flow
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] fput                                              -      -
+            |
+            ---fput
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] move_addr_to_user                                 -      -
+            |
+            ---move_addr_to_user
+               ____sys_recvmsg
+               ___sys_recvmsg
+               do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] skb_attempt_defer_free                            -      -
+            |
+            ---skb_attempt_defer_free
+               udp_recvmsg
+               |
+                --0.28%--____sys_recvmsg
+                          ___sys_recvmsg
+                          do_recvmmsg
+                          __x64_sys_recvmmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] skb_release_data                                  -      -
+            |
+            ---skb_release_data
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] start_xmit                                        -      -
+            |
+            ---start_xmit
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_v4_rcv                                        -      -
+            |
+            ---tcp_v4_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               __tcp_push_pending_frames
+               |
+                --0.28%--tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] try_charge_memcg                                  -      -
+            |
+            ---try_charge_memcg
+               mem_cgroup_sk_charge
+               |
+                --0.28%--__sk_mem_raise_allocated
+                          __sk_mem_schedule
+
+     0.42%  tokio-rt-worker  [kernel.kallsyms]                                 [k] virtqueue_disable_cb                              -      -
+            |
+            ---virtqueue_disable_cb
+               start_xmit
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.42%  tokio-rt-worker  bpf_prog_aa0144c908950a98_wan_egress_l2           [k] bpf_prog_aa0144c908950a98_wan_egress_l2           -      -
+            |
+            ---bpf_prog_aa0144c908950a98_wan_egress_l2
+               __dev_queue_xmit
+               |
+                --0.28%--ip_finish_output2
+                          ip_output
+                          ip_send_skb
+                          udp_send_skb
+                          udp_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          __syscall6 (inlined)
+                          sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __alloc_skb                                       -      -
+            |
+            ---__alloc_skb
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __dev_queue_xmit                                  -      -
+            |
+            ---__dev_queue_xmit
+               ip_finish_output2
+               ip_output
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __htab_map_lookup_elem                            -      -
+            |
+            ---__htab_map_lookup_elem
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __import_iovec                                    -      -
+            |
+            ---__import_iovec
+               import_iovec
+               copy_msghdr_from_user
+               ___sys_recvmsg
+               do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __mod_memcg_state                                 -      -
+            |
+            ---__mod_memcg_state
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] __skb_try_recv_from_queue                         -      -
+            |
+            ---__skb_try_recv_from_queue
+               __skb_recv_udp
+               udp_recvmsg
+               sock_recvmsg
+               ____sys_recvmsg
+               ___sys_recvmsg
+               do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] check_stack_object                                -      -
+            |
+            ---check_stack_object
+               __check_object_size
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] do_epoll_wait                                     -      -
+            |
+            ---do_epoll_wait
+               do_epoll_pwait.part.0
+               __x64_sys_epoll_pwait
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] free_tail_page_prepare                            -      -
+            |
+            ---free_tail_page_prepare
+               __free_frozen_pages
+               skb_release_data
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] htab_map_hash                                     -      -
+            |
+            ---htab_map_hash
+               __htab_map_lookup_elem
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] inet_recvmsg                                      -      -
+            |
+            ---inet_recvmsg
+               ____sys_recvmsg
+               ___sys_recvmsg
+               do_recvmmsg
+               __x64_sys_recvmmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] ip_finish_output2                                 -      -
+            |
+            ---ip_finish_output2
+               ip_output
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] ip_route_output_key_hash_rcu                      -      -
+            |
+            ---ip_route_output_key_hash_rcu
+               ip_route_output_flow
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] ipv4_dst_check                                    -      -
+            |
+            ---ipv4_dst_check
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] kmem_cache_free                                   -      -
+            |
+            ---kmem_cache_free
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] kvm_clock_get_cycles                              -      -
+            |
+            ---kvm_clock_get_cycles
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] lookup_nulls_elem_raw                             -      -
+            |
+            ---lookup_nulls_elem_raw
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] mutex_lock                                        -      -
+            |
+            ---mutex_lock
+               ep_send_events
+               do_epoll_wait
+               do_epoll_pwait.part.0
+               __x64_sys_epoll_pwait
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] nf_conntrack_in                                   -      -
+            |
+            ---nf_conntrack_in
+               nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] nf_ct_get_tuple                                   -      -
+            |
+            ---nf_ct_get_tuple
+               nf_conntrack_in
+               nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] nf_hook_slow                                      -      -
+            |
+            ---nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] nf_nat_ipv4_local_fn                              -      -
+            |
+            ---nf_nat_ipv4_local_fn
+               nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] nf_nat_ipv4_out                                   -      -
+            |
+            ---nf_nat_ipv4_out
+               nf_hook_slow
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] nft_match_eval                                    -      -
+            |
+            ---nft_match_eval
+               nft_do_chain
+               nf_route_table_hook4
+               nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] page_counter_uncharge                             -      -
+            |
+            ---page_counter_uncharge
+               drain_stock
+               refill_stock
+               __sk_mem_reduce_allocated
+               udp_rmem_release
+               __skb_recv_udp
+               udp_recvmsg
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] passthru_features_check                           -      -
+            |
+            ---passthru_features_check
+               netif_skb_features
+               validate_xmit_skb
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               __tcp_push_pending_frames
+               tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] sock_def_readable                                 -      -
+            |
+            ---sock_def_readable
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_data_queue                                    -      -
+            |
+            ---tcp_data_queue
+               tcp_rcv_established
+               tcp_v4_do_rcv
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_measure_rcv_mss                               -      -
+            |
+            ---tcp_measure_rcv_mss
+               tcp_event_data_recv
+               tcp_data_queue
+               tcp_rcv_established
+               tcp_v4_do_rcv
+               tcp_v4_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               __tcp_push_pending_frames
+               tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_options_write                                 -      -
+            |
+            ---tcp_options_write
+               __tcp_transmit_skb
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_queue_rcv                                     -      -
+            |
+            ---tcp_queue_rcv
+               tcp_data_queue
+               tcp_rcv_established
+               tcp_v4_do_rcv
+               tcp_v4_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               __tcp_push_pending_frames
+               tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] tcp_tso_segs                                      -      -
+            |
+            ---tcp_tso_segs
+               tcp_write_xmit
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] trie_lookup_elem                                  -      -
+            |
+            ---trie_lookup_elem
+               bpf_prog_9a8628d51af8ac42_egress_snat
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] udp4_hwcsum                                       -      -
+            |
+            ---udp4_hwcsum
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] udp_sendmsg                                       -      -
+            |
+            ---udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] virtqueue_enable_cb_delayed_split                 -      -
+            |
+            ---virtqueue_enable_cb_delayed_split
+               start_xmit
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                                 [k] vp_notify                                         -      -
+            |
+            ---vp_notify
+               virtqueue_notify
+               start_xmit
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __syscall6 (inlined)
+               sccp
+
+
+
+#
+# (Tip: To show time in nanoseconds in record/report add --ns)
+#

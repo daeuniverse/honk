@@ -1,0 +1,115 @@
+# 2026-08-26 QUIC profile and candidate evaluation
+run_date_utc=2026-08-26
+source_base=0bd6135
+juicity_candidate=429c540
+juicity_merged=d4fd31a
+juicity_pr=https://github.com/daeuniverse/honk/pull/73
+implementation_branch=perf/quic-analysis
+benchmark_branch=bench
+
+[x86]
+host=10.10.10.49
+kernel=Linux 7.1.8-arch1-3
+arch=x86_64
+profile_binary_sha256=e87506330bb5e35701b488e61cd3d32577b1afd9453be6a137f61d87ee0be02a
+config_sha256=959969bcd4d27e31b25279046f0b7e4622fb231f156a027521d191cc60436a95
+harness_sha256=6d650f4f52a943bb2732aa99907c194f90730a1115d4be245a2cd48d989cffdc
+latency_collector_sha256=aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575
+
+[arm]
+host=10.10.10.118
+kernel=Linux OpenWrt 6.12.94
+arch=aarch64
+profile_binary_sha256=1f8d7d06f1d7f000ff7e6e9a61f294d8392532f94d8f9eea96e64fedc81deb8b
+config_sha256=5b7048c2831512eef4e8c8acda8b503fd6788a7defdfce0f5833df129382f90b
+service_after_run=running
+temporary_firewall_rule_after_run=absent
+
+[method]
+target=10.10.10.70
+netns=lab
+bandwidth_duration_s=8
+alternating_runs=5
+directions=reverse(server-to-client),forward(client-to-server)
+cpu=process utime+stime divided by monotonic wall time
+profile_hardware_pmu=unavailable
+profile_event=cpu-clock:u
+profile_callgraph=dwarf
+syscall_trace=diagnostic only; tracing materially reduced throughput
+juicity_endpoint=no stable external proxy fixture; no end-to-end throughput claim
+command_profile=DURATION=8 bash runners/profile.sh BIN CONFIG OUT
+command_gso_matrix=bash runners/gso-matrix.sh BIN CONFIG_1452 CONFIG_1252 OUT
+command_gso_x86=RUNS=5 DURATION=8 bash runners/gso-alternating-x86.sh BIN CONFIG OUT
+command_gso_arm=RUNS=5 DURATION=8 bash runners/gso-alternating.sh BIN CONFIG OUT
+command_relay=RUNS=5 DURATION=8 bash runners/relay-alternating.sh BIN CONFIG OUT
+command_congestion=RUNS=5 DURATION=8 bash runners/tuic-congestion.sh BIN OUT
+
+[decisions]
+juicity=accepted and merged in PR 73; approximately 17.31 percent fewer allocation calls and 15 percent fewer allocated bytes per 500 packets
+quic_chunk_relay=rejected and reverted; reverse throughput -1.22 percent, paired forward throughput +0.01 percent, CPU reduction below 3 percent
+tuic_congestion=retain cubic; BBR paired forward throughput -5.45 percent and CPU +12.72 percent versus cubic
+x86_gso=retain current cap16 policy; HY2 paired median +3.63 percent versus off, TUIC -0.15 percent
+arm_gso=reject policy expansion; cap16 paired median HY2 -0.10 percent and TUIC -7.73 percent versus off
+mtu=retain 1252 default; no safe-path evidence justified enabling GSO by default
+udp_cleanup=no broader change; endpoint receive already reuses one fixed buffer
+salamander=no change; throughput fixture did not exercise it
+window_ack_pmtud_fairness_buffers=no change without a changed bottleneck metric
+promotion_threshold=at least 3 percent median throughput or 10 percent CPU reduction without directional regression
+further_performance_pr=none
+
+[profile_medians]
+hy2_reverse_mbps_cpu=6369.340,0.6362
+hy2_forward_mbps_cpu=5035.040,1.0374
+tuic_reverse_mbps_cpu=3758.429,0.3671
+tuic_forward_mbps_cpu=5279.175,0.8549
+reverse_hotspots=memcpy,AES-GCM-decrypt,Quinn decode/reassembly
+forward_hotspots=memcpy,AES-GCM-encrypt,Quinn packet assembly,mutex contention
+endpoint_runtime=max_udp_payload_size=1452,gso_enabled=true,kernel_max_gso_segments=64,max_transmit_segments=16,gro_segments=64
+connection_snapshots=43
+positive_flow_control_blocked_snapshots=0
+
+[gso_x86_medians]
+hy2_off_mbps_cpu=6365.477,0.6275
+hy2_cap4_mbps_cpu_paired_delta=6231.409,0.6175,+1.88%
+hy2_cap16_mbps_cpu_paired_delta=6576.212,0.6350,+3.63%
+tuic_off_mbps_cpu=3318.837,0.3430
+tuic_cap4_mbps_cpu_paired_delta=3279.974,0.3278,-7.65%
+tuic_cap16_mbps_cpu_paired_delta=3366.959,0.3404,-0.15%
+
+[gso_arm_medians]
+hy2_off_mbps_cpu=334.438,1.4191
+hy2_cap4_mbps_cpu_paired_delta=330.122,1.4399,-1.29%
+hy2_cap16_mbps_cpu_paired_delta=334.699,1.4231,-0.10%
+tuic_off_mbps_cpu=249.393,1.0591
+tuic_cap4_mbps_cpu_paired_delta=226.967,1.0008,-8.99%
+tuic_cap16_mbps_cpu_paired_delta=232.747,1.0198,-7.73%
+
+[relay_medians]
+reverse_current_mbps_cpu=3368.141,0.3443
+reverse_owned_chunk_mbps_cpu_paired_delta=3327.078,0.3344,-1.22%
+forward_current_mbps_cpu=5611.462,0.9519
+forward_owned_chunk_mbps_cpu_paired_delta=5852.040,0.9568,+0.01%
+
+[tuic_congestion_medians]
+cubic_reverse_mbps_cpu_retransmits=3474.313,0.3455,1
+cubic_forward_mbps_cpu_retransmits=5709.085,0.9235,9
+bbr_reverse_mbps_cpu_retransmits=3453.697,0.3368,0
+bbr_forward_mbps_cpu_retransmits=5487.772,1.0422,154
+new_reno_reverse_mbps_cpu_retransmits=3510.892,0.3530,0
+new_reno_forward_mbps_cpu_retransmits=5406.817,0.8669,15
+
+[evidence]
+x86_reproduced_baseline=x86-baseline/
+x86_profile=x86-profile/
+raw_profile_archive=x86-profile/perf-data.tar.zst
+raw_profile_archive_sha256=55000edf9f7fcf06db9e79f88c7047a6d0e79805361dbe5e2494b77f2c12ef2d
+telemetry_archive=x86-profile/telemetry.tar.zst
+telemetry_archive_sha256=1baf068ec229afdb5c1b9252f7c4b63fcb9cc0fdfe02946c7aff972aad465404
+x86_gso_matrix=x86-gso-matrix/
+x86_gso_alternating=x86-gso-alternating/
+arm_gso_alternating=arm-gso-alternating/
+x86_relay_alternating=x86-relay-alternating/
+x86_tuic_congestion=x86-tuic-congestion/
+paired_summary=paired-summary.tsv
+juicity_allocation=juicity-allocation.txt
+exact_runners=runners/

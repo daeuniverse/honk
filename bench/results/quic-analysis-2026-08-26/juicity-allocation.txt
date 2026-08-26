@@ -1,0 +1,12 @@
+candidate_commit=429c540d9f72
+merged_commit=d4fd31a
+pull_request=https://github.com/daeuniverse/honk/pull/73
+workload_packets=500
+paired_runs=3
+candidate_allocations_approx=4828
+baseline_allocations_approx=5839
+allocation_call_reduction_pct=17.31
+allocated_byte_reduction_pct_approx=15
+focused_juicity_tests=4
+honk_outbound_tests=546
+end_to_end_throughput_claim=none
