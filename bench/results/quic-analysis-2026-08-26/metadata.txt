@@ -36,7 +36,7 @@ profile_hardware_pmu=unavailable
 profile_event=cpu-clock:u
 profile_callgraph=dwarf
 syscall_trace=diagnostic only; tracing materially reduced throughput
-juicity_endpoint=no stable external proxy fixture; no end-to-end throughput claim
+juicity_endpoint=existing official Go v0.4.3 server at 10.10.10.70:2451; paired current-main honk-vs-dae evidence under juicity-x86/
 command_profile=DURATION=8 bash runners/profile.sh BIN CONFIG OUT
 command_gso_matrix=bash runners/gso-matrix.sh BIN CONFIG_1452 CONFIG_1252 OUT
 command_gso_x86=RUNS=5 DURATION=8 bash runners/gso-alternating-x86.sh BIN CONFIG OUT
@@ -46,6 +46,8 @@ command_congestion=RUNS=5 DURATION=8 bash runners/tuic-congestion.sh BIN OUT
 
 [decisions]
 juicity=accepted and merged in PR 73; approximately 17.31 percent fewer allocation calls and 15 percent fewer allocated bytes per 500 packets
+juicity_engine_tcp=full contract paired throughput -0.17 percent and CPU -23.75 percent; focused five-pair capacity throughput +6.34 percent and CPU -21.95 percent; report the run range rather than a universal throughput win
+juicity_engine_udp=dae leads saturated throughput by 4.27 percent in the full contract and 6.67 percent in the five-pair capacity run
 quic_chunk_relay=rejected and reverted; reverse throughput -1.22 percent, paired forward throughput +0.01 percent, CPU reduction below 3 percent
 tuic_congestion=retain cubic; BBR paired forward throughput -5.45 percent and CPU +12.72 percent versus cubic
 x86_gso=retain current cap16 policy; HY2 paired median +3.63 percent versus off, TUIC -0.15 percent
@@ -112,4 +114,5 @@ x86_relay_alternating=x86-relay-alternating/
 x86_tuic_congestion=x86-tuic-congestion/
 paired_summary=paired-summary.tsv
 juicity_allocation=juicity-allocation.txt
+juicity_x86=juicity-x86/
 exact_runners=runners/

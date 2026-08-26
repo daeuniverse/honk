@@ -50,6 +50,12 @@ ssh root@10.10.10.49 \
   "HONK_CONFIG=/root/honk-rprx.dae VLESS_VISION_INDEX=1 \
    VLESS_REALITY_INDEX=2 VMESS_INDEX=3 bash /root/lab-bench.sh \
    'honk' 'vless-vision vless-reality vmess'"
+
+# Dedicated Juicity configs reuse target slot 1.
+ssh root@10.10.10.49 \
+  "HONK_CONFIG=/root/honk-lab-juicity.dae \
+   DAE_CONFIG=/root/dae-lab-juicity.dae JUICITY_INDEX=1 \
+   bash /root/lab-bench.sh 'honk dae' 'juicity'"
 # args: [engines] [protocols] — both are space lists inside one arg
 ```
 
@@ -70,7 +76,8 @@ prints host/kernel and honk/dae SHA-256 identities on stderr.
   `net.ipv4.ip_forward=1` after every host reboot before the direct preflight.
   Standard configs route `5201/8001 → hy2` through `5206/8006 → anytls-go`.
   Dedicated rprx configs reuse target slots 1–3 with `VLESS_VISION_INDEX=1`,
-  `VLESS_REALITY_INDEX=2`, and `VMESS_INDEX=3`.
+  `VLESS_REALITY_INDEX=2`, and `VMESS_INDEX=3`; dedicated Juicity configs reuse
+  slot 1 with `JUICITY_INDEX=1`.
 - honk's lab config must expose the clash API on `127.0.0.1:9090` — the
   harness uses the API listener to identify the *active* engine process
   (a second honk instance parked on the singleton flock reports zero CPU
@@ -78,6 +85,9 @@ prints host/kernel and honk/dae SHA-256 identities on stderr.
 - Live targets on 10.10.10.70: HTTP `8001-8006`, iperf3 `5201-5206`,
   direct controls `8080`/`5300`, and UDP echo `53531-53536`; churn/reload
   servers use `18006-18007` (`18007/big.bin` is the throttled long stream).
+- The dedicated Juicity run uses the existing official Go v0.4.3 server at
+  `10.10.10.70:2451`; exact paired configs and raw evidence are archived under
+  `results/quic-analysis-2026-08-26/juicity-x86/`.
 - `latency_stability.py` must be beside the driver unless
   `STABILITY_COLLECTOR` names another path.
 

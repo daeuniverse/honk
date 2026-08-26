@@ -1,0 +1,41 @@
+global {
+    wan_interface: ens3
+    lan_interface: veth-lab
+    log_level: info
+    dial_mode: ip
+    allow_insecure: true
+    auto_config_kernel_parameter: true
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
+    check_interval: 3600s
+    check_tolerance: 30ms
+}
+
+node {
+    juicity: 'juicity://00000000-0000-0000-0000-000000000001:testpass123@10.10.10.70:2451/?sni=hy2.test&allow_insecure=1&mtu=1452'
+}
+
+group {
+    juicity {
+        filter: name('juicity')
+        policy: fixed(0)
+    }
+}
+
+routing {
+    dport(2451) -> direct(must)
+    dport(5201, 8001, 53531) -> juicity
+    fallback: direct
+}
+
+dns {
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+    }
+    routing {
+        request {
+            fallback: alidns
+        }
+    }
+}

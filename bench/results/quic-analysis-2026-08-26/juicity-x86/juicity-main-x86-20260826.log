@@ -1,0 +1,34 @@
+# host=archlinux arch=x86_64 kernel=7.1.8-arch1-3
+# honk_bin=/root/honk-main-4c3ade-musl sha256=ba2821e3c5d1d38db4ba434400449e8f84e950c4746fedf6164e1db629d532a7
+# dae_bin=/root/dae sha256=f2dc44b5fa96cd1041ed54082d753a75f81e400b2fe40b7817df0acfae36c2d7
+# lab-bench 2026-08-26T16:12:45Z engines=(honk dae honk dae) protos=(juicity)
+| engine | protocol | cold(s) | hot p50(s) | hot p95(s) | bw(Mbps) | cpu(cores) | rss(MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+# engine=honk
+| honk | direct | 0.001431 | - | - | 9401 | 0.00 | 39 |
+| honk | juicity | 0.003040 | 0.000839 | 0.001949 | 5466 | 0.53 | 42 |
+| honk | juicity/udp | 0.000094 | - | - | 1171(73.1%) | 0.45 | - |
+# engine=dae
+| dae | direct | 0.001478 | - | - | 9399 | 0.00 | 40 |
+| dae | juicity | 0.004136 | 0.000841 | 0.001307 | 6420 | 0.81 | 52 |
+| dae | juicity/udp | 0.000149 | - | - | 1196(70.9%) | 0.42 | - |
+# engine=honk
+| honk | direct | 0.001164 | - | - | 9407 | 0.00 | 39 |
+| honk | juicity | 0.001415 | 0.000910 | 0.002687 | 6514 | 0.61 | 45 |
+| honk | juicity/udp | 0.000072 | - | - | 1112(72.3%) | 0.40 | - |
+# engine=dae
+| dae | direct | 0.001485 | - | - | 9408 | 0.00 | 48 |
+| dae | juicity | 0.003438 | 0.000712 | 0.001214 | 6525 | 0.80 | 50 |
+| dae | juicity/udp | 0.000097 | - | - | 1183(71.6%) | 0.43 | - |
+
+## loaded latency stability (200 samples, 250ms cadence)
+| engine | protocol | load(Mbps) | p50(ms) | p95(ms) | p99(ms) | max(ms) | failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 9405 | 1.591 | 2.155 | 2.998 | 3.491 | 0/200 |
+| honk | juicity | 5551 | 1.562 | 2.529 | 3.436 | 3.559 | 0/200 |
+| dae | direct | 9407 | 1.603 | 2.315 | 3.008 | 3.547 | 0/200 |
+| dae | juicity | 6211 | 1.874 | 3.389 | 4.599 | 5.689 | 0/200 |
+| honk | direct | 9401 | 1.531 | 2.146 | 2.782 | 3.045 | 0/200 |
+| honk | juicity | 6044 | 1.562 | 3.257 | 4.184 | 4.498 | 0/200 |
+| dae | direct | 9407 | 1.543 | 2.020 | 2.521 | 2.612 | 0/200 |
+| dae | juicity | 5891 | 1.977 | 3.398 | 5.703 | 8.608 | 13/200 |

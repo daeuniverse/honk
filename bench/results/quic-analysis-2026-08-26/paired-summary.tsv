@@ -13,3 +13,7 @@ tuic-congestion	reverse	bbr	-1.27	-1.81	0.57	reject
 tuic-congestion	forward	bbr	-5.45	12.72	-15.28	reject
 tuic-congestion	reverse	new-reno	0.37	1.19	0.41	reject
 tuic-congestion	forward	new-reno	-5.45	-3.77	0.15	reject
+juicity-honk-vs-dae	full-tcp	current-main	-0.17	-23.75	30.93	tied-throughput-honk-efficient
+juicity-honk-vs-dae	capacity-tcp	current-main	6.34	-21.95	36.56	honk-capacity-win
+juicity-honk-vs-dae	full-udp	current-main	-4.27	4.65	-8.53	dae-overload-win
+juicity-honk-vs-dae	capacity-udp	current-main	-6.67	0.00	-6.99	dae-overload-win

@@ -1,0 +1,34 @@
+# host=archlinux arch=x86_64 kernel=7.1.8-arch1-3
+# honk_bin=/root/honk-quic-profile2-429c540-musl sha256=e87506330bb5e35701b488e61cd3d32577b1afd9453be6a137f61d87ee0be02a
+# dae_bin=/root/dae sha256=f2dc44b5fa96cd1041ed54082d753a75f81e400b2fe40b7817df0acfae36c2d7
+# lab-bench 2026-08-26T15:43:22Z engines=(honk dae honk dae) protos=(juicity)
+| engine | protocol | cold(s) | hot p50(s) | hot p95(s) | bw(Mbps) | cpu(cores) | rss(MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+# engine=honk
+| honk | direct | 0.001229 | - | - | 9411 | 0.00 | 41 |
+| honk | juicity | 0.001710 | 0.000852 | 0.001713 | 6655 | 0.62 | 46 |
+| honk | juicity/udp | 0.000103 | - | - | 1205(72.2%) | 0.45 | - |
+# engine=dae
+| dae | direct | 0.001393 | - | - | 9407 | 0.00 | 39 |
+| dae | juicity | 0.004258 | 0.000770 | 0.001155 | 6333 | 0.79 | 53 |
+| dae | juicity/udp | 0.000129 | - | - | 1185(71.7%) | 0.42 | - |
+# engine=honk
+| honk | direct | 0.001359 | - | - | 9410 | 0.00 | 76 |
+| honk | juicity | 0.001857 | 0.000833 | 0.001674 | 6560 | 0.62 | 41 |
+| honk | juicity/udp | 0.000090 | - | - | 1120(73.1%) | 0.42 | - |
+# engine=dae
+| dae | direct | 0.001118 | - | - | 9409 | 0.00 | 53 |
+| dae | juicity | 0.004273 | 0.000810 | 0.001547 | 6489 | 0.80 | 53 |
+| dae | juicity/udp | 0.000093 | - | - | 1145(71.7%) | 0.41 | - |
+
+## loaded latency stability (200 samples, 250ms cadence)
+| engine | protocol | load(Mbps) | p50(ms) | p95(ms) | p99(ms) | max(ms) | failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 9407 | 1.602 | 2.129 | 2.627 | 4.033 | 0/200 |
+| honk | juicity | 6584 | 1.507 | 2.695 | 3.667 | 6.471 | 2/200 |
+| dae | direct | 9407 | 1.532 | 2.059 | 2.564 | 4.434 | 0/200 |
+| dae | juicity | 6248 | 1.942 | 3.421 | 4.662 | 4.869 | 2/200 |
+| honk | direct | 9404 | 1.603 | 2.167 | 2.445 | 3.175 | 0/200 |
+| honk | juicity | 6409 | 1.508 | 2.664 | 3.722 | 8.187 | 0/200 |
+| dae | direct | 9410 | 1.577 | 1.984 | 2.255 | 2.811 | 0/200 |
+| dae | juicity | 6203 | 1.953 | 3.745 | 6.154 | 6.430 | 7/200 |

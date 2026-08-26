@@ -9,4 +9,5 @@ allocation_call_reduction_pct=17.31
 allocated_byte_reduction_pct_approx=15
 focused_juicity_tests=4
 honk_outbound_tests=546
-end_to_end_throughput_claim=none
+candidate_vs_baseline_end_to_end_throughput_claim=none
+current_main_vs_dae_evidence=juicity-x86/

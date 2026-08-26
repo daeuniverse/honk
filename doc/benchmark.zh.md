@@ -51,10 +51,10 @@
 - 当前 SSH 凭据无法读取 `.70` 上 rprx server 的 process/version。精确客户端
   wire 参数和两端 client binary hash 已保留,但这些行不能当作 server-version
   回归基线。
-- 2026-08-08 代理矩阵覆盖实验室已配置且可达的全部 endpoint:HY2、TUIC、
-  SS2022、Trojan、两个 AnyTLS server、VLESS Vision/REALITY 与 VMess。
-  SOCKS5/Juicity 没有可用的配对 A/B 代理 endpoint；Block 没有吞吐路径,
-  Direct 是对照。下文较早的 Juicity direct-UDP 卸载结果不是 Juicity 代理对比。
+- 2026-08-08 代理矩阵覆盖当时已配置的全部 endpoint：HY2、TUIC、SS2022、
+  Trojan、两个 AnyTLS server、VLESS Vision/REALITY 与 VMess。当前仍无
+  SOCKS5 endpoint。Juicity 未进入该矩阵；下文补充 2026-08-26 针对现有 Go
+  server 的专用对比。较早的 Juicity direct-UDP 卸载结果不是代理对比。
 
 ## 各组件位置
 
@@ -62,6 +62,7 @@
 | --- | --- | --- |
 | hy2 server | 官方 `hysteria` | `:8443`,密码 `testpass123`,证书 CN `hy2.test` |
 | TUIC server | `tuic-server` 1.0.0 | `:2444`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,要求 SNI `hy2.test` |
+| Juicity server | 官方 Go `juicity-server` v0.4.3 | `:2451`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,SNI `hy2.test` |
 | AnyTLS server | sing-box | `:2445`,密码 `testpass123` |
 | AnyTLS server | Go 参考实现 `anytls-server` | `:2443`,`-p testpass123` |
 | SS 2022 server | sing-box | `:2447`,`2022-blake3-aes-128-gcm`,psk `8JCsHssyVTFyPy5lYdNhZg==` |
@@ -72,8 +73,9 @@
 `5202/8002 → tuic`、`5203/8003 → ss2022`、`5204/8004 → trojan`、
 `5205/8005 → anytls-sb`、`5206/8006 → anytls-go`。专用 honk-only rprx
 配置通过 harness index override 把 VLESS Vision/REALITY/VMess 复用到在线
-目标槽 1–3。当前 x86 kdae build 包含 AnyTLS；ARM honk-vs-dae 只比较双方
-共有的四协议。节点服务端口为 `direct(must)`,其余全部回落 direct。
+目标槽 1–3；专用 Juicity 配置复用槽 1 完成 honk/dae 配对。当前 x86 kdae
+build 包含 AnyTLS；ARM honk-vs-dae 只比较双方共有的四协议。节点服务端口为
+`direct(must)`,其余全部回落 direct。
 
 ## 方法学
 
@@ -241,7 +243,7 @@ Cubic 保持最高 forward 中位数。BBR 在该方向消耗更多 CPU 且 retr
 在没有 changed bottleneck metric 时,未推广 window、ACK、PMTUD、fairness
 或 buffer tuning。
 
-### Allocation 清理与最终决策
+### Allocation 清理
 
 Juicity 候选 `429c540` 以 `write_chunk(Bytes)` 将编码 frame 交给 Quinn,
 并把 UDP payload 直接解码到调用方 buffer。3 轮配对的 500-packet allocation
@@ -252,10 +254,47 @@ buffer。该 allocation-specific cleanup 作为 `d4fd31a` 由
 4 个聚焦测试与全部 546 个 `honk-outbound` 测试均通过,format 与 Clippy
 也保持 clean。
 
-本地 Juicity 端到端 arm 噪声过大,不足以声称吞吐增益。外围 UDP endpoint
-receive path 已复用一个固定 buffer 并直接从中发送；更广泛的 ownership
-改动只会增加 API 与 lifetime 复杂度,却不能删除已测 allocation,故未修改。
-吞吐 fixture 也不含 Salamander,因此未作推测性优化。
+候选相对 baseline 的本地 Juicity 端到端 arm 噪声过大,不足以把吞吐变化归因于
+该清理。外围 UDP endpoint receive path 已复用一个固定 buffer 并直接从中发送；
+更广泛的 ownership 改动只会增加 API 与 lifetime 复杂度,却不能删除已测
+allocation,故未修改。该 fixture 也不含 Salamander,因此未作推测性优化。
+
+### 当前 honk 与 dae 的 Juicity 对比
+
+现有官方 Go `juicity-server` v0.4.3 endpoint 位于
+`10.10.10.70:2451`。专用配对配置复用目标槽 1,QUIC MTU 固定为 1452 字节。
+当前 main `4c3ade3` 由标准 `just build-musl` recipe 构建
+(`ba2821e3...`),与 x86 主机上的 dae
+`unstable-20260824.r1142.ec957346` (`f2dc44b5...`)对比。3 轮完整 harness
+保留 3-cold / 15-hot / bandwidth 3 次中位数 / 200-loaded contract；另做 5 轮
+capacity 配对,每个 arm 使用一个 8 秒 bandwidth 窗口。百分比 delta 均为同轮
+配对 delta 的中位数。
+
+| Contract | honk TCP Mbps / CPU / RSS | dae TCP Mbps / CPU / RSS | 配对 TCP 吞吐 / CPU | honk UDP Mbps / CPU / loss | dae UDP Mbps / CPU / loss | 配对 UDP 吞吐 / CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 完整,3 轮 | 6514 (5466–6966) / 0.61 / 43 | 6420 (6400–6525) / 0.80 / 51 | -0.17% / -23.75% | 1142 / 0.45 / 72.3% | 1193 / 0.43 / 71.2% | -4.27% / +4.65% |
+| 聚焦 capacity,5 轮 | 6941 / 0.64 / 41 | 6527 / 0.82 / 50 | +6.34% / -21.95% | 1225 / 0.45 / 71.3% | 1297 / 0.45 / 69.9% | -6.67% / 0.00% |
+
+capacity direct 锚点在两个引擎上均为 9404 Mbps。5 轮聚焦 TCP 的吞吐与 CPU
+全部有利于 honk,配对 Mbps/core 提高 36.56%。完整 contract 含一个 honk
+5466-Mbps 低值 arm,吞吐打平,但每轮 CPU 均更低,配对 Mbps/core 提高
+30.93%。因此必须同时报告两种 contract：CPU 效率优势一致,不把 TCP 吞吐
+概括为普遍胜出。
+
+| 完整 contract 延迟 | honk | dae |
+| --- | ---: | ---: |
+| cold 中位数 | 3.040 ms | 3.958 ms |
+| hot p50 / p95 | 0.839 / 1.949 ms | 0.739 / 1.214 ms |
+| loaded Mbps | 6044 | 6045 |
+| loaded p50 / p95 / p99 / max | 1.562 / 3.257 / 3.841 / 4.498 ms | 1.900 / 3.389 / 5.324 / 8.559 ms |
+| loaded 失败 | 0 / 600 | 16 / 600 |
+
+dae 的 hot-open 延迟更低；honk 的 cold 中位数更低,且在汇总中位负载实际相等
+时,每轮 loaded tail 都更低。loaded 阶段位于容量边缘,不是等速率延迟对比。
+饱和 UDP 在每轮聚焦配对中均有利于 dae；69–73% loss 来自刻意过载,不是 WAN
+丢包结果,也不支持 honk UDP 增益。精确配置、raw row、loaded sample、hash 与
+紧凑汇总位于
+[`juicity-x86`](../bench/results/quic-analysis-2026-08-26/juicity-x86/)。
 
 其他端到端候选均未能在一个稳定方向达到至少 3% 中位吞吐或 10% CPU
 改善且不让另一方向回退,故未再开 performance PR。完整 hash、raw JSON、
@@ -313,8 +352,9 @@ ARM 板使用 pre-auto-GSO 候选及其已有 `HONK_QUIC_GSO=0|1` 开关,不是
 该板没有呈现 GSO 吞吐收益,启用 arm 的稀疏失败更多。本结果保留为板级
 负面信号,不能证明最终 cap-16 的 ARM 性能。因此交付策略继续让抗黑洞的
 1252 字节默认值使用 scalar send,仅在操作者选择更大 MTU 后启用有界 GSO,
-并保留 `HONK_QUIC_GSO=0` 逃生开关。共享路径覆盖明文 HY2、TUIC 与
-Juicity,但没有可用 Juicity benchmark endpoint,故不作其性能声明。
+并保留 `HONK_QUIC_GSO=0` 逃生开关。共享路径覆盖明文 HY2、TUIC 与 Juicity。
+该 2026-08-25 arm 尚未接入 Juicity endpoint；上方当前 main 的专用对比现已
+补齐该协议证据,且不改变这里的 GSO 决策。
 
 完整 provenance、hash、TSV、loaded-run JSON/sample、探索性 arm 与清理状态
 位于

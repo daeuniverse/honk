@@ -1,0 +1,25 @@
+contract	metric	honk	dae	paired_delta_pct	interpretation
+full-3-pair	tcp_mbps_median_range	6514 (5466-6966)	6420 (6400-6525)	-0.17	variable; no stable throughput winner
+full-3-pair	tcp_cpu_cores	0.61	0.80	-23.75	honk lower
+full-3-pair	tcp_efficiency_mbps_per_core	10679	8025	30.93	honk higher in every pair
+full-3-pair	cold_ms	3.040	3.958	-26.50	honk lower
+full-3-pair	hot_p50_ms	0.839	0.739	5.82	dae lower
+full-3-pair	hot_p95_ms	1.949	1.214	49.12	dae lower
+full-3-pair	rss_mib	43	51	-15.69	observed RSS only
+full-3-pair	loaded_mbps	6044	6045	2.60	capacity-edge load; not equal-rate latency
+full-3-pair	loaded_p50_ms	1.562	1.900	-16.65	honk lower
+full-3-pair	loaded_p95_ms	3.257	3.389	-4.15	honk lower
+full-3-pair	loaded_p99_ms	3.841	5.324	-26.64	honk lower in every pair
+full-3-pair	loaded_max_ms	4.498	8.559	-41.89	honk lower in every pair
+full-3-pair	loaded_failures	0/600	16/600	-	honk fewer
+full-3-pair	udp_mbps	1142	1193	-4.27	dae higher
+full-3-pair	udp_cpu_cores	0.45	0.43	4.65	dae lower
+full-3-pair	udp_loss_pct	72.3	71.2	1.40	overload only; dae lower
+capacity-5-pair	direct_mbps	9404	9404	0.01	anchor stable
+capacity-5-pair	tcp_mbps	6941	6527	6.34	honk higher in 5/5 pairs
+capacity-5-pair	tcp_cpu_cores	0.64	0.82	-21.95	honk lower in 5/5 pairs
+capacity-5-pair	tcp_efficiency_mbps_per_core	10845	7960	36.56	honk higher in 5/5 pairs
+capacity-5-pair	rss_mib	41	50	-14.89	observed RSS only
+capacity-5-pair	udp_mbps	1225	1297	-6.67	dae higher in 5/5 pairs
+capacity-5-pair	udp_cpu_cores	0.45	0.45	0.00	tied
+capacity-5-pair	udp_loss_pct	71.3	69.9	2.00	overload only; dae lower

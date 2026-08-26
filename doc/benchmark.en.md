@@ -60,11 +60,11 @@ repo so the setup and the numbers stay in sync with the code.
   available SSH credentials. Exact client wire parameters and both client
   binary hashes are retained, but those rows must not be used as a
   server-version regression baseline.
-- The 2026-08-08 proxy matrix covers every configured, reachable lab endpoint:
+- The 2026-08-08 proxy matrix covers every endpoint configured at that time:
   HY2, TUIC, SS2022, Trojan, two AnyTLS servers, VLESS Vision/REALITY, and
-  VMess. No SOCKS5 or Juicity proxy endpoint was available for paired A/B;
-  Block has no throughput path and Direct is the control. The older Juicity
-  direct-UDP offload result below is not a Juicity proxy comparison.
+  VMess. No SOCKS5 endpoint is available. Juicity was absent from that matrix;
+  a dedicated 2026-08-26 comparison against the existing Go server is reported
+  below. The older Juicity direct-UDP offload result is not a proxy comparison.
 
 ## What's running where
 
@@ -72,6 +72,7 @@ repo so the setup and the numbers stay in sync with the code.
 | --- | --- | --- |
 | hy2 server | official `hysteria` | `:8443`, password `testpass123`, cert CN `hy2.test` |
 | TUIC server | `tuic-server` 1.0.0 | `:2444`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, requires SNI `hy2.test` |
+| Juicity server | official Go `juicity-server` v0.4.3 | `:2451`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, SNI `hy2.test` |
 | AnyTLS server | sing-box | `:2445`, password `testpass123` |
 | AnyTLS server | Go reference `anytls-server` | `:2443`, `-p testpass123` |
 | SS 2022 server | sing-box | `:2447`, `2022-blake3-aes-128-gcm`, psk `8JCsHssyVTFyPy5lYdNhZg==` |
@@ -82,9 +83,10 @@ Standard engine configs route by destination port so no API switching is
 needed: `5201/8001 → hy2`, `5202/8002 → tuic`, `5203/8003 → ss2022`,
 `5204/8004 → trojan`, `5205/8005 → anytls-sb`, `5206/8006 → anytls-go`.
 The dedicated honk-only rprx configs remap VLESS Vision/REALITY/VMess onto the
-live target slots 1–3 via the harness index overrides. The current x86 kdae
-build includes AnyTLS; ARM honk-vs-dae uses the four-protocol shared surface.
-Node server ports are `direct(must)` and everything else falls back to direct.
+live target slots 1–3 via harness index overrides; the dedicated Juicity
+configs reuse slot 1 for a paired honk/dae run. The current x86 kdae build
+includes AnyTLS; ARM honk-vs-dae uses the four-protocol shared surface. Node
+server ports are `direct(must)` and everything else falls back to direct.
 
 ## Methodology
 
@@ -267,7 +269,7 @@ that direction; New Reno lowers forward throughput. TUIC therefore retains its
 current cubic default. No window, ACK, PMTUD, fairness, or buffer tuning was
 promoted without a changed bottleneck metric.
 
-### Allocation cleanup and final decision
+### Allocation cleanup
 
 Juicity candidate `429c540` passes an encoded frame to Quinn with
 `write_chunk(Bytes)` and decodes UDP payloads directly into the caller's
@@ -279,12 +281,51 @@ frames. This allocation-specific cleanup was merged as `d4fd31a` in
 Its four focused tests and all 546 `honk-outbound` tests passed; formatting and
 Clippy were clean.
 
-The local end-to-end Juicity arm was too noisy for a throughput claim. The
-surrounding UDP endpoint receive path already reuses one fixed buffer and sends
-from it directly; broader ownership changes would add API and lifetime
-complexity without removing a measured allocation, so none were made.
-Salamander was not present in the throughput fixture and likewise received no
-speculative optimization.
+The candidate-vs-baseline local end-to-end arm was too noisy to attribute a
+throughput change to this cleanup. The surrounding UDP endpoint receive path
+already reuses one fixed buffer and sends from it directly; broader ownership
+changes would add API and lifetime complexity without removing a measured
+allocation, so none were made. Salamander was not present in that fixture and
+likewise received no speculative optimization.
+
+### Current honk versus dae on Juicity
+
+The existing official Go `juicity-server` v0.4.3 endpoint at
+`10.10.10.70:2451` was wired into dedicated paired configs that reuse target
+slot 1 and set a 1452-byte QUIC MTU. Current main `4c3ade3`, built by the
+canonical `just build-musl` recipe (`ba2821e3...`), was compared with dae
+`unstable-20260824.r1142.ec957346` (`f2dc44b5...`) on the x86 host. Three full
+harness pairs retain the 3-cold / 15-hot / median-of-3 bandwidth / 200-loaded
+contract; a separate five-pair capacity run uses one 8-second bandwidth window
+per arm. Percentage deltas are medians of paired same-run deltas.
+
+| Contract | honk TCP Mbps / CPU / RSS | dae TCP Mbps / CPU / RSS | Paired TCP throughput / CPU | honk UDP Mbps / CPU / loss | dae UDP Mbps / CPU / loss | Paired UDP throughput / CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| full, 3 pairs | 6514 (5466–6966) / 0.61 / 43 | 6420 (6400–6525) / 0.80 / 51 | -0.17% / -23.75% | 1142 / 0.45 / 72.3% | 1193 / 0.43 / 71.2% | -4.27% / +4.65% |
+| focused capacity, 5 pairs | 6941 / 0.64 / 41 | 6527 / 0.82 / 50 | +6.34% / -21.95% | 1225 / 0.45 / 71.3% | 1297 / 0.45 / 69.9% | -6.67% / 0.00% |
+
+The capacity direct anchor is 9404 Mbps for both engines. All five focused TCP
+pairs favor honk throughput and CPU, raising paired Mbps/core by 36.56%. The
+full contract contains one low 5466-Mbps honk arm and is a throughput tie, but
+still reduces CPU in every pair and raises paired Mbps/core by 30.93%. Report
+both contracts: the CPU-efficiency advantage is consistent; a universal TCP
+throughput win is not.
+
+| Full-contract latency | honk | dae |
+| --- | ---: | ---: |
+| cold median | 3.040 ms | 3.958 ms |
+| hot p50 / p95 | 0.839 / 1.949 ms | 0.739 / 1.214 ms |
+| loaded Mbps | 6044 | 6045 |
+| loaded p50 / p95 / p99 / max | 1.562 / 3.257 / 3.841 / 4.498 ms | 1.900 / 3.389 / 5.324 / 8.559 ms |
+| loaded failures | 0 / 600 | 16 / 600 |
+
+dae has the lower hot-open latency. honk has the lower cold median and lower
+loaded tails in every pair at effectively equal aggregate median load. The
+loaded phase is capacity-edge, not an equal-rate latency comparison. Saturated
+UDP favors dae in every focused pair; its 69–73% loss is deliberate overload,
+not a WAN-loss result, and establishes no honk UDP gain. Exact configs, raw
+rows, loaded samples, hashes, and the compact summary are under
+[`juicity-x86`](../bench/results/quic-analysis-2026-08-26/juicity-x86/).
 
 No other end-to-end candidate reached at least 3% median throughput or 10% CPU
 reduction in one stable direction without regressing another, so no further
@@ -350,8 +391,10 @@ the enabled arm. It is retained as a negative, board-specific signal; it is
 not evidence for final cap-16 ARM performance. The shipped policy therefore
 keeps the black-hole-safe 1252-byte default scalar, enables bounded GSO only
 after an operator selects a larger MTU, and retains `HONK_QUIC_GSO=0` as the
-escape hatch. The shared path covers plain HY2, TUIC, and Juicity, but no
-Juicity performance claim is made without a reachable benchmark endpoint.
+escape hatch. The shared path covers plain HY2, TUIC, and Juicity. No Juicity
+endpoint was wired for this 2026-08-25 arm; the dedicated current-main
+comparison above now supplies that protocol evidence without changing this
+GSO decision.
 
 Full provenance, hashes, TSVs, loaded-run JSON/samples, exploratory arms, and
 cleanup status are under

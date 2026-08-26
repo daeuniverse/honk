@@ -1,0 +1,107 @@
+# 2026-08-26 Juicity x86 honk-vs-dae comparison
+run_date_utc=2026-08-26
+benchmark_branch=bench
+
+[hosts]
+engine_host=10.10.10.49
+engine_hostname=archlinux
+engine_kernel=Linux 7.1.8-arch1-3
+engine_arch=x86_64
+client_netns=lab
+server_host=10.10.10.70
+server_hostname=nixos
+server_endpoint=10.10.10.70:2451
+target_http=10.10.10.70:8001
+target_tcp=10.10.10.70:5201
+target_udp=10.10.10.70:53531
+
+[server]
+implementation=official Go juicity-server
+version=v0.4.3
+go_version=go1.22.2
+binary_sha256=16ff506d3c8d229d7fc49e550592cbdec286ac2805909f57d8ed36506882dfc0
+launch_config_path=/tmp/lab-bin/juicity-go/juicity-server.json
+launch_config_status=deleted after the long-running process started; effective endpoint, UUID, password, SNI, and MTU are retained in both client configs
+
+[honk]
+source_commit=4c3ade3807b31599c898f1a90fbbca5f8544e559
+version=0.0.1-alpha
+build_command=just build-musl
+binary_sha256=ba2821e3c5d1d38db4ba434400449e8f84e950c4746fedf6164e1db629d532a7
+config_sha256=26f2a80fa5deca7b8bc374c756c43f616df0a21a59306dc34ac56139332b9565
+
+[dae]
+version=unstable-20260824.r1142.ec957346
+go_version=go1.26.0-X:heapminimum512kib
+binary_sha256=f2dc44b5fa96cd1041ed54082d753a75f81e400b2fe40b7817df0acfae36c2d7
+config_sha256=58b5cc6d26a9d8c1de49c6b39aa540a70a8843134092f0884adff74bf73ad70d
+
+[shared_inputs]
+quic_mtu=1452
+harness_sha256=a43d68d611dc9d01b150dffbe58bbbff740128901996575b07b2beea777abe17
+latency_collector_sha256=aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575
+full_contract=3 cold, 15 hot, median of 3 x 8-second bandwidth, 200 loaded opens at 250 ms cadence
+full_engine_pairs=3
+capacity_contract=5 alternating pairs, one 8-second bandwidth sample per arm, loaded phase disabled
+udp_offer=10 Gbit/s fixed offer; loss is overload loss, not a WAN-loss measurement
+cpu=process utime+stime divided by monotonic wall time
+paired_delta=median of same-pair percentage deltas; positive throughput favors honk, negative CPU favors honk
+
+[full_contract_medians]
+honk_tcp_mbps_range=6514,5466-6966
+dae_tcp_mbps_range=6420,6400-6525
+tcp_paired_delta=-0.17%
+honk_tcp_cpu_cores=0.61
+dae_tcp_cpu_cores=0.80
+tcp_cpu_paired_delta=-23.75%
+tcp_efficiency_paired_delta=+30.93%
+honk_cold_ms=3.040
+dae_cold_ms=3.958
+cold_paired_delta=-26.50%
+honk_hot_p50_p95_ms=0.839,1.949
+dae_hot_p50_p95_ms=0.739,1.214
+hot_p50_p95_paired_delta=+5.82%,+49.12%
+honk_rss_mib=43
+dae_rss_mib=51
+rss_paired_delta=-15.69%
+honk_loaded_mbps_p50_p95_p99_max_ms_failures=6044,1.562,3.257,3.841,4.498,0/600
+dae_loaded_mbps_p50_p95_p99_max_ms_failures=6045,1.900,3.389,5.324,8.559,16/600
+loaded_p99_paired_delta=-26.64%
+honk_udp_mbps_cpu_loss=1142,0.45,72.3%
+dae_udp_mbps_cpu_loss=1193,0.43,71.2%
+udp_throughput_cpu_paired_delta=-4.27%,+4.65%
+
+[capacity_five_pair_medians]
+honk_direct_mbps=9404
+dae_direct_mbps=9404
+direct_paired_delta=+0.01%
+honk_tcp_mbps_cpu_rss=6941,0.64,41
+dae_tcp_mbps_cpu_rss=6527,0.82,50
+tcp_throughput_cpu_efficiency_paired_delta=+6.34%,-21.95%,+36.56%
+tcp_pair_outcomes=5/5 favor honk throughput; 5/5 favor honk CPU
+honk_udp_mbps_cpu_loss=1225,0.45,71.3%
+dae_udp_mbps_cpu_loss=1297,0.45,69.9%
+udp_throughput_cpu_paired_delta=-6.67%,0.00%
+udp_pair_outcomes=0/5 favor honk throughput
+
+[decision]
+tcp_throughput=full contract is tied and contains one low honk arm; focused capacity favors honk by 6.34 percent, so report the range rather than a universal throughput win
+tcp_efficiency=honk consistently uses less process CPU and improves Mbps per core in every pair
+loaded_latency=honk has lower p50/p95/p99 and zero versus 16 failures at equal aggregate median achieved load; capacity-edge results are not equal-rate latency
+udp=dae retains a 4.27 to 6.67 percent saturated-throughput advantage; no honk UDP gain
+candidate_attribution=this compares engines, not the Juicity copy-removal candidate against its baseline; do not attribute the engine delta to PR 73
+
+[evidence]
+summary=summary.tsv
+full_run_1_2=juicity-main-x86-20260826.log
+full_run_1_2_tsv=juicity-main-x86-20260826.tsv
+full_run_1_2_stability=juicity-main-x86-20260826-stability.tsv
+full_run_1_2_sha256=1e0b1e0c29f4069d214d94a64bd92277cc70e48a3f4a426838515030fb6d2382,d2cdb895ae39a097f3634f86464841680ab40d036db2d0f31c929bc2692f5593,bc0e8348e6de326ca9af722665a120c7ebba6431cd5ecc2a65beffe06d5153d2
+full_run_3=juicity-main-x86-confirm-20260826.log
+full_run_3_tsv=juicity-main-x86-confirm-20260826.tsv
+full_run_3_stability=juicity-main-x86-confirm-20260826-stability.tsv
+full_run_3_sha256=a76af8e2965d7365da67ebe430c4db4f97eaa37d683ba7126dc9b6d30e165b74,ae2e1ab9804517c18e89fdd3fd8051d4f9339be7fdb00d56d21037565b9f71ce,07675dc01aed2174bf1dc75775ea457a3f4115a51f03c03acf86b0fe46a26ed0
+capacity_run=juicity-main-x86-capacity-20260826.log
+capacity_tsv=juicity-main-x86-capacity-20260826.tsv
+capacity_sha256=2c539a014e89a8998160836f39e886a67d4fd1bd339dba1b738947dd6423bf7e,f2760a5b7e0f41aa67eff2a68fedc9e0c163ee5f333a8ebdd670eb20952888b1
+premerge_source_equivalent_runs=juicity-x86-20260826.log,juicity-x86-capacity-20260826.log

@@ -1,0 +1,249 @@
+time="Aug 26 16:37:48" level=info msg="Include config files: [/root/dae-lab-juicity.dae]"
+time="Aug 26 16:37:48" level=info msg="Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)"
+time="Aug 26 16:37:48" level=warning msg="so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture"
+time="Aug 26 16:37:48" level=info msg="purging stale TC filters before startup"
+time="Aug 26 16:37:48" level=info msg="Waiting for network..."
+time="Aug 26 16:37:48" level=info msg="Network online."
+time="Aug 26 16:37:48" level=info msg="Building control plane and routing rules..."
+time="Aug 26 16:37:48" level=info msg="Kernel v7.1.8 supports Netkit, attempting to create Netkit device pair"
+time="Aug 26 16:37:48" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)"
+time="Aug 26 16:37:48" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer using netlink API"
+time="Aug 26 16:37:48" level=info msg="Successfully created Netkit device pair (performance mode)"
+time="Aug 26 16:37:48" level=info msg="Loading eBPF programs and maps into the kernel..."
+time="Aug 26 16:37:48" level=info msg="The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure."
+time="Aug 26 16:37:48" level=info msg="Safely enabled bpf_redirect_peer() (kernel v7.1.8, netkit+scrub=NONE)"
+time="Aug 26 16:37:48" level=info msg="sysctl /proc/sys/net/ipv4/conf/dae0/rp_filter has unexpected value 2, expected 0"
+time="Aug 26 16:37:48" level=info msg="Loaded eBPF programs and maps"
+time="Aug 26 16:37:48" level=warning msg="AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on."
+time="Aug 26 16:37:48" level=info msg="Optimizing and loading routing rules (this may take a while for large rule sets)..."
+time="Aug 26 16:37:48" level=info msg="Building routing matcher..."
+time="Aug 26 16:37:48" level=info msg="Loading routing rules into kernel space (BPF)..."
+time="Aug 26 16:37:48" level=info msg="Routing match set len: 5/1024"
+time="Aug 26 16:37:48" level=info msg="Building userspace routing matcher..."
+time="Aug 26 16:37:48" level=info msg="Health check will only verify 2 outbounds referenced by routing rules: [direct juicity]"
+time="Aug 26 16:37:48" level=info msg="Memory usage after routing build: Alloc=2MiB, Sys=26MiB, HeapObjects=11376"
+time="Aug 26 16:37:48" level=info msg="Bind to LAN: veth-lab"
+time="Aug 26 16:37:48" level=info msg="Bind to WAN: ens3"
+time="Aug 26 16:37:48" level=info msg="Control plane built in 108.173643ms"
+time="Aug 26 16:37:48" level=info msg="Total startup time: 168.810177ms"
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34526 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34536 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34552 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34560 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34576 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34588 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34604 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34616 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34620 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34624 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34636 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34638 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34648 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34654 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34670 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:34678 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:48006 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:51" level=info msg="192.168.222.2:48020 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:59" level=info msg="192.168.222.2:33372 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:37:59" level=info msg="192.168.222.2:33382 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:07" level=info msg="192.168.222.2:42944 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:07" level=info msg="192.168.222.2:42956 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:15" level=info msg="192.168.222.2:46604 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:15" level=info msg="192.168.222.2:46620 <-> 10.10.10.70:5201" dialer=juicity dscp=0 ip="10.10.10.70:5201" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:16" level=info msg="192.168.222.2:60824 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:17" level=info msg="192.168.222.2:60838 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:17" level=info msg="192.168.222.2:60852 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:17" level=info msg="192.168.222.2:60862 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:17" level=info msg="192.168.222.2:60864 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:18" level=info msg="192.168.222.2:60868 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:18" level=info msg="192.168.222.2:60872 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:18" level=info msg="192.168.222.2:60882 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:18" level=info msg="192.168.222.2:60898 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:19" level=info msg="192.168.222.2:60910 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:19" level=info msg="192.168.222.2:60912 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:19" level=info msg="192.168.222.2:60916 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:19" level=info msg="192.168.222.2:60924 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:20" level=info msg="192.168.222.2:60934 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:20" level=info msg="192.168.222.2:60946 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:20" level=info msg="192.168.222.2:60954 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:20" level=info msg="192.168.222.2:60958 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:21" level=info msg="192.168.222.2:60964 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:21" level=info msg="192.168.222.2:60972 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:21" level=info msg="192.168.222.2:60982 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:21" level=info msg="192.168.222.2:60990 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:22" level=info msg="192.168.222.2:32772 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:22" level=info msg="192.168.222.2:32788 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:22" level=info msg="192.168.222.2:32798 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:22" level=info msg="192.168.222.2:32814 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:23" level=info msg="192.168.222.2:32820 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:23" level=info msg="192.168.222.2:32836 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:23" level=info msg="192.168.222.2:32844 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:23" level=info msg="192.168.222.2:32860 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:24" level=info msg="192.168.222.2:32874 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:24" level=info msg="192.168.222.2:32882 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:24" level=info msg="192.168.222.2:32892 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:24" level=info msg="192.168.222.2:32902 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:25" level=info msg="192.168.222.2:32904 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:25" level=info msg="192.168.222.2:34502 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:25" level=info msg="192.168.222.2:34516 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:25" level=info msg="192.168.222.2:34528 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:26" level=info msg="192.168.222.2:34540 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:26" level=info msg="192.168.222.2:34556 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:26" level=info msg="192.168.222.2:34568 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:26" level=info msg="192.168.222.2:34578 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:27" level=info msg="192.168.222.2:34580 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:27" level=info msg="192.168.222.2:34594 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:27" level=info msg="192.168.222.2:34598 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:27" level=info msg="192.168.222.2:34606 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:28" level=info msg="192.168.222.2:34622 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:28" level=info msg="192.168.222.2:34628 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:28" level=info msg="192.168.222.2:34642 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:29" level=info msg="192.168.222.2:34662 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:29" level=info msg="192.168.222.2:34680 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:29" level=info msg="192.168.222.2:34682 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:29" level=info msg="192.168.222.2:34698 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:30" level=info msg="192.168.222.2:34714 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:30" level=info msg="192.168.222.2:34724 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:30" level=info msg="192.168.222.2:34730 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:30" level=info msg="192.168.222.2:34736 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:31" level=info msg="192.168.222.2:34748 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:31" level=info msg="192.168.222.2:34764 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:31" level=info msg="192.168.222.2:34768 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:31" level=info msg="192.168.222.2:34772 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:32" level=info msg="192.168.222.2:34778 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:32" level=info msg="192.168.222.2:34784 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:32" level=info msg="192.168.222.2:34794 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:32" level=info msg="192.168.222.2:34810 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:33" level=info msg="192.168.222.2:34812 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:33" level=info msg="192.168.222.2:34828 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:33" level=info msg="192.168.222.2:34842 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:33" level=info msg="192.168.222.2:34850 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:34" level=info msg="192.168.222.2:34852 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:34" level=info msg="192.168.222.2:34860 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:34" level=info msg="192.168.222.2:34876 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:34" level=info msg="192.168.222.2:34878 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:35" level=info msg="192.168.222.2:34888 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:35" level=info msg="192.168.222.2:52924 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:35" level=info msg="192.168.222.2:52930 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:35" level=info msg="192.168.222.2:52946 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:36" level=info msg="192.168.222.2:52958 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:36" level=info msg="192.168.222.2:52968 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:36" level=info msg="192.168.222.2:52970 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:36" level=info msg="192.168.222.2:52974 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:37" level=info msg="192.168.222.2:52982 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:37" level=info msg="192.168.222.2:52984 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:37" level=info msg="192.168.222.2:52986 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:37" level=info msg="192.168.222.2:52996 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:38" level=info msg="192.168.222.2:53004 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:38" level=info msg="192.168.222.2:53008 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:38" level=info msg="192.168.222.2:53020 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:38" level=info msg="192.168.222.2:53032 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:39" level=info msg="192.168.222.2:53040 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:39" level=info msg="192.168.222.2:53050 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:39" level=info msg="192.168.222.2:53058 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:39" level=info msg="192.168.222.2:53060 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:40" level=info msg="192.168.222.2:53070 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:40" level=info msg="192.168.222.2:53082 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:40" level=info msg="192.168.222.2:53084 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:40" level=info msg="192.168.222.2:53086 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:41" level=info msg="192.168.222.2:53094 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:41" level=info msg="192.168.222.2:53102 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:41" level=info msg="192.168.222.2:53112 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:41" level=info msg="192.168.222.2:53120 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:42" level=info msg="192.168.222.2:53132 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:42" level=info msg="192.168.222.2:53144 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:42" level=info msg="192.168.222.2:53150 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:42" level=info msg="192.168.222.2:53160 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:43" level=info msg="192.168.222.2:53174 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:43" level=info msg="192.168.222.2:53184 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:43" level=info msg="192.168.222.2:53194 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:43" level=info msg="192.168.222.2:53200 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:44" level=info msg="192.168.222.2:53210 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:44" level=info msg="192.168.222.2:53214 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:44" level=info msg="192.168.222.2:53230 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:44" level=info msg="192.168.222.2:53236 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:45" level=info msg="192.168.222.2:53252 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:45" level=info msg="192.168.222.2:60502 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:45" level=info msg="192.168.222.2:60508 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:45" level=info msg="192.168.222.2:60520 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:46" level=info msg="192.168.222.2:60536 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:46" level=info msg="192.168.222.2:60552 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:46" level=info msg="192.168.222.2:60564 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:46" level=info msg="192.168.222.2:60576 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:47" level=info msg="192.168.222.2:60584 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:47" level=info msg="192.168.222.2:60598 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:47" level=info msg="192.168.222.2:60614 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:47" level=info msg="192.168.222.2:60616 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:48" level=info msg="192.168.222.2:60628 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:48" level=info msg="192.168.222.2:60630 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:48" level=info msg="192.168.222.2:60636 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:48" level=info msg="192.168.222.2:60640 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:49" level=info msg="192.168.222.2:60652 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:49" level=info msg="192.168.222.2:60658 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:49" level=info msg="192.168.222.2:60672 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:49" level=info msg="192.168.222.2:60680 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:50" level=info msg="192.168.222.2:60682 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:50" level=info msg="192.168.222.2:60698 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:50" level=info msg="192.168.222.2:60708 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:50" level=info msg="192.168.222.2:60720 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:51" level=info msg="192.168.222.2:60726 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:51" level=info msg="192.168.222.2:60736 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:51" level=info msg="192.168.222.2:60740 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:51" level=info msg="192.168.222.2:60750 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:52" level=info msg="192.168.222.2:60754 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:52" level=info msg="192.168.222.2:60760 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:52" level=info msg="192.168.222.2:60766 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:52" level=info msg="192.168.222.2:60768 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:53" level=info msg="192.168.222.2:60770 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:53" level=info msg="192.168.222.2:60786 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:53" level=info msg="192.168.222.2:60798 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:53" level=info msg="192.168.222.2:60812 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:54" level=info msg="192.168.222.2:60816 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:54" level=info msg="192.168.222.2:60830 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:54" level=info msg="192.168.222.2:60840 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:55" level=info msg="192.168.222.2:46930 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:55" level=info msg="192.168.222.2:46944 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:55" level=info msg="192.168.222.2:46952 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:56" level=info msg="192.168.222.2:46956 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:56" level=info msg="192.168.222.2:46972 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:56" level=info msg="192.168.222.2:46988 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:56" level=info msg="192.168.222.2:46990 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:57" level=info msg="192.168.222.2:47004 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:57" level=info msg="192.168.222.2:47006 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:57" level=info msg="192.168.222.2:47008 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:57" level=info msg="192.168.222.2:47010 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:58" level=info msg="192.168.222.2:47022 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:58" level=info msg="192.168.222.2:47038 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:58" level=info msg="192.168.222.2:47040 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:58" level=info msg="192.168.222.2:47054 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:59" level=info msg="192.168.222.2:47070 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:59" level=info msg="192.168.222.2:47076 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:59" level=info msg="192.168.222.2:47082 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:38:59" level=info msg="192.168.222.2:47096 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:00" level=info msg="192.168.222.2:47100 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:00" level=info msg="192.168.222.2:47106 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:00" level=info msg="192.168.222.2:47122 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:00" level=info msg="192.168.222.2:47126 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:01" level=info msg="192.168.222.2:47130 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:01" level=info msg="192.168.222.2:47142 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:01" level=info msg="192.168.222.2:47158 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:01" level=info msg="192.168.222.2:47174 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:02" level=info msg="192.168.222.2:47180 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:02" level=info msg="192.168.222.2:47188 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:02" level=info msg="192.168.222.2:47198 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:02" level=info msg="192.168.222.2:47208 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:03" level=info msg="192.168.222.2:47210 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:03" level=info msg="192.168.222.2:47214 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:03" level=info msg="192.168.222.2:47230 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:03" level=info msg="192.168.222.2:47232 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:04" level=info msg="192.168.222.2:47242 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:04" level=info msg="192.168.222.2:47254 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:04" level=info msg="192.168.222.2:47266 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:04" level=info msg="192.168.222.2:47276 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:05" level=info msg="192.168.222.2:47286 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:05" level=info msg="192.168.222.2:57972 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:05" level=info msg="192.168.222.2:57984 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:05" level=info msg="192.168.222.2:57998 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:06" level=info msg="192.168.222.2:58014 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:06" level=info msg="192.168.222.2:58024 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
+time="Aug 26 16:39:06" level=info msg="192.168.222.2:58036 <-> 10.10.10.70:8001" dialer=juicity dscp=0 ip="10.10.10.70:8001" mac="2a:52:25:db:f0:27" network=tcp4 outbound=juicity pname= policy=fixed sniffed=
