@@ -347,6 +347,13 @@ rolls new work to a replacement. Driver failure fans out to its children;
 half-close, reset, receive-window release, and lazy response errors remain
 per-stream.
 
+Receive credit is fixed at 2 MiB per stream. Connection credit covers one
+maximum UoT response frame for each of the 128 admitted streams
+(8 MiB + 256 bytes). The larger stream window removes the old
+one-datagram-per-RTT ceiling on long-fat TCP paths. The per-stream cap prevents
+one unread child from consuming all connection credit, while the aggregate
+bound lets interleaved maximum UDP frames always complete.
+
 ### Mux.Cool and XUDP
 
 Mux.Cool sends the Xray VLESS mux command and multiplexes child TCP and XUDP
@@ -357,6 +364,11 @@ replacement accepts new children.
 The pool admits no more than two active carriers and 128 children per carrier.
 Draining carriers do not consume the active cap but remain alive for existing
 children. Saturation waits for capacity instead of bypassing the pool.
+
+Receive payloads share an 8 MiB carrier budget. TCP delivery allows 100 ms for
+transient budget or queue pressure before resetting only the stalled child;
+UDP remains drop-on-full. This tolerates line-rate scheduler bursts without
+letting an unread child pin the carrier indefinitely.
 
 XUDP reply metadata can change the logical peer and therefore enables full-cone
 reply sources. Pooled Mux.Cool packets are capped at 8 KiB. Single XUDP reuses

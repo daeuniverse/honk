@@ -316,6 +316,12 @@ HTTP/2 flow control 驱动 backpressure。GOAWAY 使 carrier 进入 draining，
 并把新工作滚动到 replacement。driver failure 向其 child 扩散；half-close、
 reset、receive-window 释放与 lazy response error 仍按 stream 隔离。
 
+接收 credit 固定为每条 stream 2 MiB；connection credit 能为 128 条可接收
+stream 中的每一条容纳一个最大 UoT response frame（8 MiB + 256 bytes）。
+增大的 stream window 消除了长肥 TCP 路径原先每 RTT 只能推进一个 datagram
+的上限。per-stream 上限防止一条未读取的 child 耗尽全部 connection credit；
+aggregate 上限则保证交错的最大 UDP frame 都能完成。
+
 ### Mux.Cool 与 XUDP
 
 Mux.Cool 发送 Xray VLESS mux command，并复用 child TCP 与 XUDP record。
@@ -325,6 +331,10 @@ Mux.Cool 发送 Xray VLESS mux command，并复用 child TCP 与 XUDP record。
 pool 最多接收两条 active carrier，每条最多 128 个 child。Draining carrier
 不占 active cap，但会为现有 child 保持存活。饱和时等待容量，而不是绕过
 pool。
+
+接收 payload 共用每条 carrier 8 MiB 的预算。TCP delivery 会为瞬时预算或
+队列压力保留 100 ms，超时后只 reset 停滞的 child；UDP 仍在队列满时丢包。
+这既容忍线速调度 burst，也避免未读取的 child 无限期阻塞 carrier。
 
 XUDP reply metadata 可以改变逻辑 peer，因此支持 full-cone 回包源地址。
 池化 Mux.Cool packet 上限为 8 KiB。Single XUDP 在专用、不入池的 carrier
