@@ -134,6 +134,25 @@ pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut boo
     *enabled = false;
 }
 
+pub(super) async fn publish_outbound_alive(
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    outbound_idx: u8,
+    domain: u32,
+    ipver: u32,
+    alive: bool,
+) {
+    let mut backend = ebpf.write().await;
+    if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
+        warn!(
+            %error,
+            outbound_idx,
+            domain,
+            ipver,
+            "failed to update outbound health in eBPF"
+        );
+    }
+}
+
 impl ControlPlane {
     #[cfg(feature = "ebpf")]
     pub(super) async fn degrade_nfqueue_startup(
@@ -506,11 +525,13 @@ impl ControlPlane {
                     None => true,
                 };
                 let ebpf = ebpf.clone();
-                let _handle = tokio::spawn(async move {
-                    if let Ok(mut backend) = ebpf.try_write() {
-                        let _ = backend.set_outbound_alive(outbound_idx, domain, ipver, any_alive);
-                    }
-                });
+                let _handle = tokio::spawn(publish_outbound_alive(
+                    ebpf,
+                    outbound_idx,
+                    domain,
+                    ipver,
+                    any_alive,
+                ));
             }));
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);

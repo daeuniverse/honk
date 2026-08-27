@@ -3,6 +3,28 @@ use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 
+#[tokio::test]
+async fn health_push_waits_for_backend_writer() {
+    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+        crate::ebpf::mock::MockEbpfBackend::new(),
+    )));
+    let mut held = ebpf.write().await;
+    held.set_outbound_alive(2, 0, 0, true).unwrap();
+    let update = tokio::spawn(runtime::publish_outbound_alive(
+        Arc::clone(&ebpf),
+        2,
+        0,
+        0,
+        false,
+    ));
+    tokio::task::yield_now().await;
+    assert!(!update.is_finished());
+
+    drop(held);
+    update.await.unwrap();
+    assert!(!ebpf.read().await.get_outbound_alive(2, 0, 0).unwrap());
+}
+
 #[cfg(feature = "ebpf")]
 #[test]
 fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
