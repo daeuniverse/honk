@@ -1563,20 +1563,7 @@ impl TransportQuinnSocket {
         self.recv_error().or_else(|| self.send_error())
     }
 
-    fn mark_closed(&self) {
-        let mut error = self.send_error.lock();
-        if error.is_none() {
-            *error = Some(TransportIoError::new(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "PacketTransport QUIC adapter closed",
-            )));
-        }
-        drop(error);
-        wake_recv(&self.recv_waker);
-    }
-
     async fn close_tasks(&self) {
-        self.mark_closed();
         let mut tasks = self.tasks.lock().await;
         for task in tasks.iter() {
             task.abort();
@@ -1588,7 +1575,6 @@ impl TransportQuinnSocket {
     }
 
     fn abort_tasks(&self) {
-        self.mark_closed();
         if let Ok(tasks) = self.tasks.try_lock() {
             for task in tasks.iter() {
                 task.abort();
@@ -1705,38 +1691,38 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
         let mut inbound = self.inbound.lock();
         let mut count = 0;
         for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
-            loop {
-                match inbound.poll_recv(cx) {
-                    Poll::Ready(Some(data)) if data.len() > buf.len() => continue,
-                    Poll::Ready(Some(data)) => {
-                        let len = data.len();
-                        buf[..len].copy_from_slice(&data);
-                        *meta_slot = quinn::udp::RecvMeta {
-                            addr: self.remote,
-                            len,
-                            stride: len,
-                            ecn: None,
-                            dst_ip: None,
-                        };
-                        count += 1;
-                        break;
-                    }
-                    Poll::Ready(None) => {
-                        return if count == 0 {
-                            Poll::Ready(Err(self
-                                .terminal_error()
-                                .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))))
-                        } else {
-                            Poll::Ready(Ok(count))
-                        };
-                    }
-                    Poll::Pending => {
-                        return if count == 0 {
-                            Poll::Pending
-                        } else {
-                            Poll::Ready(Ok(count))
-                        };
-                    }
+            match inbound.poll_recv(cx) {
+                Poll::Ready(Some(data)) => {
+                    // quic-go may coalesce a 1280-byte first flight despite the
+                    // 1252-byte advertisement. Preserve complete leading packets
+                    // as a bounded native UDP receive would; Quinn discards a
+                    // truncated tail and requests retransmission.
+                    let len = data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&data[..len]);
+                    *meta_slot = quinn::udp::RecvMeta {
+                        addr: self.remote,
+                        len,
+                        stride: len,
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    count += 1;
+                }
+                Poll::Ready(None) => {
+                    return if count == 0 {
+                        Poll::Ready(Err(self
+                            .terminal_error()
+                            .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))))
+                    } else {
+                        Poll::Ready(Ok(count))
+                    };
+                }
+                Poll::Pending => {
+                    return if count == 0 {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(count))
+                    };
                 }
             }
         }
@@ -1781,11 +1767,15 @@ impl PacketTransportEndpoint {
         &self.endpoint
     }
 
-    /// Close the Quinn endpoint, wait up to `timeout` for it to drain, then
-    /// abort and join both adapter workers. Repeated and cancelled closes are
-    /// safe.
+    /// Close the Quinn endpoint and wait up to `timeout` for it to drain.
+    /// A zero timeout aborts the adapter workers without waiting; other closes
+    /// abort and join them. Repeated and cancelled closes are safe.
     pub async fn close(&self, timeout: Duration) {
         self.endpoint.close(VarInt::from_u32(0), b"shutdown");
+        if timeout.is_zero() {
+            self.socket.abort_tasks();
+            return;
+        }
         let _ = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
         self.socket.close_tasks().await;
     }
@@ -1846,6 +1836,8 @@ pub async fn quic_handshake_probe(
         .context("QUIC handshake timeout")??;
     let elapsed = start.elapsed();
     conn.close(quinn::VarInt::from_u32(0), b"probe");
+    // `wait_idle` cannot complete while this handle is still alive.
+    drop(conn);
     endpoint.close(Duration::ZERO).await;
     Ok(elapsed)
 }
@@ -2120,8 +2112,7 @@ mod probe_tests {
                 full_cone: false,
                 packets: Mutex::new(std::collections::VecDeque::from([
                     (b"wrong".to_vec(), wrong),
-                    (vec![0; 65], remote),
-                    (b"accepted".to_vec(), remote),
+                    (vec![0x5a; 65], remote),
                 ])),
             }),
             remote,
@@ -2158,7 +2149,8 @@ mod probe_tests {
         .unwrap()
         .unwrap();
         assert_eq!(received, 1);
-        assert_eq!(&data[..meta[0].len], b"accepted");
+        assert_eq!(meta[0].len, data.len());
+        assert_eq!(data, [0x5a; 64]);
         assert_eq!(meta[0].addr, remote);
     }
 
