@@ -1202,7 +1202,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(listen) => {
                 let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
                 let connection_tracker = control_plane.connection_tracker();
-                connection_tracker.enable();
                 let state = std::sync::Arc::new(clash_api::ClashState {
                     config: control_plane.config_handle(),
                     stats: control_plane.stats_handle(),

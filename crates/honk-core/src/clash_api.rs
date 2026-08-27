@@ -179,18 +179,30 @@ pub fn router(state: Arc<ClashState>) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(state: Arc<ClashState>, listen: std::net::SocketAddr) {
-    let app = router(state);
-    let listener = match tokio::net::TcpListener::bind(listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("clash API failed to bind {}: {}", listen, e);
-            return;
+async fn bind_listener(
+    listen: std::net::SocketAddr,
+    connection_tracker: &crate::connection_tracker::ConnectionTracker,
+) -> Option<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(listen).await {
+        Ok(listener) => {
+            connection_tracker.enable();
+            Some(listener)
         }
+        Err(error) => {
+            tracing::error!("clash API failed to bind {}: {}", listen, error);
+            None
+        }
+    }
+}
+
+pub async fn serve(state: Arc<ClashState>, listen: std::net::SocketAddr) {
+    let Some(listener) = bind_listener(listen, &state.connection_tracker).await else {
+        return;
     };
+    let app = router(state);
     tracing::info!("clash API listening on http://{listen}");
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!("clash API server error: {}", e);
+    if let Err(error) = axum::serve(listener, app).await {
+        tracing::error!("clash API server error: {}", error);
     }
 }
 
@@ -1567,6 +1579,19 @@ async fn get_rule_providers() -> Json<serde_json::Value> {
 #[cfg(test)]
 mod sampler_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_bind_leaves_connection_tracking_disabled() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker = crate::connection_tracker::ConnectionTracker::new();
+
+        assert!(
+            bind_listener(occupied.local_addr().unwrap(), &tracker)
+                .await
+                .is_none()
+        );
+        assert!(!tracker.is_enabled());
+    }
 
     #[test]
     fn connection_intervals_use_bounded_ceiling_buckets() {
