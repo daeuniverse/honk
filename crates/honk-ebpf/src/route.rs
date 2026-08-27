@@ -285,7 +285,6 @@ impl RouteCtx {
                 };
                 let port_range = unsafe { match_set.value.port_range };
                 if check_port >= port_range.port_start && check_port <= port_range.port_end {
-                    if match_type == MatchType::Port {}
                     self.route_state |= RouteStateFlags::GoodSubrule as u8;
                 }
             }
