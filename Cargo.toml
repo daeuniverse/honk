@@ -67,9 +67,10 @@ network-types = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 
 # TLS / crypto
-boring = { version = "5", features = ["mlkem"] }
-boring-sys = "5"
-tokio-boring = "5"
+# REALITY hooks are carried by the 5.1.0 boring-sys fork below.
+boring = { version = "=5.1.0", features = ["mlkem"] }
+boring-sys = "=5.1.0"
+tokio-boring = "=5.1.0"
 brotli = "8"
 webpki-root-certs = "1"
 foreign-types = "0.5"
