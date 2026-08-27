@@ -611,9 +611,9 @@ struct UdpRecvStorage {
 }
 
 impl UdpRecvStorage {
-    fn new() -> Self {
+    fn new(packet_capacity: usize) -> Self {
         Self {
-            data: vec![0; UDP_RECV_PACKET_CAPACITY],
+            data: vec![0; packet_capacity],
             // SAFETY: all-zero is a valid empty sockaddr storage value.
             source: unsafe { std::mem::zeroed() },
             control: CmsgStorage::new(),
@@ -637,13 +637,22 @@ pub(super) struct UdpRecvBatch {
 
 impl UdpRecvBatch {
     pub(super) fn new() -> io::Result<Self> {
+        Self::with_packet_capacity(UDP_RECV_PACKET_CAPACITY)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(packet_capacity: usize) -> io::Result<Self> {
+        Self::with_packet_capacity(packet_capacity)
+    }
+
+    fn with_packet_capacity(packet_capacity: usize) -> io::Result<Self> {
         if !cmsg_control_capacity_is_sufficient() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "recvmmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
             ));
         }
-        let slots = std::array::from_fn(|_| UdpRecvStorage::new());
+        let slots = std::array::from_fn(|_| UdpRecvStorage::new(packet_capacity));
         if slots.iter().any(|slot| {
             !(slot.control.bytes.as_ptr() as usize)
                 .is_multiple_of(std::mem::align_of::<libc::cmsghdr>())
@@ -726,9 +735,9 @@ impl UdpRecvBatch {
         }
 
         self.received = count as usize;
-        // A drained queue restores scalar setup cost for the next wake; a full
-        // read immediately ramps back to the bounded batch under load.
-        self.limit = if self.received == limit {
+        // Keep partial batches warm; otherwise steady medium load oscillates
+        // between preparing one and eight slots every receive.
+        self.limit = if limit == 1 || self.received > 1 {
             UDP_RECV_BATCH_SIZE
         } else {
             1
@@ -736,6 +745,13 @@ impl UdpRecvBatch {
         for (index, message) in messages[..self.received].iter().enumerate() {
             let slot = &self.slots[index];
             self.results[index] = Some((|| {
+                let length = message.msg_len as usize;
+                if message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 || length > slot.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recvmmsg UDP payload truncated or oversized",
+                    ));
+                }
                 let source = sockaddr_to_std(&slot.source, message.msg_hdr.msg_namelen)?;
                 #[cfg(target_env = "musl")]
                 let returned_control_len = message.msg_hdr.msg_controllen as usize;
@@ -747,7 +763,7 @@ impl UdpRecvBatch {
                     message.msg_hdr.msg_flags,
                 )?;
                 Ok(UdpRecvPacket {
-                    length: message.msg_len as usize,
+                    length,
                     source,
                     meta: UdpRecvMeta {
                         original_dst_cmsg,
