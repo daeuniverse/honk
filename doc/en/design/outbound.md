@@ -220,6 +220,12 @@ The configured bootstrap resolver is queried over bypass-marked UDP/TCP; failure
 falls back to the system resolver. `query_ech_config` uses the same raw path for
 DNS HTTPS records (`qtype 65`) and extracts the SVCB `ech` parameter.
 
+After resolution, proxy-server TCP and shared QUIC clients stably interleave
+address families and race at most two addresses. The first starts immediately;
+the fallback starts after 250 ms or as soon as the first address fails. This
+race stays inside the already selected node: socket marks and security settings
+are identical, and QUIC protocol authentication runs only for the winner.
+
 ## TLS, fingerprinting, ECH, and pins
 
 All production TLS in the outbound and DNS transport stacks uses BoringSSL. TCP uses `boring` and

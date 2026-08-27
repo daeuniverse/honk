@@ -627,8 +627,8 @@ impl<C> QuicClient<C> {
     /// Return the shared connection (plus its protocol state), dialing and
     /// running `setup` first when there is no live connection.
     ///
-    /// Resolved server addresses are tried in order until one completes both
-    /// the QUIC handshake and `setup`.
+    /// Resolved server addresses are raced until one completes the QUIC
+    /// handshake; protocol setup runs exactly once for that winner.
     pub async fn connection_with<F, Fut>(
         &self,
         connect_timeout: Duration,
@@ -636,7 +636,7 @@ impl<C> QuicClient<C> {
     ) -> anyhow::Result<(Connection, Arc<C>)>
     where
         F: FnOnce(Connection) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<C>>,
+        Fut: Future<Output = anyhow::Result<C>>,
     {
         let mut state = self.state.lock().await;
         if state.closed {
@@ -660,62 +660,64 @@ impl<C> QuicClient<C> {
             anyhow::bail!("resolve {host}: no addresses");
         }
 
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut conn: Option<Connection> = None;
-        'addrs: for server_addr in addrs {
+        let mut endpoints: [Option<Endpoint>; 2] = [None, None];
+        if let Some((ipv6, endpoint)) = &state.endpoint {
+            endpoints[usize::from(*ipv6)] = Some(endpoint.clone());
+        }
+        let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
             let ipv6 = server_addr.is_ipv6();
-            let endpoint = match &state.endpoint {
-                Some((family, ep)) if *family == ipv6 => ep.clone(),
-                _ => {
-                    let ep = match &self.endpoint_factory {
+            let family = usize::from(ipv6);
+            let endpoint = match endpoints[family].clone() {
+                Some(endpoint) => Ok(endpoint),
+                None => {
+                    let endpoint = match &self.endpoint_factory {
                         Some(factory) => factory(ipv6),
                         None => client_endpoint_with_mtu(ipv6, self.mtu),
                     }
-                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
-                    state.endpoint = Some((ipv6, ep.clone()));
-                    ep
+                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"));
+                    if let Ok(endpoint) = &endpoint {
+                        endpoints[family] = Some(endpoint.clone());
+                    }
+                    endpoint
                 }
             };
-            // Retry the handshake a few times per address: lossy uplinks
-            // (typical for cross-border QUIC) drop most Initials, and a
-            // single attempt is what made nodes flap dead on such paths
-            // (Go/quic-go clients succeed via retries).
-            for attempt in 1..=3u8 {
-                let connecting = match endpoint.connect_with(
-                    self.config.clone(),
-                    server_addr,
-                    &self.server_name,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        last_err = Some(e.into());
-                        continue 'addrs;
-                    }
-                };
-                match tokio::time::timeout(connect_timeout, connecting).await {
-                    Err(_) => {
-                        last_err = Some(anyhow!(
-                            "QUIC connect to {server_addr} timed out (attempt {attempt})"
-                        ));
-                    }
-                    Ok(Err(e)) => {
-                        last_err = Some(anyhow!(
-                            "QUIC connect to {server_addr}: {e} (attempt {attempt})"
-                        ));
-                    }
-                    Ok(Ok(established)) => {
-                        conn = Some(established);
-                        break 'addrs;
+            async move {
+                let endpoint = endpoint?;
+                let mut last_error = None;
+                // Keep retries inside one address job: the shared scheduler
+                // races addresses for this node, never protocol attempts or nodes.
+                for attempt in 1..=3u8 {
+                    let connecting = match endpoint.connect_with(
+                        self.config.clone(),
+                        server_addr,
+                        &self.server_name,
+                    ) {
+                        Ok(connecting) => connecting,
+                        Err(error) => return Err(error.into()),
+                    };
+                    match tokio::time::timeout(connect_timeout, connecting).await {
+                        Err(_) => {
+                            last_error = Some(anyhow!(
+                                "QUIC connect to {server_addr} timed out (attempt {attempt})"
+                            ));
+                        }
+                        Ok(Err(error)) => {
+                            last_error = Some(anyhow!(
+                                "QUIC connect to {server_addr}: {error} (attempt {attempt})"
+                            ));
+                        }
+                        Ok(Ok(connection)) => return Ok((connection, endpoint, ipv6)),
                     }
                 }
+                Err(last_error.unwrap_or_else(|| anyhow!("QUIC connect to {server_addr} failed")))
             }
-        }
-        let conn = match conn {
-            Some(conn) => conn,
-            None => {
-                return Err(last_err.unwrap_or_else(|| anyhow!("QUIC connect to {host} failed")));
-            }
+        })
+        .await;
+        let (conn, endpoint, ipv6) = match raced {
+            Some(result) => result?,
+            None => anyhow::bail!("resolve {host}: no addresses"),
         };
+        state.endpoint = Some((ipv6, endpoint));
         let ctx = setup(conn.clone()).await.inspect_err(|_| {
             conn.close(VarInt::from_u32(0), b"setup failed");
         })?;

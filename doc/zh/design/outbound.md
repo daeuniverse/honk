@@ -200,6 +200,11 @@ frame 不设置 `END_STREAM`，TLS 请求使用 `:scheme: https`。DATA 携带 g
 的 UDP/TCP 查询；失败时回退系统 resolver。`query_ech_config` 通过同一
 raw 路径查询 DNS HTTPS 记录（`qtype 65`），并提取 SVCB `ech` 参数。
 
+解析完成后，代理服务器 TCP 与共享 QUIC client 会稳定交错两种地址族，并且
+最多同时竞速两个地址。首个地址立即开始；fallback 在 250 ms 后启动，若首个
+地址更早失败则立即启动。该竞速始终位于已经选定的同一节点内部：socket mark
+与安全配置保持一致，QUIC 协议认证也只对胜出连接执行。
+
 ## TLS、指纹、ECH 与 pin
 
 出站与 DNS transport 栈中的所有生产 TLS 都使用 BoringSSL。TCP 使用 `boring` 与
