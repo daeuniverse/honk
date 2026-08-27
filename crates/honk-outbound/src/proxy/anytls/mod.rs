@@ -1686,7 +1686,11 @@ async fn connect_transport(
         None => Arc::new(crate::tls::build_connector(node)?),
     };
     let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-    let tls = connector.connect(&server_name, tcp).await?;
+    let tls = tokio::time::timeout(connect_timeout, connector.connect(&server_name, tcp))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("AnyTLS TLS handshake timed out after {connect_timeout:?}")
+        })??;
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
 
