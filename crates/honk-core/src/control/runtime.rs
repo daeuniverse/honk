@@ -136,12 +136,41 @@ pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut boo
 
 pub(super) async fn publish_outbound_alive(
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    outbound_idx: u8,
+    config: Arc<RwLock<Arc<Config>>>,
+    group_manager: SharedGroupManager,
+    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
+    alive_set: Arc<AliveDialerSet>,
+    node_id: uuid::Uuid,
     domain: u32,
     ipver: u32,
-    alive: bool,
 ) {
+    // Reload takes these locks in the same order. Keep the config generation
+    // pinned while waiting so a queued edge cannot update a recycled slot.
+    let config = config.read().await;
     let mut backend = ebpf.write().await;
+    let Some(outbound_idx) = outbound_id_map.read().get(&node_id).copied() else {
+        return;
+    };
+    let Some(group) = outbound_idx
+        .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
+        .and_then(|idx| config.groups.get(idx as usize))
+    else {
+        warn!(outbound_idx, %node_id, "outbound health slot has no current group");
+        return;
+    };
+    let probe_domain = match domain {
+        1 => ProbeDomain::DnsUdp,
+        2 => ProbeDomain::DataUdp,
+        _ => ProbeDomain::Tcp,
+    };
+    let ip_version = if ipver == 1 {
+        IpVersion::V6
+    } else {
+        IpVersion::V4
+    };
+    let group_manager = group_manager.read().clone();
+    let alive =
+        reload::group_datapath_alive(group, &group_manager, &alive_set, probe_domain, ip_version);
     if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
         warn!(
             %error,
@@ -489,50 +518,21 @@ impl ControlPlane {
             let alive_for_push = alive_set.clone();
             let group_manager_for_push = self.group_manager.clone();
             let config_for_push = self.config.clone();
-            alive_set.set_ebpf_callback(Box::new(move |outbound_idx, domain, ipver, _alive| {
-                // Group slots normally publish the OR of their leaf health.
-                // A sole TCP leaf without `final` stays open so userspace can
-                // make the one real dial capable of proving recovery.
-                let probe_domain = match domain {
-                    1 => ProbeDomain::DnsUdp,
-                    2 => ProbeDomain::DataUdp,
-                    _ => ProbeDomain::Tcp,
-                };
-                let ip_version = if ipver == 1 {
-                    IpVersion::V6
-                } else {
-                    IpVersion::V4
-                };
-                // Group ids are OutboundIndex::UserBase + group index.
-                let group = config_for_push.try_read().ok().and_then(|c| {
-                    let idx = outbound_idx
-                        .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)?;
-                    c.groups.get(idx as usize).cloned()
-                });
-                let any_alive = match group {
-                    Some(group) => {
-                        let gm = group_manager_for_push.read().clone();
-                        reload::group_datapath_alive(
-                            &group,
-                            &gm,
-                            &alive_for_push,
-                            probe_domain,
-                            ip_version,
-                        )
-                    }
-                    // Unknown outbound: keep the datapath open (userspace
-                    // makes the final decision anyway).
-                    None => true,
-                };
-                let ebpf = ebpf.clone();
-                let _handle = tokio::spawn(publish_outbound_alive(
-                    ebpf,
-                    outbound_idx,
-                    domain,
-                    ipver,
-                    any_alive,
-                ));
-            }));
+            let outbound_id_map_for_push = self.outbound_id_map.clone();
+            alive_set.set_ebpf_callback(Box::new(
+                move |node_id, _outbound_idx, domain, ipver, _alive| {
+                    let _handle = tokio::spawn(publish_outbound_alive(
+                        ebpf.clone(),
+                        config_for_push.clone(),
+                        group_manager_for_push.clone(),
+                        outbound_id_map_for_push.clone(),
+                        alive_for_push.clone(),
+                        node_id,
+                        domain,
+                        ipver,
+                    ));
+                },
+            ));
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);
             self.background_tasks.lock().await.push(handle);

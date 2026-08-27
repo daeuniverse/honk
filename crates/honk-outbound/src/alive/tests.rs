@@ -352,7 +352,7 @@ fn test_push_ebpf_uses_outbound_resolver() {
     let set = AliveDialerSet::new();
     let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    set.set_ebpf_callback(Box::new(move |o, d, ip, alive| {
+    set.set_ebpf_callback(Box::new(move |_node_id, o, d, ip, alive| {
         calls2.lock().unwrap().push((o, d, ip, alive));
     }));
 

@@ -4,25 +4,73 @@ use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 
 #[tokio::test]
-async fn health_push_waits_for_backend_writer() {
+async fn health_push_re_resolves_after_reload_writer() {
+    let node = udp_test_node();
+    let old_config = udp_test_config(
+        "old",
+        vec![node.clone()],
+        vec![Group {
+            name: "old".into(),
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+    );
+    let new_config = udp_test_config(
+        "new",
+        vec![node.clone()],
+        vec![
+            Group {
+                name: "unused".into(),
+                ..Default::default()
+            },
+            Group {
+                name: "new".into(),
+                nodes: vec![node.id],
+                ..Default::default()
+            },
+        ],
+    );
+    let config = Arc::new(RwLock::new(Arc::new(old_config.clone())));
+    let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::new(&old_config.groups, &old_config.nodes),
+    )));
+    let outbound_id_map = Arc::new(parking_lot::RwLock::new(reload::build_outbound_id_map(
+        &old_config,
+    )));
+    let alive_set = Arc::new(AliveDialerSet::new());
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
     )));
-    let mut held = ebpf.write().await;
-    held.set_outbound_alive(2, 0, 0, true).unwrap();
+
+    let mut config_writer = config.write().await;
+    let mut backend_writer = ebpf.write().await;
+    backend_writer.set_outbound_alive(2, 1, 0, false).unwrap();
+    backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
+    *config_writer = Arc::new(new_config.clone());
+    *outbound_id_map.write() = reload::build_outbound_id_map(&new_config);
+    *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
+
     let update = tokio::spawn(runtime::publish_outbound_alive(
         Arc::clone(&ebpf),
-        2,
+        Arc::clone(&config),
+        Arc::clone(&group_manager),
+        Arc::clone(&outbound_id_map),
+        Arc::clone(&alive_set),
+        node.id,
+        1,
         0,
-        0,
-        false,
     ));
     tokio::task::yield_now().await;
     assert!(!update.is_finished());
+    drop(config_writer);
+    tokio::task::yield_now().await;
+    assert!(!update.is_finished());
+    drop(backend_writer);
 
-    drop(held);
     update.await.unwrap();
-    assert!(!ebpf.read().await.get_outbound_alive(2, 0, 0).unwrap());
+    let backend = ebpf.read().await;
+    assert!(!backend.get_outbound_alive(2, 1, 0).unwrap());
+    assert!(backend.get_outbound_alive(3, 1, 0).unwrap());
 }
 
 #[cfg(feature = "ebpf")]
