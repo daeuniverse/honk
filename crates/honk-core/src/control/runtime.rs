@@ -147,7 +147,7 @@ impl ControlPlane {
         );
         self.pending_udp_verdicts = None;
         let mut config = self.config.write().await;
-        disable_nfqueue_for_startup(&mut config, enabled);
+        disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -737,7 +737,7 @@ impl ControlPlane {
                         }
                         Some(ControlCommand::NetworkChanged) => {
                             let current = self.config.read().await.clone();
-                            let mut next = current.clone();
+                            let mut next = current.as_ref().clone();
                             let routing_changed = next.ensure_local_direct_rules();
                             let client_subnet_auto = matches!(
                                 current.dns.client_subnet_mode(),

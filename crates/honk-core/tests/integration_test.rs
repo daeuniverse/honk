@@ -634,7 +634,7 @@ protocol = "udp"
             groups: vec![selector("proxy", &[&a, &b]), selector("extra", &[&c]), ut],
             ..Default::default()
         };
-        *cp.config_handle().write().await = config_v2;
+        *cp.config_handle().write().await = Arc::new(config_v2);
         cp.reload_group_manager().await;
 
         {
@@ -662,7 +662,7 @@ protocol = "udp"
             groups: vec![selector("proxy", &[&a])],
             ..Default::default()
         };
-        *cp.config_handle().write().await = config_v3;
+        *cp.config_handle().write().await = Arc::new(config_v3);
         cp.reload_group_manager().await;
 
         {

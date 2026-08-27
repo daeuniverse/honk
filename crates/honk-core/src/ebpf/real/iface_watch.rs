@@ -59,7 +59,7 @@ impl IfaceWatcher {
     /// hooked during startup so the first reconcile does not attach twice.
     pub fn spawn(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-        config: Arc<RwLock<honk_config::Config>>,
+        config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
         attached: AttachedMap,
     ) -> Option<Self> {
@@ -107,7 +107,7 @@ fn subscribe_network_events() -> std::io::Result<OwnedFd> {
 async fn run(
     fd: OwnedFd,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    config: Arc<RwLock<honk_config::Config>>,
+    config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
@@ -182,7 +182,7 @@ async fn run(
     debug!("interface watcher stopped");
 }
 
-async fn read_network_state(config: &Arc<RwLock<honk_config::Config>>) -> NetworkState {
+async fn read_network_state(config: &Arc<RwLock<Arc<honk_config::Config>>>) -> NetworkState {
     let config = config.read().await;
     NetworkState {
         default_interface: crate::detect_default_interface(),
@@ -191,7 +191,7 @@ async fn read_network_state(config: &Arc<RwLock<honk_config::Config>>) -> Networ
 }
 
 async fn update_network_state(
-    config: &Arc<RwLock<honk_config::Config>>,
+    config: &Arc<RwLock<Arc<honk_config::Config>>>,
     current: &mut NetworkState,
 ) -> bool {
     let next = read_network_state(config).await;
@@ -204,7 +204,7 @@ async fn update_network_state(
 
 async fn reconcile_and_notify(
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-    config: &Arc<RwLock<honk_config::Config>>,
+    config: &Arc<RwLock<Arc<honk_config::Config>>>,
     commands: &tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     attached: &mut AttachedMap,
     network_state_changed: bool,
@@ -221,7 +221,7 @@ async fn reconcile_and_notify(
 
 async fn reconcile(
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-    config: &Arc<RwLock<honk_config::Config>>,
+    config: &Arc<RwLock<Arc<honk_config::Config>>>,
     attached: &mut AttachedMap,
 ) -> bool {
     let (desired, single_homed) = {
@@ -432,12 +432,14 @@ mod tests {
         let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
         let mut config = honk_config::Config::default();
         config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
 
         assert!(reconcile(&ebpf, &config, &mut attached).await);
         let first = attach.load(Ordering::Relaxed);
-        config.write().await.global.wan_interface = vec!["lo".to_string()];
+        Arc::make_mut(&mut config.write().await)
+            .global
+            .wan_interface = vec!["lo".to_string()];
         assert!(reconcile(&ebpf, &config, &mut attached).await);
 
         assert_eq!(forget.load(Ordering::Relaxed), 1);
@@ -455,7 +457,7 @@ mod tests {
         let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
         let mut config = honk_config::Config::default();
         config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         reconcile_and_notify(&ebpf, &config, &tx, &mut attached, false).await;
@@ -535,7 +537,7 @@ mod tests {
         let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
         let mut config = honk_config::Config::default();
         config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
 
         reconcile(&ebpf, &config, &mut attached).await;

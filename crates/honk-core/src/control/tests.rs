@@ -401,7 +401,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         node.id
     );
     let prober = probers::ProxyUdpProber::new(
-        Arc::new(RwLock::new(config)),
+        Arc::new(RwLock::new(Arc::new(config))),
         Arc::new(registry),
         runtime,
         Arc::new(StatsManager::new()),

@@ -75,7 +75,7 @@ impl Default for StreamSamplers {
 use crate::mode::{DatapathFlagsHandle, ModeState, SharedModeState};
 
 pub struct ClashState {
-    pub config: Arc<tokio::sync::RwLock<Config>>,
+    pub config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     pub stats: Arc<crate::stats::StatsManager>,
     pub alive_set: Arc<AliveDialerSet>,
     /// Hot-swappable group manager cell; a config reload swaps the inner

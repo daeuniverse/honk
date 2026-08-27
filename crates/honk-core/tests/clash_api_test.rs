@@ -168,7 +168,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
     datapath_flags.initialize(0, false, false).await.unwrap();
     let state = Arc::new(ClashState {
-        config: Arc::new(tokio::sync::RwLock::new(config)),
+        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
         stats: stats.clone(),
         alive_set,
         group_manager,

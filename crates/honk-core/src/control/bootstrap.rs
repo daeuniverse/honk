@@ -169,7 +169,7 @@ impl ControlPlane {
         let initial_push_result = initial_routing_plan.result();
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = Arc::new(RwLock::new(Arc::new(config)));
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),

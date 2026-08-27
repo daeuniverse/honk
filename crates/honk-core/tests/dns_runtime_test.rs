@@ -70,12 +70,12 @@ async fn reload_config(control: &ControlPlane, config: Config) {
 }
 
 async fn reload_current(control: &ControlPlane) {
-    let config = control.config_handle().read().await.clone();
+    let config = control.config_handle().read().await.as_ref().clone();
     reload_config(control, config).await;
 }
 
 async fn try_reload_current(control: &ControlPlane) -> bool {
-    let config = control.config_handle().read().await.clone();
+    let config = control.config_handle().read().await.as_ref().clone();
     control.reload_runtime_config(config).await
 }
 
@@ -121,7 +121,7 @@ async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file(
     let service = control.dns_service();
     let query = build_dns_query("reload-hosts.test", 1);
 
-    let mut candidate = control.config_handle().read().await.clone();
+    let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.hosts = vec![file.path().to_string_lossy().into_owned()];
     reload_config(&control, candidate).await;
     let initial = service
@@ -185,7 +185,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
     assert_eq!(udp_response, a_response(&query, [192, 0, 2, 20]));
     assert_eq!(udp.calls(), 1, "ingress profiles must not share cache keys");
 
-    let mut candidate = control.config_handle().read().await.clone();
+    let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.cache.ttl = 301;
     reload_config(&control, candidate).await;
     let changed = service
@@ -195,7 +195,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
     assert_eq!(changed, a_response_with_ttl(&query, [192, 0, 2, 20], 301));
     assert_eq!(udp.calls(), 2);
 
-    let mut candidate = control.config_handle().read().await.clone();
+    let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.cache.ttl = 302;
     candidate.dns.upstream[0].address = tcp.address.to_string();
     candidate.dns.upstream[0].protocol = DnsProtocol::Tcp;

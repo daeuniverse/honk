@@ -241,45 +241,6 @@ impl ControlPlaneHandle {
         }
 
         self.stats.record_connection(&outbound_name);
-
-        let ipver = if original_dst.is_ipv6() {
-            IpVersion::V6
-        } else {
-            IpVersion::V4
-        };
-        // Hold the config read guard while cloning the group/runtime handles:
-        // reload publishes all three under their write guards, so this is one
-        // coherent generation rather than three individually-current values.
-        let generation_config_guard = self.config.read().await;
-        let generation_config = generation_config_guard.clone();
-        let generation_group_manager = self.group_manager.read().clone();
-        let runtime_generation = self.runtime_registry.read().clone();
-        drop(generation_config_guard);
-        let (
-            mut candidates,
-            mut selection_mode,
-            mut score_feedback,
-            mut selection_chains,
-            health_ipver,
-        ) = {
-            let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
-            let plan = crate::control::reload::resolve_outbound_plan_for_target(
-                &generation_config,
-                &generation_group_manager,
-                &outbound_name,
-                &context,
-            );
-            unpack_tcp_score_plan(plan)
-        };
-        // Only an unmeasured URLTest group is allowed to speculate. Its
-        // candidate set is bounded before spawning so a large group cannot
-        // turn one client flow into an unbounded dial storm.
-        if selection_mode == SelectionPlanMode::ColdUrlTest {
-            candidates.truncate(3);
-        } else {
-            candidates.truncate(1);
-        }
-
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
         // For ControlPlaneRouting handoffs we must relay in userspace even if
@@ -307,6 +268,44 @@ impl ControlPlaneHandle {
             );
             self.stats.record_close(&outbound_name);
             return Ok(());
+        }
+
+        let ipver = if original_dst.is_ipv6() {
+            IpVersion::V6
+        } else {
+            IpVersion::V4
+        };
+        // Hold the config read guard while cloning the group/runtime handles:
+        // reload publishes all three under their write guards, so this is one
+        // coherent generation rather than three individually-current values.
+        let generation_config_guard = self.config.read().await;
+        let generation_config = Arc::clone(&generation_config_guard);
+        let generation_group_manager = self.group_manager.read().clone();
+        let runtime_generation = self.runtime_registry.read().clone();
+        drop(generation_config_guard);
+        let (
+            mut candidates,
+            mut selection_mode,
+            mut score_feedback,
+            mut selection_chains,
+            health_ipver,
+        ) = {
+            let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
+            let plan = crate::control::reload::resolve_outbound_plan_for_target(
+                &generation_config,
+                &generation_group_manager,
+                &outbound_name,
+                &context,
+            );
+            unpack_tcp_score_plan(plan)
+        };
+        // Only an unmeasured URLTest group is allowed to speculate. Its
+        // candidate set is bounded before spawning so a large group cannot
+        // turn one client flow into an unbounded dial storm.
+        if selection_mode == SelectionPlanMode::ColdUrlTest {
+            candidates.truncate(3);
+        } else {
+            candidates.truncate(1);
         }
 
         if candidates.is_empty() {

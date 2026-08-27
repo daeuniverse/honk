@@ -114,7 +114,7 @@ fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task:
 
 /// The main control plane.
 pub struct ControlPlane {
-    config: Arc<RwLock<Config>>,
+    config: Arc<RwLock<Arc<Config>>>,
     log_file_override: Option<PathBuf>,
     effective_log_file: Option<PathBuf>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
@@ -236,7 +236,7 @@ impl ControlPlane {
             .await
     }
 
-    pub fn config_handle(&self) -> Arc<RwLock<Config>> {
+    pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
     }
 
