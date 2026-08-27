@@ -180,7 +180,8 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
             .external_ui_download_detour
             .clone()
     };
-    let (outbound, rule) = if configured_detour.is_empty() {
+    let detour_configured = !configured_detour.is_empty();
+    let (outbound, rule) = if !detour_configured {
         let router = ctx.router.read().await;
         let (outbound, _must) = router.route_with_must(&info);
         let rule = router
@@ -208,6 +209,16 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     let (nodes, feedback) = {
         let config = ctx.config.read().await;
         let group_manager = ctx.group_manager.read().clone();
+        // Generic route resolution defaults unknown outputs to direct; an
+        // explicitly configured detour must not bypass that operator error.
+        if detour_configured
+            && outbound != Config::BUILTIN_DIRECT_NODE
+            && outbound != Config::BUILTIN_BLOCK_NODE
+            && !config.nodes.iter().any(|node| node.name == outbound)
+            && !config.groups.iter().any(|group| group.name == outbound)
+        {
+            anyhow::bail!("external UI download: detour outbound '{outbound}' not found");
+        }
         if config.groups.iter().any(|group| group.name == outbound) {
             let context = ScoreSelectionContext {
                 network: SelectionNetwork::Tcp,
@@ -832,6 +843,29 @@ mod tests {
         assert_eq!(
             std::fs::read(ui_dir.join("index.html")).unwrap(),
             b"<html>y</html>"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_configured_detour_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path(), &[]);
+        ctx.config
+            .write()
+            .await
+            .experimental
+            .clash_api
+            .external_ui_download_detour = "missing".into();
+
+        let error = decide_route(&ctx, "127.0.0.1", 80)
+            .await
+            .err()
+            .expect("an unknown explicit detour must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("detour outbound 'missing' not found"),
+            "{error:#}"
         );
     }
 
