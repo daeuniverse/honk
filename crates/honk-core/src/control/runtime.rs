@@ -864,6 +864,8 @@ impl ControlPlane {
         }
     }
     pub(super) fn spawn_handle(&self) -> ControlPlaneHandle {
+        #[cfg(test)]
+        self.connection_tracker.enable();
         ControlPlaneHandle {
             config: self.config.clone(),
             router: self.router.clone(),

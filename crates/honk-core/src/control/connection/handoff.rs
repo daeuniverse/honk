@@ -218,12 +218,26 @@ impl TcpFlowGuard {
         &mut self.stream
     }
 
+    #[cfg(test)]
     pub(super) fn track(&mut self, entry: crate::connection_tracker::ConnectionEntry) {
         assert!(
             self.tracker_id.is_none(),
             "TCP flow tracker attached more than once"
         );
         self.tracker_id = Some(self.tracker.register(entry));
+    }
+
+    pub(super) fn track_if_enabled(
+        &mut self,
+        make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
+    ) -> Option<String> {
+        assert!(
+            self.tracker_id.is_none(),
+            "TCP flow tracker attached more than once"
+        );
+        let id = self.tracker.register_if_enabled(make_entry)?;
+        self.tracker_id = Some(id.clone());
+        Some(id)
     }
 
     fn untrack(&mut self) {

@@ -5,7 +5,7 @@
 
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Snapshot of a connection's state, safe to serialize and expose via API.
@@ -85,6 +85,7 @@ impl ConnectionEntry {
 /// Thread-safe by construction via [`DashMap`] — no external locks needed.
 pub struct ConnectionTracker {
     entries: DashMap<String, ConnectionEntry>,
+    enabled: AtomicBool,
 }
 
 impl ConnectionTracker {
@@ -92,7 +93,24 @@ impl ConnectionTracker {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            enabled: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(any(feature = "clash-api", test))]
+    pub(crate) fn enable(&self) {
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn register_if_enabled(
+        &self,
+        make_entry: impl FnOnce() -> ConnectionEntry,
+    ) -> Option<String> {
+        self.is_enabled().then(|| self.register(make_entry()))
     }
 
     /// Register a new connection and return its unique ID (UUID v4).
@@ -138,5 +156,23 @@ impl ConnectionTracker {
 impl Default for ConnectionTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionTracker;
+
+    #[test]
+    fn lazy_registration_skips_construction_until_enabled() {
+        let tracker = ConnectionTracker::new();
+        assert!(
+            tracker
+                .register_if_enabled(|| panic!("disabled tracker constructed an entry"))
+                .is_none()
+        );
+
+        tracker.enable();
+        assert!(tracker.is_enabled());
     }
 }

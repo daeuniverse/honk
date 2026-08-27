@@ -531,40 +531,34 @@ impl ControlPlaneHandle {
 
         let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
-        let conn_id = uuid::Uuid::new_v4().to_string();
-        // Clash-shaped matched rule + dial chain for /connections: rule and
-        // rulePayload describe the RULE (type + own payload, "Fallback" =
-        // fallback), while metadata.host keeps the connection's domain.
-        // chains is the selection path leaf-first ([leaf, .., topGroup]).
-        let (rule, rule_payload) = matched_rule
-            .clone()
-            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-        let chains = connection_chains(
-            selection_chains.remove(&node.id).unwrap_or_default(),
-            &node.name,
-        );
-        // Live byte counters shared with the relay task: it increments them
-        // as data flows so /connections shows real-time totals instead of a
-        // single close-time (never-visible) update.
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        flow.track(crate::connection_tracker::ConnectionEntry {
-            id: conn_id.clone(),
-            source: client_addr.to_string(),
-            destination: resolved_target.to_string(),
-            proxy: node.name.clone(),
-            rule,
-            rule_payload,
-            chains,
-            upload: conn_upload.clone(),
-            download: conn_download.clone(),
-            start_time: std::time::Instant::now(),
-            domain: target_domain.clone(),
-            network: "tcp".to_string(),
-            process: handoff.as_ref().and_then(|ho| ho.process_name()),
-            process_path: None,
-        });
-        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
+        if let Some(conn_id) = flow.track_if_enabled(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let (rule, rule_payload) =
+                matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+            crate::connection_tracker::ConnectionEntry {
+                id,
+                source: client_addr.to_string(),
+                destination: resolved_target.to_string(),
+                proxy: node.name.clone(),
+                rule,
+                rule_payload,
+                chains: connection_chains(
+                    selection_chains.remove(&node.id).unwrap_or_default(),
+                    &node.name,
+                ),
+                upload: conn_upload.clone(),
+                download: conn_download.clone(),
+                start_time: std::time::Instant::now(),
+                domain: target_domain.clone(),
+                network: "tcp".to_string(),
+                process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                process_path: None,
+            }
+        }) {
+            self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
+        }
 
         debug!(
             network = "tcp",
