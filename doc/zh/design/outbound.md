@@ -202,8 +202,10 @@ raw 路径查询 DNS HTTPS 记录（`qtype 65`），并提取 SVCB `ech` 参数�
 
 解析完成后，代理服务器 TCP 与共享 QUIC client 会稳定交错两种地址族，并且
 最多同时竞速两个地址。首个地址立即开始；fallback 在 250 ms 后启动，若首个
-地址更早失败则立即启动。该竞速始终位于已经选定的同一节点内部：socket mark
-与安全配置保持一致，QUIC 协议认证也只对胜出连接执行。
+地址更早失败则立即启动。每个进行中的地址尝试分别持有 generation 与进程级
+拨号 permit；达到配置上限时，fallback 必须等待先前尝试结束，因此
+`max_concurrent_dials: 1` 会串行尝试地址。竞速始终位于已经选定的同一节点
+内部：socket mark 与安全配置保持一致，QUIC 协议认证也只对胜出连接执行。
 
 ## TLS、指纹、ECH 与 pin
 

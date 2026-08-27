@@ -222,9 +222,12 @@ DNS HTTPS records (`qtype 65`) and extracts the SVCB `ech` parameter.
 
 After resolution, proxy-server TCP and shared QUIC clients stably interleave
 address families and race at most two addresses. The first starts immediately;
-the fallback starts after 250 ms or as soon as the first address fails. This
-race stays inside the already selected node: socket marks and security settings
-are identical, and QUIC protocol authentication runs only for the winner.
+the fallback starts after 250 ms or as soon as the first address fails. Every
+in-flight address attempt holds its own generation and process dial permits, so
+at the configured ceiling a fallback waits for an earlier attempt to finish;
+`max_concurrent_dials: 1` serializes addresses. The race stays inside the
+already selected node: socket marks and security settings are identical, and
+QUIC protocol authentication runs only for the winner.
 
 ## TLS, fingerprinting, ECH, and pins
 

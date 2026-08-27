@@ -583,7 +583,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let task_state = Arc::clone(&self.state);
                     let config = self.config.clone();
                     let mut task_shutdown_rx = self.shutdown_tx.subscribe();
-                    tokio::spawn(async move {
+                    let dial_scope = crate::runtime::capture_dial_scope();
+                    tokio::spawn(dial_scope.scope(async move {
                         let mut guard = DialGuard {
                             pool: Arc::clone(&task_pool),
                             inflight_id: id,
@@ -646,7 +647,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             }
                         };
                         let _ = done.send(signal);
-                    });
+                    }));
                     // Fall through: wait on the dial like everyone else.
                 }
             }

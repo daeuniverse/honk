@@ -78,7 +78,12 @@ async fn indexed_attempt<T, E, Fut>(original_index: usize, future: Fut) -> (usiz
 where
     Fut: Future<Output = Result<T, E>>,
 {
-    (original_index, future.await)
+    let permit = crate::runtime::acquire_physical_dial_permit().await;
+    let result = future.await;
+    if result.is_ok() {
+        crate::runtime::retain_physical_dial_permit(permit);
+    }
+    (original_index, result)
 }
 
 pub(super) async fn race_resolved_addrs<T, E, F, Fut>(
@@ -296,5 +301,43 @@ mod tests {
         assert_eq!(result, Some(Err(v6(2))));
         assert_eq!(peak.load(Ordering::SeqCst), MAX_IN_FLIGHT);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn real_tcp_loser_socket_closes_when_fallback_wins() {
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_listener.local_addr().unwrap();
+        let second_addr = second_listener.local_addr().unwrap();
+        let addrs = [first_addr, second_addr];
+
+        let winner = race_resolved_addrs_with_stagger(
+            &addrs,
+            Duration::from_millis(20),
+            move |addr| async move {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                if addr == first_addr {
+                    let _stream = stream;
+                    std::future::pending::<std::io::Result<tokio::net::TcpStream>>().await
+                } else {
+                    Ok(stream)
+                }
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(winner.peer_addr().unwrap(), second_addr);
+
+        let (mut first_server, _) = first_listener.accept().await.unwrap();
+        let (second_server, _) = second_listener.accept().await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), first_server.read(&mut byte))
+            .await
+            .expect("losing TCP socket stayed open")
+            .unwrap();
+        assert_eq!(read, 0);
+        drop((winner, second_server));
     }
 }

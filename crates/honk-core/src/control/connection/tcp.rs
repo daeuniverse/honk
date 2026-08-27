@@ -1051,16 +1051,16 @@ impl ControlPlaneHandle {
                         let Some(_warm_guard) = pool.try_begin_warm(&key) else {
                             return;
                         };
-                        let _dial_permit = generation.acquire_dial_permit().await;
+                        let dial_permit = generation.acquire_dial_permit().await;
                         let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
-                        match registry
-                            .dial_runtime(
+                        match dial_permit
+                            .scope(registry.dial_runtime(
                                 Arc::clone(&generation),
                                 node.id,
                                 target,
                                 target_domain.as_deref(),
                                 connect_timeout,
-                            )
+                            ))
                             .await
                         {
                             Ok(stream) => {
@@ -1093,7 +1093,7 @@ impl ControlPlaneHandle {
                         // instead; a bare TCP is useless to them.
                         return;
                     }
-                    let _dial_permit = generation.acquire_dial_permit().await;
+                    let dial_permit = generation.acquire_dial_permit().await;
                     let pool_reporter = pool_feedback.as_ref().map(|feedback| {
                         feedback
                             .clone()
@@ -1104,7 +1104,13 @@ impl ControlPlaneHandle {
                             ))
                             .start()
                     });
-                    match honk_outbound::util::connect_outbound(&node_addr, connect_timeout).await {
+                    match dial_permit
+                        .scope(honk_outbound::util::connect_outbound(
+                            &node_addr,
+                            connect_timeout,
+                        ))
+                        .await
+                    {
                         Ok(stream) => {
                             if generation.is_shutdown() {
                                 if let Some(reporter) = &pool_reporter {
@@ -1234,7 +1240,7 @@ impl ControlPlaneHandle {
             && generation
                 .get(&node.id)
                 .is_some_and(|runtime| runtime.is_warm_or_stateless());
-        let _dial_permit = if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
+        let dial_permit = if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
             || reuses_generation_transport
         {
             None
@@ -1242,44 +1248,50 @@ impl ControlPlaneHandle {
             Some(generation.acquire_dial_permit().await)
         };
 
-        // A raw pooled TCP still needs its protocol handshake. Multiplexed
-        // protocols opt out because their node runtime owns the transport.
-        if !pool_disabled
-            && (entry.descriptor.pool_bare_tcp)(node)
-            && let Some(tcp) = pool.acquire_tcp(&addr).await
-        {
-            on_start();
-            tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-            return entry
-                .tcp
-                .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                .await
-                .map(|stream| (stream, true));
-        }
+        let dial = async {
+            // A raw pooled TCP still needs its protocol handshake. Multiplexed
+            // protocols opt out because their node runtime owns the transport.
+            if !pool_disabled
+                && (entry.descriptor.pool_bare_tcp)(node)
+                && let Some(tcp) = pool.acquire_tcp(&addr).await
+            {
+                on_start();
+                tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
+                return entry
+                    .tcp
+                    .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
+                    .await
+                    .map(|stream| (stream, true));
+            }
 
-        // Pool miss (or pools disabled) — fresh connect through the
-        // flow's pinned generation. A candidate absent from the generation
-        // (e.g. a hand-built test config without the built-in nodes
-        // injected) falls back to the stateless node-based dial.
-        tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
-        on_start();
-        if generation.get(&node.id).is_some() {
-            registry
-                .dial_runtime(
-                    Arc::clone(generation),
-                    node.id,
-                    target,
-                    target_domain,
-                    connect_timeout,
-                )
-                .await
-                .map(|stream| (stream, true))
-        } else {
-            entry
-                .tcp
-                .dial(node, target, target_domain, connect_timeout)
-                .await
-                .map(|stream| (stream, true))
+            // Pool miss (or pools disabled) — fresh connect through the
+            // flow's pinned generation. A candidate absent from the generation
+            // (e.g. a hand-built test config without the built-in nodes
+            // injected) falls back to the stateless node-based dial.
+            tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
+            on_start();
+            if generation.get(&node.id).is_some() {
+                registry
+                    .dial_runtime(
+                        Arc::clone(generation),
+                        node.id,
+                        target,
+                        target_domain,
+                        connect_timeout,
+                    )
+                    .await
+                    .map(|stream| (stream, true))
+            } else {
+                entry
+                    .tcp
+                    .dial(node, target, target_domain, connect_timeout)
+                    .await
+                    .map(|stream| (stream, true))
+            }
+        };
+        match dial_permit {
+            Some(permit) => permit.scope(dial).await,
+            None => dial.await,
         }
     }
 }

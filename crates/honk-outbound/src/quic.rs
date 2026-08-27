@@ -660,29 +660,25 @@ impl<C> QuicClient<C> {
             anyhow::bail!("resolve {host}: no addresses");
         }
 
-        let mut endpoints: [Option<Endpoint>; 2] = [None, None];
-        if let Some((ipv6, endpoint)) = &state.endpoint {
-            endpoints[usize::from(*ipv6)] = Some(endpoint.clone());
-        }
+        let cached_endpoint = state
+            .endpoint
+            .as_ref()
+            .map(|(ipv6, endpoint)| (*ipv6, endpoint.clone()));
         let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
             let ipv6 = server_addr.is_ipv6();
-            let family = usize::from(ipv6);
-            let endpoint = match endpoints[family].clone() {
-                Some(endpoint) => Ok(endpoint),
-                None => {
-                    let endpoint = match &self.endpoint_factory {
+            let endpoint = cached_endpoint
+                .as_ref()
+                .filter(|(cached_ipv6, _)| *cached_ipv6 == ipv6)
+                .map(|(_, endpoint)| endpoint.clone());
+            async move {
+                let endpoint = match endpoint {
+                    Some(endpoint) => endpoint,
+                    None => match &self.endpoint_factory {
                         Some(factory) => factory(ipv6),
                         None => client_endpoint_with_mtu(ipv6, self.mtu),
                     }
-                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"));
-                    if let Ok(endpoint) = &endpoint {
-                        endpoints[family] = Some(endpoint.clone());
-                    }
-                    endpoint
-                }
-            };
-            async move {
-                let endpoint = endpoint?;
+                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?,
+                };
                 let mut last_error = None;
                 // Keep retries inside one address job: the shared scheduler
                 // races addresses for this node, never protocol attempts or nodes.
@@ -1192,6 +1188,71 @@ mod client_tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("invalid tls_pin_sha256"));
+    }
+
+    #[tokio::test]
+    async fn real_quic_loser_connection_closes_when_fallback_wins() {
+        let (first_server, first_addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        let (second_server, second_addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        let first_closed = tokio::spawn(async move {
+            let connection = first_server.accept().await.unwrap().await.unwrap();
+            connection.closed().await
+        });
+        let second_accepted =
+            tokio::spawn(async move { second_server.accept().await.unwrap().await.unwrap() });
+        let node = honk_config::node::Node {
+            name: "quic-address-race".to_string(),
+            skip_cert_verify: true,
+            ..Default::default()
+        };
+        let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
+            .await
+            .unwrap();
+        let endpoint = client_endpoint(false).unwrap();
+        let first_connection = endpoint
+            .connect_with(config.clone(), first_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let mut first_connection = Some(first_connection);
+        let addrs = [first_addr, second_addr];
+
+        let winner = crate::address_race::race_resolved_addrs_with_stagger(
+            &addrs,
+            Duration::from_millis(20),
+            |addr| {
+                let held = (addr == first_addr).then(|| {
+                    first_connection
+                        .take()
+                        .expect("first address launched once")
+                });
+                let endpoint = endpoint.clone();
+                let config = config.clone();
+                async move {
+                    if let Some(connection) = held {
+                        let _connection = connection;
+                        return std::future::pending::<anyhow::Result<Connection>>().await;
+                    }
+                    Ok(endpoint.connect_with(config, addr, "localhost")?.await?)
+                }
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(winner.remote_address(), second_addr);
+
+        let second_connection = tokio::time::timeout(Duration::from_secs(1), second_accepted)
+            .await
+            .expect("winning QUIC handshake did not reach the server")
+            .unwrap();
+        let _closed = tokio::time::timeout(Duration::from_secs(1), first_closed)
+            .await
+            .expect("losing QUIC connection stayed open")
+            .unwrap();
+        winner.close(VarInt::from_u32(0), b"test complete");
+        drop(second_connection);
+        endpoint.close(VarInt::from_u32(0), b"test complete");
     }
 
     async fn test_client(port: u16) -> QuicClient<()> {

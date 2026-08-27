@@ -1,3 +1,11 @@
+mod runtime {
+    pub async fn acquire_physical_dial_permit() -> Option<()> {
+        None
+    }
+
+    pub fn retain_physical_dial_permit(_: Option<()>) {}
+}
+
 #[allow(dead_code)]
 #[path = "../src/address_race.rs"]
 mod address_race;
