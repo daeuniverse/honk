@@ -162,7 +162,7 @@ aborted caller. Single XUDP has no generation runtime.
 
 ### Dial admission
 
-Physical proxied connects and protocol handshakes acquire two permits:
+Physical outbound connects—including direct TCP and proxy TCP/QUIC attempts—and their protocol handshakes acquire two permits:
 
 1. the captured generation's configured dial gate; then
 2. the immutable process-wide startup ceiling shared by overlapping reload
@@ -219,6 +219,16 @@ intercepted DNS path. Node dial sites use `bootstrap::resolve` through
 The configured bootstrap resolver is queried over bypass-marked UDP/TCP; failure
 falls back to the system resolver. `query_ech_config` uses the same raw path for
 DNS HTTPS records (`qtype 65`) and extracts the SVCB `ech` parameter.
+
+After resolution, proxy-server TCP and shared QUIC clients stably interleave
+address families and race at most two addresses. The first starts immediately;
+the fallback starts after 250 ms. An earlier failure advances the fallback,
+while keeping physical attempts at least 10 ms apart. Every in-flight address
+attempt holds its own generation and process dial permits, so
+at the configured ceiling a fallback waits for an earlier attempt to finish;
+`max_concurrent_dials: 1` serializes addresses. The race stays inside the
+already selected node: socket marks and security settings are identical, and
+QUIC protocol authentication runs only for the winner.
 
 ## TLS, fingerprinting, ECH, and pins
 

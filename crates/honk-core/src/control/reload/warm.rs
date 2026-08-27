@@ -238,7 +238,13 @@ pub(in crate::control) async fn warm_selector_candidate(
                 ),
             )
             .map(|feedback| feedback.start());
-        let stream = match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
+        let stream = match generation
+            .scope_dials(honk_outbound::util::connect_outbound(
+                &addr,
+                connect_timeout,
+            ))
+            .await
+        {
             Ok(_) if generation.is_shutdown() => {
                 if let Some(reporter) = &reporter {
                     reporter.finish(crate::group::ScoreOutcome::Shutdown);

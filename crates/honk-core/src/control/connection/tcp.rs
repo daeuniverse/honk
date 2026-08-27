@@ -741,7 +741,11 @@ impl ControlPlaneHandle {
                                 ))
                                 .start()
                         });
-                        match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
+                        match generation
+                            .scope_dials(honk_outbound::util::connect_outbound(
+                                &node_addr,
+                                connect_timeout,
+                            ))
                             .await
                         {
                             Ok(stream) => {
@@ -881,13 +885,17 @@ impl ControlPlaneHandle {
                     // cancels it before it can start.
                     wait_for_cold_urltest_release(idx).await;
                 }
-                let reporter = parking_lot::Mutex::new(None);
-                let on_start = || {
-                    let started = feedback.get(&node.id).map(|feedback| feedback.start());
-                    if let Some(reporter) = &started {
-                        started_reporters.lock().push(reporter.clone());
+                let reporter = Arc::new(parking_lot::Mutex::new(None));
+                let on_start = {
+                    let feedback = feedback.get(&node.id).cloned();
+                    let reporter = Arc::clone(&reporter);
+                    move || {
+                        let started = feedback.map(|feedback| feedback.start());
+                        if let Some(reporter) = &started {
+                            started_reporters.lock().push(reporter.clone());
+                        }
+                        *reporter.lock() = started;
                     }
-                    *reporter.lock() = started;
                 };
                 let start = std::time::Instant::now();
                 let per_dial_timeout = connect_timeout * 3;
@@ -911,7 +919,7 @@ impl ControlPlaneHandle {
                     )))
                 });
                 let elapsed = start.elapsed();
-                let reporter = reporter.into_inner();
+                let reporter = reporter.lock().clone();
                 match &result {
                     Ok(_) => {
                         if let Some(reporter) = &reporter {
@@ -1051,7 +1059,6 @@ impl ControlPlaneHandle {
                         let Some(_warm_guard) = pool.try_begin_warm(&key) else {
                             return;
                         };
-                        let _dial_permit = generation.acquire_dial_permit().await;
                         let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
                         match registry
                             .dial_runtime(
@@ -1093,7 +1100,6 @@ impl ControlPlaneHandle {
                         // instead; a bare TCP is useless to them.
                         return;
                     }
-                    let _dial_permit = generation.acquire_dial_permit().await;
                     let pool_reporter = pool_feedback.as_ref().map(|feedback| {
                         feedback
                             .clone()
@@ -1104,7 +1110,13 @@ impl ControlPlaneHandle {
                             ))
                             .start()
                     });
-                    match honk_outbound::util::connect_outbound(&node_addr, connect_timeout).await {
+                    match generation
+                        .scope_dials(honk_outbound::util::connect_outbound(
+                            &node_addr,
+                            connect_timeout,
+                        ))
+                        .await
+                    {
                         Ok(stream) => {
                             if generation.is_shutdown() {
                                 if let Some(reporter) = &pool_reporter {
@@ -1198,7 +1210,7 @@ impl ControlPlaneHandle {
         node: &Node,
         target: (SocketAddr, Option<&str>),
         connect_timeout: Duration,
-        on_start: impl FnOnce(),
+        on_start: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
         let (target, target_domain) = target;
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1207,6 +1219,7 @@ impl ControlPlaneHandle {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         });
+        let on_start = Arc::new(parking_lot::Mutex::new(Some(on_start)));
 
         let addr = format!("{}:{}", node.host(), node.port);
         let entry = registry
@@ -1221,66 +1234,63 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
-                on_start();
+                if let Some(on_start) = on_start.lock().take() {
+                    on_start();
+                }
                 return Ok((stream, false));
             }
         }
 
-        // Ready streams paid their connect and protocol handshake before
-        // entering this path. For a pool miss, gate only work that can open
-        // a physical connection: a warm generation-owned QUIC/AnyTLS runtime
-        // merely opens a logical stream on its retained transport.
-        let reuses_generation_transport = entry.descriptor.has_generation_runtime(node)
-            && generation
-                .get(&node.id)
-                .is_some_and(|runtime| runtime.is_warm_or_stateless());
-        let _dial_permit = if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
-            || reuses_generation_transport
-        {
-            None
-        } else {
-            Some(generation.acquire_dial_permit().await)
+        let dial = async {
+            // A raw pooled TCP still needs its protocol handshake. Multiplexed
+            // protocols opt out because their node runtime owns the transport.
+            if !pool_disabled
+                && (entry.descriptor.pool_bare_tcp)(node)
+                && let Some(tcp) = pool.acquire_tcp(&addr).await
+            {
+                if let Some(on_start) = on_start.lock().take() {
+                    on_start();
+                }
+                tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
+                return entry
+                    .tcp
+                    .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
+                    .await
+                    .map(|stream| (stream, true));
+            }
+
+            // Pool miss (or pools disabled) — fresh connect through the
+            // flow's pinned generation. A candidate absent from the generation
+            // (e.g. a hand-built test config without the built-in nodes
+            // injected) falls back to the stateless node-based dial.
+            tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
+            if generation.get(&node.id).is_some() {
+                registry
+                    .dial_runtime(
+                        Arc::clone(generation),
+                        node.id,
+                        target,
+                        target_domain,
+                        connect_timeout,
+                    )
+                    .await
+                    .map(|stream| (stream, true))
+            } else {
+                entry
+                    .tcp
+                    .dial(node, target, target_domain, connect_timeout)
+                    .await
+                    .map(|stream| (stream, true))
+            }
         };
-
-        // A raw pooled TCP still needs its protocol handshake. Multiplexed
-        // protocols opt out because their node runtime owns the transport.
-        if !pool_disabled
-            && (entry.descriptor.pool_bare_tcp)(node)
-            && let Some(tcp) = pool.acquire_tcp(&addr).await
-        {
-            on_start();
-            tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-            return entry
-                .tcp
-                .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                .await
-                .map(|stream| (stream, true));
-        }
-
-        // Pool miss (or pools disabled) — fresh connect through the
-        // flow's pinned generation. A candidate absent from the generation
-        // (e.g. a hand-built test config without the built-in nodes
-        // injected) falls back to the stateless node-based dial.
-        tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
-        on_start();
-        if generation.get(&node.id).is_some() {
-            registry
-                .dial_runtime(
-                    Arc::clone(generation),
-                    node.id,
-                    target,
-                    target_domain,
-                    connect_timeout,
-                )
-                .await
-                .map(|stream| (stream, true))
-        } else {
-            entry
-                .tcp
-                .dial(node, target, target_domain, connect_timeout)
-                .await
-                .map(|stream| (stream, true))
-        }
+        let on_start = Arc::clone(&on_start);
+        generation
+            .scope_dials_with_start(dial, move || {
+                if let Some(on_start) = on_start.lock().take() {
+                    on_start();
+                }
+            })
+            .await
     }
 }
 

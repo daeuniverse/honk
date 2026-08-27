@@ -1820,6 +1820,7 @@ impl AnyTlsHandler {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
+        let commit_dial_scope = crate::runtime::capture_dial_admission();
 
         let (session, permit, detached) = match pool.checkout_speculative().await? {
             SpeculativeCheckout::Shared { session, permit } => (session, permit, None),
@@ -1852,21 +1853,25 @@ impl AnyTlsHandler {
             let commit_node = node.clone();
             let commit_pool = Arc::clone(&pool);
             let commit_runtime = runtime.clone();
-            return Ok(PreparedUdpTransport::new(transport, move || async move {
-                reservation.commit()?;
-                if commit_runtime.is_some() {
-                    Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
-                }
-                Ok(())
+            return Ok(PreparedUdpTransport::new(transport, move || {
+                commit_dial_scope.scope(async move {
+                    reservation.commit()?;
+                    if commit_runtime.is_some() {
+                        Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
+                    }
+                    Ok(())
+                })
             }));
         }
 
         let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(transport, move || async move {
-            if runtime.is_some() {
-                Self::ensure_janitor(&commit_node, &pool, runtime);
-            }
-            Ok(())
+        Ok(PreparedUdpTransport::new(transport, move || {
+            commit_dial_scope.scope(async move {
+                if runtime.is_some() {
+                    Self::ensure_janitor(&commit_node, &pool, runtime);
+                }
+                Ok(())
+            })
         }))
     }
 

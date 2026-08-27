@@ -149,7 +149,7 @@ pool 不会在调用方 abort 后残留。Single XUDP 没有 generation runtime�
 
 ### 拨号准入
 
-物理代理连接与协议握手获取两个 permit：
+物理出站连接（包括 direct TCP 与代理 TCP/QUIC 尝试）及其协议握手获取两个 permit：
 
 1. 捕获 generation 的配置拨号 gate；然后
 2. 所有重叠 reload generation 共享、启动时固定的进程级 ceiling。
@@ -199,6 +199,14 @@ frame 不设置 `END_STREAM`，TLS 请求使用 `:scheme: https`。DATA 携带 g
 直接调用裸 `lookup_host`。配置的 bootstrap resolver 通过带 bypass mark
 的 UDP/TCP 查询；失败时回退系统 resolver。`query_ech_config` 通过同一
 raw 路径查询 DNS HTTPS 记录（`qtype 65`），并提取 SVCB `ech` 参数。
+
+解析完成后，代理服务器 TCP 与共享 QUIC client 会稳定交错两种地址族，并且
+最多同时竞速两个地址。首个地址立即开始；fallback 在 250 ms 后启动。首个
+地址若更早失败会提前 fallback，但物理尝试之间仍至少间隔 10 ms。每个进行中
+的地址尝试分别持有 generation 与进程级拨号 permit；达到配置上限时，fallback
+必须等待先前尝试结束，因此
+`max_concurrent_dials: 1` 会串行尝试地址。竞速始终位于已经选定的同一节点
+内部：socket mark 与安全配置保持一致，QUIC 协议认证也只对胜出连接执行。
 
 ## TLS、指纹、ECH 与 pin
 

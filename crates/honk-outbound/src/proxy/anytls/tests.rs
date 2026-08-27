@@ -2405,6 +2405,52 @@ async fn speculative_detached_winner_commits_into_captured_pool_once() {
 }
 
 #[tokio::test]
+async fn speculative_commit_binds_initial_generation_admission() {
+    let node = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "speculative-initial-admission".into(),
+        protocol: NodeProtocol::AnyTLS,
+        address: "127.0.0.1:443".into(),
+        anytls_min_idle_session: Some(0),
+        ..Default::default()
+    };
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&node),
+            1,
+            None,
+        )
+        .unwrap()
+        .0,
+    );
+    let runtime = generation.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    assert!(!pool.dial_scope_matches(&generation));
+    let (session, _server) = establish_test_session("speculative-initial-admission").await;
+    let prepared = generation
+        .scope_dials(AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+            &node,
+            Arc::clone(&pool),
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+            Some(runtime),
+            {
+                let session = Arc::clone(&session);
+                move || async move { Ok(session) }
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(!pool.dial_scope_matches(&generation));
+
+    let transport = prepared.commit().await.unwrap();
+
+    assert!(pool.dial_scope_matches(&generation));
+    drop(transport);
+    pool.shutdown();
+}
+
+#[tokio::test]
 async fn speculative_detached_commit_fails_closed_after_generation_shutdown() {
     let handler = AnyTlsHandler::new();
     let node = Node {
