@@ -680,9 +680,8 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
         None => return ERR_MALFORMED,
     };
 
-    match tctx.parse(ctx, link_h_len) {
-        Err(e) => return e,
-        Ok(()) => {}
+    if let Err(e) = tctx.parse(ctx, link_h_len) {
+        return e;
     }
 
     if tctx.l4proto == IPPROTO_ICMPV6 {

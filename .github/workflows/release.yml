@@ -16,7 +16,7 @@ jobs:
     name: cargo test (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
@@ -63,7 +63,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             suffix: "-stock"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable (with target)
         uses: dtolnay/rust-toolchain@stable
@@ -73,28 +73,28 @@ jobs:
       - name: Install Rust nightly (for the eBPF object)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20 # newer nightlies carry LLVM that rejects bpf-linker -Oz
+          toolchain: nightly
           components: rust-src, llvm-tools
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev
+          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
 
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --version 0.10.3  # pinned: keep the version the eBPF build was verified with
-
-      - name: Point eBPF .cargo/config at the installed bpf-linker
+      - name: Install bpf-linker 0.11.0
         run: |
-          sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
-            crates/honk-ebpf/.cargo/config.toml
+          curl -fsSL --retry 3 -o /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          echo "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450  /tmp/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc /tmp/bpf-linker.tar.zst | tar -xf - -C "$HOME/.cargo/bin"
+          bpf-linker --version
 
       # The eBPF object is target-independent; build it once on the host so
       # cross builds just pick it up (build.rs locates it when present).
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
-          cargo +nightly-2026-07-20 build --release -Zbuild-std=core --target bpfel-unknown-none
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 
       # aya refuses objects without BTF ("no BTF parsed for object") — fail
       # the build here instead of at runtime on a gateway.
@@ -164,7 +164,7 @@ jobs:
           tar -czf "$name.tar.gz" -C dist "$name"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: honk-core-${{ matrix.target }}${{ matrix.suffix }}
           path: honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
@@ -177,13 +177,13 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*.tar.gz
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}

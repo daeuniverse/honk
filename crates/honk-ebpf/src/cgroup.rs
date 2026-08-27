@@ -84,7 +84,6 @@ fn update_map_elem_by_cookie_argv0(cookie: u64) -> i32 {
     ret
 }
 
-
 /// Guaranteed last-resort capture when kernel argv access is unavailable.
 #[inline(always)]
 fn update_map_elem_by_cookie_comm(cookie: u64) -> i32 {
@@ -117,7 +116,6 @@ pub fn tproxy_wan_cg_sock_create(ctx: SockContext) -> i32 {
     CGROUP_ALLOW
 }
 
-
 #[cgroup_sock(sock_create)]
 pub fn tproxy_wan_cg_sock_create_comm(ctx: SockContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock as *mut aya_ebpf_cty::c_void) };
@@ -141,7 +139,6 @@ pub fn tproxy_wan_cg_connect4(ctx: SockAddrContext) -> i32 {
     CGROUP_ALLOW
 }
 
-
 #[cgroup_sock_addr(connect4)]
 pub fn tproxy_wan_cg_connect4_comm(ctx: SockAddrContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
@@ -155,7 +152,6 @@ pub fn tproxy_wan_cg_connect6(ctx: SockAddrContext) -> i32 {
     update_map_elem_by_cookie_argv0(cookie);
     CGROUP_ALLOW
 }
-
 
 #[cgroup_sock_addr(connect6)]
 pub fn tproxy_wan_cg_connect6_comm(ctx: SockAddrContext) -> i32 {
@@ -171,7 +167,6 @@ pub fn tproxy_wan_cg_sendmsg4(ctx: SockAddrContext) -> i32 {
     CGROUP_ALLOW
 }
 
-
 #[cgroup_sock_addr(sendmsg4)]
 pub fn tproxy_wan_cg_sendmsg4_comm(ctx: SockAddrContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
@@ -185,7 +180,6 @@ pub fn tproxy_wan_cg_sendmsg6(ctx: SockAddrContext) -> i32 {
     update_map_elem_by_cookie_argv0(cookie);
     CGROUP_ALLOW
 }
-
 
 #[cgroup_sock_addr(sendmsg6)]
 pub fn tproxy_wan_cg_sendmsg6_comm(ctx: SockAddrContext) -> i32 {

@@ -18,7 +18,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,7 +33,7 @@ jobs:
     name: cargo test (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
@@ -58,23 +58,27 @@ jobs:
     name: eBPF object + real VM kernel tests
     # These tests attach TC/cgroup programs and therefore cannot run in a job container.
     runs-on: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20 # pinned: keep the nightly the eBPF build was verified with
+          toolchain: nightly
           components: rust-src, llvm-tools
       - name: Install build and kernel-test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev iproute2 iptables
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --version 0.10.3  # pinned: keep the version the eBPF build was verified with
-      - name: Point eBPF .cargo/config at the installed bpf-linker
+          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev iproute2 iptables zstd
+      - name: Install bpf-linker 0.11.0
         run: |
-          sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
-            crates/honk-ebpf/.cargo/config.toml
+          curl -fsSL --retry 3 -o /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          echo "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450  /tmp/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc /tmp/bpf-linker.tar.zst | tar -xf - -C "$HOME/.cargo/bin"
+          bpf-linker --version
       - name: Install geo assets for eBPF-feature unit tests
         run: |
           sudo mkdir -p /etc/dae
@@ -85,7 +89,7 @@ jobs:
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
-          cargo +nightly-2026-07-20 build --release -Zbuild-std=core --target bpfel-unknown-none
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
       # aya refuses objects without BTF ("no BTF parsed for object") — fail
       # here instead of at runtime on a gateway.
       - name: Verify eBPF object has BTF
@@ -147,7 +151,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;

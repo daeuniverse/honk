@@ -88,9 +88,9 @@ test-ebpf:
 
 # Root-gated netlink/netns integration tests (NFQUEUE + netkit/veth/route/rule roundtrip)
 test-netns:
-    cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
-    cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-    cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:

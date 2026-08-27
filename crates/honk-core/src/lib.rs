@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! honk-core: eBPF-based transparent proxy engine. Uses TC redirects and
 //! `sk_lookup` BPF with an isolated `daens` network namespace — no iptables
 //! TPROXY rules needed. The process (all threads) always stays in the host
