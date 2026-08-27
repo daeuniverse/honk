@@ -66,6 +66,12 @@ pub(crate) fn restart_required_changes(
     if old_api.external_ui != new_api.external_ui {
         changed.push("experimental.clash_api.external_ui");
     }
+    if old_api.external_ui_download_url != new_api.external_ui_download_url {
+        changed.push("experimental.clash_api.external_ui_download_url");
+    }
+    if old_api.external_ui_download_detour != new_api.external_ui_download_detour {
+        changed.push("experimental.clash_api.external_ui_download_detour");
+    }
     if old_api.secret != new_api.secret {
         changed.push("experimental.clash_api.secret");
     }

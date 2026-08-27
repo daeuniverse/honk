@@ -52,7 +52,7 @@ A real-datapath process holds the lock for its lifetime. `reload` verifies that 
 | Variable | Scope | Current behavior |
 | --- | --- | --- |
 | `RUST_LOG` | Both binaries | Tracing filter. It has the effective `honk-core` precedence described above; `honk-tool` otherwise defaults to `warn`. |
-| `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Overrides the dashboard zip URL used when a configured external-UI directory needs downloading. |
+| `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Highest-precedence dashboard ZIP URL; overrides `external_ui_download_url` when a configured external-UI directory needs downloading. |
 | `HONK_POOL_DISABLE=1` | `honk-core` | Bypasses both ready-stream and bare-TCP pools and performs fresh dials. The code also accepts case-insensitive `true`; the value is cached on first use. |
 | `HONK_QUIC_GSO=0|1` | QUIC outbounds | Forces UDP GSO off/on. Without an override, the conservative 1252-byte MTU keeps GSO off, while an explicit larger `mtu` enables batches capped at 16 segments. |
 | `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |

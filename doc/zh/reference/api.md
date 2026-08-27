@@ -79,9 +79,9 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 ## 外部 UI hosting
 
-设置 `experimental.clash_api.external_ui` 以提供静态 dashboard 目录。目录缺失或为空时，honk 会在后台下载最新 zashboard `dist.zip`；启动不会等待，文件可用前静态路由返回 `404`。`HONK_UI_DOWNLOAD_URL` 可覆盖 archive URL。
+设置 `experimental.clash_api.external_ui` 以提供静态 dashboard 目录。目录缺失或为空时，honk 会在后台下载 ZIP；启动不会等待，文件可用前静态路由返回 `404`。`external_ui_download_url` 会替换内建 zashboard URL，`HONK_UI_DOWNLOAD_URL` 则保持最高覆盖优先级。
 
-下载遵循 honk 当前的流量路由决策。`direct` 结果使用直连 HTTP client，`block` 会中止下载，proxy 结果使用选中的出站叶节点。redirect target 会再次经过路由。每次直连或经代理且实际经过 Score 组的 HTTP exchange，都会向路径经过的 Score 组报告真实 host/IP、端口、setup、首响应、字节与终态；其他路径不创建评分 reporter 或 cell。下载或解压失败只写日志，不会停止引擎。
+非空 `external_ui_download_detour` 会强制初始请求和 redirect 都经过该节点或组。该字段为空时，每个 URL 遵循 honk 当前的流量路由决策：`direct` 使用直连 HTTP client，`block` 中止下载，proxy 结果使用选中的出站叶节点。每次直连或经代理且实际经过 Score 组的 HTTP exchange，都会向路径经过的 Score 组报告真实 host/IP、端口、setup、首响应、字节与终态；其他路径不创建评分 reporter 或 cell。下载或解压失败只写日志，不会停止引擎。
 
 ## `GET /stats`
 

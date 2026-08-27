@@ -17,6 +17,8 @@
 | --- | --- | --- |
 | `external_controller` | `""` | HTTP 监听地址。空值关闭 API server。 |
 | `external_ui` | `""` | 外部 dashboard 目录。空值关闭 dashboard 服务与下载。 |
+| `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL。空值使用内建 zashboard URL。 |
+| `external_ui_download_detour` | `""` | 下载使用的节点或组 tag。空值遵循普通流量路由。 |
 | `secret` | `""` | API 鉴权 secret。空值关闭鉴权。 |
 | `default_mode` | `"Rule"` | 启动模式：`Rule`、`Global` 或 `Direct`。有效的缓存模式优先。 |
 
@@ -28,9 +30,9 @@
 
 ### 外部 UI
 
-绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择相对当前工作目录的已有目录；两者都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard zip。`HONK_UI_DOWNLOAD_URL` 可覆盖 zip URL。
+绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择相对当前工作目录的已有目录；两者都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
-下载遵循普通流量的路由决策，并解析选中的组或节点。`block` 决策会中止下载，不会绕过策略。
+非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 仍按原有行为遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。
 
 ### 启动模式
 
@@ -66,6 +68,8 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'zashboard'
+        external_ui_download_url: 'https://example.com/dashboard.zip'
+        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: Rule
     }

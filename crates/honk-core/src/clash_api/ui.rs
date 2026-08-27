@@ -8,14 +8,14 @@
 //! failures only log a warning — `ServeDir` keeps returning 404 until the
 //! files land.
 //!
-//! The fetch follows the same routing decision as user traffic: the
-//! download URL's host is run through the traffic `Router`, a `direct`
-//! result (including must-rules) takes the plain reqwest path, `block`
-//! aborts the download, and anything else is fetched through the selected
-//! node's tunnel with a real TLS handshake.
+//! A non-empty `external_ui_download_detour` forces every request and
+//! redirect through that node or group. Otherwise each URL host follows the
+//! normal traffic routing decision: `direct` uses reqwest, `block` aborts,
+//! and other results use the selected node's tunnel.
 //!
-//! The download URL defaults to [`DEFAULT_UI_DOWNLOAD_URL`] and can be
-//! overridden with the `HONK_UI_DOWNLOAD_URL` environment variable.
+//! The download URL defaults to [`DEFAULT_UI_DOWNLOAD_URL`].
+//! `external_ui_download_url` configures it, while `HONK_UI_DOWNLOAD_URL`
+//! remains the highest-precedence override.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -103,13 +103,27 @@ pub async fn ensure_external_ui(ctx: &UiDownloadContext) -> anyhow::Result<bool>
         }
         Err(_) => std::fs::create_dir_all(path)?,
     }
-    download_external_ui(ctx, &download_url()).await?;
+    let configured_url = {
+        let config = ctx.config.read().await;
+        config
+            .experimental
+            .clash_api
+            .external_ui_download_url
+            .clone()
+    };
+    download_external_ui(ctx, &download_url(&configured_url)).await?;
     Ok(true)
 }
 
-/// The configured download URL (env override, then the default constant).
-fn download_url() -> String {
-    std::env::var(UI_DOWNLOAD_URL_ENV).unwrap_or_else(|_| DEFAULT_UI_DOWNLOAD_URL.to_string())
+/// The environment override wins over the configured URL, then the default.
+fn download_url(configured: &str) -> String {
+    std::env::var(UI_DOWNLOAD_URL_ENV).unwrap_or_else(|_| {
+        if configured.is_empty() {
+            DEFAULT_UI_DOWNLOAD_URL.to_string()
+        } else {
+            configured.to_string()
+        }
+    })
 }
 
 /// Where the routing decision sends the download.
@@ -158,13 +172,26 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
         mac: None,
         dscp: None,
     };
-    let (outbound, rule) = {
+    let configured_detour = {
+        let config = ctx.config.read().await;
+        config
+            .experimental
+            .clash_api
+            .external_ui_download_detour
+            .clone()
+    };
+    let (outbound, rule) = if configured_detour.is_empty() {
         let router = ctx.router.read().await;
         let (outbound, _must) = router.route_with_must(&info);
         let rule = router
             .route_full(&info)
             .map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
         (outbound.to_string(), rule)
+    } else {
+        (
+            configured_detour,
+            Some("experimental.clash_api.external_ui_download_detour".to_string()),
+        )
     };
     let target_ipver = if matches!(dst_ip, std::net::IpAddr::V6(_)) {
         IpVersion::V6
@@ -777,16 +804,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_downloads_into_empty_directory() {
+    async fn configured_url_and_detour_download_into_empty_directory() {
         let zip_bytes = make_zip(&[("dist/index.html", b"<html>y</html>".as_slice())]);
         let addr = spawn_zip_server(zip_bytes).await;
         let dir = tempfile::tempdir().unwrap();
         let ui_dir = dir.path().join("ui");
-        // Point the download at a *missing* directory to also cover creation.
-        let ctx = test_ctx(&ui_dir, &[]);
-        download_external_ui(&ctx, &format!("http://{}/ui.zip", addr))
-            .await
-            .unwrap();
+        let rules = vec![RoutingRule {
+            name: "block-ui".into(),
+            condition: RoutingCondition {
+                ip: vec!["127.0.0.1/32".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("block".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }];
+        let ctx = test_ctx(&ui_dir, &rules);
+        {
+            let mut config = ctx.config.write().await;
+            config.experimental.clash_api.external_ui_download_url =
+                format!("http://{addr}/ui.zip");
+            config.experimental.clash_api.external_ui_download_detour = "direct".into();
+        }
+
+        assert!(ensure_external_ui(&ctx).await.unwrap());
         assert_eq!(
             std::fs::read(ui_dir.join("index.html")).unwrap(),
             b"<html>y</html>"

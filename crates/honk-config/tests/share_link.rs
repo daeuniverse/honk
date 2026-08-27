@@ -217,6 +217,9 @@ fn sample_config() -> Config {
     let mut config = Config::default();
     config.experimental.clash_api.external_controller = "0.0.0.0:9999".to_string();
     config.experimental.clash_api.external_ui = "yacd".to_string();
+    config.experimental.clash_api.external_ui_download_url =
+        "https://example.com/ui.zip".to_string();
+    config.experimental.clash_api.external_ui_download_detour = "proxy".to_string();
     config.experimental.clash_api.secret = "s3cret".to_string();
     config.experimental.cache_file.enabled = true;
     config.experimental.cache_file.path = "cache.db".to_string();

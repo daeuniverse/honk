@@ -91,6 +91,27 @@ fn data_directory_change_requires_restart() {
         vec!["global.data_dir"]
     );
 }
+
+#[test]
+fn external_ui_download_settings_require_restart() {
+    let current = Config::default();
+    let mut replacement = current.clone();
+    replacement.experimental.clash_api.external_ui_download_url =
+        "https://example.com/ui.zip".into();
+    replacement
+        .experimental
+        .clash_api
+        .external_ui_download_detour = "proxy".into();
+
+    assert_eq!(
+        restart_required_changes(&current, &replacement),
+        vec![
+            "experimental.clash_api.external_ui_download_url",
+            "experimental.clash_api.external_ui_download_detour"
+        ]
+    );
+}
+
 #[test]
 fn log_file_change_requires_restart() {
     let current = Config::default();

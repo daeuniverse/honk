@@ -10,6 +10,14 @@ pub struct ClashApiConfig {
     /// Path to external UI static files (e.g. "zashboard").
     #[serde(default)]
     pub external_ui: String,
+    /// ZIP download URL used when the external UI directory is empty.
+    /// An empty value uses the built-in zashboard URL.
+    #[serde(default)]
+    pub external_ui_download_url: String,
+    /// Node or group tag used to download the external UI.
+    /// An empty value follows the normal traffic routing decision.
+    #[serde(default)]
+    pub external_ui_download_detour: String,
     /// Bearer token secret for API authentication.
     /// If empty, authentication is bypassed.
     #[serde(default)]
@@ -28,6 +36,8 @@ impl Default for ClashApiConfig {
         Self {
             external_controller: String::new(),
             external_ui: String::new(),
+            external_ui_download_url: String::new(),
+            external_ui_download_detour: String::new(),
             secret: String::new(),
             default_mode: "Rule".to_string(),
         }

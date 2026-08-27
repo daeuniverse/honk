@@ -79,9 +79,9 @@ The mode update goes through `DatapathFlagsHandle`, the sole serialized writer f
 
 ## External UI hosting
 
-Set `experimental.clash_api.external_ui` to serve a static dashboard directory. If the directory is missing or empty, honk starts a background download of the latest zashboard `dist.zip`; startup does not wait, and the static route returns `404` until files are available. `HONK_UI_DOWNLOAD_URL` overrides the archive URL.
+Set `experimental.clash_api.external_ui` to serve a static dashboard directory. If the directory is missing or empty, honk starts a background ZIP download; startup does not wait, and the static route returns `404` until files are available. `external_ui_download_url` replaces the built-in zashboard URL, while `HONK_UI_DOWNLOAD_URL` remains the highest-precedence override.
 
-The download follows honk's current traffic routing decision. A `direct` result uses the direct HTTP client, `block` aborts the download, and a proxy result uses the selected outbound leaf. Redirect targets are routed again. Each direct or proxied HTTP exchange reports the real host/IP, port, setup, first response, bytes, and terminal outcome to its traversed Score groups; paths that traverse no Score group create no score reporter or cell. Download or extraction failures are logged and do not stop the engine.
+A non-empty `external_ui_download_detour` forces the initial request and redirects through that node or group. When empty, each URL follows honk's current traffic routing decision: `direct` uses the direct HTTP client, `block` aborts, and a proxy result uses the selected outbound leaf. Each direct or proxied HTTP exchange reports the real host/IP, port, setup, first response, bytes, and terminal outcome to its traversed Score groups; paths that traverse no Score group create no score reporter or cell. Download or extraction failures are logged and do not stop the engine.
 
 ## `GET /stats`
 

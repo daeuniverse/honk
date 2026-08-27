@@ -1744,6 +1744,12 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                 if let Some(v) = kv.get("external_ui") {
                     cfg.clash_api.external_ui = v.clone();
                 }
+                if let Some(v) = kv.get("external_ui_download_url") {
+                    cfg.clash_api.external_ui_download_url = v.clone();
+                }
+                if let Some(v) = kv.get("external_ui_download_detour") {
+                    cfg.clash_api.external_ui_download_detour = v.clone();
+                }
                 if let Some(v) = kv.get("secret") {
                     cfg.clash_api.secret = v.clone();
                 }

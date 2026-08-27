@@ -151,7 +151,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Listener/datapath | `global.tproxy_port`, `global.tproxy_mark`, `global.tproxy_port_protect`, `global.pprof_port`, `global.so_mark_from_dae`, `global.lan_interface`, `global.wan_interface`, `global.auto_config_kernel_parameter` |
 | Process state | `global.log_level`, `global.data_dir`, `global.store_subscribe` |
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
-| Clash API | `experimental.clash_api.external_controller`, `external_ui`, `secret`, `default_mode` |
+| Clash API | `experimental.clash_api.external_controller`, `external_ui`, `external_ui_download_url`, `external_ui_download_detour`, `secret`, `default_mode` |
 | Persistence | Any `experimental.cache_file` change |
 | NFQUEUE | `global.nfqueue_enable` |
 
