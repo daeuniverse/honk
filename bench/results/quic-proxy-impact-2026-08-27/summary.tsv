@@ -1,0 +1,7 @@
+protocol	metric	baseline_median_ns	candidate_median_ns	paired_delta_pct	baseline_p95_ns	candidate_p95_ns
+hy2	handshake_ns	896954	901722	0.441	1138096	1115362
+hy2	total_ns	915933	923172	0.688	1153854	1137881
+tuic	handshake_ns	900444	915523	1.531	1147381	1160847
+tuic	total_ns	920096	937079	1.580	1164195	1181381
+juicity	handshake_ns	838148	851476	1.902	1093482	1099279
+juicity	total_ns	856741	872898	2.549	1110070	1127361

@@ -169,6 +169,49 @@ Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
 
+## Results (2026-08-27, proxied QUIC adapter regression gate)
+
+The merged PR #75 path plus follow-up fix `0ecc101` was compared with pre-PR
+main `4c3ade3`. The fixture uses the production ownership shape: one shared
+`NodeRuntime`, a fresh packet flow through the real Hysteria2, TUIC, or Juicity
+lab server, and one inner QUIC handshake to a loopback H3 server. Each protocol
+has 30 alternating A/B pairs, 100 measured handshakes and 5 warmups per process
+(3,000 measured samples per arm). This isolates adapter/probe cost; it is not a
+user-data capacity benchmark.
+
+| Outer transport | baseline / candidate total median ms | paired median delta | 95% bootstrap interval | paired p95 delta | process CPU delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hysteria2 | 0.916 / 0.923 | +0.688% | -1.328% to +2.115% | -3.054% | -7.709% |
+| TUIC | 0.920 / 0.937 | +1.580% | -1.136% to +4.108% | +2.511% | -7.136% |
+| Juicity | 0.857 / 0.873 | +2.549% | -0.152% to +3.893% | +2.848% | -7.336% |
+
+Every interval includes zero, and the largest paired point estimate is below
+the 3% regression gate. All 9,000 measured candidate handshakes completed with
+empty stderr. The process CPU rows divide child CPU by all 105 probes and
+include amortized process startup; they are supporting evidence, not a claim
+about proxy throughput.
+
+A separate 5,000-probe tight loop checks endpoint-worker retirement. It is
+deliberately much denser than the periodic production cadence:
+
+| Outer transport | baseline / candidate peak RSS KiB | baseline / candidate wall s |
+| --- | ---: | ---: |
+| Hysteria2 (two runs) | 231104–247072 / 44048–45520 | 3.69–3.98 / 4.27–4.42 |
+| TUIC | 246944 / 43520 | 3.64 / 4.36 |
+| Juicity | 217840 / 43088 | 4.27 / 4.26 |
+
+The follow-up keeps peak RSS near 43–46 MiB instead of 213–241 MiB under this
+churn. Hysteria2 and TUIC pay up to 0.72 seconds over 5,000 immediate probes for
+deterministic worker cleanup; Juicity is flat. This is a cleanup stress cost,
+not a hot data-path regression.
+
+The same run exposed and fixed two correctness issues before the final A/B:
+quic-go can coalesce a 1280-byte first flight despite the 1252-byte advertised
+cap, and a successful probe must drop its connection handle before closing the
+endpoint. Full binary/source hashes, raw paired rows, confidence calculations,
+soak rows, configs, and exact runners are under
+[`quic-proxy-impact-2026-08-27`](../bench/results/quic-proxy-impact-2026-08-27/).
+
 ## Results (2026-08-26, QUIC profile and optimization gate)
 
 This follow-up profiles the current bounded-GSO implementation at source

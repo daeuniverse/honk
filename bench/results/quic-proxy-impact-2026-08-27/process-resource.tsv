@@ -1,0 +1,8 @@
+# Process wall and CPU divided by 105 probes (100 measured plus 5 warmups); includes amortized process startup
+protocol	metric	baseline_median_ns_per_probe	candidate_median_ns_per_probe	paired_delta_pct	candidate_higher_pairs
+hy2	wall	1014179	987445	-1.587	8
+hy2	cpu	867833	800319	-7.709	2
+tuic	wall	1023811	1005054	-1.643	12
+tuic	cpu	875100	812981	-7.136	3
+juicity	wall	977350	973804	-0.097	15
+juicity	cpu	872305	821343	-7.336	4

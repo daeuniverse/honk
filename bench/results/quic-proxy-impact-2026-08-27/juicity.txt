@@ -1,0 +1,1 @@
+juicity://00000000-0000-0000-0000-000000000001:testpass123@10.10.10.70:2451/?sni=hy2.test&insecure=1&mtu=1452#juicity

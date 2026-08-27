@@ -1,0 +1,1 @@
+hysteria2://testpass123@10.10.10.70:8443/?insecure=1&mtu=1452#hy2

@@ -1,0 +1,8 @@
+# 20,000 deterministic bootstrap resamples of 30 paired-run median deltas
+protocol	metric	paired_delta_pct	bootstrap95_low_pct	bootstrap95_high_pct	candidate_slower_pairs	paired_p95_delta_pct
+hy2	handshake_ns	0.441	-1.499	1.944	16	-2.958
+hy2	total_ns	0.688	-1.328	2.115	18	-3.054
+tuic	handshake_ns	1.531	-1.930	4.093	17	1.407
+tuic	total_ns	1.580	-1.136	4.108	18	2.511
+juicity	handshake_ns	1.902	-0.693	3.215	19	1.857
+juicity	total_ns	2.549	-0.152	3.893	19	2.848

@@ -149,6 +149,44 @@ ssh root@10.10.10.50 \
 候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
 点估计回退不超过 3% 时通过。
 
+## 结果(2026-08-27,代理 QUIC adapter 回归门槛)
+
+已合并 PR #75 的路径加 follow-up 修复 `0ecc101`,与 PR 前 main `4c3ade3`
+对比。fixture 使用生产 ownership 形态：一个共享 `NodeRuntime`,每轮经真实
+Hysteria2、TUIC 或 Juicity 实验室服务端建立新的 packet flow,再向本机 H3
+服务端完成一次内层 QUIC 握手。每个协议运行 30 组交替 A/B,每个进程 100 个
+计量握手加 5 个 warmup（每个 arm 3,000 个计量样本）。它隔离 adapter/probe
+成本,不是用户数据容量 benchmark。
+
+| 外层传输 | baseline / candidate total 中位数 ms | 配对中位 delta | 95% bootstrap 区间 | 配对 p95 delta | 进程 CPU delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hysteria2 | 0.916 / 0.923 | +0.688% | -1.328% 至 +2.115% | -3.054% | -7.709% |
+| TUIC | 0.920 / 0.937 | +1.580% | -1.136% 至 +4.108% | +2.511% | -7.136% |
+| Juicity | 0.857 / 0.873 | +2.549% | -0.152% 至 +3.893% | +2.848% | -7.336% |
+
+所有区间均包含零,最大的配对点估计低于 3% 回归门槛。candidate 的 9,000 个
+计量握手全部完成且 stderr 为空。进程 CPU 行把子进程 CPU 除以全部 105 个
+probe,并包含摊销后的进程启动；这是辅助证据,不代表代理吞吐。
+
+另做每个进程 5,000 次 probe 的紧循环,检查 endpoint worker 退休。其密度远高于
+生产环境的周期 probe：
+
+| 外层传输 | baseline / candidate peak RSS KiB | baseline / candidate wall s |
+| --- | ---: | ---: |
+| Hysteria2（两轮） | 231104–247072 / 44048–45520 | 3.69–3.98 / 4.27–4.42 |
+| TUIC | 246944 / 43520 | 3.64 / 4.36 |
+| Juicity | 217840 / 43088 | 4.27 / 4.26 |
+
+follow-up 在该 churn 下把 peak RSS 从 213–241 MiB 压到约 43–46 MiB。
+Hysteria2 与 TUIC 为确定性 worker 清理在 5,000 次连续 probe 中最多多付
+0.72 秒；Juicity 持平。这是清理压力成本,不是热数据路径回归。
+
+同一轮在最终 A/B 前暴露并修复两个正确性问题：即使 advertise 1252 字节,
+quic-go 仍可能合并出 1280 字节 first flight；成功 probe 关闭 endpoint 前必须
+先 drop connection handle。完整二进制/源码 hash、配对 raw row、置信区间、
+soak row、配置与原样 runner 位于
+[`quic-proxy-impact-2026-08-27`](../bench/results/quic-proxy-impact-2026-08-27/)。
+
 ## 结果(2026-08-26,QUIC profile 与优化门槛)
 
 本轮对 source `0bd6135` 的现有有界 GSO 实现及独立 Juicity 候选

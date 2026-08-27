@@ -1,0 +1,23 @@
+{
+  "timestamp_utc": "2026-08-27T04:57:26Z",
+  "host": "Linux-7.1.4-cachyos-x86_64-with-glibc2.40",
+  "cpu": "13th Gen Intel(R) Core(TM) i9-13900H",
+  "pairs": 30,
+  "samples_per_arm": 100,
+  "warmups_per_process": 5,
+  "baseline_binary": "/root/code/honk-pr75-base/target/release/examples/adapter_probe",
+  "baseline_sha256": "f7a381b2071347cf21dce3880a134ed3c1f048a6a72b08d4ffb6acf963fa5ff7",
+  "baseline_revision": "4c3ade3807b31599c898f1a90fbbca5f8544e559",
+  "baseline_quic_source_sha256": "b13e1e4b4c4df793b978f067be70b60d772e377248465bc5aad760e62a17da68",
+  "candidate_binary": "/root/code/honk-proxied-quic-fix/target/release/examples/adapter_probe",
+  "candidate_sha256": "c5d6c54169ffcdf1942aca84c8f6732add19e102abf2eb5ba5f65d8439792216",
+  "candidate_revision": "0ecc10169cb208b28ac808642794f3231538e2de",
+  "candidate_quic_source_sha256": "bac81987fe81774481b3ffa6cf83f0607bc5de585dc6bc413d208011aaf63032",
+  "runner_sha256": "23f6b5dbf2c194201c90024f9149ec5ee1673a91c635d5860ec702ff2fd82af2",
+  "probe_source_sha256": "c972ba98de4b18472fb4d750e133e1186f43769a236913a4ae8c51e23152b862",
+  "node_sha256": {
+    "hy2": "65819e52bbfde01cb4c89b2f5510e4c3b68e6a9eb4246ed2fc6c68ee6830b6c7",
+    "tuic": "ccf27b8a672bb44e7642b0045985c5f12161e05e1acd35de79b173cf18826b46",
+    "juicity": "a1b2af42fb9ad336d261431b9768d0b87e3afd6ca742204759ddad167f656429"
+  }
+}

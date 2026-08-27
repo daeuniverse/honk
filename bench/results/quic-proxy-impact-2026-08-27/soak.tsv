@@ -1,0 +1,9 @@
+protocol	run	arm	samples	maxrss_kb	elapsed_s	user_s	sys_s
+hy2	1	baseline	5000	231104	3.98	2.72	0.50
+hy2	1	candidate	5000	45520	4.42	2.60	0.94
+hy2	2	candidate	5000	44048	4.27	2.48	0.93
+hy2	2	baseline	5000	247072	3.69	2.37	0.59
+tuic	1	baseline	5000	246944	3.64	2.45	0.58
+tuic	1	candidate	5000	43520	4.36	2.46	0.88
+juicity	1	baseline	5000	217840	4.27	2.51	0.61
+juicity	1	candidate	5000	43088	4.26	2.61	0.88
