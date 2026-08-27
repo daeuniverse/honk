@@ -134,51 +134,73 @@ pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut boo
     *enabled = false;
 }
 
-pub(super) async fn publish_outbound_alive(
+pub(super) struct OutboundHealthPublisher {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     alive_set: Arc<AliveDialerSet>,
-    node_id: uuid::Uuid,
-    domain: u32,
-    ipver: u32,
-) {
-    // Reload takes these locks in the same order. Keep the config generation
-    // pinned while waiting so a queued edge cannot update a recycled slot.
-    let config = config.read().await;
-    let mut backend = ebpf.write().await;
-    let Some(outbound_idx) = outbound_id_map.read().get(&node_id).copied() else {
-        return;
-    };
-    let Some(group) = outbound_idx
-        .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
-        .and_then(|idx| config.groups.get(idx as usize))
-    else {
-        warn!(outbound_idx, %node_id, "outbound health slot has no current group");
-        return;
-    };
-    let probe_domain = match domain {
-        1 => ProbeDomain::DnsUdp,
-        2 => ProbeDomain::DataUdp,
-        _ => ProbeDomain::Tcp,
-    };
-    let ip_version = if ipver == 1 {
-        IpVersion::V6
-    } else {
-        IpVersion::V4
-    };
-    let group_manager = group_manager.read().clone();
-    let alive =
-        reload::group_datapath_alive(group, &group_manager, &alive_set, probe_domain, ip_version);
-    if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
-        warn!(
-            %error,
-            outbound_idx,
-            domain,
-            ipver,
-            "failed to update outbound health in eBPF"
+}
+
+impl OutboundHealthPublisher {
+    pub(super) fn new(
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        config: Arc<RwLock<Arc<Config>>>,
+        group_manager: SharedGroupManager,
+        outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
+        alive_set: Arc<AliveDialerSet>,
+    ) -> Self {
+        Self {
+            ebpf,
+            config,
+            group_manager,
+            outbound_id_map,
+            alive_set,
+        }
+    }
+
+    pub(super) async fn publish(self: Arc<Self>, node_id: uuid::Uuid, domain: u32, ipver: u32) {
+        // Reload takes these locks in the same order. Keep the config generation
+        // pinned while waiting so a queued edge cannot update a recycled slot.
+        let config = self.config.read().await;
+        let mut backend = self.ebpf.write().await;
+        let Some(outbound_idx) = self.outbound_id_map.read().get(&node_id).copied() else {
+            return;
+        };
+        let Some(group) = outbound_idx
+            .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
+            .and_then(|idx| config.groups.get(idx as usize))
+        else {
+            warn!(outbound_idx, %node_id, "outbound health slot has no current group");
+            return;
+        };
+        let probe_domain = match domain {
+            1 => ProbeDomain::DnsUdp,
+            2 => ProbeDomain::DataUdp,
+            _ => ProbeDomain::Tcp,
+        };
+        let ip_version = if ipver == 1 {
+            IpVersion::V6
+        } else {
+            IpVersion::V4
+        };
+        let group_manager = self.group_manager.read().clone();
+        let alive = reload::group_datapath_alive(
+            group,
+            &group_manager,
+            &self.alive_set,
+            probe_domain,
+            ip_version,
         );
+        if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
+            warn!(
+                %error,
+                outbound_idx,
+                domain,
+                ipver,
+                "failed to update outbound health in eBPF"
+            );
+        }
     }
 }
 
@@ -514,23 +536,17 @@ impl ControlPlane {
                 interval_secs,
                 check_timeout.as_secs()
             );
-            let ebpf = self.ebpf.clone();
-            let alive_for_push = alive_set.clone();
-            let group_manager_for_push = self.group_manager.clone();
-            let config_for_push = self.config.clone();
-            let outbound_id_map_for_push = self.outbound_id_map.clone();
+            let health_publisher = Arc::new(OutboundHealthPublisher::new(
+                self.ebpf.clone(),
+                self.config.clone(),
+                self.group_manager.clone(),
+                self.outbound_id_map.clone(),
+                alive_set.clone(),
+            ));
             alive_set.set_ebpf_callback(Box::new(
                 move |node_id, _outbound_idx, domain, ipver, _alive| {
-                    let _handle = tokio::spawn(publish_outbound_alive(
-                        ebpf.clone(),
-                        config_for_push.clone(),
-                        group_manager_for_push.clone(),
-                        outbound_id_map_for_push.clone(),
-                        alive_for_push.clone(),
-                        node_id,
-                        domain,
-                        ipver,
-                    ));
+                    let _handle =
+                        tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
                 },
             ));
             let period = std::time::Duration::from_secs(interval_secs);

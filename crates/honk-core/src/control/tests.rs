@@ -41,6 +41,13 @@ async fn health_push_re_resolves_after_reload_writer() {
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
     )));
+    let health_publisher = Arc::new(runtime::OutboundHealthPublisher::new(
+        Arc::clone(&ebpf),
+        Arc::clone(&config),
+        Arc::clone(&group_manager),
+        Arc::clone(&outbound_id_map),
+        Arc::clone(&alive_set),
+    ));
 
     let mut config_writer = config.write().await;
     let mut backend_writer = ebpf.write().await;
@@ -50,16 +57,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     *outbound_id_map.write() = reload::build_outbound_id_map(&new_config);
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
-    let update = tokio::spawn(runtime::publish_outbound_alive(
-        Arc::clone(&ebpf),
-        Arc::clone(&config),
-        Arc::clone(&group_manager),
-        Arc::clone(&outbound_id_map),
-        Arc::clone(&alive_set),
-        node.id,
-        1,
-        0,
-    ));
+    let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
     tokio::task::yield_now().await;
     assert!(!update.is_finished());
     drop(config_writer);
