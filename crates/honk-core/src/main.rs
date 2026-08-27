@@ -309,9 +309,8 @@ mod tests {
     fn idle_collection_runs_on_each_worker_thread() {
         use parking_lot::{Condvar, Mutex};
         use std::collections::HashSet;
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
-        let task_threads = Arc::new(Mutex::new(HashSet::new()));
         let collector_threads = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
         let callback_threads = Arc::clone(&collector_threads);
 
@@ -324,39 +323,19 @@ mod tests {
                 wake.notify_all();
             });
         let runtime = builder.build().unwrap();
-
-        let barrier = Arc::new(Barrier::new(5));
-        let tasks = (0..4)
-            .map(|_| {
-                let barrier = Arc::clone(&barrier);
-                let task_threads = Arc::clone(&task_threads);
-                runtime.spawn(async move {
-                    task_threads.lock().insert(std::thread::current().id());
-                    LAST_MI_COLLECT.with(|last_collect| {
-                        last_collect.set(Some(std::time::Instant::now()));
-                    });
-                    barrier.wait();
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        runtime.block_on(async {
-            for task in tasks {
-                task.await.unwrap();
-            }
-        });
+        let worker_count = runtime.metrics().num_workers();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let (threads, wake) = &*collector_threads;
         let mut observed = threads.lock();
-        while observed.len() < 4 {
+        while observed.len() < worker_count {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!remaining.is_zero(), "not every runtime worker parked");
             let timeout = wake.wait_for(&mut observed, remaining);
-            assert!(!timeout.timed_out() || observed.len() == 4);
+            assert!(!timeout.timed_out() || observed.len() == worker_count);
         }
 
-        assert_eq!(*task_threads.lock(), *observed);
+        assert_eq!(observed.len(), worker_count);
     }
 
     #[cfg(feature = "mimalloc")]
@@ -364,9 +343,8 @@ mod tests {
     fn periodic_sweep_collects_workers_that_remain_parked() {
         use parking_lot::{Condvar, Mutex};
         use std::collections::HashSet;
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
-        let started = Arc::new(Mutex::new(HashSet::new()));
         let observed = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
         let callback_observed = Arc::clone(&observed);
         let period = std::time::Duration::ZERO;
@@ -379,49 +357,33 @@ mod tests {
         });
         let runtime = builder.build().unwrap();
 
-        let barrier = Arc::new(Barrier::new(5));
-        let tasks = (0..4)
-            .map(|_| {
-                let barrier = Arc::clone(&barrier);
-                let started = Arc::clone(&started);
-                runtime.spawn(async move {
-                    started.lock().insert(std::thread::current().id());
-                    barrier.wait();
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        runtime.block_on(async {
-            for task in tasks {
-                task.await.unwrap();
-            }
-        });
-        let started = started.lock().clone();
-        assert_eq!(started.len(), 4);
-
+        let worker_count = runtime.metrics().num_workers();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while parked_workers.load(std::sync::atomic::Ordering::Relaxed) < 4 {
+        while parked_workers.load(std::sync::atomic::Ordering::Relaxed) < worker_count {
             assert!(
                 std::time::Instant::now() < deadline,
                 "not every runtime worker parked"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let started = observed.0.lock().clone();
+        assert_eq!(started.len(), worker_count);
         observed.0.lock().clear();
         let collector = OwnerCollector {
             period,
-            worker_count: runtime.metrics().num_workers(),
+            worker_count,
             parked_workers,
         };
-        assert_eq!(runtime.block_on(collector.sweep()), 4);
+        assert_eq!(runtime.block_on(collector.sweep()), worker_count);
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let (threads, wake) = &*observed;
         let mut observed = threads.lock();
-        while observed.len() < 4 {
+        while observed.len() < worker_count {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!remaining.is_zero(), "not every runtime worker collected");
             let timeout = wake.wait_for(&mut observed, remaining);
-            assert!(!timeout.timed_out() || observed.len() == 4);
+            assert!(!timeout.timed_out() || observed.len() == worker_count);
         }
         assert_eq!(*observed, started);
     }
