@@ -57,8 +57,13 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         proxy_node: Option<&Node>,
         target: std::net::SocketAddr,
-    ) -> DialContext {
+    ) -> anyhow::Result<DialContext> {
         let proxy = match (proxy_node, self.proxy_registry.as_ref()) {
+            (Some(_), None) => {
+                return Err(anyhow::anyhow!(
+                    "DNS proxy node selected without a proxy registry"
+                ));
+            }
             (Some(node), Some(registry)) => Some(ProxyDial {
                 registry: Arc::clone(registry),
                 generation: self.runtime_generation.get().cloned(),
@@ -66,12 +71,12 @@ impl UpstreamPool {
             }),
             _ => None,
         };
-        DialContext {
+        Ok(DialContext {
             endpoint: entry.endpoint.clone().with_resolved_addr(target),
             query_timeout: self.dns_query_timeout,
             dial_timeout: self.dns_dial_timeout,
             proxy,
-        }
+        })
     }
 
     async fn build_transport(
@@ -80,7 +85,7 @@ impl UpstreamPool {
         proxy_node: Option<&Node>,
         target: std::net::SocketAddr,
     ) -> anyhow::Result<PooledTransport> {
-        let dial = self.dial_context(entry, proxy_node, target);
+        let dial = self.dial_context(entry, proxy_node, target)?;
         Ok(match entry.protocol {
             DnsProtocol::Udp | DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
             DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
@@ -88,22 +93,9 @@ impl UpstreamPool {
                 dial,
                 Arc::clone(&self.active_transport_tasks),
             )?),
-            DnsProtocol::Quic => PooledTransport::Doq(
-                DoqClient::new(
-                    entry.endpoint.clone().with_resolved_addr(target),
-                    self.dns_query_timeout,
-                    self.dns_dial_timeout,
-                )
-                .await?,
-            ),
+            DnsProtocol::Quic => PooledTransport::Doq(DoqClient::new(dial).await?),
             DnsProtocol::H3 => PooledTransport::Doh3(
-                Doh3Client::new_tracked(
-                    entry.endpoint.clone().with_resolved_addr(target),
-                    self.dns_query_timeout,
-                    self.dns_dial_timeout,
-                    Arc::clone(&self.active_transport_tasks),
-                )
-                .await?,
+                Doh3Client::new_tracked(dial, Arc::clone(&self.active_transport_tasks)).await?,
             ),
         })
     }

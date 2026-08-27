@@ -223,7 +223,7 @@ honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>)
 
 ## DNS 设置
 
-上游可裸写 `host:port`（UDP），也可使用 `udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`quic://`、`h3://`。追加 `-> node-or-group` 可强制拨号路径；TCP、UDP、DoT、DoH 可使用代理出站，DoQ 与 DoH3 仅支持直连。请求路由选择 `reject`、`asis` 或命名上游；响应路由选择 `accept`、`reject` 或用于有界重查询的命名上游：
+上游可裸写 `host:port`（UDP），也可使用 `udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`quic://`、`h3://`。追加 `-> node-or-group` 可强制拨号路径；所选叶节点具备对应能力时，上述 transport 均可使用代理出站。DoQ 与 DoH3 要求叶节点提供 UDP-capable `PacketTransport`；缺少代理 registry 或 packet capability 时会 fail closed。请求路由选择 `reject`、`asis` 或命名上游；响应路由选择 `accept`、`reject` 或用于有界重查询的命名上游：
 
 ```dae
 dns {

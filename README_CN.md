@@ -145,7 +145,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [ ] VMess 的 UDP 中继
 - [x] REALITY 客户端 + Chrome（uTLS 风格）指纹——BoringSSL 加两个 boring-sys 补丁钩子实现；支持 VLESS `xtls-rprx-vision`
 - [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
-- [ ] 为 DoQ/DoH3 增加代理路径：将出站 `PacketTransport` 适配为 quinn `AsyncUdpSocket`
+- [x] DoQ/DoH3 代理路径：将支持 UDP 的出站 `PacketTransport` 适配为 quinn `AsyncUdpSocket`
 - [x] Hysteria2 brutal（上下行 Mbps）、端口跳跃（`mport`/`mhop`）、`pinSHA256`、QUIC 接收窗口/PMTUD 参数；已对官方服务器实测验证
 - [ ] Hysteria2 残留：`maxStreamReceiveWindow`/`maxConnReceiveWindow`（quinn 无自动调窗对应）、`fastOpen`、UDP 会话/连接空闲超时可配（当前硬编码 90s/120s）
 - [x] QUIC 客户端选项整合：`QuicClientOptions` 管传输调优，`BoringQuicOptions` 管 TLS 后端

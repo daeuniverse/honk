@@ -164,7 +164,10 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
     let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(4).await;
     let resolver =
         honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
-    let node = test_node("retry-proxy");
+    let node = Node {
+        protocol: honk_config::types::NodeProtocol::Direct,
+        ..test_node("retry-proxy")
+    };
     let traffic = Arc::new(tokio::sync::RwLock::new(
         Router::new(
             &[RoutingRule {
@@ -190,7 +193,9 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
     let pool = UpstreamPool::new_with_proxy_and_bootstrap(
         &[upstream],
         make_router(),
-        None,
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().expect("proxy registry"),
+        )),
         vec![node],
         Vec::new(),
         resolver,

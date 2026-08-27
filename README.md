@@ -57,7 +57,7 @@ These checkboxes indicate maintainer review status, not feature availability:
 ### TODO
 
 - [x] Add the always-compiled Score group policy
-- [ ] Add proxied DoQ/DoH3 through a quinn `AsyncUdpSocket` adapter over outbound `PacketTransport`
+- [x] Add proxied DoQ/DoH3 through a quinn `AsyncUdpSocket` adapter over outbound `PacketTransport`
 - [ ] Evaluate AF_XDP and XDP paths for further performance gains
 - [ ] Add a honk REST API
 - [ ] Add inbound support

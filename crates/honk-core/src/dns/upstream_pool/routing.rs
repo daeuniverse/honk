@@ -75,7 +75,7 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         target: SocketAddr,
     ) -> (Option<Node>, Option<ScoreFeedback>) {
-        if outbound.eq_ignore_ascii_case("direct") || outbound.eq_ignore_ascii_case("block") {
+        if outbound.eq_ignore_ascii_case("direct") {
             return (None, None);
         }
 
@@ -144,11 +144,11 @@ impl UpstreamPool {
         target: SocketAddr,
     ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
+            if tag.eq_ignore_ascii_case("block") {
+                anyhow::bail!("DNS upstream outbound 'block' rejected the dial");
+            }
             let (node, feedback) = self.resolve_outbound_for_target(tag, entry, target);
-            if node.is_none()
-                && !tag.eq_ignore_ascii_case("direct")
-                && !tag.eq_ignore_ascii_case("block")
-            {
+            if node.is_none() && !tag.eq_ignore_ascii_case("direct") {
                 anyhow::bail!("DNS upstream outbound '{tag}' has no available node");
             }
             debug!(
@@ -165,12 +165,8 @@ impl UpstreamPool {
 
         let host_is_ip = entry.endpoint.host.parse::<IpAddr>().is_ok();
         let protocol = match entry.protocol {
-            DnsProtocol::Udp => "udp",
-            DnsProtocol::Tcp
-            | DnsProtocol::Tls
-            | DnsProtocol::Https
-            | DnsProtocol::Quic
-            | DnsProtocol::H3 => "tcp",
+            DnsProtocol::Udp | DnsProtocol::Quic | DnsProtocol::H3 => "udp",
+            DnsProtocol::Tcp | DnsProtocol::Tls | DnsProtocol::Https => "tcp",
         };
         let connection = ConnectionInfo {
             domain: (!host_is_ip).then(|| entry.endpoint.host.clone()),
@@ -206,9 +202,10 @@ impl UpstreamPool {
             protocol,
             outbound_name
         );
-        if outbound_name.eq_ignore_ascii_case("direct")
-            || outbound_name.eq_ignore_ascii_case("block")
-        {
+        if outbound_name.eq_ignore_ascii_case("block") {
+            anyhow::bail!("DNS dial route selected block");
+        }
+        if outbound_name.eq_ignore_ascii_case("direct") {
             return Ok(DnsDialRoute {
                 target,
                 node: None,
