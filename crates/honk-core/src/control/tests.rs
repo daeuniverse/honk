@@ -175,6 +175,113 @@ fn udp_listener_enables_reuse_port_before_bind() {
     let second = sockets::new_udp_listener_socket(socket2::Domain::IPV4, true).unwrap();
     second.bind(&addr).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_receive_batch_preserves_order_metadata_and_cancellation() {
+    let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true)
+        .unwrap();
+    let local_addr = socket.local_addr().unwrap();
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+    for sequence in 0..9u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sender.send_to(&[], local_addr).await.unwrap();
+
+    let mut batch = sockets::UdpRecvBatch::new().unwrap();
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 8);
+    for index in 0..batch.len() {
+        let (data, source, meta) = batch.packet(index).unwrap();
+        assert_eq!(data, &[index as u8]);
+        assert_eq!(source, sender_addr);
+        assert_eq!(meta.original_dst_cmsg, Some(local_addr));
+        assert_eq!(meta.packet_dst_ip, Some(local_addr.ip()));
+        assert!(meta.packet_ifindex.is_some());
+        assert_eq!(meta.local_addr, local_addr);
+    }
+
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch.packet(0).unwrap().0, &[8]);
+    assert!(batch.packet(1).unwrap().0.is_empty());
+
+    for sequence in 10..13u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 3);
+
+    for sequence in 13..16u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 3);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch),
+        )
+        .await
+        .is_err()
+    );
+    for sequence in 16..25u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.packet(0).unwrap().0, &[16]);
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 8);
+    for index in 0..batch.len() {
+        assert_eq!(batch.packet(index).unwrap().0, &[index as u8 + 17]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_receive_batch_rejects_truncated_slot_without_losing_next_packet() {
+    let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true)
+        .unwrap();
+    let local_addr = socket.local_addr().unwrap();
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender.send_to(&[1, 2], local_addr).await.unwrap();
+    sender.send_to(&[3], local_addr).await.unwrap();
+
+    let mut batch = sockets::UdpRecvBatch::new_for_test(1).unwrap();
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 2);
+    assert_eq!(
+        batch.packet(0).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(batch.packet(1).unwrap().0, &[3]);
+}
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();

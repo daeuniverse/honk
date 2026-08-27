@@ -552,10 +552,11 @@ pub(super) async fn send_to_with_src(
         .await
 }
 
-// Accommodate two IPv6-sized ancillary records (ORIGDST + PKTINFO). The
-// capacity is checked through CMSG_SPACE before every recvmsg rather than
-// relying on the literal remaining correct for all libc ABIs.
+// Accommodate two IPv6-sized ancillary records (ORIGDST + PKTINFO). Capacity
+// is validated before scalar receives and when each reusable batch is built.
 const CMSG_CONTROL_CAPACITY: usize = 256;
+const UDP_RECV_BATCH_SIZE: usize = 8;
+const UDP_RECV_PACKET_CAPACITY: usize = 64 * 1024;
 
 /// Raw recvmsg control storage whose first byte is naturally aligned for a
 /// `cmsghdr`. The zero-length field carries `cmsghdr`'s ABI alignment without
@@ -601,6 +602,192 @@ pub(super) struct UdpRecvMeta {
     pub(super) packet_dst_ip: Option<std::net::IpAddr>,
     pub(super) packet_ifindex: Option<u32>,
     pub(super) local_addr: SocketAddr,
+}
+
+struct UdpRecvStorage {
+    data: Vec<u8>,
+    source: libc::sockaddr_storage,
+    control: CmsgStorage,
+}
+
+impl UdpRecvStorage {
+    fn new(packet_capacity: usize) -> Self {
+        Self {
+            data: vec![0; packet_capacity],
+            // SAFETY: all-zero is a valid empty sockaddr storage value.
+            source: unsafe { std::mem::zeroed() },
+            control: CmsgStorage::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UdpRecvPacket {
+    length: usize,
+    source: SocketAddr,
+    meta: UdpRecvMeta,
+}
+
+pub(super) struct UdpRecvBatch {
+    slots: [UdpRecvStorage; UDP_RECV_BATCH_SIZE],
+    results: [Option<io::Result<UdpRecvPacket>>; UDP_RECV_BATCH_SIZE],
+    received: usize,
+    limit: usize,
+}
+
+impl UdpRecvBatch {
+    pub(super) fn new() -> io::Result<Self> {
+        Self::with_packet_capacity(UDP_RECV_PACKET_CAPACITY)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(packet_capacity: usize) -> io::Result<Self> {
+        Self::with_packet_capacity(packet_capacity)
+    }
+
+    fn with_packet_capacity(packet_capacity: usize) -> io::Result<Self> {
+        if !cmsg_control_capacity_is_sufficient() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
+            ));
+        }
+        let slots = std::array::from_fn(|_| UdpRecvStorage::new(packet_capacity));
+        if slots.iter().any(|slot| {
+            !(slot.control.bytes.as_ptr() as usize)
+                .is_multiple_of(std::mem::align_of::<libc::cmsghdr>())
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmmsg control storage is not cmsghdr-aligned",
+            ));
+        }
+        Ok(Self {
+            slots,
+            results: std::array::from_fn(|_| None),
+            received: 0,
+            limit: UDP_RECV_BATCH_SIZE,
+        })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.received
+    }
+
+    pub(super) fn packet(
+        &self,
+        index: usize,
+    ) -> Result<(&[u8], SocketAddr, UdpRecvMeta), &io::Error> {
+        match self.results[index]
+            .as_ref()
+            .expect("received UDP slot must have a result")
+        {
+            Ok(packet) => Ok((
+                &self.slots[index].data[..packet.length],
+                packet.source,
+                packet.meta,
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recv_now(&mut self, fd: RawFd, local_addr: SocketAddr) -> io::Result<()> {
+        let limit = self.limit;
+        self.received = 0;
+        let mut iovecs: [libc::iovec; UDP_RECV_BATCH_SIZE] = unsafe { std::mem::zeroed() };
+        let mut messages: [libc::mmsghdr; UDP_RECV_BATCH_SIZE] = unsafe { std::mem::zeroed() };
+        for index in 0..limit {
+            let slot = &mut self.slots[index];
+            iovecs[index] = libc::iovec {
+                iov_base: slot.data.as_mut_ptr().cast(),
+                iov_len: slot.data.len(),
+            };
+            let message = &mut messages[index].msg_hdr;
+            message.msg_name = (&mut slot.source as *mut libc::sockaddr_storage).cast();
+            message.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+            message.msg_iov = &mut iovecs[index];
+            message.msg_iovlen = 1;
+            message.msg_control = slot.control.bytes.as_mut_ptr().cast();
+            message.msg_controllen = CMSG_CONTROL_CAPACITY as _;
+        }
+
+        // SAFETY: every mmsghdr points to live, disjoint storage above and the
+        // kernel writes at most UDP_RECV_BATCH_SIZE entries synchronously.
+        let count = unsafe {
+            libc::recvmmsg(
+                fd,
+                messages.as_mut_ptr(),
+                limit as _,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                self.limit = 1;
+            }
+            return Err(error);
+        }
+        if count == 0 {
+            self.limit = 1;
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        self.received = count as usize;
+        // Keep partial batches warm; otherwise steady medium load oscillates
+        // between preparing one and eight slots every receive.
+        self.limit = if limit == 1 || self.received > 1 {
+            UDP_RECV_BATCH_SIZE
+        } else {
+            1
+        };
+        for (index, message) in messages[..self.received].iter().enumerate() {
+            let slot = &self.slots[index];
+            self.results[index] = Some((|| {
+                let length = message.msg_len as usize;
+                if message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 || length > slot.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recvmmsg UDP payload truncated or oversized",
+                    ));
+                }
+                let source = sockaddr_to_std(&slot.source, message.msg_hdr.msg_namelen)?;
+                #[cfg(target_env = "musl")]
+                let returned_control_len = message.msg_hdr.msg_controllen as usize;
+                #[cfg(not(target_env = "musl"))]
+                let returned_control_len = message.msg_hdr.msg_controllen;
+                let control_len = returned_control_len.min(slot.control.bytes.len());
+                let (original_dst_cmsg, packet_dst_ip, packet_ifindex) = parse_cmsg_control(
+                    &slot.control.bytes[..control_len],
+                    message.msg_hdr.msg_flags,
+                )?;
+                Ok(UdpRecvPacket {
+                    length,
+                    source,
+                    meta: UdpRecvMeta {
+                        original_dst_cmsg,
+                        packet_dst_ip,
+                        packet_ifindex,
+                        local_addr,
+                    },
+                })
+            })());
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn recv_batch_from_with_orig_dst(
+    socket: &UdpSocket,
+    local_addr: SocketAddr,
+    batch: &mut UdpRecvBatch,
+) -> io::Result<()> {
+    socket
+        .async_io(Interest::READABLE, || {
+            batch.recv_now(socket.as_raw_fd(), local_addr)
+        })
+        .await
 }
 
 /// Receive a UDP datagram and preserve every destination provenance source.

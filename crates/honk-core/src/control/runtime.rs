@@ -1000,7 +1000,13 @@ pub(super) struct UdpLoopState {
 /// flow to a specific socket of the group, so loops are flow-disjoint and
 /// run in parallel across runtime workers.
 async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: &'static str) {
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut batch = match UdpRecvBatch::new() {
+        Ok(batch) => batch,
+        Err(error) => {
+            error!("{} UDP recv setup error: {}", family, error);
+            return;
+        }
+    };
     let local_addr = match socket.local_addr() {
         Ok(local_addr) => local_addr,
         Err(error) => {
@@ -1009,41 +1015,47 @@ async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: 
         }
     };
     loop {
-        match recv_from_with_orig_dst(&socket, local_addr, &mut buf).await {
-            Ok((n, src_addr, recv_meta)) => {
-                let Some(destination) = udp_original_dst(&recv_meta, &buf[..n]) else {
-                    debug!(
-                        "Dropping {} UDP from {} without original-destination provenance",
-                        family, src_addr
-                    );
-                    continue;
-                };
-                let original_dst = destination.address;
-                let mut validated_dns = destination.validated_dns;
-                if original_dst.port() == 53 && validated_dns.is_none() {
-                    validated_dns = validate_exact_dns_query(&buf[..n]);
-                }
-                if !accepts_transparent_connection(&state.drain) {
-                    state.stats.record_udp_slow_permit_closed();
+        if let Err(error) = recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch).await {
+            error!("{} UDP recv error: {}", family, error);
+            continue;
+        }
+        for index in 0..batch.len() {
+            let (data, src_addr, recv_meta) = match batch.packet(index) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    error!("{} UDP recv packet error: {}", family, error);
                     continue;
                 }
-                // Ready flows enqueue synchronously here; this loop never
-                // awaits PacketTransport I/O.
-                if udp_fast_path(
-                    &state.udp_pool,
-                    &state.stats,
-                    &buf[..n],
-                    src_addr,
-                    original_dst,
-                    validated_dns,
-                )
-                .await
-                {
-                    continue;
-                }
-                dispatch_udp_slow_path(&state, src_addr, original_dst, &buf[..n], validated_dns);
+            };
+            let Some(destination) = udp_original_dst(&recv_meta, data) else {
+                debug!(
+                    "Dropping {} UDP from {} without original-destination provenance",
+                    family, src_addr
+                );
+                continue;
+            };
+            let original_dst = destination.address;
+            let mut validated_dns = destination.validated_dns;
+            if original_dst.port() == 53 && validated_dns.is_none() {
+                validated_dns = validate_exact_dns_query(data);
             }
-            Err(e) => error!("{} UDP recv error: {}", family, e),
+            if !accepts_transparent_connection(&state.drain) {
+                state.stats.record_udp_slow_permit_closed();
+                continue;
+            }
+            if udp_fast_path(
+                &state.udp_pool,
+                &state.stats,
+                data,
+                src_addr,
+                original_dst,
+                validated_dns,
+            )
+            .await
+            {
+                continue;
+            }
+            dispatch_udp_slow_path(&state, src_addr, original_dst, data, validated_dns);
         }
     }
 }
