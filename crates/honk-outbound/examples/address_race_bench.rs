@@ -1,9 +1,12 @@
-mod runtime {
-    pub async fn acquire_physical_dial_permit() -> Option<()> {
-        None
-    }
+//! Synthetic scheduler timing only; this opens no TCP or QUIC connections.
 
-    pub fn retain_physical_dial_permit(_: Option<()>) {}
+mod runtime {
+    pub async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        future.await
+    }
 }
 
 #[allow(dead_code)]
@@ -19,10 +22,10 @@ const SAMPLES: usize = 1_000;
 const FAILED_ATTEMPT: Duration = Duration::from_millis(20);
 const SUCCESSFUL_ATTEMPT: Duration = Duration::from_micros(200);
 const STAGGER: Duration = Duration::from_micros(2_500);
-const PRODUCTION_SAMPLES: usize = 100;
-const PRODUCTION_SUCCESS: Duration = Duration::from_millis(20);
-const PRODUCTION_BASELINE_SAMPLES: usize = 11;
-const PRODUCTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const MODELED_SAMPLES: usize = 100;
+const MODELED_SUCCESS: Duration = Duration::from_millis(20);
+const MODELED_BASELINE_SAMPLES: usize = 11;
+const MODELED_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct Counters {
@@ -76,11 +79,11 @@ async fn sequential(retries: usize) {
     tokio::time::sleep(SUCCESSFUL_ATTEMPT).await;
 }
 
-async fn sequential_production(retries: usize) {
+async fn modeled_sequential(retries: usize) {
     for _ in 0..retries {
-        tokio::time::sleep(PRODUCTION_CONNECT_TIMEOUT).await;
+        tokio::time::sleep(MODELED_CONNECT_TIMEOUT).await;
     }
-    tokio::time::sleep(PRODUCTION_SUCCESS).await;
+    tokio::time::sleep(MODELED_SUCCESS).await;
 }
 
 async fn raced(retries: usize, healthy_first: bool, counters: Arc<Counters>) {
@@ -105,7 +108,7 @@ async fn raced(retries: usize, healthy_first: bool, counters: Arc<Counters>) {
     .expect("fallback must succeed");
 }
 
-async fn raced_production(healthy_first: bool, counters: Arc<Counters>) {
+async fn modeled_race(healthy_first: bool, counters: Arc<Counters>) {
     address_race::race_resolved_addrs_with_stagger(
         &addresses(),
         address_race::ADDRESS_RACE_DELAY,
@@ -116,7 +119,7 @@ async fn raced_production(healthy_first: bool, counters: Arc<Counters>) {
                     let _guard = guard;
                     std::future::pending::<Result<(), ()>>().await
                 } else {
-                    tokio::time::sleep(PRODUCTION_SUCCESS).await;
+                    tokio::time::sleep(MODELED_SUCCESS).await;
                     guard.complete();
                     Ok(())
                 }
@@ -138,11 +141,11 @@ async fn measure_sequential(label: &str, retries: usize) {
     print_samples(label, samples);
 }
 
-async fn measure_production_baseline(label: &str, retries: usize) {
-    let mut samples = Vec::with_capacity(PRODUCTION_BASELINE_SAMPLES);
-    for _ in 0..PRODUCTION_BASELINE_SAMPLES {
+async fn measure_modeled_baseline(label: &str, retries: usize) {
+    let mut samples = Vec::with_capacity(MODELED_BASELINE_SAMPLES);
+    for _ in 0..MODELED_BASELINE_SAMPLES {
         let started = Instant::now();
-        sequential_production(retries).await;
+        modeled_sequential(retries).await;
         samples.push(started.elapsed());
     }
     print_samples(label, samples);
@@ -165,12 +168,12 @@ async fn measure_raced(label: &str, retries: usize, healthy_first: bool) {
     );
 }
 
-async fn measure_production(label: &str, healthy_first: bool) {
+async fn measure_modeled(label: &str, healthy_first: bool) {
     let counters = Arc::new(Counters::default());
-    let mut samples = Vec::with_capacity(PRODUCTION_SAMPLES);
-    for _ in 0..PRODUCTION_SAMPLES {
+    let mut samples = Vec::with_capacity(MODELED_SAMPLES);
+    for _ in 0..MODELED_SAMPLES {
         let started = Instant::now();
-        raced_production(healthy_first, Arc::clone(&counters)).await;
+        modeled_race(healthy_first, Arc::clone(&counters)).await;
         samples.push(started.elapsed());
     }
     print_samples(label, samples);
@@ -192,9 +195,9 @@ fn print_samples(label: &str, mut samples: Vec<Duration>) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if std::env::args().any(|arg| arg == "production-baseline") {
-        measure_production_baseline("tcp_production_sequential", 1).await;
-        measure_production_baseline("quic_production_sequential", 3).await;
+    if std::env::args().any(|arg| arg == "modeled-baseline") {
+        measure_modeled_baseline("tcp_modeled_sequential", 1).await;
+        measure_modeled_baseline("quic_modeled_sequential", 3).await;
         return;
     }
     measure_sequential("tcp_sequential", 1).await;
@@ -203,6 +206,6 @@ async fn main() {
     measure_raced("quic_raced", 3, false).await;
     measure_sequential("healthy_sequential", 0).await;
     measure_raced("healthy_raced", 1, true).await;
-    measure_production("production_fallback", false).await;
-    measure_production("production_healthy", true).await;
+    measure_modeled("modeled_fallback", false).await;
+    measure_modeled("modeled_healthy", true).await;
 }

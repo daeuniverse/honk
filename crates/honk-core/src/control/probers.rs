@@ -204,11 +204,11 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     Some(warmable) => {
                         tokio::time::timeout(
                             timeout,
-                            warmable.warm(
+                            generation.scope_dials(warmable.warm(
                                 Arc::clone(&runtime),
                                 connect_timeout,
                                 honk_outbound::proxy::WarmRequirement::Session,
-                            ),
+                            )),
                         )
                         .await
                     }
@@ -246,9 +246,13 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             );
             let start = std::time::Instant::now();
             let attempt = async {
-                let proxy = entry
-                    .tcp
-                    .dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
+                let proxy = generation
+                    .scope_dials(entry.tcp.dial_runtime(
+                        runtime,
+                        addr,
+                        domain.as_deref(),
+                        connect_timeout,
+                    ))
                     .await?;
                 probe_setup(&reporter);
                 Self::http_check(proxy.stream, &check_url, &check_method, &reporter, timeout)
@@ -495,13 +499,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             );
             let start = std::time::Instant::now();
             let attempt = async {
-                let transport = packet
-                    .dial_udp_transport_runtime(
+                let transport = generation
+                    .scope_dials(packet.dial_udp_transport_runtime(
                         Arc::clone(&runtime),
                         dns_target,
                         None,
                         connect_timeout,
-                    )
+                    ))
                     .await?;
                 probe_setup(&reporter);
                 udp_probe_exchange(&transport, &reporter, timeout)
@@ -528,6 +532,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             if let Some(target) = quic_score_target.as_ref() {
                 score_quic_probe(
                     &packet,
+                    &generation,
                     Arc::clone(&runtime),
                     &node,
                     target,
@@ -585,6 +590,7 @@ pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> ScoreSelectionCont
 #[allow(clippy::too_many_arguments)]
 async fn score_quic_probe(
     packet: &Arc<dyn honk_outbound::proxy::PacketOutbound>,
+    generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     runtime: Arc<honk_outbound::runtime::NodeRuntime>,
     node: &Node,
     target: &QuicScoreTarget,
@@ -602,8 +608,13 @@ async fn score_quic_probe(
         ScoreTarget::Socket(_) => None,
     };
     let attempt = async {
-        let transport = packet
-            .dial_udp_transport_runtime(runtime, target.addr, target_domain, connect_timeout)
+        let transport = generation
+            .scope_dials(packet.dial_udp_transport_runtime(
+                runtime,
+                target.addr,
+                target_domain,
+                connect_timeout,
+            ))
             .await?;
         probe_setup(&reporter);
         honk_outbound::quic::quic_handshake_probe(

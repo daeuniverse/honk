@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 pub(super) const ADDRESS_RACE_DELAY: Duration = Duration::from_millis(250);
+const MIN_FAILURE_DELAY: Duration = Duration::from_millis(10);
 const MAX_IN_FLIGHT: usize = 2;
 
 struct InterleavedAddrs<'a> {
@@ -78,12 +79,10 @@ async fn indexed_attempt<T, E, Fut>(original_index: usize, future: Fut) -> (usiz
 where
     Fut: Future<Output = Result<T, E>>,
 {
-    let permit = crate::runtime::acquire_physical_dial_permit().await;
-    let result = future.await;
-    if result.is_ok() {
-        crate::runtime::retain_physical_dial_permit(permit);
-    }
-    (original_index, result)
+    (
+        original_index,
+        crate::runtime::admit_physical_dial(future).await,
+    )
 }
 
 pub(super) async fn race_resolved_addrs<T, E, F, Fut>(
@@ -110,14 +109,15 @@ where
     let first = queued.next()?;
     let mut attempts = FuturesUnordered::new();
     attempts.push(indexed_attempt(first.0, dial(first.1)));
-    let launch_delay = tokio::time::sleep(stagger);
+    let mut last_launch = tokio::time::Instant::now();
+    let launch_delay = tokio::time::sleep_until(last_launch + stagger);
     tokio::pin!(launch_delay);
     let mut last_error = None;
 
     loop {
         let has_queued = queued.len() != 0;
         tokio::select! {
-            completed = attempts.next() => {
+            completed = attempts.next(), if !attempts.is_empty() => {
                 let Some((index, result)) = completed else {
                     break;
                 };
@@ -127,11 +127,11 @@ where
                         if last_error.as_ref().is_none_or(|(last_index, _)| index > *last_index) {
                             last_error = Some((index, error));
                         }
-                        if attempts.len() < MAX_IN_FLIGHT
-                            && let Some((next_index, next_addr)) = queued.next()
-                        {
-                            attempts.push(indexed_attempt(next_index, dial(next_addr)));
-                            launch_delay.as_mut().reset(tokio::time::Instant::now() + stagger);
+                        if attempts.len() < MAX_IN_FLIGHT && queued.len() != 0 {
+                            launch_delay.as_mut().reset(std::cmp::max(
+                                tokio::time::Instant::now(),
+                                last_launch + MIN_FAILURE_DELAY,
+                            ));
                         }
                     }
                 }
@@ -139,7 +139,8 @@ where
             () = &mut launch_delay, if has_queued && attempts.len() < MAX_IN_FLIGHT => {
                 if let Some((next_index, next_addr)) = queued.next() {
                     attempts.push(indexed_attempt(next_index, dial(next_addr)));
-                    launch_delay.as_mut().reset(tokio::time::Instant::now() + stagger);
+                    last_launch = tokio::time::Instant::now();
+                    launch_delay.as_mut().reset(last_launch + stagger);
                 }
             }
         }
@@ -238,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fast_failure_refills_immediately_and_preserves_last_error() {
+    async fn fast_failure_waits_ten_milliseconds_and_preserves_last_error() {
         let addrs = [v4(1), v4(2), v6(1)];
         let launches = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let started = tokio::time::Instant::now();
@@ -265,8 +266,8 @@ mod tests {
             *launches.lock(),
             vec![
                 (v4(1), Duration::ZERO),
-                (v6(1), Duration::from_millis(5)),
-                (v4(2), Duration::from_millis(15)),
+                (v6(1), Duration::from_millis(10)),
+                (v4(2), Duration::from_millis(20)),
             ]
         );
     }

@@ -284,44 +284,45 @@ async fn urltest_node_in_generation_impl(
         timeout
     };
     let (runtime, guard) = probe_runtime(generation, node);
-    let result = async {
-        if !runtime.is_warm_or_stateless() {
-            let warm_reporter = start_feedback(group_manager.and_then(|manager| {
-                manager.feedback_for_node(
-                    node.id,
-                    ScoreSelectionContext::aggregate(
-                        SelectionNetwork::Tcp,
-                        ProbeDomain::Tcp,
-                        IpVersion::V4,
-                    ),
-                )
-            }));
-            let warmed = match warmable {
-                Some(warmable) => {
-                    warmable
-                        .warm(
-                            Arc::clone(&runtime),
-                            timeout,
-                            crate::proxy::WarmRequirement::Session,
-                        )
-                        .await
-                }
-                None => Err(anyhow!("no warm handler for node '{}'", node.name)),
-            };
-            match warmed {
-                Ok(()) => {
-                    reporter_setup(&warm_reporter);
-                    reporter_success(&warm_reporter);
-                }
-                Err(error) => {
-                    reporter_error(&warm_reporter, &error);
-                    return Err(error);
+    let result = generation
+        .scope_dials(async {
+            if !runtime.is_warm_or_stateless() {
+                let warm_reporter = start_feedback(group_manager.and_then(|manager| {
+                    manager.feedback_for_node(
+                        node.id,
+                        ScoreSelectionContext::aggregate(
+                            SelectionNetwork::Tcp,
+                            ProbeDomain::Tcp,
+                            IpVersion::V4,
+                        ),
+                    )
+                }));
+                let warmed = match warmable {
+                    Some(warmable) => {
+                        crate::runtime::capture_dial_admission()
+                            .scope(warmable.warm(
+                                Arc::clone(&runtime),
+                                timeout,
+                                crate::proxy::WarmRequirement::Session,
+                            ))
+                            .await
+                    }
+                    None => Err(anyhow!("no warm handler for node '{}'", node.name)),
+                };
+                match warmed {
+                    Ok(()) => {
+                        reporter_setup(&warm_reporter);
+                        reporter_success(&warm_reporter);
+                    }
+                    Err(error) => {
+                        reporter_error(&warm_reporter, &error);
+                        return Err(error);
+                    }
                 }
             }
-        }
-        urltest_node_impl(&runtime, handler, url, timeout, group_manager).await
-    }
-    .await;
+            urltest_node_impl(&runtime, handler, url, timeout, group_manager).await
+        })
+        .await;
     if let Some(guard) = guard {
         guard.close().await;
     }
@@ -359,8 +360,8 @@ async fn measure_head_exchange(
     let reporter = start_feedback(feedback);
     let timed = async {
         let mut start = Instant::now();
-        let proxy = match handler
-            .dial_runtime(Arc::clone(runtime), addr, target_domain, timeout)
+        let proxy = match crate::runtime::capture_dial_admission()
+            .scope(handler.dial_runtime(Arc::clone(runtime), addr, target_domain, timeout))
             .await
         {
             Ok(proxy) => proxy,

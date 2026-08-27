@@ -13,8 +13,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 const TLS_ACTIVE_RATIO_NUMERATOR: usize = 1;
 const TLS_ACTIVE_RATIO_DENOMINATOR: usize = 10;
@@ -775,6 +775,22 @@ struct DialAdmission {
 }
 
 impl DialAdmission {
+    fn for_registry(registry: &OutboundRuntimeRegistry) -> Self {
+        Self {
+            generation: Arc::clone(&registry.dial_semaphore),
+            process: Arc::clone(&registry.dial_ceiling_semaphore),
+        }
+    }
+
+    fn standalone() -> Self {
+        STANDALONE_DIAL_ADMISSION.clone()
+    }
+
+    fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
+        Arc::ptr_eq(&self.generation, &registry.dial_semaphore)
+            && Arc::ptr_eq(&self.process, &registry.dial_ceiling_semaphore)
+    }
+
     async fn acquire(self) -> DialPermit {
         let generation = Arc::clone(&self.generation)
             .acquire_owned()
@@ -785,21 +801,53 @@ impl DialAdmission {
             .await
             .expect("dial ceiling semaphore is never closed");
         DialPermit {
-            admission: self,
             _generation: generation,
             _process: process,
         }
     }
 }
 
-struct DialScopeState {
-    next: Option<DialPermit>,
+static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| DialAdmission {
+    generation: Arc::new(tokio::sync::Semaphore::new(
+        tokio::sync::Semaphore::MAX_PERMITS,
+    )),
+    process: Arc::new(tokio::sync::Semaphore::new(
+        tokio::sync::Semaphore::MAX_PERMITS,
+    )),
+});
+
+type DialStart = Arc<parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+#[derive(Default)]
+struct HeldDialPermits {
+    first: Option<DialPermit>,
     extra: Vec<DialPermit>,
 }
 
 struct DialScope {
     admission: DialAdmission,
-    state: parking_lot::Mutex<DialScopeState>,
+    held: parking_lot::Mutex<HeldDialPermits>,
+    on_start: Option<DialStart>,
+}
+
+impl DialScope {
+    fn new(admission: DialAdmission, on_start: Option<DialStart>) -> Arc<Self> {
+        Arc::new(Self {
+            admission,
+            held: parking_lot::Mutex::new(HeldDialPermits::default()),
+            on_start,
+        })
+    }
+
+    fn start(&self) {
+        let callback = self
+            .on_start
+            .as_ref()
+            .and_then(|callback| callback.lock().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
 }
 
 tokio::task_local! {
@@ -809,70 +857,71 @@ tokio::task_local! {
 /// One physical proxy dial admitted by both its generation and the shared
 /// process descriptor partition.
 pub struct DialPermit {
-    admission: DialAdmission,
     _generation: tokio::sync::OwnedSemaphorePermit,
     _process: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl DialPermit {
-    /// Run a logical dial while lending this permit to its first physical
-    /// address attempt. Concurrent fallbacks acquire independent permits, and
-    /// the winner's permit remains held through protocol setup.
-    pub async fn scope<F>(self, future: F) -> F::Output
-    where
-        F: Future,
-    {
-        let scope = Arc::new(DialScope {
-            admission: self.admission.clone(),
-            state: parking_lot::Mutex::new(DialScopeState {
-                next: Some(self),
-                extra: Vec::new(),
-            }),
-        });
-        DIAL_SCOPE.scope(scope, future).await
-    }
-}
-
-pub(crate) struct CapturedDialScope(Option<Arc<DialScope>>);
+#[derive(Clone)]
+pub(crate) struct CapturedDialScope(Arc<DialScope>);
 
 impl CapturedDialScope {
+    fn standalone() -> Self {
+        Self(DialScope::new(DialAdmission::standalone(), None))
+    }
+
     pub(crate) async fn scope<F>(self, future: F) -> F::Output
     where
         F: Future,
     {
-        match self.0 {
-            Some(scope) => DIAL_SCOPE.scope(scope, future).await,
-            None => future.await,
-        }
+        DIAL_SCOPE.scope(self.0, future).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
+        self.0.admission.matches_registry(registry)
     }
 }
 
 pub(crate) fn capture_dial_scope() -> CapturedDialScope {
-    CapturedDialScope(DIAL_SCOPE.try_with(Arc::clone).ok())
+    DIAL_SCOPE
+        .try_with(|scope| CapturedDialScope(Arc::clone(scope)))
+        .unwrap_or_else(|_| CapturedDialScope::standalone())
 }
 
-pub(crate) async fn acquire_physical_dial_permit() -> Option<DialPermit> {
-    let scope = DIAL_SCOPE.try_with(Arc::clone).ok()?;
-    let inherited = {
-        let mut state = scope.state.lock();
-        state.next.take().or_else(|| state.extra.pop())
-    };
-    match inherited {
-        Some(permit) => Some(permit),
-        None => Some(scope.admission.clone().acquire().await),
-    }
+pub(crate) fn try_capture_dial_admission() -> Option<CapturedDialScope> {
+    DIAL_SCOPE
+        .try_with(|scope| CapturedDialScope(DialScope::new(scope.admission.clone(), None)))
+        .ok()
 }
 
-pub(crate) fn retain_physical_dial_permit(permit: Option<DialPermit>) {
-    let (Some(permit), Ok(scope)) = (permit, DIAL_SCOPE.try_with(Arc::clone)) else {
-        return;
+pub(crate) fn capture_dial_admission() -> CapturedDialScope {
+    try_capture_dial_admission().unwrap_or_else(CapturedDialScope::standalone)
+}
+
+pub(crate) async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let scope = DIAL_SCOPE.try_with(Arc::clone).ok();
+    let permit = match &scope {
+        Some(scope) => scope.admission.clone().acquire().await,
+        None => DialAdmission::standalone().acquire().await,
     };
-    let mut state = scope.state.lock();
-    if state.next.is_none() {
-        state.next = Some(permit);
-    } else {
-        state.extra.push(permit);
+    if let Some(scope) = &scope {
+        scope.start();
     }
+    let result = future.await;
+    if result.is_ok()
+        && let Some(scope) = scope
+    {
+        let mut held = scope.held.lock();
+        if held.first.is_none() {
+            held.first = Some(permit);
+        } else {
+            held.extra.push(permit);
+        }
+    }
+    result
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -1073,12 +1122,41 @@ impl OutboundRuntimeRegistry {
     /// Acquire generation-local admission before the shared process gate so
     /// low configured limits cannot hoard process capacity while waiting.
     pub async fn acquire_dial_permit(&self) -> DialPermit {
-        DialAdmission {
-            generation: Arc::clone(&self.dial_semaphore),
-            process: Arc::clone(&self.dial_ceiling_semaphore),
+        DialAdmission::for_registry(self).acquire().await
+    }
+
+    /// Bind physical attempts made by `future` to this generation's gates.
+    /// Nested dispatch through the same registry keeps the existing scope.
+    pub async fn scope_dials<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        if DIAL_SCOPE
+            .try_with(|scope| scope.admission.matches_registry(self))
+            .unwrap_or(false)
+        {
+            return future.await;
         }
-        .acquire()
-        .await
+        DIAL_SCOPE
+            .scope(
+                DialScope::new(DialAdmission::for_registry(self), None),
+                future,
+            )
+            .await
+    }
+
+    /// As [`Self::scope_dials`], starting feedback at the first admitted
+    /// physical attempt. A warm logical dial starts feedback on completion.
+    pub async fn scope_dials_with_start<F, C>(&self, future: F, on_start: C) -> F::Output
+    where
+        F: Future,
+        C: FnOnce() + Send + 'static,
+    {
+        let callback: DialStart = Arc::new(parking_lot::Mutex::new(Some(Box::new(on_start))));
+        let scope = DialScope::new(DialAdmission::for_registry(self), Some(callback));
+        let output = DIAL_SCOPE.scope(Arc::clone(&scope), future).await;
+        scope.start();
+        output
     }
 
     /// Make the generation unavailable to new generation-owned work without
@@ -1086,6 +1164,17 @@ impl OutboundRuntimeRegistry {
     /// captured this generation starts pool draining after its leases retire.
     pub fn begin_retirement(&self) {
         self.terminal.store(true, Ordering::Release);
+    }
+
+    /// Rebind autonomous AnyTLS replacement dials after this generation is
+    /// published. Reused pools must stop consulting the predecessor's gate.
+    pub fn activate_background_dial_admission(&self) {
+        let scope = CapturedDialScope(DialScope::new(DialAdmission::for_registry(self), None));
+        for runtime in self.nodes.values() {
+            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
+                anytls.pool.set_dial_scope(scope.clone());
+            }
+        }
     }
 
     /// Record runtimes a published successor generation has taken over.
@@ -1424,9 +1513,11 @@ mod tests {
         let second_started = Arc::new(tokio::sync::Notify::new());
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let (registry, _) =
-            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None).unwrap();
-        let permit = registry.acquire_dial_permit().await;
+        let registry = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0,
+        );
 
         let dial = tokio::spawn({
             let release_first = Arc::clone(&release_first);
@@ -1434,37 +1525,42 @@ mod tests {
             let second_started = Arc::clone(&second_started);
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
-            permit.scope(async move {
-                crate::address_race::race_resolved_addrs_with_stagger(
-                    &addrs,
-                    Duration::ZERO,
-                    move |addr| {
-                        let release_first = Arc::clone(&release_first);
-                        let first_started = Arc::clone(&first_started);
-                        let second_started = Arc::clone(&second_started);
-                        let active = Arc::clone(&active);
-                        let peak = Arc::clone(&peak);
-                        async move {
-                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                            peak.fetch_max(now, Ordering::SeqCst);
-                            let _active = Active(active);
-                            if addr == second_addr {
-                                second_started.notify_one();
-                            }
-                            let stream = tokio::net::TcpStream::connect(addr).await?;
-                            if addr == first_addr {
-                                first_started.notify_one();
-                                release_first.notified().await;
-                                drop(stream);
-                                Err(std::io::Error::other("first address failed"))
-                            } else {
-                                Ok(stream)
-                            }
-                        }
-                    },
-                )
-                .await
-            })
+            let generation = Arc::clone(&registry);
+            async move {
+                generation
+                    .scope_dials(async move {
+                        crate::address_race::race_resolved_addrs_with_stagger(
+                            &addrs,
+                            Duration::ZERO,
+                            move |addr| {
+                                let release_first = Arc::clone(&release_first);
+                                let first_started = Arc::clone(&first_started);
+                                let second_started = Arc::clone(&second_started);
+                                let active = Arc::clone(&active);
+                                let peak = Arc::clone(&peak);
+                                async move {
+                                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    peak.fetch_max(now, Ordering::SeqCst);
+                                    let _active = Active(active);
+                                    if addr == second_addr {
+                                        second_started.notify_one();
+                                    }
+                                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                                    if addr == first_addr {
+                                        first_started.notify_one();
+                                        release_first.notified().await;
+                                        drop(stream);
+                                        Err(std::io::Error::other("first address failed"))
+                                    } else {
+                                        Ok(stream)
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    })
+                    .await
+            }
         });
 
         first_started.notified().await;
@@ -1512,13 +1608,12 @@ mod tests {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             async move {
-                let permit = generation.acquire_dial_permit().await;
                 let addrs = [
                     "192.0.2.1:443".parse().unwrap(),
                     "[2001:db8::1]:443".parse().unwrap(),
                 ];
-                permit
-                    .scope(crate::address_race::race_resolved_addrs_with_stagger(
+                generation
+                    .scope_dials(crate::address_race::race_resolved_addrs_with_stagger(
                         &addrs,
                         Duration::ZERO,
                         move |addr| {

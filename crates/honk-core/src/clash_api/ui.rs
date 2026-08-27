@@ -420,9 +420,12 @@ async fn fetch_proxied(
         }
     };
     let reporter = feedback.as_ref().map(ScoreFeedback::start);
-    let result = match entry
-        .tcp
-        .dial_runtime(runtime, addr, domain, connect_timeout)
+    let result = match generation
+        .scope_dials(
+            entry
+                .tcp
+                .dial_runtime(runtime, addr, domain, connect_timeout),
+        )
         .await
     {
         Ok(proxy) => match tokio::time::timeout(

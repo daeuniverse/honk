@@ -1281,6 +1281,67 @@ mod client_tests {
     }
 
     #[tokio::test]
+    async fn dead_warm_quic_reconnect_waits_for_limit_one() {
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        let client = Arc::new(test_client(addr.port()).await);
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0,
+        );
+        let first_accept = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { endpoint.accept().await.unwrap().await.unwrap() }
+        });
+        let (first, _) = generation
+            .scope_dials(client.connection_with(Duration::from_secs(1), |_| async {
+                Ok::<(), anyhow::Error>(())
+            }))
+            .await
+            .unwrap();
+        let first_server = first_accept.await.unwrap();
+        first.close(VarInt::from_u32(0), b"replace");
+        client.invalidate(&first).await;
+
+        let held = generation.acquire_dial_permit().await;
+        let reconnect = tokio::spawn({
+            let client = Arc::clone(&client);
+            let generation = Arc::clone(&generation);
+            async move {
+                generation
+                    .scope_dials(client.connection_with(Duration::from_secs(1), |_| async {
+                        Ok::<(), anyhow::Error>(())
+                    }))
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), endpoint.accept())
+                .await
+                .is_err(),
+            "dead cached QUIC reconnect bypassed the physical dial limit"
+        );
+
+        drop(held);
+        let incoming = tokio::time::timeout(Duration::from_secs(1), endpoint.accept())
+            .await
+            .expect("admitted QUIC reconnect sent no Initial")
+            .expect("server endpoint closed");
+        let second_accept = tokio::spawn(async move { incoming.await.unwrap() });
+        let (second, _) = tokio::time::timeout(Duration::from_secs(1), reconnect)
+            .await
+            .expect("admitted QUIC reconnect did not finish")
+            .unwrap()
+            .unwrap();
+        let second_server = second_accept.await.unwrap();
+
+        second.close(VarInt::from_u32(0), b"test complete");
+        client.force_close().await;
+        endpoint.close(VarInt::from_u32(0), b"test complete");
+        drop((first_server, second_server));
+    }
+
+    #[tokio::test]
     async fn force_close_covers_connection_cached_by_in_flight_dial() {
         let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
         spawn_accept_loop(endpoint);

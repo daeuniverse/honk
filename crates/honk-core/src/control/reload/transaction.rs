@@ -347,6 +347,7 @@ impl ControlPlane {
                 }
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
+                new_runtime_registry.activate_background_dial_admission();
                 // Commit point for runtime reuse: only now, with the successor
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.

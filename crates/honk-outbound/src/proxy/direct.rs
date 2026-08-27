@@ -37,11 +37,11 @@ impl TcpOutbound for DirectHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         debug!("Direct dial to {}", target);
-        let stream = crate::util::connect_marked_addr(
+        let stream = crate::runtime::admit_physical_dial(crate::util::connect_marked_addr(
             target,
             Some(honk_ebpf_common::DAE_BYPASS_MARK),
             connect_timeout,
-        )
+        ))
         .await?;
         Ok(ProxyStream {
             stream: Box::new(stream),
@@ -121,5 +121,68 @@ mod tests {
             .dial(&node, target, None, Duration::from_secs(3))
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn direct_connect_respects_one_physical_dial_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                listener.accept().await.unwrap();
+            }
+        });
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0,
+        );
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first = tokio::spawn({
+            let generation = Arc::clone(&generation);
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            async move {
+                generation
+                    .scope_dials(async {
+                        let _stream = DirectHandler::new()
+                            .dial(&Node::default(), addr, None, Duration::from_secs(1))
+                            .await
+                            .unwrap();
+                        ready.notify_one();
+                        release.notified().await;
+                    })
+                    .await;
+            }
+        });
+        ready.notified().await;
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                generation.scope_dials(DirectHandler::new().dial(
+                    &Node::default(),
+                    addr,
+                    None,
+                    Duration::from_secs(1),
+                )),
+            )
+            .await
+            .is_err()
+        );
+
+        release.notify_one();
+        first.await.unwrap();
+        generation
+            .scope_dials(DirectHandler::new().dial(
+                &Node::default(),
+                addr,
+                None,
+                Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 }
