@@ -94,6 +94,7 @@ impl VlessMuxSession {
         self.capacity.close();
     }
 }
+
 impl ManagedSession for VlessMuxSession {
     fn active_streams(&self) -> usize {
         MAX_STREAMS_PER_SESSION - self.capacity.available_permits()
