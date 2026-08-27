@@ -185,11 +185,12 @@ user-data capacity benchmark.
 | TUIC | 0.920 / 0.937 | +1.580% | -1.136% to +4.108% | +2.511% | -7.136% |
 | Juicity | 0.857 / 0.873 | +2.549% | -0.152% to +3.893% | +2.848% | -7.336% |
 
-Every interval includes zero, and the largest paired point estimate is below
-the 3% regression gate. All 9,000 measured candidate handshakes completed with
-empty stderr. The process CPU rows divide child CPU by all 105 probes and
-include amortized process startup; they are supporting evidence, not a claim
-about proxy throughput.
+Every interval includes zero, so this run demonstrates no latency regression.
+The point estimates stay below 3%, but the TUIC and Juicity upper bounds exceed
+3%; the sample does not prove a sub-3% worst case. All 9,000 measured candidate
+handshakes completed with empty stderr. The process CPU rows divide child CPU
+by all 105 probes and include amortized process startup; they are supporting
+evidence, not a claim about proxy throughput.
 
 A separate 5,000-probe tight loop checks endpoint-worker retirement. It is
 deliberately much denser than the periodic production cadence:
