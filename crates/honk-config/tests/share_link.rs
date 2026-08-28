@@ -71,7 +71,7 @@ fn test_node_serialization_bytes_match_flat_wire_goldens() {
 }
 
 #[test]
-fn test_legacy_cross_protocol_fields_are_rejected() {
+fn test_legacy_cross_protocol_fields_are_ignored() {
     let json = r#"{
         "name":"dirty-id",
         "protocol":"socks5",
@@ -80,10 +80,15 @@ fn test_legacy_cross_protocol_fields_are_rejected() {
         "port":1080,
         "username":"user",
         "password":"pass",
+        "tls":true,
         "hy2_obfs":"cross-protocol-obfs"
     }"#;
-    let error = serde_json::from_str::<Node>(json).unwrap_err();
-    assert!(error.to_string().contains("hy2_obfs"), "{error}");
+    let node = serde_json::from_str::<Node>(json).unwrap();
+    let socks5 = node.socks5().unwrap();
+    assert_eq!(socks5.username.as_deref(), Some("user"));
+    assert_eq!(socks5.password.as_deref(), Some("pass"));
+    assert!(node.tls().is_none());
+    assert!(node.hysteria2().is_none());
 }
 
 #[test]
