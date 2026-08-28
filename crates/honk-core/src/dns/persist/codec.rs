@@ -255,9 +255,6 @@ fn decode_policy(
         1 => {
             let digest = reader.take(32)?;
             let canonical = reader.bytes()?;
-            if Sha256::digest(canonical).as_slice() != digest {
-                return Err(DecodeError::Corrupt);
-            }
             let Some(active) = active else {
                 return Err(DecodeError::PolicyMismatch);
             };

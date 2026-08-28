@@ -83,7 +83,7 @@ pub(super) fn resolver_with_config(
             Arc::new(Mutex::new(DnsCache::new(32))),
             Arc::new(DnsRouter::new_from_dns_config(config).expect("router")),
         )
-        .with_strategy(config.strategy.clone()),
+        .with_strategy(config.strategy),
     );
     DnsResolver::with_forwarder(config, forwarder).expect("resolver")
 }

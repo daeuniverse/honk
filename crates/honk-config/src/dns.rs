@@ -246,7 +246,7 @@ where
 }
 
 /// DNS configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsConfig {
     /// Standalone DNS listener endpoint. Empty disables the listener.
     #[serde(default)]
@@ -329,7 +329,7 @@ impl DnsConfig {
 }
 
 /// A DNS upstream server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsUpstream {
     pub name: String,
     pub address: String,
@@ -351,7 +351,7 @@ pub struct DnsUpstream {
 /// Supports both the new request/response rules and the legacy flat
 /// `rules` + `fallback` format. When `request.rules` is empty (e.g.
 /// after serde from old JSON), `DnsRouter::new` converts legacy rules.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRouting {
     /// New-style request routing rules.
     #[serde(default, skip_serializing_if = "DnsRequestRouting::is_default")]
@@ -389,7 +389,7 @@ impl Default for DnsRouting {
 /// use [`DnsRequestRouting`] instead.
 pub type DnsRule = DnsLegacyRule;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsLegacyRule {
     /// Domain pattern ("suffix:.cn" | "full:x" | "keyword:" | "regex:" | bare full)
     pub domain: String,
@@ -443,7 +443,7 @@ impl DnsResponseAction {
 }
 
 /// How to match a domain name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsDomainMatcher {
     /// Exact full-domain match.
     Full(String),
@@ -458,7 +458,7 @@ pub enum DnsDomainMatcher {
 }
 
 /// One AND-ed condition. Matchers within the condition are OR-ed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsCond {
     /// Match the query name.
     Qname {
@@ -502,7 +502,7 @@ pub enum DnsCond {
 /// A single request routing rule.
 ///
 /// All conditions are AND-ed; first matching rule wins.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRequestRule {
     /// Conditions that must all be true.
     pub conditions: Vec<DnsCond>,
@@ -513,7 +513,7 @@ pub struct DnsRequestRule {
 /// A single response routing rule.
 ///
 /// All conditions are AND-ed; first matching rule wins.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsResponseRule {
     /// Conditions that must all be true.
     pub conditions: Vec<DnsCond>,
@@ -522,7 +522,7 @@ pub struct DnsResponseRule {
 }
 
 /// Request routing: rules + fallback action.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRequestRouting {
     /// Ordered list of rules.
     pub rules: Vec<DnsRequestRule>,
@@ -540,7 +540,7 @@ impl Default for DnsRequestRouting {
 }
 
 /// Response routing: rules + fallback action.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsResponseRouting {
     /// Ordered list of rules.
     pub rules: Vec<DnsResponseRule>,
@@ -694,7 +694,7 @@ pub fn parse_qtype_token(s: &str) -> Option<u16> {
 }
 
 /// DNS resolution strategy.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsStrategy {
     /// Prefer IPv4
@@ -711,7 +711,7 @@ pub enum DnsStrategy {
 }
 
 /// DNS cache configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsCacheConfig {
     /// Enable DNS cache
     #[serde(default = "crate::types::default_true")]

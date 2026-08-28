@@ -38,8 +38,8 @@ impl DnsResolver {
                 forwarder
                     .as_ref()
                     .clone()
-                    .with_strategy(config.strategy.clone())
-                    .with_hosts_from_config(config)?,
+                    .with_strategy(config.strategy)
+                    .with_policy_from_config(config)?,
             )),
         })
     }
@@ -79,18 +79,19 @@ impl DnsResolver {
 
 fn build_forwarder_from_config(config: &DnsConfig) -> anyhow::Result<Arc<DnsForwarder>> {
     let dns_cache = Arc::new(Mutex::new(DnsCache::new(config.cache.max_size)));
-    let router = Arc::new(DnsRouter::new_from_dns_config(config)?);
+    let requirements = DnsRouter::geo_requirements(config);
+    let geo_sources = crate::routing::GeoSourceSet::load(&requirements);
+    let router = Arc::new(DnsRouter::new_with_geo_sources(config, &geo_sources)?);
     let pool = Arc::new(
         UpstreamPool::new(&config.upstream, Arc::clone(&router))?
             .with_client_subnet(config.effective_client_subnet()?),
     );
     Ok(Arc::new(
         DnsForwarder::new(pool, dns_cache, router)
-            .with_strategy(config.strategy.clone())
+            .with_strategy(config.strategy)
             .with_cache_enabled(config.cache.enabled)
             .with_cache_ttl(config.cache.ttl.min(u64::from(u32::MAX)) as u32)
-            .with_policy_from_config(config)?
-            .with_hosts_from_config(config)?,
+            .with_policy_from_config(config)?,
     ))
 }
 

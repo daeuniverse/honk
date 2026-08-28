@@ -5,7 +5,7 @@ use std::collections::HashMap;
 pub const DATAPATH_RESERVED_MARK_MASK: u32 = 0xc000_0000;
 
 /// A routing rule that matches traffic and sends it to an outbound.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingRule {
     #[serde(default)]
     pub name: String,
@@ -28,7 +28,7 @@ pub struct RoutingRule {
 }
 
 /// Conditions for matching traffic.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RoutingCondition {
     #[serde(default)]
     pub domain: Vec<String>,
@@ -69,7 +69,7 @@ pub struct RoutingCondition {
 /// Negated matcher set of a routing rule, mirroring [`RoutingCondition`]
 /// field for field. Kept as a separate struct so existing serde configs
 /// without a `not` key keep parsing unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RoutingNotCondition {
     #[serde(default)]
     pub domain: Vec<String>,
@@ -264,7 +264,7 @@ fn clash_api_rule_type(kind: &'static str) -> &'static str {
 
 /// A routing target. Dae and supported structured formats use one node or
 /// group tag; partially wired chain/balancer variants were removed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RoutingOutbound {
     Simple(String),
@@ -278,7 +278,7 @@ impl RoutingOutbound {
 }
 
 /// Routing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingConfig {
     /// Routing rules
     #[serde(default)]

@@ -452,7 +452,7 @@ impl Node {
 /// A group of nodes for load balancing / failover.
 ///
 /// Modeled after sing-box's outbound groups, plus the built-in Score policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,

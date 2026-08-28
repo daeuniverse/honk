@@ -10,9 +10,7 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
         drop(dns_resolver);
-        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
-            &config.dns,
-        )?);
+        let dns_router = dns_forwarder.routing_snapshot();
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
                 &config.dns.upstream,
@@ -23,7 +21,7 @@ impl ControlPlane {
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
                 ),
-                config.dns.strategy.clone(),
+                config.dns.strategy,
             )?
             .with_client_subnet(config.dns.effective_client_subnet()?),
         );
@@ -158,10 +156,7 @@ impl ControlPlane {
             })));
         }
 
-        let pinned_router = Arc::new(Router::new(
-            &config.routing.rules,
-            &config.routing.default_outbound,
-        )?);
+        let pinned_router = Arc::new(router.clone());
         let pinned_groups = group_manager.read().clone();
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
@@ -229,6 +224,7 @@ impl ControlPlane {
 
         let control_plane = Self {
             config: config_arc,
+            reload_lock: tokio::sync::Mutex::new(()),
             log_file_override: None,
             effective_log_file,
             ebpf: ebpf_arc,
@@ -281,6 +277,11 @@ impl ControlPlane {
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
+            routing_publication_dirty: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(feature = "reload-bench-counters")]
+            reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            pre_dns_publication_hook: parking_lot::Mutex::new(None),
             #[cfg(feature = "ebpf")]
             iface_watcher: None,
         };

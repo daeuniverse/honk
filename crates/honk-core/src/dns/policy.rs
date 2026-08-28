@@ -10,6 +10,13 @@ use sha2::{Digest, Sha256};
 pub struct PolicyId {
     digest: [u8; 32],
     canonical: Arc<[u8]>,
+    artifacts: Option<Arc<ArtifactFingerprints>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct ArtifactFingerprints {
+    hosts: [u8; 32],
+    dns_geo: [u8; 32],
 }
 
 impl PolicyId {
@@ -19,6 +26,29 @@ impl PolicyId {
         Ok(Self {
             digest,
             canonical: canonical.into(),
+            artifacts: None,
+        })
+    }
+
+    pub fn from_config_with_artifacts(
+        config: &DnsConfig,
+        hosts_fingerprint: &[u8; 32],
+        dns_geo_fingerprint: &[u8; 32],
+    ) -> Result<Self, PolicyError> {
+        let canonical = canonical::encode(config)?;
+        let mut hash = Sha256::new();
+        hash.update(&canonical);
+        hash.update(b"\0honk.dns-policy.hosts.v1\0");
+        hash.update(hosts_fingerprint);
+        hash.update(b"\0honk.dns-policy.geo.v1\0");
+        hash.update(dns_geo_fingerprint);
+        Ok(Self {
+            digest: hash.finalize().into(),
+            canonical: canonical.into(),
+            artifacts: Some(Arc::new(ArtifactFingerprints {
+                hosts: *hosts_fingerprint,
+                dns_geo: *dns_geo_fingerprint,
+            })),
         })
     }
 
@@ -28,6 +58,16 @@ impl PolicyId {
 
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical
+    }
+
+    pub(crate) fn matches_artifacts(
+        &self,
+        hosts_fingerprint: &[u8; 32],
+        dns_geo_fingerprint: &[u8; 32],
+    ) -> bool {
+        self.artifacts.as_deref().is_some_and(|artifacts| {
+            artifacts.hosts == *hosts_fingerprint && artifacts.dns_geo == *dns_geo_fingerprint
+        })
     }
 
     pub fn digest_hex(&self) -> String {
@@ -86,3 +126,25 @@ pub enum PolicyError {
 mod normalization_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    #[test]
+    fn artifact_digests_are_domain_separated_from_canonical_config() {
+        let config = DnsConfig::default();
+        let zero = [0; 32];
+        let one = [1; 32];
+        let base = PolicyId::from_config_with_artifacts(&config, &zero, &zero).unwrap();
+        let hosts_changed = PolicyId::from_config_with_artifacts(&config, &one, &zero).unwrap();
+        let geo_changed = PolicyId::from_config_with_artifacts(&config, &zero, &one).unwrap();
+        let isolated = PolicyId::from_config(&config).unwrap();
+
+        assert_ne!(base, hosts_changed);
+        assert_ne!(base, geo_changed);
+        assert_ne!(hosts_changed, geo_changed);
+        assert_ne!(base, isolated);
+        assert_eq!(base.canonical_bytes(), isolated.canonical_bytes());
+    }
+}

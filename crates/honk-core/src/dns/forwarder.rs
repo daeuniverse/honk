@@ -19,7 +19,7 @@ use super::engine::{DnsEngine, EngineError};
 use super::policy::PolicyId;
 use super::response::ResponseError;
 use super::routing::DnsRouter;
-use honk_config::dns::{DnsConfig, DnsStrategy, SYSTEM_HOSTS_PATH};
+use honk_config::dns::{DnsConfig, DnsStrategy};
 
 /// Abstraction over a pool of DNS upstream servers.
 ///
@@ -94,6 +94,7 @@ pub struct DnsForwarder {
     pub(crate) routing: Arc<DnsRouter>,
     pub(crate) strategy: DnsStrategy,
     hosts: Option<Arc<hosts::HostsFile>>,
+    hosts_fingerprint: [u8; 32],
     /// When false, skip positive/negative cache lookups and inserts
     /// (`dns.optimistic_cache` / `cache.enabled`).
     pub(crate) cache_enabled: bool,
@@ -123,6 +124,7 @@ impl DnsForwarder {
             routing,
             strategy: DnsStrategy::default(),
             hosts: None,
+            hosts_fingerprint: hosts::HostsSnapshot::default().fingerprint(),
             cache_enabled: true,
             // 0 = keep answer min TTL until `with_cache_ttl` is applied from config.
             cache_ttl: 0,
@@ -171,31 +173,41 @@ impl DnsForwarder {
     }
 
     pub fn with_policy_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
-        let policy_id =
-            PolicyId::from_config(config).context("failed to derive DNS policy identity")?;
-        Ok(self.with_policy_id(policy_id))
+        let sources = hosts::HostsSourceSet::load(config)?;
+        let policy_id = PolicyId::from_config_with_artifacts(
+            config,
+            &sources.fingerprint(),
+            &self.routing.geo_fingerprint(),
+        )
+        .context("failed to derive effective DNS policy identity")?;
+        let snapshot = sources.parse().map_err(anyhow::Error::new)?;
+        Ok(self.with_policy_id(policy_id).with_hosts_snapshot(snapshot))
     }
 
-    pub(crate) fn with_hosts_from_config(mut self, config: &DnsConfig) -> anyhow::Result<Self> {
-        if config.hosts.is_empty() {
-            self.hosts = None;
-            return Ok(self);
-        }
+    #[cfg(test)]
+    pub(crate) fn with_hosts_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
+        let sources = hosts::HostsSourceSet::load(config)?;
+        let snapshot = sources.parse().map_err(anyhow::Error::new)?;
+        Ok(self.with_hosts_snapshot(snapshot))
+    }
 
-        let mut hosts = hosts::HostsFile::default();
-        for source in &config.hosts {
-            let path = honk_config::paths::resolve_dependency_path(source);
-            let loaded = if source == SYSTEM_HOSTS_PATH {
-                hosts::HostsFile::load(&path)
-            } else {
-                hosts::HostsFile::load_rules(&path)
-            }
-            .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
-            hosts.merge(loaded);
-        }
-        tracing::info!(sources = config.hosts.len(), "Loaded DNS hosts snapshot");
-        self.hosts = Some(Arc::new(hosts));
-        Ok(self)
+    pub(crate) fn hosts_snapshot(&self) -> hosts::HostsSnapshot {
+        hosts::HostsSnapshot::new(self.hosts_fingerprint, self.hosts.clone())
+    }
+
+    pub(crate) fn with_hosts_snapshot(mut self, snapshot: hosts::HostsSnapshot) -> Self {
+        self.hosts_fingerprint = snapshot.fingerprint();
+        self.hosts = snapshot.hosts();
+        self
+    }
+
+    pub(crate) fn routing_snapshot(&self) -> Arc<DnsRouter> {
+        Arc::clone(&self.routing)
+    }
+
+    /// Cache identity for this forwarder's effective config and loaded artifacts.
+    pub fn policy_id(&self) -> Option<PolicyId> {
+        self.policy_id.clone()
     }
 
     /// Return a clone of the underlying cache Arc.
@@ -214,7 +226,7 @@ impl DnsForwarder {
     pub(crate) async fn engine(&self) -> Result<&DnsEngine, EngineError> {
         self.engine
             .get_or_try_init(|| async {
-                DnsEngine::from_router(&self.routing, self.policy_id.clone())
+                DnsEngine::from_shared_router(Arc::clone(&self.routing), self.policy_id.clone())
             })
             .await
     }
@@ -226,8 +238,9 @@ impl DnsForwarder {
             cache_service: Arc::clone(&self.cache_service),
             engine: Arc::clone(&self.engine),
             routing: Arc::clone(&self.routing),
-            strategy: self.strategy.clone(),
+            strategy: self.strategy,
             hosts: self.hosts.clone(),
+            hosts_fingerprint: self.hosts_fingerprint,
             cache_enabled: self.cache_enabled,
             cache_ttl: self.cache_ttl,
             policy_id: self.policy_id.clone(),
@@ -244,6 +257,7 @@ impl DnsForwarder {
 
 mod exchange;
 mod hosts;
+pub(crate) use hosts::{HostsSnapshot, HostsSourceSet};
 mod message {
     use crate::dns::query::{NameParseState, parse_name};
     use std::net::{IpAddr, SocketAddr};

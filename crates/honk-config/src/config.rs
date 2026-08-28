@@ -20,7 +20,7 @@ pub const BLOCK_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x00000000_0000_4000
 pub const PRECONNECT_NODE_COUNT_AUTO: usize = usize::MAX;
 
 /// Main honk configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub global: GlobalConfig,
@@ -39,7 +39,7 @@ pub struct Config {
 }
 
 /// Global configuration matching dae `global { ... }` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_tproxy_port")]
     pub tproxy_port: u16,

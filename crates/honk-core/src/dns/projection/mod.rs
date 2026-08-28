@@ -186,6 +186,30 @@ pub(crate) struct RoutingProjection {
     lifecycle: Arc<ProjectionLifecycle>,
 }
 
+pub(crate) struct PreparedProjectionPublication<'a> {
+    projection: &'a RoutingProjection,
+    _fence: parking_lot::RwLockWriteGuard<'a, ()>,
+}
+
+impl PreparedProjectionPublication<'_> {
+    pub(crate) fn project(
+        &self,
+        snapshot: &RoutingProjectionSnapshot,
+    ) -> Vec<(IpAddr, DomainRouting)> {
+        self.projection
+            .state
+            .lock()
+            .project(snapshot)
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn commit(self, snapshot: Arc<RoutingProjectionSnapshot>) {
+        self.projection.state.lock().update_snapshot(snapshot);
+        self.projection.notify_worker();
+    }
+}
+
 impl RoutingProjection {
     pub(crate) fn spawn(
         ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>,
@@ -212,7 +236,14 @@ impl RoutingProjection {
         projection.worker.lock().replace(handle);
         projection
     }
+    pub(crate) fn prepare_snapshot_publication(&self) -> PreparedProjectionPublication<'_> {
+        PreparedProjectionPublication {
+            projection: self,
+            _fence: self.publication_fence.write(),
+        }
+    }
 
+    #[cfg(test)]
     pub(crate) fn update_snapshot(&self, snapshot: Arc<RoutingProjectionSnapshot>) {
         self.mutate(|state| {
             state.update_snapshot(snapshot);
@@ -220,6 +251,7 @@ impl RoutingProjection {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn project(
         &self,
         snapshot: &RoutingProjectionSnapshot,

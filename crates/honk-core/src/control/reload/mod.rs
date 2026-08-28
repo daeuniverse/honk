@@ -1,10 +1,15 @@
 use super::*;
 mod connectivity;
+mod fingerprint;
 mod policy;
 mod subscription;
 mod transaction;
 mod warm;
 
+pub(in crate::control) use fingerprint::{
+    dns_routing_state_reusable, effective_config_unchanged, routing_state_reusable,
+    subscription_nodes_unchanged,
+};
 pub(in crate::control) use policy::restart_required_changes;
 
 #[cfg(test)]
@@ -13,6 +18,7 @@ pub(in crate::control) use warm::{
     warm_selector_candidate,
 };
 
+#[cfg(test)]
 pub(in crate::control) use subscription::config_with_subscription_nodes;
 
 pub(in crate::control) use connectivity::{

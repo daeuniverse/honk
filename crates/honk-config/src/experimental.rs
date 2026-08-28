@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Clash-compatible REST API server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClashApiConfig {
     /// Listen address for the REST API (e.g. "0.0.0.0:9999").
     /// API is disabled when empty.
@@ -45,7 +45,7 @@ impl Default for ClashApiConfig {
 }
 
 /// Cache file for persistent state (FakeIP, DNS cache, mode/selection).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheFileConfig {
     /// Enable cache file persistence.
     #[serde(default)]
@@ -82,7 +82,7 @@ impl Default for CacheFileConfig {
 }
 
 /// Compatibility-only NFQUEUE settings accepted while old configurations migrate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LegacyUdpNfqueueConfig {
     #[serde(default)]
@@ -90,7 +90,7 @@ pub(crate) struct LegacyUdpNfqueueConfig {
 }
 
 /// Experimental features configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentalConfig {
     #[serde(default)]

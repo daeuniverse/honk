@@ -2,12 +2,12 @@
 
 use honk_config::routing::RoutingRule;
 use regex::Regex;
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
 
 mod geo;
 mod lpm;
 
-pub(crate) use geo::GeoAssets;
+pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
 pub(crate) use lpm::BinaryLpmTrie;
 
 // Read-only dat scan API consumed by honk-tool (`geosite`/`geoip`
@@ -218,23 +218,71 @@ fn conn_log_id(conn: &ConnectionInfo) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+struct CompiledRoutes {
+    routes: Arc<[CompiledRoute]>,
+    geo_fingerprint: [u8; 32],
+    geo_requirements: GeoRequirements,
+}
+
+impl CompiledRoutes {
+    fn new(
+        routes: Vec<CompiledRoute>,
+        geo_fingerprint: [u8; 32],
+        geo_requirements: GeoRequirements,
+    ) -> Self {
+        Self {
+            routes: routes.into(),
+            geo_fingerprint,
+            geo_requirements,
+        }
+    }
+}
+
+impl From<Vec<CompiledRoute>> for CompiledRoutes {
+    fn from(routes: Vec<CompiledRoute>) -> Self {
+        let requirements = GeoRequirements::default();
+        let sources = GeoSourceSet::load(&requirements);
+        Self::new(routes, sources.fingerprint(), requirements)
+    }
+}
+
+impl std::ops::Deref for CompiledRoutes {
+    type Target = Arc<[CompiledRoute]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.routes
+    }
+}
+
+impl AsRef<[CompiledRoute]> for CompiledRoutes {
+    fn as_ref(&self) -> &[CompiledRoute] {
+        &self.routes
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Router {
-    routes: Vec<CompiledRoute>,
-    default_outbound: String,
+    routes: CompiledRoutes,
+    default_outbound: Arc<str>,
 }
 
 impl Router {
     pub fn new(rules: &[RoutingRule], default_outbound: &str) -> anyhow::Result<Self> {
+        let requirements = GeoRequirements::for_traffic(rules);
+        let sources = GeoSourceSet::load(&requirements);
+        Self::new_with_geo_sources(rules, default_outbound, &sources)
+    }
+
+    pub(crate) fn new_with_geo_sources(
+        rules: &[RoutingRule],
+        default_outbound: &str,
+        geo_sources: &GeoSourceSet,
+    ) -> anyhow::Result<Self> {
+        let requirements = GeoRequirements::for_traffic(rules);
+        let assets = GeoAssets::from_sources(&requirements, geo_sources);
+        let geo_fingerprint = geo_sources.fingerprint_for(&requirements);
         let mut compiled = Vec::new();
-
-        // Parse geosite.dat / geoip.dat at most once per Router build (see
-        // GeoAssets). Previously each rule with a geosite:/geoip: condition
-        // re-read and re-parsed the whole multi-MB protobuf database and
-        // re-compiled every geosite regex, making Router construction take
-        // >10s (a full CPU core) on typical configs.
-        let assets = GeoAssets::load(rules);
-
         for rule in rules {
             let mut domain_patterns = Vec::new();
             for pattern in &rule.condition.domain_regex {
@@ -404,13 +452,21 @@ impl Router {
         let (default_outbound, _default_must) = parse_outbound(default_outbound);
 
         Ok(Self {
-            routes: compiled,
-            default_outbound,
+            routes: CompiledRoutes::new(compiled, geo_fingerprint, requirements),
+            default_outbound: default_outbound.into(),
         })
     }
 
-    pub const fn default_outbound(&self) -> &str {
-        self.default_outbound.as_str()
+    pub fn default_outbound(&self) -> &str {
+        self.default_outbound.as_ref()
+    }
+
+    pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
+        self.routes.geo_fingerprint
+    }
+
+    pub(crate) fn geo_requirements(&self) -> &GeoRequirements {
+        &self.routes.geo_requirements
     }
 
     pub fn route(&self, conn: &ConnectionInfo) -> &str {
@@ -422,7 +478,7 @@ impl Router {
                     conn_log_id(conn),
                     self.default_outbound
                 );
-                &self.default_outbound
+                self.default_outbound.as_ref()
             }
         }
     }
@@ -440,7 +496,7 @@ impl Router {
     /// should use default outbound). A `(must)` rule is terminal and tells
     /// the control plane to skip TLS/HTTP sniffing.
     pub fn route_full<'a>(&'a self, conn: &ConnectionInfo) -> Option<RouteMatch<'a>> {
-        for route in &self.routes {
+        for route in self.routes.iter() {
             if self.match_route(route, conn) {
                 tracing::debug!(
                     "Connection {} matched rule '{}' → '{}' (must={}, mark={})",
@@ -491,7 +547,7 @@ impl Router {
             dscp: None,
         };
 
-        for route in &self.routes {
+        for route in self.routes.iter() {
             if !route_has_domain_condition(route) {
                 continue;
             }
@@ -729,7 +785,7 @@ impl Router {
     }
 
     pub fn compiled_routes(&self) -> &[CompiledRoute] {
-        &self.routes
+        self.routes.as_ref()
     }
 }
 

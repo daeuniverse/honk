@@ -1894,7 +1894,10 @@ async fn test_store_dns_persister_end_to_end() {
 
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_config = DnsConfig::default();
-    let policy = honk_core::dns::policy::PolicyId::from_config(&dns_config).unwrap();
+    let forwarder = test_dns_forwarder(dns_cache.clone(), a_record_response([1, 2, 3, 4], 300))
+        .with_policy_from_config(&dns_config)
+        .unwrap();
+    let policy = forwarder.policy_id().expect("effective DNS policy");
     let persister = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
         persister
@@ -1907,9 +1910,6 @@ async fn test_store_dns_persister_end_to_end() {
         .lock()
         .await
         .set_persister(Some(persister.clone()));
-    let forwarder = test_dns_forwarder(dns_cache.clone(), a_record_response([1, 2, 3, 4], 300))
-        .with_policy_from_config(&dns_config)
-        .unwrap();
     let response = forwarder
         .resolve(&build_dns_query("example.com", 1))
         .await
