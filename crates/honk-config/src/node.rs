@@ -484,16 +484,93 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_identity_goldens() {
+        let cases = [
+            (
+                "ss",
+                "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#ss",
+                "e4a92538-53a2-5f83-85cd-b5d11f90361b",
+            ),
+            (
+                "socks5",
+                "socks5://user:pass@1.2.3.4:1080#socks5",
+                "4257ffb1-f1ac-5838-b020-fe5c08dc99f8",
+            ),
+            (
+                "trojan",
+                "trojan://secret@example.com:443#trojan",
+                "6b92dad3-62ea-5dcd-a71f-fd67105ccfe1",
+            ),
+            (
+                "vmess",
+                "vmess://eyJwcyI6InZtZXNzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoidGxzIn0",
+                "263e811a-31e9-572f-bb87-66f1fc63ce98",
+            ),
+            (
+                "vless-legacy",
+                "vless://uuid@example.com:443#legacy",
+                "d47c73f3-910d-56b4-baa5-d230c76d788b",
+            ),
+            (
+                "vless-uot-v2",
+                "vless://uuid@example.com:443?vless_mode=uot-v2#uot-v2",
+                "372e7dc7-86a7-5d0d-accc-ba38fd103214",
+            ),
+            (
+                "vless-h2mux",
+                "vless://uuid@example.com:443?vless_mode=h2mux#h2mux",
+                "258ef463-002a-5fdf-8901-a1c8508ff988",
+            ),
+            (
+                "vless-h2mux-padded",
+                "vless://uuid@example.com:443?vless_mode=h2mux-padded#h2mux-padded",
+                "7f5ed150-4f89-54e1-b157-4d123d7fbc52",
+            ),
+            (
+                "vless-xudp",
+                "vless://uuid@example.com:443?vless_mode=xudp#xudp",
+                "85e3e4ce-e4e7-546b-93d5-e1d8a0742f4b",
+            ),
+            (
+                "vless-mux-cool",
+                "vless://uuid@example.com:443?vless_mode=mux-cool#mux-cool",
+                "4133852f-b86f-5a8f-b8fb-b335023645fe",
+            ),
+            (
+                "hysteria2",
+                "hysteria2://secret@example.com:443#hysteria2",
+                "f622cf2a-ef2e-5777-abdb-d8c826d11f57",
+            ),
+            (
+                "tuic",
+                "tuic://uuid:pass@example.com:443#tuic",
+                "e8751061-7db8-5d0d-b2e9-04af9ce55d02",
+            ),
+            (
+                "juicity",
+                "juicity://uuid:pass@example.com:443#juicity",
+                "26d8181d-9c09-580d-86bc-1bdc22f1d113",
+            ),
+            (
+                "anytls",
+                "anytls://secret@example.com:443#anytls",
+                "743d15b1-586a-5095-9e49-58c6f444f738",
+            ),
+        ];
+
+        for (name, link, expected) in cases {
+            let node = Node::from_share_link(link).unwrap();
+            assert_eq!(node.id.to_string(), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn test_vless_mode_identity() {
         let legacy = Node::from_share_link("vless://uuid@example.com:443#legacy").unwrap();
         let explicit_legacy =
             Node::from_share_link("vless://uuid@example.com:443?vless_mode=legacy#explicit")
                 .unwrap();
         assert_eq!(legacy.id, explicit_legacy.id);
-        assert_eq!(
-            legacy.id,
-            uuid::Uuid::parse_str("d47c73f3-910d-56b4-baa5-d230c76d788b").unwrap()
-        );
 
         let ids = ["uot-v2", "h2mux", "h2mux-padded", "xudp", "mux-cool"].map(|mode| {
             Node::from_share_link(&format!(

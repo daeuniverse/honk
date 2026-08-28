@@ -85,7 +85,7 @@ Validation requires every non-built-in node to have a non-empty name and either 
 
 ### Structured-loader compatibility
 
-**Compatibility change:** TOML, YAML, and JSON retain the legacy flat node keys, but loading is now strict. A non-default field that does not belong to the selected `protocol` is a parse error instead of being silently ignored; for example, an `ss` node with `tls: true` is rejected. Remove stale fields emitted by templates or generators before upgrading. Honk's serializer emits protocol-inapplicable slots only at their accepted defaults, so its own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
+TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol`; non-default fields left over from other protocols are stripped without rejecting the node, and one warning lists the stripped field names. For example, `tls: true` on an `ss` node is ignored with a warning rather than enabling TLS. `username` is not a credential alias for Trojan, VLESS, Hysteria2, or AnyTLS; when supplied without that protocol's effective credential field, it is stripped with a targeted warning, preserving legacy behavior and IDs. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
 
 ## Protocols
 
