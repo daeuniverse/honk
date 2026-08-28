@@ -46,7 +46,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `username` / `password` | string? | null | 来自 userinfo 的认证、UUID 或密钥 |
 | `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串 |
 | `vless_mode` | `WireMode` | `legacy` | `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 或 `mux-cool` |
-| `plugin` / `plugin_opts` | string? | null | SIP002 插件名称/参数（`plugin`、`plugin-opts`） |
+| `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，VLESS 历史默认开启 |
 | `sni` | string? | null | 来自 `sni` 或未被 transport 消耗的 `host` query 的 TLS 服务端名称 |

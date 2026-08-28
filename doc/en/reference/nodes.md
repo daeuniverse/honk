@@ -46,7 +46,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `username` / `password` | string? | null | Authentication, UUID, or secret from userinfo |
 | `encryption` | string? | null | SS/VMess cipher or VLESS Encryption client string |
 | `vless_mode` | `WireMode` | `legacy` | `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, or `mux-cool` |
-| `plugin` / `plugin_opts` | string? | null | SIP002 plugin name/options (`plugin`, `plugin-opts`) |
+| `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, VLESS historically defaults on |
 | `sni` | string? | null | TLS server name from `sni`, or an unconsumed `host` query |

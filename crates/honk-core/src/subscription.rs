@@ -283,6 +283,21 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     let nodes = nodes
         .into_iter()
         .filter(|node| {
+            if node
+                .plugin
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || node
+                    .plugin_opts
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                tracing::warn!(
+                    node = %node.name,
+                    "skipping subscription node with unsupported proxy plugin"
+                );
+                return false;
+            }
             if seen.insert(node.id) {
                 true
             } else {
@@ -661,6 +676,22 @@ fn parse_clash_subscription(
             continue;
         };
         let name = get_str("name").unwrap_or_else(|| format!("{proxy_type}-{server}:{port}"));
+        let plugin_configured = ["plugin", "plugin-opts"].into_iter().any(|key| {
+            get_value(key).is_some_and(|value| match value {
+                serde_yaml::Value::Null => false,
+                serde_yaml::Value::String(value) => !value.trim().is_empty(),
+                serde_yaml::Value::Sequence(value) => !value.is_empty(),
+                serde_yaml::Value::Mapping(value) => !value.is_empty(),
+                _ => true,
+            })
+        });
+        if plugin_configured {
+            tracing::warn!(
+                node = %name,
+                "skipping Clash node with unsupported proxy plugin"
+            );
+            continue;
+        }
         let address = format!("{server}:{port}");
         let mut node = Node {
             name,
@@ -682,8 +713,6 @@ fn parse_clash_subscription(
         } else {
             get_str("cipher")
         };
-        node.plugin = get_str("plugin");
-        node.plugin_opts = get_str("plugin-opts");
         if let Some(network) = get_str("network") {
             node.transport = network;
         }
@@ -907,6 +936,51 @@ mod tests {
 "#;
         let error = parse_subscription_content(&sub, yaml).unwrap_err();
         assert!(error.to_string().contains("duplicate endpoint identities"));
+    }
+
+    #[test]
+    fn test_parse_subscription_skips_proxy_plugins() {
+        let clash = Subscription {
+            sub_type: SubscriptionType::Clash,
+            ..Default::default()
+        };
+        let clash_nodes = parse_subscription_content(
+            &clash,
+            r#"proxies:
+  - name: obfs
+    type: ss
+    server: ss.example
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    plugin: obfs
+    plugin-opts:
+      mode: http
+      host: mask.example
+  - name: plain
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+"#,
+        )
+        .unwrap();
+        assert_eq!(clash_nodes.len(), 1);
+        assert_eq!(clash_nodes[0].name, "plain");
+
+        let simple = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let simple_nodes = parse_subscription_content(
+            &simple,
+            concat!(
+                "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp#obfs\n",
+                "socks5://127.0.0.1:1080#plain"
+            ),
+        )
+        .unwrap();
+        assert_eq!(simple_nodes.len(), 1);
+        assert_eq!(simple_nodes[0].name, "plain");
     }
 
     #[test]
