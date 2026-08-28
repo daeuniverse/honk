@@ -1697,14 +1697,6 @@ impl TransportQuinnSocket {
         }
         tasks.clear();
     }
-
-    fn abort_tasks(&self) {
-        if let Ok(tasks) = self.tasks.try_lock() {
-            for task in tasks.iter() {
-                task.abort();
-            }
-        }
-    }
 }
 
 impl Drop for TransportQuinnSocket {
@@ -1892,22 +1884,15 @@ impl PacketTransportEndpoint {
     }
 
     /// Close the Quinn endpoint and wait up to `timeout` for it to drain.
-    /// A zero timeout aborts the adapter workers without waiting; other closes
-    /// abort and join them. Repeated and cancelled closes are safe.
+    /// A zero timeout leaves the adapter workers alive until Quinn releases
+    /// the socket; other closes abort and join them.
     pub async fn close(&self, timeout: Duration) {
         self.endpoint.close(VarInt::from_u32(0), b"shutdown");
         if timeout.is_zero() {
-            self.socket.abort_tasks();
             return;
         }
         let _ = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
         self.socket.close_tasks().await;
-    }
-}
-
-impl Drop for PacketTransportEndpoint {
-    fn drop(&mut self) {
-        self.socket.abort_tasks();
     }
 }
 
@@ -2163,6 +2148,38 @@ mod probe_tests {
         .unwrap()
         .unwrap_err();
         assert_eq!(recv_error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_close_does_not_surface_adapter_error() {
+        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let endpoint = packet_transport_endpoint(
+            Arc::new(AdmissionPacketTransport {
+                confirmed: AtomicUsize::new(0),
+                ordinary: AtomicUsize::new(0),
+                ordinary_sent: tokio::sync::Notify::new(),
+            }),
+            remote,
+        )
+        .unwrap();
+
+        endpoint.close(Duration::ZERO).await;
+        tokio::task::yield_now().await;
+
+        let mut data = [0; 1];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+        let receive = tokio::time::timeout(
+            Duration::from_millis(10),
+            std::future::poll_fn(|cx| {
+                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
+                quinn::AsyncUdpSocket::poll_recv(&*endpoint.socket, cx, &mut bufs, &mut meta)
+            }),
+        )
+        .await;
+        assert!(
+            receive.is_err(),
+            "graceful close surfaced an adapter I/O error"
+        );
     }
 
     #[tokio::test]
