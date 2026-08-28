@@ -167,7 +167,7 @@ On `SIGHUP`, subscription IDs are stabilized by URL and active subscription node
 
 ## Clash API and cache DB
 
-The optional Clash-compatible axum server is a userspace view and mutation surface over the current config, group manager, mode/flags handle, connection tracker, DNS service, statistics, and outbound runtime pointer; endpoint details are in the [API reference](../reference/api.md). The optional SQLite `cachedb` is opened before datapath admission and persists Selector choices, Clash mode, and optionally DNS answers. Relative paths prefer `global.data_dir` while retaining an existing legacy config-relative database during cutover. Configuration and persistence semantics are in the [experimental reference](../reference/experimental.md).
+The optional Clash-compatible axum server is a userspace view and mutation surface over the current config, group manager, mode/flags handle, connection tracker, DNS service, statistics, and outbound runtime pointer; endpoint details are in the [API reference](../reference/api.md). Connection metadata is enabled when the API binds successfully or when any configured group uses `interrupt_connections`, so selection-change interruption works without the API. The optional SQLite `cachedb` is opened before datapath admission and persists Selector choices, Clash mode, and optionally DNS answers. Relative paths prefer `global.data_dir` while retaining an existing legacy config-relative database during cutover. Configuration and persistence semantics are in the [experimental reference](../reference/experimental.md).
 
 ## Related docs
 

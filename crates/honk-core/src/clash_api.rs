@@ -199,10 +199,11 @@ pub async fn serve(state: Arc<ClashState>, listen: std::net::SocketAddr) {
     let Some(listener) = bind_listener(listen, &state.connection_tracker).await else {
         return;
     };
-    let app = router(state);
+    let app = router(state.clone());
     tracing::info!("clash API listening on http://{listen}");
     if let Err(error) = axum::serve(listener, app).await {
         tracing::error!("clash API server error: {}", error);
+        state.connection_tracker.disable_api();
     }
 }
 

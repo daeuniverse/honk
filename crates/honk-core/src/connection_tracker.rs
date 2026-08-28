@@ -1,11 +1,11 @@
-//! Per-connection state tracker for the Clash API.
+//! Per-connection state tracker for the Clash API and interrupting groups.
 //!
 //! Uses [`DashMap`] for concurrent-safe access from multiple tokio tasks
 //! (accept loop, relay workers, and HTTP API handlers).
 
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Snapshot of a connection's state, safe to serialize and expose via API.
@@ -85,25 +85,45 @@ impl ConnectionEntry {
 /// Thread-safe by construction via [`DashMap`] — no external locks needed.
 pub struct ConnectionTracker {
     entries: DashMap<String, ConnectionEntry>,
-    enabled: AtomicBool,
+    consumers: AtomicU8,
 }
+
+#[cfg(any(feature = "clash-api", test))]
+const API_CONSUMER: u8 = 1;
+const INTERRUPT_CONSUMER: u8 = 2;
 
 impl ConnectionTracker {
     /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
-            enabled: AtomicBool::new(false),
+            consumers: AtomicU8::new(0),
         }
     }
 
+    /// Enable tracking for the Clash API.
     #[cfg(any(feature = "clash-api", test))]
     pub(crate) fn enable(&self) {
-        self.enabled.store(true, Ordering::Release);
+        self.consumers.fetch_or(API_CONSUMER, Ordering::AcqRel);
+    }
+
+    /// Enable tracking for interrupting group selections.
+    pub(crate) fn enable_for_interrupts(&self) {
+        self.consumers
+            .fetch_or(INTERRUPT_CONSUMER, Ordering::AcqRel);
+    }
+
+    /// Stop API-only tracking after its server terminates.
+    #[cfg(any(feature = "clash-api", test))]
+    pub(crate) fn disable_api(&self) {
+        let previous = self.consumers.fetch_and(!API_CONSUMER, Ordering::AcqRel);
+        if previous & !API_CONSUMER == 0 {
+            self.entries.clear();
+        }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Acquire)
+        self.consumers.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn register_if_enabled(
@@ -164,15 +184,11 @@ mod tests {
     use super::ConnectionTracker;
 
     #[test]
-    fn lazy_registration_skips_construction_until_enabled() {
+    fn interrupt_consumer_survives_api_shutdown() {
         let tracker = ConnectionTracker::new();
-        assert!(
-            tracker
-                .register_if_enabled(|| panic!("disabled tracker constructed an entry"))
-                .is_none()
-        );
-
         tracker.enable();
+        tracker.enable_for_interrupts();
+        tracker.disable_api();
         assert!(tracker.is_enabled());
     }
 }

@@ -3,6 +3,24 @@ use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 
+#[test]
+fn interrupting_groups_enable_tracking_without_the_clash_api() {
+    let groups = [Group {
+        interrupt_connections: true,
+        ..Default::default()
+    }];
+    let manager = GroupManager::new(&groups, &[]);
+    let manager_cell = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+        &groups,
+        &[],
+    ))));
+    let tracker = Arc::new(ConnectionTracker::new());
+
+    reload::install_interrupt_callback(&manager, &manager_cell, &tracker);
+
+    assert!(tracker.is_enabled());
+}
+
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
     let node = udp_test_node();
@@ -2528,6 +2546,107 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             .redirect_track_lookup(&redirect_key)?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_ebpf_direct_offload_skips_dial_and_balances_stats() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            ..Default::default()
+        },
+    )?;
+    let raw_tuples: [u8; 40] = bytes_of(&tuples).try_into().expect("40-byte tuple key");
+    backend.routing_handoffs.lock().insert(
+        raw_tuples,
+        RoutingHandoffEntry {
+            result: RoutingResult {
+                outbound: OutboundIndex::Direct as u8,
+                mark: DAE_BYPASS_MARK,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "direct".into();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(backend),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    let handle = plane.spawn_handle();
+    let task_handle = handle.clone();
+    let task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    task.await??;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    let mut stats = handle.stats.snapshot();
+    let direct = stats.remove("direct").expect("direct stats");
+    assert_eq!(direct.total_conns, 1);
+    assert_eq!(direct.active_conns, 0);
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    drop(client);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_overall_dial_timeout_aborts_started_candidate() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.global.connect_timeout_ms = 1;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: Arc::clone(&entered),
+            release,
+        },
+        1,
+    );
+    let client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let task_handle = handle.clone();
+    let task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    entered.notified().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    task.await??;
+
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    drop(client);
     Ok(())
 }
 

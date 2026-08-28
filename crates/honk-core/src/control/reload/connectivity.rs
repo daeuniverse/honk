@@ -166,6 +166,10 @@ pub(in crate::control) fn install_interrupt_callback(
     group_manager_cell: &SharedGroupManager,
     tracker: &Arc<ConnectionTracker>,
 ) {
+    if group_manager.has_interrupt_connections() {
+        tracker.enable_for_interrupts();
+    }
+
     let cell = group_manager_cell.clone();
     let tracker = tracker.clone();
     group_manager.set_interrupt_callback(Some(Arc::new(move |group_name: &str| {
