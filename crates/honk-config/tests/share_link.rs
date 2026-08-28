@@ -54,7 +54,7 @@ fn serialization_golden_node() -> Node {
 }
 
 #[test]
-fn test_node_serialization_bytes_match_legacy_flat_goldens() {
+fn test_node_serialization_bytes_match_flat_wire_goldens() {
     let node = serialization_golden_node();
     assert_eq!(
         serde_json::to_string_pretty(&node).unwrap().as_bytes(),
