@@ -84,7 +84,7 @@ socks5://user:password@127.0.0.1:1080#local
 vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 ```
 
-每个非注释行都由 `Node::from_share_link` 解析。不支持或格式错误的行会被跳过。若正文没有受支持的节点 URI，则拒绝整个正文。规范分享链接字段与协议见[节点参考](./nodes.md)。
+每个非注释行都由 `Node::from_share_link` 解析。不支持或格式错误的行会被跳过。honk 不执行代理插件，因此带有非空插件值的分享链接也会被跳过。若正文没有受支持的节点 URI，则拒绝整个正文。规范分享链接字段与协议见[节点参考](./nodes.md)。
 
 ### Clash YAML
 
@@ -101,7 +101,7 @@ Clash 正文必须包含顶层 `proxies` sequence。非 mapping 条目、缺少 
 | `username` | `username` | 可选 string。 |
 | `password` | `password` | 可选 string；VLESS 使用下文优先级。 |
 | `cipher` | `encryption` | 可选 string；VLESS 使用下文优先级。 |
-| `plugin`, `plugin-opts` | 同名字段 | 可选 string；mapping 类型的 `plugin-opts` 不会导入。 |
+| `plugin`, `plugin-opts` | — | 不支持；任一字段具有非空值时，条目会在发布节点前被跳过，mapping 类型的 options 也会被拒绝。 |
 | `network` | `transport` | 可选 transport string。 |
 | `tls` | `tls` | 可选 bool。 |
 | `servername`, `sni` | `sni` | `servername` 优先，`sni` 作为回退。 |

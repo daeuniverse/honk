@@ -84,7 +84,7 @@ socks5://user:password@127.0.0.1:1080#local
 vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 ```
 
-Each non-comment line is parsed by `Node::from_share_link`. Unsupported or malformed lines are skipped. The body is rejected when it contains no supported node URI. See the [node reference](./nodes.md) for canonical share-link fields and protocols.
+Each non-comment line is parsed by `Node::from_share_link`. Unsupported or malformed lines are skipped. Share links with a non-empty proxy plugin are also skipped because honk does not execute plugins. The body is rejected when it contains no supported node URI. See the [node reference](./nodes.md) for canonical share-link fields and protocols.
 
 ### Clash YAML
 
@@ -101,7 +101,7 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `username` | `username` | Optional string. |
 | `password` | `password` | Optional string; VLESS applies the precedence below. |
 | `cipher` | `encryption` | Optional string; VLESS applies the precedence below. |
-| `plugin`, `plugin-opts` | same names | Optional strings; mapping-valued `plugin-opts` is not imported. |
+| `plugin`, `plugin-opts` | — | Unsupported. An entry with either non-empty value is skipped before node publication; mapping-valued options are rejected too. |
 | `network` | `transport` | Optional transport string. |
 | `tls` | `tls` | Optional boolean. |
 | `servername`, `sni` | `sni` | `servername` wins; `sni` is the fallback. |
