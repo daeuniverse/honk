@@ -10,8 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
+use honk_config::node::{Node, OutboundConfig, VlessConfig};
 use honk_outbound::proxy::TcpOutbound;
 use honk_outbound::proxy::vless::VLessHandler;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,13 +92,14 @@ async fn spawn_server(wire: Arc<Vec<u8>>) -> SocketAddr {
 fn benchmark_node(server: SocketAddr) -> Node {
     Node {
         name: "vless-vision-benchmark".into(),
-        protocol: NodeProtocol::VLess,
+        outbound: OutboundConfig::Vless(VlessConfig {
+            uuid: Some(UUID_TEXT.into()),
+            flow: Some("xtls-rprx-vision".into()),
+            ..Default::default()
+        }),
         address: server.to_string(),
         host: server.ip().to_string(),
         port: server.port(),
-        password: Some(UUID_TEXT.into()),
-        transport: "tcp".into(),
-        flow: Some("xtls-rprx-vision".into()),
         ..Default::default()
     }
 }

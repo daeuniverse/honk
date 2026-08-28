@@ -460,7 +460,7 @@ fn build_group_proxy_info(
 fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json::Value {
     let mut info = serde_json::json!({
         "name": node.name,
-        "type": clash_protocol_type(node.protocol),
+        "type": clash_protocol_type(node.protocol()),
         "udp": true,
         "history": [],
     });
@@ -665,7 +665,7 @@ async fn get_proxy_delay(
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
         drop(config);
-        let Some(entry) = s.proxy_registry.find(node.protocol) else {
+        let Some(entry) = s.proxy_registry.find(node.protocol()) else {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no handler for the node protocol",

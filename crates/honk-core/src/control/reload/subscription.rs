@@ -77,7 +77,9 @@ mod tests {
     fn subscription_node(subscription_id: uuid::Uuid) -> Node {
         let mut node = Node {
             name: "node".into(),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
             address: "127.0.0.1:1080".into(),
             subscription_id: Some(subscription_id),
             ..Default::default()

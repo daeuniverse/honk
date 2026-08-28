@@ -587,7 +587,7 @@ pub trait ProbeableOutbound: Send + Sync {
             Err(e) => {
                 tracing::debug!(
                     "{} connectivity test failed for {}: {}",
-                    node.protocol.as_str(),
+                    node.protocol().as_str(),
                     node.name,
                     e
                 );
@@ -640,7 +640,7 @@ impl ProtocolEntry {
     fn validate_consistency(&self) {
         let protocol = self.descriptor.protocol;
         let default_node = Node {
-            protocol,
+            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
             ..Default::default()
         };
         if (self.descriptor.supports_udp)(&default_node) && self.packet.is_none() {
@@ -770,14 +770,15 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        let protocol = node.protocol();
         let entry = self
-            .find(node.protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
 
         tracing::debug!(
             "Dialing {}:{} via {} ({})",
             target,
-            node.protocol.as_str(),
+            protocol.as_str(),
             node.name,
             node.host()
         );
@@ -806,9 +807,10 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let entry = self.find(runtime.node.protocol).ok_or_else(|| {
-            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-        })?;
+        let protocol = runtime.node.protocol();
+        let entry = self
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
         let stream = generation
             .scope_dials(
                 entry
@@ -835,9 +837,10 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let entry = self.find(runtime.node.protocol).ok_or_else(|| {
-            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-        })?;
+        let protocol = runtime.node.protocol();
+        let entry = self
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
         if entry.descriptor.generation_runtime(&runtime.node)
             == crate::runtime::GenerationRuntime::None
         {
@@ -910,14 +913,15 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let protocol = node.protocol();
         let entry = self
-            .find(node.protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
-        if node.protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
-            anyhow::bail!("UDP not supported for protocol {}", node.protocol.as_str());
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+        if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
+            anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
         let packet = entry.packet.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("UDP not supported for protocol {}", node.protocol.as_str())
+            anyhow::anyhow!("UDP not supported for protocol {}", protocol.as_str())
         })?;
         packet
             .dial_udp_transport(node, target, target_domain, connect_timeout)
@@ -988,20 +992,15 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        if runtime.node.protocol != NodeProtocol::Block && !runtime.udp_capable {
-            anyhow::bail!(
-                "UDP not supported for protocol {}",
-                runtime.node.protocol.as_str()
-            );
+        let protocol = runtime.node.protocol();
+        if protocol != NodeProtocol::Block && !runtime.udp_capable {
+            anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
-        let entry = self.find(runtime.node.protocol).ok_or_else(|| {
-            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-        })?;
+        let entry = self
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
         let packet = entry.packet.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "UDP not supported for protocol {}",
-                runtime.node.protocol.as_str()
-            )
+            anyhow::anyhow!("UDP not supported for protocol {}", protocol.as_str())
         })?;
         Ok((runtime, packet))
     }
@@ -1086,7 +1085,7 @@ mod tests {
         for protocol in [NodeProtocol::VLess, NodeProtocol::VMess] {
             assert!(registry.find(protocol).is_none());
             let node = Node {
-                protocol,
+                outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
                 ..Default::default()
             };
             let err = registry
@@ -1129,7 +1128,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "legacy-vless".into(),
-            protocol: NodeProtocol::VLess,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::VLess),
             address: "127.0.0.1:9".into(),
             ..Default::default()
         };
@@ -1165,7 +1164,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "block".into(),
-            protocol: NodeProtocol::Block,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
             ..Default::default()
         };
         let target: SocketAddr = "10.0.0.1:80".parse().unwrap();
@@ -1240,15 +1239,17 @@ mod tests {
             nodes.push(Node {
                 id: uuid::Uuid::new_v4(),
                 name: name.into(),
-                protocol,
+                outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
                 ..Default::default()
             });
         }
         nodes.push(Node {
             id: uuid::Uuid::new_v4(),
             name: "tcp-only-anytls".into(),
-            protocol: NodeProtocol::AnyTLS,
-            network: Some("tcp".into()),
+            outbound: honk_config::node::OutboundConfig::AnyTls(honk_config::node::AnyTlsConfig {
+                network: Some("tcp".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let generation = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
@@ -1302,7 +1303,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "cancelled-anytls".into(),
-            protocol: NodeProtocol::AnyTLS,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
             ..Default::default()
         };
         let generation = Arc::new(
@@ -1363,7 +1364,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "failing-anytls".into(),
-            protocol: NodeProtocol::AnyTLS,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
             ..Default::default()
         };
         let generation = Arc::new(
@@ -1408,7 +1409,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "old-anytls".into(),
-            protocol: NodeProtocol::AnyTLS,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
             ..Default::default()
         };
         let generation = Arc::new(
@@ -1430,7 +1431,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "direct".into(),
-            protocol: NodeProtocol::Direct,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Direct),
             ..Default::default()
         };
         let generation = Arc::new(

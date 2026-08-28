@@ -27,21 +27,13 @@ use crate::types::{NodeProtocol, parse_duration_secs};
 
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
-    ///
-    /// A link may describe a chain (`a -> b`); only the first hop is parsed.
+    /// A chain describes several hops; only the first is parsed.
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
         let first = link.split("->").next().unwrap_or("").trim();
-
-        // vmess:// carries a base64-encoded payload in place of a
-        // URL-shaped authority, so it is decoded before the generic path.
         if let Some(payload) = first.strip_prefix("vmess://") {
             return parse_vmess_link(payload);
         }
 
-        // SIP002 also allows the whole authority to be base64-encoded
-        // (`ss://base64(method:password@host:port)#name`). Decode that form
-        // up front: the URL parser would otherwise treat (and lowercase) the
-        // payload as a host name.
         let decoded_ss;
         let first = match first.strip_prefix("ss://") {
             Some(rest) => match decode_full_base64_ss_link(rest) {
@@ -53,11 +45,9 @@ impl Node {
             },
             None => first,
         };
-
         let url = url::Url::parse(first)
             .map_err(|_| ConfigError::Parse("invalid share link syntax".into()))?;
         let scheme = url.scheme();
-
         let protocol = match scheme {
             "socks5" | "socks4" | "socks4a" => NodeProtocol::Socks5,
             "ss" => NodeProtocol::SS,
@@ -70,52 +60,68 @@ impl Node {
             "juicity" => NodeProtocol::Juicity,
             _ => return Err(ConfigError::UnknownProtocol(scheme.to_string())),
         };
-
         let host = url
             .host_str()
             .ok_or_else(|| ConfigError::Parse("missing host in share link".into()))?
             .to_string();
         let port = url.port().unwrap_or(443);
-
+        let outbound = match protocol {
+            NodeProtocol::SS => crate::node::OutboundConfig::Shadowsocks(Default::default()),
+            NodeProtocol::Trojan => crate::node::OutboundConfig::Trojan(Default::default()),
+            NodeProtocol::VMess => crate::node::OutboundConfig::Vmess(Default::default()),
+            NodeProtocol::VLess => crate::node::OutboundConfig::Vless(Default::default()),
+            NodeProtocol::Socks5 => crate::node::OutboundConfig::Socks5(Default::default()),
+            NodeProtocol::Hysteria2 => crate::node::OutboundConfig::Hysteria2(Default::default()),
+            NodeProtocol::Tuic => crate::node::OutboundConfig::Tuic(Default::default()),
+            NodeProtocol::Juicity => crate::node::OutboundConfig::Juicity(Default::default()),
+            NodeProtocol::AnyTLS => crate::node::OutboundConfig::AnyTls(Default::default()),
+            NodeProtocol::Direct | NodeProtocol::Block => unreachable!(),
+        };
         let mut node = Node {
-            protocol,
             host: host.clone(),
             address: format!("{}:{}", host, port),
             port,
+            outbound,
             ..Default::default()
         };
 
-        if protocol == NodeProtocol::SS {
-            apply_ss_userinfo(&mut node, &url);
+        if let Some(config) = node.shadowsocks_mut() {
+            apply_ss_userinfo(config, &url);
         } else {
-            // The `url` crate returns userinfo still percent-encoded
-            // (`d2d53752%2D0985...`). Decode it so auth secrets match what
-            // the server expects — an encoded UUID otherwise hashes to a
-            // completely different AnyTLS/Trojan credential.
-            if !url.username().is_empty() {
-                node.username = Some(percent_decode_str(url.username()));
-            }
-            if let Some(pw) = url.password() {
-                node.password = Some(percent_decode_str(pw));
-            }
-
-            // Trojan, AnyTLS and VLess put the authentication secret (UUID
-            // for VLess) in the URI userinfo field, not the password field.
-            // Copy it to `password` so the protocol handler can build the
-            // correct request header.
-            if matches!(
-                protocol,
-                NodeProtocol::Trojan | NodeProtocol::AnyTLS | NodeProtocol::VLess
-            ) && node.password.is_none()
-                && !url.username().is_empty()
-            {
-                node.password = Some(percent_decode_str(url.username()));
+            let username = (!url.username().is_empty()).then(|| percent_decode_str(url.username()));
+            let password = url.password().map(percent_decode_str);
+            match &mut node.outbound {
+                crate::node::OutboundConfig::Socks5(config) => {
+                    config.username = username;
+                    config.password = password;
+                }
+                crate::node::OutboundConfig::Trojan(config) => {
+                    config.password = password.or(username);
+                }
+                crate::node::OutboundConfig::Vless(config) => {
+                    config.uuid = password.or(username);
+                }
+                crate::node::OutboundConfig::Hysteria2(config) => {
+                    config.auth = username.or(password);
+                }
+                crate::node::OutboundConfig::Tuic(config) => {
+                    config.uuid = username;
+                    config.password = password;
+                }
+                crate::node::OutboundConfig::Juicity(config) => {
+                    config.uuid = username;
+                    config.password = password;
+                }
+                crate::node::OutboundConfig::AnyTls(config) => {
+                    config.password = password.or(username);
+                }
+                crate::node::OutboundConfig::Vmess(_)
+                | crate::node::OutboundConfig::Shadowsocks(_)
+                | crate::node::OutboundConfig::Direct
+                | crate::node::OutboundConfig::Block => {}
             }
         }
 
-        // Use the URL fragment (#name) as the display name if present.
-        // Otherwise fall back to `scheme-host` — never the raw URI, which
-        // would leak the credentials into node lists and dashboards.
         node.name = url
             .fragment()
             .map(percent_decode_str)
@@ -147,278 +153,240 @@ impl Node {
             ));
         }
 
-        match protocol {
-            NodeProtocol::Trojan | NodeProtocol::AnyTLS => {
-                node.tls = true;
-            }
-            // An explicit `security` overrides the historical vless default
-            // of TLS-on; a missing parameter keeps it so existing links
-            // parse unchanged.
-            NodeProtocol::VLess | NodeProtocol::VMess => {
-                node.tls = match query.get("security").map(String::as_str) {
-                    Some("none") => false,
-                    Some(_) => true,
-                    None => protocol == NodeProtocol::VLess,
-                };
-            }
-            _ => {}
-        }
-
-        // Transport selection comes first so that transport-specific
-        // parameters (ws path/host, grpc service name) can be interpreted.
-        if let Some(v) = query.get("type").or_else(|| query.get("network")) {
-            node.transport = v.clone();
-        }
-        if let Some(v) = query.get("sni") {
-            node.sni = Some(v.clone());
-        }
-
-        // Trojan and VLess transport options.  `alpn` is accepted for
-        // compatibility but intentionally not stored.
-        let mut host_consumed = false;
-        if matches!(protocol, NodeProtocol::Trojan | NodeProtocol::VLess) {
-            match node.transport.as_str() {
-                "ws" => {
-                    if let Some(v) = query.get("host") {
-                        node.ws_host = Some(v.clone());
-                        host_consumed = true;
-                    }
-                    if let Some(v) = query.get("path") {
-                        node.ws_path = Some(v.clone());
+        if let Some(tls) = node.tls_mut() {
+            tls.enabled = match protocol {
+                NodeProtocol::Trojan | NodeProtocol::AnyTLS => true,
+                NodeProtocol::VLess | NodeProtocol::VMess => {
+                    match query.get("security").map(String::as_str) {
+                        Some("none") => false,
+                        Some(_) => true,
+                        None => protocol == NodeProtocol::VLess,
                     }
                 }
+                _ => tls.enabled,
+            };
+            tls.sni = query.get("sni").cloned();
+            if let Some(value) = query
+                .get("allowInsecure")
+                .or_else(|| query.get("allow_insecure"))
+                .or_else(|| query.get("insecure"))
+            {
+                tls.skip_cert_verify = value == "1" || value.eq_ignore_ascii_case("true");
+            }
+            tls.pin_sha256 = query
+                .get("pinSHA256")
+                .or_else(|| query.get("pin_sha256"))
+                .cloned();
+            if let Some(value) = query.get("ech_config").or_else(|| query.get("echconfig")) {
+                tls.ech_enabled = true;
+                tls.ech_config = Some(value.clone());
+            } else if let Some(value) = query.get("ech") {
+                tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
+            }
+        }
+
+        if let Some(transport) = node.transport_mut() {
+            if let Some(value) = query.get("type").or_else(|| query.get("network")) {
+                transport.transport = value.clone();
+            }
+            let mut host_consumed = false;
+            match transport.transport.as_str() {
+                "ws" => {
+                    if let Some(value) = query.get("host") {
+                        transport.ws_host = Some(value.clone());
+                        host_consumed = true;
+                    }
+                    transport.ws_path = query.get("path").cloned();
+                }
                 "grpc" => {
-                    if let Some(v) = query
+                    transport.grpc_service = query
                         .get("serviceName")
                         .or_else(|| query.get("service_name"))
-                    {
-                        node.grpc_service = Some(v.clone());
-                    }
+                        .cloned();
                 }
                 _ => {}
             }
-        }
-
-        // `host=` falls back to the TLS SNI unless it was already consumed as
-        // a transport option above.
-        if node.sni.is_none()
-            && !host_consumed
-            && let Some(v) = query.get("host")
+            if !host_consumed
+                && node.tls().is_some_and(|tls| tls.sni.is_none())
+                && let Some(value) = query.get("host")
+                && let Some(tls) = node.tls_mut()
+            {
+                tls.sni = Some(value.clone());
+            }
+        } else if node.tls().is_some_and(|tls| tls.sni.is_none())
+            && let Some(value) = query.get("host")
+            && let Some(tls) = node.tls_mut()
         {
-            node.sni = Some(v.clone());
+            tls.sni = Some(value.clone());
         }
 
-        if let Some(v) = query
-            .get("allowInsecure")
-            .or_else(|| query.get("allow_insecure"))
-            .or_else(|| query.get("insecure"))
-        {
-            node.skip_cert_verify = v == "1" || v.eq_ignore_ascii_case("true");
-        }
-
-        // Certificate SHA-256 pin (`pinSHA256=<hex>`) — replaces PKI
-        // verification with a leaf-certificate fingerprint check.
-        if let Some(v) = query.get("pinSHA256").or_else(|| query.get("pin_sha256")) {
-            node.tls_pin_sha256 = Some(v.clone());
-        }
-
-        // ECH (Encrypted Client Hello): `ech_config=<base64 ECHConfigList>`
-        // enables real ECH with static keys; bare `ech=1` enables it without
-        // keys, triggering DNS HTTPS-RR discovery at connect time.
-        if let Some(v) = query.get("ech_config").or_else(|| query.get("echconfig")) {
-            node.ech_enabled = true;
-            node.ech_config = Some(v.clone());
-        } else if let Some(v) = query.get("ech") {
-            node.ech_enabled = v == "1" || v.eq_ignore_ascii_case("true");
-        }
-
-        if let Some(v) = query.get("plugin") {
-            // SIP002 packs the plugin as `name;opt=k;...` in a single
-            // parameter; other protocols pass the plugin name verbatim.
-            if protocol == NodeProtocol::SS {
-                if let Some((name, opts)) = v.split_once(';') {
-                    node.plugin = Some(name.to_string());
-                    if !opts.is_empty() {
-                        node.plugin_opts = Some(opts.to_string());
-                    }
-                } else {
-                    node.plugin = Some(v.clone());
+        if let Some(value) = query.get("plugin") {
+            let Some(config) = node.shadowsocks_mut() else {
+                return Err(ConfigError::Parse(
+                    "plugin parameters are valid only for Shadowsocks links".into(),
+                ));
+            };
+            if let Some((name, options)) = value.split_once(';') {
+                config.plugin = Some(name.to_string());
+                if !options.is_empty() {
+                    config.plugin_opts = Some(options.to_string());
                 }
             } else {
-                node.plugin = Some(v.clone());
+                config.plugin = Some(value.clone());
             }
         }
-        if let Some(v) = query
+        if let Some(value) = query
             .get("plugin-opts")
             .or_else(|| query.get("plugin_opts"))
         {
-            node.plugin_opts = Some(v.clone());
+            let Some(config) = node.shadowsocks_mut() else {
+                return Err(ConfigError::Parse(
+                    "plugin parameters are valid only for Shadowsocks links".into(),
+                ));
+            };
+            config.plugin_opts = Some(value.clone());
         }
 
-        if protocol == NodeProtocol::Hysteria2 {
-            // hy2 puts the auth secret bare in the userinfo
-            // (`hysteria2://password@host`); the handler reads `hy2_auth`
-            // first and falls back to `password`, so populate both.
-            if node.hy2_auth.is_none() {
-                node.hy2_auth = node.username.clone();
+        if let Some(config) = node.hysteria2_mut() {
+            if query.get("obfs").is_some_and(|value| value == "salamander") {
+                config.obfs = query
+                    .get("obfs-password")
+                    .filter(|value| !value.is_empty())
+                    .cloned();
             }
-            if node.password.is_none() {
-                node.password = node.username.clone();
-            }
-            // Salamander obfuscation: `obfs=salamander&obfs-password=...`.
-            if query.get("obfs").is_some_and(|v| v == "salamander")
-                && let Some(v) = query.get("obfs-password").filter(|s| !s.is_empty())
-            {
-                node.hy2_obfs = Some(v.clone());
-            }
-            // Brutal bandwidth hints (`upmbps`/`downmbps`).
-            if let Some(v) = query.get("upmbps") {
-                node.hy2_up_mbps = v.parse().ok();
-            }
-            if let Some(v) = query.get("downmbps") {
-                node.hy2_down_mbps = v.parse().ok();
-            }
-            // Port hopping (`mport=20000-30000` / `mport=p1,p2`, `mhop=secs`).
-            if let Some(v) = query.get("mport").filter(|s| !s.is_empty()) {
-                node.hy2_port_hopping = Some(v.clone());
-            }
-            if let Some(v) = query.get("mhop") {
-                node.hy2_hop_interval = v.parse().ok();
-            }
-            // QUIC flow-control / MTU knobs (hy2 client config parity).
-            if let Some(v) = query.get("initStreamReceiveWindow") {
-                node.hy2_init_stream_recv_window = v.parse().ok();
-            }
-            if let Some(v) = query.get("initConnReceiveWindow") {
-                node.hy2_init_conn_recv_window = v.parse().ok();
-            }
-            if let Some(v) = query.get("disablePathMTUDiscovery") {
-                node.hy2_disable_mtu_discovery = Some(v == "1" || v.eq_ignore_ascii_case("true"));
-            }
+            config.up_mbps = query.get("upmbps").and_then(|value| value.parse().ok());
+            config.down_mbps = query.get("downmbps").and_then(|value| value.parse().ok());
+            config.port_hopping = query
+                .get("mport")
+                .filter(|value| !value.is_empty())
+                .cloned();
+            config.hop_interval = query.get("mhop").and_then(|value| value.parse().ok());
+            config.init_stream_recv_window = query
+                .get("initStreamReceiveWindow")
+                .and_then(|value| value.parse().ok());
+            config.init_conn_recv_window = query
+                .get("initConnReceiveWindow")
+                .and_then(|value| value.parse().ok());
+            config.disable_mtu_discovery = query
+                .get("disablePathMTUDiscovery")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         }
 
-        // QUIC payload-size cap (`mtu=`, hy2/tuic/juicity): 1200..=65527,
-        // out-of-range values dropped at parse time (clamped downstream).
         if matches!(
             protocol,
             NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
-        ) && let Some(v) = query.get("mtu")
-            && let Ok(mtu) = v.parse::<u16>()
-            && (1200..=65527).contains(&mtu)
+        ) && let Some(mtu) = query
+            .get("mtu")
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|mtu| (1200..=65527).contains(mtu))
         {
-            node.quic_mtu = Some(mtu);
-        }
-
-        if protocol == NodeProtocol::Tuic {
-            // QUIC flow-control knobs (same spelling as the hy2 fields).
-            if let Some(v) = query.get("initStreamReceiveWindow") {
-                node.tuic_init_stream_recv_window = v.parse().ok();
-            }
-            if let Some(v) = query.get("initConnReceiveWindow") {
-                node.tuic_init_conn_recv_window = v.parse().ok();
-            }
-            if let Some(v) = query.get("congestion_control") {
-                let v = v.trim();
-                if !v.is_empty() {
-                    node.tuic_congestion = Some(v.to_string());
-                }
-            }
-            // ALPN override (e.g. `alpn=h3` for HTTP/3-camouflaged servers);
-            // comma-separated for multiple. Without this the handler would
-            // always offer `tuic` and the handshake is rejected.
-            if let Some(v) = query.get("alpn") {
-                let v = v.trim();
-                if !v.is_empty() {
-                    node.tuic_alpn = Some(v.to_string());
-                }
+            match &mut node.outbound {
+                crate::node::OutboundConfig::Hysteria2(config) => config.quic.mtu = Some(mtu),
+                crate::node::OutboundConfig::Tuic(config) => config.quic.mtu = Some(mtu),
+                crate::node::OutboundConfig::Juicity(config) => config.quic.mtu = Some(mtu),
+                _ => unreachable!(),
             }
         }
 
-        if protocol == NodeProtocol::AnyTLS {
-            // The AnyTLS secret doubles as the session-pool password.
-            node.anytls_password = node.password.clone();
-            if let Some(v) = query.get("idle_session_check_interval") {
-                node.anytls_idle_session_check_interval = parse_duration_secs(v);
-            }
-            if let Some(v) = query.get("idle_session_timeout") {
-                node.anytls_idle_session_timeout = parse_duration_secs(v);
-            }
-            if let Some(v) = query.get("min_idle_session") {
-                node.anytls_min_idle_session = v.parse::<u16>().ok().map(usize::from);
-            }
+        if let Some(config) = node.tuic_mut() {
+            config.init_stream_recv_window = query
+                .get("initStreamReceiveWindow")
+                .and_then(|value| value.parse().ok());
+            config.init_conn_recv_window = query
+                .get("initConnReceiveWindow")
+                .and_then(|value| value.parse().ok());
+            config.congestion = query
+                .get("congestion_control")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            config.alpn = query
+                .get("alpn")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
         }
 
-        if matches!(protocol, NodeProtocol::VLess | NodeProtocol::VMess) {
-            if protocol == NodeProtocol::VLess
-                && let Some(parameter) = [
-                    "mux",
-                    "smux",
-                    "multiplex",
-                    "udp-over-tcp",
-                    "udp_over_tcp",
-                    "packet-encoding",
-                    "packet_encoding",
-                    "packet-addr",
-                    "packet_addr",
-                    "xudp",
-                    "only-tcp",
-                    "only_tcp",
-                    "brutal",
-                    "brutal-opts",
-                    "brutal_opts",
-                    "max-connections",
-                    "max_connections",
-                    "min-streams",
-                    "min_streams",
-                    "max-streams",
-                    "max_streams",
-                ]
-                .into_iter()
-                .find(|parameter| query.contains_key(*parameter))
+        if let Some(config) = node.anytls_mut() {
+            config.idle_session_check_interval = query
+                .get("idle_session_check_interval")
+                .and_then(|value| parse_duration_secs(value));
+            config.idle_session_timeout = query
+                .get("idle_session_timeout")
+                .and_then(|value| parse_duration_secs(value));
+            config.min_idle_session = query
+                .get("min_idle_session")
+                .and_then(|value| value.parse::<u16>().ok())
+                .map(usize::from);
+        }
+
+        if let Some(config) = node.vless_mut() {
+            if let Some(parameter) = [
+                "mux",
+                "smux",
+                "multiplex",
+                "udp-over-tcp",
+                "udp_over_tcp",
+                "packet-encoding",
+                "packet_encoding",
+                "packet-addr",
+                "packet_addr",
+                "xudp",
+                "only-tcp",
+                "only_tcp",
+                "brutal",
+                "brutal-opts",
+                "brutal_opts",
+                "max-connections",
+                "max_connections",
+                "min-streams",
+                "min_streams",
+                "max-streams",
+                "max_streams",
+            ]
+            .into_iter()
+            .find(|parameter| query.contains_key(*parameter))
             {
                 return Err(ConfigError::Parse(format!(
                     "unsupported VLESS share-link parameter '{parameter}'; use vless_mode"
                 )));
             }
-            if protocol == NodeProtocol::VLess {
-                if let Some(mode) = query.get("vless_mode") {
-                    node.vless_mode = mode.parse()?;
-                } else if let Some(encoding) = query.get("packetEncoding") {
-                    // `none` is the explicit spelling of legacy plain VLESS.
-                    match encoding.as_str() {
-                        "xudp" => node.vless_mode = crate::node::WireMode::Xudp,
-                        "none" => {}
-                        _ => {
-                            return Err(ConfigError::Parse(
-                                "unsupported VLESS packetEncoding (expected xudp or none)".into(),
-                            ));
-                        }
+            if let Some(mode) = query.get("vless_mode") {
+                config.mode = mode.parse()?;
+            } else if let Some(encoding) = query.get("packetEncoding") {
+                match encoding.as_str() {
+                    "xudp" => config.mode = crate::node::WireMode::Xudp,
+                    "none" => {}
+                    _ => {
+                        return Err(ConfigError::Parse(
+                            "unsupported VLESS packetEncoding (expected xudp or none)".into(),
+                        ));
                     }
                 }
             }
-            // `security=reality` carries the REALITY handshake parameters.
-            if query.get("security").is_some_and(|v| v == "reality") {
-                node.tls = true;
-                node.reality_public_key = query.get("pbk").cloned();
-                node.reality_short_id = query.get("sid").cloned();
-                // `spx` defaults to `/` in the share-link convention.
-                node.reality_spider_x = Some(
+            if query
+                .get("security")
+                .is_some_and(|value| value == "reality")
+            {
+                config.tls.enabled = true;
+                config.tls.reality_public_key = query.get("pbk").cloned();
+                config.tls.reality_short_id = query.get("sid").cloned();
+                config.tls.reality_spider_x = Some(
                     query
                         .get("spx")
-                        .filter(|s| !s.is_empty())
+                        .filter(|value| !value.is_empty())
                         .cloned()
                         .unwrap_or_else(|| "/".to_string()),
                 );
             }
-            if let Some(v) = query.get("flow") {
-                node.flow = Some(v.clone());
-            }
-            if let Some(v) = query.get("encryption").filter(|v| !v.trim().is_empty()) {
-                node.encryption = Some(v.clone());
-            }
+            config.flow = query.get("flow").cloned();
+            config.encryption = query
+                .get("encryption")
+                .filter(|value| !value.trim().is_empty())
+                .cloned();
         }
 
-        node.validate_vless_mode()?;
+        node.validate_protocol()?;
         node.id = node.derive_id();
         Ok(node)
     }
@@ -487,42 +455,45 @@ impl VmessLinkJson {
 
         let transport = self.net.unwrap_or_default();
 
-        let mut node = Node {
-            protocol: NodeProtocol::VMess,
-            host: host.clone(),
-            address: format!("{}:{}", host, port),
-            port,
-            password: Some(id),
-            encryption: self.scy.or(self.security),
+        let mut stream = crate::node::StreamTransportOptions {
             transport: transport.clone(),
-            tls: self.tls.as_deref() == Some("tls"),
-            name: self.ps.unwrap_or_else(|| format!("vmess-{}", host)),
             ..Default::default()
         };
-        if !transport.is_empty() {
-            node.network = Some(transport.clone());
-        }
-
-        // `host` is the WS host header on ws links and the TLS SNI elsewhere;
-        // an explicit `sni` field wins over both.
-        if let Some(v) = self.host.filter(|s| !s.is_empty()) {
+        let mut tls = crate::node::TlsOptions {
+            enabled: self.tls.as_deref() == Some("tls"),
+            ..Default::default()
+        };
+        if let Some(value) = self.host.filter(|value| !value.is_empty()) {
             if transport == "ws" {
-                node.ws_host = Some(v);
+                stream.ws_host = Some(value);
             } else {
-                node.sni = Some(v);
+                tls.sni = Some(value);
             }
         }
-        if let Some(v) = self.sni.filter(|s| !s.is_empty()) {
-            node.sni = Some(v);
+        if let Some(value) = self.sni.filter(|value| !value.is_empty()) {
+            tls.sni = Some(value);
         }
-        if let Some(v) = self.path.filter(|s| !s.is_empty()) {
+        if let Some(value) = self.path.filter(|value| !value.is_empty()) {
             match transport.as_str() {
-                "ws" => node.ws_path = Some(v),
-                "grpc" => node.grpc_service = Some(v),
+                "ws" => stream.ws_path = Some(value),
+                "grpc" => stream.grpc_service = Some(value),
                 _ => {}
             }
         }
-
+        let mut node = Node {
+            host: host.clone(),
+            address: format!("{}:{}", host, port),
+            port,
+            name: self.ps.unwrap_or_else(|| format!("vmess-{}", host)),
+            outbound: crate::node::OutboundConfig::Vmess(crate::node::VmessConfig {
+                uuid: Some(id),
+                encryption: self.scy.or(self.security),
+                network: (!transport.is_empty()).then_some(transport),
+                transport: stream,
+                tls,
+            }),
+            ..Default::default()
+        };
         node.id = node.derive_id();
         Ok(node)
     }
@@ -543,7 +514,7 @@ fn json_port(value: Option<serde_json::Value>) -> Option<u16> {
 /// decoded method lands in `encryption` and the password in `password`.
 /// Note: the `url` crate percent-encodes `=` in userinfo, so the raw parts
 /// are percent-decoded before any base64 decoding happens.
-fn apply_ss_userinfo(node: &mut Node, url: &url::Url) {
+fn apply_ss_userinfo(config: &mut crate::node::ShadowsocksConfig, url: &url::Url) {
     let userinfo = match url.password() {
         Some(pw) => format!(
             "{}:{}",
@@ -558,12 +529,12 @@ fn apply_ss_userinfo(node: &mut Node, url: &url::Url) {
 
     match decode_ss_userinfo(&userinfo) {
         Some((method, password)) => {
-            node.encryption = Some(method);
-            node.password = Some(password);
+            config.encryption = Some(method);
+            config.password = Some(password);
         }
         None => {
             // Unrecognized userinfo: keep it as the password so nothing is lost.
-            node.password = Some(userinfo);
+            config.password = Some(userinfo);
         }
     }
 }

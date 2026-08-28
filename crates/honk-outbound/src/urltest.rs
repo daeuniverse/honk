@@ -126,7 +126,7 @@ async fn urltest_node_impl(
     } else {
         timeout
     };
-    if node.protocol == honk_config::types::NodeProtocol::Direct {
+    if node.protocol() == honk_config::types::NodeProtocol::Direct {
         let (host, port, is_https) = parse_url_host_port(url)?;
         let addr = {
             let hook = URLTEST_RESOLVER.read().clone();
@@ -372,7 +372,7 @@ async fn measure_head_exchange(
         };
         reporter_setup(&reporter);
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
-        if matches!(node.protocol, honk_config::types::NodeProtocol::Hysteria2) {
+        if matches!(node.protocol(), honk_config::types::NodeProtocol::Hysteria2) {
             start = Instant::now();
         }
         let stream = proxy.stream;
@@ -550,7 +550,7 @@ async fn urltest_group_impl(
         let group_manager = group_manager.clone();
         join_set.spawn(async move {
             let _permit = permit.acquire_owned().await;
-            let result = match registry.find(node.protocol) {
+            let result = match registry.find(node.protocol()) {
                 Some(entry) => {
                     urltest_node_in_generation_impl(
                         &generation,
@@ -563,7 +563,7 @@ async fn urltest_group_impl(
                     )
                     .await
                 }
-                None => Err(anyhow!("no handler for protocol {:?}", node.protocol)),
+                None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
             match &result {
                 Ok(latency) => alive_set.record_probe_latency(
@@ -763,7 +763,7 @@ mod tests {
         Node {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             ..Default::default()
         }
     }
@@ -814,9 +814,9 @@ mod tests {
 
     fn reusable_node(name: &str, protocol: NodeProtocol) -> Node {
         let mut node = make_node(name);
-        node.protocol = protocol;
-        if protocol == NodeProtocol::VLess {
-            node.vless_mode = honk_config::node::WireMode::H2mux;
+        node.outbound = honk_config::node::OutboundConfig::from_protocol(protocol);
+        if let Some(vless) = node.vless_mut() {
+            vless.mode = honk_config::node::WireMode::H2mux;
         }
         node
     }
@@ -1128,7 +1128,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "hysteria2".into(),
-            protocol: NodeProtocol::Hysteria2,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Hysteria2),
             ..Default::default()
         };
         let elapsed = urltest_node_addr(
@@ -1343,7 +1343,9 @@ mod direct_urltest_tests {
         });
         let node = Node {
             name: honk_config::Config::BUILTIN_DIRECT_NODE.to_string(),
-            protocol: honk_config::types::NodeProtocol::Direct,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Direct,
+            ),
             ..Default::default()
         };
         let handler = crate::proxy::direct::DirectHandler::new();

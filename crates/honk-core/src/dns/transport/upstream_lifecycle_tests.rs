@@ -107,7 +107,7 @@ async fn proxied_quic_transports_use_packet_outbound() {
     );
     let proxy = Node {
         name: "proxy".to_string(),
-        protocol: NodeProtocol::Block,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
         ..Default::default()
     };
     let upstreams = [
@@ -159,7 +159,7 @@ async fn proxied_quic_without_registry_fails_closed() {
     };
     let proxy = Node {
         name: "proxy".into(),
-        protocol: NodeProtocol::Block,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
         ..Default::default()
     };
     let router = Arc::new(

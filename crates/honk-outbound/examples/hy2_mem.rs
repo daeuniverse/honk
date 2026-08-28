@@ -43,15 +43,18 @@ async fn main() -> anyhow::Result<()> {
     let mut node = Node::from_share_link(&link)?;
     let sw = opt("stream_win_mib", 0);
     let cw = opt("conn_win_mib", 0);
+    let hy2 = node
+        .hysteria2_mut()
+        .ok_or_else(|| anyhow::anyhow!("share link is not Hysteria2"))?;
     if sw > 0 {
-        node.hy2_init_stream_recv_window = Some(sw << 20);
+        hy2.init_stream_recv_window = Some(sw << 20);
     }
     if cw > 0 {
-        node.hy2_init_conn_recv_window = Some(cw << 20);
+        hy2.init_conn_recv_window = Some(cw << 20);
     }
     let up = opt("up_mbps", 0);
     if up > 0 {
-        node.hy2_up_mbps = Some(up as u32);
+        hy2.up_mbps = Some(up as u32);
     }
     node.id = node.derive_id();
     // nodes=K:克隆 K 个节点,用不同 SNI 派生不同 Node.id,
@@ -61,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     for i in 1..n_nodes {
         let mut c = nodes[0].clone();
         c.name = format!("memtest-{i}");
-        c.sni = Some(format!("hy2-memtest-{i}"));
+        c.tls_mut().unwrap().sni = Some(format!("hy2-memtest-{i}"));
         c.id = c.derive_id();
         nodes.push(c);
     }

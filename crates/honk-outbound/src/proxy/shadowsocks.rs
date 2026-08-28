@@ -413,8 +413,9 @@ impl TcpOutbound for ShadowsocksHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = node.password.as_deref().unwrap_or("");
+        let config = node.shadowsocks().unwrap();
+        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = config.password.as_deref().unwrap_or("");
         // Validate the cipher/key material up front so dial fails fast.
         if is_2022_method(method) {
             Ss2022Method::new(method, password)?;
@@ -439,8 +440,9 @@ impl TcpOutbound for ShadowsocksHandler {
         server: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = node.password.as_deref().unwrap_or("");
+        let config = node.shadowsocks().unwrap();
+        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = config.password.as_deref().unwrap_or("");
         let header = addr::encode_address(target, target_domain);
         self.start_relay(method, password, server, header, target, target_domain)
             .await
@@ -479,8 +481,9 @@ impl ShadowsocksHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<(SsUdpCrypto, tokio::net::UdpSocket, Vec<u8>)> {
-        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = node.password.as_deref().unwrap_or("");
+        let config = node.shadowsocks().unwrap();
+        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = config.password.as_deref().unwrap_or("");
         let socks = addr::encode_address(target, target_domain);
 
         let crypto = if is_2022_method(method) {
@@ -980,8 +983,6 @@ mod tests {
     /// `dial_udp_transport`, payload exchange through the framed transport.
     #[tokio::test]
     async fn test_dial_udp_legacy_end_to_end() {
-        use honk_config::types::NodeProtocol;
-
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
@@ -999,12 +1000,15 @@ mod tests {
 
         let node = Node {
             name: "test-ss-udp".into(),
-            protocol: NodeProtocol::SS,
             address: server_addr.ip().to_string(),
-            host: String::new(),
             port: server_addr.port(),
-            encryption: Some("aes-128-gcm".to_string()),
-            password: Some("test-password".to_string()),
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(
+                honk_config::node::ShadowsocksConfig {
+                    encryption: Some("aes-128-gcm".into()),
+                    password: Some("test-password".into()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         let handler = ShadowsocksHandler::new();
@@ -1026,8 +1030,6 @@ mod tests {
     /// ways (chunk boundaries crossed many times).
     #[tokio::test]
     async fn test_dial_tcp_legacy_end_to_end() {
-        use honk_config::types::NodeProtocol;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1099,12 +1101,15 @@ mod tests {
 
         let node = Node {
             name: "test-ss-tcp".into(),
-            protocol: NodeProtocol::SS,
             address: server_addr.ip().to_string(),
-            host: String::new(),
             port: server_addr.port(),
-            encryption: Some("aes-128-gcm".to_string()),
-            password: Some("test-password".to_string()),
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(
+                honk_config::node::ShadowsocksConfig {
+                    encryption: Some("aes-128-gcm".into()),
+                    password: Some("test-password".into()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         let handler = ShadowsocksHandler::new();
@@ -1140,8 +1145,6 @@ mod tests {
     /// `dial_udp_transport` path (no loopback pair).
     #[tokio::test]
     async fn test_dial_udp_transport_legacy_end_to_end() {
-        use honk_config::types::NodeProtocol;
-
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
@@ -1159,12 +1162,15 @@ mod tests {
 
         let node = Node {
             name: "test-ss-udp".into(),
-            protocol: NodeProtocol::SS,
             address: server_addr.ip().to_string(),
-            host: String::new(),
             port: server_addr.port(),
-            encryption: Some("aes-128-gcm".to_string()),
-            password: Some("test-password".to_string()),
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(
+                honk_config::node::ShadowsocksConfig {
+                    encryption: Some("aes-128-gcm".into()),
+                    password: Some("test-password".into()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         let handler = ShadowsocksHandler::new();

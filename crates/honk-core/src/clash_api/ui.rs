@@ -254,7 +254,7 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     let Some(node) = nodes.into_iter().next() else {
         anyhow::bail!("external UI download: outbound '{outbound}' has no available node");
     };
-    let route = match node.protocol {
+    let route = match node.protocol() {
         NodeProtocol::Direct => UiRoute::Direct { feedback },
         NodeProtocol::Block => UiRoute::Block,
         _ => UiRoute::Proxy {
@@ -396,10 +396,11 @@ async fn fetch_proxied(
     path: &str,
     is_https: bool,
 ) -> anyhow::Result<ProxiedFetch> {
+    let protocol = node.protocol();
     let entry = ctx
         .proxy_registry
-        .find(node.protocol)
-        .ok_or_else(|| anyhow::anyhow!("no handler for protocol {:?}", node.protocol))?;
+        .find(protocol)
+        .ok_or_else(|| anyhow::anyhow!("no handler for protocol {:?}", protocol))?;
     let connect_timeout = Duration::from_millis(ctx.config.read().await.global.connect_timeout_ms);
     // Tunnel handlers dial by domain; the address is only a fallback for
     // handlers that need a numeric target.
@@ -992,7 +993,7 @@ mod tests {
 
         let mut node = Node {
             name: "mock".into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: "127.0.0.1".into(),
             port: 1,
             ..Default::default()
@@ -1035,7 +1036,7 @@ mod tests {
         let nodes = ["a", "b"].map(|name| {
             let mut node = Node {
                 name: name.into(),
-                protocol: NodeProtocol::Socks5,
+                outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
                 address: "127.0.0.1".into(),
                 port: 1,
                 ..Default::default()

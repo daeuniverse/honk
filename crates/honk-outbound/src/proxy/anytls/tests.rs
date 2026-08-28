@@ -275,23 +275,28 @@ async fn overflow_admit_hard_byte_cap_waits_inside_the_grace() {
     assert!(!overflow.has(1));
 }
 
-#[test]
-fn test_resolve_password_fallback() {
-    let mut node = Node {
-        name: "test".into(),
-        protocol: NodeProtocol::AnyTLS,
+fn anytls_node(name: &str) -> Node {
+    Node {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        outbound: honk_config::node::OutboundConfig::AnyTls(Default::default()),
         ..Default::default()
-    };
+    }
+}
+
+fn zero_idle_anytls_node(name: &str) -> Node {
+    let mut node = anytls_node(name);
+    node.anytls_mut().unwrap().min_idle_session = Some(0);
+    node
+}
+
+#[test]
+fn test_resolve_password() {
+    let mut node = anytls_node("test");
     assert_eq!(AnyTlsHandler::resolve_password(&node), "");
 
-    node.anytls_password = Some("anytls-secret".into());
+    node.anytls_mut().unwrap().password = Some("anytls-secret".into());
     assert_eq!(AnyTlsHandler::resolve_password(&node), "anytls-secret");
-
-    node.password = Some("generic-secret".into());
-    assert_eq!(AnyTlsHandler::resolve_password(&node), "generic-secret");
-
-    node.anytls_password = None;
-    assert_eq!(AnyTlsHandler::resolve_password(&node), "generic-secret");
 }
 
 #[tokio::test]
@@ -305,15 +310,18 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
         std::future::pending::<()>().await;
     });
     let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "stalled-tls".into(),
-        protocol: NodeProtocol::AnyTLS,
         address: address.clone(),
         host: socket_addr.ip().to_string(),
         port: socket_addr.port(),
-        sni: Some("localhost".into()),
-        skip_cert_verify: true,
-        ..Default::default()
+        outbound: honk_config::node::OutboundConfig::AnyTls(honk_config::node::AnyTlsConfig {
+            tls: honk_config::node::TlsOptions {
+                sni: Some("localhost".into()),
+                skip_cert_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..anytls_node("stalled-tls")
     };
 
     // When: a pool-owned physical AnyTLS session dial reaches that server.
@@ -451,7 +459,7 @@ async fn runtime_udp_pool_hit_does_not_build_connector() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "runtime-udp-hit".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -496,7 +504,7 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "guard-abort".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -532,7 +540,7 @@ async fn ephemeral_runtime_close_releases_session_and_connection() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "ephemeral-probe".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -579,7 +587,7 @@ async fn warm_resources_flip_with_pool_session() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "warm-resources".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -610,7 +618,7 @@ async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
     let old_node = Node {
         id: uuid::Uuid::new_v4(),
         name: "generation-node".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -660,7 +668,7 @@ async fn runtime_retirement_drains_live_session_without_cutting_it() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "retiring-anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         ..Default::default()
     };
     let generation =
@@ -2236,13 +2244,7 @@ async fn remote_fin_drop_does_not_enqueue_a_second_fin() {
 
 #[tokio::test]
 async fn warm_uses_only_its_generation_owned_runtime_pool() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "warm-anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("warm-anytls");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
     );
@@ -2273,13 +2275,7 @@ async fn warm_uses_only_its_generation_owned_runtime_pool() {
 
 #[tokio::test]
 async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "shutdown-warm-anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("shutdown-warm-anytls");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
     );
@@ -2334,13 +2330,7 @@ async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
 #[tokio::test]
 async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
     let handler = AnyTlsHandler::new();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-shared".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-shared");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let (session, _server) = establish_test_session("speculative-shared").await;
     pool.insert(&session);
@@ -2371,13 +2361,7 @@ async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
 #[tokio::test]
 async fn speculative_detached_winner_commits_into_captured_pool_once() {
     let handler = AnyTlsHandler::new();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-detached-commit".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-detached-commit");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let (session, _server) = establish_test_session("speculative-detached-commit").await;
     let prepared = handler
@@ -2406,14 +2390,8 @@ async fn speculative_detached_winner_commits_into_captured_pool_once() {
 
 #[tokio::test]
 async fn speculative_commit_binds_initial_generation_admission() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-initial-admission".into(),
-        protocol: NodeProtocol::AnyTLS,
-        address: "127.0.0.1:443".into(),
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let mut node = zero_idle_anytls_node("speculative-initial-admission");
+    node.address = "127.0.0.1:443".into();
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build_reusing(
             std::slice::from_ref(&node),
@@ -2453,13 +2431,7 @@ async fn speculative_commit_binds_initial_generation_admission() {
 #[tokio::test]
 async fn speculative_detached_commit_fails_closed_after_generation_shutdown() {
     let handler = AnyTlsHandler::new();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-detached-shutdown".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-detached-shutdown");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let (session, _server) = establish_test_session("speculative-detached-shutdown").await;
     let prepared = handler
@@ -2494,13 +2466,7 @@ impl Drop for CancelledDial {
 #[tokio::test]
 async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
     let handler = Arc::new(AnyTlsHandler::new());
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-abort".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-abort");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2555,13 +2521,7 @@ async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
 #[tokio::test]
 async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
     let handler = Arc::new(AnyTlsHandler::new());
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-shutdown".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-shutdown");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));

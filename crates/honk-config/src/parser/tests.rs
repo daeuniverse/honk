@@ -270,9 +270,15 @@ node {
         .unwrap();
         assert_eq!(config.nodes.len(), 2);
         assert_eq!(config.nodes[0].name, "xudp");
-        assert_eq!(config.nodes[0].vless_mode, crate::node::WireMode::Xudp);
+        assert_eq!(
+            config.nodes[0].vless().unwrap().mode,
+            crate::node::WireMode::Xudp
+        );
         assert_eq!(config.nodes[1].name, "cool");
-        assert_eq!(config.nodes[1].vless_mode, crate::node::WireMode::MuxCool);
+        assert_eq!(
+            config.nodes[1].vless().unwrap().mode,
+            crate::node::WireMode::MuxCool
+        );
     }
 
     #[test]
@@ -618,16 +624,20 @@ node {
         let node = &config.nodes[0];
         // Named node key is the config name; URL fragment is not the name.
         assert_eq!(node.name, "test_node");
-        assert!(matches!(node.protocol, crate::types::NodeProtocol::AnyTLS));
+        assert!(matches!(
+            node.protocol(),
+            crate::types::NodeProtocol::AnyTLS
+        ));
         assert_eq!(node.host, "example.com");
         assert_eq!(node.port, 443);
+        let anytls = node.anytls().unwrap();
         assert_eq!(
-            node.password.as_deref(),
+            anytls.password.as_deref(),
             Some("00000000-0000-0000-0000-000000000000")
         );
-        assert!(node.tls);
-        assert_eq!(node.sni.as_deref(), Some("example.com"));
-        assert!(node.skip_cert_verify);
+        assert!(anytls.tls.enabled);
+        assert_eq!(anytls.tls.sni.as_deref(), Some("example.com"));
+        assert!(anytls.tls.skip_cert_verify);
     }
 
     #[test]

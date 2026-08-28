@@ -939,7 +939,7 @@ mod tests {
 
         let node = Node {
             name: "test".into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: server_addr.ip().to_string(),
             host: String::new(),
             port: server_addr.port(),

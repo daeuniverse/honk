@@ -453,7 +453,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     });
     let mut registry = ProxyRegistry::new();
     registry.register(
-        honk_outbound::proxy::ProtocolEntry::new(node.protocol, handler.clone())
+        honk_outbound::proxy::ProtocolEntry::new(node.protocol(), handler.clone())
             .with_packet(handler),
     );
     let runtime = Arc::new(parking_lot::RwLock::new(Arc::new(
@@ -2040,7 +2040,9 @@ async fn tcp_local_resolution_uses_client_source() -> anyhow::Result<()> {
     let original_dst = SocketAddr::new("127.0.0.1".parse()?, listener.local_addr()?.port());
     let mut node = Node {
         name: "local-resolve".into(),
-        protocol: honk_config::types::NodeProtocol::VMess,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::VMess,
+        ),
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()
@@ -2656,7 +2658,9 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
 
     let mut hk = Node {
         name: "hk-140".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 140,
         ..Default::default()
@@ -2664,7 +2668,9 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
     hk.id = hk.derive_id();
     let mut us = Node {
         name: "us-163".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 163,
         ..Default::default()
@@ -2764,7 +2770,9 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
 async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
     let mut tcp_node = Node {
         name: "tcp-node".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 140,
         ..Default::default()
@@ -2772,7 +2780,9 @@ async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
     tcp_node.id = tcp_node.derive_id();
     let mut udp_node = Node {
         name: "udp-node".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 163,
         ..Default::default()
@@ -2874,7 +2884,9 @@ fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>)
 fn udp_test_node() -> Node {
     let mut node = Node {
         name: "udp-test".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()
@@ -3099,7 +3111,9 @@ async fn udp_first_send_failure_does_not_replay_to_another_candidate() {
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test-second".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -3327,7 +3341,9 @@ async fn udp_authoritative_selection_stops_after_single_candidate_dial_failure()
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test-second".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -3370,7 +3386,9 @@ async fn udp_production_death_during_unbound_preparation_prevents_send() {
     let unrelated = Node {
         id: uuid::Uuid::new_v4(),
         name: "health-registered-other".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -4554,8 +4572,8 @@ fn preconnect_test_node(name: &str, protocol: NodeProtocol) -> Node {
     Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol,
         address: format!("{name}.example.com:443"),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         ..Default::default()
     }
 }
@@ -5584,7 +5602,9 @@ async fn tcp_authoritative_dial_failure_retries_with_replacement() -> anyhow::Re
     let socks_node = |name: &str, port: u16| {
         let mut node = Node {
             name: name.into(),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
             address: "127.0.0.1".into(),
             port,
             ..Default::default()

@@ -297,7 +297,7 @@ fn parse_lines(content: &str) -> anyhow::Result<Vec<Node>> {
 fn print_summary_header(nodes: &[Node]) {
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     for n in nodes {
-        *counts.entry(n.protocol.as_str().to_string()).or_default() += 1;
+        *counts.entry(n.protocol().as_str().to_string()).or_default() += 1;
     }
     let breakdown = counts
         .iter()
@@ -307,16 +307,17 @@ fn print_summary_header(nodes: &[Node]) {
     println!("protocols: {breakdown}\n");
 }
 fn classify_vless_node(node: &Node) -> ProbeEligibility {
-    let Some(password) = node.password.as_deref().filter(|value| !value.is_empty()) else {
+    let vless = node.vless().unwrap();
+    let Some(password) = vless.uuid.as_deref().filter(|value| !value.is_empty()) else {
         return ProbeEligibility::InvalidConfig("invalid-uuid");
     };
     if Uuid::parse_str(password).is_err() {
         return ProbeEligibility::InvalidConfig("invalid-uuid");
     }
 
-    let reality_fields_present = node.reality_public_key.is_some()
-        || node.reality_short_id.is_some()
-        || node.reality_spider_x.is_some();
+    let reality_fields_present = vless.tls.reality_public_key.is_some()
+        || vless.tls.reality_short_id.is_some()
+        || vless.tls.reality_spider_x.is_some();
     let reality = if reality_fields_present {
         match parse_reality_config(node) {
             Ok(Some(_)) => true,
@@ -326,24 +327,27 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
         false
     };
 
-    if !matches!(node.transport.as_str(), "" | "tcp" | "ws" | "grpc") {
+    if !matches!(
+        vless.transport.transport.as_str(),
+        "" | "tcp" | "ws" | "grpc"
+    ) {
         return ProbeEligibility::ExpectedUnsupported("unsupported-transport");
     }
 
-    let flow = node.flow.as_deref().filter(|flow| !flow.is_empty());
+    let flow = vless.flow.as_deref().filter(|flow| !flow.is_empty());
     if flow.is_some_and(|flow| flow != "xtls-rprx-vision") {
         return ProbeEligibility::ExpectedUnsupported("unsupported-flow");
     }
     let vision = flow == Some("xtls-rprx-vision");
-    if vision && !node.tls && !reality {
+    if vision && !vless.tls.enabled && !reality {
         return ProbeEligibility::InvalidConfig("vision-without-tls");
     }
-    if vision && matches!(node.transport.as_str(), "ws" | "grpc") {
+    if vision && matches!(vless.transport.transport.as_str(), "ws" | "grpc") {
         return ProbeEligibility::ExpectedUnsupported("vision-non-tcp");
     }
 
     let mut candidate = node.clone();
-    candidate.flow = flow.map(str::to_string);
+    candidate.vless_mut().unwrap().flow = flow.map(str::to_string);
     let config = Config {
         nodes: vec![candidate],
         ..Config::default()
@@ -355,28 +359,29 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
 }
 
 fn vless_shape(node: &Node) -> String {
-    let carrier = if node.reality_public_key.is_some()
-        || node.reality_short_id.is_some()
-        || node.reality_spider_x.is_some()
+    let vless = node.vless().unwrap();
+    let carrier = if vless.tls.reality_public_key.is_some()
+        || vless.tls.reality_short_id.is_some()
+        || vless.tls.reality_spider_x.is_some()
     {
         "reality"
-    } else if node.tls {
+    } else if vless.tls.enabled {
         "tls"
     } else {
         "plain"
     };
-    let transport = match node.transport.as_str() {
+    let transport = match vless.transport.transport.as_str() {
         "" | "tcp" => "tcp",
         "ws" => "ws",
         "grpc" => "grpc",
         _ => "unsupported",
     };
-    let vision = if node.flow.as_deref() == Some("xtls-rprx-vision") {
+    let vision = if vless.flow.as_deref() == Some("xtls-rprx-vision") {
         "/vision"
     } else {
         ""
     };
-    let wire = match node.vless_mode {
+    let wire = match vless.mode {
         WireMode::Legacy => "",
         WireMode::UotV2 => "/uot-v2",
         WireMode::H2mux => "/h2mux",
@@ -398,7 +403,7 @@ struct ProbeTargets {
 }
 
 async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets) -> ProbeOutcome {
-    let eligibility = if node.protocol == NodeProtocol::VLess {
+    let eligibility = if node.protocol() == NodeProtocol::VLess {
         classify_vless_node(&node)
     } else {
         ProbeEligibility::Supported
@@ -469,7 +474,7 @@ async fn probe_urltest(
     url: &str,
     timeout: Duration,
 ) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol) else {
+    let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
     let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
@@ -496,7 +501,7 @@ impl ProbeOutcome {
 
     fn timed_out(registry: &ProxyRegistry, node: &Node) -> Self {
         let packet_result = registry
-            .find(node.protocol)
+            .find(node.protocol())
             .filter(|entry| (entry.descriptor.supports_udp)(node))
             .and_then(|entry| entry.packet.as_ref())
             .map(|_| Err(ProbeFailureKind::Timeout));
@@ -516,10 +521,10 @@ impl ProbeOutcome {
 }
 
 fn probe_shape(node: &Node) -> String {
-    if node.protocol == NodeProtocol::VLess {
+    if node.protocol() == NodeProtocol::VLess {
         vless_shape(node)
     } else {
-        node.protocol.as_str().to_string()
+        node.protocol().as_str().to_string()
     }
 }
 
@@ -565,7 +570,7 @@ async fn probe_family(
             Err(_) => return Some(Err(ProbeFailureKind::Resolve)),
         },
     };
-    let Some(entry) = registry.find(node.protocol) else {
+    let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
     let url = format!("https://{url_host}/");
@@ -659,7 +664,7 @@ async fn probe_udp_dns(
     node: &Node,
     timeout: Duration,
 ) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol) else {
+    let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
     if !(entry.descriptor.supports_udp)(node) {
@@ -720,7 +725,7 @@ async fn probe_udp_quic(
     url_port: u16,
     timeout: Duration,
 ) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol) else {
+    let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
     if !(entry.descriptor.supports_udp)(node) {
@@ -737,8 +742,19 @@ async fn probe_udp_quic(
     };
 
     let probe_node = Node {
-        skip_cert_verify: true,
-        sni: Some(url_host.to_string()),
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                quic: honk_config::node::QuicOptions {
+                    tls: honk_config::node::TlsOptions {
+                        skip_cert_verify: true,
+                        sni: Some(url_host.to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
         ..Default::default()
     };
     let config = match honk_outbound::quic::client_config(
@@ -766,13 +782,17 @@ mod tests {
     fn vless_node() -> Node {
         Node {
             name: "vless-test".into(),
-            protocol: NodeProtocol::VLess,
             address: "192.0.2.1:443".into(),
             host: "192.0.2.1".into(),
             port: 443,
-            password: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
-            tls: true,
-            transport: "tcp".into(),
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+                tls: honk_config::node::TlsOptions {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -786,7 +806,7 @@ mod tests {
         assert!(entry.packet.is_some());
         let mut node = vless_node();
         assert!(!(entry.descriptor.supports_udp)(&node));
-        node.vless_mode = WireMode::UotV2;
+        node.vless_mut().unwrap().mode = WireMode::UotV2;
         assert!((entry.descriptor.supports_udp)(&node));
     }
 
@@ -825,46 +845,50 @@ mod tests {
         );
 
         let mut node = vless_node();
-        node.password = None;
-        node.reality_short_id = Some("abc".into());
+        let vless = node.vless_mut().unwrap();
+        vless.uuid = None;
+        vless.tls.reality_short_id = Some("abc".into());
         assert_eq!(
             classify_vless_node(&node),
             ProbeEligibility::InvalidConfig("invalid-uuid")
         );
 
         let mut node = vless_node();
-        node.reality_short_id = Some("abc".into());
-        node.transport = "kcp".into();
+        let vless = node.vless_mut().unwrap();
+        vless.tls.reality_short_id = Some("abc".into());
+        vless.transport.transport = "kcp".into();
         assert_eq!(
             classify_vless_node(&node),
             ProbeEligibility::InvalidConfig("invalid-reality")
         );
 
         let mut node = vless_node();
-        node.transport = "kcp".into();
+        node.vless_mut().unwrap().transport.transport = "kcp".into();
         assert_eq!(
             classify_vless_node(&node),
             ProbeEligibility::ExpectedUnsupported("unsupported-transport")
         );
 
         let mut node = vless_node();
-        node.flow = Some("unsupported-flow-value".into());
+        node.vless_mut().unwrap().flow = Some("unsupported-flow-value".into());
         assert_eq!(
             classify_vless_node(&node),
             ProbeEligibility::ExpectedUnsupported("unsupported-flow")
         );
 
         let mut node = vless_node();
-        node.tls = false;
-        node.flow = Some("xtls-rprx-vision".into());
+        let vless = node.vless_mut().unwrap();
+        vless.tls.enabled = false;
+        vless.flow = Some("xtls-rprx-vision".into());
         assert_eq!(
             classify_vless_node(&node),
             ProbeEligibility::InvalidConfig("vision-without-tls")
         );
 
         let mut node = vless_node();
-        node.transport = "ws".into();
-        node.flow = Some("xtls-rprx-vision".into());
+        let vless = node.vless_mut().unwrap();
+        vless.transport.transport = "ws".into();
+        vless.flow = Some("xtls-rprx-vision".into());
         assert_eq!(
             classify_vless_node(&node),
             ProbeEligibility::ExpectedUnsupported("vision-non-tcp")
@@ -881,27 +905,31 @@ mod tests {
     #[test]
     fn vless_shapes_are_fixed_and_non_identifying() {
         let mut node = vless_node();
-        node.tls = false;
-        node.transport.clear();
+        let vless = node.vless_mut().unwrap();
+        vless.tls.enabled = false;
+        vless.transport.transport.clear();
         assert_eq!(vless_shape(&node), "vless/plain/tcp");
 
-        node.vless_mode = WireMode::Xudp;
+        node.vless_mut().unwrap().mode = WireMode::Xudp;
         assert_eq!(vless_shape(&node), "vless/plain/tcp/xudp");
-        node.vless_mode = WireMode::MuxCool;
+        node.vless_mut().unwrap().mode = WireMode::MuxCool;
         assert_eq!(vless_shape(&node), "vless/plain/tcp/mux-cool");
-        node.vless_mode = WireMode::Legacy;
+        node.vless_mut().unwrap().mode = WireMode::Legacy;
 
-        node.tls = true;
-        node.transport = "ws".into();
+        let vless = node.vless_mut().unwrap();
+        vless.tls.enabled = true;
+        vless.transport.transport = "ws".into();
         assert_eq!(vless_shape(&node), "vless/tls/ws");
 
-        node.reality_public_key = Some("private-key-material".into());
-        node.transport = "grpc".into();
-        node.flow = Some("xtls-rprx-vision".into());
+        let vless = node.vless_mut().unwrap();
+        vless.tls.reality_public_key = Some("private-key-material".into());
+        vless.transport.transport = "grpc".into();
+        vless.flow = Some("xtls-rprx-vision".into());
         assert_eq!(vless_shape(&node), "vless/reality/grpc/vision");
 
-        node.transport = "kcp-secret".into();
-        node.flow = Some("provider-flow-secret".into());
+        let vless = node.vless_mut().unwrap();
+        vless.transport.transport = "kcp-secret".into();
+        vless.flow = Some("provider-flow-secret".into());
         assert_eq!(vless_shape(&node), "vless/reality/unsupported");
     }
 
@@ -920,7 +948,7 @@ mod tests {
     fn vless_udp_mode_is_rendered_as_probeable() {
         let registry = ProxyRegistry::default_resolver().unwrap();
         let mut node = vless_node();
-        node.vless_mode = WireMode::H2mux;
+        node.vless_mut().unwrap().mode = WireMode::H2mux;
         let outcome = ProbeOutcome::timed_out(&registry, &node);
         assert!(matches!(
             outcome.udp_dns,
@@ -935,9 +963,10 @@ mod tests {
         let mut node = vless_node();
         node.host = "sentinel-host.invalid".into();
         node.address = "sentinel-host.invalid:443".into();
-        node.password = Some("sentinel-uuid".into());
-        node.sni = Some("sentinel-sni.invalid".into());
-        node.reality_public_key = Some("sentinel-reality-key".into());
+        let vless = node.vless_mut().unwrap();
+        vless.uuid = Some("sentinel-uuid".into());
+        vless.tls.sni = Some("sentinel-sni.invalid".into());
+        vless.tls.reality_public_key = Some("sentinel-reality-key".into());
         let outcome = ProbeOutcome::skipped(&node, classify_vless_node(&node));
         let rendered = render_outcome(&outcome);
         for sentinel in [

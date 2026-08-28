@@ -32,7 +32,7 @@ impl ProtocolDescriptor {
 /// paths: no `network` restriction means UDP is allowed; otherwise the list
 /// must contain "udp".
 pub(crate) fn network_allows_udp(node: &Node) -> bool {
-    node.network.as_deref().is_none_or(|network| {
+    node.network().is_none_or(|network| {
         network
             .split(',')
             .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
@@ -60,18 +60,18 @@ fn quic_runtime(_: &Node) -> GenerationRuntime {
 }
 
 fn vless_supports_udp(node: &Node) -> bool {
-    node.vless_mode != WireMode::Legacy && network_allows_udp(node)
+    node.vless().unwrap().mode != WireMode::Legacy && network_allows_udp(node)
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
     matches!(
-        node.vless_mode,
+        node.vless().unwrap().mode,
         WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp
     )
 }
 
 fn vless_runtime(node: &Node) -> GenerationRuntime {
-    match node.vless_mode {
+    match node.vless().unwrap().mode {
         WireMode::H2mux | WireMode::H2muxPadded => GenerationRuntime::VlessH2Mux,
         WireMode::MuxCool => GenerationRuntime::VlessCoolMux,
         WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => GenerationRuntime::None,
@@ -85,7 +85,7 @@ fn vless_runtime(node: &Node) -> GenerationRuntime {
 /// framing state whose idle liveness cannot be probed at the fd level, so
 /// they stay on bare-TCP pooling.
 fn trojan_pool_ready_streams(node: &Node) -> bool {
-    matches!(node.transport.as_str(), "" | "tcp")
+    matches!(node.transport().unwrap().transport.as_str(), "" | "tcp")
 }
 
 static DESCRIPTORS: &[ProtocolDescriptor] = &[
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn generation_runtime_matches_protocol_family() {
         let node = |protocol| Node {
-            protocol,
+            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
             ..Default::default()
         };
         for protocol in [
@@ -266,8 +266,12 @@ mod tests {
             ),
         ] {
             let node = Node {
-                protocol: NodeProtocol::VLess,
-                vless_mode: mode,
+                outbound: honk_config::node::OutboundConfig::Vless(
+                    honk_config::node::VlessConfig {
+                        mode,
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             };
             assert_eq!((descriptor.supports_udp)(&node), udp);
@@ -278,46 +282,40 @@ mod tests {
 
     #[test]
     fn udp_capability_follows_the_network_gate() {
-        let base = Node {
-            protocol: NodeProtocol::Trojan,
+        let mut base = Node {
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
             ..Default::default()
         };
         let trojan = descriptor(NodeProtocol::Trojan).supports_udp;
         assert!(trojan(&base), "no network restriction allows UDP");
-        let ws_only = Node {
-            network: Some("ws".to_string()),
-            ..base.clone()
-        };
-        assert!(!trojan(&ws_only));
-        let mixed = Node {
-            network: Some("tcp, udp".to_string()),
-            ..base.clone()
-        };
-        assert!(trojan(&mixed));
+        base.trojan_mut().unwrap().network = Some("ws".to_string());
+        assert!(!trojan(&base));
+        base.trojan_mut().unwrap().network = Some("tcp, udp".to_string());
+        assert!(trojan(&base));
 
         let anytls = descriptor(NodeProtocol::AnyTLS).supports_udp;
         let ws_only = Node {
-            protocol: NodeProtocol::AnyTLS,
-            network: Some("ws".to_string()),
+            outbound: honk_config::node::OutboundConfig::AnyTls(honk_config::node::AnyTlsConfig {
+                network: Some("ws".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(!anytls(&ws_only));
 
         let vless = descriptor(NodeProtocol::VLess).supports_udp;
         let tcp_only = Node {
-            protocol: NodeProtocol::VLess,
-            vless_mode: WireMode::H2mux,
-            network: Some("tcp".to_string()),
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                mode: WireMode::H2mux,
+                network: Some("tcp".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(!vless(&tcp_only));
 
         let ss = descriptor(NodeProtocol::SS).supports_udp;
-        let restricted = Node {
-            protocol: NodeProtocol::SS,
-            network: Some("tcp".to_string()),
-            ..Default::default()
-        };
-        assert!(ss(&restricted), "SS UDP is not network-gated");
+        let node = Node::default();
+        assert!(ss(&node), "SS UDP is not network-gated");
     }
 }

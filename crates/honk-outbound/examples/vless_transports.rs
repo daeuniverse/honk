@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use honk_outbound::proxy::TcpOutbound;
 use honk_outbound::proxy::vless::VLessHandler;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,17 +22,25 @@ const UUID_GRPC: &str = "80e02391-1835-47b8-8df7-3077554bc2f6";
 fn node(host: &str, port: u16, uuid: &str, transport: &str, tls: bool) -> Node {
     Node {
         name: format!("lab59-{port}"),
-        protocol: NodeProtocol::VLess,
         address: format!("{host}:{port}"),
         host: host.into(),
         port,
-        password: Some(uuid.into()),
-        transport: transport.into(),
-        tls,
-        sni: tls.then(|| "test.local".into()),
-        skip_cert_verify: tls,
-        ws_path: (transport == "ws").then(|| "/vless-ws".into()),
-        grpc_service: (transport == "grpc").then(|| "vless-grpc".into()),
+        outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+            uuid: Some(uuid.into()),
+            transport: honk_config::node::StreamTransportOptions {
+                transport: transport.into(),
+                ws_path: (transport == "ws").then(|| "/vless-ws".into()),
+                grpc_service: (transport == "grpc").then(|| "vless-grpc".into()),
+                ..Default::default()
+            },
+            tls: honk_config::node::TlsOptions {
+                enabled: tls,
+                sni: tls.then(|| "test.local".into()),
+                skip_cert_verify: tls,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
