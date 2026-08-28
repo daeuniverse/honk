@@ -97,6 +97,12 @@ impl GroupManager {
     pub fn set_interrupt_callback(&self, cb: Option<InterruptCallback>) {
         *self.interrupt_callback.write() = cb;
     }
+    /// Whether any group needs connection tracking for selection changes.
+    pub fn has_interrupt_connections(&self) -> bool {
+        self.groups
+            .values()
+            .any(|group| group.interrupt_connections)
+    }
 
     /// Record group activity: updates idle tracking only for groups that
     /// actually configure an idle timeout, then wakes URLTest health checks.

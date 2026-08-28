@@ -1201,13 +1201,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         match listen_str.parse::<std::net::SocketAddr>() {
             Ok(listen) => {
                 let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
+                let connection_tracker = control_plane.connection_tracker();
                 let state = std::sync::Arc::new(clash_api::ClashState {
                     config: control_plane.config_handle(),
                     stats: control_plane.stats_handle(),
                     alive_set: control_plane.alive_set(),
                     group_manager: control_plane.group_manager(),
                     cache_db: control_plane.cache_db(),
-                    connection_tracker: control_plane.connection_tracker(),
+                    connection_tracker,
                     proxy_registry: control_plane.proxy_registry(),
                     runtime_registry: control_plane.runtime_registry(),
                     mode_state,

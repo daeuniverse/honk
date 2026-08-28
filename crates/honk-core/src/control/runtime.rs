@@ -134,6 +134,76 @@ pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut boo
     *enabled = false;
 }
 
+pub(super) struct OutboundHealthPublisher {
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    config: Arc<RwLock<Arc<Config>>>,
+    group_manager: SharedGroupManager,
+    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
+    alive_set: Arc<AliveDialerSet>,
+}
+
+impl OutboundHealthPublisher {
+    pub(super) fn new(
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        config: Arc<RwLock<Arc<Config>>>,
+        group_manager: SharedGroupManager,
+        outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
+        alive_set: Arc<AliveDialerSet>,
+    ) -> Self {
+        Self {
+            ebpf,
+            config,
+            group_manager,
+            outbound_id_map,
+            alive_set,
+        }
+    }
+
+    pub(super) async fn publish(self: Arc<Self>, node_id: uuid::Uuid, domain: u32, ipver: u32) {
+        // Reload takes these locks in the same order. Keep the config generation
+        // pinned while waiting so a queued edge cannot update a recycled slot.
+        let config = self.config.read().await;
+        let mut backend = self.ebpf.write().await;
+        let Some(outbound_idx) = self.outbound_id_map.read().get(&node_id).copied() else {
+            return;
+        };
+        let Some(group) = outbound_idx
+            .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
+            .and_then(|idx| config.groups.get(idx as usize))
+        else {
+            warn!(outbound_idx, %node_id, "outbound health slot has no current group");
+            return;
+        };
+        let probe_domain = match domain {
+            1 => ProbeDomain::DnsUdp,
+            2 => ProbeDomain::DataUdp,
+            _ => ProbeDomain::Tcp,
+        };
+        let ip_version = if ipver == 1 {
+            IpVersion::V6
+        } else {
+            IpVersion::V4
+        };
+        let group_manager = self.group_manager.read().clone();
+        let alive = reload::group_datapath_alive(
+            group,
+            &group_manager,
+            &self.alive_set,
+            probe_domain,
+            ip_version,
+        );
+        if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
+            warn!(
+                %error,
+                outbound_idx,
+                domain,
+                ipver,
+                "failed to update outbound health in eBPF"
+            );
+        }
+    }
+}
+
 impl ControlPlane {
     #[cfg(feature = "ebpf")]
     pub(super) async fn degrade_nfqueue_startup(
@@ -147,7 +217,7 @@ impl ControlPlane {
         );
         self.pending_udp_verdicts = None;
         let mut config = self.config.write().await;
-        disable_nfqueue_for_startup(&mut config, enabled);
+        disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -466,52 +536,19 @@ impl ControlPlane {
                 interval_secs,
                 check_timeout.as_secs()
             );
-            let ebpf = self.ebpf.clone();
-            let alive_for_push = alive_set.clone();
-            let group_manager_for_push = self.group_manager.clone();
-            let config_for_push = self.config.clone();
-            alive_set.set_ebpf_callback(Box::new(move |outbound_idx, domain, ipver, _alive| {
-                // Group slots normally publish the OR of their leaf health.
-                // A sole TCP leaf without `final` stays open so userspace can
-                // make the one real dial capable of proving recovery.
-                let probe_domain = match domain {
-                    1 => ProbeDomain::DnsUdp,
-                    2 => ProbeDomain::DataUdp,
-                    _ => ProbeDomain::Tcp,
-                };
-                let ip_version = if ipver == 1 {
-                    IpVersion::V6
-                } else {
-                    IpVersion::V4
-                };
-                // Group ids are OutboundIndex::UserBase + group index.
-                let group = config_for_push.try_read().ok().and_then(|c| {
-                    let idx = outbound_idx
-                        .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)?;
-                    c.groups.get(idx as usize).cloned()
-                });
-                let any_alive = match group {
-                    Some(group) => {
-                        let gm = group_manager_for_push.read().clone();
-                        reload::group_datapath_alive(
-                            &group,
-                            &gm,
-                            &alive_for_push,
-                            probe_domain,
-                            ip_version,
-                        )
-                    }
-                    // Unknown outbound: keep the datapath open (userspace
-                    // makes the final decision anyway).
-                    None => true,
-                };
-                let ebpf = ebpf.clone();
-                let _handle = tokio::spawn(async move {
-                    if let Ok(mut backend) = ebpf.try_write() {
-                        let _ = backend.set_outbound_alive(outbound_idx, domain, ipver, any_alive);
-                    }
-                });
-            }));
+            let health_publisher = Arc::new(OutboundHealthPublisher::new(
+                self.ebpf.clone(),
+                self.config.clone(),
+                self.group_manager.clone(),
+                self.outbound_id_map.clone(),
+                alive_set.clone(),
+            ));
+            alive_set.set_ebpf_callback(Box::new(
+                move |node_id, _outbound_idx, domain, ipver, _alive| {
+                    let _handle =
+                        tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
+                },
+            ));
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);
             self.background_tasks.lock().await.push(handle);
@@ -737,7 +774,7 @@ impl ControlPlane {
                         }
                         Some(ControlCommand::NetworkChanged) => {
                             let current = self.config.read().await.clone();
-                            let mut next = current.clone();
+                            let mut next = current.as_ref().clone();
                             let routing_changed = next.ensure_local_direct_rules();
                             let client_subnet_auto = matches!(
                                 current.dns.client_subnet_mode(),
@@ -843,6 +880,8 @@ impl ControlPlane {
         }
     }
     pub(super) fn spawn_handle(&self) -> ControlPlaneHandle {
+        #[cfg(test)]
+        self.connection_tracker.enable();
         ControlPlaneHandle {
             config: self.config.clone(),
             router: self.router.clone(),

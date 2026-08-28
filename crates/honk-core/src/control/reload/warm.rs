@@ -15,7 +15,7 @@ pub(in crate::control) struct SelectorWarmResources {
 }
 
 pub(super) struct SelectorWarmCoordinator {
-    pub(super) config: Arc<tokio::sync::RwLock<Config>>,
+    pub(super) config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     pub(super) group_manager: crate::group::SharedGroupManager,
     pub(super) notify: Arc<tokio::sync::Notify>,
     pub(super) resources: SelectorWarmResources,
@@ -386,7 +386,7 @@ pub(super) async fn reconcile_udp_warm_retention(
 /// sessions/clients, so repeat dispatch is cheap. Exits when the count is
 /// disabled or the generation turns terminal (reload/shutdown replaces it).
 pub(super) async fn run_udp_warm_coordinator<F, Fut>(
-    config: Arc<tokio::sync::RwLock<Config>>,
+    config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     group_manager: crate::group::SharedGroupManager,
     generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     stats: Arc<StatsManager>,

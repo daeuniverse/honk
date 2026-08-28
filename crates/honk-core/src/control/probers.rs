@@ -109,7 +109,7 @@ fn http_probe_context(url: &str, addr: SocketAddr) -> ScoreSelectionContext {
 /// Resolves the check URL's hostname, dials through the proxy node via the
 /// `ProxyRegistry`, sends a raw HTTP request, and validates the status code.
 pub(super) struct ProxyHttpProber {
-    config: Arc<RwLock<Config>>,
+    config: Arc<RwLock<Arc<Config>>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     check_method: String,
@@ -118,7 +118,7 @@ pub(super) struct ProxyHttpProber {
 
 impl ProxyHttpProber {
     pub(super) fn new(
-        config: Arc<RwLock<Config>>,
+        config: Arc<RwLock<Arc<Config>>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         check_method: String,
@@ -405,7 +405,7 @@ pub(super) struct QuicScoreTarget {
 /// while their TCP probe succeeds — exactly the signal the UDP alive
 /// domains need.
 pub(super) struct ProxyUdpProber {
-    config: Arc<RwLock<Config>>,
+    config: Arc<RwLock<Arc<Config>>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
@@ -418,7 +418,7 @@ pub(super) struct ProxyUdpProber {
 impl ProxyUdpProber {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        config: Arc<RwLock<Config>>,
+        config: Arc<RwLock<Arc<Config>>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         stats: Arc<StatsManager>,

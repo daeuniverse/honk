@@ -391,7 +391,18 @@ pub(super) async fn run_endpoint_driver(
     // Send that retained prefix before the untouched receiver queue so the
     // server sees the original flight in order without waiting for a PTO.
     let UdpDriverStart { first, followers } = initial;
-    if let Err(failure) = send_one(&endpoint, &stats, &outbound_tracker, first, true).await {
+    let send_timeout = tokio::time::sleep(TRANSPORT_SEND_TIMEOUT);
+    tokio::pin!(send_timeout);
+    if let Err(failure) = send_one(
+        &endpoint,
+        &stats,
+        &outbound_tracker,
+        send_timeout.as_mut(),
+        first,
+        true,
+    )
+    .await
+    {
         let congested = matches!(&failure, PacketSendFailure::Congestion(_));
         let error = failure.into_io_error();
         if !congested && !endpoint.dead.load(Ordering::Acquire) {
@@ -406,7 +417,16 @@ pub(super) async fn run_endpoint_driver(
     }
 
     for follower in followers {
-        match send_one(&endpoint, &stats, &outbound_tracker, follower, false).await {
+        match send_one(
+            &endpoint,
+            &stats,
+            &outbound_tracker,
+            send_timeout.as_mut(),
+            follower,
+            false,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(PacketSendFailure::Congestion(error)) => {
                 debug!(
@@ -434,6 +454,7 @@ pub(super) async fn run_endpoint_driver(
         queue_rx,
         Arc::clone(&stats),
         outbound_tracker.clone(),
+        send_timeout.as_mut(),
     );
     let receiver = receive_loop(
         Arc::clone(&endpoint),
@@ -473,9 +494,19 @@ async fn send_followers(
     mut queue_rx: mpsc::Receiver<QueuedDatagram>,
     stats: Arc<StatsManager>,
     outbound_tracker: OutboundTracker,
+    mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
 ) -> io::Result<()> {
     while let Some(packet) = queue_rx.recv().await {
-        match send_one(&endpoint, &stats, &outbound_tracker, packet, false).await {
+        match send_one(
+            &endpoint,
+            &stats,
+            &outbound_tracker,
+            send_timeout.as_mut(),
+            packet,
+            false,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(PacketSendFailure::Congestion(error)) => {
                 debug!(
@@ -496,6 +527,7 @@ async fn send_one(
     endpoint: &UdpEndpoint,
     stats: &StatsManager,
     outbound_tracker: &OutboundTracker,
+    mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
     packet: QueuedDatagram,
     first: bool,
 ) -> Result<(), PacketSendFailure> {
@@ -506,27 +538,30 @@ async fn send_one(
         .begin_send_attempt()
         .map_err(PacketSendFailure::Transport)?;
     let started = first.then(Instant::now);
-    let sent = tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, async {
-        if first {
-            endpoint
-                .proxy_socket
-                .send_packet_confirmed(&packet.data)
-                .await
-        } else {
-            endpoint.proxy_socket.send_packet(&packet.data).await
-        }
-    })
-    .await;
+    send_timeout
+        .as_mut()
+        .reset(tokio::time::Instant::now() + TRANSPORT_SEND_TIMEOUT);
+    let sent = tokio::select! {
+        biased;
+        result = async {
+            if first {
+                endpoint
+                    .proxy_socket
+                    .send_packet_confirmed(&packet.data)
+                    .await
+            } else {
+                endpoint.proxy_socket.send_packet(&packet.data).await
+            }
+        } => Ok(result),
+        _ = send_timeout.as_mut() => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "UDP PacketTransport send timed out",
+        )),
+    };
     let result = match sent {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(classify_send_error(endpoint.proxy_socket.as_ref(), error)),
-        Err(_) => Err(classify_send_error(
-            endpoint.proxy_socket.as_ref(),
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "UDP PacketTransport send timed out",
-            ),
-        )),
+        Err(error) => Err(classify_send_error(endpoint.proxy_socket.as_ref(), error)),
     };
     if let Some(started) = started {
         stats.record_udp_first_send_latency(started.elapsed());
@@ -563,16 +598,21 @@ async fn receive_loop(
     // allocating. Full-cone sources populate this small endpoint-local cache.
     let mut alternate_reply_sockets = Vec::new();
     let mut buf = [0u8; 65536];
+    let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
+    tokio::pin!(reply_idle_timeout);
     loop {
-        let received = tokio::time::timeout(
-            REPLY_IDLE_TIMEOUT,
-            endpoint.proxy_socket.recv_packet(&mut buf),
-        )
-        .await;
+        reply_idle_timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now() + REPLY_IDLE_TIMEOUT);
+        let received = tokio::select! {
+            biased;
+            packet = endpoint.proxy_socket.recv_packet(&mut buf) => Ok(packet),
+            _ = reply_idle_timeout.as_mut() => Err(()),
+        };
         let (n, source) = match received {
             Ok(Ok(packet)) => packet,
             Ok(Err(error)) => return Err(error),
-            Err(_) => {
+            Err(()) => {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
             }
         };

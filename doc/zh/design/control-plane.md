@@ -166,7 +166,7 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 
 ## Clash API 与 cache DB
 
-可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash mode，并可选持久化 DNS 答案。相对路径优先位于 `global.data_dir`，同时在切换期继续使用已有的配置目录相对旧数据库。配置与持久化语义见[实验性配置参考](../reference/experimental.md)。
+可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当 API 成功绑定，或任一配置组使用 `interrupt_connections` 时，才启用连接元数据，因此即使没有 API 也能在选择变化时中断连接。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash mode，并可选持久化 DNS 答案。相对路径优先位于 `global.data_dir`，同时在切换期继续使用已有的配置目录相对旧数据库。配置与持久化语义见[实验性配置参考](../reference/experimental.md)。
 
 ## 相关文档
 

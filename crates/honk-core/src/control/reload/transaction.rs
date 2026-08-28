@@ -59,7 +59,7 @@ impl ControlPlane {
         new_config: Config,
         drain: &DrainTracker,
     ) -> bool {
-        let current_config = self.config.read().await.clone();
+        let current_config = self.config.read().await.as_ref().clone();
         let candidate_log_file =
             crate::resolved_log_file_path(&new_config, self.log_file_override.as_deref());
         let restart_required = restart_required_changes(
@@ -363,7 +363,7 @@ impl ControlPlane {
                 }
                 publication.commit();
                 *router_guard = new_router;
-                *config_guard = new_config;
+                *config_guard = Arc::new(new_config);
                 *group_guard = Arc::clone(&new_group_manager);
                 *outbound_guard = new_outbound_id_map;
                 *plan_guard = Arc::clone(&new_plan);

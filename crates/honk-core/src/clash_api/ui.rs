@@ -66,7 +66,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub struct UiDownloadContext {
     pub external_ui: String,
     pub router: Arc<RwLock<Router>>,
-    pub config: Arc<RwLock<Config>>,
+    pub config: Arc<RwLock<Arc<Config>>>,
     pub group_manager: SharedGroupManager,
     pub proxy_registry: Arc<ProxyRegistry>,
     pub runtime_registry: SharedRuntimeRegistry,
@@ -735,7 +735,7 @@ mod tests {
                 &config.groups,
                 &config.nodes,
             )))),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             proxy_registry,
             runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
@@ -837,6 +837,7 @@ mod tests {
         let ctx = test_ctx(&ui_dir, &rules);
         {
             let mut config = ctx.config.write().await;
+            let config = Arc::make_mut(&mut config);
             config.experimental.clash_api.external_ui_download_url =
                 format!("http://{addr}/ui.zip");
             config.experimental.clash_api.external_ui_download_detour = "direct".into();
@@ -853,12 +854,12 @@ mod tests {
     async fn unknown_configured_detour_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path(), &[]);
-        ctx.config
-            .write()
-            .await
+        let mut config = ctx.config.write().await;
+        Arc::make_mut(&mut config)
             .experimental
             .clash_api
             .external_ui_download_detour = "missing".into();
+        drop(config);
 
         let error = decide_route(&ctx, "127.0.0.1", 80)
             .await
@@ -1016,7 +1017,9 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx_with_registry(dir.path(), &rules, Arc::new(registry));
-        ctx.config.write().await.nodes.push(node);
+        let mut config = ctx.config.write().await;
+        Arc::make_mut(&mut config).nodes.push(node);
+        drop(config);
         download_external_ui(&ctx, &format!("http://{addr}/ui.zip"))
             .await
             .expect("proxied download must succeed");
@@ -1081,7 +1084,7 @@ mod tests {
                 &config.groups,
                 &config.nodes,
             )))),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             proxy_registry: Arc::new(registry),
             runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
@@ -1169,7 +1172,7 @@ mod tests {
                 &config.groups,
                 &config.nodes,
             )))),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
             runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),

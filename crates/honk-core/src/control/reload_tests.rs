@@ -540,7 +540,7 @@ async fn empty_subscription_merge_does_not_publish_runtime() {
 async fn reload_clamps_dials_to_startup_descriptor_reservation() {
     let cp = test_cp().await;
     let ceiling = cp.resource_budget.transient_dials;
-    let mut config = cp.config_handle().read().await.clone();
+    let mut config = cp.config_handle().read().await.as_ref().clone();
     config.global.max_concurrent_dials = usize::MAX;
 
     assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
@@ -1085,7 +1085,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
         vec![first.id]
     );
     let cp = test_cp().await;
-    *cp.config.write().await = config;
+    *cp.config.write().await = Arc::new(config);
     *cp.group_manager.write() = Arc::clone(&manager);
     *cp.runtime_registry.write() = Arc::clone(&generation);
     install_selector_warm_callback(&manager, &cp.selector_warm_notify);
