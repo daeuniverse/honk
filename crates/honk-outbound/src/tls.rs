@@ -518,9 +518,15 @@ pub(crate) fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Resul
 }
 
 pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
+    let tls = node.tls().ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal configuration error: node '{}' protocol '{}' has no TLS options",
+            node.name,
+            node.protocol().as_str()
+        )
+    })?;
     let chrome = chrome_mode();
     let ech_config_list = load_ech_config_list(node)?;
-    let tls = node.tls().unwrap();
 
     let pin = match tls.pin_sha256.as_deref() {
         Some(s) => Some(parse_pin_sha256(s).ok_or_else(|| {
@@ -1019,6 +1025,17 @@ mod pin_tests {
             err.to_string().contains("invalid tls_pin_sha256"),
             "bad pin must be a hard error: {err}"
         );
+    }
+
+    #[test]
+    fn non_tls_node_connector_returns_error() {
+        let node = Node {
+            name: "direct".into(),
+            outbound: honk_config::node::OutboundConfig::Direct,
+            ..Default::default()
+        };
+        let error = build_connector(&node).unwrap_err();
+        assert!(error.to_string().contains("has no TLS options"), "{error}");
     }
 }
 
