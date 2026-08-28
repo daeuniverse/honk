@@ -85,7 +85,7 @@ Validation requires every non-built-in node to have a non-empty name and either 
 
 ### Structured-loader compatibility
 
-TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol` and ignores fields left over from other protocols; for example, `tls: true` on an `ss` node neither enables TLS nor rejects the node. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
+TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol`; non-default fields left over from other protocols are stripped without rejecting the node, and one warning lists the stripped field names. For example, `tls: true` on an `ss` node is ignored with a warning rather than enabling TLS. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
 
 ## Protocols
 

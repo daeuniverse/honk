@@ -123,6 +123,185 @@ struct FlatNode {
 }
 
 impl FlatNode {
+    fn strip_protocol_incompatible_fields(&mut self) {
+        let stream = matches!(
+            self.protocol,
+            NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+        );
+        let tls = matches!(
+            self.protocol,
+            NodeProtocol::Trojan
+                | NodeProtocol::VMess
+                | NodeProtocol::VLess
+                | NodeProtocol::Hysteria2
+                | NodeProtocol::Tuic
+                | NodeProtocol::Juicity
+                | NodeProtocol::AnyTLS
+        );
+        let reality = matches!(
+            self.protocol,
+            NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+        );
+        let mut dropped = Vec::new();
+        macro_rules! strip {
+            ($condition:expr, $field:ident) => {
+                if $condition {
+                    let _ = std::mem::take(&mut self.$field);
+                    dropped.push(stringify!($field));
+                }
+            };
+        }
+
+        strip!(
+            self.username.is_some()
+                && !matches!(
+                    self.protocol,
+                    NodeProtocol::Socks5
+                        | NodeProtocol::Trojan
+                        | NodeProtocol::VLess
+                        | NodeProtocol::Hysteria2
+                        | NodeProtocol::Tuic
+                        | NodeProtocol::Juicity
+                        | NodeProtocol::AnyTLS
+                ),
+            username
+        );
+        strip!(
+            self.password.is_some()
+                && matches!(self.protocol, NodeProtocol::Direct | NodeProtocol::Block),
+            password
+        );
+        strip!(
+            self.encryption.is_some()
+                && !matches!(
+                    self.protocol,
+                    NodeProtocol::SS | NodeProtocol::VMess | NodeProtocol::VLess
+                ),
+            encryption
+        );
+        strip!(
+            self.vless_mode != WireMode::Legacy && self.protocol != NodeProtocol::VLess,
+            vless_mode
+        );
+        strip!(
+            self.plugin.is_some() && self.protocol != NodeProtocol::SS,
+            plugin
+        );
+        strip!(
+            self.plugin_opts.is_some() && self.protocol != NodeProtocol::SS,
+            plugin_opts
+        );
+        strip!(self.transport != "tcp" && !stream, transport);
+        strip!(self.tls && !tls, tls);
+        strip!(self.sni.is_some() && !tls, sni);
+        strip!(self.skip_cert_verify && !tls, skip_cert_verify);
+        strip!(self.ech_enabled && !tls, ech_enabled);
+        strip!(self.ech_config.is_some() && !tls, ech_config);
+        strip!(self.ech_config_path.is_some() && !tls, ech_config_path);
+        strip!(
+            self.reality_public_key.is_some() && !reality,
+            reality_public_key
+        );
+        strip!(
+            self.reality_short_id.is_some() && !reality,
+            reality_short_id
+        );
+        strip!(
+            self.reality_spider_x.is_some() && !reality,
+            reality_spider_x
+        );
+        strip!(
+            self.flow.is_some() && self.protocol != NodeProtocol::VLess,
+            flow
+        );
+        strip!(
+            self.network.is_some()
+                && !matches!(
+                    self.protocol,
+                    NodeProtocol::Trojan
+                        | NodeProtocol::VMess
+                        | NodeProtocol::VLess
+                        | NodeProtocol::AnyTLS
+                ),
+            network
+        );
+        strip!(self.ws_path.is_some() && !stream, ws_path);
+        strip!(self.ws_host.is_some() && !stream, ws_host);
+        strip!(self.grpc_service.is_some() && !stream, grpc_service);
+
+        let hy2 = self.protocol == NodeProtocol::Hysteria2;
+        strip!(self.hy2_auth.is_some() && !hy2, hy2_auth);
+        strip!(self.hy2_obfs.is_some() && !hy2, hy2_obfs);
+        strip!(self.hy2_up_mbps.is_some() && !hy2, hy2_up_mbps);
+        strip!(self.hy2_down_mbps.is_some() && !hy2, hy2_down_mbps);
+        strip!(self.hy2_port_hopping.is_some() && !hy2, hy2_port_hopping);
+        strip!(self.hy2_hop_interval.is_some() && !hy2, hy2_hop_interval);
+        strip!(
+            self.hy2_init_stream_recv_window.is_some() && !hy2,
+            hy2_init_stream_recv_window
+        );
+        strip!(
+            self.hy2_init_conn_recv_window.is_some() && !hy2,
+            hy2_init_conn_recv_window
+        );
+        strip!(
+            self.hy2_disable_mtu_discovery.is_some() && !hy2,
+            hy2_disable_mtu_discovery
+        );
+
+        let quic = matches!(
+            self.protocol,
+            NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+        );
+        strip!(self.tls_pin_sha256.is_some() && !tls, tls_pin_sha256);
+        strip!(self.quic_mtu.is_some() && !quic, quic_mtu);
+
+        let tuic = self.protocol == NodeProtocol::Tuic;
+        strip!(self.tuic_uuid.is_some() && !tuic, tuic_uuid);
+        strip!(self.tuic_password.is_some() && !tuic, tuic_password);
+        strip!(self.tuic_congestion.is_some() && !tuic, tuic_congestion);
+        strip!(self.tuic_alpn.is_some() && !tuic, tuic_alpn);
+        strip!(
+            self.tuic_init_stream_recv_window.is_some() && !tuic,
+            tuic_init_stream_recv_window
+        );
+        strip!(
+            self.tuic_init_conn_recv_window.is_some() && !tuic,
+            tuic_init_conn_recv_window
+        );
+
+        let juicity = self.protocol == NodeProtocol::Juicity;
+        strip!(self.juicity_uuid.is_some() && !juicity, juicity_uuid);
+        strip!(
+            self.juicity_password.is_some() && !juicity,
+            juicity_password
+        );
+
+        let anytls = self.protocol == NodeProtocol::AnyTLS;
+        strip!(self.anytls_password.is_some() && !anytls, anytls_password);
+        strip!(
+            self.anytls_min_idle_session.is_some() && !anytls,
+            anytls_min_idle_session
+        );
+        strip!(
+            self.anytls_idle_session_check_interval.is_some() && !anytls,
+            anytls_idle_session_check_interval
+        );
+        strip!(
+            self.anytls_idle_session_timeout.is_some() && !anytls,
+            anytls_idle_session_timeout
+        );
+
+        if !dropped.is_empty() {
+            tracing::warn!(
+                node = %self.name,
+                protocol = %self.protocol.as_str(),
+                fields = %dropped.join(", "),
+                "ignoring protocol-incompatible fields"
+            );
+        }
+    }
+
     fn take_tls(&mut self) -> TlsOptions {
         TlsOptions {
             enabled: self.tls,
@@ -152,6 +331,7 @@ impl TryFrom<FlatNode> for Node {
     type Error = crate::ConfigError;
 
     fn try_from(mut flat: FlatNode) -> Result<Self, Self::Error> {
+        flat.strip_protocol_incompatible_fields();
         let outbound = match flat.protocol {
             NodeProtocol::SS => OutboundConfig::Shadowsocks(ShadowsocksConfig {
                 password: flat.password.take(),

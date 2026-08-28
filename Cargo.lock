@@ -1475,6 +1475,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "url",
  "uuid",
 ]
