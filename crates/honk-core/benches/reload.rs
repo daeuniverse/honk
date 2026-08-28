@@ -5,7 +5,7 @@ use std::time::Instant;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use honk_config::Config;
 use honk_config::dns::{DnsLegacyRule, DnsRouting};
-use honk_config::node::{Group, GroupPolicy, Node};
+use honk_config::node::{Group, GroupPolicy, Node, OutboundConfig};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use honk_config::types::NodeProtocol;
 use honk_core::control::ControlPlane;
@@ -267,7 +267,7 @@ fn large_config(hosts_path: String) -> Config {
                 format!("reload-bench-{index}").as_bytes(),
             ),
             name: format!("node-{index:03}"),
-            protocol: NodeProtocol::Socks5,
+            outbound: OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: format!("192.0.2.{}:{}", index % 250 + 1, 10_000 + index),
             ..Default::default()
         })
