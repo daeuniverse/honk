@@ -437,9 +437,10 @@ mod tests {
 
         assert!(reconcile(&ebpf, &config, &mut attached).await);
         let first = attach.load(Ordering::Relaxed);
-        Arc::make_mut(&mut config.write().await)
-            .global
-            .wan_interface = vec!["lo".to_string()];
+        {
+            let mut config = config.write().await;
+            Arc::make_mut(&mut config).global.wan_interface = vec!["lo".to_string()];
+        }
         assert!(reconcile(&ebpf, &config, &mut attached).await);
 
         assert_eq!(forget.load(Ordering::Relaxed), 1);
