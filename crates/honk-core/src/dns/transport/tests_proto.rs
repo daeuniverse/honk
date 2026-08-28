@@ -211,7 +211,7 @@ impl PacketOutbound for TestPacketHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        assert_eq!(runtime.node.protocol, NodeProtocol::Socks5);
+        assert_eq!(runtime.node.protocol(), NodeProtocol::Socks5);
         self.runtime_dials.fetch_add(1, Ordering::SeqCst);
         self.open(target).await
     }
@@ -238,7 +238,7 @@ pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture 
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "packet-proxy".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:1".into(),
         host: "127.0.0.1".into(),
         port: 1,
@@ -267,7 +267,18 @@ pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture 
 pub(super) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
     honk_outbound::quic::client_config(
         &Node {
-            skip_cert_verify: true,
+            outbound: honk_config::node::OutboundConfig::Hysteria2(
+                honk_config::node::Hysteria2Config {
+                    quic: honk_config::node::QuicOptions {
+                        tls: honk_config::node::TlsOptions {
+                            skip_cert_verify: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
         &[alpn],

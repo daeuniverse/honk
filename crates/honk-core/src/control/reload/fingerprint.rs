@@ -138,7 +138,7 @@ mod tests {
         candidate.subscriptions[0].node_count += 1;
         assert!(effective_config_unchanged(&current, &mut candidate));
 
-        candidate.nodes[0].password = Some("changed".into());
+        candidate.nodes[0].shadowsocks_mut().unwrap().password = Some("changed".into());
         assert!(!effective_config_unchanged(&current, &mut candidate));
     }
 }

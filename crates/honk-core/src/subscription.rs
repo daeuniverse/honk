@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use honk_config::node::Node;
+use honk_config::node::{Node, OutboundConfig};
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
 use sha2::{Digest as _, Sha256};
@@ -283,15 +283,16 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     let nodes = nodes
         .into_iter()
         .filter(|node| {
-            if node
-                .plugin
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || node
-                    .plugin_opts
+            if node.shadowsocks().is_some_and(|config| {
+                config
+                    .plugin
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty())
-            {
+                    || config
+                        .plugin_opts
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+            }) {
                 tracing::warn!(
                     node = %node.name,
                     "skipping subscription node with unsupported proxy plugin"
@@ -693,68 +694,101 @@ fn parse_clash_subscription(
             continue;
         }
         let address = format!("{server}:{port}");
+        let vless_mode = if protocol == NodeProtocol::VLess {
+            match parse_vless_external_mode(mapping) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    tracing::warn!(node = %name, reason = %error, "skipping unsupported VLESS node");
+                    continue;
+                }
+            }
+        } else {
+            honk_config::node::WireMode::Legacy
+        };
         let mut node = Node {
             name,
-            protocol,
             address,
             host: server,
             port,
+            outbound: OutboundConfig::from_protocol(protocol),
             ..Default::default()
         };
 
-        node.username = get_str("username");
-        node.password = if protocol == NodeProtocol::VLess {
-            get_str("uuid").or_else(|| get_str("password"))
-        } else {
-            get_str("password")
-        };
-        node.encryption = if protocol == NodeProtocol::VLess {
-            get_str("encryption").or_else(|| get_str("cipher"))
-        } else {
-            get_str("cipher")
-        };
-        if let Some(network) = get_str("network") {
-            node.transport = network;
-        }
-        node.flow = get_str("flow").filter(|flow| !flow.is_empty());
-        if protocol == NodeProtocol::VLess {
-            node.vless_mode = match parse_vless_external_mode(mapping) {
-                Ok(mode) => mode,
-                Err(error) => {
-                    tracing::warn!(node = %node.name, reason = %error, "skipping unsupported VLESS node");
-                    continue;
-                }
-            };
+        let username = get_str("username");
+        let password = get_str("password");
+        let cipher = get_str("cipher");
+        match &mut node.outbound {
+            OutboundConfig::Shadowsocks(config) => {
+                config.password = password;
+                config.encryption = cipher;
+            }
+            OutboundConfig::Socks5(config) => {
+                config.username = username;
+                config.password = password;
+            }
+            OutboundConfig::Trojan(config) => config.password = password,
+            OutboundConfig::Vmess(config) => {
+                config.uuid = get_str("uuid").or(password);
+                config.encryption = cipher;
+            }
+            OutboundConfig::Vless(config) => {
+                config.uuid = get_str("uuid").or(password);
+                config.encryption = get_str("encryption").or(cipher);
+                config.flow = get_str("flow").filter(|flow| !flow.is_empty());
+                config.mode = vless_mode;
+            }
+            OutboundConfig::Hysteria2(config) => {
+                config.auth = get_str("auth").or(password);
+            }
+            OutboundConfig::Tuic(config) => {
+                config.uuid = get_str("uuid").or(username);
+                config.password = password;
+            }
+            OutboundConfig::Juicity(config) => {
+                config.uuid = get_str("uuid").or(username);
+                config.password = password;
+            }
+            OutboundConfig::AnyTls(config) => config.password = password,
+            OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
         }
 
-        if let Some(tls) = get_value("tls").and_then(serde_yaml::Value::as_bool) {
-            node.tls = tls;
+        if let Some(network) = get_str("network")
+            && let Some(transport) = node.transport_mut()
+        {
+            transport.transport = network;
         }
-        node.sni = get_str("servername").or_else(|| get_str("sni"));
-        if let Some(skip) = get_value("skip-cert-verify").and_then(serde_yaml::Value::as_bool) {
-            node.skip_cert_verify = skip;
-        }
-
-        node.ws_path = get_nested_str("ws-opts", "path").or_else(|| get_str("ws-path"));
-        node.ws_host = get_value("ws-opts")
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|options| {
-                options
-                    .get(serde_yaml::Value::String("headers".to_string()))
-                    .and_then(serde_yaml::Value::as_mapping)
-            })
-            .and_then(|headers| {
-                headers.iter().find_map(|(key, value)| {
-                    key.as_str()
-                        .filter(|key| key.eq_ignore_ascii_case("host"))
-                        .and_then(|_| value.as_str())
-                        .map(str::to_string)
+        if let Some(transport) = node.transport_mut() {
+            transport.ws_path = get_nested_str("ws-opts", "path").or_else(|| get_str("ws-path"));
+            transport.ws_host = get_value("ws-opts")
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|options| {
+                    options
+                        .get(serde_yaml::Value::String("headers".to_string()))
+                        .and_then(serde_yaml::Value::as_mapping)
                 })
-            })
-            .or_else(|| get_str("ws-headers"))
-            .or_else(|| get_str("ws-host"));
-        node.grpc_service =
-            get_nested_str("grpc-opts", "grpc-service-name").or_else(|| get_str("grpc-service"));
+                .and_then(|headers| {
+                    headers.iter().find_map(|(key, value)| {
+                        key.as_str()
+                            .filter(|key| key.eq_ignore_ascii_case("host"))
+                            .and_then(|_| value.as_str())
+                            .map(str::to_string)
+                    })
+                })
+                .or_else(|| get_str("ws-headers"))
+                .or_else(|| get_str("ws-host"));
+            transport.grpc_service = get_nested_str("grpc-opts", "grpc-service-name")
+                .or_else(|| get_str("grpc-service"));
+        }
+
+        if let Some(tls_options) = node.tls_mut() {
+            if let Some(enabled) = get_value("tls").and_then(serde_yaml::Value::as_bool) {
+                tls_options.enabled = enabled;
+            }
+            tls_options.sni = get_str("servername").or_else(|| get_str("sni"));
+            if let Some(skip) = get_value("skip-cert-verify").and_then(serde_yaml::Value::as_bool) {
+                tls_options.skip_cert_verify = skip;
+            }
+        }
 
         if protocol == NodeProtocol::VLess
             && let Some(reality_value) = get_value("reality-opts")
@@ -774,16 +808,17 @@ fn parse_clash_subscription(
                 tracing::warn!("skipping VLESS Clash node with incomplete reality-opts");
                 continue;
             };
-            node.reality_public_key = Some(public_key);
-            node.reality_short_id = nested("short-id");
-            node.reality_spider_x = Some(
+            let tls = &mut node.vless_mut().unwrap().tls;
+            tls.reality_public_key = Some(public_key);
+            tls.reality_short_id = nested("short-id");
+            tls.reality_spider_x = Some(
                 nested("spider-x")
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "/".to_string()),
             );
-            node.tls = true;
+            tls.enabled = true;
         }
-        if let Err(error) = node.validate_vless_mode() {
+        if let Err(error) = node.validate_protocol() {
             tracing::warn!(node = %node.name, reason = %error, "skipping unsupported VLESS node");
             continue;
         }
@@ -812,7 +847,7 @@ mod tests {
     #[test]
     fn test_parse_socks5_uri() {
         let node = parse_node_uri("socks5://192.168.1.1:1080").unwrap();
-        assert_eq!(node.protocol, NodeProtocol::Socks5);
+        assert_eq!(node.protocol(), NodeProtocol::Socks5);
         assert_eq!(node.host, "192.168.1.1");
         assert_eq!(node.port, 1080);
         assert_eq!(node.address, "192.168.1.1:1080");
@@ -822,7 +857,7 @@ mod tests {
     #[test]
     fn test_parse_socks5_uri_with_fragment() {
         let node = parse_node_uri("socks5://10.0.0.1:1080#MySocks5").unwrap();
-        assert_eq!(node.protocol, NodeProtocol::Socks5);
+        assert_eq!(node.protocol(), NodeProtocol::Socks5);
         assert_eq!(node.host, "10.0.0.1");
         assert_eq!(node.port, 1080);
         assert_eq!(node.name, "MySocks5");
@@ -839,11 +874,12 @@ mod tests {
     #[test]
     fn test_parse_socks5_uri_with_auth() {
         let node = parse_node_uri("socks5://user:pass@10.0.0.1:1080").unwrap();
-        assert_eq!(node.protocol, NodeProtocol::Socks5);
+        assert_eq!(node.protocol(), NodeProtocol::Socks5);
         assert_eq!(node.host, "10.0.0.1");
         assert_eq!(node.port, 1080);
-        assert_eq!(node.username, Some("user".to_string()));
-        assert_eq!(node.password, Some("pass".to_string()));
+        let socks = node.socks5().unwrap();
+        assert_eq!(socks.username, Some("user".to_string()));
+        assert_eq!(socks.password, Some("pass".to_string()));
     }
 
     #[test]
@@ -858,8 +894,8 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].name, "Node1");
         assert_eq!(nodes[1].name, "Node2");
-        assert_eq!(nodes[0].protocol, NodeProtocol::Socks5);
-        assert_eq!(nodes[1].protocol, NodeProtocol::Socks5);
+        assert_eq!(nodes[0].protocol(), NodeProtocol::Socks5);
+        assert_eq!(nodes[1].protocol(), NodeProtocol::Socks5);
     }
 
     #[test]
@@ -1001,12 +1037,15 @@ proxies:
         let nodes = parse_clash_subscription(yaml, None).unwrap();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].name, "My SOCKS5");
-        assert_eq!(nodes[0].protocol, NodeProtocol::Socks5);
+        assert_eq!(nodes[0].protocol(), NodeProtocol::Socks5);
         assert_eq!(nodes[0].host, "192.168.1.1");
         assert_eq!(nodes[0].port, 1080);
         assert_eq!(nodes[1].name, "My SS");
-        assert_eq!(nodes[1].protocol, NodeProtocol::SS);
-        assert_eq!(nodes[1].encryption, Some("aes-256-gcm".to_string()));
+        assert_eq!(nodes[1].protocol(), NodeProtocol::SS);
+        assert_eq!(
+            nodes[1].shadowsocks().unwrap().encryption,
+            Some("aes-256-gcm".to_string())
+        );
     }
     #[test]
     fn test_parse_clash_vless_nested_fields() {
@@ -1069,37 +1108,44 @@ proxies:
         assert_eq!(nodes.len(), 4);
 
         let reality = &nodes[0];
-        assert_eq!(reality.protocol, NodeProtocol::VLess);
+        assert_eq!(reality.protocol(), NodeProtocol::VLess);
+        let reality_config = reality.vless().unwrap();
         assert_eq!(
-            reality.password.as_deref(),
+            reality_config.uuid.as_deref(),
             Some("b831381d-6324-4d53-ad4f-8cda48b30811")
         );
-        assert_eq!(reality.sni.as_deref(), Some("mask.example"));
-        assert_eq!(reality.flow.as_deref(), Some("xtls-rprx-vision"));
-        assert_eq!(reality.transport, "tcp");
-        assert!(reality.tls);
+        assert_eq!(reality_config.tls.sni.as_deref(), Some("mask.example"));
+        assert_eq!(reality_config.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(reality_config.transport.transport, "tcp");
+        assert!(reality_config.tls.enabled);
         assert_eq!(
-            reality.reality_public_key.as_deref(),
+            reality_config.tls.reality_public_key.as_deref(),
             Some("jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc")
         );
-        assert_eq!(reality.reality_short_id.as_deref(), Some("a1b2c3d4"));
-        assert_eq!(reality.reality_spider_x.as_deref(), Some("/"));
+        assert_eq!(
+            reality_config.tls.reality_short_id.as_deref(),
+            Some("a1b2c3d4")
+        );
+        assert_eq!(reality_config.tls.reality_spider_x.as_deref(), Some("/"));
 
-        let ws = &nodes[1];
-        assert_eq!(ws.sni.as_deref(), Some("tls.example"));
+        let ws = nodes[1].vless().unwrap();
+        assert_eq!(ws.tls.sni.as_deref(), Some("tls.example"));
         assert_eq!(
             ws.encryption.as_deref(),
             Some("mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         );
-        assert_eq!(ws.transport, "ws");
-        assert_eq!(ws.ws_path.as_deref(), Some("/nested"));
-        assert_eq!(ws.ws_host.as_deref(), Some("websocket.example"));
+        assert_eq!(ws.transport.transport, "ws");
+        assert_eq!(ws.transport.ws_path.as_deref(), Some("/nested"));
+        assert_eq!(ws.transport.ws_host.as_deref(), Some("websocket.example"));
 
-        let grpc = &nodes[2];
-        assert_eq!(grpc.transport, "grpc");
-        assert_eq!(grpc.grpc_service.as_deref(), Some("nested-service"));
+        let grpc = nodes[2].vless().unwrap();
+        assert_eq!(grpc.transport.transport, "grpc");
+        assert_eq!(
+            grpc.transport.grpc_service.as_deref(),
+            Some("nested-service")
+        );
 
-        assert_eq!(nodes[3].password, None);
+        assert_eq!(nodes[3].vless().unwrap().uuid, None);
         for node in &nodes {
             assert_eq!(node.subscription_id, Some(subscription_id));
             assert_eq!(node.id, node.derive_id());
@@ -1160,16 +1206,34 @@ proxies:
 
         let nodes = parse_clash_subscription(yaml, None).unwrap();
         assert_eq!(nodes.len(), 6);
-        assert_eq!(nodes[0].vless_mode, honk_config::node::WireMode::H2mux);
         assert_eq!(
-            nodes[1].vless_mode,
+            nodes[0].vless().unwrap().mode,
+            honk_config::node::WireMode::H2mux
+        );
+        assert_eq!(
+            nodes[1].vless().unwrap().mode,
             honk_config::node::WireMode::H2muxPadded
         );
-        assert_eq!(nodes[2].vless_mode, honk_config::node::WireMode::UotV2);
-        assert_eq!(nodes[3].vless_mode, honk_config::node::WireMode::UotV2);
-        assert_eq!(nodes[4].vless_mode, honk_config::node::WireMode::Legacy);
-        assert_eq!(nodes[5].vless_mode, honk_config::node::WireMode::Xudp);
-        assert_eq!(nodes[5].flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(
+            nodes[2].vless().unwrap().mode,
+            honk_config::node::WireMode::UotV2
+        );
+        assert_eq!(
+            nodes[3].vless().unwrap().mode,
+            honk_config::node::WireMode::UotV2
+        );
+        assert_eq!(
+            nodes[4].vless().unwrap().mode,
+            honk_config::node::WireMode::Legacy
+        );
+        assert_eq!(
+            nodes[5].vless().unwrap().mode,
+            honk_config::node::WireMode::Xudp
+        );
+        assert_eq!(
+            nodes[5].vless().unwrap().flow.as_deref(),
+            Some("xtls-rprx-vision")
+        );
     }
 
     #[test]

@@ -513,17 +513,14 @@ impl Hysteria2Handler {
         Self
     }
 
-    /// Resolve the effective authentication password (`hy2_auth`, falling
-    /// back to `password`).
     fn resolve_password(node: &Node) -> &str {
-        node.hy2_auth
-            .as_deref()
-            .unwrap_or_else(|| node.password.as_deref().unwrap_or(""))
+        node.hysteria2().unwrap().auth.as_deref().unwrap_or("")
     }
 
     async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
+        let hy2 = node.hysteria2().unwrap();
         let password = Self::resolve_password(node);
-        let obfs = node.hy2_obfs.as_deref().filter(|s| !s.is_empty());
+        let obfs = hy2.obfs.as_deref().filter(|s| !s.is_empty());
         if let Some(obfs) = obfs
             && obfs.len() < SALAMANDER_MIN_PSK_LEN
         {
@@ -532,30 +529,35 @@ impl Hysteria2Handler {
             );
         }
         // Hysteria-CC-RX is bytes/s; configuration uses decimal Mbit/s.
-        let rx_bytes_per_second = u64::from(node.hy2_down_mbps.unwrap_or(0)) * 125_000;
+        let rx_bytes_per_second = u64::from(hy2.down_mbps.unwrap_or(0)) * 125_000;
         // Port hopping (`mport`/`mhop`): destination port rotates among the
         // list every interval (default 30s, official client parity).
-        let hop = node
-            .hy2_port_hopping
+        let hop = hy2
+            .port_hopping
             .as_deref()
             .map(|spec| {
                 let ports = parse_port_hopping(spec)
                     .ok_or_else(|| anyhow!("Hysteria2: invalid port hopping list"))?;
                 Ok::<_, anyhow::Error>((
                     ports,
-                    Duration::from_secs(node.hy2_hop_interval.unwrap_or(30).max(5)),
+                    Duration::from_secs(hy2.hop_interval.unwrap_or(30).max(5)),
                 ))
             })
             .transpose()?;
-        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let server_name = hy2
+            .quic
+            .tls
+            .sni
+            .clone()
+            .unwrap_or_else(|| node.host().to_string());
         // A positive upload hint selects the fixed-rate sender; no hint uses BBR.
-        let factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
-            match node.hy2_up_mbps {
-                Some(mbps) if mbps > 0 => Arc::new(crate::quic::BrutalConfig::from_bps(
-                    u64::from(mbps) * 1_000_000,
-                )),
-                _ => crate::quic::congestion_factory(Some("bbr")),
-            };
+        let factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> = match hy2.up_mbps
+        {
+            Some(mbps) if mbps > 0 => Arc::new(crate::quic::BrutalConfig::from_bps(
+                u64::from(mbps) * 1_000_000,
+            )),
+            _ => crate::quic::congestion_factory(Some("bbr")),
+        };
         let config = crate::quic::client_config(
             node,
             &[b"h3"],
@@ -569,15 +571,15 @@ impl Hysteria2Handler {
                 // per-connection memory budget (slow consumers buffer up to
                 // ~3x it), so it stays at 8 MiB — measured throughput-neutral
                 // on a 75ms/15%-loss link.
-                stream_receive_window: node.hy2_init_stream_recv_window.or(Some(8 << 20)),
-                conn_receive_window: node.hy2_init_conn_recv_window.or(Some(8 << 20)),
-                disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
-                max_udp_payload_size: node.quic_mtu,
+                stream_receive_window: hy2.init_stream_recv_window.or(Some(8 << 20)),
+                conn_receive_window: hy2.init_conn_recv_window.or(Some(8 << 20)),
+                disable_mtu_discovery: hy2.disable_mtu_discovery == Some(true),
+                max_udp_payload_size: hy2.quic.mtu,
             },
         )
         .await?;
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
-        let mtu = node.quic_mtu.unwrap_or(1252);
+        let mtu = hy2.quic.mtu.unwrap_or(1252);
         let quic = quic.with_max_udp_payload_size(mtu);
         let quic = match (obfs, hop) {
             (None, None) => quic,

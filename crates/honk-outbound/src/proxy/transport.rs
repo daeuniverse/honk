@@ -44,7 +44,7 @@ pub(crate) async fn wrap_transport(
     tcp: TcpStream,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let stream = maybe_tls_wrap(node, tcp).await?;
-    match node.transport.as_str() {
+    match node.transport().unwrap().transport.as_str() {
         "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,
         "grpc" => wrap_grpc(node, stream).await,
@@ -88,9 +88,10 @@ pub(crate) async fn maybe_tls_wrap_concrete(
             crate::reality::reality_connect(tcp, &reality, crate::tls::chrome_mode()).await?;
         return Ok(MaybeTls::Tls(Box::new(tls_stream)));
     }
-    if node.tls {
+    let tls = node.tls().unwrap();
+    if tls.enabled {
         let connector = crate::tls::build_connector(node)?;
-        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
         let tls_stream = connector.connect(&server_name, tcp).await?;
         return Ok(MaybeTls::Tls(Box::new(tls_stream)));
     }
@@ -106,8 +107,13 @@ async fn wrap_ws(
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let ws_path = node.ws_path.as_deref().unwrap_or("/");
-    let ws_host = node.ws_host.as_deref().unwrap_or(node.host()).to_string();
+    let transport = node.transport().unwrap();
+    let ws_path = transport.ws_path.as_deref().unwrap_or("/");
+    let ws_host = transport
+        .ws_host
+        .as_deref()
+        .unwrap_or(node.host())
+        .to_string();
 
     // Build the request from the URI so tungstenite generates the full
     // handshake header set (Sec-WebSocket-Key, Upgrade, ...); a bare
@@ -212,11 +218,20 @@ async fn wrap_grpc(
     node: &Node,
     stream: Box<dyn AsyncReadWrite>,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-    let service = node.grpc_service.as_deref().unwrap_or("GunService");
+    let service = node
+        .transport()
+        .unwrap()
+        .grpc_service
+        .as_deref()
+        .unwrap_or("GunService");
     let path = format!("/{}/Tun", service);
     let authority = node.host().to_string();
     // gRPC servers (sing-box) reject :scheme http over a TLS connection.
-    let scheme = if node.tls { "https" } else { "http" };
+    let scheme = if node.tls().unwrap().enabled {
+        "https"
+    } else {
+        "http"
+    };
 
     Ok(Box::new(
         GrpcStream::new(stream, &path, &authority, scheme).await?,
@@ -785,18 +800,16 @@ impl AsyncWrite for GrpcStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use honk_config::types::NodeProtocol;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn transport_node(port: u16) -> Node {
         Node {
             name: "transport-node".into(),
-            // The protocol is irrelevant to the transport layer.
-            protocol: NodeProtocol::Trojan,
-            address: format!("127.0.0.1:{}", port),
+            address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
             ..Default::default()
         }
     }
@@ -934,9 +947,10 @@ mod tests {
         });
 
         let mut node = transport_node(port);
-        node.transport = "ws".into();
-        node.ws_path = Some("/ws-path".into());
-        node.ws_host = Some("cdn.example.com".into());
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "ws".into();
+        transport.ws_path = Some("/ws-path".into());
+        transport.ws_host = Some("cdn.example.com".into());
 
         let mut stream = connect_transport(&node, std::time::Duration::from_secs(3))
             .await
@@ -1046,8 +1060,9 @@ mod tests {
         });
 
         let mut node = transport_node(port);
-        node.transport = "grpc".into();
-        node.grpc_service = Some("testSvc".into());
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "grpc".into();
+        transport.grpc_service = Some("testSvc".into());
 
         let mut stream = connect_transport(&node, std::time::Duration::from_secs(3))
             .await

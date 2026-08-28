@@ -28,9 +28,15 @@ fn lab_config(addr_host: &str, public_key: &str) -> RealityConfig {
         name: "lab59".into(),
         host: addr_host.into(),
         port: 8443,
-        sni: Some(SNI.into()),
-        reality_public_key: Some(public_key.into()),
-        reality_short_id: Some(SHORT_ID.into()),
+        outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+            tls: honk_config::node::TlsOptions {
+                sni: Some(SNI.into()),
+                reality_public_key: Some(public_key.into()),
+                reality_short_id: Some(SHORT_ID.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         ..Default::default()
     };
     parse_reality_config(&node).unwrap().unwrap()

@@ -6,7 +6,6 @@ use super::wire::{
 };
 use super::*;
 use crate::quic::{recv_read_exact as read_exact, testutil};
-use honk_config::types::NodeProtocol;
 use quinn::EndpointConfig;
 use std::time::Instant;
 
@@ -18,17 +17,23 @@ const TEST_PASSWORD: &str = "hy2-test-password";
 fn test_node(port: u16, password: &str) -> Node {
     Node {
         name: "hy2-test".to_string(),
-        protocol: NodeProtocol::Hysteria2,
         host: "127.0.0.1".to_string(),
         address: format!("127.0.0.1:{port}"),
         port,
-        hy2_auth: Some(password.to_string()),
-        // Loopback has no loss, so PMTU discovery would climb to 1452 and
-        // the client would fragment UDP payloads above what the peer (capped
-        // by our advertised 1252 max_udp_payload_size) can send back. Real
-        // lossy links keep PMTUD near the advertised value anyway.
-        hy2_disable_mtu_discovery: Some(true),
-        skip_cert_verify: true,
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                auth: Some(password.to_string()),
+                disable_mtu_discovery: Some(true),
+                quic: honk_config::node::QuicOptions {
+                    tls: honk_config::node::TlsOptions {
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
         ..Default::default()
     }
 }
@@ -627,7 +632,7 @@ fn test_udp_message_rejects_invalid_fragments() {
 #[tokio::test]
 async fn test_short_salamander_password_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
-    node.hy2_obfs = Some("abc".to_string());
+    node.hysteria2_mut().unwrap().obfs = Some("abc".to_string());
     let result = Hysteria2Handler::new().build_client(&node).await;
     let error = match result {
         Ok(_) => panic!("short Salamander password must be rejected"),
@@ -639,7 +644,7 @@ async fn test_short_salamander_password_rejected_before_dial() {
 #[tokio::test]
 async fn test_invalid_port_hopping_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
-    node.hy2_port_hopping = Some("0-10".to_string());
+    node.hysteria2_mut().unwrap().port_hopping = Some("0-10".to_string());
     let error = match Hysteria2Handler::new().build_client(&node).await {
         Ok(_) => panic!("invalid port hopping list must be rejected"),
         Err(error) => error,
@@ -650,7 +655,7 @@ async fn test_invalid_port_hopping_rejected_before_dial() {
 #[tokio::test]
 async fn test_downlink_mbps_is_serialized_as_bytes_per_second() {
     let mut node = test_node(443, TEST_PASSWORD);
-    node.hy2_down_mbps = Some(1);
+    node.hysteria2_mut().unwrap().down_mbps = Some(1);
     let client = Hysteria2Handler::new().build_client(&node).await.unwrap();
     let frame = auth_request_frame(TEST_PASSWORD, client.rx_bytes_per_second);
     let mut offset = 0;
@@ -685,23 +690,17 @@ fn test_tcp_request_frame_shape() {
 }
 
 #[test]
-fn test_resolve_password_prefers_hy2_auth() {
+fn test_resolve_password() {
     let node = Node {
-        hy2_auth: Some("hy2-secret".to_string()),
-        password: Some("generic-secret".to_string()),
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                auth: Some("hy2-secret".to_string()),
+                ..Default::default()
+            },
+        ),
         ..Default::default()
     };
     assert_eq!(Hysteria2Handler::resolve_password(&node), "hy2-secret");
-}
-
-#[test]
-fn test_resolve_password_falls_back() {
-    let node = Node {
-        hy2_auth: None,
-        password: Some("generic-secret".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(Hysteria2Handler::resolve_password(&node), "generic-secret");
 }
 
 #[tokio::test]
@@ -893,7 +892,7 @@ async fn test_connection_reuse_across_dials() {
 async fn test_salamander_obfs_tcp_udp_echo() {
     let server_addr = start_obfs_server(TEST_PASSWORD, b"obfs-secret").await;
     let mut node = test_node(server_addr.port(), TEST_PASSWORD);
-    node.hy2_obfs = Some("obfs-secret".to_string());
+    node.hysteria2_mut().unwrap().obfs = Some("obfs-secret".to_string());
     let handler = Hysteria2Handler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
@@ -925,7 +924,7 @@ async fn test_salamander_obfs_tcp_udp_echo() {
 async fn test_salamander_wrong_obfs_password_rejected() {
     let server_addr = start_obfs_server(TEST_PASSWORD, b"obfs-secret").await;
     let mut node = test_node(server_addr.port(), TEST_PASSWORD);
-    node.hy2_obfs = Some("wrong-obfs-password".to_string());
+    node.hysteria2_mut().unwrap().obfs = Some("wrong-obfs-password".to_string());
     let handler = Hysteria2Handler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
@@ -960,44 +959,52 @@ fn e2e_node() -> Option<Node> {
     let port: u16 = port.parse().ok()?;
     Some(Node {
         name: "hy2-e2e".to_string(),
-        protocol: NodeProtocol::Hysteria2,
         host: host.to_string(),
         address: server,
         port,
-        hy2_auth: std::env::var("HONK_HY2_PASSWORD").ok(),
-        hy2_obfs: std::env::var("HONK_HY2_OBFS")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        hy2_up_mbps: std::env::var("HONK_HY2_UP_MBPS")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        hy2_down_mbps: std::env::var("HONK_HY2_DOWN_MBPS")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        hy2_port_hopping: std::env::var("HONK_HY2_MPORT")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        hy2_hop_interval: std::env::var("HONK_HY2_MHOP")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        tls_pin_sha256: std::env::var("HONK_HY2_PIN").ok().filter(|s| !s.is_empty()),
-        hy2_init_stream_recv_window: std::env::var("HONK_HY2_STREAM_RWND")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        hy2_init_conn_recv_window: std::env::var("HONK_HY2_CONN_RWND")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        hy2_disable_mtu_discovery: std::env::var("HONK_HY2_DISABLE_PMTUD")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .map(|v| v == 1),
-        quic_mtu: std::env::var("HONK_HY2_MTU")
-            .ok()
-            .and_then(|value| value.parse().ok()),
-        skip_cert_verify: std::env::var("HONK_HY2_INSECURE")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .is_some_and(|v| v == 1),
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                auth: std::env::var("HONK_HY2_PASSWORD").ok(),
+                obfs: std::env::var("HONK_HY2_OBFS")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                up_mbps: std::env::var("HONK_HY2_UP_MBPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                down_mbps: std::env::var("HONK_HY2_DOWN_MBPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                port_hopping: std::env::var("HONK_HY2_MPORT")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                hop_interval: std::env::var("HONK_HY2_MHOP")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                init_stream_recv_window: std::env::var("HONK_HY2_STREAM_RWND")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                init_conn_recv_window: std::env::var("HONK_HY2_CONN_RWND")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                disable_mtu_discovery: std::env::var("HONK_HY2_DISABLE_PMTUD")
+                    .ok()
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .map(|v| v == 1),
+                quic: honk_config::node::QuicOptions {
+                    mtu: std::env::var("HONK_HY2_MTU")
+                        .ok()
+                        .and_then(|value| value.parse().ok()),
+                    tls: honk_config::node::TlsOptions {
+                        pin_sha256: std::env::var("HONK_HY2_PIN").ok().filter(|s| !s.is_empty()),
+                        skip_cert_verify: std::env::var("HONK_HY2_INSECURE")
+                            .ok()
+                            .and_then(|v| v.parse::<u8>().ok())
+                            .is_some_and(|v| v == 1),
+                        ..Default::default()
+                    },
+                },
+            },
+        ),
         ..Default::default()
     })
 }
@@ -1009,10 +1016,11 @@ async fn test_e2e_real_server_expected_connect_failure() {
         return;
     };
     let mut node = e2e_node().expect("HONK_HY2_SERVER required for negative e2e");
+    let hy2 = node.hysteria2_mut().unwrap();
     match mode.as_str() {
-        "auth" => node.hy2_auth = Some("known-invalid-auth".to_string()),
-        "pin" => node.tls_pin_sha256 = Some("00".repeat(32)),
-        "obfs" => node.hy2_obfs = Some("known-invalid-obfs".to_string()),
+        "auth" => hy2.auth = Some("known-invalid-auth".to_string()),
+        "pin" => hy2.quic.tls.pin_sha256 = Some("00".repeat(32)),
+        "obfs" => hy2.obfs = Some("known-invalid-obfs".to_string()),
         _ => panic!("HONK_HY2_EXPECT_CONNECT_FAILURE must be auth, pin, or obfs"),
     }
     let target: SocketAddr = "104.18.0.204:80".parse().unwrap();

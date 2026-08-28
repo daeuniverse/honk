@@ -453,8 +453,8 @@ impl NodeRuntime {
     pub fn ephemeral(node: &Node) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::new(node.clone()),
-            udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
-            runtime: crate::descriptor::descriptor(node.protocol)
+            udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
+            runtime: crate::descriptor::descriptor(node.protocol())
                 .generation_runtime(node)
                 .build(),
             ephemeral: true,
@@ -999,7 +999,7 @@ impl OutboundRuntimeRegistry {
             }
             // Validate cheap, fail-closed TLS inputs before publishing the
             // generation. The heavyweight SSL_CTX/root store stays lazy.
-            if node.tls {
+            if node.tls().is_some_and(|tls| tls.enabled) {
                 crate::tls::validate_connector_config(node).map_err(|source| {
                     RuntimeRegistryError::Tls {
                         node: node.name.clone(),
@@ -1018,8 +1018,10 @@ impl OutboundRuntimeRegistry {
                 }
                 None => Arc::new(NodeRuntime {
                     node: Arc::new(node.clone()),
-                    udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
-                    runtime: crate::descriptor::descriptor(node.protocol)
+                    udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(
+                        node,
+                    ),
+                    runtime: crate::descriptor::descriptor(node.protocol())
                         .generation_runtime(node)
                         .build(),
                     ephemeral: false,
@@ -1231,10 +1233,16 @@ mod tests {
         Node {
             id: uuid::Uuid::new_v4(),
             name: name.to_string(),
-            protocol,
             address: "1.2.3.4:443".to_string(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
             ..Default::default()
         }
+    }
+
+    fn vless_node(name: &str, mode: honk_config::node::WireMode) -> Node {
+        let mut node = node(name, NodeProtocol::VLess);
+        node.vless_mut().unwrap().mode = mode;
+        node
     }
 
     #[test]
@@ -1248,10 +1256,7 @@ mod tests {
             (WireMode::H2muxPadded, 1),
             (WireMode::MuxCool, 2),
         ] {
-            let node = Node {
-                vless_mode: mode,
-                ..node("vless", NodeProtocol::VLess)
-            };
+            let node = vless_node("vless", mode);
             let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
             let actual = match &registry.get(&node.id).unwrap().runtime {
                 ProtocolRuntime::None => 0,
@@ -1308,10 +1313,7 @@ mod tests {
     async fn warm_retention_releases_only_after_last_owner() {
         for node in [
             node("anytls-retained", NodeProtocol::AnyTLS),
-            Node {
-                vless_mode: honk_config::node::WireMode::H2mux,
-                ..node("vless-retained", NodeProtocol::VLess)
-            },
+            vless_node("vless-retained", honk_config::node::WireMode::H2mux),
         ] {
             let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
             let runtime = registry.get(&node.id).unwrap();
@@ -1642,27 +1644,22 @@ mod tests {
     #[test]
     fn udp_capability_matrix() {
         let anytls = node("x", NodeProtocol::AnyTLS);
-        assert!((crate::descriptor::descriptor(anytls.protocol).supports_udp)(&anytls));
+        assert!((crate::descriptor::descriptor(anytls.protocol()).supports_udp)(&anytls));
         let vmess = node("x", NodeProtocol::VMess);
-        assert!(!(crate::descriptor::descriptor(vmess.protocol).supports_udp)(&vmess));
+        assert!(!(crate::descriptor::descriptor(vmess.protocol()).supports_udp)(&vmess));
         let hy2 = node("x", NodeProtocol::Hysteria2);
-        assert!((crate::descriptor::descriptor(hy2.protocol).supports_udp)(
-            &hy2
-        ));
+        assert!((crate::descriptor::descriptor(hy2.protocol()).supports_udp)(&hy2));
     }
 
     #[test]
     fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
-        let unchanged = Node {
-            vless_mode: honk_config::node::WireMode::H2mux,
-            ..node("vless", NodeProtocol::VLess)
-        };
+        let unchanged = vless_node("vless", honk_config::node::WireMode::H2mux);
         let mut changed = node("tuic", NodeProtocol::Tuic);
         let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
         let first_unchanged = first.get(&unchanged.id).unwrap();
         let first_changed = first.get(&changed.id).unwrap();
 
-        changed.sni = Some("new.example.com".to_string());
+        changed.tls_mut().unwrap().sni = Some("new.example.com".to_string());
         let (second, reused) = OutboundRuntimeRegistry::build_reusing(
             &[unchanged.clone(), changed.clone()],
             64,
@@ -1732,10 +1729,7 @@ mod tests {
     async fn vless_mux_pools_retire_and_shut_down_with_their_generation() {
         use honk_config::node::WireMode;
         for mode in [WireMode::H2mux, WireMode::MuxCool] {
-            let node = Node {
-                vless_mode: mode,
-                ..node("vless", NodeProtocol::VLess)
-            };
+            let node = vless_node("vless", mode);
             let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
             let runtime = registry.get(&node.id).unwrap();
             let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
@@ -1757,10 +1751,7 @@ mod tests {
     #[test]
     fn vless_mux_runtime_reuse_is_mode_exact() {
         use honk_config::node::WireMode;
-        let node = Node {
-            vless_mode: WireMode::MuxCool,
-            ..node("vless-cool", NodeProtocol::VLess)
-        };
+        let node = vless_node("vless-cool", WireMode::MuxCool);
         let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let (unchanged, reused) =
             OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 64, Some(&first))
@@ -1771,10 +1762,8 @@ mod tests {
             &unchanged.get(&node.id).unwrap()
         ));
 
-        let changed = Node {
-            vless_mode: WireMode::H2mux,
-            ..node.clone()
-        };
+        let mut changed = node.clone();
+        changed.vless_mut().unwrap().mode = WireMode::H2mux;
         let (changed_registry, reused) = OutboundRuntimeRegistry::build_reusing(
             std::slice::from_ref(&changed),
             64,
@@ -1795,7 +1784,7 @@ mod tests {
     #[test]
     fn build_reusing_ignores_parse_timestamps() {
         let mut parsed = node("trojan", NodeProtocol::Trojan);
-        parsed.sni = Some("example.com".to_string());
+        parsed.tls_mut().unwrap().sni = Some("example.com".to_string());
         let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&parsed)).unwrap();
         let mut reparsed = parsed.clone();
         reparsed.created_at = chrono::Utc::now();

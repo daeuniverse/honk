@@ -160,20 +160,20 @@ impl JuicityHandler {
     }
 
     async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
-        let uuid_str = node
-            .juicity_uuid
+        let juicity = node.juicity().unwrap();
+        let uuid_str = juicity
+            .uuid
             .as_deref()
-            .or(node.username.as_deref())
             .ok_or_else(|| anyhow!("Juicity node '{}': missing juicity_uuid", node.name))?;
         let uuid = uuid::Uuid::parse_str(uuid_str)
             .with_context(|| format!("Juicity node '{}': invalid uuid", node.name))?;
-        let password = node
-            .juicity_password
-            .as_deref()
-            .or(node.password.as_deref())
-            .unwrap_or("")
-            .to_string();
-        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let password = juicity.password.as_deref().unwrap_or("").to_string();
+        let server_name = juicity
+            .quic
+            .tls
+            .sni
+            .clone()
+            .unwrap_or_else(|| node.host().to_string());
         // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
         // when no congestion_control is configured.
         let config = crate::quic::client_config(
@@ -181,7 +181,7 @@ impl JuicityHandler {
             &[b"h3"],
             crate::quic::QuicClientOptions {
                 keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                max_udp_payload_size: node.quic_mtu,
+                max_udp_payload_size: juicity.quic.mtu,
                 // Same receive-window rationale as hy2/tuic: quinn's
                 // 1.25 MiB stream default caps downloads around 2 Gbps
                 // on a LAN. Conn window doubles as the per-connection
@@ -194,7 +194,7 @@ impl JuicityHandler {
         .await?;
         Ok(Arc::new(JuicityClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
-                .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
+                .with_max_udp_payload_size(juicity.quic.mtu.unwrap_or(1252)),
             uuid: *uuid.as_bytes(),
             password,
         }))
@@ -457,7 +457,6 @@ impl PacketTransport for JuicityUdpTransport {
 mod tests {
     use super::*;
     use crate::quic::testutil;
-    use honk_config::types::NodeProtocol;
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -472,13 +471,22 @@ mod tests {
     fn test_node(port: u16, password: &str) -> Node {
         Node {
             name: "juicity-test".to_string(),
-            protocol: NodeProtocol::Juicity,
             host: "127.0.0.1".to_string(),
             address: format!("127.0.0.1:{port}"),
             port,
-            juicity_uuid: Some(TEST_UUID.to_string()),
-            juicity_password: Some(password.to_string()),
-            skip_cert_verify: true,
+            outbound: honk_config::node::OutboundConfig::Juicity(
+                honk_config::node::JuicityConfig {
+                    uuid: Some(TEST_UUID.to_string()),
+                    password: Some(password.to_string()),
+                    quic: honk_config::node::QuicOptions {
+                        tls: honk_config::node::TlsOptions {
+                            skip_cert_verify: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+            ),
             ..Default::default()
         }
     }

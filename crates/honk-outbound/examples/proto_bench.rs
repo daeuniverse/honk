@@ -178,14 +178,17 @@ async fn main() -> anyhow::Result<()> {
     let node = Node::from_share_link(&link)?;
     let registry = ProxyRegistry::default_resolver()?;
     let tcp = registry
-        .find(node.protocol)
+        .find(node.protocol())
         .expect("handler for protocol")
         .tcp
         .clone();
 
     println!(
         "node: {} ({:?} {}:{})",
-        node.name, node.protocol, node.host, node.port
+        node.name,
+        node.protocol(),
+        node.host,
+        node.port
     );
 
     let mut downs = Vec::with_capacity(runs);

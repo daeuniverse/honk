@@ -54,7 +54,10 @@ pub struct RealityConfig {
 /// Like pinSHA256, these keys are security assertions: an unparseable
 /// public key or short id fails closed instead of degrading the handshake.
 pub fn parse_reality_config(node: &Node) -> anyhow::Result<Option<RealityConfig>> {
-    let Some(encoded) = node
+    let Some(tls) = node.tls() else {
+        return Ok(None);
+    };
+    let Some(encoded) = tls
         .reality_public_key
         .as_deref()
         .map(str::trim)
@@ -69,13 +72,13 @@ pub fn parse_reality_config(node: &Node) -> anyhow::Result<Option<RealityConfig>
         )
     })?;
     let short_id =
-        parse_short_id(node.reality_short_id.as_deref().unwrap_or("")).ok_or_else(|| {
+        parse_short_id(tls.reality_short_id.as_deref().unwrap_or("")).ok_or_else(|| {
             anyhow::anyhow!(
                 "node '{}': invalid reality_short_id (expected even-length hex, at most 8 bytes)",
                 node.name
             )
         })?;
-    let server_name = node
+    let server_name = tls
         .sni
         .clone()
         .filter(|s| !s.is_empty())
@@ -464,46 +467,46 @@ mod tests {
         assert!(decode_public_key("!!!").is_none());
     }
 
+    fn reality_node() -> Node {
+        Node {
+            outbound: honk_config::node::OutboundConfig::Vless(Default::default()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn parse_config_none_without_public_key() {
-        let node = Node::default();
+        let node = reality_node();
         assert!(parse_reality_config(&node).unwrap().is_none());
     }
 
     #[test]
     fn parse_config_sni_fallback_and_errors() {
-        let node = Node {
-            name: "r".into(),
-            host: "203.0.113.9".into(),
-            reality_public_key: Some("ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518".into()),
-            reality_short_id: Some("a1b2".into()),
-            ..Default::default()
-        };
+        let mut node = reality_node();
+        node.name = "r".into();
+        node.host = "203.0.113.9".into();
+        let tls = node.tls_mut().unwrap();
+        tls.reality_public_key = Some("ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518".into());
+        tls.reality_short_id = Some("a1b2".into());
         let cfg = parse_reality_config(&node).unwrap().unwrap();
         assert_eq!(cfg.server_name, "203.0.113.9", "no sni: falls back to host");
         assert_eq!(cfg.short_id, [0xa1, 0xb2, 0, 0, 0, 0, 0, 0]);
 
-        let node = Node {
-            sni: Some("dl.google.com".into()),
-            ..node
-        };
+        node.tls_mut().unwrap().sni = Some("dl.google.com".into());
         let cfg = parse_reality_config(&node).unwrap().unwrap();
         assert_eq!(cfg.server_name, "dl.google.com");
 
-        let bad = Node {
-            reality_public_key: Some("not-a-key".into()),
-            ..Default::default()
-        };
+        let mut bad = reality_node();
+        bad.tls_mut().unwrap().reality_public_key = Some("not-a-key".into());
         assert!(
             parse_reality_config(&bad).is_err(),
             "bad key must fail closed"
         );
 
-        let bad = Node {
-            reality_public_key: Some("ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518".into()),
-            reality_short_id: Some("abc".into()),
-            ..Default::default()
-        };
+        let mut bad = reality_node();
+        let tls = bad.tls_mut().unwrap();
+        tls.reality_public_key = Some("ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518".into());
+        tls.reality_short_id = Some("abc".into());
         assert!(
             parse_reality_config(&bad).is_err(),
             "bad sid must fail closed"

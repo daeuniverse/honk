@@ -41,7 +41,7 @@ pub(in crate::control) fn selector_warm_candidates(
         .filter(|group| group.policy == GroupPolicy::Selector)
         .filter_map(|group| group_manager.selector_warm_node(&group.name))
         .filter(|node| {
-            !matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
+            !matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block)
                 && configured.contains(&node.id)
                 && generation.get(&node.id).is_some()
                 && seen.insert(node.id)
@@ -158,7 +158,7 @@ pub(in crate::control) async fn warm_selector_candidate(
     } = resources;
     // Purge a moved endpoint before redial: failure must not keep the old
     // socket pinned under a stable node ID.
-    let descriptor = honk_outbound::descriptor::descriptor(node.protocol);
+    let descriptor = honk_outbound::descriptor::descriptor(node.protocol());
     let bare_addr =
         (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
     let stale = {
@@ -328,7 +328,7 @@ pub(in crate::control) fn udp_warm_candidates(
             }
             for node in leaves {
                 if matches!(
-                    node.protocol,
+                    node.protocol(),
                     honk_config::types::NodeProtocol::Direct
                         | honk_config::types::NodeProtocol::Block
                 ) {
@@ -341,7 +341,7 @@ pub(in crate::control) fn udp_warm_candidates(
                     continue;
                 };
                 if !runtime.udp_capable
-                    || !honk_outbound::descriptor::descriptor(node.protocol)
+                    || !honk_outbound::descriptor::descriptor(node.protocol())
                         .has_generation_runtime(node)
                 {
                     continue;
@@ -533,7 +533,7 @@ impl ControlPlane {
                         .get(&node_id)
                         .filter(|runtime| {
                             runtime.udp_capable
-                                && honk_outbound::descriptor::descriptor(runtime.node.protocol)
+                                && honk_outbound::descriptor::descriptor(runtime.node.protocol())
                                     .has_generation_runtime(&runtime.node)
                         })
                         .and_then(|_| {

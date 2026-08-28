@@ -400,7 +400,7 @@ impl Config {
         crate::node::Node {
             id: DIRECT_NODE_ID,
             name: Self::BUILTIN_DIRECT_NODE.to_string(),
-            protocol: crate::types::NodeProtocol::Direct,
+            outbound: crate::node::OutboundConfig::Direct,
             ..Default::default()
         }
     }
@@ -410,7 +410,7 @@ impl Config {
         crate::node::Node {
             id: BLOCK_NODE_ID,
             name: Self::BUILTIN_BLOCK_NODE.to_string(),
-            protocol: crate::types::NodeProtocol::Block,
+            outbound: crate::node::OutboundConfig::Block,
             ..Default::default()
         }
     }
@@ -662,46 +662,49 @@ impl Config {
             }
             // Reject unknown transports at load time instead of silently
             // degrading to raw TCP at dial time.
-            if !matches!(node.transport.as_str(), "" | "tcp" | "ws" | "grpc") {
+            if let Some(transport) = node.transport()
+                && !matches!(transport.transport.as_str(), "" | "tcp" | "ws" | "grpc")
+            {
                 return Err(crate::ConfigError::Validation(format!(
                     "Node '{}' has unsupported transport '{}' (expected tcp/ws/grpc)",
-                    node.name, node.transport
+                    node.name, transport.transport
                 )));
             }
-            if let Some(flow) = node.flow.as_deref() {
-                if node.reality_public_key.is_none() && !node.tls {
-                    return Err(crate::ConfigError::Validation(format!(
-                        "Node '{}' sets flow '{}' without TLS or REALITY",
-                        node.name, flow
-                    )));
+            if let Some(vless) = node.vless() {
+                if let Some(flow) = vless.flow.as_deref() {
+                    if vless.tls.reality_public_key.is_none() && !vless.tls.enabled {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "Node '{}' sets flow '{}' without TLS or REALITY",
+                            node.name, flow
+                        )));
+                    }
+                    if flow != "xtls-rprx-vision" {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "Node '{}' has unsupported flow '{}' (expected xtls-rprx-vision)",
+                            node.name, flow
+                        )));
+                    }
                 }
-                if flow != "xtls-rprx-vision" {
-                    return Err(crate::ConfigError::Validation(format!(
-                        "Node '{}' has unsupported flow '{}' (expected xtls-rprx-vision)",
-                        node.name, flow
-                    )));
-                }
-            }
-            if node.protocol == crate::types::NodeProtocol::VLess
-                && node
+                if vless
                     .encryption
                     .as_deref()
                     .is_some_and(|value| !value.is_empty() && value != "none")
-                && node.flow.as_deref().is_some_and(|flow| !flow.is_empty())
-            {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Node '{}' combines VLESS Encryption with flow; this combination is unsupported",
-                    node.name
-                )));
+                    && vless.flow.as_deref().is_some_and(|flow| !flow.is_empty())
+                {
+                    return Err(crate::ConfigError::Validation(format!(
+                        "Node '{}' combines VLESS Encryption with flow; this combination is unsupported",
+                        node.name
+                    )));
+                }
             }
-            node.validate_vless_mode()?;
+            node.validate_protocol()?;
             // direct/block are the injected built-ins; a user node may
             // neither take their names nor their protocols.
             if matches!(
                 node.name.as_str(),
                 Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE
             ) || matches!(
-                node.protocol,
+                node.protocol(),
                 crate::types::NodeProtocol::Direct | crate::types::NodeProtocol::Block
             ) {
                 return Err(crate::ConfigError::Validation(format!(
@@ -868,7 +871,13 @@ mod builtin_nodes_tests {
         config.nodes.push(crate::node::Node {
             name: "bad".into(),
             address: "1.2.3.4:443".into(),
-            transport: "kcp".into(),
+            outbound: crate::node::OutboundConfig::Trojan(crate::node::TrojanConfig {
+                transport: crate::node::StreamTransportOptions {
+                    transport: "kcp".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let err = config.validate().unwrap_err();
@@ -877,7 +886,7 @@ mod builtin_nodes_tests {
             "unknown transport must be rejected at load: {err}"
         );
         for ok in ["", "tcp", "ws", "grpc"] {
-            config.nodes[0].transport = ok.into();
+            config.nodes[0].transport_mut().unwrap().transport = ok.into();
             assert!(config.validate().is_ok(), "transport '{ok}' must pass");
         }
     }
@@ -900,8 +909,9 @@ mod builtin_nodes_tests {
             crate::node::WireMode::MuxCool,
         ] {
             config.nodes[0] = base.clone();
-            config.nodes[0].vless_mode = mode;
-            config.nodes[0].flow = Some("xtls-rprx-vision".into());
+            let vless = config.nodes[0].vless_mut().unwrap();
+            vless.mode = mode;
+            vless.flow = Some("xtls-rprx-vision".into());
             assert!(
                 config
                     .validate()
@@ -911,28 +921,20 @@ mod builtin_nodes_tests {
             );
         }
         config.nodes[0] = base.clone();
-        config.nodes[0].vless_mode = crate::node::WireMode::Xudp;
-        config.nodes[0].flow = Some("xtls-rprx-vision".into());
+        let vless = config.nodes[0].vless_mut().unwrap();
+        vless.mode = crate::node::WireMode::Xudp;
+        vless.flow = Some("xtls-rprx-vision".into());
         assert!(config.validate().is_ok());
 
-        config.nodes[0] = base.clone();
-        config.nodes[0].encryption = Some("mlkem768x25519plus.native.1rtt.key".into());
+        config.nodes[0] = base;
+        config.nodes[0].vless_mut().unwrap().encryption =
+            Some("mlkem768x25519plus.native.1rtt.key".into());
         assert!(
             config
                 .validate()
                 .unwrap_err()
                 .to_string()
                 .contains("with VLESS Encryption")
-        );
-
-        config.nodes[0] = base;
-        config.nodes[0].protocol = crate::types::NodeProtocol::Trojan;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("non-VLESS protocol")
         );
     }
 
@@ -944,11 +946,19 @@ mod builtin_nodes_tests {
             ("web-proxy", crate::types::NodeProtocol::Direct),
             ("web-proxy", crate::types::NodeProtocol::Block),
         ] {
+            let outbound = match protocol {
+                crate::types::NodeProtocol::Socks5 => {
+                    crate::node::OutboundConfig::Socks5(Default::default())
+                }
+                crate::types::NodeProtocol::Direct => crate::node::OutboundConfig::Direct,
+                crate::types::NodeProtocol::Block => crate::node::OutboundConfig::Block,
+                _ => unreachable!(),
+            };
             let mut config = Config::default();
             config.nodes.push(crate::node::Node {
                 name: name.into(),
                 address: "1.2.3.4:8080".into(),
-                protocol,
+                outbound,
                 ..Default::default()
             });
             let err = config.validate().unwrap_err();
@@ -976,7 +986,7 @@ mod builtin_nodes_tests {
             "conflict error must name both nodes: {err}"
         );
         // A credential change breaks the tie.
-        config.nodes[1].password = Some("other".into());
+        config.nodes[1].trojan_mut().unwrap().password = Some("other".into());
         config.nodes[1].id = config.nodes[1].derive_id();
         assert!(config.validate().is_ok());
     }
@@ -989,10 +999,16 @@ mod builtin_nodes_tests {
         assert_eq!(config.nodes.len(), 2);
         assert_eq!(config.nodes[0].name, "direct");
         assert_eq!(config.nodes[0].id, DIRECT_NODE_ID);
-        assert_eq!(config.nodes[0].protocol, crate::types::NodeProtocol::Direct);
+        assert_eq!(
+            config.nodes[0].protocol(),
+            crate::types::NodeProtocol::Direct
+        );
         assert_eq!(config.nodes[1].name, "block");
         assert_eq!(config.nodes[1].id, BLOCK_NODE_ID);
-        assert_eq!(config.nodes[1].protocol, crate::types::NodeProtocol::Block);
+        assert_eq!(
+            config.nodes[1].protocol(),
+            crate::types::NodeProtocol::Block
+        );
         config.ensure_builtin_nodes();
         assert_eq!(config.nodes.len(), 2);
         assert!(config.validate().is_ok(), "built-ins stay valid");
