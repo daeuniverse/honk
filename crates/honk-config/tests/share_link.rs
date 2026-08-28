@@ -5,10 +5,26 @@ use base64::Engine as _;
 use honk_config::Config;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// URL-safe base64 without padding (the encoding used by vmess links).
 fn b64(s: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)
+}
+
+#[derive(Clone)]
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn serialization_golden_node() -> Node {
@@ -92,6 +108,39 @@ fn test_legacy_cross_protocol_fields_are_stripped() {
     let flat = serde_json::to_value(&node).unwrap();
     assert_eq!(flat["tls"], false);
     assert!(flat["hy2_obfs"].is_null());
+}
+
+#[test]
+fn test_unused_username_credential_is_stripped_and_warned() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || LogWriter(Arc::clone(&writer)))
+        .finish();
+    let node = tracing::subscriber::with_default(subscriber, || {
+        serde_json::from_str::<Node>(
+            r#"{
+                "name":"username-only",
+                "protocol":"trojan",
+                "address":"proxy.example:443",
+                "host":"proxy.example",
+                "port":443,
+                "username":"secret"
+            }"#,
+        )
+        .unwrap()
+    });
+
+    assert!(node.trojan().unwrap().password.is_none());
+    assert!(serde_json::to_value(&node).unwrap()["username"].is_null());
+    let output = String::from_utf8(output.lock().clone()).unwrap();
+    assert!(
+        output.contains("credential field 'password' is empty; 'username' is not used by trojan"),
+        "{output}"
+    );
+    assert!(output.contains("fields=username"), "{output}");
 }
 
 #[test]

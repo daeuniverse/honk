@@ -142,6 +142,36 @@ impl FlatNode {
             self.protocol,
             NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
         );
+        let unused_username_credential = if self.username.is_some() {
+            match self.protocol {
+                NodeProtocol::Trojan | NodeProtocol::VLess
+                    if self.password.as_deref().is_none_or(str::is_empty) =>
+                {
+                    Some("password")
+                }
+                NodeProtocol::Hysteria2
+                    if self
+                        .hy2_auth
+                        .as_deref()
+                        .or(self.password.as_deref())
+                        .is_none_or(str::is_empty) =>
+                {
+                    Some("hy2_auth/password")
+                }
+                NodeProtocol::AnyTLS
+                    if self
+                        .password
+                        .as_deref()
+                        .or(self.anytls_password.as_deref())
+                        .is_none_or(str::is_empty) =>
+                {
+                    Some("password/anytls_password")
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let mut dropped = Vec::new();
         macro_rules! strip {
             ($condition:expr, $field:ident) => {
@@ -154,16 +184,17 @@ impl FlatNode {
 
         strip!(
             self.username.is_some()
-                && !matches!(
-                    self.protocol,
-                    NodeProtocol::Socks5
-                        | NodeProtocol::Trojan
-                        | NodeProtocol::VLess
-                        | NodeProtocol::Hysteria2
-                        | NodeProtocol::Tuic
-                        | NodeProtocol::Juicity
-                        | NodeProtocol::AnyTLS
-                ),
+                && (unused_username_credential.is_some()
+                    || !matches!(
+                        self.protocol,
+                        NodeProtocol::Socks5
+                            | NodeProtocol::Trojan
+                            | NodeProtocol::VLess
+                            | NodeProtocol::Hysteria2
+                            | NodeProtocol::Tuic
+                            | NodeProtocol::Juicity
+                            | NodeProtocol::AnyTLS
+                    )),
             username
         );
         strip!(
@@ -293,12 +324,23 @@ impl FlatNode {
         );
 
         if !dropped.is_empty() {
-            tracing::warn!(
-                node = %self.name,
-                protocol = %self.protocol.as_str(),
-                fields = %dropped.join(", "),
-                "ignoring protocol-incompatible fields"
-            );
+            if let Some(credential) = unused_username_credential {
+                tracing::warn!(
+                    node = %self.name,
+                    protocol = %self.protocol.as_str(),
+                    fields = %dropped.join(", "),
+                    "credential field '{}' is empty; 'username' is not used by {}",
+                    credential,
+                    self.protocol.as_str()
+                );
+            } else {
+                tracing::warn!(
+                    node = %self.name,
+                    protocol = %self.protocol.as_str(),
+                    fields = %dropped.join(", "),
+                    "ignoring protocol-incompatible fields"
+                );
+            }
         }
     }
 

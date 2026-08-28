@@ -1468,6 +1468,7 @@ dependencies = [
  "glob",
  "ipnet",
  "libc",
+ "parking_lot",
  "regex",
  "serde",
  "serde_json",
@@ -1476,6 +1477,7 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
