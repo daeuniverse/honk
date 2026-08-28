@@ -112,9 +112,14 @@ fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task:
     })
 }
 
+#[cfg(test)]
+type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
+
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Arc<Config>>>,
+    /// Reuse decisions must observe the generation they eventually replace.
+    reload_lock: tokio::sync::Mutex<()>,
     log_file_override: Option<PathBuf>,
     effective_log_file: Option<PathBuf>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
@@ -180,6 +185,12 @@ pub struct ControlPlane {
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
+    /// Startup publication is non-fatal; the next reload must retry it.
+    routing_publication_dirty: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "reload-bench-counters")]
+    reload_slow_path_entries: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pre_dns_publication_hook: parking_lot::Mutex<Option<PreDnsPublicationHook>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
     /// shutdown so it cannot re-attach hooks mid-drain.
     #[cfg(feature = "ebpf")]
@@ -238,6 +249,12 @@ impl ControlPlane {
 
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
+    }
+
+    #[cfg(feature = "reload-bench-counters")]
+    pub fn reload_slow_path_entries(&self) -> u64 {
+        self.reload_slow_path_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shared backend cell, used by the interface watcher for dynamic attach.
@@ -300,6 +317,15 @@ impl ControlPlane {
     pub fn is_datapath_healthy(&self) -> bool {
         self.datapath_healthy
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "reload-bench-counters")]
+    #[doc(hidden)]
+    pub fn reload_benchmark_dns_generation(&self) -> u64 {
+        self.dns_controller
+            .runtime_provider()
+            .current_generation()
+            .get()
     }
 }
 

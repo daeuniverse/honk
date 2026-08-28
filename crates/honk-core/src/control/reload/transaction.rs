@@ -1,26 +1,79 @@
 use super::*;
 
 #[cfg(test)]
-type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
-
-#[cfg(test)]
-static PRE_DNS_PUBLICATION_HOOK: std::sync::LazyLock<
-    parking_lot::Mutex<Option<(usize, PreDnsPublicationHook)>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
-
-#[cfg(test)]
-pub(in crate::control) struct PreDnsPublicationHookGuard {
-    owner: usize,
+pub(in crate::control) struct PreDnsPublicationHookGuard<'a> {
+    hook: &'a parking_lot::Mutex<Option<PreDnsPublicationHook>>,
 }
 
 #[cfg(test)]
-impl Drop for PreDnsPublicationHookGuard {
+impl Drop for PreDnsPublicationHookGuard<'_> {
     fn drop(&mut self) {
-        let mut hook = PRE_DNS_PUBLICATION_HOOK.lock();
-        if hook.as_ref().map(|(owner, _)| *owner) == Some(self.owner) {
-            hook.take();
+        self.hook.lock().take();
+    }
+}
+
+fn domain_routes_eq(
+    left: &[(crate::ebpf::maps::LpmKey, honk_ebpf_common::DomainRouting)],
+    right: &[(crate::ebpf::maps::LpmKey, honk_ebpf_common::DomainRouting)],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((left_key, left), (right_key, right))| {
+                crate::ebpf::maps::lpm_key_bytes(left_key)
+                    == crate::ebpf::maps::lpm_key_bytes(right_key)
+                    && left.bitmap == right.bitmap
+            })
+}
+
+fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
+    let mut static_nodes = Vec::with_capacity(candidate.nodes.len());
+    let mut candidate_subscription_nodes =
+        std::collections::HashMap::<uuid::Uuid, Vec<Node>>::new();
+    for node in std::mem::take(&mut candidate.nodes) {
+        if let Some(subscription_id) = node.subscription_id {
+            candidate_subscription_nodes
+                .entry(subscription_id)
+                .or_default()
+                .push(node);
+        } else {
+            static_nodes.push(node);
         }
     }
+    let mut matched_previous = std::collections::HashSet::new();
+
+    for subscription in candidate.subscriptions.iter_mut().filter(|sub| sub.enabled) {
+        let candidate_id = subscription.id;
+        if let Some(previous) = current.subscriptions.iter().find(|previous| {
+            previous.url == subscription.url && !matched_previous.contains(&previous.id)
+        }) {
+            matched_previous.insert(previous.id);
+            subscription.id = previous.id;
+            let current_nodes = current
+                .nodes
+                .iter()
+                .filter(|node| node.subscription_id == Some(previous.id));
+            if current_nodes.clone().next().is_some() {
+                static_nodes.extend(current_nodes.cloned());
+                continue;
+            }
+        }
+
+        if let Some(mut nodes) = candidate_subscription_nodes.remove(&candidate_id) {
+            for node in &mut nodes {
+                node.subscription_id = Some(subscription.id);
+            }
+            static_nodes.extend(nodes);
+        }
+    }
+
+    candidate.nodes = static_nodes;
+    honk_config::parser::resolve_group_filters(
+        &mut candidate.groups,
+        &candidate.nodes,
+        &candidate.subscriptions,
+    );
 }
 
 impl ControlPlane {
@@ -28,38 +81,98 @@ impl ControlPlane {
     pub(in crate::control) fn set_pre_dns_publication_hook(
         &self,
         hook: impl FnOnce(&Arc<GroupManager>) + Send + 'static,
-    ) -> PreDnsPublicationHookGuard {
-        let owner = self as *const Self as usize;
-        *PRE_DNS_PUBLICATION_HOOK.lock() = Some((owner, Box::new(hook)));
-        PreDnsPublicationHookGuard { owner }
+    ) -> PreDnsPublicationHookGuard<'_> {
+        *self.pre_dns_publication_hook.lock() = Some(Box::new(hook));
+        PreDnsPublicationHookGuard {
+            hook: &self.pre_dns_publication_hook,
+        }
     }
     /// Atomically publish a rebuilt router, config, group manager, outbound
     /// runtime generation, DNS runtime, and exact eBPF routing plan. Build
     /// failures leave the current generation untouched; an eBPF push failure
-    /// replays the exact active plan before admission resumes. SIGHUP and
-    /// subscription merges share this command-channel-serialized path.
+    /// replays the exact active plan before admission resumes. SIGHUP,
+    /// subscription merges, and public callers share this serialized path.
     pub(in crate::control) async fn apply_runtime_config(
+        &self,
+        new_config: Config,
+        drain: &DrainTracker,
+    ) -> bool {
+        let _reload = self.reload_lock.lock().await;
+        self.apply_runtime_config_locked(new_config, drain).await
+    }
+
+    /// Apply a SIGHUP candidate after rebasing its in-memory subscription
+    /// nodes against the snapshot being replaced. The signal task may have
+    /// prepared the candidate while another runtime update was committing.
+    pub(in crate::control) async fn apply_sighup_config(
+        &self,
+        mut new_config: Config,
+        drain: &DrainTracker,
+    ) -> bool {
+        let _reload = self.reload_lock.lock().await;
+        let current = self.config.read().await.clone();
+        rebase_subscription_nodes(&current, &mut new_config);
+        new_config.ensure_local_direct_rules();
+        self.apply_runtime_config_locked(new_config, drain).await
+    }
+
+    pub(in crate::control) async fn apply_runtime_config_locked(
         &self,
         mut new_config: Config,
         drain: &DrainTracker,
     ) -> bool {
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
-        self.apply_resolved_runtime_config(new_config, drain).await
+        self.apply_resolved_runtime_config_locked(new_config, drain)
+            .await
     }
 
     /// Publish an explicit runtime configuration through the same transaction
     /// used by SIGHUP and subscription refreshes.
     pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
-        self.apply_runtime_config(new_config, &DrainTracker::new())
-            .await
+        let drain = Arc::clone(&self.drain_tracker);
+        self.apply_runtime_config(new_config, &drain).await
     }
 
-    pub(in crate::control) async fn apply_resolved_runtime_config(
+    pub(in crate::control) async fn apply_resolved_runtime_config_locked(
         &self,
-        new_config: Config,
+        mut new_config: Config,
         drain: &DrainTracker,
     ) -> bool {
-        let current_config = self.config.read().await.as_ref().clone();
+        let current_router = self.router.read().await.clone();
+        let current_config = self.config.read().await.clone();
+        let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
+        let current_dns_forwarder = self.dns_controller.forwarder();
+        let current_dns_router = current_dns_forwarder.routing_snapshot();
+        if config_unchanged
+            && !self
+                .routing_publication_dirty
+                .load(std::sync::atomic::Ordering::Acquire)
+            && self.is_datapath_healthy()
+        {
+            let traffic_geo = current_router.geo_requirements();
+            let dns_geo = current_dns_router.geo_requirements_snapshot();
+            let geo_probe = crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
+            let traffic_geo_fingerprint = geo_probe.fingerprint_for(traffic_geo);
+            let dns_geo_fingerprint = geo_probe.fingerprint_for(dns_geo);
+            let hosts_fingerprint =
+                match crate::dns::forwarder::HostsSourceSet::probe_fingerprint(&new_config.dns) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        error!(%error, "Failed to fingerprint DNS hosts snapshot");
+                        self.stop_reload_rejection_if_healthy(drain);
+                        return false;
+                    }
+                };
+            if current_router.geo_fingerprint() == traffic_geo_fingerprint
+                && current_dns_router.geo_fingerprint() == dns_geo_fingerprint
+                && current_dns_forwarder.policy_id().is_some_and(|policy| {
+                    policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
+                })
+            {
+                info!("Configuration unchanged — retaining active runtime generation");
+                return true;
+            }
+        }
         let candidate_log_file =
             crate::resolved_log_file_path(&new_config, self.log_file_override.as_deref());
         let restart_required = restart_required_changes(
@@ -75,31 +188,58 @@ impl ControlPlane {
             );
             return false;
         }
-        let old_plan = self.active_routing_plan.read().clone();
 
-        // Build the candidate completely before mutating live state.
-        let new_router = match Router::new(
-            &new_config.routing.rules,
-            &new_config.routing.default_outbound,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to build new router: {}", e);
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
-            }
-        };
-        let pinned_router = match Router::new(
-            &new_config.routing.rules,
-            &new_config.routing.default_outbound,
-        ) {
-            Ok(router) => Arc::new(router),
+        #[cfg(feature = "reload-bench-counters")]
+        self.reload_slow_path_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let traffic_geo = crate::routing::GeoRequirements::for_traffic(&new_config.routing.rules);
+        let dns_geo = crate::dns::routing::DnsRouter::geo_requirements(&new_config.dns);
+        let geo_requirements = traffic_geo.union(&dns_geo);
+        let geo_sources = crate::routing::GeoSourceSet::load(&geo_requirements);
+        let traffic_geo_fingerprint = geo_sources.fingerprint_for(&traffic_geo);
+        let dns_geo_fingerprint = geo_sources.fingerprint_for(&dns_geo);
+        let hosts_sources = match crate::dns::forwarder::HostsSourceSet::load(&new_config.dns) {
+            Ok(sources) => sources,
             Err(error) => {
-                error!(%error, "Failed to build pinned DNS traffic router");
+                error!(%error, "Failed to load DNS hosts snapshot");
                 self.stop_reload_rejection_if_healthy(drain);
                 return false;
             }
         };
+        let candidate_dns_policy = match crate::dns::policy::PolicyId::from_config_with_artifacts(
+            &new_config.dns,
+            &hosts_sources.fingerprint(),
+            &dns_geo_fingerprint,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                error!(%error, "Failed to derive DNS policy identity");
+                self.stop_reload_rejection_if_healthy(drain);
+                return false;
+            }
+        };
+        let old_plan = self.active_routing_plan.read().clone();
+        let reuse_routing_state = routing_state_reusable(&current_config, &new_config)
+            && current_router.geo_fingerprint() == traffic_geo_fingerprint;
+        // Build the candidate completely before mutating live state.
+        let new_router = if reuse_routing_state {
+            current_router
+        } else {
+            match Router::new_with_geo_sources(
+                &new_config.routing.rules,
+                &new_config.routing.default_outbound,
+                &geo_sources,
+            ) {
+                Ok(router) => router,
+                Err(error) => {
+                    error!(%error, "Failed to build new router");
+                    self.stop_reload_rejection_if_healthy(drain);
+                    return false;
+                }
+            }
+        };
+        let pinned_router = Arc::new(new_router.clone());
         let old_group_manager = self.group_manager.read().clone();
         let new_group_manager = Arc::new(GroupManager::with_alive_set_and_score_state(
             &new_config.groups,
@@ -131,12 +271,46 @@ impl ControlPlane {
                     return false;
                 }
             };
+        let reuse_dns_router = dns_routing_state_reusable(&current_config, &new_config)
+            && current_dns_router.geo_fingerprint() == dns_geo_fingerprint;
+        let dns_router = if reuse_dns_router {
+            current_dns_router
+        } else {
+            match crate::dns::routing::DnsRouter::new_with_geo_sources(
+                &new_config.dns,
+                &geo_sources,
+            ) {
+                Ok(router) => Arc::new(router),
+                Err(error) => {
+                    error!(%error, "Failed to build DNS router");
+                    self.stop_reload_rejection_if_healthy(drain);
+                    return false;
+                }
+            }
+        };
+        let current_hosts = current_dns_forwarder.hosts_snapshot();
+        let hosts_changed = hosts_sources.fingerprint() != current_hosts.fingerprint();
+        let hosts_snapshot = if !hosts_changed {
+            current_hosts
+        } else {
+            match hosts_sources.parse() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    error!(%error, "Failed to parse DNS hosts snapshot");
+                    self.stop_reload_rejection_if_healthy(drain);
+                    return false;
+                }
+            }
+        };
         let (new_dns_forwarder, new_upstream_pool) = match self
             .build_dns_forwarder(
                 &new_config,
                 Arc::clone(&pinned_router),
                 Arc::clone(&new_group_manager),
                 Arc::clone(&new_runtime_registry),
+                candidate_dns_policy,
+                dns_router,
+                hosts_snapshot,
             )
             .await
         {
@@ -148,19 +322,19 @@ impl ControlPlane {
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
-        let old_connectivity =
-            group_connectivity_snapshot(&current_config, &old_group_manager, &self.alive_set);
-        let new_connectivity =
-            group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
-        let new_plan = match Self::compile_routing_plan(&new_config, &new_router) {
-            Ok(plan) => Arc::new(plan),
-            Err(error) => {
-                error!(%error, "Failed to compile routing publication");
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
+        let new_plan = if reuse_routing_state {
+            Arc::clone(&old_plan)
+        } else {
+            match Self::compile_routing_plan(&new_config, &new_router) {
+                Ok(plan) => Arc::new(plan),
+                Err(error) => {
+                    error!(%error, "Failed to compile routing publication");
+                    self.stop_reload_rejection_if_healthy(drain);
+                    return false;
+                }
             }
         };
         let push_result = new_plan.result();
@@ -180,18 +354,6 @@ impl ControlPlane {
             Arc::clone(&pinned_router),
             push_result.domain_bitmaps,
         ));
-        let old_domain_routes = self
-            .dns_controller
-            .project_routes(&old_projection_snapshot)
-            .into_iter()
-            .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
-            .collect::<Vec<_>>();
-        let new_domain_routes = self
-            .dns_controller
-            .project_routes(&projection_snapshot)
-            .into_iter()
-            .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
-            .collect::<Vec<_>>();
         let new_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
@@ -271,11 +433,40 @@ impl ControlPlane {
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
             let mut ebpf = self.ebpf.write().await;
+            let projection_publication = self.dns_controller.prepare_projection_publication();
             let mut group_guard = self.group_manager.write();
             let mut outbound_guard = self.outbound_id_map.write();
             let mut plan_guard = self.active_routing_plan.write();
             let mut runtime_guard = self.runtime_registry.write();
             'publication: {
+                let old_connectivity = group_connectivity_snapshot(
+                    &current_config,
+                    &old_group_manager,
+                    &self.alive_set,
+                );
+                let new_connectivity =
+                    group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
+                let mut old_domain_routes = projection_publication
+                    .project(&old_projection_snapshot)
+                    .into_iter()
+                    .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
+                    .collect::<Vec<_>>();
+                let mut new_domain_routes = projection_publication
+                    .project(&projection_snapshot)
+                    .into_iter()
+                    .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
+                    .collect::<Vec<_>>();
+                old_domain_routes
+                    .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
+                new_domain_routes
+                    .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
+                let routing_publication_needed = self
+                    .routing_publication_dirty
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    || !old_plan.semantically_eq(&new_plan)
+                    || !domain_routes_eq(&old_domain_routes, &new_domain_routes);
+                let bitmap_generation_fence_needed =
+                    routing_publication_needed || !reuse_routing_state;
                 let provider = self.dns_controller.runtime_provider();
                 let publication = provider.prepare_publication(new_runtime);
 
@@ -286,57 +477,70 @@ impl ControlPlane {
                     error!(%error, ?restore, "Failed to open group connectivity for reload transition");
                     break 'publication Err(());
                 }
-                let active_generation = match ebpf.active_routing_generation() {
-                    Ok(generation) => generation,
-                    Err(error) => {
-                        error!(%error, "Failed to read active routing generation");
+                if routing_publication_needed {
+                    let active_generation = match ebpf.active_routing_generation() {
+                        Ok(generation) => generation,
+                        Err(error) => {
+                            let restore =
+                                publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
+                            error!(%error, ?restore, "Failed to read active routing generation");
+                            break 'publication Err(());
+                        }
+                    };
+                    let next_generation =
+                        active_generation ^ (honk_ebpf_common::ROUTING_GENERATION_COUNT as u32 - 1);
+                    if let Err(error) =
+                        ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
+                    {
+                        let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
+                        error!(%error, ?restore, "Failed to stage learned domain routes");
                         break 'publication Err(());
                     }
-                };
-                let next_generation =
-                    active_generation ^ (honk_ebpf_common::ROUTING_GENERATION_COUNT as u32 - 1);
-                if let Err(error) =
-                    ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
-                {
-                    let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
-                    error!(%error, ?restore, "Failed to stage learned domain routes");
-                    break 'publication Err(());
-                }
-                if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
-                    ebpf.as_mut(),
-                    Some(&old_plan),
-                    &new_plan,
-                ) {
-                    let replay = ebpf
-                        .stage_domain_routing_generation(next_generation, &old_domain_routes)
-                        .and_then(|_| {
-                            routing_matcher::RoutingMatcherBuilder::push_transition(
-                                ebpf.as_mut(),
-                                Some(&old_plan),
-                                &old_plan,
-                            )
-                            .map(|_| ())
-                        })
-                        .and_then(|_| publish_group_connectivity(ebpf.as_mut(), &old_connectivity));
-                    match replay {
-                        Ok(()) => {
-                            error!(
-                                %error,
-                                "Failed to push routing to eBPF; exact active plan replayed"
-                            );
+                    if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
+                        ebpf.as_mut(),
+                        Some(&old_plan),
+                        &new_plan,
+                    ) {
+                        let replay = ebpf
+                            .stage_domain_routing_generation(next_generation, &old_domain_routes)
+                            .and_then(|_| {
+                                routing_matcher::RoutingMatcherBuilder::push_transition(
+                                    ebpf.as_mut(),
+                                    Some(&old_plan),
+                                    &old_plan,
+                                )
+                                .map(|_| ())
+                            })
+                            .and_then(|_| {
+                                publish_group_connectivity(ebpf.as_mut(), &old_connectivity)
+                            });
+                        match replay {
+                            Ok(()) => {
+                                error!(
+                                    %error,
+                                    "Failed to push routing to eBPF; exact active plan replayed"
+                                );
+                            }
+                            Err(replay_error) => {
+                                error!(
+                                    %error,
+                                    %replay_error,
+                                    "Routing push and active-plan replay failed; datapath unhealthy"
+                                );
+                                self.datapath_healthy
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                self.drain_tracker.start_rejecting();
+                            }
                         }
-                        Err(replay_error) => {
-                            error!(
-                                %error,
-                                %replay_error,
-                                "Routing push and active-plan replay failed; datapath unhealthy"
-                            );
-                            self.datapath_healthy
-                                .store(false, std::sync::atomic::Ordering::Release);
-                            self.drain_tracker.start_rejecting();
-                        }
+                        break 'publication Err(());
                     }
-                    break 'publication Err(());
+                }
+                if bitmap_generation_fence_needed {
+                    routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
+                }
+                if routing_publication_needed {
+                    self.routing_publication_dirty
+                        .store(false, std::sync::atomic::Ordering::Release);
                 }
 
                 if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
@@ -355,9 +559,8 @@ impl ControlPlane {
                 new_group_manager.publish_score_membership();
                 #[cfg(test)]
                 if let Some(hook) = {
-                    let mut hook = PRE_DNS_PUBLICATION_HOOK.lock();
-                    (hook.as_ref().map(|(owner, _)| *owner) == Some(self as *const Self as usize))
-                        .then(|| hook.take().expect("matching hook exists").1)
+                    let mut hook = self.pre_dns_publication_hook.lock();
+                    hook.take()
                 } {
                     hook(&new_group_manager);
                 }
@@ -366,12 +569,12 @@ impl ControlPlane {
                 *config_guard = Arc::new(new_config);
                 *group_guard = Arc::clone(&new_group_manager);
                 *outbound_guard = new_outbound_id_map;
-                *plan_guard = Arc::clone(&new_plan);
+                if routing_publication_needed {
+                    *plan_guard = Arc::clone(&new_plan);
+                }
                 // The projection worker takes eBPF before its generation fence;
-                // install the snapshot under the same lock so no old batch can
-                // enter the newly activated datapath generation.
-                self.dns_controller
-                    .update_projection_snapshot(projection_snapshot);
+                // publish under both locks so an old batch cannot enter this snapshot.
+                projection_publication.commit(projection_snapshot);
                 Ok(old_registry)
             }
         };
@@ -388,7 +591,6 @@ impl ControlPlane {
             }
         };
 
-        routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);
         install_interrupt_callback(
@@ -534,19 +736,20 @@ impl ControlPlane {
     /// Build a DNS forwarder from an explicit config (used by the reload
     /// pipeline's build phase — must not read live state, so the caller can
     /// abort before commit without having mutated anything).
+    #[allow(clippy::too_many_arguments)]
     async fn build_dns_forwarder(
         &self,
         config: &Config,
         router: Arc<Router>,
         group_manager: Arc<GroupManager>,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+        dns_policy: crate::dns::policy::PolicyId,
+        dns_router: Arc<crate::dns::routing::DnsRouter>,
+        hosts_snapshot: crate::dns::forwarder::HostsSnapshot,
     ) -> anyhow::Result<(
         Arc<crate::dns::forwarder::DnsForwarder>,
         Arc<crate::dns::upstream_pool::UpstreamPool>,
     )> {
-        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
-            &config.dns,
-        )?);
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
                 &config.dns.upstream,
@@ -557,7 +760,7 @@ impl ControlPlane {
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
                 ),
-                config.dns.strategy.clone(),
+                config.dns.strategy,
             )?
             .with_client_subnet(config.dns.effective_client_subnet()?)
             .with_runtime_generation(runtime_generation)
@@ -580,11 +783,11 @@ impl ControlPlane {
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
                 std::time::Duration::from_millis(config.global.connect_timeout_ms),
             )
-            .with_strategy(config.dns.strategy.clone())
+            .with_strategy(config.dns.strategy)
             .with_cache_enabled(config.dns.cache.enabled)
             .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
-            .with_policy_from_config(&config.dns)?
-            .with_hosts_from_config(&config.dns)?,
+            .with_policy_id(dns_policy)
+            .with_hosts_snapshot(hosts_snapshot),
         );
         Ok((forwarder, dns_upstream_pool))
     }

@@ -183,12 +183,15 @@ async fn config_backed_forwarder_populates_typed_policy_identity() {
 
     let outcome = forwarder.resolve_outcome(&query).await.expect("outcome");
 
+    let hosts = crate::dns::forwarder::HostsSourceSet::load(&config).unwrap();
+    let expected = crate::dns::policy::PolicyId::from_config_with_artifacts(
+        &config,
+        &hosts.fingerprint(),
+        &forwarder.routing_snapshot().geo_fingerprint(),
+    )
+    .unwrap();
     assert_eq!(
         outcome.policy_id().map(ToString::to_string),
-        Some(
-            crate::dns::policy::PolicyId::from_config(&config)
-                .expect("expected policy")
-                .to_string()
-        )
+        Some(expected.to_string())
     );
 }

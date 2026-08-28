@@ -111,13 +111,16 @@ impl ResponseTraversal {
 }
 
 pub struct Planner {
-    router: DnsRouter,
+    router: Arc<DnsRouter>,
     upstreams: BTreeSet<UpstreamTag>,
 }
 
 impl Planner {
-    pub fn new(router: DnsRouter, upstreams: BTreeSet<UpstreamTag>) -> Self {
-        Self { router, upstreams }
+    pub fn new(router: impl Into<Arc<DnsRouter>>, upstreams: BTreeSet<UpstreamTag>) -> Self {
+        Self {
+            router: router.into(),
+            upstreams,
+        }
     }
 
     pub fn plan_request(&self, context: RequestContext<'_>) -> Result<RequestPlan, PlanError> {

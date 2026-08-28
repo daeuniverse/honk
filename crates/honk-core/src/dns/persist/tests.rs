@@ -50,3 +50,19 @@ fn fixture(
 fn upstream(name: &str) -> RequestScope {
     RequestScope::Upstream(UpstreamTag::new(name).expect("upstream"))
 }
+
+#[test]
+fn artifact_aware_policy_round_trips_through_persistence_codec() {
+    let config = DnsConfig::default();
+    let policy = PolicyId::from_config_with_artifacts(&config, &[1; 32], &[2; 32]).unwrap();
+    let (key, response, _) = fixture(
+        IngressProfile::Internal,
+        Some(policy.clone()),
+        upstream("default"),
+    );
+    let encoded = codec::encode(&key, &response, 123);
+
+    let decoded = codec::decode(&encoded.suffix, &encoded.bytes, Some(&policy)).unwrap();
+
+    assert_eq!(decoded.key.policy_id(), Some(&policy));
+}

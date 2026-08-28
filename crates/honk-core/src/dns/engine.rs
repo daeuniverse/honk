@@ -90,8 +90,16 @@ pub(crate) enum ResponseDirective {
 }
 
 impl DnsEngine {
+    #[cfg(test)]
     pub(crate) fn from_router(
         router: &DnsRouter,
+        policy_id: Option<PolicyId>,
+    ) -> Result<Self, EngineError> {
+        Self::from_shared_router(Arc::new(router.clone()), policy_id)
+    }
+
+    pub(crate) fn from_shared_router(
+        router: Arc<DnsRouter>,
         policy_id: Option<PolicyId>,
     ) -> Result<Self, EngineError> {
         let upstreams = router
@@ -100,7 +108,7 @@ impl DnsEngine {
             .map(|name| UpstreamTag::new(&name))
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            planner: Planner::new(router.clone(), upstreams),
+            planner: Planner::new(router, upstreams),
             policy_id,
         })
     }

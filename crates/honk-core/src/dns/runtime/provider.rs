@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -20,7 +19,6 @@ pub(crate) struct DnsServiceProvider {
     state: RwLock<ProviderState>,
     supervisors: Mutex<JoinSet<()>>,
     deadline: Duration,
-    publication_count: AtomicU64,
 }
 
 pub(crate) struct PreparedPublication<'a> {
@@ -28,7 +26,6 @@ pub(crate) struct PreparedPublication<'a> {
     supervisors: MutexGuard<'a, JoinSet<()>>,
     replacement: Arc<DnsRuntime>,
     deadline: Duration,
-    publication_count: &'a AtomicU64,
 }
 
 impl PreparedPublication<'_> {
@@ -57,7 +54,6 @@ impl PreparedPublication<'_> {
         let deadline = self.deadline;
         self.supervisors
             .spawn(async move { retired.retire(deadline).await });
-        self.publication_count.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -74,7 +70,6 @@ impl DnsServiceProvider {
             }),
             supervisors: Mutex::new(JoinSet::new()),
             deadline,
-            publication_count: AtomicU64::new(0),
         }
     }
 
@@ -97,7 +92,6 @@ impl DnsServiceProvider {
             supervisors: self.supervisors.lock(),
             replacement,
             deadline: self.deadline,
-            publication_count: &self.publication_count,
         }
     }
 

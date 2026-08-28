@@ -1,4 +1,217 @@
 use super::*;
+use sha2::{Digest, Sha256};
+use std::io::Read as _;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GeoRequirements {
+    geosite_codes: std::collections::HashSet<String>,
+    geoip_codes: std::collections::HashSet<String>,
+}
+
+impl GeoRequirements {
+    pub(crate) fn for_traffic(rules: &[RoutingRule]) -> Self {
+        let mut requirements = Self::default();
+        for rule in rules {
+            for code in rule
+                .condition
+                .geosite
+                .iter()
+                .chain(&rule.condition.not.geosite)
+            {
+                requirements.add_geosite(code);
+            }
+            for code in rule
+                .condition
+                .geo_ip
+                .iter()
+                .chain(&rule.condition.not.geo_ip)
+            {
+                requirements.add_geoip(code);
+            }
+        }
+        requirements
+    }
+
+    pub(crate) fn add_geosite(&mut self, code: &str) {
+        let code = code.trim().to_lowercase();
+        if !code.is_empty() {
+            self.geosite_codes.insert(code);
+        }
+    }
+
+    pub(crate) fn add_geoip(&mut self, code: &str) {
+        let code = code.trim().to_lowercase();
+        if !code.is_empty() && code != "private" {
+            self.geoip_codes.insert(code);
+        }
+    }
+
+    pub(crate) fn union(&self, other: &Self) -> Self {
+        let mut union = self.clone();
+        union
+            .geosite_codes
+            .extend(other.geosite_codes.iter().cloned());
+        union.geoip_codes.extend(other.geoip_codes.iter().cloned());
+        union
+    }
+}
+
+#[derive(Clone)]
+enum GeoSource {
+    Unused,
+    Missing,
+    Present {
+        bytes: Option<Arc<[u8]>>,
+        content_digest: [u8; 32],
+    },
+}
+
+impl GeoSource {
+    fn present(bytes: Vec<u8>) -> Self {
+        let content_digest = Sha256::digest(&bytes).into();
+        Self::Present {
+            bytes: Some(bytes.into()),
+            content_digest,
+        }
+    }
+
+    fn digest(content_digest: [u8; 32]) -> Self {
+        Self::Present {
+            bytes: None,
+            content_digest,
+        }
+    }
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Present { bytes, .. } => bytes.as_deref(),
+            Self::Unused | Self::Missing => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GeoSourceSet {
+    geosite: GeoSource,
+    geoip: GeoSource,
+    fingerprint: [u8; 32],
+}
+
+impl GeoSourceSet {
+    pub(crate) fn load(requirements: &GeoRequirements) -> Self {
+        let geosite = capture_source(!requirements.geosite_codes.is_empty(), find_geosite_dat);
+        let geoip = capture_source(!requirements.geoip_codes.is_empty(), find_geoip_dat);
+        Self::from_sources(geosite, geoip)
+    }
+
+    pub(crate) fn probe_union(first: &GeoRequirements, second: &GeoRequirements) -> Self {
+        let geosite = probe_source_digest(
+            !first.geosite_codes.is_empty() || !second.geosite_codes.is_empty(),
+            find_geosite_dat,
+        );
+        let geoip = probe_source_digest(
+            !first.geoip_codes.is_empty() || !second.geoip_codes.is_empty(),
+            find_geoip_dat,
+        );
+        Self::from_sources(geosite, geoip)
+    }
+
+    fn from_sources(geosite: GeoSource, geoip: GeoSource) -> Self {
+        let fingerprint = fingerprint_sources(
+            &geosite,
+            !matches!(&geosite, GeoSource::Unused),
+            &geoip,
+            !matches!(&geoip, GeoSource::Unused),
+        );
+        Self {
+            geosite,
+            geoip,
+            fingerprint,
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+
+    pub(crate) fn fingerprint_for(&self, requirements: &GeoRequirements) -> [u8; 32] {
+        fingerprint_sources(
+            &self.geosite,
+            !requirements.geosite_codes.is_empty(),
+            &self.geoip,
+            !requirements.geoip_codes.is_empty(),
+        )
+    }
+}
+
+fn capture_source(required: bool, find: fn() -> Option<std::path::PathBuf>) -> GeoSource {
+    if !required {
+        return GeoSource::Unused;
+    }
+    let Some(path) = find() else {
+        return GeoSource::Missing;
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => GeoSource::present(bytes),
+        Err(error) => {
+            tracing::warn!("failed to read {}: {}", path.display(), error);
+            GeoSource::Missing
+        }
+    }
+}
+
+fn probe_source_digest(required: bool, find: fn() -> Option<std::path::PathBuf>) -> GeoSource {
+    if !required {
+        return GeoSource::Unused;
+    }
+    let Some(path) = find() else {
+        return GeoSource::Missing;
+    };
+    match digest_file(&path) {
+        Ok(digest) => GeoSource::digest(digest),
+        Err(error) => {
+            tracing::warn!("failed to read {}: {}", path.display(), error);
+            GeoSource::Missing
+        }
+    }
+}
+
+fn digest_file(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hash.finalize().into());
+        }
+        hash.update(&buffer[..read]);
+    }
+}
+
+fn fingerprint_sources(
+    geosite: &GeoSource,
+    geosite_required: bool,
+    geoip: &GeoSource,
+    geoip_required: bool,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"honk.geo-source-set.v1\0");
+    update_source_fingerprint(&mut hash, b"geosite.dat\0", geosite, geosite_required);
+    update_source_fingerprint(&mut hash, b"geoip.dat\0", geoip, geoip_required);
+    hash.finalize().into()
+}
+
+fn update_source_fingerprint(hash: &mut Sha256, domain: &[u8], source: &GeoSource, required: bool) {
+    hash.update(domain);
+    match (required, source) {
+        (false, _) => hash.update([0]),
+        (true, GeoSource::Present { content_digest, .. }) => {
+            hash.update([2]);
+            hash.update(content_digest);
+        }
+        (true, GeoSource::Unused | GeoSource::Missing) => hash.update([1]),
+    }
+}
 
 /// geosite.dat / geoip.dat parsed at most once per `Router` build.
 ///
@@ -33,55 +246,27 @@ fn split_geosite_code(code: &str) -> (String, Option<String>) {
 }
 
 impl GeoAssets {
-    pub(crate) fn load(rules: &[RoutingRule]) -> Self {
-        use std::collections::HashSet;
-        let mut geosite_codes: HashSet<String> = HashSet::new();
-        let mut geoip_codes: HashSet<String> = HashSet::new();
-        for rule in rules {
-            geosite_codes.extend(
-                rule.condition
-                    .geosite
-                    .iter()
-                    .map(|c| c.trim().to_lowercase())
-                    .filter(|c| !c.is_empty()),
-            );
-            geoip_codes.extend(
-                rule.condition
-                    .geo_ip
-                    .iter()
-                    .map(|c| c.trim().to_lowercase())
-                    .filter(|c| !c.is_empty() && c != "private"),
-            );
-        }
-
-        let geosite = if geosite_codes.is_empty() {
-            None
-        } else {
-            load_geosite_index(&geosite_codes)
-        };
-        let geoip = if geoip_codes.is_empty() {
-            None
-        } else {
-            load_geoip_index(&geoip_codes)
-        };
-        Self { geosite, geoip }
-    }
-
-    /// Load GeoAssets from explicit code sets (for DNS routing).
+    /// Load GeoAssets from explicit code sets (for DNS routing and tooling tests).
+    #[cfg(test)]
     pub(crate) fn load_codes(
         geosite_codes: &std::collections::HashSet<String>,
         geoip_codes: &std::collections::HashSet<String>,
     ) -> Self {
-        let geosite = if geosite_codes.is_empty() {
-            None
-        } else {
-            load_geosite_index(geosite_codes)
+        let requirements = GeoRequirements {
+            geosite_codes: geosite_codes.clone(),
+            geoip_codes: geoip_codes.clone(),
         };
-        let geoip = if geoip_codes.is_empty() {
-            None
-        } else {
-            load_geoip_index(geoip_codes)
-        };
+        let sources = GeoSourceSet::load(&requirements);
+        Self::from_sources(&requirements, &sources)
+    }
+
+    pub(crate) fn from_sources(requirements: &GeoRequirements, sources: &GeoSourceSet) -> Self {
+        let geosite = (!requirements.geosite_codes.is_empty())
+            .then(|| load_geosite_index(&sources.geosite, &requirements.geosite_codes))
+            .flatten();
+        let geoip = (!requirements.geoip_codes.is_empty())
+            .then(|| load_geoip_index(&sources.geoip, &requirements.geoip_codes))
+            .flatten();
         Self { geosite, geoip }
     }
 
@@ -199,20 +384,13 @@ impl GeoAssets {
 }
 
 fn load_geosite_index(
+    source: &GeoSource,
     codes: &std::collections::HashSet<String>,
 ) -> Option<std::collections::HashMap<String, IndexedGeosite>> {
-    let path = find_geosite_dat()?;
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("failed to read {}: {}", path.display(), e);
-            return None;
-        }
-    };
-    match parse_geosite_index(&data, codes) {
+    match parse_geosite_index(source.bytes()?, codes) {
         Ok(index) => Some(index),
-        Err(e) => {
-            tracing::warn!("failed to parse {}: {}", path.display(), e);
+        Err(error) => {
+            tracing::warn!("failed to parse retained geosite.dat: {}", error);
             None
         }
     }
@@ -382,20 +560,13 @@ fn parse_domain_attribute(data: &[u8]) -> anyhow::Result<(String, Option<bool>)>
 
 /// Expand `geoip:<code>` to CIDRs. `geoip:private` uses a built-in list.
 fn load_geoip_index(
+    source: &GeoSource,
     codes: &std::collections::HashSet<String>,
 ) -> Option<std::collections::HashMap<String, Vec<ipnet::IpNet>>> {
-    let path = find_geoip_dat()?;
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("failed to read {}: {}", path.display(), e);
-            return None;
-        }
-    };
-    match parse_geoip_index(&data, codes) {
+    match parse_geoip_index(source.bytes()?, codes) {
         Ok(index) => Some(index),
-        Err(e) => {
-            tracing::warn!("failed to parse {}: {}", path.display(), e);
+        Err(error) => {
+            tracing::warn!("failed to parse retained geoip.dat: {}", error);
             None
         }
     }
@@ -1143,5 +1314,127 @@ mod scan_tests {
         let assets = GeoAssets::load_codes(&codes, &std::collections::HashSet::new());
         let expanded = assets.geosite_domains(&[format!("{}@{}", cat.code, attr)]);
         assert_eq!(expanded.len(), tool_count, "routing vs tool attr count");
+    }
+
+    #[test]
+    fn fingerprints_track_only_selected_asset_bytes_and_state() {
+        let first = GeoSourceSet::from_sources(
+            GeoSource::present(b"geosite-a".to_vec()),
+            GeoSource::present(b"geoip-a".to_vec()),
+        );
+        let geosite_changed = GeoSourceSet::from_sources(
+            GeoSource::present(b"geosite-b".to_vec()),
+            GeoSource::present(b"geoip-a".to_vec()),
+        );
+        let geoip_changed = GeoSourceSet::from_sources(
+            GeoSource::present(b"geosite-a".to_vec()),
+            GeoSource::present(b"geoip-b".to_vec()),
+        );
+        assert_ne!(first.fingerprint(), geosite_changed.fingerprint());
+        assert_ne!(first.fingerprint(), geoip_changed.fingerprint());
+
+        let mut geosite_only = GeoRequirements::default();
+        geosite_only.add_geosite("test");
+        assert_eq!(
+            first.fingerprint_for(&geosite_only),
+            geoip_changed.fingerprint_for(&geosite_only)
+        );
+        assert_ne!(
+            GeoSourceSet::from_sources(GeoSource::Missing, GeoSource::Unused).fingerprint(),
+            GeoSourceSet::from_sources(GeoSource::Unused, GeoSource::Unused).fingerprint()
+        );
+    }
+
+    #[test]
+    fn negated_traffic_geo_codes_are_captured_and_compiled() {
+        let condition = honk_config::routing::RoutingCondition {
+            not: honk_config::routing::RoutingNotCondition {
+                geosite: vec![" BLOCKED ".into()],
+                geo_ip: vec![" TEST ".into(), "private".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rule = RoutingRule {
+            name: "negative-geo".into(),
+            condition,
+            outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        };
+        let requirements = GeoRequirements::for_traffic(std::slice::from_ref(&rule));
+        assert_eq!(
+            requirements.geosite_codes,
+            std::collections::HashSet::from(["blocked".to_string()])
+        );
+        assert_eq!(
+            requirements.geoip_codes,
+            std::collections::HashSet::from(["test".to_string()])
+        );
+
+        let geosite = geosite_dat(&[("BLOCKED", vec![domain_msg(3, "blocked.example", &[])])]);
+        let geoip = geoip_dat(&[("TEST", vec![(&[1, 2, 3, 0], 24)])]);
+        let sources =
+            GeoSourceSet::from_sources(GeoSource::present(geosite), GeoSource::present(geoip));
+        let router = Router::new_with_geo_sources(&[rule], "direct", &sources).unwrap();
+        let connection = |domain: &str, ip: &str| ConnectionInfo {
+            domain: Some(domain.into()),
+            dst_ip: ip.parse().unwrap(),
+            dst_port: 443,
+            src_ip: "192.0.2.1".parse().unwrap(),
+            src_port: 12345,
+            protocol: "tcp",
+            process_name: None,
+            mac: None,
+            dscp: None,
+        };
+
+        assert_eq!(
+            router.route(&connection("allowed.example", "8.8.8.8")),
+            "proxy"
+        );
+        assert_eq!(
+            router.route(&connection("blocked.example", "8.8.8.8")),
+            "direct"
+        );
+        assert_eq!(
+            router.route(&connection("allowed.example", "1.2.3.4")),
+            "direct"
+        );
+
+        let mut dns = honk_config::dns::DnsConfig::default();
+        dns.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+            conditions: vec![honk_config::dns::DnsCond::Qname {
+                not: false,
+                matchers: vec![honk_config::dns::DnsDomainMatcher::Geosite(
+                    "blocked".into(),
+                )],
+            }],
+            action: honk_config::dns::DnsRequestAction::Reject,
+        }];
+        dns.routing.response.rules = vec![honk_config::dns::DnsResponseRule {
+            conditions: vec![honk_config::dns::DnsCond::Ip {
+                not: false,
+                cidrs: Vec::new(),
+                geoip: vec!["test".into()],
+            }],
+            action: honk_config::dns::DnsResponseAction::Reject,
+        }];
+        let dns_router =
+            crate::dns::routing::DnsRouter::new_with_geo_sources(&dns, &sources).unwrap();
+        assert_eq!(
+            dns_router.select_request("blocked.example", 1),
+            crate::dns::routing::DnsRequestDecision::Reject
+        );
+        assert_eq!(
+            dns_router.select_response(
+                "allowed.example",
+                1,
+                &["1.2.3.4".parse().unwrap()],
+                "default"
+            ),
+            crate::dns::routing::DnsResponseDecision::Reject
+        );
     }
 }

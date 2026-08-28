@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "honk-core"
 path = "src/main.rs"
+bench = false
 
 [dependencies]
 honk-config.workspace = true
@@ -112,6 +113,9 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
 dns-bench = []
+reload-bench = []
+reload-alloc-bench = ["reload-bench"]
+reload-bench-counters = ["reload-bench"]
 
 [build-dependencies]
 anyhow.workspace = true
@@ -138,3 +142,8 @@ required-features = ["dns-bench"]
 [[bench]]
 name = "udp"
 harness = false
+
+[[bench]]
+name = "reload"
+harness = false
+required-features = ["reload-bench"]

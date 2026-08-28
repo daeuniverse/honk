@@ -1045,7 +1045,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .effective_client_subnet()
         .map_err(anyhow::Error::new)?;
 
-    let router = routing::Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
+    let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
+    let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
+    let router = routing::Router::new_with_geo_sources(
+        &config.routing.rules,
+        &config.routing.default_outbound,
+        &geo_sources,
+    )?;
     info!("Router ready with {} compiled routes", router.route_count());
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
@@ -1057,8 +1064,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_cache = std::sync::Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(
         config.dns.cache.max_size,
     )));
-    let dns_router =
-        std::sync::Arc::new(dns::routing::DnsRouter::new_from_dns_config(&config.dns)?);
+    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_with_geo_sources(
+        &config.dns,
+        &geo_sources,
+    )?);
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
@@ -1069,7 +1078,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             config.nodes.clone(),
             config.groups.clone(),
             honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
-            config.dns.strategy.clone(),
+            config.dns.strategy,
         )?
         .with_client_subnet(dns_client_subnet)
         .with_timeouts(
@@ -1083,6 +1092,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             u.name, u.address, u.protocol, u.outbound
         );
     }
+    let hosts_sources = dns::forwarder::HostsSourceSet::load(&config.dns)?;
+    let dns_policy = dns::policy::PolicyId::from_config_with_artifacts(
+        &config.dns,
+        &hosts_sources.fingerprint(),
+        &dns_router.geo_fingerprint(),
+    )?;
+    let hosts_snapshot = hosts_sources.parse()?;
     let dns_forwarder = std::sync::Arc::new(
         dns::forwarder::DnsForwarder::new(
             dns_upstream_pool.clone() as std::sync::Arc<dyn dns::forwarder::DnsUpstreamPool>,
@@ -1093,11 +1109,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),
         )
-        .with_strategy(config.dns.strategy.clone())
+        .with_strategy(config.dns.strategy)
         .with_cache_enabled(config.dns.cache.enabled)
         .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
-        .with_policy_from_config(&config.dns)?
-        .with_hosts_from_config(&config.dns)?,
+        .with_policy_id(dns_policy)
+        .with_hosts_snapshot(hosts_snapshot),
     );
     info!("DNS forwarder ready");
 
@@ -1354,10 +1370,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     // immediate background refresh for fresh data.
                     let refresh_subs: Vec<_> = {
                         let current = config_handle.read().await;
+                        let mut matched_previous = std::collections::HashSet::new();
                         for sub in &mut new_config.subscriptions {
-                            if let Some(old) =
-                                current.subscriptions.iter().find(|o| o.url == sub.url)
-                            {
+                            if let Some(old) = current.subscriptions.iter().find(|old| {
+                                old.url == sub.url && !matched_previous.contains(&old.id)
+                            }) {
+                                matched_previous.insert(old.id);
                                 sub.id = old.id;
                             }
                         }

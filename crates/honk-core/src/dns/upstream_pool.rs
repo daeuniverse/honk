@@ -202,7 +202,7 @@ mod entries {
                 upstream.protocol,
                 upstream.tls_server_name.as_deref(),
                 bootstrap_resolver,
-                strategy.clone(),
+                strategy,
             )
             .map_err(|error| {
                 anyhow::anyhow!(

@@ -400,6 +400,8 @@ impl ControlPlane {
             match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
                 Ok(_) => {
                     routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
+                    self.routing_publication_dirty
+                        .store(false, std::sync::atomic::Ordering::Release);
                 }
                 Err(e) => {
                     warn!("Failed to push routing to eBPF (non-fatal): {}", e);
@@ -745,13 +747,17 @@ impl ControlPlane {
                     match cmd {
                         Some(ControlCommand::ReloadConfig { request_id, config }) => {
                             info!("SIGHUP reload request {request_id} started");
-                            if self.apply_runtime_config(*config, &drain).await {
+                            if self.apply_sighup_config(*config, &drain).await {
                                 info!("SIGHUP reload request {request_id} applied");
                             } else {
                                 warn!("SIGHUP reload request {request_id} rejected");
                             }
                         }
-                        Some(ControlCommand::MergeSubscription { subscription_id, name, nodes }) => {
+                        Some(ControlCommand::MergeSubscription {
+                            subscription_id,
+                            name,
+                            nodes,
+                        }) => {
                             info!(
                                 "Merging {} node(s) from subscription '{}'",
                                 nodes.len(),
@@ -764,15 +770,16 @@ impl ControlPlane {
                                 );
                                 continue;
                             }
-                            let new_config = {
-                                let current = self.config.read().await;
-                                config_with_subscription_nodes(&current, subscription_id, nodes)
-                            };
-                            // Same serialized rebuild path as ReloadConfig —
-                            // both commands queue on this single channel.
-                            let _ = self.apply_runtime_config(new_config, &drain).await;
+                            let _ = self
+                                .merge_subscription_nodes_with_drain(
+                                    subscription_id,
+                                    nodes,
+                                    &drain,
+                                )
+                                .await;
                         }
                         Some(ControlCommand::NetworkChanged) => {
+                            let _reload = self.reload_lock.lock().await;
                             let current = self.config.read().await.clone();
                             let mut next = current.as_ref().clone();
                             let routing_changed = next.ensure_local_direct_rules();
@@ -793,10 +800,12 @@ impl ControlPlane {
                                         client_subnet_changed,
                                         "refreshing runtime after network change"
                                     );
-                                    self.apply_resolved_runtime_config(new_config, &drain).await
+                                    self.apply_resolved_runtime_config_locked(new_config, &drain)
+                                        .await
                                 }
                                 None => true,
                             };
+                            drop(_reload);
                             if !applied {
                                 warn!("network-triggered runtime refresh rejected");
                                 if self

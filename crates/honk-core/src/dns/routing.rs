@@ -3,7 +3,6 @@
 //! Routes DNS queries by domain, qtype, logical client source, response IPs, and upstream metadata.
 
 mod compiler {
-    use std::collections::HashSet;
 
     use honk_config::dns::{
         DnsCond, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
@@ -12,7 +11,9 @@ mod compiler {
     use tracing::warn;
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
-    use crate::routing::{BinaryLpmTrie, GeoAssets, GeositeMatcher, parse_ip_net_str};
+    use crate::routing::{
+        BinaryLpmTrie, GeoAssets, GeoRequirements, GeositeMatcher, parse_ip_net_str,
+    };
 
     #[derive(Clone)]
     pub(super) struct CompiledRequestRule {
@@ -31,27 +32,33 @@ mod compiler {
         pub(super) response_rules: Vec<CompiledResponseRule>,
     }
 
-    pub(super) fn compile(
+    pub(super) fn requirements(
         request: &DnsRequestRouting,
         response: &DnsResponseRouting,
-    ) -> anyhow::Result<CompiledRouting> {
-        let mut geosite_codes = HashSet::new();
-        let mut geoip_codes = HashSet::new();
+    ) -> GeoRequirements {
+        let mut requirements = GeoRequirements::default();
         for conditions in request
             .rules
             .iter()
             .map(|rule| rule.conditions.as_slice())
             .chain(response.rules.iter().map(|rule| rule.conditions.as_slice()))
         {
-            collect_cond_codes(conditions, &mut geosite_codes, &mut geoip_codes);
+            collect_cond_codes(conditions, &mut requirements);
         }
-        let assets = GeoAssets::load_codes(&geosite_codes, &geoip_codes);
+        requirements
+    }
+
+    pub(super) fn compile(
+        request: &DnsRequestRouting,
+        response: &DnsResponseRouting,
+        assets: &GeoAssets,
+    ) -> anyhow::Result<CompiledRouting> {
         let request_rules = request
             .rules
             .iter()
             .map(|rule| {
                 Ok(CompiledRequestRule {
-                    conditions: compile_conditions(&rule.conditions, &assets, true)?,
+                    conditions: compile_conditions(&rule.conditions, assets, true)?,
                     action: rule.action.clone(),
                 })
             })
@@ -61,7 +68,7 @@ mod compiler {
             .iter()
             .map(|rule| {
                 Ok(CompiledResponseRule {
-                    conditions: compile_conditions(&rule.conditions, &assets, false)?,
+                    conditions: compile_conditions(&rule.conditions, assets, false)?,
                     action: rule.action.clone(),
                 })
             })
@@ -72,27 +79,20 @@ mod compiler {
         })
     }
 
-    fn collect_cond_codes(
-        conditions: &[DnsCond],
-        geosite: &mut HashSet<String>,
-        geoip: &mut HashSet<String>,
-    ) {
+    fn collect_cond_codes(conditions: &[DnsCond], requirements: &mut GeoRequirements) {
         for condition in conditions {
             match condition {
                 DnsCond::Qname { matchers, .. } => {
                     for matcher in matchers {
                         if let DnsDomainMatcher::Geosite(code) = matcher {
-                            geosite.insert(code.to_lowercase());
+                            requirements.add_geosite(code);
                         }
                     }
                 }
                 DnsCond::Ip { geoip: codes, .. } => {
-                    geoip.extend(
-                        codes
-                            .iter()
-                            .filter(|code| code.as_str() != "private")
-                            .map(|code| code.to_lowercase()),
-                    );
+                    for code in codes {
+                        requirements.add_geoip(code);
+                    }
                 }
                 DnsCond::Sip { .. } | DnsCond::Qtype { .. } | DnsCond::Upstream { .. } => {}
             }
@@ -340,12 +340,15 @@ mod tests;
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 
-use honk_config::dns::{DnsRequestAction, DnsResponseAction, DnsResponseRouting, DnsRouting};
+use honk_config::dns::{
+    DnsConfig, DnsRequestAction, DnsResponseAction, DnsResponseRouting, DnsRouting,
+};
 use tracing::debug;
 
-use self::compiler::{CompiledRequestRule, CompiledResponseRule, compile};
+use self::compiler::{CompiledRequestRule, CompiledResponseRule, compile, requirements};
 use self::config::{request_upstream, resolve_request_routing, response_upstream};
 use self::matcher::{Evaluation, ResponseContext, eval_conditions};
+use crate::routing::{GeoAssets, GeoRequirements, GeoSourceSet};
 
 /// Output of request routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +375,8 @@ pub struct DnsRouter {
     response_fallback: DnsResponseAction,
     fixed_domain_ttl: HashMap<String, u32>,
     rule_count: usize,
+    geo_fingerprint: [u8; 32],
+    geo_requirements: GeoRequirements,
 }
 
 impl DnsRouter {
@@ -384,19 +389,59 @@ impl DnsRouter {
         fixed_domain_ttl: &HashMap<String, u32>,
     ) -> anyhow::Result<Self> {
         let request = resolve_request_routing(config);
-        Self::build(&request, &config.response, fixed_domain_ttl)
+        let requirements = requirements(&request, &config.response);
+        let sources = GeoSourceSet::load(&requirements);
+        Self::build(
+            &request,
+            &config.response,
+            fixed_domain_ttl,
+            &requirements,
+            &sources,
+        )
     }
 
-    pub fn new_from_dns_config(dns_config: &honk_config::dns::DnsConfig) -> anyhow::Result<Self> {
-        Self::new_with_fixed_ttl(&dns_config.routing, &dns_config.fixed_domain_ttl)
+    pub fn new_from_dns_config(dns_config: &DnsConfig) -> anyhow::Result<Self> {
+        let request = resolve_request_routing(&dns_config.routing);
+        let requirements = requirements(&request, &dns_config.routing.response);
+        let sources = GeoSourceSet::load(&requirements);
+        Self::build(
+            &request,
+            &dns_config.routing.response,
+            &dns_config.fixed_domain_ttl,
+            &requirements,
+            &sources,
+        )
+    }
+
+    pub(crate) fn geo_requirements(dns_config: &DnsConfig) -> GeoRequirements {
+        let request = resolve_request_routing(&dns_config.routing);
+        requirements(&request, &dns_config.routing.response)
+    }
+
+    pub(crate) fn new_with_geo_sources(
+        dns_config: &DnsConfig,
+        geo_sources: &GeoSourceSet,
+    ) -> anyhow::Result<Self> {
+        let request = resolve_request_routing(&dns_config.routing);
+        let requirements = requirements(&request, &dns_config.routing.response);
+        Self::build(
+            &request,
+            &dns_config.routing.response,
+            &dns_config.fixed_domain_ttl,
+            &requirements,
+            geo_sources,
+        )
     }
 
     fn build(
         request: &honk_config::dns::DnsRequestRouting,
         response: &DnsResponseRouting,
         fixed_domain_ttl: &HashMap<String, u32>,
+        requirements: &GeoRequirements,
+        geo_sources: &GeoSourceSet,
     ) -> anyhow::Result<Self> {
-        let compiled = compile(request, response)?;
+        let assets = GeoAssets::from_sources(requirements, geo_sources);
+        let compiled = compile(request, response, &assets)?;
         Ok(Self {
             rule_count: compiled.request_rules.len() + compiled.response_rules.len(),
             request_rules: compiled.request_rules,
@@ -404,6 +449,8 @@ impl DnsRouter {
             response_rules: compiled.response_rules,
             response_fallback: response.fallback.clone(),
             fixed_domain_ttl: fixed_domain_ttl.clone(),
+            geo_fingerprint: geo_sources.fingerprint_for(requirements),
+            geo_requirements: requirements.clone(),
         })
     }
 
@@ -496,6 +543,14 @@ impl DnsRouter {
 
     pub fn rule_count(&self) -> usize {
         self.rule_count
+    }
+
+    pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
+        self.geo_fingerprint
+    }
+
+    pub(crate) fn geo_requirements_snapshot(&self) -> &GeoRequirements {
+        &self.geo_requirements
     }
 
     pub(crate) fn select_upstream_normalized(&self, domain: &str) -> &str {

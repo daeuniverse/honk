@@ -265,16 +265,18 @@ impl ControlPlaneHandle {
         domain: &str,
         dst_ip: std::net::IpAddr,
     ) {
-        let (rule_name, bitmaps) = {
+        let (rule_name, bitmaps, bitmap_generation) = {
             let router = self.router.read().await;
             match router.route_full(conn_info) {
                 Some(matched) => {
                     let rule_name = matched.rule_name.to_string();
-                    let bitmaps = {
+                    let (bitmaps, generation) = {
                         let db = DOMAIN_BITMAPS.read();
-                        db.get(&rule_name).cloned().unwrap_or_default()
+                        let generation = crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        (db.get(&rule_name).cloned().unwrap_or_default(), generation)
                     };
-                    (rule_name, bitmaps)
+                    (rule_name, bitmaps, generation)
                 }
                 None => return,
             }
@@ -294,6 +296,12 @@ impl ControlPlaneHandle {
             return;
         };
         let mut ebpf = self.ebpf.write().await;
+        if crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
+            .load(std::sync::atomic::Ordering::Acquire)
+            != bitmap_generation
+        {
+            return;
+        }
         match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
             Ok(()) => debug!(
                 "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
