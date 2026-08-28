@@ -197,16 +197,23 @@ pub async fn client_config(
         .iter()
         .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
         .collect::<Vec<u8>>();
+    let tls = node.tls().ok_or_else(|| {
+        anyhow!(
+            "node '{}' protocol '{}' has no QUIC TLS configuration",
+            node.name,
+            node.protocol().as_str()
+        )
+    })?;
     let ech = match crate::tls::load_ech_config_list(node)? {
         Some(list) => Some(Arc::new(list)),
-        None if node.ech_enabled => {
-            let name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        None if tls.ech_enabled => {
+            let name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
             crate::tls::discover_ech_config(&name).await.map(Arc::new)
         }
         None => None,
     };
-    let pin_sha256 = node
-        .tls_pin_sha256
+    let pin_sha256 = tls
+        .pin_sha256
         .as_deref()
         .map(|pin| {
             crate::tls::parse_pin_sha256(pin).ok_or_else(|| {
@@ -220,7 +227,7 @@ pub async fn client_config(
     let crypto =
         crate::quic_boring::BoringQuicClientConfig::new(crate::quic_boring::BoringQuicOptions {
             alpn_wire,
-            skip_cert_verify: node.skip_cert_verify,
+            skip_cert_verify: tls.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
             ech_config_list: ech,
             pin_sha256,
@@ -232,7 +239,7 @@ pub async fn client_config(
                 "{}|{}|{}|{}",
                 node.host(),
                 node.port,
-                node.sni.clone().unwrap_or_else(|| node.host().to_string()),
+                tls.sni.clone().unwrap_or_else(|| node.host().to_string()),
                 alpn.iter()
                     .map(|p| String::from_utf8_lossy(p).into_owned())
                     .collect::<Vec<_>>()
@@ -1162,6 +1169,19 @@ mod brutal_tests {
 #[cfg(test)]
 mod client_tests {
     use super::*;
+
+    fn quic_node() -> honk_config::node::Node {
+        honk_config::node::Node {
+            outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    fn skip_verify_node() -> honk_config::node::Node {
+        let mut node = quic_node();
+        node.tls_mut().unwrap().skip_cert_verify = true;
+        node
+    }
     #[test]
     fn explicit_large_mtu_enables_gso_by_default() {
         assert!(!default_gso_enabled(1252));
@@ -1178,11 +1198,9 @@ mod client_tests {
 
     #[tokio::test]
     async fn client_config_rejects_invalid_pin() {
-        let node = honk_config::node::Node {
-            name: "bad-pin".to_string(),
-            tls_pin_sha256: Some("not-a-pin".to_string()),
-            ..Default::default()
-        };
+        let mut node = quic_node();
+        node.name = "bad-pin".to_string();
+        node.tls_mut().unwrap().pin_sha256 = Some("not-a-pin".to_string());
         let error = match client_config(&node, &[b"h3"], QuicClientOptions::default()).await {
             Ok(_) => panic!("invalid pin must fail closed"),
             Err(error) => error,
@@ -1200,11 +1218,8 @@ mod client_tests {
         });
         let second_accepted =
             tokio::spawn(async move { second_server.accept().await.unwrap().await.unwrap() });
-        let node = honk_config::node::Node {
-            name: "quic-address-race".to_string(),
-            skip_cert_verify: true,
-            ..Default::default()
-        };
+        let mut node = skip_verify_node();
+        node.name = "quic-address-race".to_string();
         let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
             .await
             .unwrap();
@@ -1256,14 +1271,11 @@ mod client_tests {
     }
 
     async fn test_client(port: u16) -> QuicClient<()> {
-        let node = honk_config::node::Node {
-            name: "quic-test".to_string(),
-            host: "127.0.0.1".to_string(),
-            address: format!("127.0.0.1:{port}"),
-            port,
-            skip_cert_verify: true,
-            ..Default::default()
-        };
+        let mut node = skip_verify_node();
+        node.name = "quic-test".to_string();
+        node.host = "127.0.0.1".to_string();
+        node.address = format!("127.0.0.1:{port}");
+        node.port = port;
         let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
             .await
             .unwrap();
@@ -1440,7 +1452,7 @@ mod client_tests {
 
     fn tuic_ephemeral() -> Arc<crate::runtime::NodeRuntime> {
         crate::runtime::NodeRuntime::ephemeral(&honk_config::node::Node {
-            protocol: honk_config::types::NodeProtocol::Tuic,
+            outbound: honk_config::node::OutboundConfig::Tuic(Default::default()),
             ..Default::default()
         })
     }
@@ -1498,7 +1510,7 @@ mod client_tests {
         let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
         let probe = tokio::spawn(async move {
             let guard = NodeRuntime::ephemeral_guarded(&honk_config::node::Node {
-                protocol: honk_config::types::NodeProtocol::Tuic,
+                outbound: honk_config::node::OutboundConfig::Tuic(Default::default()),
                 ..Default::default()
             });
             let runtime = guard.runtime();
@@ -2337,11 +2349,13 @@ mod probe_tests {
         });
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(remote).await.unwrap();
-        let node = honk_config::node::Node {
-            sni: Some("localhost".into()),
-            skip_cert_verify: true,
+        let mut node = honk_config::node::Node {
+            outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
             ..Default::default()
         };
+        let tls = node.tls_mut().unwrap();
+        tls.sni = Some("localhost".into());
+        tls.skip_cert_verify = true;
         let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
             .await
             .unwrap();

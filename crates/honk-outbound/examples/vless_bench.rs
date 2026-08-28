@@ -182,8 +182,9 @@ async fn main() -> anyhow::Result<()> {
         node.name,
         node.host,
         node.port,
-        node.flow,
-        node.reality_public_key.is_some()
+        node.vless().and_then(|config| config.flow.as_ref()),
+        node.tls()
+            .is_some_and(|tls| tls.reality_public_key.is_some())
     );
 
     let mut downs = Vec::with_capacity(runs);

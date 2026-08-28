@@ -32,9 +32,9 @@ fn make_node(name: &str) -> Node {
     Node {
         id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.into(),
-        protocol: NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 1,
+        outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
         ..Default::default()
     }
 }
@@ -580,14 +580,17 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
         config
             .nodes
             .iter()
-            .map(|node| (
-                node.name.as_str(),
-                node.protocol,
-                node.address.as_str(),
-                node.port,
-                node.username.as_deref(),
-                node.password.as_deref(),
-            ))
+            .map(|node| {
+                let socks = node.socks5().unwrap();
+                (
+                    node.name.as_str(),
+                    node.protocol(),
+                    node.address.as_str(),
+                    node.port,
+                    socks.username.as_deref(),
+                    socks.password.as_deref(),
+                )
+            })
             .collect::<Vec<_>>(),
         [
             (

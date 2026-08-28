@@ -6,7 +6,12 @@ use crate::dns::endpoint::DnsEndpoint;
 /// Shared QUIC client config for DNS transports (15s keep-alive, cubic).
 pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::ClientConfig> {
     honk_outbound::quic::client_config(
-        &Default::default(),
+        &honk_config::node::Node {
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Hysteria2,
+            ),
+            ..Default::default()
+        },
         alpn,
         honk_outbound::quic::QuicClientOptions {
             keep_alive: Some(Duration::from_secs(15)),

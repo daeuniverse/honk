@@ -107,7 +107,7 @@ async fn proxied_quic_transports_use_packet_outbound() {
     );
     let proxy = Node {
         name: "proxy".to_string(),
-        protocol: NodeProtocol::Block,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
         ..Default::default()
     };
     let upstreams = [
@@ -134,17 +134,16 @@ async fn proxied_quic_transports_use_packet_outbound() {
 
     let doq = pool.query("doq", &query).await.expect_err("blocked DoQ");
     let doh3 = pool.query("doh3", &query).await.expect_err("blocked DoH3");
+    let doq_chain = format!("{doq:#}");
+    let doh3_chain = format!("{doh3:#}");
 
+    assert!(doq_chain.contains("UDP connection blocked"), "{doq_chain}");
     assert!(
-        doq.to_string().contains("UDP connection blocked"),
-        "{doq:#}"
+        doh3_chain.contains("UDP connection blocked"),
+        "{doh3_chain}"
     );
-    assert!(
-        doh3.to_string().contains("UDP connection blocked"),
-        "{doh3:#}"
-    );
-    assert!(!doq.to_string().contains("does not support outbound"));
-    assert!(!doh3.to_string().contains("does not support outbound"));
+    assert!(!doq_chain.contains("does not support outbound"));
+    assert!(!doh3_chain.contains("does not support outbound"));
     assert_eq!(pool.lifecycle_stats().init_count, 2);
 }
 
@@ -159,7 +158,7 @@ async fn proxied_quic_without_registry_fails_closed() {
     };
     let proxy = Node {
         name: "proxy".into(),
-        protocol: NodeProtocol::Block,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
         ..Default::default()
     };
     let router = Arc::new(
@@ -173,9 +172,10 @@ async fn proxied_quic_without_registry_fails_closed() {
         UpstreamPool::new_with_proxy(&[upstream], router, None, vec![proxy], vec![]).unwrap();
 
     let error = pool.query("doq", &[0; 12]).await.unwrap_err();
+    let error_chain = format!("{error:#}");
     assert!(
-        error.to_string().contains("without a proxy registry"),
-        "{error:#}"
+        error_chain.contains("without a proxy registry"),
+        "{error_chain}"
     );
 }
 
@@ -364,10 +364,11 @@ async fn stalled_tls_setups_use_dial_timeout_for_dot_and_doh() {
             .await
             .expect("TLS setup ignored dial timeout")
             .expect_err("stalled TLS setup must fail");
+        let error_chain = format!("{result:#}");
 
         assert!(
-            result.to_string().contains("timed out"),
-            "unexpected {protocol:?} setup error: {result:#}"
+            error_chain.contains("timed out"),
+            "unexpected {protocol:?} setup error: {error_chain}"
         );
         pool.close().await;
         assert_eq!(pool.lifecycle_stats().tasks, 0);

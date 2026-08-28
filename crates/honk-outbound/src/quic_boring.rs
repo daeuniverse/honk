@@ -1054,11 +1054,17 @@ mod tests {
     use super::*;
     use honk_config::node::Node;
 
-    fn skip_verify_node() -> Node {
+    fn quic_node() -> Node {
         Node {
-            skip_cert_verify: true,
+            outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
             ..Default::default()
         }
+    }
+
+    fn skip_verify_node() -> Node {
+        let mut node = quic_node();
+        node.tls_mut().unwrap().skip_cert_verify = true;
+        node
     }
 
     /// Echo server: relays every accepted bi stream back to its peer.
@@ -1340,7 +1346,7 @@ mod tests {
             boring::hash::hash(boring::hash::MessageDigest::sha256(), &cert_der).unwrap();
         let pin: String = pin_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut pinned = skip_verify_node();
-        pinned.tls_pin_sha256 = Some(pin);
+        pinned.tls_mut().unwrap().pin_sha256 = Some(pin);
         let cfg = crate::quic::client_config(&pinned, &[b"h3"], Default::default())
             .await
             .unwrap();
@@ -1433,18 +1439,14 @@ mod tests {
 
         // Matching pin works even though the cert is self-signed and the
         // node does not skip verification.
-        let node = Node {
-            tls_pin_sha256: Some(pin_hex),
-            ..Default::default()
-        };
+        let mut node = quic_node();
+        node.tls_mut().unwrap().pin_sha256 = Some(pin_hex);
         let echoed = roundtrip_to(&node, addr).await.unwrap();
         assert_eq!(&echoed, b"ping");
 
         // A mismatched pin fails the handshake.
-        let node = Node {
-            tls_pin_sha256: Some("00".repeat(32)),
-            ..Default::default()
-        };
+        let mut node = quic_node();
+        node.tls_mut().unwrap().pin_sha256 = Some("00".repeat(32));
         assert!(roundtrip_to(&node, addr).await.is_err());
     }
 
@@ -1470,12 +1472,10 @@ mod tests {
     async fn ech_over_quic_fails_closed_without_server_support() {
         static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
         crate::tls::set_tls_mode("utls");
-        let node = Node {
-            skip_cert_verify: true,
-            ech_enabled: true,
-            ech_config: Some(base64::engine::general_purpose::STANDARD.encode(ECH_CONFIG_LIST)),
-            ..Default::default()
-        };
+        let mut node = skip_verify_node();
+        let tls = node.tls_mut().unwrap();
+        tls.ech_enabled = true;
+        tls.ech_config = Some(base64::engine::general_purpose::STANDARD.encode(ECH_CONFIG_LIST));
         let err = roundtrip(&node)
             .await
             .expect_err("handshake must fail when the server cannot accept ECH");

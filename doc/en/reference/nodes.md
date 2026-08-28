@@ -83,6 +83,10 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 
 Validation requires every non-built-in node to have a non-empty name and either `address` or `host`.
 
+### Structured-loader compatibility
+
+**Compatibility change:** TOML, YAML, and JSON retain the legacy flat node keys, but loading is now strict. A non-default field that does not belong to the selected `protocol` is a parse error instead of being silently ignored; for example, an `ss` node with `tls: true` is rejected. Remove stale fields emitted by templates or generators before upgrading. Honk's serializer emits protocol-inapplicable slots only at their accepted defaults, so its own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
+
 ## Protocols
 
 | Protocol | Alias | TCP | UDP | Notes |

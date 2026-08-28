@@ -322,7 +322,7 @@ fn score_reload_config(interval: u64) -> Config {
     let nodes = ["score-a", "score-b"].map(|name| Node {
         id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     });
@@ -967,7 +967,7 @@ async fn identical_subscription_merge_skips_runtime_generation() {
     let subscription_id = uuid::Uuid::new_v4();
     let mut node = Node {
         name: "subscription-node".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:1080".into(),
         subscription_id: Some(subscription_id),
         ..Default::default()
@@ -1205,8 +1205,8 @@ fn selector_warm_candidates_follow_configured_leaves_and_deduplicate() {
     let node = |name: &str, protocol| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol,
         address: "127.0.0.1:9".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         ..Default::default()
     };
     let anytls = node("selector-anytls", NodeProtocol::AnyTLS);
@@ -1266,7 +1266,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     let first = Node {
         id: uuid::Uuid::new_v4(),
         name: "selector-first".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: first_addr.clone(),
         host: first_socket.ip().to_string(),
         port: first_socket.port(),
@@ -1275,7 +1275,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "selector-second".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: second_addr.clone(),
         host: second_socket.ip().to_string(),
         port: second_socket.port(),
@@ -1349,7 +1349,7 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "selector-moved".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: old_addr.clone(),
         host: old_socket.ip().to_string(),
         port: old_socket.port(),
@@ -1405,8 +1405,8 @@ fn udp_warm_candidates_only_use_authoritative_group_leaves() {
     let node = |name: &str, protocol| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol,
         address: "127.0.0.1:9".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         ..Default::default()
     };
     let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS);
@@ -1477,7 +1477,9 @@ fn udp_warm_candidates_bound_capacity_and_exclude_explicitly_dead_udp_leaves() {
     let node = |name: &str| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol: honk_config::types::NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::AnyTLS,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -1536,7 +1538,9 @@ fn udp_warm_candidates_enforce_a_process_wide_latency_ordered_cap() {
             let node = Node {
                 id: uuid::Uuid::new_v4(),
                 name: format!("n{g}-{i}"),
-                protocol: honk_config::types::NodeProtocol::AnyTLS,
+                outbound: honk_config::node::OutboundConfig::from_protocol(
+                    honk_config::types::NodeProtocol::AnyTLS,
+                ),
                 address: "127.0.0.1:9".into(),
                 ..Default::default()
             };
@@ -1579,7 +1583,9 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
     let node = |name: &str| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol: honk_config::types::NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::AnyTLS,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -1682,7 +1688,9 @@ async fn udp_warm_coordinator_limits_concurrency_and_keeps_shutdown_errors_neutr
         .map(|n| Node {
             id: uuid::Uuid::new_v4(),
             name: format!("node-{n}"),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
             address: "127.0.0.1:9".into(),
             ..Default::default()
         })
@@ -1765,7 +1773,9 @@ async fn udp_warm_dispatch_metrics_distinguish_live_and_terminal_errors_and_pani
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "warm-node".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -1862,7 +1872,9 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "warm-node".into(),
-        protocol: honk_config::types::NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::AnyTLS,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };

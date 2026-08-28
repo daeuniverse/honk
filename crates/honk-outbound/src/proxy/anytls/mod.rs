@@ -1685,7 +1685,13 @@ async fn connect_transport(
         Some(connector) => connector,
         None => Arc::new(crate::tls::build_connector(node)?),
     };
-    let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+    let server_name = node
+        .anytls()
+        .unwrap()
+        .tls
+        .sni
+        .clone()
+        .unwrap_or_else(|| node.host().to_string());
     let tls = tokio::time::timeout(connect_timeout, connector.connect(&server_name, tcp))
         .await
         .map_err(|_| {
@@ -1708,13 +1714,8 @@ impl AnyTlsHandler {
         Self
     }
 
-    /// Resolve the AnyTLS password: generic password first, then the
-    /// AnyTLS-specific field.
     fn resolve_password(node: &Node) -> &str {
-        node.password
-            .as_deref()
-            .or(node.anytls_password.as_deref())
-            .unwrap_or("")
+        node.anytls().unwrap().password.as_deref().unwrap_or("")
     }
 
     /// Build the client settings frame payload.
@@ -1736,9 +1737,11 @@ impl AnyTlsHandler {
         pool: &Arc<AnyTlsPool>,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) {
-        let min_idle = node.anytls_min_idle_session.unwrap_or(0);
+        let config = node.anytls().unwrap();
+        let min_idle = config.min_idle_session.unwrap_or(0);
         let idle_timeout = Duration::from_secs(
-            node.anytls_idle_session_timeout
+            config
+                .idle_session_timeout
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
         );
         let prewarm_node = node.clone();

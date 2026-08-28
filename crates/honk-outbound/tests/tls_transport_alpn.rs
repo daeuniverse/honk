@@ -41,8 +41,17 @@ async fn chrome_websocket_connector_does_not_negotiate_h2() {
 
     honk_outbound::tls::set_tls_mode("utls");
     let node = Node {
-        transport: "ws".into(),
-        skip_cert_verify: true,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            transport: honk_config::node::StreamTransportOptions {
+                transport: "ws".into(),
+                ..Default::default()
+            },
+            tls: honk_config::node::TlsOptions {
+                skip_cert_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let connector = honk_outbound::tls::build_connector(&node).unwrap();

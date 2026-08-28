@@ -7,7 +7,6 @@ use honk_config::Config;
 use honk_config::dns::{DnsLegacyRule, DnsRouting};
 use honk_config::node::{Group, GroupPolicy, Node};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
-use honk_config::types::NodeProtocol;
 use honk_core::control::ControlPlane;
 use honk_core::dns::DnsResolver;
 use honk_core::dns::cache::DnsCache;
@@ -260,6 +259,10 @@ fn contract_counter_suffix(_: Observation, _: Observation) -> String {
 }
 
 fn large_config(hosts_path: String) -> Config {
+    // CI copies this harness into main, so use the wire shape shared by both revisions.
+    let node_template: Node =
+        serde_json::from_str(r#"{"name":"","protocol":"socks5","address":"","port":0}"#)
+            .expect("reload benchmark node template must deserialize");
     let nodes = (0..512)
         .map(|index| Node {
             id: uuid::Uuid::new_v5(
@@ -267,9 +270,8 @@ fn large_config(hosts_path: String) -> Config {
                 format!("reload-bench-{index}").as_bytes(),
             ),
             name: format!("node-{index:03}"),
-            protocol: NodeProtocol::Socks5,
             address: format!("192.0.2.{}:{}", index % 250 + 1, 10_000 + index),
-            ..Default::default()
+            ..node_template.clone()
         })
         .collect::<Vec<_>>();
     let groups = nodes

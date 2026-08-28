@@ -332,7 +332,7 @@ impl ControlPlaneHandle {
         );
         let all_domain_capable = candidates.iter().all(|node| {
             matches!(
-                node.protocol,
+                node.protocol(),
                 NodeProtocol::Direct
                     | NodeProtocol::Block
                     | NodeProtocol::Socks5
@@ -662,7 +662,7 @@ impl ControlPlaneHandle {
                     let pool_health_family = health_ipver;
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
-                            .find(node.protocol)
+                            .find(node.protocol())
                             .map(|entry| {
                                 (
                                     (entry.descriptor.pool_ready_streams)(&node),
@@ -1036,7 +1036,7 @@ impl ControlPlaneHandle {
                 deposit_count += 1;
                 tokio::spawn(async move {
                     let (ready_capable, bare_capable) = registry
-                        .find(node.protocol)
+                        .find(node.protocol())
                         .map(|entry| {
                             (
                                 (entry.descriptor.pool_ready_streams)(&node),
@@ -1215,9 +1215,10 @@ impl ControlPlaneHandle {
         let on_start = Arc::new(parking_lot::Mutex::new(Some(on_start)));
 
         let addr = format!("{}:{}", node.host(), node.port);
+        let protocol = node.protocol();
         let entry = registry
-            .find(node.protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
 
         if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
             let key = ConnectionPool::ready_key(&addr, target, target_domain);

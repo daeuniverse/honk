@@ -12,7 +12,7 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
     let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
     let mut node = Node {
         name: "ready-socks".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: server_addr.ip().to_string(),
         port: server_addr.port(),
         ..Default::default()
@@ -66,7 +66,7 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
     let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
     let mut node = Node {
         name: "blocked-socks".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()

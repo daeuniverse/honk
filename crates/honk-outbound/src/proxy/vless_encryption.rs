@@ -1384,7 +1384,6 @@ mod tests {
     #[ignore = "requires HONK_VLESS_ENCRYPTION_SERVER and an Xray VLESS Encryption server"]
     async fn xray_interop_covers_1rtt_then_0rtt() {
         use honk_config::node::Node;
-        use honk_config::types::NodeProtocol;
 
         use crate::proxy::TcpOutbound as _;
 
@@ -1400,12 +1399,14 @@ mod tests {
             std::env::var("HONK_VLESS_ENCRYPTION_CONFIG").expect("HONK_VLESS_ENCRYPTION_CONFIG");
         let node = Node {
             name: "xray-vless-encryption".into(),
-            protocol: NodeProtocol::VLess,
             address: server.to_string(),
             host: server.ip().to_string(),
             port: server.port(),
-            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
-            encryption: Some(encryption),
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                uuid: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
+                encryption: Some(encryption),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let handler = crate::proxy::vless::VLessHandler::new();

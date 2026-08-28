@@ -165,7 +165,9 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
     let resolver =
         honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
     let node = Node {
-        protocol: honk_config::types::NodeProtocol::Direct,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Direct,
+        ),
         ..test_node("retry-proxy")
     };
     let traffic = Arc::new(tokio::sync::RwLock::new(

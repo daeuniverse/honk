@@ -597,7 +597,6 @@ mod tests {
     use crate::proxy::shadowsocks::ShadowsocksHandler;
     use crate::proxy::{PacketOutbound, TcpOutbound};
     use honk_config::node::Node;
-    use honk_config::types::NodeProtocol;
     use std::net::SocketAddr;
     use tokio::io::AsyncReadExt;
 
@@ -1078,12 +1077,15 @@ mod tests {
 
         let node = Node {
             name: "test-ss2022".into(),
-            protocol: NodeProtocol::SS,
             address: server_addr.ip().to_string(),
-            host: String::new(),
             port: server_addr.port(),
-            encryption: Some(method_name.to_string()),
-            password: Some(password.to_string()),
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(
+                honk_config::node::ShadowsocksConfig {
+                    encryption: Some(method_name.to_string()),
+                    password: Some(password.to_string()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         let handler = ShadowsocksHandler::new();
@@ -1172,12 +1174,15 @@ mod tests {
 
         let node = Node {
             name: "test-ss2022-udp".into(),
-            protocol: NodeProtocol::SS,
             address: server_addr.ip().to_string(),
-            host: String::new(),
             port: server_addr.port(),
-            encryption: Some("2022-blake3-aes-256-gcm".to_string()),
-            password: Some(psk_b64.to_string()),
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(
+                honk_config::node::ShadowsocksConfig {
+                    encryption: Some("2022-blake3-aes-256-gcm".into()),
+                    password: Some(psk_b64.to_string()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         let handler = ShadowsocksHandler::new();

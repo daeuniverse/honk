@@ -170,10 +170,11 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     "node '{node_name}' not found"
                 ));
             };
-            let Some(entry) = registry.find(node.protocol) else {
+            let protocol = node.protocol();
+            let Some(entry) = registry.find(protocol) else {
                 return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                     "no handler for protocol {:?}",
-                    node.protocol
+                    protocol
                 ));
             };
             let connect_timeout = match config.try_read() {
@@ -184,7 +185,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     );
                 }
             };
-            let domain = if node.protocol == NodeProtocol::Direct {
+            let domain = if protocol == NodeProtocol::Direct {
                 None
             } else {
                 url_host(&check_url)
@@ -472,13 +473,14 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
 
         Box::pin(async move {
             let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
+            let protocol = node.protocol();
             let entry = registry
-                .find(node.protocol)
-                .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
+                .find(protocol)
+                .ok_or_else(|| format!("no handler for protocol {:?}", protocol))?;
             let packet = entry
                 .packet
                 .clone()
-                .ok_or_else(|| format!("protocol {:?} has no UDP capability", node.protocol))?;
+                .ok_or_else(|| format!("protocol {:?} has no UDP capability", protocol))?;
             let connect_timeout = {
                 let config = config
                     .try_read()
@@ -765,8 +767,19 @@ pub(super) async fn resolve_quic_score_target(
         .parse::<std::net::IpAddr>()
         .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
     let tls_node = Node {
-        sni: Some(host.clone()),
-        skip_cert_verify: true,
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                quic: honk_config::node::QuicOptions {
+                    tls: honk_config::node::TlsOptions {
+                        sni: Some(host.clone()),
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
         ..Node::default()
     };
     let config = match honk_outbound::quic::client_config(

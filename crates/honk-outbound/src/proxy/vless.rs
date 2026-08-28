@@ -80,7 +80,8 @@ impl VLessHandler {
         &self,
         node: &Node,
     ) -> anyhow::Result<Option<Arc<super::vless_encryption::ClientConfig>>> {
-        let Some(value) = node
+        let vless = node.vless().unwrap();
+        let Some(value) = vless
             .encryption
             .as_deref()
             .map(str::trim)
@@ -89,7 +90,7 @@ impl VLessHandler {
             return Ok(None);
         };
         anyhow::ensure!(
-            node.flow.as_deref().is_none_or(str::is_empty),
+            vless.flow.as_deref().is_none_or(str::is_empty),
             "VLESS Encryption cannot be combined with XTLS flow"
         );
         let cache_key = if node.id.is_nil() {
@@ -196,13 +197,14 @@ impl VLessHandler {
         uuid: [u8; 16],
         tcp: TcpStream,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        let vless = node.vless().unwrap();
         if let Some(config) = self.encryption_config(node)? {
             let stream = super::transport::wrap_transport(node, tcp).await?;
             let encrypted = config.connect(stream).await?;
             return Ok(Self::wrap_response_stream(node, uuid, Box::new(encrypted)));
         }
-        if node.flow.as_deref() == Some("xtls-rprx-vision")
-            && matches!(node.transport.as_str(), "" | "tcp")
+        if vless.flow.as_deref() == Some("xtls-rprx-vision")
+            && matches!(vless.transport.transport.as_str(), "" | "tcp")
         {
             let stream: Box<dyn AsyncReadWrite> =
                 match super::transport::maybe_tls_wrap_concrete(node, tcp).await? {
@@ -225,7 +227,7 @@ impl VLessHandler {
         stream: Box<dyn AsyncReadWrite>,
     ) -> Box<dyn AsyncReadWrite> {
         let stripped = ResponseHeaderStrip::new(stream);
-        if node.flow.as_deref() == Some("xtls-rprx-vision") {
+        if node.vless().unwrap().flow.as_deref() == Some("xtls-rprx-vision") {
             Box::new(VisionStream::new(stripped, uuid))
         } else {
             Box::new(stripped)
@@ -260,13 +262,14 @@ impl VLessHandler {
         tcp: Option<TcpStream>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let uuid_bytes = Self::parse_uuid(node.password.as_deref().unwrap_or(""))?;
+        let vless = node.vless().unwrap();
+        let uuid_bytes = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
             &uuid_bytes,
             CMD_TCP,
             Some(target),
             target_domain,
-            node.flow.as_deref(),
+            vless.flow.as_deref(),
         )?;
         let stream = self
             .dial_carrier(node, uuid_bytes, header, tcp, connect_timeout)
@@ -283,13 +286,14 @@ impl VLessHandler {
         node: &Node,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let uuid = Self::parse_uuid(node.password.as_deref().unwrap_or(""))?;
+        let vless = node.vless().unwrap();
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
             &uuid,
             super::vless_cool::VLESS_MUX_COMMAND,
             None,
             None,
-            node.flow.as_deref(),
+            vless.flow.as_deref(),
         )?;
         self.dial_carrier(node, uuid, header, None, connect_timeout)
             .await
@@ -297,7 +301,7 @@ impl VLessHandler {
 
     fn uses_mux_runtime(node: &Node) -> bool {
         matches!(
-            node.vless_mode,
+            node.vless().unwrap().mode,
             WireMode::H2mux | WireMode::H2muxPadded | WireMode::MuxCool
         )
     }
@@ -307,7 +311,7 @@ impl VLessHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<super::vless_mux::VlessMuxSession>> {
         let (target, domain) = super::vless_mux::physical_target();
-        let padded = node.vless_mode == WireMode::H2muxPadded;
+        let padded = node.vless().unwrap().mode == WireMode::H2muxPadded;
         let stream = Self::new()
             .dial_base(&node, target, Some(domain), None, connect_timeout)
             .await?
@@ -1106,7 +1110,7 @@ impl TcpOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        match node.vless_mode {
+        match node.vless().unwrap().mode {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
                 let stream =
@@ -1150,7 +1154,7 @@ impl TcpOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        match runtime.node.vless_mode {
+        match runtime.node.vless().unwrap().mode {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 Self::open_h2_tcp(runtime, target, target_domain, connect_timeout).await
             }
@@ -1177,7 +1181,7 @@ impl PacketOutbound for VLessHandler {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!("VLESS node '{}' disables UDP", node.name);
         }
-        match node.vless_mode {
+        match node.vless().unwrap().mode {
             WireMode::Legacy => anyhow::bail!(
                 "VLESS UDP requires uot-v2, xudp, h2mux, h2mux-padded, or mux-cool mode"
             ),
@@ -1224,7 +1228,7 @@ impl PacketOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        match runtime.node.vless_mode {
+        match runtime.node.vless().unwrap().mode {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await
             }
@@ -1245,7 +1249,7 @@ impl PacketOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        match runtime.node.vless_mode {
+        match runtime.node.vless().unwrap().mode {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 let pool = runtime.vless_h2_pool()?;
                 let node = Arc::clone(&runtime.node);
@@ -1286,7 +1290,7 @@ impl WarmableOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
         _requirement: WarmRequirement,
     ) -> anyhow::Result<()> {
-        match runtime.node.vless_mode {
+        match runtime.node.vless().unwrap().mode {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 let pool = runtime.vless_h2_pool()?;
                 let node = Arc::clone(&runtime.node);
@@ -1321,8 +1325,18 @@ impl ProbeableOutbound for VLessHandler {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use honk_config::types::NodeProtocol;
     use tokio::io::AsyncReadExt;
+
+    fn vless_node(uuid: &str, mode: WireMode) -> Node {
+        Node {
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                uuid: Some(uuid.into()),
+                mode,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
 
     /// AsyncRead yielding at most `chunk` bytes per poll, to force frame
     /// headers and UUID detection across read boundaries.
@@ -1638,10 +1652,8 @@ mod tests {
             raw.shutdown(std::net::Shutdown::Both).ok();
         });
 
-        let node = Node {
-            skip_cert_verify: true,
-            ..Default::default()
-        };
+        let mut node = vless_node("", WireMode::Legacy);
+        node.tls_mut().unwrap().skip_cert_verify = true;
         let connector = crate::tls::build_connector(&node).unwrap();
         let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut tls = connector.connect("localhost", tcp).await.unwrap();
@@ -1781,12 +1793,10 @@ mod tests {
 
         let node = Node {
             name: "vless-lazy".into(),
-            protocol: NodeProtocol::VLess,
-            address: format!("127.0.0.1:{}", port),
+            address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some(uuid_str.into()),
-            ..Default::default()
+            ..vless_node(uuid_str, WireMode::Legacy)
         };
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let mut ps = tokio::time::timeout(
@@ -1853,13 +1863,10 @@ mod tests {
 
         let node = Node {
             name: "vless-uot".into(),
-            protocol: NodeProtocol::VLess,
             address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
-            vless_mode: WireMode::UotV2,
-            ..Default::default()
+            ..vless_node("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3", WireMode::UotV2)
         };
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let transport = VLessHandler::new()
@@ -1892,13 +1899,10 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let node = Arc::new(Node {
             name: "vless-h2mux-cancel".into(),
-            protocol: NodeProtocol::VLess,
             address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
-            vless_mode: WireMode::H2mux,
-            ..Default::default()
+            ..vless_node("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3", WireMode::H2mux)
         });
         let pool = Arc::new(crate::session::SessionPool::new(
             super::super::vless_mux::session_pool_config(),
@@ -2014,13 +2018,10 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "vless-h2mux".into(),
-            protocol: NodeProtocol::VLess,
             address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
-            vless_mode: WireMode::H2mux,
-            ..Default::default()
+            ..vless_node("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3", WireMode::H2mux)
         };
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
@@ -2288,12 +2289,8 @@ mod tests {
         assert!(ready, "sing-box did not bind its VLESS listeners");
 
         let registry = super::super::ProxyRegistry::default_resolver().unwrap();
-        let base = Node {
-            protocol: NodeProtocol::VLess,
-            host: "127.0.0.1".into(),
-            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
-            ..Default::default()
-        };
+        let mut base = vless_node("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3", WireMode::Legacy);
+        base.host = "127.0.0.1".into();
         for (name, mode) in [
             ("uot-v2", WireMode::UotV2),
             ("xudp", WireMode::Xudp),
@@ -2301,54 +2298,37 @@ mod tests {
             ("h2mux-padded", WireMode::H2muxPadded),
             ("mux-cool", WireMode::MuxCool),
         ] {
-            exercise(
-                &registry,
-                Node {
-                    name: name.into(),
-                    address: format!("127.0.0.1:{plain_port}"),
-                    port: plain_port,
-                    vless_mode: mode,
-                    ..base.clone()
-                },
-                tcp_target,
-                udp_target,
-            )
-            .await;
+            let mut node = base.clone();
+            node.name = name.into();
+            node.address = format!("127.0.0.1:{plain_port}");
+            node.port = plain_port;
+            node.vless_mut().unwrap().mode = mode;
+            exercise(&registry, node, tcp_target, udp_target).await;
         }
-        exercise(
-            &registry,
-            Node {
-                name: "h2mux-tls".into(),
-                address: format!("127.0.0.1:{tls_port}"),
-                port: tls_port,
-                tls: true,
-                skip_cert_verify: true,
-                sni: Some("localhost".into()),
-                vless_mode: WireMode::H2mux,
-                ..base.clone()
-            },
-            tcp_target,
-            udp_target,
-        )
-        .await;
-        exercise(
-            &registry,
-            Node {
-                name: "h2mux-reality".into(),
-                address: format!("127.0.0.1:{reality_port}"),
-                port: reality_port,
-                tls: true,
-                sni: Some("www.cloudflare.com".into()),
-                reality_public_key: Some("pYbbKZZ-9WsXODEENCcbisSN6ol6sx5GoVisiyN1oyo".into()),
-                reality_short_id: Some("0123456789abcdef".into()),
-                reality_spider_x: Some("/".into()),
-                vless_mode: WireMode::H2muxPadded,
-                ..base.clone()
-            },
-            tcp_target,
-            udp_target,
-        )
-        .await;
+
+        let mut node = base.clone();
+        node.name = "h2mux-tls".into();
+        node.address = format!("127.0.0.1:{tls_port}");
+        node.port = tls_port;
+        node.vless_mut().unwrap().mode = WireMode::H2mux;
+        let tls = node.tls_mut().unwrap();
+        tls.enabled = true;
+        tls.skip_cert_verify = true;
+        tls.sni = Some("localhost".into());
+        exercise(&registry, node, tcp_target, udp_target).await;
+
+        let mut node = base.clone();
+        node.name = "h2mux-reality".into();
+        node.address = format!("127.0.0.1:{reality_port}");
+        node.port = reality_port;
+        node.vless_mut().unwrap().mode = WireMode::H2muxPadded;
+        let tls = node.tls_mut().unwrap();
+        tls.enabled = true;
+        tls.sni = Some("www.cloudflare.com".into());
+        tls.reality_public_key = Some("pYbbKZZ-9WsXODEENCcbisSN6ol6sx5GoVisiyN1oyo".into());
+        tls.reality_short_id = Some("0123456789abcdef".into());
+        tls.reality_spider_x = Some("/".into());
+        exercise(&registry, node, tcp_target, udp_target).await;
 
         let xray_bin = std::env::var_os("HONK_XRAY_BIN").unwrap_or_else(|| "xray".into());
         let mut xray = tokio::process::Command::new(xray_bin)
@@ -2374,37 +2354,26 @@ mod tests {
             ("xray-xudp", WireMode::Xudp),
             ("xray-mux-cool", WireMode::MuxCool),
         ] {
-            exercise(
-                &registry,
-                Node {
-                    name: name.into(),
-                    address: format!("127.0.0.1:{xray_port}"),
-                    port: xray_port,
-                    vless_mode: mode,
-                    ..base.clone()
-                },
-                tcp_target,
-                udp_target,
-            )
-            .await;
+            let mut node = base.clone();
+            node.name = name.into();
+            node.address = format!("127.0.0.1:{xray_port}");
+            node.port = xray_port;
+            node.vless_mut().unwrap().mode = mode;
+            exercise(&registry, node, tcp_target, udp_target).await;
         }
-        exercise(
-            &registry,
-            Node {
-                name: "xray-xudp-vision".into(),
-                address: format!("127.0.0.1:{xray_vision_port}"),
-                port: xray_vision_port,
-                tls: true,
-                skip_cert_verify: true,
-                sni: Some("localhost".into()),
-                flow: Some("xtls-rprx-vision".into()),
-                vless_mode: WireMode::Xudp,
-                ..base.clone()
-            },
-            tcp_target,
-            udp_target,
-        )
-        .await;
+
+        let mut node = base.clone();
+        node.name = "xray-xudp-vision".into();
+        node.address = format!("127.0.0.1:{xray_vision_port}");
+        node.port = xray_vision_port;
+        let vless = node.vless_mut().unwrap();
+        vless.mode = WireMode::Xudp;
+        vless.flow = Some("xtls-rprx-vision".into());
+        let tls = node.tls_mut().unwrap();
+        tls.enabled = true;
+        tls.skip_cert_verify = true;
+        tls.sni = Some("localhost".into());
+        exercise(&registry, node, tcp_target, udp_target).await;
 
         xray.start_kill().unwrap();
         xray.wait().await.unwrap();
@@ -2634,13 +2603,18 @@ mod tests {
 
         let node = Node {
             name: "vless-ws".into(),
-            protocol: NodeProtocol::VLess,
-            address: format!("127.0.0.1:{}", port),
+            address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some(uuid_str.into()),
-            transport: "ws".into(),
-            ws_path: Some("/vless".into()),
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                uuid: Some(uuid_str.into()),
+                transport: honk_config::node::StreamTransportOptions {
+                    transport: "ws".into(),
+                    ws_path: Some("/vless".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
@@ -2689,12 +2663,10 @@ mod tests {
 
         let node = Node {
             name: "vless-bare".into(),
-            protocol: NodeProtocol::VLess,
-            address: format!("127.0.0.1:{}", port),
+            address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some(uuid_str.into()),
-            ..Default::default()
+            ..vless_node(uuid_str, WireMode::Legacy)
         };
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let mut ps = VLessHandler::new()
@@ -2741,12 +2713,14 @@ mod tests {
 
         let node = Node {
             name: "vless-vision".into(),
-            protocol: NodeProtocol::VLess,
-            address: format!("127.0.0.1:{}", port),
+            address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some(uuid_str.into()),
-            flow: Some("xtls-rprx-vision".into()),
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                uuid: Some(uuid_str.into()),
+                flow: Some("xtls-rprx-vision".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
