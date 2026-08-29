@@ -17,7 +17,7 @@ fn start_probe_feedback(
     manager
         .read()
         .feedback_for_node(node_id, context)
-        .map(|feedback| feedback.start())
+        .map(|feedback| feedback.streak_neutral().start())
 }
 
 fn probe_setup(reporter: &ProbeReporter) {

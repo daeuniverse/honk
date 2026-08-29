@@ -274,14 +274,16 @@ impl Stats {
             self.last_used = tick;
             return;
         }
-        if sample.outcome == ScoreOutcome::Success {
-            // Liveness is proven, but the streak steps down one at a
-            // time: a flapping leaf earns the fast cadence back.
-            self.fail_streak = self.fail_streak.saturating_sub(1);
-            self.explore_not_before = None;
-        } else {
-            self.fail_streak = self.fail_streak.saturating_add(1);
-            self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
+        if !sample.streak_neutral {
+            if sample.outcome == ScoreOutcome::Success {
+                // Liveness is proven, but the streak steps down one at a
+                // time: a flapping leaf earns the fast cadence back.
+                self.fail_streak = self.fail_streak.saturating_sub(1);
+                self.explore_not_before = None;
+            } else {
+                self.fail_streak = self.fail_streak.saturating_add(1);
+                self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
+            }
         }
         if let Some(setup) = sample.setup {
             self.setup_success += 1.0;
@@ -1587,6 +1589,7 @@ pub struct ScoreFeedback {
     authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
+    streak_neutral: bool,
 }
 
 impl std::fmt::Debug for ScoreFeedback {
@@ -1608,7 +1611,16 @@ impl ScoreFeedback {
             authority,
             context,
             attributions: attributions.into(),
+            streak_neutral: false,
         }
+    }
+
+    /// Probe, urltest, and warm-up outcomes must not touch the failure
+    /// streak: a probe succeeding through a half-dead leaf must not wash out
+    /// consecutive real-flow failures (and vice versa).
+    pub fn streak_neutral(mut self) -> Self {
+        self.streak_neutral = true;
+        self
     }
 
     pub fn attributions(&self) -> &[ScoreAttribution] {
@@ -1662,6 +1674,7 @@ impl ScoreFeedback {
                 tx: AtomicU64::new(0),
                 rx: AtomicU64::new(0),
                 progress: Mutex::new(ReporterProgress::default()),
+                streak_neutral: self.streak_neutral,
             }),
         }
     }
@@ -1685,6 +1698,7 @@ struct ReporterShared {
     tx: AtomicU64,
     rx: AtomicU64,
     progress: Mutex<ReporterProgress>,
+    streak_neutral: bool,
 }
 
 /// Cloneable exact-once flow reporter. The first terminal call wins; dropping
@@ -1736,6 +1750,7 @@ impl ScoreReporter {
             authority: Arc::clone(&self.shared.authority),
             context: self.shared.context.clone(),
             attributions: Arc::clone(&self.shared.attributions),
+            streak_neutral: self.shared.streak_neutral,
         }
     }
 
@@ -1766,6 +1781,7 @@ impl ScoreReporter {
             rx: self.shared.rx.load(Ordering::Relaxed),
             elapsed: self.shared.started.elapsed(),
             count_usefulness,
+            streak_neutral: self.shared.streak_neutral,
         };
         self.shared.state.finish(
             &self.shared.context,
@@ -1798,6 +1814,7 @@ struct FlowSample {
     rx: u64,
     elapsed: Duration,
     count_usefulness: bool,
+    streak_neutral: bool,
 }
 
 impl super::GroupManager {
@@ -2638,6 +2655,7 @@ mod tests {
             rx: 0,
             elapsed: Duration::ZERO,
             count_usefulness: true,
+            streak_neutral: false,
         };
         let backed_off = |at: Instant| {
             let inner = state.inner.lock();
@@ -2653,8 +2671,22 @@ mod tests {
                 at,
             );
         };
+        let neutral = |outcome, at: Instant| {
+            let cells = state.start_at(&context, &attributions, at);
+            let mut neutral_sample = sample(outcome, None);
+            neutral_sample.streak_neutral = true;
+            state.finish_at(&context, &attributions, &cells, &neutral_sample, at);
+        };
+        let streak = |at: Instant| {
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, leaf.id, at).fail_streak
+        };
 
         fail(now);
+        // Probe/urltest/warm outcomes never move the streak or the backoff.
+        neutral(ScoreOutcome::Success, now);
+        neutral(ScoreOutcome::Timeout, now);
+        assert_eq!(streak(now), 1);
         assert!(backed_off(now + Duration::from_secs(1)));
         assert!(!backed_off(
             now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
@@ -3409,6 +3441,7 @@ mod tests {
             rx,
             elapsed,
             count_usefulness: true,
+            streak_neutral: false,
         };
 
         stats.record_finish(
@@ -3568,6 +3601,7 @@ mod tests {
                     rx: u64::from(success),
                     elapsed: Duration::from_secs(1),
                     count_usefulness: true,
+                    streak_neutral: false,
                 },
                 now,
             );
@@ -5163,6 +5197,7 @@ group {
             rx: 1,
             elapsed: Duration::from_millis(1),
             count_usefulness: true,
+            streak_neutral: false,
         };
         state.finish(
             &context,
