@@ -104,7 +104,7 @@ impl ControlPlane {
                                 pool.deposit_tcp(&addr, stream).await;
                                 stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
                                 if let Some(reporter) = &reporter {
-                                    reporter.finish(crate::group::ScoreOutcome::Success);
+                                    reporter.finish_setup_only();
                                 }
                                 debug!("Preconnect warmup: deposited connection to {}", addr);
                             }
