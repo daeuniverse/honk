@@ -154,16 +154,18 @@ async fn urltest_node_impl(
             let target = host
                 .parse::<std::net::IpAddr>()
                 .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
-            manager.feedback_for_node(
-                node.id,
-                ScoreSelectionContext {
-                    network: SelectionNetwork::Tcp,
-                    probe_domain: ProbeDomain::Tcp,
-                    target_family: Some(family),
-                    health_family: family,
-                    target: Some(target),
-                },
-            )
+            manager
+                .feedback_for_node(
+                    node.id,
+                    ScoreSelectionContext {
+                        network: SelectionNetwork::Tcp,
+                        probe_domain: ProbeDomain::Tcp,
+                        target_family: Some(family),
+                        health_family: family,
+                        target: Some(target),
+                    },
+                )
+                .map(|feedback| feedback.streak_neutral())
         });
         return measure_head_exchange(
             runtime,
@@ -202,16 +204,18 @@ async fn urltest_node_impl(
         let target = host
             .parse::<std::net::IpAddr>()
             .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
-        manager.feedback_for_node(
-            node.id,
-            ScoreSelectionContext {
-                network: SelectionNetwork::Tcp,
-                probe_domain: ProbeDomain::Tcp,
-                target_family: Some(family),
-                health_family: family,
-                target: Some(target),
-            },
-        )
+        manager
+            .feedback_for_node(
+                node.id,
+                ScoreSelectionContext {
+                    network: SelectionNetwork::Tcp,
+                    probe_domain: ProbeDomain::Tcp,
+                    target_family: Some(family),
+                    health_family: family,
+                    target: Some(target),
+                },
+            )
+            .map(|feedback| feedback.streak_neutral())
     });
     measure_head_exchange(
         runtime,
@@ -288,14 +292,16 @@ async fn urltest_node_in_generation_impl(
         .scope_dials(async {
             if !runtime.is_warm_or_stateless() {
                 let warm_reporter = start_feedback(group_manager.and_then(|manager| {
-                    manager.feedback_for_node(
-                        node.id,
-                        ScoreSelectionContext::aggregate(
-                            SelectionNetwork::Tcp,
-                            ProbeDomain::Tcp,
-                            IpVersion::V4,
-                        ),
-                    )
+                    manager
+                        .feedback_for_node(
+                            node.id,
+                            ScoreSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                IpVersion::V4,
+                            ),
+                        )
+                        .map(|feedback| feedback.streak_neutral())
                 }));
                 let warmed = match warmable {
                     Some(warmable) => {
@@ -312,7 +318,9 @@ async fn urltest_node_in_generation_impl(
                 match warmed {
                     Ok(()) => {
                         reporter_setup(&warm_reporter);
-                        reporter_success(&warm_reporter);
+                        if let Some(reporter) = &warm_reporter {
+                            reporter.finish_setup_only();
+                        }
                     }
                     Err(error) => {
                         reporter_error(&warm_reporter, &error);

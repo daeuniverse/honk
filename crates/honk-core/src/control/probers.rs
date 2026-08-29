@@ -17,7 +17,7 @@ fn start_probe_feedback(
     manager
         .read()
         .feedback_for_node(node_id, context)
-        .map(|feedback| feedback.start())
+        .map(|feedback| feedback.streak_neutral().start())
 }
 
 fn probe_setup(reporter: &ProbeReporter) {
@@ -221,7 +221,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 match warmed {
                     Ok(Ok(())) => {
                         probe_setup(&warm_reporter);
-                        probe_finish(&warm_reporter, ScoreOutcome::Success);
+                        if let Some(reporter) = &warm_reporter {
+                            reporter.finish_setup_only();
+                        }
                     }
                     Ok(Err(error)) => {
                         probe_finish(&warm_reporter, ScoreOutcome::from_error(&error));
@@ -531,10 +533,8 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     Err("UDP probe timeout".to_string())
                 }
             };
-            // A failed DNS UDP probe already proves this node's UDP path dead
-            // and feeds Score a failure; the DataUdp handshake through the
-            // same dead path only adds a doomed quinn endpoint and its ERROR
-            // log, so skip it until the node healthily passes again.
+            // The DNS probe failure already recorded the Score evidence; a
+            // handshake through the same dead path only adds quinn ERROR noise.
             if health_result.is_ok()
                 && let Some(target) = quic_score_target.as_ref()
             {

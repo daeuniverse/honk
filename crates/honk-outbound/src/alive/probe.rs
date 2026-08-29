@@ -16,7 +16,7 @@ impl AliveDialerSet {
                     ),
                 )
             })
-            .map(|feedback| feedback.start())
+            .map(|feedback| feedback.streak_neutral().start())
     }
 }
 
@@ -365,7 +365,7 @@ impl AliveDialerSet {
                 Ok(Ok(_stream)) => {
                     if let Some(reporter) = &reporter {
                         reporter.setup_succeeded();
-                        reporter.finish(ScoreOutcome::Success);
+                        reporter.finish_setup_only();
                     }
                     tracing::debug!(
                         "Health check probe succeeded for node '{}' via {} ({}ms)",

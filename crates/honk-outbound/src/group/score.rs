@@ -26,12 +26,15 @@ const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
 const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
 const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
+/// Consecutive fresh failures that drop a leaf out of the reliability band
+/// while any healthier candidate exists. Decayed history must not shield a
+/// leaf that is failing right now.
+const SCORE_FAIL_STREAK_EXCLUDE: u32 = 3;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
 
-/// Exploration retry delay for a consecutive-failure streak. Tracked outside
-/// the decaying evidence so a dead leaf is re-probed on a growing cadence
-/// instead of turning cold again after a few half-lives.
+/// Exploration retry delay for a consecutive-failure streak, tracked outside
+/// the decaying evidence so a dead leaf is not rediscovered as cold.
 fn explore_backoff(streak: u32) -> Duration {
     SCORE_EXPLORE_BACKOFF_BASE
         .saturating_mul(2u32.saturating_pow(streak.saturating_sub(1).min(7)))
@@ -272,15 +275,16 @@ impl Stats {
             self.last_used = tick;
             return;
         }
-        if sample.outcome == ScoreOutcome::Success {
-            // A success proves current liveness, so the leaf rejoins
-            // exploration immediately, but the streak only works down one
-            // step: a flapping leaf must earn the fast cadence back.
-            self.fail_streak = self.fail_streak.saturating_sub(1);
-            self.explore_not_before = None;
-        } else {
-            self.fail_streak = self.fail_streak.saturating_add(1);
-            self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
+        if !sample.streak_neutral {
+            if sample.outcome == ScoreOutcome::Success {
+                // Liveness is proven, but the streak steps down one at a
+                // time: a flapping leaf earns the fast cadence back.
+                self.fail_streak = self.fail_streak.saturating_sub(1);
+                self.explore_not_before = None;
+            } else {
+                self.fail_streak = self.fail_streak.saturating_add(1);
+                self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
+            }
         }
         if let Some(setup) = sample.setup {
             self.setup_success += 1.0;
@@ -1211,14 +1215,23 @@ fn best_index(
             }
         }
     }
+    // Fresh consecutive failures outweigh decayed success history.
+    let any_healthy = snapshots
+        .iter()
+        .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
+    let rankable =
+        |score: &&ScoreSnapshot| !any_healthy || score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE;
     let best_reliability = snapshots
         .iter()
+        .filter(rankable)
         .map(|score| score.reliability)
         .fold(0.0_f64, f64::max);
     let index = snapshots
         .iter()
         .enumerate()
-        .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+        .filter(|(_, score)| {
+            rankable(score) && best_reliability - score.reliability <= RELIABILITY_CLOSE
+        })
         .max_by(|(left_index, left), (right_index, right)| {
             utility(left, performance)
                 .total_cmp(&utility(right, performance))
@@ -1374,6 +1387,7 @@ struct ScoreSnapshot {
     throughput_confidence: f64,
     failures: f64,
     explore_backed_off: bool,
+    fail_streak: u32,
     selected_at: u64,
     targeted: bool,
     target_attempts: f64,
@@ -1450,6 +1464,7 @@ fn score_snapshot(
             ),
             failures: global_score.failures.max(family.failures),
             explore_backed_off: global_score.explore_backed_off,
+            fail_streak: global_score.fail_streak,
             selected_at: global_score.selected_at.max(family.selected_at),
             targeted: false,
             target_attempts: 0.0,
@@ -1511,6 +1526,7 @@ fn score_snapshot(
         ),
         failures: aggregate_score.failures.max(exact.failures),
         explore_backed_off: aggregate_score.explore_backed_off,
+        fail_streak: aggregate_score.fail_streak,
         selected_at: aggregate_score.selected_at.max(exact.selected_at),
         targeted: exact.completed >= MIN_TRAINED_EVIDENCE
             || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
@@ -1544,6 +1560,7 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
         failures: (stats.setup_failure + stats.useful_failure) * factor,
         explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
+        fail_streak: stats.fail_streak,
         selected_at: stats.selected_at,
         targeted: false,
         target_attempts: 0.0,
@@ -1611,6 +1628,7 @@ pub struct ScoreFeedback {
     authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
+    streak_neutral: bool,
 }
 
 impl std::fmt::Debug for ScoreFeedback {
@@ -1632,7 +1650,16 @@ impl ScoreFeedback {
             authority,
             context,
             attributions: attributions.into(),
+            streak_neutral: false,
         }
+    }
+
+    /// Probe, urltest, and warm-up outcomes must not touch the failure
+    /// streak: a probe succeeding through a half-dead leaf must not wash out
+    /// consecutive real-flow failures (and vice versa).
+    pub fn streak_neutral(mut self) -> Self {
+        self.streak_neutral = true;
+        self
     }
 
     pub fn attributions(&self) -> &[ScoreAttribution] {
@@ -1686,6 +1713,7 @@ impl ScoreFeedback {
                 tx: AtomicU64::new(0),
                 rx: AtomicU64::new(0),
                 progress: Mutex::new(ReporterProgress::default()),
+                streak_neutral: self.streak_neutral,
             }),
         }
     }
@@ -1709,6 +1737,7 @@ struct ReporterShared {
     tx: AtomicU64,
     rx: AtomicU64,
     progress: Mutex<ReporterProgress>,
+    streak_neutral: bool,
 }
 
 /// Cloneable exact-once flow reporter. The first terminal call wins; dropping
@@ -1760,6 +1789,7 @@ impl ScoreReporter {
             authority: Arc::clone(&self.shared.authority),
             context: self.shared.context.clone(),
             attributions: Arc::clone(&self.shared.attributions),
+            streak_neutral: self.shared.streak_neutral,
         }
     }
 
@@ -1790,6 +1820,7 @@ impl ScoreReporter {
             rx: self.shared.rx.load(Ordering::Relaxed),
             elapsed: self.shared.started.elapsed(),
             count_usefulness,
+            streak_neutral: self.shared.streak_neutral,
         };
         self.shared.state.finish(
             &self.shared.context,
@@ -1822,6 +1853,7 @@ struct FlowSample {
     rx: u64,
     elapsed: Duration,
     count_usefulness: bool,
+    streak_neutral: bool,
 }
 
 impl super::GroupManager {
@@ -2374,6 +2406,7 @@ mod tests {
             failures: 0.0,
             selected_at: 0,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2400,6 +2433,7 @@ mod tests {
             failures: 0.0,
             selected_at: 0,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2434,6 +2468,7 @@ mod tests {
             failures,
             selected_at: 0,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2572,6 +2607,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures: 0.0,
             explore_backed_off: backed_off,
+            fail_streak: 0,
             selected_at: 0,
             targeted: false,
             target_attempts: 0.0,
@@ -2590,13 +2626,53 @@ mod tests {
             0
         );
 
-        // Every candidate backed off must never yield no pick: exploration
-        // simply skips and the reliability ranking still returns a leaf.
+        // All backed off: exploration skips, ranking still returns a leaf.
         let snapshots = [cold(true), cold(true)];
         let performance = performance_baseline(&snapshots);
         let selection = best_index(&snapshots, &node_refs, 1, true, performance);
         assert!(!selection.reason.is_exploration());
         assert_eq!(selection.reason, SelectionReason::PerformanceWinner);
+    }
+
+    #[test]
+    fn consecutive_failures_exclude_leaf_from_ranking() {
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let trained = |reliability, fail_streak| ScoreSnapshot {
+            attempts: 8.0,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability,
+            reliability_upper: reliability,
+            useful_completed: 8.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            explore_backed_off: false,
+            fail_streak,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let snapshots = [trained(0.9, SCORE_FAIL_STREAK_EXCLUDE), trained(0.8, 0)];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, false, performance).index,
+            1
+        );
+        // Pinned fallback: with every candidate excluded, rank the full set.
+        let snapshots = [
+            trained(0.9, SCORE_FAIL_STREAK_EXCLUDE),
+            trained(0.8, SCORE_FAIL_STREAK_EXCLUDE),
+        ];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, false, performance).index,
+            0
+        );
     }
 
     #[test]
@@ -2618,6 +2694,7 @@ mod tests {
             rx: 0,
             elapsed: Duration::ZERO,
             count_usefulness: true,
+            streak_neutral: false,
         };
         let backed_off = |at: Instant| {
             let inner = state.inner.lock();
@@ -2633,8 +2710,22 @@ mod tests {
                 at,
             );
         };
+        let neutral = |outcome, at: Instant| {
+            let cells = state.start_at(&context, &attributions, at);
+            let mut neutral_sample = sample(outcome, None);
+            neutral_sample.streak_neutral = true;
+            state.finish_at(&context, &attributions, &cells, &neutral_sample, at);
+        };
+        let streak = |at: Instant| {
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, leaf.id, at).fail_streak
+        };
 
         fail(now);
+        // Probe/urltest/warm outcomes never move the streak or the backoff.
+        neutral(ScoreOutcome::Success, now);
+        neutral(ScoreOutcome::Timeout, now);
+        assert_eq!(streak(now), 1);
         assert!(backed_off(now + Duration::from_secs(1)));
         assert!(!backed_off(
             now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
@@ -2657,9 +2748,8 @@ mod tests {
             &sample(ScoreOutcome::Success, Some(Duration::from_millis(10))),
             second,
         );
-        // The streak steps down (2 → 1) instead of resetting: liveness
-        // returns immediately, but the next failure lands back on the
-        // doubled cadence rather than the base one.
+        // Success steps the streak down (2 → 1), so the next failure lands
+        // back on the doubled cadence rather than the base one.
         assert!(!backed_off(second + Duration::from_secs(1)));
         let third = second + Duration::from_secs(2);
         fail(third);
@@ -2729,6 +2819,7 @@ mod tests {
             failures: 0.0,
             selected_at,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -3245,6 +3336,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures: aged,
             explore_backed_off: false,
+            fail_streak: 0,
             selected_at: 1,
             targeted: false,
             target_attempts: 0.0,
@@ -3388,6 +3480,7 @@ mod tests {
             rx,
             elapsed,
             count_usefulness: true,
+            streak_neutral: false,
         };
 
         stats.record_finish(
@@ -3547,6 +3640,7 @@ mod tests {
                     rx: u64::from(success),
                     elapsed: Duration::from_secs(1),
                     count_usefulness: true,
+                    streak_neutral: false,
                 },
                 now,
             );
@@ -5167,6 +5261,7 @@ group {
             rx: 1,
             elapsed: Duration::from_millis(1),
             count_usefulness: true,
+            streak_neutral: false,
         };
         state.finish(
             &context,
