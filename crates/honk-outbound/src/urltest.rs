@@ -318,7 +318,9 @@ async fn urltest_node_in_generation_impl(
                 match warmed {
                     Ok(()) => {
                         reporter_setup(&warm_reporter);
-                        reporter_success(&warm_reporter);
+                        if let Some(reporter) = &warm_reporter {
+                            reporter.finish_setup_only();
+                        }
                     }
                     Err(error) => {
                         reporter_error(&warm_reporter, &error);

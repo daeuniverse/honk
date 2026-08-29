@@ -221,7 +221,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 match warmed {
                     Ok(Ok(())) => {
                         probe_setup(&warm_reporter);
-                        probe_finish(&warm_reporter, ScoreOutcome::Success);
+                        if let Some(reporter) = &warm_reporter {
+                            reporter.finish_setup_only();
+                        }
                     }
                     Ok(Err(error)) => {
                         probe_finish(&warm_reporter, ScoreOutcome::from_error(&error));
