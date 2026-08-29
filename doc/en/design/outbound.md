@@ -506,6 +506,11 @@ It spreads work: after the first session becomes busy, the pool establishes the
 second before adding more load, then schedules least-loaded. Consecutive dial
 failures use bounded backoff instead of one physical connect per proxied flow.
 
+After v2 server-settings negotiation, every reused logical stream (SID 2 and
+later) must receive a SYNACK within three seconds. Each new open replaces the
+previous deadline and any SYNACK clears it, matching sing-anytls. Expiry retires
+the physical session so the pool redials instead of reusing a silent carrier.
+
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor and idle timeout feed one node-local janitor.
 Selector or UDP warm ownership independently raises effective retention; the
@@ -514,9 +519,10 @@ last owner release drains future reuse without terminating live streams.
 ### Ordered write path
 
 Every frame crosses one `WriterQueue` and one physical writer task. Data uses
-bounded permits; control frames retain reserved queue headroom. A stream's SYN
-and first PSH are inserted as one atomic batch, so another stream cannot
-interleave between them.
+bounded permits, control frames retain reserved headroom, and the whole queue is
+capped at 1,024 frames. Queue exhaustion makes the session terminal instead of
+growing memory. A stream's SYN and first PSH are inserted as one atomic batch,
+so another stream cannot interleave between them.
 
 After one blocking pop, the writer gathers only frames already queued, up to 64
 frames or 256 KiB, into one `write_all` and one `flush`. It never waits to fill
