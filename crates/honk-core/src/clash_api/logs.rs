@@ -137,11 +137,15 @@ struct ClashLogFilter {
 
 impl<S> Filter<S> for ClashLogFilter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _cx: &Context<'_, S>) -> bool {
-        self.interest.includes(*metadata.level())
+        // Same suppression as the default console filter: endpoint-driver
+        // death is lifecycle noise, not an operator event.
+        metadata.target() != "quinn::endpoint" && self.interest.includes(*metadata.level())
     }
 
     fn callsite_enabled(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
-        if self.interest.includes(*metadata.level()) {
+        if metadata.target() == "quinn::endpoint" {
+            Interest::never()
+        } else if self.interest.includes(*metadata.level()) {
             Interest::always()
         } else {
             Interest::never()
