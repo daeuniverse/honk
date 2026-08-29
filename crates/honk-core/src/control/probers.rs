@@ -742,7 +742,13 @@ pub(super) async fn resolve_quic_score_target(
         warn!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
         return None;
     }
-    let (host, _) = extract_url_host_path(url)?;
+    let (host, _) = match extract_url_host_path(url) {
+        Some(parts) => parts,
+        None => {
+            warn!("Score QUIC probe disabled: invalid tcp_check_url");
+            return None;
+        }
+    };
     let host = host.to_string();
     let port = url_port(url);
     let addrs = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -795,7 +801,7 @@ pub(super) async fn resolve_quic_score_target(
             return None;
         }
     };
-    info!(host, %addr, "Score QUIC probe enabled");
+    debug!(host, %addr, "Score QUIC probe enabled");
     Some(QuicScoreTarget {
         addr,
         host,

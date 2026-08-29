@@ -78,17 +78,10 @@ impl AliveDialerSet {
                 .await;
         }
 
-        let hostname = match Self::parse_url_host(&check_url) {
-            Some(h) => h,
-            None => {
-                tracing::warn!(
-                    "Invalid check URL '{}', falling back to TCP probe",
-                    check_url
-                );
-                return self
-                    .probe_node_tcp(node_id, node_name, &registered.address, timeout)
-                    .await;
-            }
+        let Some(hostname) = Self::parse_url_host(&check_url) else {
+            return self
+                .probe_node_tcp(node_id, node_name, &registered.address, timeout)
+                .await;
         };
 
         // Use cached IPs from startup (Go: TcpCheckOption.Ip46).
@@ -110,7 +103,7 @@ impl AliveDialerSet {
         };
 
         if addrs.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 "Health check found no addresses for '{}' (node '{}')",
                 hostname,
                 node_name
@@ -183,9 +176,9 @@ impl AliveDialerSet {
         }
 
         if any_ok {
-            tracing::info!("Node '{}' is alive after HTTP health check", node_name);
+            tracing::debug!("Node '{}' is alive after HTTP health check", node_name);
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 "Node '{}' failed HTTP health check for '{}' through proxy endpoint {}",
                 node_name,
                 check_url,
@@ -230,7 +223,7 @@ impl AliveDialerSet {
         }
         let addrs = self.check_ips_for_url(url).await;
         if addrs.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 "Health check found no addresses for '{}' (member '{}')",
                 url,
                 tag
@@ -278,7 +271,7 @@ impl AliveDialerSet {
             }
         }
         if !any_ok {
-            tracing::warn!(
+            tracing::debug!(
                 "Member '{}' (leaf '{}') failed HTTP health check against custom URL '{}'",
                 tag,
                 leaf,
@@ -310,7 +303,7 @@ impl AliveDialerSet {
             if !out.is_empty() {
                 out
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     "Health check DNS resolution failed for node '{}' ({}): system lookup failed",
                     node_name,
                     addr
@@ -322,7 +315,7 @@ impl AliveDialerSet {
         };
 
         if addrs.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 "Health check found no addresses for node '{}' ({})",
                 node_name,
                 addr
@@ -418,9 +411,9 @@ impl AliveDialerSet {
         // nothing about the other family's reachability through the tunnel —
         // leave it untouched rather than dead-marking it without evidence.
         if any_ok {
-            tracing::info!("Node '{}' is alive after TCP health check", node_name);
+            tracing::debug!("Node '{}' is alive after TCP health check", node_name);
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 "Node '{}' failed TCP health check against all addresses ({})",
                 node_name,
                 addr

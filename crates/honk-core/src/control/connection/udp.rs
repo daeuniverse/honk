@@ -248,6 +248,17 @@ impl ControlPlaneHandle {
                         self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
                             .await;
                     }
+                    info!(
+                        network = "udp",
+                        outbound = %outbound_name,
+                        ip = %original_dst,
+                        src = %client_addr,
+                        sniffed = quic_domain.as_deref().unwrap_or(""),
+                        ebpf_offload = true,
+                        "UDP offloaded to eBPF: {} -> {}",
+                        client_addr,
+                        original_dst,
+                    );
                     return Ok(());
                 }
                 "block" => {
@@ -577,9 +588,17 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
-        debug!(
-            "Proxying UDP {} -> {} via {} (endpoint driver ready)",
-            client_addr, original_dst, node.name
+        info!(
+            network = "udp",
+            outbound = %outbound_name,
+            dialer = %node.name,
+            sniffed = quic_domain.as_deref().unwrap_or(""),
+            ip = %original_dst,
+            src = %client_addr,
+            "UDP connection: {} -> {} via {} (endpoint driver ready)",
+            client_addr,
+            original_dst,
+            node.name,
         );
         Ok(())
     }

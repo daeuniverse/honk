@@ -454,31 +454,39 @@ impl AliveDialerSet {
         check_method: String,
     ) {
         *self.http_prober.write() = Some(prober);
+        *self.check_method.write() = check_method.clone();
+
+        let port = Self::parse_url_port(&check_url);
+        let Some(hostname) = Self::parse_url_host(&check_url) else {
+            tracing::warn!(
+                "Invalid health check URL '{}'; falling back to TCP probe",
+                check_url
+            );
+            *self.check_url.write() = String::new();
+            self.check_url_ips.write().clear();
+            return;
+        };
         *self.check_url.write() = check_url.clone();
-        *self.check_method.write() = check_method;
 
         // Resolve the check URL hostname once at startup; dae-format literal
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
-        let port = Self::parse_url_port(&check_url);
-        if let Some(hostname) = Self::parse_url_host(&check_url) {
-            let addrs = self.resolve_host(&hostname, port).await;
-            if addrs.is_empty() {
-                tracing::warn!("Failed to resolve health check URL '{}'", hostname);
-            }
-            let ips = Self::merge_check_addrs(addrs, &check_url, port);
-            tracing::info!(
-                "Health check DNS resolved '{}' → {} IPs",
-                hostname,
-                ips.len()
-            );
-            *self.check_url_ips.write() = ips;
-        } else {
-            let ips = Self::merge_check_addrs(Vec::new(), &check_url, port);
-            if !ips.is_empty() {
-                *self.check_url_ips.write() = ips;
-            }
+        let addrs = self.resolve_host(&hostname, port).await;
+        if addrs.is_empty() {
+            tracing::warn!("Failed to resolve health check URL '{}'[39m", hostname);
         }
+        let ips = Self::merge_check_addrs(addrs, &check_url, port);
+        tracing::debug!(
+            "Health check DNS resolved '{}' → {} IPs",
+            hostname,
+            ips.len()
+        );
+        *self.check_url_ips.write() = ips;
+        tracing::info!(
+            "HTTP health check enabled (url={}, method={})",
+            check_url,
+            check_method
+        );
     }
 
     /// Install the UDP health check prober (Go: UdpCheckOption).
@@ -1443,7 +1451,7 @@ impl AliveDialerSet {
                 .cloned()
                 .unwrap_or_default();
             if !members.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     "URLTest group '{}' active again — resuming member probes",
                     group
                 );
