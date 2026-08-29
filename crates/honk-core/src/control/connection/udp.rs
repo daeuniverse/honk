@@ -577,7 +577,7 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
-        debug!(
+        info!(
             "Proxying UDP {} -> {} via {} (endpoint driver ready)",
             client_addr, original_dst, node.name
         );

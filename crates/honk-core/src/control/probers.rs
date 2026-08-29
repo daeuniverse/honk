@@ -702,7 +702,7 @@ pub(super) async fn resolve_udp_check_target(
         if let Some(addr) = addrs.into_iter().next() {
             return addr;
         }
-        warn!(
+        debug!(
             "Failed to resolve udp_check_dns '{}'; using {}",
             raw, fallback
         );
@@ -739,7 +739,7 @@ pub(super) async fn resolve_quic_score_target(
     resolver: Option<crate::outbound::ResolveHook>,
 ) -> Option<QuicScoreTarget> {
     if !url.trim().starts_with("https://") {
-        warn!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
+        debug!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
         return None;
     }
     let (host, _) = extract_url_host_path(url)?;
@@ -759,7 +759,7 @@ pub(super) async fn resolve_quic_score_target(
     let addr = match addrs.into_iter().next() {
         Some(addr) => addr,
         None => {
-            warn!("Score QUIC probe disabled: tcp_check_url host did not resolve");
+            debug!("Score QUIC probe disabled: tcp_check_url host did not resolve");
             return None;
         }
     };
@@ -791,11 +791,11 @@ pub(super) async fn resolve_quic_score_target(
     {
         Ok(config) => config,
         Err(error) => {
-            warn!("Score QUIC probe disabled: failed to build QUIC client: {error:#}");
+            debug!("Score QUIC probe disabled: failed to build QUIC client: {error:#}");
             return None;
         }
     };
-    info!(host, %addr, "Score QUIC probe enabled");
+    debug!(host, %addr, "Score QUIC probe enabled");
     Some(QuicScoreTarget {
         addr,
         host,

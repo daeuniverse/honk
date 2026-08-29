@@ -464,10 +464,10 @@ impl AliveDialerSet {
         if let Some(hostname) = Self::parse_url_host(&check_url) {
             let addrs = self.resolve_host(&hostname, port).await;
             if addrs.is_empty() {
-                tracing::warn!("Failed to resolve health check URL '{}'", hostname);
+                tracing::debug!("Failed to resolve health check URL '{}'", hostname);
             }
             let ips = Self::merge_check_addrs(addrs, &check_url, port);
-            tracing::info!(
+            tracing::debug!(
                 "Health check DNS resolved '{}' → {} IPs",
                 hostname,
                 ips.len()
@@ -1443,7 +1443,7 @@ impl AliveDialerSet {
                 .cloned()
                 .unwrap_or_default();
             if !members.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     "URLTest group '{}' active again — resuming member probes",
                     group
                 );
