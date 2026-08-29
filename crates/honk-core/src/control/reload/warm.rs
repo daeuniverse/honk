@@ -193,7 +193,7 @@ pub(in crate::control) async fn warm_selector_candidate(
             Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
                 if let Some(reporter) = &reporter {
                     reporter.setup_succeeded();
-                    reporter.finish(crate::group::ScoreOutcome::Success);
+                    reporter.finish_setup_only();
                 }
                 if let Some(addr) = bare_warm.lock().remove(&node.id) {
                     connection_pool.purge_bare(&addr);
@@ -277,7 +277,7 @@ pub(in crate::control) async fn warm_selector_candidate(
         }
         connection_pool.deposit_tcp(&addr, stream).await;
         if let Some(reporter) = &reporter {
-            reporter.finish(crate::group::ScoreOutcome::Success);
+            reporter.finish_setup_only();
         }
     }
     if connection_pool.has_live_bare_entry(&addr) {
@@ -554,7 +554,7 @@ impl ControlPlane {
                         Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
                             if let Some(reporter) = &reporter {
                                 reporter.setup_succeeded();
-                                reporter.finish(crate::group::ScoreOutcome::Success);
+                                reporter.finish_setup_only();
                             }
                         }
                         Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
