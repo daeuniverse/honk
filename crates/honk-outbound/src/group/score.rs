@@ -20,6 +20,7 @@ const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_MARGIN: f64 = 0.01;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
+const SELECTION_HISTORY_CAPACITY: usize = 4096;
 const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
@@ -383,10 +384,34 @@ impl SelectionCadenceKey {
     }
 }
 
+/// Flap history is scoped to the same target the pick was ranked for:
+/// unrelated targets interleaving their own winners is not a flap. The
+/// exploration cadence keeps the coarser [`SelectionCadenceKey`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SelectionHistoryKey {
+    group: String,
+    network: SelectionNetwork,
+    family: Option<IpVersion>,
+    target: Option<ScoreTarget>,
+}
+
+impl SelectionHistoryKey {
+    fn new(group: &str, context: &ScoreSelectionContext) -> Self {
+        Self {
+            group: group.to_owned(),
+            network: context.network,
+            family: context.target_family,
+            target: context.target.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SelectionHistory {
     current: Uuid,
     previous: Option<Uuid>,
+    /// Committed non-exploration selections seen by this target scope.
+    selections: u64,
     switched_at: u64,
 }
 
@@ -486,7 +511,7 @@ struct StateInner {
     valid: HashSet<(String, Uuid)>,
     valid_groups: HashSet<String>,
     selection_counts: HashMap<SelectionCadenceKey, u64>,
-    selection_history: HashMap<SelectionCadenceKey, SelectionHistory>,
+    selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, SelectionReasonCounts>,
     active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
@@ -504,7 +529,10 @@ impl Default for StateInner {
             valid: HashSet::new(),
             valid_groups: HashSet::new(),
             selection_counts: HashMap::new(),
-            selection_history: HashMap::new(),
+            selection_history: LruCache::new(
+                // SAFE-EXPECT: the capacity is a positive compile-time constant.
+                NonZeroUsize::new(SELECTION_HISTORY_CAPACITY).expect("non-zero capacity"),
+            ),
             selection_reasons: HashMap::new(),
             active_authority: None,
             tick: 0,
@@ -570,20 +598,31 @@ impl ScorePolicyState {
         } = &mut *inner;
         selection_counts.retain(|key, _| valid_groups.contains(&key.group));
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
-        selection_history.retain(|key, history| {
-            if !valid_groups.contains(&key.group)
-                || !valid.contains(&(key.group.clone(), history.current))
-            {
-                return false;
-            }
-            if history
-                .previous
-                .is_some_and(|node_id| !valid.contains(&(key.group.clone(), node_id)))
-            {
+        let invalid_history: Vec<_> = selection_history
+            .iter()
+            .filter(|(key, history)| {
+                !valid_groups.contains(&key.group)
+                    || !valid.contains(&(key.group.clone(), history.current))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in invalid_history {
+            selection_history.pop(&key);
+        }
+        let stale_previous: Vec<_> = selection_history
+            .iter()
+            .filter(|(key, history)| {
+                history
+                    .previous
+                    .is_some_and(|node_id| !valid.contains(&(key.group.clone(), node_id)))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_previous {
+            if let Some(history) = selection_history.get_mut(&key) {
                 history.previous = None;
             }
-            true
-        });
+        }
         let invalid_exact: Vec<_> = inner
             .exact
             .iter()
@@ -645,39 +684,40 @@ impl ScorePolicyState {
 
     fn record_switch_flap(
         inner: &mut StateInner,
-        cadence_key: &SelectionCadenceKey,
-        selection_count: u64,
+        history_key: &SelectionHistoryKey,
         node_id: Uuid,
         reason: SelectionReason,
     ) {
         if reason.is_exploration() {
             return;
         }
-        let Some(history) = inner.selection_history.get_mut(cadence_key) else {
-            inner.selection_history.insert(
-                cadence_key.clone(),
+        let Some(history) = inner.selection_history.get_mut(history_key) else {
+            inner.selection_history.push(
+                history_key.clone(),
                 SelectionHistory {
                     current: node_id,
                     previous: None,
-                    switched_at: selection_count,
+                    selections: 1,
+                    switched_at: 0,
                 },
             );
             return;
         };
+        history.selections = history.selections.saturating_add(1);
         if history.current == node_id {
             return;
         }
         let switch_flap = history.previous == Some(node_id)
-            && selection_count.saturating_sub(history.switched_at) <= SCORE_SWITCH_FLAP_WINDOW;
+            && history.selections.saturating_sub(history.switched_at) <= SCORE_SWITCH_FLAP_WINDOW;
         history.previous = Some(history.current);
         history.current = node_id;
-        history.switched_at = selection_count;
+        history.switched_at = history.selections;
         if switch_flap {
             let counter = &mut inner
                 .selection_reasons
                 .entry(SelectionReasonKey::new(
-                    &cadence_key.group,
-                    cadence_key.network,
+                    &history_key.group,
+                    history_key.network,
                 ))
                 .or_default()
                 .switch_flap;
@@ -987,8 +1027,7 @@ impl ScorePolicyState {
             Self::record_selection_reason(&mut inner, group, context.network, selection);
             Self::record_switch_flap(
                 &mut inner,
-                &cadence_key,
-                selection_count,
+                &SelectionHistoryKey::new(group, context),
                 nodes[selection.index].id,
                 selection.reason,
             );
@@ -3690,46 +3729,24 @@ group {
             ProbeDomain::Tcp,
             IpVersion::V4,
         );
-        let key = SelectionCadenceKey::new("score", &context);
+        let key = SelectionHistoryKey::new("score", &context);
         let first = node("first").id;
         let second = node("second").id;
         let mut inner = StateInner::default();
 
-        ScorePolicyState::record_switch_flap(
-            &mut inner,
-            &key,
-            1,
-            first,
-            SelectionReason::PerformanceWinner,
-        );
-        ScorePolicyState::record_switch_flap(
-            &mut inner,
-            &key,
-            2,
-            second,
-            SelectionReason::PeriodicExplore,
-        );
-        ScorePolicyState::record_switch_flap(
-            &mut inner,
-            &key,
-            3,
-            second,
-            SelectionReason::PerformanceWinner,
-        );
-        ScorePolicyState::record_switch_flap(
-            &mut inner,
-            &key,
-            3 + SCORE_SWITCH_FLAP_WINDOW,
-            first,
-            SelectionReason::ReliabilityWinner,
-        );
-        ScorePolicyState::record_switch_flap(
-            &mut inner,
-            &key,
-            4 + SCORE_SWITCH_FLAP_WINDOW * 2,
-            second,
-            SelectionReason::PerformanceWinner,
-        );
+        let record = |inner: &mut StateInner, node_id, reason| {
+            ScorePolicyState::record_switch_flap(inner, &key, node_id, reason);
+        };
+        record(&mut inner, first, SelectionReason::PerformanceWinner);
+        // Exploration never touches flap history.
+        record(&mut inner, second, SelectionReason::PeriodicExplore);
+        record(&mut inner, second, SelectionReason::PerformanceWinner);
+        // Same-winner selections push the next reversal out of the window.
+        for _ in 0..SCORE_SWITCH_FLAP_WINDOW {
+            record(&mut inner, second, SelectionReason::PerformanceWinner);
+        }
+        record(&mut inner, first, SelectionReason::ReliabilityWinner);
+        record(&mut inner, second, SelectionReason::PerformanceWinner);
 
         assert_eq!(
             inner
@@ -3739,6 +3756,47 @@ group {
                 .switch_flap,
             1
         );
+    }
+
+    #[test]
+    fn switch_flap_ignores_cross_target_interleaving() {
+        let first = node("first").id;
+        let second = node("second").id;
+        let mut inner = StateInner::default();
+        let key_a = SelectionHistoryKey::new("score", &context("a.example", IpVersion::V4));
+        let key_b = SelectionHistoryKey::new("score", &context("b.example", IpVersion::V4));
+        let flap_count = |inner: &StateInner| {
+            inner
+                .selection_reasons
+                .get(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+                .map_or(0, |counts| counts.switch_flap)
+        };
+
+        // A→first, B→second, A→first: neither target reversed its own winner.
+        for (key, node_id) in [(&key_a, first), (&key_b, second), (&key_a, first)] {
+            ScorePolicyState::record_switch_flap(
+                &mut inner,
+                key,
+                node_id,
+                SelectionReason::PerformanceWinner,
+            );
+        }
+        assert_eq!(flap_count(&inner), 0);
+
+        // A same-target reversal within the window still counts.
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key_a,
+            second,
+            SelectionReason::PerformanceWinner,
+        );
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key_a,
+            first,
+            SelectionReason::PerformanceWinner,
+        );
+        assert_eq!(flap_count(&inner), 1);
     }
 
     #[test]
@@ -3792,24 +3850,26 @@ group {
         let second = node("second").id;
         state.publish_membership([("score".to_owned(), first), ("score".to_owned(), second)]);
         let removed_key =
-            SelectionCadenceKey::new("score", &context("removed.example", IpVersion::V4));
+            SelectionHistoryKey::new("score", &context("removed.example", IpVersion::V4));
         let retained_key =
-            SelectionCadenceKey::new("score", &context("retained.example", IpVersion::V6));
+            SelectionHistoryKey::new("score", &context("retained.example", IpVersion::V6));
         {
             let mut inner = state.inner.lock();
-            inner.selection_history.insert(
+            inner.selection_history.push(
                 removed_key.clone(),
                 SelectionHistory {
                     current: first,
                     previous: Some(second),
+                    selections: 1,
                     switched_at: 1,
                 },
             );
-            inner.selection_history.insert(
+            inner.selection_history.push(
                 retained_key.clone(),
                 SelectionHistory {
                     current: second,
                     previous: Some(first),
+                    selections: 1,
                     switched_at: 1,
                 },
             );
@@ -3818,9 +3878,13 @@ group {
         state.publish_membership([("score".to_owned(), second)]);
 
         let inner = state.inner.lock();
-        assert!(!inner.selection_history.contains_key(&removed_key));
+        assert!(!inner.selection_history.contains(&removed_key));
         assert_eq!(
-            inner.selection_history.get(&retained_key).unwrap().previous,
+            inner
+                .selection_history
+                .peek(&retained_key)
+                .unwrap()
+                .previous,
             None
         );
     }
