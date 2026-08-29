@@ -23,8 +23,19 @@ const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
+const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
+
+/// Exploration retry delay for a consecutive-failure streak. Tracked outside
+/// the decaying evidence so a dead leaf is re-probed on a growing cadence
+/// instead of turning cold again after a few half-lives.
+fn explore_backoff(streak: u32) -> Duration {
+    SCORE_EXPLORE_BACKOFF_BASE
+        .saturating_mul(2u32.saturating_pow(streak.saturating_sub(1).min(7)))
+        .min(SCORE_EXPLORE_BACKOFF_MAX)
+}
 
 fn exploration_target(candidate_count: usize) -> usize {
     if candidate_count <= 4 {
@@ -189,6 +200,8 @@ struct Stats {
     throughput_bytes: f64,
     throughput_seconds: f64,
     throughput_windows: f64,
+    fail_streak: u32,
+    explore_not_before: Option<Instant>,
     last_used: u64,
     updated_at: Option<Instant>,
     selected_at: u64,
@@ -257,6 +270,16 @@ impl Stats {
             self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
             self.last_used = tick;
             return;
+        }
+        if sample.outcome == ScoreOutcome::Success {
+            // A success proves current liveness, so the leaf rejoins
+            // exploration immediately, but the streak only works down one
+            // step: a flapping leaf must earn the fast cadence back.
+            self.fail_streak = self.fail_streak.saturating_sub(1);
+            self.explore_not_before = None;
+        } else {
+            self.fail_streak = self.fail_streak.saturating_add(1);
+            self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
         }
         if let Some(setup) = sample.setup {
             self.setup_success += 1.0;
@@ -1100,7 +1123,9 @@ fn best_index(
         let cold = snapshots
             .iter()
             .enumerate()
-            .filter(|(_, score)| exploration_completed(score) < MIN_TRAINED_EVIDENCE)
+            .filter(|(_, score)| {
+                exploration_completed(score) < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
+            })
             .min_by(|(left_index, left), (right_index, right)| {
                 exploration_attempts(left)
                     .total_cmp(&exploration_attempts(right))
@@ -1129,7 +1154,7 @@ fn best_index(
             if let Some((index, _)) = snapshots
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| Some(*index) != incumbent)
+                .filter(|(index, score)| Some(*index) != incumbent && !score.explore_backed_off)
                 .max_by(|(left_index, left), (right_index, right)| {
                     left.reliability_upper
                         .total_cmp(&right.reliability_upper)
@@ -1309,6 +1334,7 @@ struct ScoreSnapshot {
     throughput: Option<f64>,
     throughput_confidence: f64,
     failures: f64,
+    explore_backed_off: bool,
     selected_at: u64,
     targeted: bool,
     target_attempts: f64,
@@ -1384,6 +1410,7 @@ fn score_snapshot(
                 reliability_weight,
             ),
             failures: global_score.failures.max(family.failures),
+            explore_backed_off: global_score.explore_backed_off,
             selected_at: global_score.selected_at.max(family.selected_at),
             targeted: false,
             target_attempts: 0.0,
@@ -1444,6 +1471,7 @@ fn score_snapshot(
             reliability_weight,
         ),
         failures: aggregate_score.failures.max(exact.failures),
+        explore_backed_off: aggregate_score.explore_backed_off,
         selected_at: aggregate_score.selected_at.max(exact.selected_at),
         targeted: exact.completed >= MIN_TRAINED_EVIDENCE
             || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
@@ -1476,6 +1504,7 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         throughput,
         throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
         failures: (stats.setup_failure + stats.useful_failure) * factor,
+        explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
         selected_at: stats.selected_at,
         targeted: false,
         target_attempts: 0.0,
@@ -2305,6 +2334,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures: 0.0,
             selected_at: 0,
+            explore_backed_off: false,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2330,6 +2360,7 @@ mod tests {
             throughput_confidence: 1.0,
             failures: 0.0,
             selected_at: 0,
+            explore_backed_off: false,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2363,6 +2394,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures,
             selected_at: 0,
+            explore_backed_off: false,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2485,6 +2517,122 @@ mod tests {
     }
 
     #[test]
+    fn cold_exploration_skips_backed_off_candidates() {
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let cold = |backed_off| ScoreSnapshot {
+            attempts: 0.0,
+            completed: 0.0,
+            hysteresis_completed: 0.0,
+            reliability: 0.0,
+            reliability_upper: 0.5,
+            useful_completed: 0.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            explore_backed_off: backed_off,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let snapshots = [cold(true), cold(false)];
+        let performance = performance_baseline(&snapshots);
+        let selection = best_index(&snapshots, &node_refs, 1, true, performance);
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.reason, SelectionReason::ColdExplore);
+
+        let snapshots = [cold(false), cold(false)];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, true, performance).index,
+            0
+        );
+
+        // Every candidate backed off must never yield no pick: exploration
+        // simply skips and the reliability ranking still returns a leaf.
+        let snapshots = [cold(true), cold(true)];
+        let performance = performance_baseline(&snapshots);
+        let selection = best_index(&snapshots, &node_refs, 1, true, performance);
+        assert!(!selection.reason.is_exploration());
+        assert_eq!(selection.reason, SelectionReason::PerformanceWinner);
+    }
+
+    #[test]
+    fn exploration_backoff_grows_with_failures_and_shrinks_with_success() {
+        let state = ScorePolicyState::default();
+        let leaf = node("leaf");
+        state.publish_membership([("score".into(), leaf.id)]);
+        let context = context("example.com", IpVersion::V4);
+        let attributions = [ScoreAttribution {
+            group: "score".into(),
+            node_id: leaf.id,
+        }];
+        let now = Instant::now();
+        let sample = |outcome, setup| FlowSample {
+            outcome,
+            setup,
+            first_response: None,
+            tx: 0,
+            rx: 0,
+            elapsed: Duration::ZERO,
+            count_usefulness: true,
+        };
+        let backed_off = |at: Instant| {
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, leaf.id, at).explore_backed_off
+        };
+        let fail = |at: Instant| {
+            let cells = state.start_at(&context, &attributions, at);
+            state.finish_at(
+                &context,
+                &attributions,
+                &cells,
+                &sample(ScoreOutcome::Timeout, None),
+                at,
+            );
+        };
+
+        fail(now);
+        assert!(backed_off(now + Duration::from_secs(1)));
+        assert!(!backed_off(
+            now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
+        ));
+
+        let second = now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(2);
+        fail(second);
+        assert!(backed_off(
+            second + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
+        ));
+        assert!(!backed_off(
+            second + SCORE_EXPLORE_BACKOFF_BASE * 2 + Duration::from_secs(1)
+        ));
+
+        let cells = state.start_at(&context, &attributions, second);
+        state.finish_at(
+            &context,
+            &attributions,
+            &cells,
+            &sample(ScoreOutcome::Success, Some(Duration::from_millis(10))),
+            second,
+        );
+        // The streak steps down (2 → 1) instead of resetting: liveness
+        // returns immediately, but the next failure lands back on the
+        // doubled cadence rather than the base one.
+        assert!(!backed_off(second + Duration::from_secs(1)));
+        let third = second + Duration::from_secs(2);
+        fail(third);
+        assert!(backed_off(
+            third + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
+        ));
+        assert!(!backed_off(
+            third + SCORE_EXPLORE_BACKOFF_BASE * 2 + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
     fn large_score_groups_periodically_try_non_incumbent() {
         let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
         let node_refs: Vec<_> = nodes.iter().collect();
@@ -2541,6 +2689,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures: 0.0,
             selected_at,
+            explore_backed_off: false,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -3056,6 +3205,7 @@ mod tests {
             throughput: None,
             throughput_confidence: 0.0,
             failures: aged,
+            explore_backed_off: false,
             selected_at: 1,
             targeted: false,
             target_attempts: 0.0,
@@ -3301,6 +3451,8 @@ mod tests {
             throughput_bytes: 1_000_000.0,
             throughput_seconds: 10.0,
             throughput_windows: 4.0,
+            fail_streak: 0,
+            explore_not_before: None,
             last_used: 9,
             updated_at: Some(start),
             selected_at: 0,
