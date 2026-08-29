@@ -185,7 +185,7 @@ pub(in crate::control) async fn warm_selector_candidate(
                     IpVersion::V4,
                 ),
             )
-            .map(|feedback| feedback.start());
+            .map(|feedback| feedback.streak_neutral().start());
         match proxy_registry
             .warm_session(Arc::clone(&generation), node.id, connect_timeout)
             .await
@@ -237,7 +237,7 @@ pub(in crate::control) async fn warm_selector_candidate(
                     IpVersion::V4,
                 ),
             )
-            .map(|feedback| feedback.start());
+            .map(|feedback| feedback.streak_neutral().start());
         let stream = match generation
             .scope_dials(honk_outbound::util::connect_outbound(
                 &addr,
@@ -546,7 +546,7 @@ impl ControlPlane {
                                 ),
                             )
                         })
-                        .map(|feedback| feedback.start());
+                        .map(|feedback| feedback.streak_neutral().start());
                     let result = proxy_registry
                         .warm_udp(generation.clone(), node_id, connect_timeout)
                         .await;

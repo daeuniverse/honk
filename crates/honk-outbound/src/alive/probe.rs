@@ -16,7 +16,7 @@ impl AliveDialerSet {
                     ),
                 )
             })
-            .map(|feedback| feedback.start())
+            .map(|feedback| feedback.streak_neutral().start())
     }
 }
 
