@@ -537,8 +537,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         other => other,
     };
     let default_level = if cli.debug { "debug" } else { config_level };
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+    // quinn logs every endpoint-driver death at ERROR; probe/warm endpoints
+    // over retiring AnyTLS sessions die as a matter of course (the SYNACK
+    // watchdog kills them on purpose), so that target is silenced unless
+    // RUST_LOG says otherwise.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(format!("{default_level},quinn::endpoint=off"))
+    });
 
     let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
     let log_file_layer = if let Some(path) = log_file_path.as_ref() {
