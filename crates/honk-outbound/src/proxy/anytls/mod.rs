@@ -697,9 +697,12 @@ async fn session_writer(
         let Some(first) = queue.pop().await else {
             break;
         };
-        let remaining_bytes = WRITER_BATCH_MAX_BYTES.saturating_sub(first.wire_len());
         batch.push(first);
-        queue.drain_available(&mut batch, WRITER_BATCH_MAX_FRAMES - 1, remaining_bytes);
+        queue.drain_available(
+            &mut batch,
+            WRITER_BATCH_MAX_FRAMES - 1,
+            WRITER_BATCH_MAX_BYTES,
+        );
         buf.clear();
         buf.reserve(batch.iter().map(FrameCommand::wire_len).sum());
         for cmd in &batch {
