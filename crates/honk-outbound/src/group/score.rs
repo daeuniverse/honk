@@ -2550,6 +2550,14 @@ mod tests {
             best_index(&snapshots, &node_refs, 1, true, performance).index,
             0
         );
+
+        // Every candidate backed off must never yield no pick: exploration
+        // simply skips and the reliability ranking still returns a leaf.
+        let snapshots = [cold(true), cold(true)];
+        let performance = performance_baseline(&snapshots);
+        let selection = best_index(&snapshots, &node_refs, 1, true, performance);
+        assert!(!selection.reason.is_exploration());
+        assert_eq!(selection.reason, SelectionReason::PerformanceWinner);
     }
 
     #[test]
