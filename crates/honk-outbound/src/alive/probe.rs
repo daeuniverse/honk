@@ -78,17 +78,10 @@ impl AliveDialerSet {
                 .await;
         }
 
-        let hostname = match Self::parse_url_host(&check_url) {
-            Some(h) => h,
-            None => {
-                tracing::debug!(
-                    "Invalid check URL '{}', falling back to TCP probe",
-                    check_url
-                );
-                return self
-                    .probe_node_tcp(node_id, node_name, &registered.address, timeout)
-                    .await;
-            }
+        let Some(hostname) = Self::parse_url_host(&check_url) else {
+            return self
+                .probe_node_tcp(node_id, node_name, &registered.address, timeout)
+                .await;
         };
 
         // Use cached IPs from startup (Go: TcpCheckOption.Ip46).

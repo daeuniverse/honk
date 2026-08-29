@@ -467,11 +467,6 @@ impl ControlPlane {
                     alive_set
                         .set_http_probe(prober, check_url, check_method)
                         .await;
-                    info!(
-                        "HTTP health check enabled (url={}, method={})",
-                        c.global.tcp_check_url.first().unwrap_or(&String::new()),
-                        c.global.tcp_check_http_method
-                    );
                 } else {
                     info!(
                         "HTTP health check disabled (no tcp_check_url configured), using TCP connect"

@@ -445,6 +445,22 @@ impl HttpProber for MockHttpProber {
 }
 
 #[tokio::test]
+async fn invalid_http_check_url_falls_back_before_probe_cycles() {
+    let set = AliveDialerSet::new();
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::WarmSuccess(Duration::from_millis(1)),
+        }),
+        "http://".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    assert!(set.check_url.read().is_empty());
+    assert!(set.check_url_ips.read().is_empty());
+}
+
+#[tokio::test]
 async fn warm_http_probe_is_the_only_result_recorded_as_latency() {
     let set = AliveDialerSet::new();
     set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
