@@ -463,10 +463,10 @@ AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spre
 least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每条代理 flow
 各执行一次物理连接。
 
-协商 v2 server settings 后，每个复用逻辑 stream（SID 2 及以后）都必须在三秒内
-收到 SYNACK。每次新建 stream 会替换前一个 deadline，任意 SYNACK 都会清除它，
-与 sing-anytls 一致。deadline 到期会退役物理 session，让 pool 重新拨号，而不是
-继续复用无响应的 carrier。
+协商 v2 server settings 后，每个复用逻辑 stream（SID 2 及以后）的 SYN 写出后
+即加入按 SID 跟踪的 pending 集合，SYNACK 只结清自己的 SID——无关 stream 的应答
+不会清除其他 stream 的 deadline。任何在 SYN 写出三秒后仍 pending 的 open 都会退役
+物理 session，让 pool 重新拨号，而不是继续复用无响应的 carrier。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor 与 idle timeout 输入同一个节点局部 janitor。Selector 或
@@ -481,7 +481,7 @@ queue 耗尽时 session 会转为 terminal，而不会继续增长内存。strea
 第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。
 
 完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 64
-frame 或 256 KiB，再执行一次 `write_all` 与一次 `flush`。它绝不等待
+frame 或 256 KiB（均不含首帧），再执行一次 `write_all` 与一次 `flush`。它绝不等待
 凑满 batch。只有物理 batch 成功或 session 变为 terminal 后，才释放 data
 permit 与 confirmed-write completion。
 
