@@ -480,7 +480,7 @@ permit，control frame 保留 queue headroom，整个 queue 封顶 1,024 个 fra
 queue 耗尽时 session 会转为 terminal，而不会继续增长内存。stream 的 SYN 与
 第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。
 
-完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 64
+完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 63
 frame 或 256 KiB（均不含首帧），再执行一次 `write_all` 与一次 `flush`。它绝不等待
 凑满 batch。只有物理 batch 成功或 session 变为 terminal 后，才释放 data
 permit 与 confirmed-write completion。

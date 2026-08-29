@@ -591,12 +591,12 @@ struct WriterQueue {
     closed: AtomicBool,
 }
 
-/// Open streams awaiting their SYNACK. The timer is armed when the first
-/// SYN is written and stopped only when every pending SID is answered.
+/// Open streams awaiting their SYNACK. A SID is registered when its SYN is
+/// queued (so an early SYNACK can settle it) and gets its own deadline when
+/// the writer puts the SYN on the wire.
 #[derive(Default)]
 struct SynackPending {
-    sids: std::collections::HashSet<u32>,
-    timer: Option<tokio::task::AbortHandle>,
+    sids: std::collections::HashMap<u32, Option<tokio::task::AbortHandle>>,
 }
 
 /// Total writer-queue depth (data + control headroom).
@@ -731,7 +731,7 @@ async fn session_writer(
                 FrameCommand::Control {
                     cmd: CMD_SYN, sid, ..
                 } if succeeded => {
-                    session.arm_synack_watchdog(*sid);
+                    session.start_synack_deadline(*sid);
                 }
                 FrameCommand::Data { completion, .. } => {
                     if let Some(completion) = completion.take() {
@@ -876,29 +876,31 @@ impl AnyTlsSession {
         self.closed.load(Ordering::SeqCst)
     }
 
-    fn arm_synack_watchdog(self: &Arc<Self>, sid: u32) {
+    fn register_synack(&self, sid: u32) {
         if sid < 2 || !self.peer_supports_synack.load(Ordering::Acquire) {
             return;
         }
+        self.synack_pending.lock().sids.insert(sid, None);
+    }
+
+    /// The SYN is on the wire; start its deadline. A fast peer may have
+    /// acked while the frame sat in the queue — then there is nothing to arm.
+    fn start_synack_deadline(self: &Arc<Self>, sid: u32) {
         let mut pending = self.synack_pending.lock();
-        if self.is_closed() {
+        let Some(slot) = pending.sids.get_mut(&sid) else {
             return;
-        }
-        if !pending.sids.insert(sid) || pending.timer.is_some() {
+        };
+        if slot.is_some() || self.is_closed() {
             return;
         }
         let session = Arc::clone(self);
-        pending.timer = Some(
+        *slot = Some(
             tokio::spawn(async move {
                 tokio::time::sleep(SYNACK_TIMEOUT).await;
-                let overdue: Vec<u32> = {
-                    let mut pending = session.synack_pending.lock();
-                    pending.timer = None;
-                    pending.sids.iter().copied().collect()
-                };
-                if !overdue.is_empty() {
+                let overdue = session.synack_pending.lock().sids.remove(&sid).is_some();
+                if overdue {
                     session.fail(anyhow::anyhow!(
-                        "SYNACK timed out after {SYNACK_TIMEOUT:?} for {overdue:?}"
+                        "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
                     ));
                 }
             })
@@ -909,20 +911,16 @@ impl AnyTlsSession {
     /// A SYNACK settles only its own SID; acknowledging an unrelated stream
     /// must not extend the deadline of opens the peer never answered.
     fn acknowledge_syn(&self, sid: u32) {
-        let mut pending = self.synack_pending.lock();
-        if pending.sids.remove(&sid)
-            && pending.sids.is_empty()
-            && let Some(handle) = pending.timer.take()
-        {
-            handle.abort();
+        if let Some(timer) = self.synack_pending.lock().sids.remove(&sid).flatten() {
+            timer.abort();
         }
     }
 
     fn clear_synack_pending(&self) {
-        let mut pending = self.synack_pending.lock();
-        pending.sids.clear();
-        if let Some(handle) = pending.timer.take() {
-            handle.abort();
+        for (_, timer) in self.synack_pending.lock().sids.drain() {
+            if let Some(timer) = timer {
+                timer.abort();
+            }
         }
     }
 
@@ -1128,6 +1126,7 @@ impl AnyTlsSession {
         if self.is_closed() {
             return Err(anyhow::anyhow!("AnyTLS session {} is closed", self.seq));
         }
+        self.register_synack(sid);
         self.writer_q
             .push_batch([
                 FrameCommand::Control {

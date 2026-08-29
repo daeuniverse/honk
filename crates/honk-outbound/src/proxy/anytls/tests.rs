@@ -1244,6 +1244,95 @@ async fn synack_deadline_is_tracked_per_stream() {
     );
 }
 
+/// Each open gets its own full deadline: acknowledging an earlier stream
+/// must not leave a later stream on the earlier one's clock.
+#[tokio::test(start_paused = true)]
+async fn synack_deadlines_do_not_share_elapsed_time() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    read_frame(&mut server).await.unwrap();
+    read_frame(&mut server).await.unwrap();
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let _third = session
+        .open_stream_direct(
+            vec![0x01, 3, 3, 3, 3, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    read_frame(&mut server).await.unwrap();
+    read_frame(&mut server).await.unwrap();
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_millis(500)).await;
+    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // 1.6s past the second stream's deadline, but only 2.1s into the third's.
+    tokio::time::advance(Duration::from_millis(1600)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "the third stream keeps its own full deadline"
+    );
+
+    tokio::time::advance(SYNACK_TIMEOUT).await;
+    tokio::task::yield_now().await;
+    assert!(session.is_closed(), "the third stream's own deadline fires");
+}
+
+/// A SYNACK that arrives while the SYN is still queued must settle the open:
+/// registering at queue time means the wire-time arm finds nothing to do.
+#[tokio::test(start_paused = true)]
+async fn synack_before_wire_write_settles_the_open() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    // ACK before the writer has written the SYN.
+    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    // Now let the writer put the SYN on the wire.
+    read_frame(&mut server).await.unwrap();
+    read_frame(&mut server).await.unwrap();
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "an early SYNACK must not strand a never-armed deadline"
+    );
+}
+
 #[tokio::test]
 async fn overflow_accounting_clears_on_lifecycle_exits() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;

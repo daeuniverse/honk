@@ -526,7 +526,7 @@ capped at 1,024 frames. Queue exhaustion makes the session terminal instead of
 growing memory. A stream's SYN and first PSH are inserted as one atomic batch,
 so another stream cannot interleave between them.
 
-After one blocking pop, the writer gathers only frames already queued, up to 64
+After one blocking pop, the writer gathers only frames already queued, up to 63
 frames or 256 KiB on top of the first frame, into one `write_all` and one `flush`. It never waits to fill
 a batch. Data permits and confirmed-write completions are released only after
 the physical batch succeeds or the session becomes terminal.
