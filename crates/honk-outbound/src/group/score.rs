@@ -25,6 +25,10 @@ const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
 const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
 const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
+/// Consecutive fresh failures that drop a leaf out of the reliability band
+/// while any healthier candidate exists. Decayed history must not shield a
+/// leaf that is failing right now.
+const SCORE_FAIL_STREAK_EXCLUDE: u32 = 3;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
 
@@ -1172,14 +1176,25 @@ fn best_index(
             }
         }
     }
+    // A leaf failing consecutively right now yields to any healthier
+    // candidate no matter how strong its decayed history is; with every
+    // candidate failing, rank the full set so a pick always exists.
+    let any_healthy = snapshots
+        .iter()
+        .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
+    let rankable =
+        |score: &&ScoreSnapshot| !any_healthy || score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE;
     let best_reliability = snapshots
         .iter()
+        .filter(rankable)
         .map(|score| score.reliability)
         .fold(0.0_f64, f64::max);
     let index = snapshots
         .iter()
         .enumerate()
-        .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+        .filter(|(_, score)| {
+            rankable(score) && best_reliability - score.reliability <= RELIABILITY_CLOSE
+        })
         .max_by(|(left_index, left), (right_index, right)| {
             utility(left, performance)
                 .total_cmp(&utility(right, performance))
@@ -1335,6 +1350,7 @@ struct ScoreSnapshot {
     throughput_confidence: f64,
     failures: f64,
     explore_backed_off: bool,
+    fail_streak: u32,
     selected_at: u64,
     targeted: bool,
     target_attempts: f64,
@@ -1411,6 +1427,7 @@ fn score_snapshot(
             ),
             failures: global_score.failures.max(family.failures),
             explore_backed_off: global_score.explore_backed_off,
+            fail_streak: global_score.fail_streak,
             selected_at: global_score.selected_at.max(family.selected_at),
             targeted: false,
             target_attempts: 0.0,
@@ -1472,6 +1489,7 @@ fn score_snapshot(
         ),
         failures: aggregate_score.failures.max(exact.failures),
         explore_backed_off: aggregate_score.explore_backed_off,
+        fail_streak: aggregate_score.fail_streak,
         selected_at: aggregate_score.selected_at.max(exact.selected_at),
         targeted: exact.completed >= MIN_TRAINED_EVIDENCE
             || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
@@ -1505,6 +1523,7 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
         failures: (stats.setup_failure + stats.useful_failure) * factor,
         explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
+        fail_streak: stats.fail_streak,
         selected_at: stats.selected_at,
         targeted: false,
         target_attempts: 0.0,
@@ -2335,6 +2354,7 @@ mod tests {
             failures: 0.0,
             selected_at: 0,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2361,6 +2381,7 @@ mod tests {
             failures: 0.0,
             selected_at: 0,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2395,6 +2416,7 @@ mod tests {
             failures,
             selected_at: 0,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -2533,6 +2555,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures: 0.0,
             explore_backed_off: backed_off,
+            fail_streak: 0,
             selected_at: 0,
             targeted: false,
             target_attempts: 0.0,
@@ -2558,6 +2581,48 @@ mod tests {
         let selection = best_index(&snapshots, &node_refs, 1, true, performance);
         assert!(!selection.reason.is_exploration());
         assert_eq!(selection.reason, SelectionReason::PerformanceWinner);
+    }
+
+    #[test]
+    fn consecutive_failures_exclude_leaf_from_ranking() {
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let trained = |reliability, fail_streak| ScoreSnapshot {
+            attempts: 8.0,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability,
+            reliability_upper: reliability,
+            useful_completed: 8.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            explore_backed_off: false,
+            fail_streak,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        // The historically stronger leaf yields while it fails consecutively.
+        let snapshots = [trained(0.9, SCORE_FAIL_STREAK_EXCLUDE), trained(0.8, 0)];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, false, performance).index,
+            1
+        );
+        // Every candidate failing: the full-set fallback still returns a leaf.
+        let snapshots = [
+            trained(0.9, SCORE_FAIL_STREAK_EXCLUDE),
+            trained(0.8, SCORE_FAIL_STREAK_EXCLUDE),
+        ];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, false, performance).index,
+            0
+        );
     }
 
     #[test]
@@ -2690,6 +2755,7 @@ mod tests {
             failures: 0.0,
             selected_at,
             explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
@@ -3206,6 +3272,7 @@ mod tests {
             throughput_confidence: 0.0,
             failures: aged,
             explore_backed_off: false,
+            fail_streak: 0,
             selected_at: 1,
             targeted: false,
             target_attempts: 0.0,
