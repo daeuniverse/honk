@@ -398,16 +398,17 @@ stability_row() {
 # Median UDP echo RTT (seconds) through the protocol at 53530+idx. Dedicated
 # rprx runs reuse slots 1-3; VLESS/VMess correctly return no sample (no UDP).
 udp_echo_rtt() { # idx → p50 seconds
-    ip netns exec $N python3 - "$1" <<'PY' 2>/dev/null
+    ip netns exec $N python3 - "$1" "$T" <<'PY' 2>/dev/null
 import socket, sys, time
 port = 53530 + int(sys.argv[1])
+target = sys.argv[2]
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(3)
 rtts = []
 for _ in range(15):
     t = time.time()
     try:
-        s.sendto(b"lab-udp-ping", ("10.10.10.70", port))
+        s.sendto(b"lab-udp-ping", (target, port))
         s.recvfrom(64)
         rtts.append(time.time() - t)
     except Exception:
