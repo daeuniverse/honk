@@ -392,6 +392,15 @@ impl DnsUpstreamPool for UpstreamPool {
                     };
                 }
                 Err(error) => {
+                    debug!(
+                        target: "honk_core::dns::upstream_pool::failure",
+                        upstream = upstream_name,
+                        protocol = ?entry.protocol,
+                        server = %route.target,
+                        leaf = ?route.node.as_ref().map(|node| node.name.as_str()),
+                        error = %error,
+                        "DNS upstream route failed"
+                    );
                     first_error.get_or_insert_with(|| (route.target, error.to_string()));
                     last_error = Some((route.target, error));
                 }
@@ -401,9 +410,9 @@ impl DnsUpstreamPool for UpstreamPool {
             last_error.ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
         let context = match first_error.filter(|(first, _)| *first != target) {
             Some((first, first_error)) => format!(
-                "DNS upstream '{upstream_name}' failed via {target}: {error} (first {first}: {first_error})"
+                "DNS upstream '{upstream_name}' failed via {target} (first {first}: {first_error})"
             ),
-            None => format!("DNS upstream '{upstream_name}' failed via {target}: {error}"),
+            None => format!("DNS upstream '{upstream_name}' failed via {target}"),
         };
         Err(error).context(context)
     }

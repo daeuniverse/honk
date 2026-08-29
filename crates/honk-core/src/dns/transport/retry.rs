@@ -13,41 +13,30 @@ where
     Reset: FnOnce() -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
-    async fn attempt<Once, Fut>(
-        once: &Once,
-        feedback: Option<&honk_outbound::group::ScoreFeedback>,
-        raw_query: &[u8],
-    ) -> anyhow::Result<Vec<u8>>
-    where
-        Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
-        Fut: Future<Output = anyhow::Result<Vec<u8>>>,
-    {
-        let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
-        let result = once(reporter.clone()).await;
-        if let Some(reporter) = &reporter {
-            match &result {
-                Ok(response) if super::is_valid_response(raw_query, response) => {
-                    reporter.finish(honk_outbound::group::ScoreOutcome::Success)
-                }
-                Ok(_) => reporter.finish(honk_outbound::group::ScoreOutcome::Other),
-                Err(error) => {
-                    reporter.finish(honk_outbound::group::ScoreOutcome::from_error(error))
-                }
-            }
-        }
-        result
-    }
-
-    match attempt(&once, feedback, raw_query).await {
+    let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
+    let result = match once(reporter.clone()).await {
         Ok(response) => Ok(response),
         Err(first) => {
             record_reset(label);
             reset().await;
-            attempt(&once, feedback, raw_query).await.map_err(|error| {
-                anyhow::anyhow!("{label} failed after retry: {error} (first: {first})")
+            once(reporter.clone()).await.map_err(|error| {
+                let detail = error.to_string();
+                error.context(format!(
+                    "{label} failed after retry: {detail} (first: {first})"
+                ))
             })
         }
+    };
+    if let Some(reporter) = &reporter {
+        match &result {
+            Ok(response) if super::is_valid_response(raw_query, response) => {
+                reporter.finish(honk_outbound::group::ScoreOutcome::Success)
+            }
+            Ok(_) => reporter.finish(honk_outbound::group::ScoreOutcome::Other),
+            Err(error) => reporter.finish(honk_outbound::group::ScoreOutcome::from_error(error)),
+        }
     }
+    result
 }
 
 fn record_reset(label: &'static str) {
@@ -61,6 +50,12 @@ fn record_reset(label: &'static str) {
 
 #[cfg(test)]
 mod tests {
+    use honk_config::group::GroupPolicy;
+    use honk_config::node::{Group, Node};
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::{
+        GroupManager, ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+    };
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -121,5 +116,90 @@ mod tests {
         assert!(log.contains("transport=\"test\""));
         assert!(!log.contains("secret endpoint value"));
         assert!(crate::stats::dns_snapshot().delta(before).transport_reset >= 1);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_does_not_penalize_score_candidate() {
+        let nodes = ["a", "b"].map(|name| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            ..Default::default()
+        });
+        let group = Group {
+            name: "score".into(),
+            policy: GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = GroupManager::new(&[group], &nodes);
+        let context = ScoreSelectionContext {
+            network: SelectionNetwork::Tcp,
+            probe_domain: ProbeDomain::Tcp,
+            target_family: Some(IpVersion::V4),
+            health_family: IpVersion::V4,
+            target: Some(ScoreTarget::from(
+                "8.8.8.8:443".parse::<std::net::SocketAddr>().unwrap(),
+            )),
+        };
+
+        for node in &nodes {
+            let feedback = manager
+                .feedback_for_node(node.id, context.clone())
+                .expect("Score candidate feedback");
+            for _ in 0..32 {
+                let reporter = feedback.start();
+                reporter.setup_succeeded();
+                reporter.tx(1);
+                reporter.first_response();
+                reporter.rx(1);
+                reporter.finish(ScoreOutcome::Success);
+            }
+        }
+
+        let plan = manager.selection_plan_for_target("score", &context);
+        let incumbent = plan.entries[0].node.id;
+        let feedback = plan.entries[0]
+            .feedback
+            .clone()
+            .expect("Score candidate feedback");
+        let calls = AtomicUsize::new(0);
+        let query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        let mut response = query.clone();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+
+        for _ in 0..32 {
+            super::exchange_with_retry(
+                "test",
+                &query,
+                |reporter| async {
+                    let reporter = reporter.expect("Score reporter");
+                    reporter.setup_succeeded();
+                    if calls.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "stale session",
+                        )
+                        .into());
+                    }
+                    reporter.tx(1);
+                    reporter.first_response();
+                    reporter.rx(1);
+                    Ok(response.clone())
+                },
+                || async {},
+                Some(&feedback),
+            )
+            .await
+            .expect("retry succeeds");
+        }
+
+        let selected = manager.selection_plan_for_target("score", &context).entries[0]
+            .node
+            .id;
+        assert_eq!(selected, incumbent);
     }
 }
