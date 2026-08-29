@@ -591,6 +591,14 @@ struct WriterQueue {
     closed: AtomicBool,
 }
 
+/// Open streams awaiting their SYNACK. The timer is armed when the first
+/// SYN is written and stopped only when every pending SID is answered.
+#[derive(Default)]
+struct SynackPending {
+    sids: std::collections::HashSet<u32>,
+    timer: Option<tokio::task::AbortHandle>,
+}
+
 /// Total writer-queue depth (data + control headroom).
 const WRITER_QUEUE_CAP: usize = 1024;
 /// Slots reserved for control frames (SYN/FIN/HEART) — data can never
@@ -717,10 +725,20 @@ async fn session_writer(
             Ok(Ok(()))
         );
         for command in &mut batch {
-            if let FrameCommand::Data { completion, .. } = command
-                && let Some(completion) = completion.take()
-            {
-                let _ = completion.send(succeeded);
+            match command {
+                // The deadline starts when the SYN is on the wire, not at
+                // registration: writer backlog must not eat the budget.
+                FrameCommand::Control {
+                    cmd: CMD_SYN, sid, ..
+                } if succeeded => {
+                    session.arm_synack_watchdog(*sid);
+                }
+                FrameCommand::Data { completion, .. } => {
+                    if let Some(completion) = completion.take() {
+                        let _ = completion.send(succeeded);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -764,8 +782,9 @@ pub(crate) struct AnyTlsSession {
     next_sid: AtomicU32,
     /// Negotiated through `CMD_SERVER_SETTINGS`; v2 peers acknowledge opens.
     peer_supports_synack: AtomicBool,
-    /// Latest reused-stream acknowledgement deadline (sing-anytls parity).
-    synack_watchdog: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
+    /// Per-SID open acknowledgements outstanding; the timer runs while any
+    /// SYN is past the wire without its SYNACK (sing-anytls parity).
+    synack_pending: parking_lot::Mutex<SynackPending>,
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
     /// close via [`AnyTlsSession::close`].
     closed: AtomicBool,
@@ -824,7 +843,7 @@ impl AnyTlsSession {
             remote_fin: parking_lot::Mutex::new(HashSet::new()),
             next_sid: AtomicU32::new(0),
             peer_supports_synack: AtomicBool::new(false),
-            synack_watchdog: parking_lot::Mutex::new(None),
+            synack_pending: parking_lot::Mutex::new(SynackPending::default()),
             closed: AtomicBool::new(false),
             created: Instant::now(),
             session_state: AtomicUsize::new(crate::session::SessionState::Active as usize),
@@ -861,27 +880,48 @@ impl AnyTlsSession {
         if sid < 2 || !self.peer_supports_synack.load(Ordering::Acquire) {
             return;
         }
-        let mut watchdog = self.synack_watchdog.lock();
+        let mut pending = self.synack_pending.lock();
         if self.is_closed() {
             return;
         }
-        if let Some(handle) = watchdog.take() {
-            handle.abort();
+        if !pending.sids.insert(sid) || pending.timer.is_some() {
+            return;
         }
         let session = Arc::clone(self);
-        *watchdog = Some(
+        pending.timer = Some(
             tokio::spawn(async move {
                 tokio::time::sleep(SYNACK_TIMEOUT).await;
-                session.fail(anyhow::anyhow!(
-                    "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
-                ));
+                let overdue: Vec<u32> = {
+                    let mut pending = session.synack_pending.lock();
+                    pending.timer = None;
+                    pending.sids.iter().copied().collect()
+                };
+                if !overdue.is_empty() {
+                    session.fail(anyhow::anyhow!(
+                        "SYNACK timed out after {SYNACK_TIMEOUT:?} for {overdue:?}"
+                    ));
+                }
             })
             .abort_handle(),
         );
     }
 
-    fn acknowledge_syn(&self) {
-        if let Some(handle) = self.synack_watchdog.lock().take() {
+    /// A SYNACK settles only its own SID; acknowledging an unrelated stream
+    /// must not extend the deadline of opens the peer never answered.
+    fn acknowledge_syn(&self, sid: u32) {
+        let mut pending = self.synack_pending.lock();
+        if pending.sids.remove(&sid)
+            && pending.sids.is_empty()
+            && let Some(handle) = pending.timer.take()
+        {
+            handle.abort();
+        }
+    }
+
+    fn clear_synack_pending(&self) {
+        let mut pending = self.synack_pending.lock();
+        pending.sids.clear();
+        if let Some(handle) = pending.timer.take() {
             handle.abort();
         }
     }
@@ -1088,7 +1128,6 @@ impl AnyTlsSession {
         if self.is_closed() {
             return Err(anyhow::anyhow!("AnyTLS session {} is closed", self.seq));
         }
-        self.arm_synack_watchdog(sid);
         self.writer_q
             .push_batch([
                 FrameCommand::Control {
@@ -1241,7 +1280,7 @@ impl AnyTlsSession {
         if let Some(handle) = self.writer_task.lock().unwrap().take() {
             handle.abort();
         }
-        self.acknowledge_syn();
+        self.clear_synack_pending();
         if let Some(handle) = self.watchdog.lock().unwrap().take() {
             handle.abort();
         }
@@ -1559,7 +1598,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             CMD_PSH => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
-                session.acknowledge_syn();
+                session.acknowledge_syn(sid);
                 if !data.is_empty() {
                     let shown = &data[..data.len().min(MAX_STREAM_ERROR_SOURCE_BYTES)];
                     let suffix = if shown.len() == data.len() {

@@ -1159,7 +1159,7 @@ async fn reused_v2_session_requires_synack_within_deadline() {
         .await
         .unwrap();
     tokio::task::yield_now().await;
-    assert!(session.synack_watchdog.lock().is_none());
+    assert!(session.synack_pending.lock().sids.is_empty());
     tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
     assert!(
         !session.is_closed(),
@@ -1190,6 +1190,58 @@ async fn reused_v2_session_requires_synack_within_deadline() {
             .is_some_and(|error| error.to_string().contains("SYNACK timed out"))
     );
     drop((first, second));
+}
+
+/// Regression for the PR review repro: a SYNACK for one stream must not
+/// cancel the deadline of a concurrent, still-unacknowledged open.
+#[tokio::test(start_paused = true)]
+async fn synack_deadline_is_tracked_per_stream() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let _first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    let _third = session
+        .open_stream_direct(
+            vec![0x01, 3, 3, 3, 3, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        read_frame(&mut server).await.unwrap();
+    }
+    tokio::task::yield_now().await;
+
+    // A late SYNACK for the second stream leaves the third one pending.
+    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(!session.synack_pending.lock().sids.is_empty());
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        session.is_closed(),
+        "an unrelated SYNACK must not clear another stream's deadline"
+    );
 }
 
 #[tokio::test]
