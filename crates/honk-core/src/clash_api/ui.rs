@@ -8,14 +8,14 @@
 //! failures only log a warning — `ServeDir` keeps returning 404 until the
 //! files land.
 //!
-//! The fetch follows the same routing decision as user traffic: the
-//! download URL's host is run through the traffic `Router`, a `direct`
-//! result (including must-rules) takes the plain reqwest path, `block`
-//! aborts the download, and anything else is fetched through the selected
-//! node's tunnel with a real TLS handshake.
+//! A non-empty `external_ui_download_detour` forces every request and
+//! redirect through that node or group. Otherwise each URL host follows the
+//! normal traffic routing decision: `direct` uses reqwest, `block` aborts,
+//! and other results use the selected node's tunnel.
 //!
-//! The download URL defaults to [`DEFAULT_UI_DOWNLOAD_URL`] and can be
-//! overridden with the `HONK_UI_DOWNLOAD_URL` environment variable.
+//! The download URL defaults to [`DEFAULT_UI_DOWNLOAD_URL`].
+//! `external_ui_download_url` configures it, while `HONK_UI_DOWNLOAD_URL`
+//! remains the highest-precedence override.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -66,7 +66,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub struct UiDownloadContext {
     pub external_ui: String,
     pub router: Arc<RwLock<Router>>,
-    pub config: Arc<RwLock<Config>>,
+    pub config: Arc<RwLock<Arc<Config>>>,
     pub group_manager: SharedGroupManager,
     pub proxy_registry: Arc<ProxyRegistry>,
     pub runtime_registry: SharedRuntimeRegistry,
@@ -103,13 +103,27 @@ pub async fn ensure_external_ui(ctx: &UiDownloadContext) -> anyhow::Result<bool>
         }
         Err(_) => std::fs::create_dir_all(path)?,
     }
-    download_external_ui(ctx, &download_url()).await?;
+    let configured_url = {
+        let config = ctx.config.read().await;
+        config
+            .experimental
+            .clash_api
+            .external_ui_download_url
+            .clone()
+    };
+    download_external_ui(ctx, &download_url(&configured_url)).await?;
     Ok(true)
 }
 
-/// The configured download URL (env override, then the default constant).
-fn download_url() -> String {
-    std::env::var(UI_DOWNLOAD_URL_ENV).unwrap_or_else(|_| DEFAULT_UI_DOWNLOAD_URL.to_string())
+/// The environment override wins over the configured URL, then the default.
+fn download_url(configured: &str) -> String {
+    std::env::var(UI_DOWNLOAD_URL_ENV).unwrap_or_else(|_| {
+        if configured.is_empty() {
+            DEFAULT_UI_DOWNLOAD_URL.to_string()
+        } else {
+            configured.to_string()
+        }
+    })
 }
 
 /// Where the routing decision sends the download.
@@ -158,13 +172,27 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
         mac: None,
         dscp: None,
     };
-    let (outbound, rule) = {
+    let configured_detour = {
+        let config = ctx.config.read().await;
+        config
+            .experimental
+            .clash_api
+            .external_ui_download_detour
+            .clone()
+    };
+    let detour_configured = !configured_detour.is_empty();
+    let (outbound, rule) = if !detour_configured {
         let router = ctx.router.read().await;
         let (outbound, _must) = router.route_with_must(&info);
         let rule = router
             .route_full(&info)
             .map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
         (outbound.to_string(), rule)
+    } else {
+        (
+            configured_detour,
+            Some("experimental.clash_api.external_ui_download_detour".to_string()),
+        )
     };
     let target_ipver = if matches!(dst_ip, std::net::IpAddr::V6(_)) {
         IpVersion::V6
@@ -181,6 +209,16 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     let (nodes, feedback) = {
         let config = ctx.config.read().await;
         let group_manager = ctx.group_manager.read().clone();
+        // Generic route resolution defaults unknown outputs to direct; an
+        // explicitly configured detour must not bypass that operator error.
+        if detour_configured
+            && outbound != Config::BUILTIN_DIRECT_NODE
+            && outbound != Config::BUILTIN_BLOCK_NODE
+            && !config.nodes.iter().any(|node| node.name == outbound)
+            && !config.groups.iter().any(|group| group.name == outbound)
+        {
+            anyhow::bail!("external UI download: detour outbound '{outbound}' not found");
+        }
         if config.groups.iter().any(|group| group.name == outbound) {
             let context = ScoreSelectionContext {
                 network: SelectionNetwork::Tcp,
@@ -216,7 +254,7 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     let Some(node) = nodes.into_iter().next() else {
         anyhow::bail!("external UI download: outbound '{outbound}' has no available node");
     };
-    let route = match node.protocol {
+    let route = match node.protocol() {
         NodeProtocol::Direct => UiRoute::Direct { feedback },
         NodeProtocol::Block => UiRoute::Block,
         _ => UiRoute::Proxy {
@@ -358,10 +396,11 @@ async fn fetch_proxied(
     path: &str,
     is_https: bool,
 ) -> anyhow::Result<ProxiedFetch> {
+    let protocol = node.protocol();
     let entry = ctx
         .proxy_registry
-        .find(node.protocol)
-        .ok_or_else(|| anyhow::anyhow!("no handler for protocol {:?}", node.protocol))?;
+        .find(protocol)
+        .ok_or_else(|| anyhow::anyhow!("no handler for protocol {:?}", protocol))?;
     let connect_timeout = Duration::from_millis(ctx.config.read().await.global.connect_timeout_ms);
     // Tunnel handlers dial by domain; the address is only a fallback for
     // handlers that need a numeric target.
@@ -382,9 +421,12 @@ async fn fetch_proxied(
         }
     };
     let reporter = feedback.as_ref().map(ScoreFeedback::start);
-    let result = match entry
-        .tcp
-        .dial_runtime(runtime, addr, domain, connect_timeout)
+    let result = match generation
+        .scope_dials(
+            entry
+                .tcp
+                .dial_runtime(runtime, addr, domain, connect_timeout),
+        )
         .await
     {
         Ok(proxy) => match tokio::time::timeout(
@@ -694,7 +736,7 @@ mod tests {
                 &config.groups,
                 &config.nodes,
             )))),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             proxy_registry,
             runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
@@ -777,19 +819,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_downloads_into_empty_directory() {
+    async fn configured_url_and_detour_download_into_empty_directory() {
         let zip_bytes = make_zip(&[("dist/index.html", b"<html>y</html>".as_slice())]);
         let addr = spawn_zip_server(zip_bytes).await;
         let dir = tempfile::tempdir().unwrap();
         let ui_dir = dir.path().join("ui");
-        // Point the download at a *missing* directory to also cover creation.
-        let ctx = test_ctx(&ui_dir, &[]);
-        download_external_ui(&ctx, &format!("http://{}/ui.zip", addr))
-            .await
-            .unwrap();
+        let rules = vec![RoutingRule {
+            name: "block-ui".into(),
+            condition: RoutingCondition {
+                ip: vec!["127.0.0.1/32".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("block".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }];
+        let ctx = test_ctx(&ui_dir, &rules);
+        {
+            let mut config = ctx.config.write().await;
+            let config = Arc::make_mut(&mut config);
+            config.experimental.clash_api.external_ui_download_url =
+                format!("http://{addr}/ui.zip");
+            config.experimental.clash_api.external_ui_download_detour = "direct".into();
+        }
+
+        assert!(ensure_external_ui(&ctx).await.unwrap());
         assert_eq!(
             std::fs::read(ui_dir.join("index.html")).unwrap(),
             b"<html>y</html>"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_configured_detour_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path(), &[]);
+        let mut config = ctx.config.write().await;
+        Arc::make_mut(&mut config)
+            .experimental
+            .clash_api
+            .external_ui_download_detour = "missing".into();
+        drop(config);
+
+        let error = decide_route(&ctx, "127.0.0.1", 80)
+            .await
+            .err()
+            .expect("an unknown explicit detour must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("detour outbound 'missing' not found"),
+            "{error:#}"
         );
     }
 
@@ -912,7 +993,7 @@ mod tests {
 
         let mut node = Node {
             name: "mock".into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: "127.0.0.1".into(),
             port: 1,
             ..Default::default()
@@ -937,7 +1018,9 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx_with_registry(dir.path(), &rules, Arc::new(registry));
-        ctx.config.write().await.nodes.push(node);
+        let mut config = ctx.config.write().await;
+        Arc::make_mut(&mut config).nodes.push(node);
+        drop(config);
         download_external_ui(&ctx, &format!("http://{addr}/ui.zip"))
             .await
             .expect("proxied download must succeed");
@@ -953,7 +1036,7 @@ mod tests {
         let nodes = ["a", "b"].map(|name| {
             let mut node = Node {
                 name: name.into(),
-                protocol: NodeProtocol::Socks5,
+                outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
                 address: "127.0.0.1".into(),
                 port: 1,
                 ..Default::default()
@@ -1002,7 +1085,7 @@ mod tests {
                 &config.groups,
                 &config.nodes,
             )))),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             proxy_registry: Arc::new(registry),
             runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
@@ -1090,7 +1173,7 @@ mod tests {
                 &config.groups,
                 &config.nodes,
             )))),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
             runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),

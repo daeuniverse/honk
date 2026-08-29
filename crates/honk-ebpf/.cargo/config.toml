@@ -5,7 +5,7 @@ rustflags = [
   "-C",
   "llvm-args=-inline-threshold=300",
   "-C",
-  "linker=/root/.cargo/bin/bpf-linker-wrapper",
+  "linker=bpf-linker",
   "-C",
   "debuginfo=2",
   "-C",

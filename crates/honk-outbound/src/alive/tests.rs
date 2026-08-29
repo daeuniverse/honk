@@ -352,7 +352,7 @@ fn test_push_ebpf_uses_outbound_resolver() {
     let set = AliveDialerSet::new();
     let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    set.set_ebpf_callback(Box::new(move |o, d, ip, alive| {
+    set.set_ebpf_callback(Box::new(move |_node_id, o, d, ip, alive| {
         calls2.lock().unwrap().push((o, d, ip, alive));
     }));
 
@@ -442,6 +442,22 @@ impl HttpProber for MockHttpProber {
         let result = self.result.clone();
         Box::pin(async move { result })
     }
+}
+
+#[tokio::test]
+async fn invalid_http_check_url_falls_back_before_probe_cycles() {
+    let set = AliveDialerSet::new();
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::WarmSuccess(Duration::from_millis(1)),
+        }),
+        "http://".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    assert!(set.check_url.read().is_empty());
+    assert!(set.check_url_ips.read().is_empty());
 }
 
 #[tokio::test]

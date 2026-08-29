@@ -411,25 +411,25 @@ impl TuicHandler {
     }
 
     async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<TuicClient>> {
-        let uuid_str = node
-            .tuic_uuid
+        let tuic = node.tuic().unwrap();
+        let uuid_str = tuic
+            .uuid
             .as_deref()
-            .or(node.username.as_deref())
             .ok_or_else(|| anyhow!("TUIC node '{}': missing tuic_uuid", node.name))?;
         let uuid = uuid::Uuid::parse_str(uuid_str)
             .with_context(|| format!("TUIC node '{}': invalid uuid", node.name))?;
-        let password = node
-            .tuic_password
-            .as_deref()
-            .or(node.password.as_deref())
-            .unwrap_or("")
-            .to_string();
-        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let password = tuic.password.as_deref().unwrap_or("").to_string();
+        let server_name = tuic
+            .quic
+            .tls
+            .sni
+            .clone()
+            .unwrap_or_else(|| node.host().to_string());
         // ALPN override from the share link (`alpn=h3`, comma-separated);
         // servers configured without `tuic` in their ALPN list reject the
         // handshake at the TLS layer otherwise.
-        let alpn: Vec<Vec<u8>> = node
-            .tuic_alpn
+        let alpn: Vec<Vec<u8>> = tuic
+            .alpn
             .as_deref()
             .map(|s| {
                 s.split(',')
@@ -445,19 +445,17 @@ impl TuicHandler {
         // to 8MB stream / 8MB conn (conn window = memory budget, see hy2).
         // Explicit node fields override.
         let options = crate::quic::QuicClientOptions {
-            congestion: Some(crate::quic::congestion_factory(
-                node.tuic_congestion.as_deref(),
-            )),
-            stream_receive_window: Some(node.tuic_init_stream_recv_window.unwrap_or(8 << 20)),
-            conn_receive_window: Some(node.tuic_init_conn_recv_window.unwrap_or(8 << 20)),
-            max_udp_payload_size: node.quic_mtu,
+            congestion: Some(crate::quic::congestion_factory(tuic.congestion.as_deref())),
+            stream_receive_window: Some(tuic.init_stream_recv_window.unwrap_or(8 << 20)),
+            conn_receive_window: Some(tuic.init_conn_recv_window.unwrap_or(8 << 20)),
+            max_udp_payload_size: tuic.quic.mtu,
             ..Default::default()
         };
         let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
         let config = crate::quic::client_config(node, &alpn_refs, options).await?;
         Ok(Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
-                .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
+                .with_max_udp_payload_size(tuic.quic.mtu.unwrap_or(1252)),
             uuid: *uuid.as_bytes(),
             password,
         }))
@@ -776,7 +774,6 @@ impl PacketTransport for TuicUdpTransport {
 mod tests {
     use super::*;
     use crate::quic::testutil;
-    use honk_config::types::NodeProtocol;
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -791,13 +788,21 @@ mod tests {
     fn test_node(port: u16, password: &str) -> Node {
         Node {
             name: "tuic-test".to_string(),
-            protocol: NodeProtocol::Tuic,
             host: "127.0.0.1".to_string(),
             address: format!("127.0.0.1:{port}"),
             port,
-            tuic_uuid: Some(TEST_UUID.to_string()),
-            tuic_password: Some(password.to_string()),
-            skip_cert_verify: true,
+            outbound: honk_config::node::OutboundConfig::Tuic(honk_config::node::TuicConfig {
+                uuid: Some(TEST_UUID.to_string()),
+                password: Some(password.to_string()),
+                quic: honk_config::node::QuicOptions {
+                    tls: honk_config::node::TlsOptions {
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -983,10 +988,8 @@ mod tests {
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
         // Share-link `alpn=h3` is honored: the handshake succeeds.
-        let node = Node {
-            tuic_alpn: Some("h3".to_string()),
-            ..test_node(server_addr.port(), TEST_PASSWORD)
-        };
+        let mut node = test_node(server_addr.port(), TEST_PASSWORD);
+        node.tuic_mut().unwrap().alpn = Some("h3".to_string());
         let mut stream = handler
             .dial(&node, target, None, Duration::from_secs(5))
             .await

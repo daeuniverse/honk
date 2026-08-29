@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
+use bytes::Bytes;
 use honk_config::node::Node;
 use tracing::debug;
 
@@ -32,16 +33,32 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// credentials fail the first stream open an RTT later instead.
 const AUTH_GRACE: Duration = Duration::ZERO;
 
-/// Read one inbound UDP frame (`[metadata][len u16][payload]`); the address
-/// is returned alongside the payload for completeness but relayed sessions
-/// are keyed by target, so callers currently ignore it.
-async fn read_udp_frame(recv: &mut quinn::RecvStream) -> io::Result<(JuiceAddr, Vec<u8>)> {
+/// Read one inbound UDP frame (`[metadata][len u16][payload]`) into the
+/// caller's buffer. Oversized payloads are consumed before returning the
+/// same buffer-size error as the previous allocating path.
+async fn read_udp_frame(
+    recv: &mut quinn::RecvStream,
+    payload: &mut [u8],
+) -> io::Result<(JuiceAddr, usize)> {
     let addr = JuiceAddr::read_from_stream(recv).await?;
     let mut len = [0u8; 2];
     read_exact(recv, &mut len).await?;
-    let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
-    read_exact(recv, &mut payload).await?;
-    Ok((addr, payload))
+    let payload_len = u16::from_be_bytes(len) as usize;
+    if payload_len > payload.len() {
+        let mut discard = [0u8; 512];
+        let mut remaining = payload_len;
+        while remaining != 0 {
+            let chunk = remaining.min(discard.len());
+            read_exact(recv, &mut discard[..chunk]).await?;
+            remaining -= chunk;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "juicity datagram exceeds buffer",
+        ));
+    }
+    read_exact(recv, &mut payload[..payload_len]).await?;
+    Ok((addr, payload_len))
 }
 
 /// Per-QUIC-connection protocol state.
@@ -143,20 +160,20 @@ impl JuicityHandler {
     }
 
     async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
-        let uuid_str = node
-            .juicity_uuid
+        let juicity = node.juicity().unwrap();
+        let uuid_str = juicity
+            .uuid
             .as_deref()
-            .or(node.username.as_deref())
             .ok_or_else(|| anyhow!("Juicity node '{}': missing juicity_uuid", node.name))?;
         let uuid = uuid::Uuid::parse_str(uuid_str)
             .with_context(|| format!("Juicity node '{}': invalid uuid", node.name))?;
-        let password = node
-            .juicity_password
-            .as_deref()
-            .or(node.password.as_deref())
-            .unwrap_or("")
-            .to_string();
-        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let password = juicity.password.as_deref().unwrap_or("").to_string();
+        let server_name = juicity
+            .quic
+            .tls
+            .sni
+            .clone()
+            .unwrap_or_else(|| node.host().to_string());
         // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
         // when no congestion_control is configured.
         let config = crate::quic::client_config(
@@ -164,7 +181,7 @@ impl JuicityHandler {
             &[b"h3"],
             crate::quic::QuicClientOptions {
                 keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                max_udp_payload_size: node.quic_mtu,
+                max_udp_payload_size: juicity.quic.mtu,
                 // Same receive-window rationale as hy2/tuic: quinn's
                 // 1.25 MiB stream default caps downloads around 2 Gbps
                 // on a LAN. Conn window doubles as the per-connection
@@ -177,7 +194,7 @@ impl JuicityHandler {
         .await?;
         Ok(Arc::new(JuicityClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
-                .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
+                .with_max_udp_payload_size(juicity.quic.mtu.unwrap_or(1252)),
             uuid: *uuid.as_bytes(),
             password,
         }))
@@ -425,21 +442,14 @@ impl PacketTransport for JuicityUdpTransport {
         self.send
             .lock()
             .await
-            .write_all(&frame)
+            .write_chunk(Bytes::from(frame))
             .await
             .map_err(io::Error::other)
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (_addr, payload) = read_udp_frame(&mut *self.recv.lock().await).await?;
-        if payload.len() > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "juicity datagram exceeds buffer",
-            ));
-        }
-        buf[..payload.len()].copy_from_slice(&payload);
-        Ok((payload.len(), self.target))
+        let (_addr, payload_len) = read_udp_frame(&mut *self.recv.lock().await, buf).await?;
+        Ok((payload_len, self.target))
     }
 }
 
@@ -447,7 +457,6 @@ impl PacketTransport for JuicityUdpTransport {
 mod tests {
     use super::*;
     use crate::quic::testutil;
-    use honk_config::types::NodeProtocol;
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -462,13 +471,22 @@ mod tests {
     fn test_node(port: u16, password: &str) -> Node {
         Node {
             name: "juicity-test".to_string(),
-            protocol: NodeProtocol::Juicity,
             host: "127.0.0.1".to_string(),
             address: format!("127.0.0.1:{port}"),
             port,
-            juicity_uuid: Some(TEST_UUID.to_string()),
-            juicity_password: Some(password.to_string()),
-            skip_cert_verify: true,
+            outbound: honk_config::node::OutboundConfig::Juicity(
+                honk_config::node::JuicityConfig {
+                    uuid: Some(TEST_UUID.to_string()),
+                    password: Some(password.to_string()),
+                    quic: honk_config::node::QuicOptions {
+                        tls: honk_config::node::TlsOptions {
+                            skip_cert_verify: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+            ),
             ..Default::default()
         }
     }
@@ -556,15 +574,18 @@ mod tests {
                         if JuiceAddr::read_from_stream(&mut recv).await.is_err() {
                             return;
                         }
+                        let mut payload = vec![0u8; u16::MAX as usize];
                         loop {
-                            let Ok((addr, payload)) = read_udp_frame(&mut recv).await else {
+                            let Ok((addr, payload_len)) =
+                                read_udp_frame(&mut recv, &mut payload).await
+                            else {
                                 return;
                             };
                             let mut frame =
-                                Vec::with_capacity(addr.encoded_len() + 2 + payload.len());
+                                Vec::with_capacity(addr.encoded_len() + 2 + payload_len);
                             addr.encode(&mut frame);
-                            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-                            frame.extend_from_slice(&payload);
+                            frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+                            frame.extend_from_slice(&payload[..payload_len]);
                             if send.write_all(&frame).await.is_err() {
                                 return;
                             }
@@ -622,7 +643,12 @@ mod tests {
             .expect("dial_udp_transport should succeed");
         assert_eq!(transport.relay_addr(), target);
         transport.send_packet(b"dns-query").await.unwrap();
+        let mut small = [0u8; 4];
+        let error = transport.recv_packet(&mut small).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
         let mut buf = [0u8; 256];
+        transport.send_packet(b"dns-query").await.unwrap();
         let (n, src) =
             tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
                 .await

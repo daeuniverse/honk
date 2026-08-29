@@ -1,0 +1,32 @@
+id = "11111111-2222-5333-8444-555555555555"
+name = "golden-vless"
+protocol = "vless"
+address = "edge.example:443"
+host = "edge.example"
+port = 443
+username = "00000000-0000-0000-0000-000000000001"
+password = "00000000-0000-0000-0000-000000000001"
+encryption = "none"
+vless_mode = "xudp"
+transport = "ws"
+tls = true
+sni = "front.example"
+skip_cert_verify = true
+ech_enabled = true
+ech_config = "AAECAw=="
+reality_public_key = "reality-public-key"
+reality_short_id = "0123456789abcdef"
+reality_spider_x = "/spider"
+flow = "xtls-rprx-vision"
+network = "tcp,udp"
+ws_path = "/ws"
+ws_host = "cdn.example"
+mark = 7
+tags = [
+    "paid",
+    "hk",
+]
+subscription_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+group_id = "12345678-1234-4234-8234-123456789abc"
+created_at = "2026-01-02T03:04:05Z"
+updated_at = "2026-02-03T04:05:06Z"

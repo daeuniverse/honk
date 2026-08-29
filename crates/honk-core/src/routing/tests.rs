@@ -2,6 +2,17 @@ use super::*;
 use honk_config::routing::{RoutingCondition, RoutingOutbound};
 
 #[test]
+fn router_clone_shares_compiled_state() {
+    let router = Router::new(&[], "direct").unwrap();
+    let clone = router.clone();
+    assert!(Arc::ptr_eq(&router.routes, &clone.routes));
+    assert!(Arc::ptr_eq(
+        &router.default_outbound,
+        &clone.default_outbound
+    ));
+}
+
+#[test]
 fn test_trie_empty() {
     let trie = BinaryLpmTrie::from_nets(&[]);
     assert!(!trie.matches(&"1.2.3.4".parse().unwrap()));
@@ -1278,7 +1289,7 @@ mod negation {
             ..route.clone()
         };
         let router = Router {
-            routes: vec![route],
+            routes: vec![route].into(),
             default_outbound: "direct".into(),
         };
         let mut veto = conn();

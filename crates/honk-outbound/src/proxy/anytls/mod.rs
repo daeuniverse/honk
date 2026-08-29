@@ -46,6 +46,9 @@ const FRAME_HEADER_LEN: usize = 7;
 /// sing-anytls defaults (session/client.go): values below 5s clamp to 30s.
 const DEFAULT_IDLE_CHECK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
+const SETTINGS_PAYLOAD: &[u8] = b"v=2\nclient=dae\npadding-md5=dda34b9d9b470e6259f75776159e605b\n";
+/// Reused v2 sessions must prove that a newly opened target is still live.
+const SYNACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
@@ -585,6 +588,7 @@ struct WriterQueue {
     queue: parking_lot::Mutex<std::collections::VecDeque<FrameCommand>>,
     notify: tokio::sync::Notify,
     data_permits: Arc<tokio::sync::Semaphore>,
+    closed: AtomicBool,
 }
 
 /// Total writer-queue depth (data + control headroom).
@@ -604,20 +608,30 @@ impl WriterQueue {
             data_permits: Arc::new(tokio::sync::Semaphore::new(
                 WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
             )),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Push commands atomically as one batch (the SYN+PSH opening pair is
     /// never interleaved with another stream's frame).
-    fn push_batch(&self, cmds: impl IntoIterator<Item = FrameCommand>) {
-        self.queue.lock().extend(cmds);
+    fn push_batch<const N: usize>(&self, cmds: [FrameCommand; N]) -> Result<(), [FrameCommand; N]> {
+        let mut queue = self.queue.lock();
+        if self.closed.load(Ordering::Acquire) || queue.len().saturating_add(N) > WRITER_QUEUE_CAP {
+            return Err(cmds);
+        }
+        queue.extend(cmds);
+        drop(queue);
         self.notify.notify_one();
+        Ok(())
     }
 
-    async fn pop(&self) -> FrameCommand {
+    async fn pop(&self) -> Option<FrameCommand> {
         loop {
             if let Some(cmd) = self.queue.lock().pop_front() {
-                return cmd;
+                return Some(cmd);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
             }
             self.notify.notified().await;
         }
@@ -628,23 +642,32 @@ impl WriterQueue {
     /// blocking. Only drains what is queued *now* — never waits, so it adds
     /// no latency to a live writer loop.
     fn drain_available(&self, out: &mut Vec<FrameCommand>, max_frames: usize, max_bytes: usize) {
-        let mut q = self.queue.lock();
+        let mut queue = self.queue.lock();
         let mut bytes = 0usize;
         let mut taken = 0usize;
         while taken < max_frames {
-            let Some(front) = q.front() else { break };
+            let Some(front) = queue.front() else { break };
             let next = bytes + front.wire_len();
-            if taken > 0 && next > max_bytes {
+            if next > max_bytes {
                 break;
             }
             bytes = next;
-            out.push(q.pop_front().expect("front checked"));
+            out.push(queue.pop_front().expect("front checked"));
             taken += 1;
         }
     }
 
-    fn clear(&self) {
-        self.queue.lock().clear();
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        let mut queue = self.queue.lock();
+        self.closed.store(true, Ordering::Release);
+        queue.clear();
+        self.data_permits.close();
+        drop(queue);
+        self.notify.notify_one();
     }
 }
 
@@ -671,13 +694,14 @@ async fn session_writer(
     let mut batch: Vec<FrameCommand> = Vec::with_capacity(WRITER_BATCH_MAX_FRAMES);
     let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
     loop {
-        batch.push(queue.pop().await);
-        queue.drain_available(
-            &mut batch,
-            WRITER_BATCH_MAX_FRAMES - 1,
-            WRITER_BATCH_MAX_BYTES,
-        );
+        let Some(first) = queue.pop().await else {
+            break;
+        };
+        let remaining_bytes = WRITER_BATCH_MAX_BYTES.saturating_sub(first.wire_len());
+        batch.push(first);
+        queue.drain_available(&mut batch, WRITER_BATCH_MAX_FRAMES - 1, remaining_bytes);
         buf.clear();
+        buf.reserve(batch.iter().map(FrameCommand::wire_len).sum());
         for cmd in &batch {
             cmd.encode_into(&mut buf);
         }
@@ -735,6 +759,10 @@ pub(crate) struct AnyTlsSession {
     remote_fin: parking_lot::Mutex<HashSet<u32>>,
     /// Stream id allocator (sing `streamId`); first stream gets sid 1.
     next_sid: AtomicU32,
+    /// Negotiated through `CMD_SERVER_SETTINGS`; v2 peers acknowledge opens.
+    peer_supports_synack: AtomicBool,
+    /// Latest reused-stream acknowledgement deadline (sing-anytls parity).
+    synack_watchdog: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
     /// close via [`AnyTlsSession::close`].
     closed: AtomicBool,
@@ -792,6 +820,8 @@ impl AnyTlsSession {
             streams: Mutex::new(HashMap::new()),
             remote_fin: parking_lot::Mutex::new(HashSet::new()),
             next_sid: AtomicU32::new(0),
+            peer_supports_synack: AtomicBool::new(false),
+            synack_watchdog: parking_lot::Mutex::new(None),
             closed: AtomicBool::new(false),
             created: Instant::now(),
             session_state: AtomicUsize::new(crate::session::SessionState::Active as usize),
@@ -824,6 +854,50 @@ impl AnyTlsSession {
         self.closed.load(Ordering::SeqCst)
     }
 
+    fn arm_synack_watchdog(self: &Arc<Self>, sid: u32) {
+        if sid < 2 || !self.peer_supports_synack.load(Ordering::Acquire) {
+            return;
+        }
+        let mut watchdog = self.synack_watchdog.lock();
+        if self.is_closed() {
+            return;
+        }
+        if let Some(handle) = watchdog.take() {
+            handle.abort();
+        }
+        let session = Arc::clone(self);
+        *watchdog = Some(
+            tokio::spawn(async move {
+                tokio::time::sleep(SYNACK_TIMEOUT).await;
+                session.fail(anyhow::anyhow!(
+                    "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
+                ));
+            })
+            .abort_handle(),
+        );
+    }
+
+    fn acknowledge_syn(&self) {
+        if let Some(handle) = self.synack_watchdog.lock().take() {
+            handle.abort();
+        }
+    }
+
+    fn writer_queue_error(&self) -> std::io::Error {
+        let overloaded = !self.writer_q.is_closed();
+        if overloaded {
+            self.fail(anyhow::anyhow!("writer queue capacity exceeded"));
+        }
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            if overloaded {
+                "AnyTLS writer queue capacity exceeded"
+            } else {
+                "AnyTLS writer queue is closed"
+            },
+        )
+    }
+
     /// Open streams on this session (capacity taken from the semaphore —
     /// the single truth; `MAX_STREAMS_PER_SESSION - available`).
     fn active_streams(&self) -> usize {
@@ -831,8 +905,8 @@ impl AnyTlsSession {
     }
 
     /// Enqueue a control frame (SYN/FIN/HEART): ordered, reserved
-    /// headroom, uncancellable once queued. Fails only when the session
-    /// is already closed.
+    /// headroom, uncancellable once queued. Exhausting the bounded queue
+    /// makes the shared session terminal rather than growing memory.
     fn enqueue_control(&self, cmd: u8, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
         if self.is_closed() {
             return Err(std::io::Error::new(
@@ -841,8 +915,8 @@ impl AnyTlsSession {
             ));
         }
         self.writer_q
-            .push_batch([FrameCommand::Control { cmd, sid, payload }]);
-        Ok(())
+            .push_batch([FrameCommand::Control { cmd, sid, payload }])
+            .map_err(|_| self.writer_queue_error())
     }
 
     /// Enqueue a payload PSH for a stream: bounded by the writer-queue
@@ -882,22 +956,14 @@ impl AnyTlsSession {
         }
 
         let (completion, completed) = tokio::sync::oneshot::channel();
-        {
-            let mut queue = self.writer_q.queue.lock();
-            if self.is_closed() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "AnyTLS session is closed",
-                ));
-            }
-            queue.push_back(FrameCommand::Data {
+        self.writer_q
+            .push_batch([FrameCommand::Data {
                 sid,
                 payload,
                 _permit: permit,
                 completion: Some(completion),
-            });
-        }
-        self.writer_q.notify.notify_one();
+            }])
+            .map_err(|_| self.writer_queue_error())?;
         Ok(completed)
     }
 
@@ -941,13 +1007,21 @@ impl AnyTlsSession {
         let Ok(permit) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
             return Err(payload);
         };
-        self.writer_q.push_batch([FrameCommand::Data {
+        match self.writer_q.push_batch([FrameCommand::Data {
             sid,
             payload,
             _permit: permit,
             completion: None,
-        }]);
-        Ok(())
+        }]) {
+            Ok(()) => Ok(()),
+            Err(commands) => {
+                let [FrameCommand::Data { payload, .. }] = commands else {
+                    unreachable!("queued one data command")
+                };
+                let _ = self.writer_queue_error();
+                Err(payload)
+            }
+        }
     }
 
     /// Enqueue a data frame with an already-acquired permit.
@@ -963,13 +1037,14 @@ impl AnyTlsSession {
                 "AnyTLS session is closed",
             ));
         }
-        self.writer_q.push_batch([FrameCommand::Data {
-            sid,
-            payload,
-            _permit: permit,
-            completion: None,
-        }]);
-        Ok(())
+        self.writer_q
+            .push_batch([FrameCommand::Data {
+                sid,
+                payload,
+                _permit: permit,
+                completion: None,
+            }])
+            .map_err(|_| self.writer_queue_error())
     }
 
     async fn write_uot_datagram(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
@@ -1010,18 +1085,21 @@ impl AnyTlsSession {
         if self.is_closed() {
             return Err(anyhow::anyhow!("AnyTLS session {} is closed", self.seq));
         }
-        self.writer_q.push_batch([
-            FrameCommand::Control {
-                cmd: CMD_SYN,
-                sid,
-                payload: bytes::Bytes::new(),
-            },
-            FrameCommand::Control {
-                cmd: CMD_PSH,
-                sid,
-                payload: bytes::Bytes::from(target_addr),
-            },
-        ]);
+        self.arm_synack_watchdog(sid);
+        self.writer_q
+            .push_batch([
+                FrameCommand::Control {
+                    cmd: CMD_SYN,
+                    sid,
+                    payload: bytes::Bytes::new(),
+                },
+                FrameCommand::Control {
+                    cmd: CMD_PSH,
+                    sid,
+                    payload: bytes::Bytes::from(target_addr),
+                },
+            ])
+            .map_err(|_| self.writer_queue_error())?;
         guard.frame_started = false;
         Ok((sid, rx, guard))
     }
@@ -1160,10 +1238,11 @@ impl AnyTlsSession {
         if let Some(handle) = self.writer_task.lock().unwrap().take() {
             handle.abort();
         }
+        self.acknowledge_syn();
         if let Some(handle) = self.watchdog.lock().unwrap().take() {
             handle.abort();
         }
-        self.writer_q.clear();
+        self.writer_q.close();
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
@@ -1453,6 +1532,15 @@ impl AnyTlsSession {
     }
 }
 
+fn server_supports_synack(data: &[u8]) -> bool {
+    data.split(|byte| *byte == b'\n').any(|line| {
+        line.strip_prefix(b"v=")
+            .and_then(|version| std::str::from_utf8(version).ok())
+            .and_then(|version| version.parse::<u8>().ok())
+            .is_some_and(|version| version >= 2)
+    })
+}
+
 async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
     let mut fail_reason: Option<anyhow::Error> = None;
     loop {
@@ -1468,6 +1556,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             CMD_PSH => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
+                session.acknowledge_syn();
                 if !data.is_empty() {
                     let shown = &data[..data.len().min(MAX_STREAM_ERROR_SOURCE_BYTES)];
                     let suffix = if shown.len() == data.len() {
@@ -1502,12 +1591,13 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                 );
                 break;
             }
-            CMD_WASTE
-            | CMD_SETTINGS
-            | CMD_SERVER_SETTINGS
-            | CMD_HEART_RESPONSE
-            | CMD_UPDATE_PADDING_SCHEME
-            | CMD_SYN => {}
+            CMD_SERVER_SETTINGS => {
+                if server_supports_synack(&data) {
+                    session.peer_supports_synack.store(true, Ordering::Release);
+                }
+            }
+            CMD_WASTE | CMD_SETTINGS | CMD_HEART_RESPONSE | CMD_UPDATE_PADDING_SCHEME | CMD_SYN => {
+            }
             other => {
                 debug!(
                     "AnyTLS session {} ignoring unknown cmd {}",
@@ -1648,7 +1738,7 @@ async fn dial_session(
     tokio::time::timeout(timeout, async {
         let (read, write, auth, settings) =
             connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
-        AnyTlsSession::establish(addr, read, write, &auth, &settings).await
+        AnyTlsSession::establish(addr, read, write, &auth, settings).await
     })
     .await
     .map_err(|_| anyhow::anyhow!("AnyTLS session dial timed out after {timeout:?}"))?
@@ -1664,20 +1754,14 @@ async fn connect_transport(
     connect_timeout: Duration,
     tcp: Option<TcpStream>,
     tls_connector: Option<Arc<TlsConnector>>,
-) -> anyhow::Result<(BoxedReader, BoxedWriter, Vec<u8>, Vec<u8>)> {
+) -> anyhow::Result<(BoxedReader, BoxedWriter, [u8; 34], &'static [u8])> {
     let password = AnyTlsHandler::resolve_password(node);
-    let auth_key = Sha256::digest(password.as_bytes());
+    let auth_key: [u8; 32] = Sha256::digest(password.as_bytes()).into();
 
     let tcp = match tcp {
         Some(tcp) => tcp,
 
-        None => {
-            crate::util::connect_outbound(
-                &format!("{}:{}", node.host(), node.port),
-                connect_timeout,
-            )
-            .await?
-        }
+        None => crate::util::connect_outbound(addr, connect_timeout).await?,
     };
     debug!("AnyTLS: TCP connected to {}", addr);
 
@@ -1685,17 +1769,30 @@ async fn connect_transport(
         Some(connector) => connector,
         None => Arc::new(crate::tls::build_connector(node)?),
     };
-    let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-    let tls = connector.connect(&server_name, tcp).await?;
+    let server_name = node
+        .anytls()
+        .unwrap()
+        .tls
+        .sni
+        .clone()
+        .unwrap_or_else(|| node.host().to_string());
+    let tls = tokio::time::timeout(connect_timeout, connector.connect(&server_name, tcp))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("AnyTLS TLS handshake timed out after {connect_timeout:?}")
+        })??;
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
 
-    let mut auth = Vec::with_capacity(34);
-    auth.extend_from_slice(&auth_key);
-    auth.extend_from_slice(&[0u8; 2]);
+    let mut auth = [0u8; 34];
+    auth[..32].copy_from_slice(&auth_key);
 
-    let settings = AnyTlsHandler::settings_payload();
-    Ok((Box::new(read), Box::new(write), auth, settings))
+    Ok((
+        Box::new(read),
+        Box::new(write),
+        auth,
+        AnyTlsHandler::settings_payload(),
+    ))
 }
 
 impl AnyTlsHandler {
@@ -1704,27 +1801,12 @@ impl AnyTlsHandler {
         Self
     }
 
-    /// Resolve the AnyTLS password: generic password first, then the
-    /// AnyTLS-specific field.
     fn resolve_password(node: &Node) -> &str {
-        node.password
-            .as_deref()
-            .or(node.anytls_password.as_deref())
-            .unwrap_or("")
+        node.anytls().unwrap().password.as_deref().unwrap_or("")
     }
 
-    /// Build the client settings frame payload.
-    fn settings_payload() -> Vec<u8> {
-        let scheme = b"stop=0\n";
-        use md5::Digest as _;
-        use std::fmt::Write as _;
-        let md5 = md5::Md5::digest(scheme)
-            .iter()
-            .fold(String::with_capacity(32), |mut s, b| {
-                let _ = write!(s, "{b:02x}");
-                s
-            });
-        format!("v=2\nclient=dae\npadding-md5={}\n", md5).into_bytes()
+    fn settings_payload() -> &'static [u8] {
+        SETTINGS_PAYLOAD
     }
     /// Lazily start the pool janitor for this node (once per pool).
     fn ensure_janitor(
@@ -1732,9 +1814,11 @@ impl AnyTlsHandler {
         pool: &Arc<AnyTlsPool>,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) {
-        let min_idle = node.anytls_min_idle_session.unwrap_or(0);
+        let config = node.anytls().unwrap();
+        let min_idle = config.min_idle_session.unwrap_or(0);
         let idle_timeout = Duration::from_secs(
-            node.anytls_idle_session_timeout
+            config
+                .idle_session_timeout
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
         );
         let prewarm_node = node.clone();
@@ -1816,6 +1900,7 @@ impl AnyTlsHandler {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
+        let commit_dial_scope = crate::runtime::capture_dial_admission();
 
         let (session, permit, detached) = match pool.checkout_speculative().await? {
             SpeculativeCheckout::Shared { session, permit } => (session, permit, None),
@@ -1848,21 +1933,25 @@ impl AnyTlsHandler {
             let commit_node = node.clone();
             let commit_pool = Arc::clone(&pool);
             let commit_runtime = runtime.clone();
-            return Ok(PreparedUdpTransport::new(transport, move || async move {
-                reservation.commit()?;
-                if commit_runtime.is_some() {
-                    Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
-                }
-                Ok(())
+            return Ok(PreparedUdpTransport::new(transport, move || {
+                commit_dial_scope.scope(async move {
+                    reservation.commit()?;
+                    if commit_runtime.is_some() {
+                        Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
+                    }
+                    Ok(())
+                })
             }));
         }
 
         let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(transport, move || async move {
-            if runtime.is_some() {
-                Self::ensure_janitor(&commit_node, &pool, runtime);
-            }
-            Ok(())
+        Ok(PreparedUdpTransport::new(transport, move || {
+            commit_dial_scope.scope(async move {
+                if runtime.is_some() {
+                    Self::ensure_janitor(&commit_node, &pool, runtime);
+                }
+                Ok(())
+            })
         }))
     }
 
@@ -2016,7 +2105,6 @@ impl tokio::io::AsyncRead for AnyTlsStream {
             this.read_buf.clear();
             this.read_pos = 0;
 
-            this.session.flush_overflow(this.sid);
             let next = if got_any {
                 match this.rx.try_recv() {
                     Ok(ev) => std::task::Poll::Ready(Some(ev)),

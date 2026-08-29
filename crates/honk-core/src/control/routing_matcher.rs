@@ -117,6 +117,87 @@ impl RoutingPushPlan {
             domain_bitmaps: self.domain_bitmaps.clone(),
         }
     }
+
+    pub fn semantically_eq(&self, other: &Self) -> bool {
+        self.has_domain_rules == other.has_domain_rules
+            && self.group_bitmaps == other.group_bitmaps
+            && match_sets_eq(&self.match_sets, &other.match_sets)
+            && domain_bitmaps_eq(&self.domain_bitmaps, &other.domain_bitmaps)
+            && lpm_plans_eq(&self.lpm, &other.lpm)
+    }
+}
+fn match_sets_eq(left: &[MatchSet], right: &[MatchSet]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.not == right.not
+                && left.match_type == right.match_type
+                && left.outbound == right.outbound
+                && left.must == right.must
+                && left.mark == right.mark
+                && match_value_eq(left, right)
+        })
+}
+
+fn match_value_eq(left: &MatchSet, right: &MatchSet) -> bool {
+    match MatchType::from_u8(left.match_type) {
+        Some(
+            MatchType::DomainSet
+            | MatchType::IpSet
+            | MatchType::SourceIpSet
+            | MatchType::Mac
+            | MatchType::Fallback,
+        ) => true,
+        Some(MatchType::Port | MatchType::SourcePort) => unsafe {
+            let left = left.value.port_range;
+            let right = right.value.port_range;
+            left.port_start == right.port_start && left.port_end == right.port_end
+        },
+        Some(MatchType::L4Proto) => unsafe {
+            left.value.l4proto_type as u8 == right.value.l4proto_type as u8
+        },
+        Some(MatchType::IpVersion) => unsafe {
+            left.value.ip_version as u8 == right.value.ip_version as u8
+        },
+        Some(MatchType::ProcessName) => unsafe { left.value.pname == right.value.pname },
+        Some(MatchType::Dscp) => unsafe { left.value.dscp == right.value.dscp },
+        Some(MatchType::MustRules | MatchType::Upstream | MatchType::QType) | None => false,
+    }
+}
+
+fn domain_bitmaps_eq(
+    left: &HashMap<String, Vec<DomainRouting>>,
+    right: &HashMap<String, Vec<DomainRouting>>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(name, left)| {
+            right.get(name).is_some_and(|right| {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.bitmap == right.bitmap)
+            })
+        })
+}
+
+fn lpm_plans_eq(left: &LpmPushPlan, right: &LpmPushPlan) -> bool {
+    lpm_maps_eq(&left.dest, &right.dest)
+        && lpm_maps_eq(&left.source, &right.source)
+        && lpm_maps_eq(&left.mac, &right.mac)
+}
+
+fn lpm_maps_eq(
+    left: &HashMap<[u8; 20], (LpmKey, DomainRouting)>,
+    right: &HashMap<[u8; 20], (LpmKey, DomainRouting)>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(raw, (left_key, left_bitmap))| {
+            right.get(raw).is_some_and(|(right_key, right_bitmap)| {
+                left_key.prefix_len == right_key.prefix_len
+                    && left_key.data == right_key.data
+                    && left_bitmap.bitmap == right_bitmap.bitmap
+            })
+        })
 }
 
 impl LpmPushPlan {

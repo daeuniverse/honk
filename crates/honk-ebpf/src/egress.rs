@@ -116,7 +116,7 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
 /// - `pid_name.pid == PARAM.control_plane_pid` to detect the control plane
 /// - `PARAM.dae_socket_mark && skb_mark == PARAM.dae_socket_mark`
 /// - `skb_mark & 0x100 == 0x100`
-/// to determine whether the packet should be allowed to pass.
+///   to determine whether the packet should be allowed to pass.
 #[inline(always)]
 pub fn pid_is_control_plane(ctx: &TcContext) -> Option<&PIDName> {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.skb.skb as *mut c_void) };

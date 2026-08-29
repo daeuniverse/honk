@@ -22,10 +22,20 @@ async fn main() -> anyhow::Result<()> {
             name: "probe".into(),
             host: host.clone(),
             port,
-            sni: Some(sni.clone()),
-            skip_cert_verify: true,
-            juicity_uuid: Some("a8eb0027-f7ac-da79-12b4-5433da6fdfce".into()),
-            juicity_password: Some("33440f5a7608".into()),
+            outbound: honk_config::node::OutboundConfig::Juicity(
+                honk_config::node::JuicityConfig {
+                    uuid: Some("a8eb0027-f7ac-da79-12b4-5433da6fdfce".into()),
+                    password: Some("33440f5a7608".into()),
+                    quic: honk_config::node::QuicOptions {
+                        tls: honk_config::node::TlsOptions {
+                            sni: Some(sni.clone()),
+                            skip_cert_verify: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+            ),
             ..Default::default()
         };
         let config = quic::client_config(

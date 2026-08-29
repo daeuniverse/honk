@@ -3,6 +3,92 @@ use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 
+#[test]
+fn interrupting_groups_enable_tracking_without_the_clash_api() {
+    let groups = [Group {
+        interrupt_connections: true,
+        ..Default::default()
+    }];
+    let manager = GroupManager::new(&groups, &[]);
+    let manager_cell = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+        &groups,
+        &[],
+    ))));
+    let tracker = Arc::new(ConnectionTracker::new());
+
+    reload::install_interrupt_callback(&manager, &manager_cell, &tracker);
+
+    assert!(tracker.is_enabled());
+}
+
+#[tokio::test]
+async fn health_push_re_resolves_after_reload_writer() {
+    let node = udp_test_node();
+    let old_config = udp_test_config(
+        "old",
+        vec![node.clone()],
+        vec![Group {
+            name: "old".into(),
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+    );
+    let new_config = udp_test_config(
+        "new",
+        vec![node.clone()],
+        vec![
+            Group {
+                name: "unused".into(),
+                ..Default::default()
+            },
+            Group {
+                name: "new".into(),
+                nodes: vec![node.id],
+                ..Default::default()
+            },
+        ],
+    );
+    let config = Arc::new(RwLock::new(Arc::new(old_config.clone())));
+    let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::new(&old_config.groups, &old_config.nodes),
+    )));
+    let outbound_id_map = Arc::new(parking_lot::RwLock::new(reload::build_outbound_id_map(
+        &old_config,
+    )));
+    let alive_set = Arc::new(AliveDialerSet::new());
+    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+        crate::ebpf::mock::MockEbpfBackend::new(),
+    )));
+    let health_publisher = Arc::new(runtime::OutboundHealthPublisher::new(
+        Arc::clone(&ebpf),
+        Arc::clone(&config),
+        Arc::clone(&group_manager),
+        Arc::clone(&outbound_id_map),
+        Arc::clone(&alive_set),
+    ));
+
+    let mut config_writer = config.write().await;
+    let mut backend_writer = ebpf.write().await;
+    backend_writer.set_outbound_alive(2, 1, 0, false).unwrap();
+    backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
+    *config_writer = Arc::new(new_config.clone());
+    *outbound_id_map.write() = reload::build_outbound_id_map(&new_config);
+    *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
+
+    let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
+    tokio::task::yield_now().await;
+    assert!(!update.is_finished());
+    drop(config_writer);
+    tokio::task::yield_now().await;
+    assert!(!update.is_finished());
+    drop(backend_writer);
+
+    update.await.unwrap();
+    let backend = ebpf.read().await;
+    assert!(!backend.get_outbound_alive(2, 1, 0).unwrap());
+    assert!(backend.get_outbound_alive(3, 1, 0).unwrap());
+}
+
 #[cfg(feature = "ebpf")]
 #[test]
 fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
@@ -175,6 +261,113 @@ fn udp_listener_enables_reuse_port_before_bind() {
     let second = sockets::new_udp_listener_socket(socket2::Domain::IPV4, true).unwrap();
     second.bind(&addr).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_receive_batch_preserves_order_metadata_and_cancellation() {
+    let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true)
+        .unwrap();
+    let local_addr = socket.local_addr().unwrap();
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+    for sequence in 0..9u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sender.send_to(&[], local_addr).await.unwrap();
+
+    let mut batch = sockets::UdpRecvBatch::new().unwrap();
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 8);
+    for index in 0..batch.len() {
+        let (data, source, meta) = batch.packet(index).unwrap();
+        assert_eq!(data, &[index as u8]);
+        assert_eq!(source, sender_addr);
+        assert_eq!(meta.original_dst_cmsg, Some(local_addr));
+        assert_eq!(meta.packet_dst_ip, Some(local_addr.ip()));
+        assert!(meta.packet_ifindex.is_some());
+        assert_eq!(meta.local_addr, local_addr);
+    }
+
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch.packet(0).unwrap().0, &[8]);
+    assert!(batch.packet(1).unwrap().0.is_empty());
+
+    for sequence in 10..13u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 3);
+
+    for sequence in 13..16u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 3);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch),
+        )
+        .await
+        .is_err()
+    );
+    for sequence in 16..25u8 {
+        sender.send_to(&[sequence], local_addr).await.unwrap();
+    }
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.packet(0).unwrap().0, &[16]);
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 8);
+    for index in 0..batch.len() {
+        assert_eq!(batch.packet(index).unwrap().0, &[index as u8 + 17]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_receive_batch_rejects_truncated_slot_without_losing_next_packet() {
+    let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true)
+        .unwrap();
+    let local_addr = socket.local_addr().unwrap();
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender.send_to(&[1, 2], local_addr).await.unwrap();
+    sender.send_to(&[3], local_addr).await.unwrap();
+
+    let mut batch = sockets::UdpRecvBatch::new_for_test(1).unwrap();
+    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 2);
+    assert_eq!(
+        batch.packet(0).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(batch.packet(1).unwrap().0, &[3]);
+}
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -260,7 +453,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     });
     let mut registry = ProxyRegistry::new();
     registry.register(
-        honk_outbound::proxy::ProtocolEntry::new(node.protocol, handler.clone())
+        honk_outbound::proxy::ProtocolEntry::new(node.protocol(), handler.clone())
             .with_packet(handler),
     );
     let runtime = Arc::new(parking_lot::RwLock::new(Arc::new(
@@ -294,7 +487,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         node.id
     );
     let prober = probers::ProxyUdpProber::new(
-        Arc::new(RwLock::new(config)),
+        Arc::new(RwLock::new(Arc::new(config))),
         Arc::new(registry),
         runtime,
         Arc::new(StatsManager::new()),
@@ -1847,7 +2040,9 @@ async fn tcp_local_resolution_uses_client_source() -> anyhow::Result<()> {
     let original_dst = SocketAddr::new("127.0.0.1".parse()?, listener.local_addr()?.port());
     let mut node = Node {
         name: "local-resolve".into(),
-        protocol: honk_config::types::NodeProtocol::VMess,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::VMess,
+        ),
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()
@@ -2357,12 +2552,115 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn tcp_ebpf_direct_offload_skips_dial_and_balances_stats() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            ..Default::default()
+        },
+    )?;
+    let raw_tuples: [u8; 40] = bytes_of(&tuples).try_into().expect("40-byte tuple key");
+    backend.routing_handoffs.lock().insert(
+        raw_tuples,
+        RoutingHandoffEntry {
+            result: RoutingResult {
+                outbound: OutboundIndex::Direct as u8,
+                mark: DAE_BYPASS_MARK,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "direct".into();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(backend),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    let handle = plane.spawn_handle();
+    let task_handle = handle.clone();
+    let task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    task.await??;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    let mut stats = handle.stats.snapshot();
+    let direct = stats.remove("direct").expect("direct stats");
+    assert_eq!(direct.total_conns, 1);
+    assert_eq!(direct.active_conns, 0);
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    drop(client);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_overall_dial_timeout_aborts_started_candidate() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.global.connect_timeout_ms = 1;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: Arc::clone(&entered),
+            release,
+        },
+        1,
+    );
+    let client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let task_handle = handle.clone();
+    let task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    entered.notified().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    task.await??;
+
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    drop(client);
+    Ok(())
+}
+
+#[tokio::test]
 async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
     let mut hk = Node {
         name: "hk-140".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 140,
         ..Default::default()
@@ -2370,7 +2668,9 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
     hk.id = hk.derive_id();
     let mut us = Node {
         name: "us-163".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 163,
         ..Default::default()
@@ -2470,7 +2770,9 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
 async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
     let mut tcp_node = Node {
         name: "tcp-node".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 140,
         ..Default::default()
@@ -2478,7 +2780,9 @@ async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
     tcp_node.id = tcp_node.derive_id();
     let mut udp_node = Node {
         name: "udp-node".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 163,
         ..Default::default()
@@ -2580,7 +2884,9 @@ fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>)
 fn udp_test_node() -> Node {
     let mut node = Node {
         name: "udp-test".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()
@@ -2805,7 +3111,9 @@ async fn udp_first_send_failure_does_not_replay_to_another_candidate() {
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test-second".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -3033,7 +3341,9 @@ async fn udp_authoritative_selection_stops_after_single_candidate_dial_failure()
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test-second".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -3076,7 +3386,9 @@ async fn udp_production_death_during_unbound_preparation_prevents_send() {
     let unrelated = Node {
         id: uuid::Uuid::new_v4(),
         name: "health-registered-other".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -4260,8 +4572,8 @@ fn preconnect_test_node(name: &str, protocol: NodeProtocol) -> Node {
     Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol,
         address: format!("{name}.example.com:443"),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         ..Default::default()
     }
 }
@@ -5290,7 +5602,9 @@ async fn tcp_authoritative_dial_failure_retries_with_replacement() -> anyhow::Re
     let socks_node = |name: &str, port: u16| {
         let mut node = Node {
             name: name.into(),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
             address: "127.0.0.1".into(),
             port,
             ..Default::default()

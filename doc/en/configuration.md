@@ -173,6 +173,8 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'ui'
+        external_ui_download_url: 'https://example.com/dashboard.zip'
+        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: 'Rule'
     }
@@ -223,7 +225,7 @@ See the [routing reference](./reference/routing.md).
 
 ## DNS setup
 
-Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`udp+tcp://`, `tls://`, `https://`, `quic://`, and `h3://`. Add `-> node-or-group` to force the dial path; TCP, UDP, DoT, and DoH can use a proxy outbound, while DoQ and DoH3 are direct-only. Request routing chooses `reject`, `asis`, or a named upstream; response routing chooses `accept`, `reject`, or a named upstream for a bounded re-query:
+Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`udp+tcp://`, `tls://`, `https://`, `quic://`, and `h3://`. Add `-> node-or-group` to force the dial path; every listed transport can use a proxy outbound when the selected leaf supplies its required capability. DoQ and DoH3 require the leaf's UDP-capable `PacketTransport`; a missing proxy registry or packet capability fails closed. Request routing chooses `reject`, `asis`, or a named upstream; response routing chooses `accept`, `reject`, or a named upstream for a bounded re-query:
 
 ```dae
 dns {
@@ -257,7 +259,7 @@ See the [subscription reference](./reference/subscription.md).
 
 ## Enabling the Clash API, cache file, and held-first-packet UDP
 
-**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` resolves through `data_dir` and may be downloaded in the background when missing.
+**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` resolves through `data_dir` and may be downloaded in the background when missing. `external_ui_download_url` selects the ZIP source, while `external_ui_download_detour` forces the download through one node or group; empty values retain the built-in URL and normal traffic routing.
 
 **Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` uses `data_dir`, subject to the legacy-path rule above.
 

@@ -2,10 +2,10 @@ use super::*;
 
 #[test]
 fn test_settings_payload_format() {
-    let payload = String::from_utf8(AnyTlsHandler::settings_payload()).unwrap();
-    assert!(payload.contains("v=2"));
-    assert!(payload.contains("client=dae"));
-    assert!(payload.contains("padding-md5="));
+    assert_eq!(
+        AnyTlsHandler::settings_payload(),
+        b"v=2\nclient=dae\npadding-md5=dda34b9d9b470e6259f75776159e605b\n"
+    );
 }
 
 #[test]
@@ -275,23 +275,28 @@ async fn overflow_admit_hard_byte_cap_waits_inside_the_grace() {
     assert!(!overflow.has(1));
 }
 
-#[test]
-fn test_resolve_password_fallback() {
-    let mut node = Node {
-        name: "test".into(),
-        protocol: NodeProtocol::AnyTLS,
+fn anytls_node(name: &str) -> Node {
+    Node {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        outbound: honk_config::node::OutboundConfig::AnyTls(Default::default()),
         ..Default::default()
-    };
+    }
+}
+
+fn zero_idle_anytls_node(name: &str) -> Node {
+    let mut node = anytls_node(name);
+    node.anytls_mut().unwrap().min_idle_session = Some(0);
+    node
+}
+
+#[test]
+fn test_resolve_password() {
+    let mut node = anytls_node("test");
     assert_eq!(AnyTlsHandler::resolve_password(&node), "");
 
-    node.anytls_password = Some("anytls-secret".into());
+    node.anytls_mut().unwrap().password = Some("anytls-secret".into());
     assert_eq!(AnyTlsHandler::resolve_password(&node), "anytls-secret");
-
-    node.password = Some("generic-secret".into());
-    assert_eq!(AnyTlsHandler::resolve_password(&node), "generic-secret");
-
-    node.anytls_password = None;
-    assert_eq!(AnyTlsHandler::resolve_password(&node), "generic-secret");
 }
 
 #[tokio::test]
@@ -305,15 +310,18 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
         std::future::pending::<()>().await;
     });
     let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "stalled-tls".into(),
-        protocol: NodeProtocol::AnyTLS,
         address: address.clone(),
         host: socket_addr.ip().to_string(),
         port: socket_addr.port(),
-        sni: Some("localhost".into()),
-        skip_cert_verify: true,
-        ..Default::default()
+        outbound: honk_config::node::OutboundConfig::AnyTls(honk_config::node::AnyTlsConfig {
+            tls: honk_config::node::TlsOptions {
+                sni: Some("localhost".into()),
+                skip_cert_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..anytls_node("stalled-tls")
     };
 
     // When: a pool-owned physical AnyTLS session dial reaches that server.
@@ -324,11 +332,11 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
     .await;
     server.abort();
 
-    // Then: the dial itself expires instead of relying on caller cancellation.
+    // Then: the handshake expires instead of relying on caller cancellation.
     let outcome = result.expect("the AnyTLS dial must enforce an internal deadline");
     let error = outcome.err().expect("the stalled TLS dial must fail");
     assert!(
-        error.to_string().contains("AnyTLS session dial timed out"),
+        error.to_string().contains("AnyTLS TLS handshake timed out"),
         "unexpected error: {error:#}"
     );
 }
@@ -339,31 +347,34 @@ async fn test_writer_batch_encoding_matches_sequential_frames() {
     let sem = Arc::new(tokio::sync::Semaphore::new(2));
     let p1 = sem.clone().acquire_owned().await.unwrap();
     let p2 = sem.clone().acquire_owned().await.unwrap();
-    q.push_batch([
-        FrameCommand::Control {
-            cmd: CMD_SYN,
-            sid: 1,
-            payload: bytes::Bytes::from_static(b"addr"),
-        },
-        FrameCommand::Data {
-            sid: 1,
-            payload: bytes::Bytes::from_static(b"hello"),
-            _permit: p1,
-            completion: None,
-        },
-        FrameCommand::Data {
-            sid: 2,
-            payload: bytes::Bytes::from_static(b"world"),
-            _permit: p2,
-            completion: None,
-        },
-        FrameCommand::Control {
-            cmd: CMD_FIN,
-            sid: 2,
-            payload: bytes::Bytes::new(),
-        },
-    ]);
-    let mut batch = vec![q.pop().await];
+    assert!(
+        q.push_batch([
+            FrameCommand::Control {
+                cmd: CMD_SYN,
+                sid: 1,
+                payload: bytes::Bytes::from_static(b"addr"),
+            },
+            FrameCommand::Data {
+                sid: 1,
+                payload: bytes::Bytes::from_static(b"hello"),
+                _permit: p1,
+                completion: None,
+            },
+            FrameCommand::Data {
+                sid: 2,
+                payload: bytes::Bytes::from_static(b"world"),
+                _permit: p2,
+                completion: None,
+            },
+            FrameCommand::Control {
+                cmd: CMD_FIN,
+                sid: 2,
+                payload: bytes::Bytes::new(),
+            },
+        ])
+        .is_ok()
+    );
+    let mut batch = vec![q.pop().await.unwrap()];
     q.drain_available(
         &mut batch,
         WRITER_BATCH_MAX_FRAMES - 1,
@@ -394,11 +405,14 @@ async fn test_writer_batch_caps() {
     let q = WriterQueue::new();
     let payload = bytes::Bytes::from(vec![7u8; 100]);
     for sid in 0..5u32 {
-        q.push_batch([FrameCommand::Control {
-            cmd: CMD_WASTE,
-            sid,
-            payload: payload.clone(),
-        }]);
+        assert!(
+            q.push_batch([FrameCommand::Control {
+                cmd: CMD_WASTE,
+                sid,
+                payload: payload.clone(),
+            }])
+            .is_ok()
+        );
     }
 
     let mut batch = Vec::new();
@@ -413,6 +427,40 @@ async fn test_writer_batch_caps() {
     q.drain_available(&mut batch, usize::MAX, usize::MAX);
     assert_eq!(batch.len(), 1);
     assert!(q.queue.lock().is_empty());
+}
+
+#[test]
+fn writer_queue_bounds_control_pressure_and_rejects_after_close() {
+    let q = WriterQueue::new();
+    for sid in 0..WRITER_QUEUE_CAP {
+        assert!(
+            q.push_batch([FrameCommand::Control {
+                cmd: CMD_HEART_RESPONSE,
+                sid: sid as u32,
+                payload: bytes::Bytes::new(),
+            }])
+            .is_ok()
+        );
+    }
+    assert!(
+        q.push_batch([FrameCommand::Control {
+            cmd: CMD_HEART_RESPONSE,
+            sid: u32::MAX,
+            payload: bytes::Bytes::new(),
+        }])
+        .is_err()
+    );
+
+    q.close();
+    assert!(q.queue.lock().is_empty());
+    assert!(
+        q.push_batch([FrameCommand::Control {
+            cmd: CMD_FIN,
+            sid: 1,
+            payload: bytes::Bytes::new(),
+        }])
+        .is_err()
+    );
 }
 
 const TEST_AUTH: &[u8] = b"test-auth";
@@ -451,7 +499,7 @@ async fn runtime_udp_pool_hit_does_not_build_connector() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "runtime-udp-hit".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -496,7 +544,7 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "guard-abort".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -532,7 +580,7 @@ async fn ephemeral_runtime_close_releases_session_and_connection() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "ephemeral-probe".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -579,7 +627,7 @@ async fn warm_resources_flip_with_pool_session() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "warm-resources".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -610,7 +658,7 @@ async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
     let old_node = Node {
         id: uuid::Uuid::new_v4(),
         name: "generation-node".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -660,7 +708,7 @@ async fn runtime_retirement_drains_live_session_without_cutting_it() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "retiring-anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
         ..Default::default()
     };
     let generation =
@@ -1076,6 +1124,72 @@ async fn test_synack_with_data_surfaces_open_error() {
     assert!(err.to_string().contains("refused"));
     assert!(!session.is_closed(), "target refusal keeps the session");
     assert!(!session.streams.lock().unwrap().contains_key(&stream.sid));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reused_v2_session_requires_synack_within_deadline() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(session.peer_supports_synack.load(Ordering::Acquire));
+
+    let first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(session.synack_watchdog.lock().is_none());
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    assert!(
+        !session.is_closed(),
+        "a received SYNACK keeps the session live"
+    );
+
+    let _third = session
+        .open_stream_direct(
+            vec![0x01, 3, 3, 3, 3, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+    tokio::task::yield_now().await;
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        session.is_closed(),
+        "a missing SYNACK retires the reused session"
+    );
+    assert!(
+        session
+            .terminal_error
+            .get()
+            .is_some_and(|error| error.to_string().contains("SYNACK timed out"))
+    );
+    drop((first, second));
 }
 
 #[tokio::test]
@@ -2236,13 +2350,7 @@ async fn remote_fin_drop_does_not_enqueue_a_second_fin() {
 
 #[tokio::test]
 async fn warm_uses_only_its_generation_owned_runtime_pool() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "warm-anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("warm-anytls");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
     );
@@ -2273,13 +2381,7 @@ async fn warm_uses_only_its_generation_owned_runtime_pool() {
 
 #[tokio::test]
 async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "shutdown-warm-anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("shutdown-warm-anytls");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
     );
@@ -2334,13 +2436,7 @@ async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
 #[tokio::test]
 async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
     let handler = AnyTlsHandler::new();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-shared".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-shared");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let (session, _server) = establish_test_session("speculative-shared").await;
     pool.insert(&session);
@@ -2371,13 +2467,7 @@ async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
 #[tokio::test]
 async fn speculative_detached_winner_commits_into_captured_pool_once() {
     let handler = AnyTlsHandler::new();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-detached-commit".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-detached-commit");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let (session, _server) = establish_test_session("speculative-detached-commit").await;
     let prepared = handler
@@ -2405,15 +2495,49 @@ async fn speculative_detached_winner_commits_into_captured_pool_once() {
 }
 
 #[tokio::test]
+async fn speculative_commit_binds_initial_generation_admission() {
+    let mut node = zero_idle_anytls_node("speculative-initial-admission");
+    node.address = "127.0.0.1:443".into();
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&node),
+            1,
+            None,
+        )
+        .unwrap()
+        .0,
+    );
+    let runtime = generation.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    assert!(!pool.dial_scope_matches(&generation));
+    let (session, _server) = establish_test_session("speculative-initial-admission").await;
+    let prepared = generation
+        .scope_dials(AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+            &node,
+            Arc::clone(&pool),
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+            Some(runtime),
+            {
+                let session = Arc::clone(&session);
+                move || async move { Ok(session) }
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(!pool.dial_scope_matches(&generation));
+
+    let transport = prepared.commit().await.unwrap();
+
+    assert!(pool.dial_scope_matches(&generation));
+    drop(transport);
+    pool.shutdown();
+}
+
+#[tokio::test]
 async fn speculative_detached_commit_fails_closed_after_generation_shutdown() {
     let handler = AnyTlsHandler::new();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-detached-shutdown".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-detached-shutdown");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let (session, _server) = establish_test_session("speculative-detached-shutdown").await;
     let prepared = handler
@@ -2448,13 +2572,7 @@ impl Drop for CancelledDial {
 #[tokio::test]
 async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
     let handler = Arc::new(AnyTlsHandler::new());
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-abort".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-abort");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2509,13 +2627,7 @@ async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
 #[tokio::test]
 async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
     let handler = Arc::new(AnyTlsHandler::new());
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "speculative-shutdown".into(),
-        protocol: NodeProtocol::AnyTLS,
-        anytls_min_idle_session: Some(0),
-        ..Default::default()
-    };
+    let node = zero_idle_anytls_node("speculative-shutdown");
     let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));

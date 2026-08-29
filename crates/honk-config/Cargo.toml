@@ -20,6 +20,9 @@ base64.workspace = true
 # getifaddrs for interface address enumeration (replaces `ip addr show`)
 ipnet.workspace = true
 libc.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true

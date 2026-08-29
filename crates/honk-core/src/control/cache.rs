@@ -114,10 +114,7 @@ impl ControlPlane {
         if cache_cfg.store_dns {
             let dns_cache = self.dns_controller.cache().await;
             let persister = crate::dns::persist::DnsCachePersister::spawn(db.clone());
-            let policy = {
-                let config = self.config.read().await;
-                crate::dns::policy::PolicyId::from_config(&config.dns).ok()
-            };
+            let policy = self.dns_controller.forwarder().policy_id();
             match persister.restore_cache(&dns_cache, policy).await {
                 Ok(restored) if restored > 0 => {
                     info!("cache.db: restored {} persisted DNS answer(s)", restored);

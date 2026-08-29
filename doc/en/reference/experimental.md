@@ -17,6 +17,8 @@ This reference describes the two current nested sections under `experimental { .
 | --- | --- | --- |
 | `external_controller` | `""` | HTTP listen address. An empty value disables the API server. |
 | `external_ui` | `""` | External dashboard directory. An empty value disables dashboard serving and download. |
+| `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL. An empty value uses the built-in zashboard URL. |
+| `external_ui_download_detour` | `""` | Node or group tag used for the download. An empty value follows normal traffic routing. |
 | `secret` | `""` | API authentication secret. An empty value disables authentication. |
 | `default_mode` | `"Rule"` | Startup mode: `Rule`, `Global`, or `Direct`. A valid cached mode takes precedence. |
 
@@ -28,9 +30,9 @@ With a non-empty `secret`, API requests use `Authorization: Bearer <secret>`; We
 
 ### External UI
 
-An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing working-directory-relative directory; if neither exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard zip download. `HONK_UI_DOWNLOAD_URL` overrides the zip URL.
+An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing working-directory-relative directory; if neither exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `external_ui_download_url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
 
-The download follows the normal traffic routing decision and resolves the selected group or node. A `block` decision aborts the download; it does not bypass policy.
+A non-empty `external_ui_download_detour` forces the initial request and every redirect through that node or group. `direct` downloads directly, `block` aborts, and a group resolves its authoritative leaf for each exchange. When the field is empty, each URL follows the normal traffic routing decision as before. An unavailable tag, download failure, or extraction failure is logged without stopping the engine.
 
 ### Startup mode
 
@@ -66,6 +68,8 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'zashboard'
+        external_ui_download_url: 'https://example.com/dashboard.zip'
+        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: Rule
     }

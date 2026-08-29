@@ -343,12 +343,15 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
 /// `ech_config_path`. `ech_enabled` without configs is handled separately at
 /// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
-    if let Some(encoded) = &node.ech_config {
+    let Some(tls) = node.tls() else {
+        return Ok(None);
+    };
+    if let Some(encoded) = &tls.ech_config {
         return decode_ech_config_list(encoded)
             .map(Some)
             .with_context(|| format!("node {}: ech_config", node.name));
     }
-    if let Some(path) = &node.ech_config_path {
+    if let Some(path) = &tls.ech_config_path {
         let path = honk_config::paths::resolve_dependency_path(path);
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("node {}: read {}", node.name, path.display()))?;
@@ -363,7 +366,7 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
 /// built lazily when a node first enters the active working set.
 pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
     load_ech_config_list(node)?;
-    if let Some(pin) = node.tls_pin_sha256.as_deref()
+    if let Some(pin) = node.tls().and_then(|tls| tls.pin_sha256.as_deref())
         && parse_pin_sha256(pin).is_none()
     {
         anyhow::bail!(
@@ -515,10 +518,17 @@ pub(crate) fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Resul
 }
 
 pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
+    let tls = node.tls().ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal configuration error: node '{}' protocol '{}' has no TLS options",
+            node.name,
+            node.protocol().as_str()
+        )
+    })?;
     let chrome = chrome_mode();
     let ech_config_list = load_ech_config_list(node)?;
 
-    let pin = match node.tls_pin_sha256.as_deref() {
+    let pin = match tls.pin_sha256.as_deref() {
         Some(s) => Some(parse_pin_sha256(s).ok_or_else(|| {
             // pinSHA256 is a security assertion: an unparseable pin
             // must fail closed, never degrade to plain PKI.
@@ -529,24 +539,32 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         })?),
         None => None,
     };
-    let mut builder = base_builder(node.skip_cert_verify || pin.is_some())?;
+    let mut builder = base_builder(tls.skip_cert_verify || pin.is_some())?;
     if let Some(pin) = pin {
         builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
     }
     if chrome {
         apply_chrome_ctx(&mut builder)?;
-        builder.set_alpn_protos(if node.transport == "ws" {
-            HTTP11_ALPN_WIRE
-        } else {
-            CHROME_ALPN_WIRE
-        })?;
+        builder.set_alpn_protos(
+            if node
+                .transport()
+                .is_some_and(|transport| transport.transport == "ws")
+            {
+                HTTP11_ALPN_WIRE
+            } else {
+                CHROME_ALPN_WIRE
+            },
+        )?;
     }
 
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
-        alps: chrome && node.transport != "ws",
-        ech_discovery: node.ech_enabled && ech_config_list.is_none(),
+        alps: chrome
+            && !node
+                .transport()
+                .is_some_and(|transport| transport.transport == "ws"),
+        ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
 }
@@ -644,7 +662,13 @@ mod tests {
 
     fn test_node() -> Node {
         Node {
-            skip_cert_verify: true,
+            outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                tls: honk_config::node::TlsOptions {
+                    skip_cert_verify: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -726,12 +750,10 @@ mod tests {
     #[tokio::test]
     async fn ech_accepted_end_to_end() {
         static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
-        let node = Node {
-            skip_cert_verify: true,
-            ech_enabled: true,
-            ech_config: Some(general_purpose::STANDARD.encode(ECH_CONFIG_LIST)),
-            ..Default::default()
-        };
+        let mut node = test_node();
+        let tls = node.tls_mut().unwrap();
+        tls.ech_enabled = true;
+        tls.ech_config = Some(general_purpose::STANDARD.encode(ECH_CONFIG_LIST));
         let (cert, key) = server_cert();
         let (port, server) = spawn_ech_server(&cert, &key);
         let mut stream = loopback_connect(&node, true, port).await.unwrap();
@@ -749,12 +771,10 @@ mod tests {
     #[tokio::test]
     async fn ech_rejected_when_server_lacks_keys() {
         static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
-        let node = Node {
-            skip_cert_verify: true,
-            ech_enabled: true,
-            ech_config: Some(general_purpose::STANDARD.encode(ECH_CONFIG_LIST)),
-            ..Default::default()
-        };
+        let mut node = test_node();
+        let tls = node.tls_mut().unwrap();
+        tls.ech_enabled = true;
+        tls.ech_config = Some(general_purpose::STANDARD.encode(ECH_CONFIG_LIST));
         let (cert, key) = server_cert();
         let (port, _server) = spawn_server(&cert, &key);
         let err = loopback_connect(&node, true, port)
@@ -953,11 +973,8 @@ mod tests {
         crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
             "udp://{addr}"
         )));
-        let node = Node {
-            skip_cert_verify: true,
-            ech_enabled: true,
-            ..Default::default()
-        };
+        let mut node = test_node();
+        node.tls_mut().unwrap().ech_enabled = true;
         let (cert, key) = server_cert();
         let (port, server) = spawn_ech_server(&cert, &key);
         let mut stream = loopback_connect(&node, true, port).await.unwrap();
@@ -994,19 +1011,31 @@ mod pin_tests {
     /// degrade to plain PKI.
     #[test]
     fn invalid_pin_fails_closed() {
-        let node = Node {
+        let mut node = Node {
             name: "pinned".into(),
             host: "example.com".into(),
             address: "example.com:443".into(),
             port: 443,
-            tls_pin_sha256: Some("not-a-pin".into()),
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
             ..Default::default()
         };
+        node.tls_mut().unwrap().pin_sha256 = Some("not-a-pin".into());
         let err = build_connector(&node).unwrap_err();
         assert!(
             err.to_string().contains("invalid tls_pin_sha256"),
             "bad pin must be a hard error: {err}"
         );
+    }
+
+    #[test]
+    fn non_tls_node_connector_returns_error() {
+        let node = Node {
+            name: "direct".into(),
+            outbound: honk_config::node::OutboundConfig::Direct,
+            ..Default::default()
+        };
+        let error = build_connector(&node).unwrap_err();
+        assert!(error.to_string().contains("has no TLS options"), "{error}");
     }
 }
 

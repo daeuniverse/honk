@@ -17,7 +17,7 @@ fn start_probe_feedback(
     manager
         .read()
         .feedback_for_node(node_id, context)
-        .map(|feedback| feedback.start())
+        .map(|feedback| feedback.streak_neutral().start())
 }
 
 fn probe_setup(reporter: &ProbeReporter) {
@@ -109,7 +109,7 @@ fn http_probe_context(url: &str, addr: SocketAddr) -> ScoreSelectionContext {
 /// Resolves the check URL's hostname, dials through the proxy node via the
 /// `ProxyRegistry`, sends a raw HTTP request, and validates the status code.
 pub(super) struct ProxyHttpProber {
-    config: Arc<RwLock<Config>>,
+    config: Arc<RwLock<Arc<Config>>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     check_method: String,
@@ -118,7 +118,7 @@ pub(super) struct ProxyHttpProber {
 
 impl ProxyHttpProber {
     pub(super) fn new(
-        config: Arc<RwLock<Config>>,
+        config: Arc<RwLock<Arc<Config>>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         check_method: String,
@@ -170,10 +170,11 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     "node '{node_name}' not found"
                 ));
             };
-            let Some(entry) = registry.find(node.protocol) else {
+            let protocol = node.protocol();
+            let Some(entry) = registry.find(protocol) else {
                 return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                     "no handler for protocol {:?}",
-                    node.protocol
+                    protocol
                 ));
             };
             let connect_timeout = match config.try_read() {
@@ -184,7 +185,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     );
                 }
             };
-            let domain = if node.protocol == NodeProtocol::Direct {
+            let domain = if protocol == NodeProtocol::Direct {
                 None
             } else {
                 url_host(&check_url)
@@ -204,11 +205,11 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     Some(warmable) => {
                         tokio::time::timeout(
                             timeout,
-                            warmable.warm(
+                            generation.scope_dials(warmable.warm(
                                 Arc::clone(&runtime),
                                 connect_timeout,
                                 honk_outbound::proxy::WarmRequirement::Session,
-                            ),
+                            )),
                         )
                         .await
                     }
@@ -220,7 +221,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 match warmed {
                     Ok(Ok(())) => {
                         probe_setup(&warm_reporter);
-                        probe_finish(&warm_reporter, ScoreOutcome::Success);
+                        if let Some(reporter) = &warm_reporter {
+                            reporter.finish_setup_only();
+                        }
                     }
                     Ok(Err(error)) => {
                         probe_finish(&warm_reporter, ScoreOutcome::from_error(&error));
@@ -246,9 +249,13 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             );
             let start = std::time::Instant::now();
             let attempt = async {
-                let proxy = entry
-                    .tcp
-                    .dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
+                let proxy = generation
+                    .scope_dials(entry.tcp.dial_runtime(
+                        runtime,
+                        addr,
+                        domain.as_deref(),
+                        connect_timeout,
+                    ))
                     .await?;
                 probe_setup(&reporter);
                 Self::http_check(proxy.stream, &check_url, &check_method, &reporter, timeout)
@@ -401,7 +408,7 @@ pub(super) struct QuicScoreTarget {
 /// while their TCP probe succeeds — exactly the signal the UDP alive
 /// domains need.
 pub(super) struct ProxyUdpProber {
-    config: Arc<RwLock<Config>>,
+    config: Arc<RwLock<Arc<Config>>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
@@ -414,7 +421,7 @@ pub(super) struct ProxyUdpProber {
 impl ProxyUdpProber {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        config: Arc<RwLock<Config>>,
+        config: Arc<RwLock<Arc<Config>>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         stats: Arc<StatsManager>,
@@ -468,13 +475,14 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
 
         Box::pin(async move {
             let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
+            let protocol = node.protocol();
             let entry = registry
-                .find(node.protocol)
-                .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
+                .find(protocol)
+                .ok_or_else(|| format!("no handler for protocol {:?}", protocol))?;
             let packet = entry
                 .packet
                 .clone()
-                .ok_or_else(|| format!("protocol {:?} has no UDP capability", node.protocol))?;
+                .ok_or_else(|| format!("protocol {:?} has no UDP capability", protocol))?;
             let connect_timeout = {
                 let config = config
                     .try_read()
@@ -495,13 +503,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             );
             let start = std::time::Instant::now();
             let attempt = async {
-                let transport = packet
-                    .dial_udp_transport_runtime(
+                let transport = generation
+                    .scope_dials(packet.dial_udp_transport_runtime(
                         Arc::clone(&runtime),
                         dns_target,
                         None,
                         connect_timeout,
-                    )
+                    ))
                     .await?;
                 probe_setup(&reporter);
                 udp_probe_exchange(&transport, &reporter, timeout)
@@ -525,9 +533,14 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     Err("UDP probe timeout".to_string())
                 }
             };
-            if let Some(target) = quic_score_target.as_ref() {
+            // The DNS probe failure already recorded the Score evidence; a
+            // handshake through the same dead path only adds quinn ERROR noise.
+            if health_result.is_ok()
+                && let Some(target) = quic_score_target.as_ref()
+            {
                 score_quic_probe(
                     &packet,
+                    &generation,
                     Arc::clone(&runtime),
                     &node,
                     target,
@@ -585,6 +598,7 @@ pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> ScoreSelectionCont
 #[allow(clippy::too_many_arguments)]
 async fn score_quic_probe(
     packet: &Arc<dyn honk_outbound::proxy::PacketOutbound>,
+    generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     runtime: Arc<honk_outbound::runtime::NodeRuntime>,
     node: &Node,
     target: &QuicScoreTarget,
@@ -602,8 +616,13 @@ async fn score_quic_probe(
         ScoreTarget::Socket(_) => None,
     };
     let attempt = async {
-        let transport = packet
-            .dial_udp_transport_runtime(runtime, target.addr, target_domain, connect_timeout)
+        let transport = generation
+            .scope_dials(packet.dial_udp_transport_runtime(
+                runtime,
+                target.addr,
+                target_domain,
+                connect_timeout,
+            ))
             .await?;
         probe_setup(&reporter);
         honk_outbound::quic::quic_handshake_probe(
@@ -729,7 +748,13 @@ pub(super) async fn resolve_quic_score_target(
         warn!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
         return None;
     }
-    let (host, _) = extract_url_host_path(url)?;
+    let (host, _) = match extract_url_host_path(url) {
+        Some(parts) => parts,
+        None => {
+            warn!("Score QUIC probe disabled: invalid tcp_check_url");
+            return None;
+        }
+    };
     let host = host.to_string();
     let port = url_port(url);
     let addrs = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -754,8 +779,19 @@ pub(super) async fn resolve_quic_score_target(
         .parse::<std::net::IpAddr>()
         .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
     let tls_node = Node {
-        sni: Some(host.clone()),
-        skip_cert_verify: true,
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                quic: honk_config::node::QuicOptions {
+                    tls: honk_config::node::TlsOptions {
+                        sni: Some(host.clone()),
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
         ..Node::default()
     };
     let config = match honk_outbound::quic::client_config(
@@ -771,7 +807,7 @@ pub(super) async fn resolve_quic_score_target(
             return None;
         }
     };
-    info!(host, %addr, "Score QUIC probe enabled");
+    debug!(host, %addr, "Score QUIC probe enabled");
     Some(QuicScoreTarget {
         addr,
         host,

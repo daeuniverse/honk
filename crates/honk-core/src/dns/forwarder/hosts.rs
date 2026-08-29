@@ -3,11 +3,17 @@
 //! Loading happens while a generation is built, so SIGHUP publishes hosts,
 //! policy, transports, and routing together. Query handling performs no file I/O.
 
+use anyhow::Context;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::io::Read as _;
 use std::net::IpAddr;
+#[cfg(test)]
 use std::path::Path;
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 use regex::Regex;
 
@@ -20,9 +26,114 @@ use super::{DnsForwardError, DnsForwarder, ResolveMode};
 const HOSTS_TTL_SECS: u32 = 60;
 
 #[derive(Debug, Default)]
-pub(super) struct HostsFile {
+pub(crate) struct HostsFile {
     entries: HashMap<String, Vec<IpAddr>>,
     rules: Vec<HostsRule>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostsSnapshot {
+    fingerprint: [u8; 32],
+    hosts: Option<Arc<HostsFile>>,
+}
+
+pub(crate) struct HostsSourceSet {
+    fingerprint: [u8; 32],
+    sources: Vec<(bool, String)>,
+}
+
+impl Default for HostsSnapshot {
+    fn default() -> Self {
+        Self {
+            fingerprint: Sha256::digest([]).into(),
+            hosts: None,
+        }
+    }
+}
+
+impl HostsSnapshot {
+    pub(crate) fn new(fingerprint: [u8; 32], hosts: Option<Arc<HostsFile>>) -> Self {
+        Self { fingerprint, hosts }
+    }
+
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+}
+
+impl HostsSourceSet {
+    pub(crate) fn load(config: &honk_config::dns::DnsConfig) -> anyhow::Result<Self> {
+        let mut hash = Sha256::new();
+        let mut sources = Vec::with_capacity(config.hosts.len());
+        for source in &config.hosts {
+            let rules = source != honk_config::dns::SYSTEM_HOSTS_PATH;
+            let path = honk_config::paths::resolve_dependency_path(source);
+            let contents = fs::read_to_string(&path)
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
+            update_hash(&mut hash, &[u8::from(rules)]);
+            update_hash(&mut hash, &Sha256::digest(contents.as_bytes()));
+            sources.push((rules, contents));
+        }
+        Ok(Self {
+            fingerprint: hash.finalize().into(),
+            sources,
+        })
+    }
+
+    pub(crate) fn probe_fingerprint(
+        config: &honk_config::dns::DnsConfig,
+    ) -> anyhow::Result<[u8; 32]> {
+        let mut hash = Sha256::new();
+        for source in &config.hosts {
+            let rules = source != honk_config::dns::SYSTEM_HOSTS_PATH;
+            let path = honk_config::paths::resolve_dependency_path(source);
+            let digest = digest_file(&path)
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
+            update_hash(&mut hash, &[u8::from(rules)]);
+            update_hash(&mut hash, &digest);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+
+    pub(crate) fn parse(self) -> io::Result<HostsSnapshot> {
+        let mut hosts = HostsFile::default();
+        for (rules, contents) in self.sources {
+            let loaded = if rules {
+                HostsFile::parse_rules(&contents)?
+            } else {
+                HostsFile::parse(&contents)
+            };
+            hosts.merge(loaded);
+        }
+        Ok(HostsSnapshot {
+            fingerprint: self.fingerprint,
+            hosts: (!hosts.entries.is_empty() || !hosts.rules.is_empty()).then(|| Arc::new(hosts)),
+        })
+    }
+}
+
+fn update_hash(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn digest_file(path: &std::path::Path) -> io::Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hash.finalize().into());
+        }
+        hash.update(&buffer[..read]);
+    }
 }
 
 #[derive(Debug)]
@@ -49,13 +160,16 @@ impl HostsMatcher {
     }
 }
 
+impl HostsSnapshot {
+    pub(crate) fn hosts(&self) -> Option<Arc<HostsFile>> {
+        self.hosts.clone()
+    }
+}
+
 impl HostsFile {
+    #[cfg(test)]
     pub(super) fn load(path: &Path) -> io::Result<Self> {
         fs::read_to_string(path).map(|contents| Self::parse(&contents))
-    }
-
-    pub(super) fn load_rules(path: &Path) -> io::Result<Self> {
-        fs::read_to_string(path).and_then(|contents| Self::parse_rules(&contents))
     }
 
     pub(super) fn merge(&mut self, other: Self) {

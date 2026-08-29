@@ -22,8 +22,8 @@ pub(crate) fn preconnect_candidates(
         count
     };
     fn eligible(node: &Node) -> bool {
-        !matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
-            && (honk_outbound::descriptor::descriptor(node.protocol).pool_bare_tcp)(node)
+        !matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block)
+            && (honk_outbound::descriptor::descriptor(node.protocol()).pool_bare_tcp)(node)
     }
     let mut seen = std::collections::HashSet::new();
     let mut selected: Vec<Node> = Vec::new();
@@ -69,6 +69,7 @@ impl ControlPlane {
             let node_count = nodes.len();
             let pool = self.connection_pool.clone();
             let stats = self.stats.clone();
+            let generation = self.runtime_registry.read().clone();
             let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
             let handle = tokio::spawn(async move {
                 let mut set = tokio::task::JoinSet::new();
@@ -84,11 +85,18 @@ impl ControlPlane {
                     let addr = format!("{}:{}", node.host(), node.port);
                     let pool = pool.clone();
                     let stats = stats.clone();
+                    let generation = Arc::clone(&generation);
                     let sem = semaphore.clone();
                     set.spawn(async move {
                         let _permit = sem.acquire_owned().await;
-                        let reporter = feedback.map(|feedback| feedback.start());
-                        match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
+                        let reporter = feedback.map(|feedback| feedback.streak_neutral().start());
+                        match generation
+                            .scope_dials(honk_outbound::util::connect_outbound(
+                                &addr,
+                                connect_timeout,
+                            ))
+                            .await
+                        {
                             Ok(stream) if is_tcp_stream_alive(&stream) => {
                                 if let Some(reporter) = &reporter {
                                     reporter.setup_succeeded();

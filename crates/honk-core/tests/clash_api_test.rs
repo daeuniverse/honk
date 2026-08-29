@@ -32,9 +32,9 @@ fn make_node(name: &str) -> Node {
     Node {
         id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.into(),
-        protocol: NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 1,
+        outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
         ..Default::default()
     }
 }
@@ -168,7 +168,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
     datapath_flags.initialize(0, false, false).await.unwrap();
     let state = Arc::new(ClashState {
-        config: Arc::new(tokio::sync::RwLock::new(config)),
+        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
         stats: stats.clone(),
         alive_set,
         group_manager,
@@ -378,6 +378,7 @@ routing {
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();
+    app.state.mode_state.write().global_selection = "Proxy".to_string();
 
     let body: serde_json::Value = client
         .get(app.url("/proxies"))
@@ -406,13 +407,14 @@ async fn test_proxies_structure_and_selector_switch() {
     // GLOBAL synthetic group exists with the mode-state selection.
     assert_eq!(proxies["GLOBAL"]["type"], "selector");
     assert_eq!(proxies["GLOBAL"]["now"], "proxy");
-    assert_eq!(proxies["GLOBAL"]["all"][0], "Proxy");
-    // GLOBAL contains the group and both nodes, without duplicates.
+    // Every GLOBAL member is concrete, unique, and resolves to a top-level
+    // proxy document; stale virtual selections fall back to the first member.
     let global_all = proxies["GLOBAL"]["all"].as_array().unwrap();
     let unique: std::collections::HashSet<_> = global_all.iter().collect();
     assert_eq!(global_all.len(), unique.len());
-    for expected in ["Proxy", "proxy", "node-a", "node-b"] {
-        assert!(global_all.iter().any(|n| n == expected));
+    assert!(!global_all.iter().any(|name| name == "Proxy"));
+    for member in global_all {
+        assert!(proxies.get(member.as_str().unwrap()).is_some());
     }
 
     // Switch the selector to node-b.
@@ -578,14 +580,17 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
         config
             .nodes
             .iter()
-            .map(|node| (
-                node.name.as_str(),
-                node.protocol,
-                node.address.as_str(),
-                node.port,
-                node.username.as_deref(),
-                node.password.as_deref(),
-            ))
+            .map(|node| {
+                let socks = node.socks5().unwrap();
+                (
+                    node.name.as_str(),
+                    node.protocol(),
+                    node.address.as_str(),
+                    node.port,
+                    socks.username.as_deref(),
+                    socks.password.as_deref(),
+                )
+            })
             .collect::<Vec<_>>(),
         [
             (
@@ -683,6 +688,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -692,6 +698,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
             },
             {
@@ -704,6 +711,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -713,6 +721,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "incumbentHeld": 0,
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
+                    "switchFlap": 0,
                 },
             },
         ],
@@ -935,14 +944,16 @@ async fn test_global_selection_and_mode_persisted() {
     assert_eq!(resp.status(), 204);
     assert_eq!(app.state.mode_state.read().global_selection, "proxy");
 
-    // Unknown GLOBAL target → 400.
-    let resp = client
-        .put(app.url("/proxies/GLOBAL"))
-        .json(&serde_json::json!({"name": "nope"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+    // Virtual and unknown GLOBAL targets do not resolve.
+    for invalid in ["Proxy", "nope"] {
+        let resp = client
+            .put(app.url("/proxies/GLOBAL"))
+            .json(&serde_json::json!({"name": invalid}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
 
     // Switch mode to Global (case-insensitive).
     let resp = client
@@ -1886,7 +1897,10 @@ async fn test_store_dns_persister_end_to_end() {
 
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_config = DnsConfig::default();
-    let policy = honk_core::dns::policy::PolicyId::from_config(&dns_config).unwrap();
+    let forwarder = test_dns_forwarder(dns_cache.clone(), a_record_response([1, 2, 3, 4], 300))
+        .with_policy_from_config(&dns_config)
+        .unwrap();
+    let policy = forwarder.policy_id().expect("effective DNS policy");
     let persister = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
         persister
@@ -1899,9 +1913,6 @@ async fn test_store_dns_persister_end_to_end() {
         .lock()
         .await
         .set_persister(Some(persister.clone()));
-    let forwarder = test_dns_forwarder(dns_cache.clone(), a_record_response([1, 2, 3, 4], 300))
-        .with_policy_from_config(&dns_config)
-        .unwrap();
     let response = forwarder
         .resolve(&build_dns_query("example.com", 1))
         .await

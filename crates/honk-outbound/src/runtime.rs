@@ -12,8 +12,9 @@
 //! QUIC protocols own their per-node client (and shared connection) here.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 const TLS_ACTIVE_RATIO_NUMERATOR: usize = 1;
 const TLS_ACTIVE_RATIO_DENOMINATOR: usize = 10;
@@ -452,8 +453,8 @@ impl NodeRuntime {
     pub fn ephemeral(node: &Node) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::new(node.clone()),
-            udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
-            runtime: crate::descriptor::descriptor(node.protocol)
+            udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
+            runtime: crate::descriptor::descriptor(node.protocol())
                 .generation_runtime(node)
                 .build(),
             ephemeral: true,
@@ -767,11 +768,160 @@ pub struct OutboundRuntimeRegistry {
     dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
     dial_ceiling_limit: usize,
 }
-/// One proxied dial admitted by both its generation and the process-wide
-/// descriptor partition. Dropping it releases both capacities.
+#[derive(Clone)]
+struct DialAdmission {
+    generation: Arc<tokio::sync::Semaphore>,
+    process: Arc<tokio::sync::Semaphore>,
+}
+
+impl DialAdmission {
+    fn for_registry(registry: &OutboundRuntimeRegistry) -> Self {
+        Self {
+            generation: Arc::clone(&registry.dial_semaphore),
+            process: Arc::clone(&registry.dial_ceiling_semaphore),
+        }
+    }
+
+    fn standalone() -> Self {
+        STANDALONE_DIAL_ADMISSION.clone()
+    }
+
+    fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
+        Arc::ptr_eq(&self.generation, &registry.dial_semaphore)
+            && Arc::ptr_eq(&self.process, &registry.dial_ceiling_semaphore)
+    }
+
+    async fn acquire(self) -> DialPermit {
+        let generation = Arc::clone(&self.generation)
+            .acquire_owned()
+            .await
+            .expect("dial semaphore is never closed");
+        let process = Arc::clone(&self.process)
+            .acquire_owned()
+            .await
+            .expect("dial ceiling semaphore is never closed");
+        DialPermit {
+            _generation: generation,
+            _process: process,
+        }
+    }
+}
+
+static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| DialAdmission {
+    generation: Arc::new(tokio::sync::Semaphore::new(
+        tokio::sync::Semaphore::MAX_PERMITS,
+    )),
+    process: Arc::new(tokio::sync::Semaphore::new(
+        tokio::sync::Semaphore::MAX_PERMITS,
+    )),
+});
+
+type DialStart = Arc<parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+#[derive(Default)]
+struct HeldDialPermits {
+    first: Option<DialPermit>,
+    extra: Vec<DialPermit>,
+}
+
+struct DialScope {
+    admission: DialAdmission,
+    held: parking_lot::Mutex<HeldDialPermits>,
+    on_start: Option<DialStart>,
+}
+
+impl DialScope {
+    fn new(admission: DialAdmission, on_start: Option<DialStart>) -> Arc<Self> {
+        Arc::new(Self {
+            admission,
+            held: parking_lot::Mutex::new(HeldDialPermits::default()),
+            on_start,
+        })
+    }
+
+    fn start(&self) {
+        let callback = self
+            .on_start
+            .as_ref()
+            .and_then(|callback| callback.lock().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
+tokio::task_local! {
+    static DIAL_SCOPE: Arc<DialScope>;
+}
+
+/// One physical proxy dial admitted by both its generation and the shared
+/// process descriptor partition.
 pub struct DialPermit {
     _generation: tokio::sync::OwnedSemaphorePermit,
     _process: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedDialScope(Arc<DialScope>);
+
+impl CapturedDialScope {
+    fn standalone() -> Self {
+        Self(DialScope::new(DialAdmission::standalone(), None))
+    }
+
+    pub(crate) async fn scope<F>(self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        DIAL_SCOPE.scope(self.0, future).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
+        self.0.admission.matches_registry(registry)
+    }
+}
+
+pub(crate) fn capture_dial_scope() -> CapturedDialScope {
+    DIAL_SCOPE
+        .try_with(|scope| CapturedDialScope(Arc::clone(scope)))
+        .unwrap_or_else(|_| CapturedDialScope::standalone())
+}
+
+pub(crate) fn try_capture_dial_admission() -> Option<CapturedDialScope> {
+    DIAL_SCOPE
+        .try_with(|scope| CapturedDialScope(DialScope::new(scope.admission.clone(), None)))
+        .ok()
+}
+
+pub(crate) fn capture_dial_admission() -> CapturedDialScope {
+    try_capture_dial_admission().unwrap_or_else(CapturedDialScope::standalone)
+}
+
+pub(crate) async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let scope = DIAL_SCOPE.try_with(Arc::clone).ok();
+    let permit = match &scope {
+        Some(scope) => scope.admission.clone().acquire().await,
+        None => DialAdmission::standalone().acquire().await,
+    };
+    if let Some(scope) = &scope {
+        scope.start();
+    }
+    let result = future.await;
+    if result.is_ok()
+        && let Some(scope) = scope
+    {
+        let mut held = scope.held.lock();
+        if held.first.is_none() {
+            held.first = Some(permit);
+        } else {
+            held.extra.push(permit);
+        }
+    }
+    result
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -849,7 +999,7 @@ impl OutboundRuntimeRegistry {
             }
             // Validate cheap, fail-closed TLS inputs before publishing the
             // generation. The heavyweight SSL_CTX/root store stays lazy.
-            if node.tls {
+            if node.tls().is_some_and(|tls| tls.enabled) {
                 crate::tls::validate_connector_config(node).map_err(|source| {
                     RuntimeRegistryError::Tls {
                         node: node.name.clone(),
@@ -868,8 +1018,10 @@ impl OutboundRuntimeRegistry {
                 }
                 None => Arc::new(NodeRuntime {
                     node: Arc::new(node.clone()),
-                    udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
-                    runtime: crate::descriptor::descriptor(node.protocol)
+                    udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(
+                        node,
+                    ),
+                    runtime: crate::descriptor::descriptor(node.protocol())
                         .generation_runtime(node)
                         .build(),
                     ephemeral: false,
@@ -972,18 +1124,41 @@ impl OutboundRuntimeRegistry {
     /// Acquire generation-local admission before the shared process gate so
     /// low configured limits cannot hoard process capacity while waiting.
     pub async fn acquire_dial_permit(&self) -> DialPermit {
-        let generation = Arc::clone(&self.dial_semaphore)
-            .acquire_owned()
-            .await
-            .expect("dial semaphore is never closed");
-        let process = Arc::clone(&self.dial_ceiling_semaphore)
-            .acquire_owned()
-            .await
-            .expect("dial ceiling semaphore is never closed");
-        DialPermit {
-            _generation: generation,
-            _process: process,
+        DialAdmission::for_registry(self).acquire().await
+    }
+
+    /// Bind physical attempts made by `future` to this generation's gates.
+    /// Nested dispatch through the same registry keeps the existing scope.
+    pub async fn scope_dials<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        if DIAL_SCOPE
+            .try_with(|scope| scope.admission.matches_registry(self))
+            .unwrap_or(false)
+        {
+            return future.await;
         }
+        DIAL_SCOPE
+            .scope(
+                DialScope::new(DialAdmission::for_registry(self), None),
+                future,
+            )
+            .await
+    }
+
+    /// As [`Self::scope_dials`], starting feedback at the first admitted
+    /// physical attempt. A warm logical dial starts feedback on completion.
+    pub async fn scope_dials_with_start<F, C>(&self, future: F, on_start: C) -> F::Output
+    where
+        F: Future,
+        C: FnOnce() + Send + 'static,
+    {
+        let callback: DialStart = Arc::new(parking_lot::Mutex::new(Some(Box::new(on_start))));
+        let scope = DialScope::new(DialAdmission::for_registry(self), Some(callback));
+        let output = DIAL_SCOPE.scope(Arc::clone(&scope), future).await;
+        scope.start();
+        output
     }
 
     /// Make the generation unavailable to new generation-owned work without
@@ -991,6 +1166,17 @@ impl OutboundRuntimeRegistry {
     /// captured this generation starts pool draining after its leases retire.
     pub fn begin_retirement(&self) {
         self.terminal.store(true, Ordering::Release);
+    }
+
+    /// Rebind autonomous AnyTLS replacement dials after this generation is
+    /// published. Reused pools must stop consulting the predecessor's gate.
+    pub fn activate_background_dial_admission(&self) {
+        let scope = CapturedDialScope(DialScope::new(DialAdmission::for_registry(self), None));
+        for runtime in self.nodes.values() {
+            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
+                anytls.pool.set_dial_scope(scope.clone());
+            }
+        }
     }
 
     /// Record runtimes a published successor generation has taken over.
@@ -1041,15 +1227,22 @@ impl OutboundRuntimeRegistry {
 mod tests {
     use super::*;
     use honk_config::types::NodeProtocol;
+    use std::sync::atomic::AtomicUsize;
 
     fn node(name: &str, protocol: NodeProtocol) -> Node {
         Node {
             id: uuid::Uuid::new_v4(),
             name: name.to_string(),
-            protocol,
             address: "1.2.3.4:443".to_string(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
             ..Default::default()
         }
+    }
+
+    fn vless_node(name: &str, mode: honk_config::node::WireMode) -> Node {
+        let mut node = node(name, NodeProtocol::VLess);
+        node.vless_mut().unwrap().mode = mode;
+        node
     }
 
     #[test]
@@ -1063,10 +1256,7 @@ mod tests {
             (WireMode::H2muxPadded, 1),
             (WireMode::MuxCool, 2),
         ] {
-            let node = Node {
-                vless_mode: mode,
-                ..node("vless", NodeProtocol::VLess)
-            };
+            let node = vless_node("vless", mode);
             let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
             let actual = match &registry.get(&node.id).unwrap().runtime {
                 ProtocolRuntime::None => 0,
@@ -1123,10 +1313,7 @@ mod tests {
     async fn warm_retention_releases_only_after_last_owner() {
         for node in [
             node("anytls-retained", NodeProtocol::AnyTLS),
-            Node {
-                vless_mode: honk_config::node::WireMode::H2mux,
-                ..node("vless-retained", NodeProtocol::VLess)
-            },
+            vless_node("vless-retained", honk_config::node::WireMode::H2mux),
         ] {
             let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
             let runtime = registry.get(&node.id).unwrap();
@@ -1309,30 +1496,170 @@ mod tests {
             .expect("released process capacity must admit the successor");
     }
 
+    #[tokio::test]
+    async fn one_dial_permit_serializes_real_tcp_fallbacks() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_listener.local_addr().unwrap();
+        let second_addr = second_listener.local_addr().unwrap();
+        let addrs = [first_addr, second_addr];
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let second_started = Arc::new(tokio::sync::Notify::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0,
+        );
+
+        let dial = tokio::spawn({
+            let release_first = Arc::clone(&release_first);
+            let first_started = Arc::clone(&first_started);
+            let second_started = Arc::clone(&second_started);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let generation = Arc::clone(&registry);
+            async move {
+                generation
+                    .scope_dials(async move {
+                        crate::address_race::race_resolved_addrs_with_stagger(
+                            &addrs,
+                            Duration::ZERO,
+                            move |addr| {
+                                let release_first = Arc::clone(&release_first);
+                                let first_started = Arc::clone(&first_started);
+                                let second_started = Arc::clone(&second_started);
+                                let active = Arc::clone(&active);
+                                let peak = Arc::clone(&peak);
+                                async move {
+                                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    peak.fetch_max(now, Ordering::SeqCst);
+                                    let _active = Active(active);
+                                    if addr == second_addr {
+                                        second_started.notify_one();
+                                    }
+                                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                                    if addr == first_addr {
+                                        first_started.notify_one();
+                                        release_first.notified().await;
+                                        drop(stream);
+                                        Err(std::io::Error::other("first address failed"))
+                                    } else {
+                                        Ok(stream)
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    })
+                    .await
+            }
+        });
+
+        first_started.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), second_started.notified())
+                .await
+                .is_err(),
+            "the fallback started without a second physical permit"
+        );
+        release_first.notify_one();
+        let winner = dial.await.unwrap().unwrap().unwrap();
+        assert_eq!(winner.peer_addr().unwrap(), second_addr);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+
+        let (mut first_server, _) = first_listener.accept().await.unwrap();
+        let (second_server, _) = second_listener.accept().await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), first_server.read(&mut byte))
+            .await
+            .expect("failed TCP attempt stayed open")
+            .unwrap();
+        assert_eq!(read, 0);
+        drop((winner, second_server));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_generations_bound_physical_address_attempts() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let (first, _) =
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, None).unwrap();
+        let (second, _) =
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, Some(&first))
+                .unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let run = |generation: Arc<OutboundRuntimeRegistry>| {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            async move {
+                let addrs = [
+                    "192.0.2.1:443".parse().unwrap(),
+                    "[2001:db8::1]:443".parse().unwrap(),
+                ];
+                generation
+                    .scope_dials(crate::address_race::race_resolved_addrs_with_stagger(
+                        &addrs,
+                        Duration::ZERO,
+                        move |addr| {
+                            let active = Arc::clone(&active);
+                            let peak = Arc::clone(&peak);
+                            async move {
+                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                let _active = Active(active);
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                Err::<(), _>(addr)
+                            }
+                        },
+                    ))
+                    .await
+            }
+        };
+
+        let (old_result, new_result) = tokio::join!(run(Arc::new(first)), run(Arc::new(second)));
+        assert!(matches!(old_result, Some(Err(_))));
+        assert!(matches!(new_result, Some(Err(_))));
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn udp_capability_matrix() {
         let anytls = node("x", NodeProtocol::AnyTLS);
-        assert!((crate::descriptor::descriptor(anytls.protocol).supports_udp)(&anytls));
+        assert!((crate::descriptor::descriptor(anytls.protocol()).supports_udp)(&anytls));
         let vmess = node("x", NodeProtocol::VMess);
-        assert!(!(crate::descriptor::descriptor(vmess.protocol).supports_udp)(&vmess));
+        assert!(!(crate::descriptor::descriptor(vmess.protocol()).supports_udp)(&vmess));
         let hy2 = node("x", NodeProtocol::Hysteria2);
-        assert!((crate::descriptor::descriptor(hy2.protocol).supports_udp)(
-            &hy2
-        ));
+        assert!((crate::descriptor::descriptor(hy2.protocol()).supports_udp)(&hy2));
     }
 
     #[test]
     fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
-        let unchanged = Node {
-            vless_mode: honk_config::node::WireMode::H2mux,
-            ..node("vless", NodeProtocol::VLess)
-        };
+        let unchanged = vless_node("vless", honk_config::node::WireMode::H2mux);
         let mut changed = node("tuic", NodeProtocol::Tuic);
         let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
         let first_unchanged = first.get(&unchanged.id).unwrap();
         let first_changed = first.get(&changed.id).unwrap();
 
-        changed.sni = Some("new.example.com".to_string());
+        changed.tls_mut().unwrap().sni = Some("new.example.com".to_string());
         let (second, reused) = OutboundRuntimeRegistry::build_reusing(
             &[unchanged.clone(), changed.clone()],
             64,
@@ -1402,10 +1729,7 @@ mod tests {
     async fn vless_mux_pools_retire_and_shut_down_with_their_generation() {
         use honk_config::node::WireMode;
         for mode in [WireMode::H2mux, WireMode::MuxCool] {
-            let node = Node {
-                vless_mode: mode,
-                ..node("vless", NodeProtocol::VLess)
-            };
+            let node = vless_node("vless", mode);
             let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
             let runtime = registry.get(&node.id).unwrap();
             let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
@@ -1427,10 +1751,7 @@ mod tests {
     #[test]
     fn vless_mux_runtime_reuse_is_mode_exact() {
         use honk_config::node::WireMode;
-        let node = Node {
-            vless_mode: WireMode::MuxCool,
-            ..node("vless-cool", NodeProtocol::VLess)
-        };
+        let node = vless_node("vless-cool", WireMode::MuxCool);
         let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let (unchanged, reused) =
             OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 64, Some(&first))
@@ -1441,10 +1762,8 @@ mod tests {
             &unchanged.get(&node.id).unwrap()
         ));
 
-        let changed = Node {
-            vless_mode: WireMode::H2mux,
-            ..node.clone()
-        };
+        let mut changed = node.clone();
+        changed.vless_mut().unwrap().mode = WireMode::H2mux;
         let (changed_registry, reused) = OutboundRuntimeRegistry::build_reusing(
             std::slice::from_ref(&changed),
             64,
@@ -1465,7 +1784,7 @@ mod tests {
     #[test]
     fn build_reusing_ignores_parse_timestamps() {
         let mut parsed = node("trojan", NodeProtocol::Trojan);
-        parsed.sni = Some("example.com".to_string());
+        parsed.tls_mut().unwrap().sni = Some("example.com".to_string());
         let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&parsed)).unwrap();
         let mut reparsed = parsed.clone();
         reparsed.created_at = chrono::Utc::now();

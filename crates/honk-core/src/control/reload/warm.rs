@@ -15,7 +15,7 @@ pub(in crate::control) struct SelectorWarmResources {
 }
 
 pub(super) struct SelectorWarmCoordinator {
-    pub(super) config: Arc<tokio::sync::RwLock<Config>>,
+    pub(super) config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     pub(super) group_manager: crate::group::SharedGroupManager,
     pub(super) notify: Arc<tokio::sync::Notify>,
     pub(super) resources: SelectorWarmResources,
@@ -41,7 +41,7 @@ pub(in crate::control) fn selector_warm_candidates(
         .filter(|group| group.policy == GroupPolicy::Selector)
         .filter_map(|group| group_manager.selector_warm_node(&group.name))
         .filter(|node| {
-            !matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
+            !matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block)
                 && configured.contains(&node.id)
                 && generation.get(&node.id).is_some()
                 && seen.insert(node.id)
@@ -158,7 +158,7 @@ pub(in crate::control) async fn warm_selector_candidate(
     } = resources;
     // Purge a moved endpoint before redial: failure must not keep the old
     // socket pinned under a stable node ID.
-    let descriptor = honk_outbound::descriptor::descriptor(node.protocol);
+    let descriptor = honk_outbound::descriptor::descriptor(node.protocol());
     let bare_addr =
         (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
     let stale = {
@@ -185,7 +185,7 @@ pub(in crate::control) async fn warm_selector_candidate(
                     IpVersion::V4,
                 ),
             )
-            .map(|feedback| feedback.start());
+            .map(|feedback| feedback.streak_neutral().start());
         match proxy_registry
             .warm_session(Arc::clone(&generation), node.id, connect_timeout)
             .await
@@ -237,8 +237,14 @@ pub(in crate::control) async fn warm_selector_candidate(
                     IpVersion::V4,
                 ),
             )
-            .map(|feedback| feedback.start());
-        let stream = match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
+            .map(|feedback| feedback.streak_neutral().start());
+        let stream = match generation
+            .scope_dials(honk_outbound::util::connect_outbound(
+                &addr,
+                connect_timeout,
+            ))
+            .await
+        {
             Ok(_) if generation.is_shutdown() => {
                 if let Some(reporter) = &reporter {
                     reporter.finish(crate::group::ScoreOutcome::Shutdown);
@@ -322,7 +328,7 @@ pub(in crate::control) fn udp_warm_candidates(
             }
             for node in leaves {
                 if matches!(
-                    node.protocol,
+                    node.protocol(),
                     honk_config::types::NodeProtocol::Direct
                         | honk_config::types::NodeProtocol::Block
                 ) {
@@ -335,7 +341,7 @@ pub(in crate::control) fn udp_warm_candidates(
                     continue;
                 };
                 if !runtime.udp_capable
-                    || !honk_outbound::descriptor::descriptor(node.protocol)
+                    || !honk_outbound::descriptor::descriptor(node.protocol())
                         .has_generation_runtime(node)
                 {
                     continue;
@@ -380,7 +386,7 @@ pub(super) async fn reconcile_udp_warm_retention(
 /// sessions/clients, so repeat dispatch is cheap. Exits when the count is
 /// disabled or the generation turns terminal (reload/shutdown replaces it).
 pub(super) async fn run_udp_warm_coordinator<F, Fut>(
-    config: Arc<tokio::sync::RwLock<Config>>,
+    config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     group_manager: crate::group::SharedGroupManager,
     generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     stats: Arc<StatsManager>,
@@ -527,7 +533,7 @@ impl ControlPlane {
                         .get(&node_id)
                         .filter(|runtime| {
                             runtime.udp_capable
-                                && honk_outbound::descriptor::descriptor(runtime.node.protocol)
+                                && honk_outbound::descriptor::descriptor(runtime.node.protocol())
                                     .has_generation_runtime(&runtime.node)
                         })
                         .and_then(|_| {
@@ -540,7 +546,7 @@ impl ControlPlane {
                                 ),
                             )
                         })
-                        .map(|feedback| feedback.start());
+                        .map(|feedback| feedback.streak_neutral().start());
                     let result = proxy_registry
                         .warm_udp(generation.clone(), node_id, connect_timeout)
                         .await;

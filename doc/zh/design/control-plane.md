@@ -78,7 +78,7 @@ Endpoint 创建是事务性的：
 5. 转移保留的首包，用 `send_packet_confirmed` 发送并等待 acknowledgement。
 6. 按 FIFO 顺序发送嗅探保留的 fragment 和未触碰的 queue follower，再运行 steady send 和 receive 路径。
 
-透明 listener 接收循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送各有五秒超时。超时或错误具有歧义，因为 transport 可能已接受 packet 的一部分，因此 driver 不会重放该 datagram，也不会继续后续 follower。
+每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST 与 PKTINFO 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送各有五秒超时。超时或错误具有歧义，因为 transport 可能已接受 packet 的一部分，因此 driver 不会重放该 datagram，也不会继续后续 follower。
 
 SOCKS5 UDP 在 endpoint 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 endpoint 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。`PacketTransport::relay_addr()` 和接收来源元数据暴露的是逻辑目标，因此 endpoint 首回复校验不会把 SOCKS relay 与远端 peer 混淆。
 
@@ -90,17 +90,17 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 
 每个 UDP 流最多保留 64 个 datagram，包括首包。所有流共享精确的 8 MiB payload permit 预算。准入在复制前取得每流 slot 和全局 byte permit；FIFO 饱和时丢弃最新 datagram。NFQUEUE 有独立 ingest actor，限制为 256 个条目和 8 MiB 排队 payload。
 
-启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 32,768。在该上限处，固定分区为：
+启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 1,048,576。在该上限处，固定分区为：
 
 | 所有者 | 容量 | 描述符记账 |
 | --- | ---: | ---: |
 | 固定/运行时预留 | 256 | 256 |
-| 已接受 TCP 流 | 1024 | 每个 6 = 6144 |
+| 已接受 TCP 流 | 16,384 | 每个 6 = 98,304 |
 | 保留 TCP pool | 2048 | 每个 1 = 2048 |
 | 临时出站 dial | 1024 | 每个 1 = 1024 |
-| UDP endpoint | 7765 | 每个 3 = 23,295 |
-| **合计** |  | **32,767** |
-剩余 1 个描述符是分区取整余量。TCP 从描述符导出的 floor 开始，在不使用的 non-TCP 描述符余量内动态扩容，最多达到该 floor 的两倍，同时保留一半 non-TCP 预算作为突发余量；4,096 描述符服务在余量空闲时可从 160 个流 permit 扩展到 320 个。已有流不会被切断，固定预留用于保护控制平面描述符。
+| UDP endpoint | 8192 | 每个 3 = 24,576 |
+| **合计** |  | **126,208** |
+剩余描述符余量有意不分配：较高的 `RLIMIT_NOFILE` 不代表拥有等量的内存或调度能力。TCP 从描述符导出的固定分区开始，该分区封顶为 16,384 个流，并在保留一半 non-TCP 预算作为突发余量的前提下借用空闲的 non-TCP 描述符余量。在 1,048,576 上限处，保留的 non-TCP 所有者空闲时，当前目标可提高到 18,688；4,096 描述符服务则可从 160 扩展到 320。已有流不会被切断，固定预留用于保护控制平面描述符。
 
 一个 TCP 流为 accepted socket、outbound socket 和两组各含两个 FD 的 splice pipe 记账。一个 UDP endpoint 按常见最坏所有权形态记账：relay socket、SOCKS5 控制流和 anyfrom reply socket。较小的 `RLIMIT_NOFILE` 值以相同的饱和算术缩放分区。
 
@@ -108,7 +108,7 @@ Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 i
 
 | 准入 | 上限 |
 | --- | ---: |
-| TCP 流 permit | 描述符导出的 floor；32,768 上限时为 1024，动态扩容最多到 2048 |
+| TCP 流 permit | 描述符导出的 floor；1,048,576 上限时为 16,384，借用空闲保留余量后可达 18,688 |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | 端口 53 入口 slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
@@ -152,7 +152,7 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 | Listener/数据路径 | `global.tproxy_port`、`global.tproxy_mark`、`global.tproxy_port_protect`、`global.pprof_port`、`global.so_mark_from_dae`、`global.lan_interface`、`global.wan_interface`、`global.auto_config_kernel_parameter` |
 | 进程状态 | `global.log_level`、`global.data_dir`、`global.store_subscribe` |
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
-| Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode` |
+| Clash API | `experimental.clash_api.external_controller`、`external_ui`、`external_ui_download_url`、`external_ui_download_detour`、`secret`、`default_mode` |
 | 持久化 | 任意 `experimental.cache_file` 变更 |
 | NFQUEUE | `global.nfqueue_enable` |
 
@@ -166,7 +166,7 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 
 ## Clash API 与 cache DB
 
-可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash mode，并可选持久化 DNS 答案。相对路径优先位于 `global.data_dir`，同时在切换期继续使用已有的配置目录相对旧数据库。配置与持久化语义见[实验性配置参考](../reference/experimental.md)。
+可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当 API 成功绑定，或任一配置组使用 `interrupt_connections` 时，才启用连接元数据，因此即使没有 API 也能在选择变化时中断连接。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash mode，并可选持久化 DNS 答案。相对路径优先位于 `global.data_dir`，同时在切换期继续使用已有的配置目录相对旧数据库。配置与持久化语义见[实验性配置参考](../reference/experimental.md)。
 
 ## 相关文档
 

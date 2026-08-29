@@ -77,7 +77,7 @@ Endpoint creation is transactional:
 5. Transfer the retained first packet, send it with `send_packet_confirmed`, and wait for its acknowledgement.
 6. Send sniff-retained fragments and untouched queue followers in FIFO order, then run steady send and receive paths.
 
-The transparent listener receive loop only validates, reserves, and enqueues; it never awaits `PacketTransport` I/O. The endpoint driver owns all transport calls. First and steady sends each have a five-second timeout. A timeout or error is ambiguous because the transport may have accepted part of the packet, so the driver never replays that datagram or advances to later followers.
+Each transparent socket consumes at most eight datagrams per readiness turn with `recvmmsg`. Every slot retains independent ORIGDST and PKTINFO metadata, packets remain in kernel order, and malformed metadata drops only that slot. After a drained queue, the next wake starts with one slot; a full read immediately reopens the eight-slot batch, avoiding sparse-traffic setup cost. The cap bounds scheduler fairness and payload storage to 512 KiB per socket, or 4 MiB across the current four sockets per family when both families are active. The listener loop only validates, reserves, and enqueues; it never awaits `PacketTransport` I/O. The endpoint driver owns all transport calls. First and steady sends each have a five-second timeout. A timeout or error is ambiguous because the transport may have accepted part of the packet, so the driver never replays that datagram or advances to later followers.
 
 SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the endpoint lifetime and treats control EOF or unexpected control data as endpoint failure. Its connected UDP socket sends to the physical server `BND.ADDR` relay, resolving a domain reply and replacing an unspecified address with the control peer IP. `PacketTransport::relay_addr()` and received source metadata expose the logical target instead, so endpoint first-reply validation does not confuse the SOCKS relay with the remote peer.
 
@@ -89,17 +89,17 @@ Reload advances a cancellation epoch before waiting. Initializers capture that e
 
 Each UDP flow retains at most 64 datagrams including its first packet. All flows share an exact 8 MiB payload-permit budget. Admission obtains per-flow slots and global byte permits before copying; FIFO saturation drops the newest datagram. NFQUEUE has a separate ingest actor bounded to 256 entries and 8 MiB of queued payload.
 
-At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 32,768. At that cap the fixed partition is:
+At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 1,048,576. At that cap the fixed partition is:
 
 | Owner | Capacity | Descriptor accounting |
 | --- | ---: | ---: |
 | Fixed/runtime reserve | 256 | 256 |
-| Accepted TCP flows | 1024 | 6 each = 6144 |
+| Accepted TCP flows | 16,384 | 6 each = 98,304 |
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
-| UDP endpoints | 7765 | 3 each = 23,295 |
-| **Total** |  | **32,767** |
-The remaining descriptor is partition-rounding slack. TCP starts with the descriptor-derived floor and elastically borrows idle non-TCP descriptor headroom up to twice that floor, while retaining half of the non-TCP budget as burst reserve; a 4,096-descriptor service can scale from 160 to 320 flow permits while that headroom is idle. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
+| UDP endpoints | 8192 | 3 each = 24,576 |
+| **Total** |  | **126,208** |
+The remaining descriptor headroom is deliberately unassigned: a high `RLIMIT_NOFILE` is not treated as proof of equivalent memory or scheduler capacity. TCP starts with a descriptor-derived fixed partition capped at 16,384 flows and elastically borrows idle non-TCP descriptor headroom while retaining half of the non-TCP budget as burst reserve. At the 1,048,576 cap that raises the current target to 18,688 when the reserved non-TCP owners are idle; a 4,096-descriptor service scales from 160 to 320. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
 
 A TCP flow budgets the accepted socket, outbound socket, and two two-FD splice pipes. A UDP endpoint budgets the worst common ownership shape: relay socket, SOCKS5 control stream, and anyfrom reply socket. Smaller `RLIMIT_NOFILE` values scale the same partition with saturating arithmetic.
 
@@ -107,7 +107,7 @@ Admission ceilings are distinct:
 
 | Admission | Ceiling |
 | --- | ---: |
-| TCP flow permits | Descriptor-derived floor; 1024 at the 32,768 cap, with elastic scaling up to 2048 |
+| TCP flow permits | Descriptor-derived floor; 16,384 at the 1,048,576 cap, reaching 18,688 from idle reserved headroom |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
@@ -151,7 +151,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Listener/datapath | `global.tproxy_port`, `global.tproxy_mark`, `global.tproxy_port_protect`, `global.pprof_port`, `global.so_mark_from_dae`, `global.lan_interface`, `global.wan_interface`, `global.auto_config_kernel_parameter` |
 | Process state | `global.log_level`, `global.data_dir`, `global.store_subscribe` |
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
-| Clash API | `experimental.clash_api.external_controller`, `external_ui`, `secret`, `default_mode` |
+| Clash API | `experimental.clash_api.external_controller`, `external_ui`, `external_ui_download_url`, `external_ui_download_detour`, `secret`, `default_mode` |
 | Persistence | Any `experimental.cache_file` change |
 | NFQUEUE | `global.nfqueue_enable` |
 
@@ -167,7 +167,7 @@ On `SIGHUP`, subscription IDs are stabilized by URL and active subscription node
 
 ## Clash API and cache DB
 
-The optional Clash-compatible axum server is a userspace view and mutation surface over the current config, group manager, mode/flags handle, connection tracker, DNS service, statistics, and outbound runtime pointer; endpoint details are in the [API reference](../reference/api.md). The optional SQLite `cachedb` is opened before datapath admission and persists Selector choices, Clash mode, and optionally DNS answers. Relative paths prefer `global.data_dir` while retaining an existing legacy config-relative database during cutover. Configuration and persistence semantics are in the [experimental reference](../reference/experimental.md).
+The optional Clash-compatible axum server is a userspace view and mutation surface over the current config, group manager, mode/flags handle, connection tracker, DNS service, statistics, and outbound runtime pointer; endpoint details are in the [API reference](../reference/api.md). Connection metadata is enabled when the API binds successfully or when any configured group uses `interrupt_connections`, so selection-change interruption works without the API. The optional SQLite `cachedb` is opened before datapath admission and persists Selector choices, Clash mode, and optionally DNS answers. Relative paths prefer `global.data_dir` while retaining an existing legacy config-relative database during cutover. Configuration and persistence semantics are in the [experimental reference](../reference/experimental.md).
 
 ## Related docs
 

@@ -512,7 +512,7 @@ impl StatsManager {
         let mut warm_ids = std::collections::HashSet::new();
         for runtime in generation.values() {
             let counts = runtime.warm_counts();
-            snap.add_protocol_counts(runtime.node.protocol, counts);
+            snap.add_protocol_counts(runtime.node.protocol(), counts);
             let bare =
                 pool.has_live_bare_entry(&format!("{}:{}", runtime.node.host(), runtime.node.port));
             // An unknown QUIC client count (map locked by an in-flight
@@ -1152,9 +1152,9 @@ mod tests {
         let node = honk_config::node::Node {
             id: uuid::Uuid::new_v4(),
             name: "ss".into(),
-            protocol: honk_config::types::NodeProtocol::SS,
             address: addr.to_string(),
             port: addr.port(),
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(Default::default()),
             ..Default::default()
         };
         let generation =
@@ -1210,9 +1210,9 @@ mod tests {
         let node = honk_config::node::Node {
             id: uuid::Uuid::new_v4(),
             name: "tuic".into(),
-            protocol: honk_config::types::NodeProtocol::Tuic,
             address: "127.0.0.1:443".into(),
             port: 443,
+            outbound: honk_config::node::OutboundConfig::Tuic(Default::default()),
             ..Default::default()
         };
         let generation =

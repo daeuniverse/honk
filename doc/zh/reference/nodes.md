@@ -46,7 +46,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `username` / `password` | string? | null | 来自 userinfo 的认证、UUID 或密钥 |
 | `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串 |
 | `vless_mode` | `WireMode` | `legacy` | `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 或 `mux-cool` |
-| `plugin` / `plugin_opts` | string? | null | SIP002 插件名称/参数（`plugin`、`plugin-opts`） |
+| `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，VLESS 历史默认开启 |
 | `sni` | string? | null | 来自 `sni` 或未被 transport 消耗的 `host` query 的 TLS 服务端名称 |
@@ -82,6 +82,10 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `created_at` / `updated_at` | datetime | now | 运行时元数据 |
 
 校验要求每个非内置节点名称非空，并且 `address` 或 `host` 至少一个非空。
+
+### 结构化 loader 兼容性
+
+TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所选 `protocol` 自己的字段；其他协议遗留的非默认字段会被剥离而不会拒绝节点，并由一条警告列出被剥离的字段名。例如，`ss` 节点上的 `tls: true` 会被忽略并告警，而不会开启 TLS。对 Trojan、VLESS、Hysteria2 与 AnyTLS，`username` 不是凭证别名；缺少该协议实际凭证字段时，单独提供的 `username` 会被剥离并触发针对性警告，从而保持旧版行为与 ID。所选协议实际使用的值仍会正常解析与校验。Honk 自身输出仍可安全 round-trip。启用 `store_subscribe` 时，原始订阅正文仅在解析成功后持久化；被拒绝的刷新不会覆盖上一份有效正文。
 
 ## 协议
 

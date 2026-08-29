@@ -115,15 +115,23 @@ pub async fn connect_marked(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    let ips = crate::bootstrap::resolve(host).await?;
-    let mut last_err = None;
-    for ip in ips {
-        match connect_marked_addr(SocketAddr::new(ip, port), mark, connect_timeout).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no address")))
+    let addrs: Vec<_> = crate::bootstrap::resolve(host)
+        .await?
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    // Address fallback stays inside one authoritative node; policy selection
+    // and its dial-admission accounting remain unchanged.
+    crate::address_race::race_resolved_addrs(&addrs, |addr| {
+        connect_marked_addr(addr, mark, connect_timeout)
+    })
+    .await
+    .unwrap_or_else(|| {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no address",
+        ))
+    })
 }
 
 /// Connect to a proxy server from the control plane, bypassing eBPF re-routing.

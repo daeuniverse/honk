@@ -190,6 +190,10 @@ pub struct MockEbpfBackend {
     pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub routing_meta_write_order: Vec<u32>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
+    #[cfg(feature = "reload-bench-counters")]
+    routing_map_writes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "reload-bench-counters")]
+    outbound_alive_writes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent allocator state; cleanup intentionally leaves this intact.
     pub udp_decision_sequence_next: u32,
     pub udp_decision_sequence_generation: u32,
@@ -214,6 +218,32 @@ impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(feature = "reload-bench-counters")]
+    pub fn routing_map_write_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.routing_map_writes)
+    }
+
+    #[cfg(feature = "reload-bench-counters")]
+    pub fn outbound_alive_write_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.outbound_alive_writes)
+    }
+
+    #[inline]
+    fn count_routing_writes(&self, count: u64) {
+        #[cfg(feature = "reload-bench-counters")]
+        self.routing_map_writes
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "reload-bench-counters"))]
+        let _ = count;
+    }
+
+    #[inline]
+    fn count_outbound_alive_write(&self) {
+        #[cfg(feature = "reload-bench-counters")]
+        self.outbound_alive_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -710,6 +740,7 @@ impl EbpfBackend for MockEbpfBackend {
         for (i, rule) in rules.iter().enumerate() {
             self.routing_map.insert(base + i as u32, *rule);
         }
+        self.count_routing_writes(rules.len() as u64);
         Ok(())
     }
 
@@ -764,6 +795,9 @@ impl EbpfBackend for MockEbpfBackend {
             .push(ROUTING_META_ACTIVE_GENERATION_SLOT);
         self.routing_publication_order
             .push(MockRoutingPublicationWrite::Selector(generation));
+        self.count_routing_writes(
+            (ROUTING_GROUP_COUNT * ROUTING_GROUP_BITMAP_WORDS + ROUTING_GROUP_COUNT + 2) as u64,
+        );
         Ok(())
     }
 
@@ -780,6 +814,7 @@ impl EbpfBackend for MockEbpfBackend {
     ) -> anyhow::Result<()> {
         let bitmap = self.bitmap_for_active_generation(bitmap);
         Self::or_bitmap(&mut self.domain_routing_bitmap, key, &bitmap);
+        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -792,6 +827,7 @@ impl EbpfBackend for MockEbpfBackend {
         // reach the backend.
         self.dest_lpm_bitmap
             .insert(Self::lpm_key_bytes(key), *bitmap);
+        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -803,6 +839,7 @@ impl EbpfBackend for MockEbpfBackend {
         self.take_routing_fault(RoutingPushPhase::SourceLpm)?;
         self.source_lpm_bitmap
             .insert(Self::lpm_key_bytes(key), *bitmap);
+        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -810,6 +847,7 @@ impl EbpfBackend for MockEbpfBackend {
         self.take_routing_fault(RoutingPushPhase::MacLpm)?;
         self.mac_lpm_bitmap
             .insert(Self::lpm_key_bytes(key), *bitmap);
+        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -825,6 +863,7 @@ impl EbpfBackend for MockEbpfBackend {
         }
         let bitmap = self.bitmap_for_active_generation(bitmap);
         Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, &bitmap);
+        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -839,6 +878,7 @@ impl EbpfBackend for MockEbpfBackend {
         let bitmap =
             self.replace_active_bitmap(self.domain_routing_bitmap.get(&key).copied(), bitmap);
         self.domain_routing_bitmap.insert(key, bitmap);
+        self.count_routing_writes(1);
         Ok(())
     }
     fn remove_domain_ip_bitmap(
@@ -859,6 +899,7 @@ impl EbpfBackend for MockEbpfBackend {
         } else {
             self.domain_routing_bitmap.insert(key, bitmap);
         }
+        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -873,6 +914,7 @@ impl EbpfBackend for MockEbpfBackend {
             "invalid routing generation {generation}"
         );
         let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        let entries_before = self.domain_routing_bitmap.len();
         for bitmap in self.domain_routing_bitmap.values_mut() {
             bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
         }
@@ -884,6 +926,7 @@ impl EbpfBackend for MockEbpfBackend {
             bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
                 .copy_from_slice(&logical.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
         }
+        self.count_routing_writes((entries_before + entries.len()) as u64);
         Ok(())
     }
 
@@ -912,10 +955,15 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn prune_lpm_entries(&mut self, keep: &LpmKeepSet) -> anyhow::Result<()> {
         self.take_routing_fault(RoutingPushPhase::PruneLpm)?;
+        let entries_before =
+            self.dest_lpm_bitmap.len() + self.source_lpm_bitmap.len() + self.mac_lpm_bitmap.len();
         self.dest_lpm_bitmap.retain(|k, _| keep.dest.contains(k));
         self.source_lpm_bitmap
             .retain(|k, _| keep.source.contains(k));
         self.mac_lpm_bitmap.retain(|k, _| keep.mac.contains(k));
+        let entries_after =
+            self.dest_lpm_bitmap.len() + self.source_lpm_bitmap.len() + self.mac_lpm_bitmap.len();
+        self.count_routing_writes((entries_before - entries_after) as u64);
         Ok(())
     }
 
@@ -1160,6 +1208,7 @@ impl EbpfBackend for MockEbpfBackend {
             .wrapping_mul(6)
             .wrapping_add(domain.wrapping_mul(2))
             .wrapping_add(ipver);
+        self.count_outbound_alive_write();
         self.outbound_alive.insert(key, if alive { 1 } else { 0 });
         Ok(())
     }

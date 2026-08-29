@@ -1,0 +1,94 @@
+name: Reload benchmark
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/honk-config/**"
+      - "crates/honk-core/**"
+      - "crates/honk-outbound/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/reload-benchmark.yml"
+      - "ci/compare-reload-benchmark.py"
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          path: candidate
+      - name: Check out main baseline
+        uses: actions/checkout@v7
+        with:
+          path: baseline
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies and geo assets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+          sudo mkdir -p /etc/dae
+          sudo curl -fsSL --retry 3 -o /etc/dae/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -fsSL --retry 3 -o /etc/dae/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+      - name: Install the candidate harness into main
+        run: |
+          cp candidate/crates/honk-core/benches/reload.rs baseline/crates/honk-core/benches/reload.rs
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("baseline/crates/honk-core/Cargo.toml")
+          text = manifest.read_text()
+          if "reload-bench = []" not in text:
+              text = text.replace(
+                  "dns-bench = []",
+                  'dns-bench = []\nreload-bench = []\nreload-alloc-bench = ["reload-bench"]\nreload-bench-counters = ["reload-bench"]',
+              )
+          if 'name = "reload"' not in text:
+              text += '\n[[bench]]\nname = "reload"\nharness = false\nrequired-features = ["reload-bench"]\n'
+          if 'path = "src/main.rs"\nbench = false' not in text:
+              text = text.replace('path = "src/main.rs"', 'path = "src/main.rs"\nbench = false')
+          manifest.write_text(text)
+          PY
+      - name: Benchmark main
+        run: |
+          cd baseline
+          HONK_RELOAD_EXPECT_NOOP=0 \
+          HONK_RELOAD_METRICS_ONLY=1 \
+          CARGO_TARGET_DIR="$RUNNER_TEMP/reload-main-target" \
+            cargo bench -p honk-core --bench reload --no-default-features \
+              --features reload-bench,reload-alloc-bench -- --noplot 2>&1 \
+            | tee ../main-reload.log
+      - name: Benchmark candidate
+        run: |
+          cd candidate
+          HONK_RELOAD_METRICS_ONLY=1 \
+          CARGO_TARGET_DIR="$RUNNER_TEMP/reload-candidate-target" \
+            cargo bench -p honk-core --bench reload --no-default-features \
+              --features reload-bench-counters,reload-alloc-bench -- --noplot 2>&1 \
+            | tee ../candidate-reload.log
+      - name: Compare candidate with main
+        run: |
+          candidate/ci/compare-reload-benchmark.py \
+            main-reload.log candidate-reload.log
+      - name: Upload raw benchmark output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reload-benchmark-${{ github.run_id }}
+          path: |
+            main-reload.log
+            candidate-reload.log

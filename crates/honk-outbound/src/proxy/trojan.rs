@@ -69,7 +69,7 @@ impl TcpOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.password.as_deref().unwrap_or("");
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain);
         let mut stream = Self::connect_server(node, connect_timeout).await?;
         stream.write_all(&header).await?;
@@ -88,7 +88,7 @@ impl TcpOutbound for TrojanHandler {
         tcp: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.password.as_deref().unwrap_or("");
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain);
         let mut stream = Self::maybe_tls_wrap(node, tcp).await?;
         stream.write_all(&header).await?;
@@ -112,10 +112,10 @@ impl PacketOutbound for TrojanHandler {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!(
                 "Trojan UDP: node network {:?} does not include \"udp\"",
-                node.network
+                node.network()
             );
         }
-        let password = node.password.as_deref().unwrap_or("");
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let mut control = Self::connect_server(node, connect_timeout).await?;
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
         header.extend_from_slice(hex_sha224(password).as_bytes());
@@ -215,18 +215,18 @@ mod tests {
             crate::descriptor::descriptor(NodeProtocol::Trojan).pool_ready_streams;
         let mut node = Node {
             name: "t".into(),
-            protocol: NodeProtocol::Trojan,
             address: "127.0.0.1".into(),
             port: 443,
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
             ..Default::default()
         };
-        node.transport = String::new();
+        node.transport_mut().unwrap().transport.clear();
         assert!(pool_ready_streams(&node));
-        node.transport = "tcp".into();
+        node.transport_mut().unwrap().transport = "tcp".into();
         assert!(pool_ready_streams(&node));
-        node.transport = "ws".into();
+        node.transport_mut().unwrap().transport = "ws".into();
         assert!(!pool_ready_streams(&node));
-        node.transport = "grpc".into();
+        node.transport_mut().unwrap().transport = "grpc".into();
         assert!(!pool_ready_streams(&node));
     }
 }

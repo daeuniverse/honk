@@ -1,14 +1,17 @@
-//! Protocol-level tests for DNS transports (UDP/TCP/DoT/DoH).
+//! Protocol-level tests for DNS transports.
 //!
-//! Local mock servers exercise the real wire formats. DoQ/DoH3 require a
-//! full QUIC stack on both sides; their construction and endpoint parsing
-//! are covered in unit tests, with optional network e2e gated separately.
+//! Local mock servers exercise the real UDP, TCP, TLS, HTTP/2, QUIC, and
+//! HTTP/3 wire paths.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use bytes::{Buf, Bytes};
 use honk_config::dns::DnsUpstream;
-use honk_config::types::DnsProtocol;
+use honk_config::node::Node;
+use honk_config::types::{DnsProtocol, NodeProtocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
@@ -18,9 +21,10 @@ use tokio_rustls::rustls::{self, ServerConfig};
 use crate::dns::endpoint::DnsEndpoint;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query, parse_dns_question};
 use crate::dns::routing::DnsRouter;
-use crate::dns::transport::{DialContext, DohClient, DotPool, TcpPool};
+use crate::dns::transport::{DialContext, DohClient, DotPool, ProxyDial, TcpPool};
 use crate::dns::upstream_pool::UpstreamPool;
 use crate::dns::{DnsResolver, cache::DnsCache};
+use crate::proxy::{PacketOutbound, PacketTransport, ProtocolEntry, ProxyStream, TcpOutbound};
 
 fn mock_dns_response(txid: u16) -> Vec<u8> {
     vec![
@@ -120,6 +124,246 @@ fn self_signed_server_config() -> (ServerConfig, rustls::RootCertStore) {
         .expect("server config");
     cfg.alpn_protocols = vec![b"dot".to_vec(), b"h2".to_vec()];
     (cfg, roots)
+}
+
+#[derive(Debug)]
+struct TrackedUdpTransport {
+    socket: UdpSocket,
+    remote: SocketAddr,
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for TrackedUdpTransport {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl PacketTransport for TrackedUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.remote
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.socket.send(data).await?;
+        Ok(())
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        Ok((self.socket.recv(buf).await?, self.remote))
+    }
+}
+
+#[derive(Debug)]
+struct TestPacketHandler {
+    active: Arc<AtomicUsize>,
+    runtime_dials: Arc<AtomicUsize>,
+}
+
+impl TestPacketHandler {
+    async fn open(&self, target: SocketAddr) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let bind = if target.is_ipv4() {
+            "127.0.0.1:0"
+        } else {
+            "[::1]:0"
+        };
+        let socket = UdpSocket::bind(bind).await?;
+        socket.connect(target).await?;
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(TrackedUdpTransport {
+            socket,
+            remote: target,
+            active: Arc::clone(&self.active),
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl TcpOutbound for TestPacketHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("test handler has no TCP capability")
+    }
+}
+
+#[async_trait::async_trait]
+impl PacketOutbound for TestPacketHandler {
+    async fn dial_udp_transport(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        anyhow::bail!("unpinned packet dial")
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<honk_outbound::runtime::NodeRuntime>,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        assert_eq!(runtime.node.protocol(), NodeProtocol::Socks5);
+        self.runtime_dials.fetch_add(1, Ordering::SeqCst);
+        self.open(target).await
+    }
+}
+
+pub(super) struct ProxiedQuicFixture {
+    pub(super) dial: DialContext,
+    pub(super) active: Arc<AtomicUsize>,
+    pub(super) runtime_dials: Arc<AtomicUsize>,
+}
+
+pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture {
+    let active = Arc::new(AtomicUsize::new(0));
+    let runtime_dials = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(TestPacketHandler {
+        active: Arc::clone(&active),
+        runtime_dials: Arc::clone(&runtime_dials),
+    });
+    let mut registry = crate::proxy::ProxyRegistry::new();
+    registry.register(
+        ProtocolEntry::new(NodeProtocol::Socks5, Arc::clone(&handler))
+            .with_packet(Arc::clone(&handler)),
+    );
+    let node = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "packet-proxy".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+        address: "127.0.0.1:1".into(),
+        host: "127.0.0.1".into(),
+        port: 1,
+        ..Default::default()
+    };
+    let generation = Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap(),
+    );
+    ProxiedQuicFixture {
+        dial: DialContext {
+            endpoint,
+            query_timeout: Duration::from_secs(2),
+            dial_timeout: Duration::from_secs(2),
+            proxy: Some(ProxyDial {
+                registry: Arc::new(registry),
+                generation: Some(generation),
+                node,
+            }),
+        },
+        active,
+        runtime_dials,
+    }
+}
+
+pub(super) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
+    honk_outbound::quic::client_config(
+        &Node {
+            outbound: honk_config::node::OutboundConfig::Hysteria2(
+                honk_config::node::Hysteria2Config {
+                    quic: honk_config::node::QuicOptions {
+                        tls: honk_config::node::TlsOptions {
+                            skip_cert_verify: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        },
+        &[alpn],
+        honk_outbound::quic::QuicClientOptions::default(),
+    )
+    .await
+    .unwrap()
+}
+
+fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
+    ensure_crypto_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut tls =
+        ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.cert)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())),
+            )
+            .unwrap();
+    tls.alpn_protocols = vec![alpn.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+    let endpoint = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let address = endpoint.local_addr().unwrap();
+    (endpoint, address)
+}
+
+pub(super) fn spawn_doq_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let (endpoint, address) = quic_server_endpoint(b"doq");
+    let task = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        for _ in 0..2 {
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut length = [0; 2];
+            recv.read_exact(&mut length).await.unwrap();
+            let mut query = vec![0; u16::from_be_bytes(length) as usize];
+            recv.read_exact(&mut query).await.unwrap();
+            let response = mock_dns_response(0);
+            send.write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            send.write_all(&response).await.unwrap();
+            send.finish().unwrap();
+        }
+        connection.closed().await;
+    });
+    (address, task)
+}
+
+pub(super) fn spawn_doh3_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let (endpoint, address) = quic_server_endpoint(b"h3");
+    let task = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let mut h3 = h3::server::builder()
+            .build(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let resolver = h3.accept().await.unwrap().unwrap();
+            let (_request, mut stream) = resolver.resolve_request().await.unwrap();
+            while let Some(mut data) = stream.recv_data().await.unwrap() {
+                while data.has_remaining() {
+                    let length = data.chunk().len();
+                    data.advance(length);
+                }
+            }
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+            stream
+                .send_data(Bytes::from(mock_dns_response(0)))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+        }
+        connection.closed().await;
+    });
+    (address, task)
 }
 
 async fn serve_length_prefixed_dns(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) {
@@ -645,23 +889,25 @@ async fn live_google_doh_request_path() {
 async fn doq_doh3_clients_construct() {
     let ep = DnsEndpoint::parse("127.0.0.1", DnsProtocol::Quic, Some("localhost")).unwrap();
     assert!(
-        crate::dns::transport::DoqClient::new(
-            ep.clone(),
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        )
+        crate::dns::transport::DoqClient::new(DialContext {
+            endpoint: ep,
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_secs(2),
+            proxy: None,
+        })
         .await
         .is_ok()
     );
     let ep3 =
         DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::H3, Some("localhost")).unwrap();
     assert!(
-        crate::dns::transport::Doh3Client::new(
-            ep3,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        )
-            .await
-            .is_ok()
+        crate::dns::transport::Doh3Client::new(DialContext {
+            endpoint: ep3,
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_secs(2),
+            proxy: None,
+        })
+        .await
+        .is_ok()
     );
 }

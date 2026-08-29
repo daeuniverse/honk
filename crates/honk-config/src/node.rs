@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+mod protocol;
+mod wire;
+
+pub use protocol::*;
+
 /// Deserialize a group-tag list from either an array (`["hk", "jp"]`) or a
 /// single delimited string (`"hk|jp"` / `"hk, jp"`). Entries themselves may
 /// also contain `,` or `|` separators.
@@ -79,179 +84,29 @@ impl std::str::FromStr for WireMode {
     }
 }
 
-/// A proxy node definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A proxy node definition. Protocol-specific state lives in [`OutboundConfig`];
+/// the outer node carries only identity, endpoint, and provenance shared by all
+/// outbounds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     /// Stable identity derived from the node's content by [`Node::derive_id`]
     /// at every construction entry (nil until then — the runtime registry
     /// rejects nil IDs, so a missed entry fails loudly).
-    #[serde(default)]
     pub id: uuid::Uuid,
     pub name: String,
-    pub protocol: NodeProtocol,
     pub address: String,
-    #[serde(default)]
     pub host: String,
     pub port: u16,
-    /// Username / password / UUID for auth
-    #[serde(default)]
-    pub username: Option<String>,
-    /// Password / UUID for auth
-    #[serde(default)]
-    pub password: Option<String>,
-    /// Protocol encryption/cipher setting (SS, VMess, or VLESS Encryption)
-    #[serde(default)]
-    pub encryption: Option<String>,
-    /// VLESS TCP/UDP multiplexing mode.
-    #[serde(default)]
-    pub vless_mode: WireMode,
-    #[serde(default)]
-    pub plugin: Option<String>,
-    #[serde(default)]
-    pub plugin_opts: Option<String>,
-    /// Transport protocol (tcp/udp/ws/grpc etc.)
-    #[serde(default = "default_transport")]
-    pub transport: String,
-    #[serde(default)]
-    pub tls: bool,
-    /// TLS server name (SNI)
-    #[serde(default)]
-    pub sni: Option<String>,
-    /// Skip certificate verification
-    #[serde(default)]
-    pub skip_cert_verify: bool,
-    /// Enable ECH (Encrypted Client Hello) for TLS/QUIC handshakes
-    #[serde(default)]
-    pub ech_enabled: bool,
-    /// Base64-encoded ECHConfigList; implies ech_enabled when set
-    #[serde(default)]
-    pub ech_config: Option<String>,
-    /// Path to a file containing a base64-encoded ECHConfigList
-    #[serde(default)]
-    pub ech_config_path: Option<String>,
-    /// REALITY public key (share-link `pbk`); selects the REALITY handshake
-    #[serde(default)]
-    pub reality_public_key: Option<String>,
-    /// REALITY short id (share-link `sid`)
-    #[serde(default)]
-    pub reality_short_id: Option<String>,
-    /// REALITY spider path (share-link `spx`, share-link default `/`)
-    #[serde(default)]
-    pub reality_spider_x: Option<String>,
-    /// VLESS flow control; only `xtls-rprx-vision` is supported and it
-    /// requires REALITY or TLS (enforced by `Config::validate`)
-    #[serde(default)]
-    pub flow: Option<String>,
-    /// Network type for V2Ray (tcp/ws/grpc/h2/quic/kcp)
-    #[serde(default)]
-    pub network: Option<String>,
-    /// WebSocket path
-    #[serde(default)]
-    pub ws_path: Option<String>,
-    /// WebSocket host header
-    #[serde(default)]
-    pub ws_host: Option<String>,
-    /// gRPC service name
-    #[serde(default)]
-    pub grpc_service: Option<String>,
-    /// Hysteria2 authentication
-    #[serde(default)]
-    pub hy2_auth: Option<String>,
-    /// Hysteria2 obfuscation
-    #[serde(default)]
-    pub hy2_obfs: Option<String>,
-    /// Hysteria2 upload bandwidth in Mbps; enables the brutal sender when set
-    #[serde(default)]
-    pub hy2_up_mbps: Option<u32>,
-    /// Hysteria2 download bandwidth in Mbps (advertised via `Hysteria-CC-RX`)
-    #[serde(default)]
-    pub hy2_down_mbps: Option<u32>,
-    /// Hysteria2 port hopping list (`mport`: "20000-30000" or "p1,p2,...")
-    #[serde(default)]
-    pub hy2_port_hopping: Option<String>,
-    /// Hysteria2 port hopping interval in seconds (`mhop`, default 30)
-    #[serde(default)]
-    pub hy2_hop_interval: Option<u64>,
-    /// SHA-256 fingerprint of the peer leaf certificate (hex); replaces PKI
-    /// and hostname verification when set (`pinSHA256`)
-    #[serde(default)]
-    pub tls_pin_sha256: Option<String>,
-    /// Hysteria2 initial stream receive window in bytes
-    /// (`initStreamReceiveWindow`)
-    #[serde(default)]
-    pub hy2_init_stream_recv_window: Option<u64>,
-    /// Hysteria2 initial connection receive window in bytes
-    /// (`initConnReceiveWindow`)
-    #[serde(default)]
-    pub hy2_init_conn_recv_window: Option<u64>,
-    /// Hysteria2: disable QUIC path MTU discovery (`disablePathMTUDiscovery`)
-    #[serde(default)]
-    pub hy2_disable_mtu_discovery: Option<bool>,
-    /// QUIC protocols (hy2/tuic/juicity): UDP **payload** size in bytes
-    /// (share-link `mtu=`, valid range 1200..=65527, clamped). Applied to
-    /// the send-side initial MTU, the PMTUD upper bound, and the endpoint's
-    /// receive advertisement — it is NOT the link/IP MTU (IPv4 payload on
-    /// a 1500 link is 1472; on PMTU-unsafe last miles keep the 1252
-    /// default).
-    #[serde(default)]
-    pub quic_mtu: Option<u16>,
-    /// TUIC UUID
-    #[serde(default)]
-    pub tuic_uuid: Option<String>,
-    /// TUIC password
-    #[serde(default)]
-    pub tuic_password: Option<String>,
-    /// TUIC congestion control
-    #[serde(default)]
-    pub tuic_congestion: Option<String>,
-    /// TUIC ALPN (share-link `alpn=`; comma-separated for multiple).
-    /// Defaults to `tuic` when unset — servers configured with e.g. `h3`
-    /// (HTTP/3 camouflage) reject the handshake otherwise.
-    #[serde(default)]
-    pub tuic_alpn: Option<String>,
-    /// TUIC: initial per-stream receive window (`initStreamReceiveWindow`).
-    /// quinn's default (1.25MB) caps a stream at ~12.5MB/s per 100ms RTT —
-    /// far too small for long-fat links; unset uses honk's larger default.
-    #[serde(default)]
-    pub tuic_init_stream_recv_window: Option<u64>,
-    /// TUIC: initial connection-level receive window (`initConnReceiveWindow`).
-    #[serde(default)]
-    pub tuic_init_conn_recv_window: Option<u64>,
-    /// Juicity UUID
-    #[serde(default)]
-    pub juicity_uuid: Option<String>,
-    /// Juicity password
-    #[serde(default)]
-    pub juicity_password: Option<String>,
-    /// AnyTLS password
-    #[serde(default)]
-    pub anytls_password: Option<String>,
-    /// Minimum idle AnyTLS sessions to maintain per node.
-    #[serde(default)]
-    pub anytls_min_idle_session: Option<usize>,
-    /// Seconds between AnyTLS idle session heartbeat checks.
-    #[serde(default)]
-    pub anytls_idle_session_check_interval: Option<u64>,
-    /// Seconds before an idle AnyTLS session is evicted.
-    #[serde(default)]
-    pub anytls_idle_session_timeout: Option<u64>,
-    /// Outbound mark for routing
-    #[serde(default)]
+    pub outbound: OutboundConfig,
     pub mark: Option<u32>,
-    /// Tags for classification
-    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
     pub subscription_id: Option<uuid::Uuid>,
-    #[serde(default)]
     pub group_id: Option<uuid::Uuid>,
-    #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    #[serde(default = "chrono::Utc::now")]
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn default_transport() -> String {
+pub(super) fn default_transport() -> String {
     "tcp".to_string()
 }
 
@@ -260,54 +115,10 @@ impl Default for Node {
         Self {
             id: uuid::Uuid::nil(),
             name: String::new(),
-            protocol: NodeProtocol::default(),
             address: String::new(),
             host: String::new(),
             port: 0,
-            username: None,
-            password: None,
-            encryption: None,
-            vless_mode: WireMode::default(),
-            plugin: None,
-            plugin_opts: None,
-            transport: default_transport(),
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            ech_enabled: false,
-            ech_config: None,
-            ech_config_path: None,
-            reality_public_key: None,
-            reality_short_id: None,
-            reality_spider_x: None,
-            flow: None,
-            network: None,
-            ws_path: None,
-            ws_host: None,
-            grpc_service: None,
-            hy2_auth: None,
-            hy2_obfs: None,
-            hy2_up_mbps: None,
-            hy2_down_mbps: None,
-            hy2_port_hopping: None,
-            hy2_hop_interval: None,
-            tls_pin_sha256: None,
-            hy2_init_stream_recv_window: None,
-            hy2_init_conn_recv_window: None,
-            hy2_disable_mtu_discovery: None,
-            quic_mtu: None,
-            tuic_uuid: None,
-            tuic_password: None,
-            tuic_congestion: None,
-            tuic_alpn: None,
-            tuic_init_stream_recv_window: None,
-            tuic_init_conn_recv_window: None,
-            juicity_uuid: None,
-            juicity_password: None,
-            anytls_password: None,
-            anytls_min_idle_session: None,
-            anytls_idle_session_check_interval: None,
-            anytls_idle_session_timeout: None,
+            outbound: OutboundConfig::default(),
             mark: None,
             tags: Vec::new(),
             subscription_id: None,
@@ -319,6 +130,10 @@ impl Default for Node {
 }
 
 impl Node {
+    pub fn protocol(&self) -> NodeProtocol {
+        self.outbound.protocol()
+    }
+
     /// Get the effective host (use host field or parse from address).
     pub fn host(&self) -> &str {
         if self.host.is_empty() {
@@ -327,132 +142,173 @@ impl Node {
             &self.host
         }
     }
-    pub fn validate_vless_mode(&self) -> Result<(), crate::ConfigError> {
-        if self.vless_mode == WireMode::Legacy {
-            return Ok(());
+
+    pub fn shadowsocks(&self) -> Option<&ShadowsocksConfig> {
+        match &self.outbound {
+            OutboundConfig::Shadowsocks(config) => Some(config),
+            _ => None,
         }
-        if self.protocol != NodeProtocol::VLess {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{}' sets a VLESS mode on a non-VLESS protocol",
-                self.name
-            )));
+    }
+
+    pub fn shadowsocks_mut(&mut self) -> Option<&mut ShadowsocksConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Shadowsocks(config) => Some(config),
+            _ => None,
         }
-        if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
-            && !(self.vless_mode == WireMode::Xudp && flow == "xtls-rprx-vision")
-        {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{}' combines VLESS mode '{}' with flow; this combination is unsupported",
-                self.name,
-                self.vless_mode.as_str()
-            )));
+    }
+
+    pub fn socks5(&self) -> Option<&Socks5Config> {
+        match &self.outbound {
+            OutboundConfig::Socks5(config) => Some(config),
+            _ => None,
         }
-        if self
-            .encryption
-            .as_deref()
-            .is_some_and(|value| !value.is_empty() && value != "none")
-        {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{}' combines VLESS mode '{}' with VLESS Encryption; this combination is unsupported",
-                self.name,
-                self.vless_mode.as_str()
-            )));
+    }
+
+    pub fn socks5_mut(&mut self) -> Option<&mut Socks5Config> {
+        match &mut self.outbound {
+            OutboundConfig::Socks5(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn trojan(&self) -> Option<&TrojanConfig> {
+        match &self.outbound {
+            OutboundConfig::Trojan(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn trojan_mut(&mut self) -> Option<&mut TrojanConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Trojan(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn vmess(&self) -> Option<&VmessConfig> {
+        match &self.outbound {
+            OutboundConfig::Vmess(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn vmess_mut(&mut self) -> Option<&mut VmessConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Vmess(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn vless(&self) -> Option<&VlessConfig> {
+        self.outbound.vless()
+    }
+
+    pub fn vless_mut(&mut self) -> Option<&mut VlessConfig> {
+        self.outbound.vless_mut()
+    }
+
+    pub fn hysteria2(&self) -> Option<&Hysteria2Config> {
+        match &self.outbound {
+            OutboundConfig::Hysteria2(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn hysteria2_mut(&mut self) -> Option<&mut Hysteria2Config> {
+        match &mut self.outbound {
+            OutboundConfig::Hysteria2(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn tuic(&self) -> Option<&TuicConfig> {
+        match &self.outbound {
+            OutboundConfig::Tuic(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn tuic_mut(&mut self) -> Option<&mut TuicConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Tuic(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn juicity(&self) -> Option<&JuicityConfig> {
+        match &self.outbound {
+            OutboundConfig::Juicity(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn juicity_mut(&mut self) -> Option<&mut JuicityConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Juicity(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn anytls(&self) -> Option<&AnyTlsConfig> {
+        match &self.outbound {
+            OutboundConfig::AnyTls(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn anytls_mut(&mut self) -> Option<&mut AnyTlsConfig> {
+        match &mut self.outbound {
+            OutboundConfig::AnyTls(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn tls(&self) -> Option<&TlsOptions> {
+        self.outbound.tls()
+    }
+
+    pub fn tls_mut(&mut self) -> Option<&mut TlsOptions> {
+        self.outbound.tls_mut()
+    }
+
+    pub fn transport(&self) -> Option<&StreamTransportOptions> {
+        self.outbound.transport()
+    }
+
+    pub fn transport_mut(&mut self) -> Option<&mut StreamTransportOptions> {
+        self.outbound.transport_mut()
+    }
+
+    pub fn network(&self) -> Option<&str> {
+        self.outbound.network()
+    }
+
+    pub fn validate_protocol(&self) -> Result<(), crate::ConfigError> {
+        if let Some(config) = self.vless() {
+            config.validate(&self.name)?;
         }
         Ok(())
     }
 
     /// Content-derived stable identity: UUID v5 over
-    /// `protocol|host|port|credential-fingerprint|dial-shape`. The same
-    /// node config keeps its ID across reloads and subscription refreshes
-    /// (health state, latency history, and session pools survive); renaming
-    /// a node does NOT change the ID — identity is the dialable endpoint,
-    /// not the label. Dial shape covers SNI, transport, obfs, the
-    /// REALITY/flow handshake shape, and non-legacy VLESS modes;
-    /// validation and tuning knobs are excluded.
+    /// `protocol|host|port|credential-fingerprint|dial-shape`.
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = format!(
             "{}|{}|{}|{}|{}",
-            self.protocol.as_str(),
+            self.protocol().as_str(),
             self.host(),
             self.port,
-            self.credential_fingerprint(),
-            self.dial_shape_fingerprint()
+            self.outbound.credential_fingerprint(),
+            self.outbound.dial_shape_fingerprint()
         );
         uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes())
-    }
-
-    fn dial_shape_fingerprint(&self) -> String {
-        let mut fingerprint = [
-            self.sni.as_deref().unwrap_or(""),
-            self.transport.as_str(),
-            self.ws_path.as_deref().unwrap_or(""),
-            self.ws_host.as_deref().unwrap_or(""),
-            self.grpc_service.as_deref().unwrap_or(""),
-            self.hy2_obfs.as_deref().unwrap_or(""),
-            self.reality_public_key.as_deref().unwrap_or(""),
-            self.reality_short_id.as_deref().unwrap_or(""),
-            self.reality_spider_x.as_deref().unwrap_or(""),
-            self.flow.as_deref().unwrap_or(""),
-        ]
-        .join("|");
-        if self.protocol == NodeProtocol::VLess && self.vless_mode != WireMode::Legacy {
-            fingerprint.push('|');
-            fingerprint.push_str(self.vless_mode.as_str());
-        }
-        fingerprint
-    }
-
-    /// The protocol's credential identity, resolved the same way the
-    /// protocol handlers resolve their auth fields (specific field first,
-    /// generic `username`/`password` fallback). Empty for protocols
-    /// without credentials (direct/block, unauthenticated socks5).
-    fn credential_fingerprint(&self) -> String {
-        let user = self.username.as_deref().unwrap_or("");
-        let pass = self.password.as_deref().unwrap_or("");
-        match self.protocol {
-            NodeProtocol::SS => {
-                format!("{}|{}", self.encryption.as_deref().unwrap_or(""), pass)
-            }
-            NodeProtocol::Trojan | NodeProtocol::VMess => pass.to_string(),
-            NodeProtocol::VLess
-                if self
-                    .encryption
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty() && value != "none") =>
-            {
-                format!(
-                    "{}|{}",
-                    self.encryption.as_deref().unwrap_or_default(),
-                    pass
-                )
-            }
-            NodeProtocol::VLess => pass.to_string(),
-            NodeProtocol::Socks5 => format!("{user}|{pass}"),
-            NodeProtocol::Hysteria2 => self.hy2_auth.as_deref().unwrap_or(pass).to_string(),
-            NodeProtocol::Tuic => format!(
-                "{}|{}",
-                self.tuic_uuid.as_deref().unwrap_or(user),
-                self.tuic_password.as_deref().unwrap_or(pass)
-            ),
-            NodeProtocol::Juicity => format!(
-                "{}|{}",
-                self.juicity_uuid.as_deref().unwrap_or(user),
-                self.juicity_password.as_deref().unwrap_or(pass)
-            ),
-            NodeProtocol::AnyTLS => self
-                .password
-                .as_deref()
-                .or(self.anytls_password.as_deref())
-                .unwrap_or("")
-                .to_string(),
-            NodeProtocol::Direct | NodeProtocol::Block => String::new(),
-        }
     }
 }
 
 /// A group of nodes for load balancing / failover.
 ///
 /// Modeled after sing-box's outbound groups, plus the built-in Score policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
@@ -603,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_vless_mode_serde_and_default() {
-        assert_eq!(Node::default().vless_mode, WireMode::Legacy);
+        assert_eq!(Node::default().vless(), None);
         for (value, mode) in [
             ("legacy", WireMode::Legacy),
             ("uot-v2", WireMode::UotV2),
@@ -628,16 +484,93 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_identity_goldens() {
+        let cases = [
+            (
+                "ss",
+                "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#ss",
+                "e4a92538-53a2-5f83-85cd-b5d11f90361b",
+            ),
+            (
+                "socks5",
+                "socks5://user:pass@1.2.3.4:1080#socks5",
+                "4257ffb1-f1ac-5838-b020-fe5c08dc99f8",
+            ),
+            (
+                "trojan",
+                "trojan://secret@example.com:443#trojan",
+                "6b92dad3-62ea-5dcd-a71f-fd67105ccfe1",
+            ),
+            (
+                "vmess",
+                "vmess://eyJwcyI6InZtZXNzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoidGxzIn0",
+                "263e811a-31e9-572f-bb87-66f1fc63ce98",
+            ),
+            (
+                "vless-legacy",
+                "vless://uuid@example.com:443#legacy",
+                "d47c73f3-910d-56b4-baa5-d230c76d788b",
+            ),
+            (
+                "vless-uot-v2",
+                "vless://uuid@example.com:443?vless_mode=uot-v2#uot-v2",
+                "372e7dc7-86a7-5d0d-accc-ba38fd103214",
+            ),
+            (
+                "vless-h2mux",
+                "vless://uuid@example.com:443?vless_mode=h2mux#h2mux",
+                "258ef463-002a-5fdf-8901-a1c8508ff988",
+            ),
+            (
+                "vless-h2mux-padded",
+                "vless://uuid@example.com:443?vless_mode=h2mux-padded#h2mux-padded",
+                "7f5ed150-4f89-54e1-b157-4d123d7fbc52",
+            ),
+            (
+                "vless-xudp",
+                "vless://uuid@example.com:443?vless_mode=xudp#xudp",
+                "85e3e4ce-e4e7-546b-93d5-e1d8a0742f4b",
+            ),
+            (
+                "vless-mux-cool",
+                "vless://uuid@example.com:443?vless_mode=mux-cool#mux-cool",
+                "4133852f-b86f-5a8f-b8fb-b335023645fe",
+            ),
+            (
+                "hysteria2",
+                "hysteria2://secret@example.com:443#hysteria2",
+                "f622cf2a-ef2e-5777-abdb-d8c826d11f57",
+            ),
+            (
+                "tuic",
+                "tuic://uuid:pass@example.com:443#tuic",
+                "e8751061-7db8-5d0d-b2e9-04af9ce55d02",
+            ),
+            (
+                "juicity",
+                "juicity://uuid:pass@example.com:443#juicity",
+                "26d8181d-9c09-580d-86bc-1bdc22f1d113",
+            ),
+            (
+                "anytls",
+                "anytls://secret@example.com:443#anytls",
+                "743d15b1-586a-5095-9e49-58c6f444f738",
+            ),
+        ];
+
+        for (name, link, expected) in cases {
+            let node = Node::from_share_link(link).unwrap();
+            assert_eq!(node.id.to_string(), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn test_vless_mode_identity() {
         let legacy = Node::from_share_link("vless://uuid@example.com:443#legacy").unwrap();
         let explicit_legacy =
             Node::from_share_link("vless://uuid@example.com:443?vless_mode=legacy#explicit")
                 .unwrap();
         assert_eq!(legacy.id, explicit_legacy.id);
-        assert_eq!(
-            legacy.id,
-            uuid::Uuid::parse_str("d47c73f3-910d-56b4-baa5-d230c76d788b").unwrap()
-        );
 
         let ids = ["uot-v2", "h2mux", "h2mux-padded", "xudp", "mux-cool"].map(|mode| {
             Node::from_share_link(&format!(
@@ -667,7 +600,7 @@ mod tests {
 
         // Credential or endpoint change → different ID.
         let mut other_pw = node.clone();
-        other_pw.password = Some("other".into());
+        other_pw.trojan_mut().unwrap().password = Some("other".into());
         assert_ne!(node.derive_id(), other_pw.derive_id());
         let mut other_port = node.clone();
         other_port.port = 8443;
@@ -675,14 +608,14 @@ mod tests {
         // Dial shape participates: same server behind a different SNI or
         // transport is a different endpoint (CDN fronting).
         let mut other_sni = node.clone();
-        other_sni.sni = Some("cdn.example".into());
+        other_sni.tls_mut().unwrap().sni = Some("cdn.example".into());
         assert_ne!(node.derive_id(), other_sni.derive_id());
         let mut other_transport = node.clone();
-        other_transport.transport = "ws".into();
+        other_transport.transport_mut().unwrap().transport = "ws".into();
         assert_ne!(node.derive_id(), other_transport.derive_id());
         // Validation and tuning knobs do not participate.
         let mut other_insecure = node.clone();
-        other_insecure.skip_cert_verify = true;
+        other_insecure.tls_mut().unwrap().skip_cert_verify = true;
         assert_eq!(node.derive_id(), other_insecure.derive_id());
     }
 }

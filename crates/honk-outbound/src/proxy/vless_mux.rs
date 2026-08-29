@@ -25,8 +25,11 @@ pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;
 const PADDED_RECORDS: u8 = 16;
 const MAX_RECORD_DATA: usize = u16::MAX as usize;
 const MAX_ERROR_MESSAGE: usize = 64 * 1024;
-const H2_STREAM_RECV_WINDOW: u32 = (1 + 2 + super::uot::MAX_PACKET_SIZE) as u32;
-const H2_CONNECTION_RECV_WINDOW: u32 = H2_STREAM_RECV_WINDOW * MAX_STREAMS_PER_SESSION as u32;
+// Let long-fat TCP streams grow without allowing one unread child to monopolize
+// the carrier; aggregate credit still covers one maximum response frame per slot.
+const H2_STREAM_RECV_WINDOW: u32 = 2 * 1024 * 1024;
+const H2_CONNECTION_RECV_WINDOW: u32 =
+    ((1 + 2 + super::uot::MAX_PACKET_SIZE) * MAX_STREAMS_PER_SESSION) as u32;
 #[cfg(feature = "rprx")]
 const MUX_MAGIC_ADDRESS: &str = "sp.mux.sing-box.arpa";
 #[cfg(feature = "rprx")]
@@ -91,6 +94,7 @@ impl VlessMuxSession {
         self.capacity.close();
     }
 }
+
 impl ManagedSession for VlessMuxSession {
     fn active_streams(&self) -> usize {
         MAX_STREAMS_PER_SESSION - self.capacity.available_permits()
@@ -976,6 +980,15 @@ mod tests {
     }
 
     #[test]
+    fn receive_windows_cover_every_maximum_udp_frame() {
+        let maximum_response_frame = 1 + 2 + super::super::uot::MAX_PACKET_SIZE;
+        assert!(H2_STREAM_RECV_WINDOW as usize >= maximum_response_frame);
+        assert!(
+            H2_CONNECTION_RECV_WINDOW as usize >= maximum_response_frame * MAX_STREAMS_PER_SESSION
+        );
+    }
+
+    #[test]
     fn physical_preface_matches_sing_mux() {
         assert_eq!(&mux_preface(false)[..], &[0, H2MUX_BACKEND]);
         let padded = mux_preface(true);
@@ -1237,6 +1250,137 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_receive_window_admits_one_megabyte_before_reads() {
+        const PAYLOAD_SIZE: usize = 1024 * 1024;
+
+        let (client, server) = tokio::io::duplex(2 * PAYLOAD_SIZE);
+        let (sent, sent_done) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let io = server_carrier(server, false).await;
+            let mut connection = h2::server::handshake(io).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let writer = tokio::spawn(async move {
+                let mut response = BytesMut::with_capacity(PAYLOAD_SIZE + 1);
+                response.extend_from_slice(&[0]);
+                response.resize(PAYLOAD_SIZE + 1, 0x5a);
+                send_owned(&mut send, response.freeze()).await.unwrap();
+                send.send_data(Bytes::new(), true).unwrap();
+                let _ = sent.send(());
+            });
+            while connection.accept().await.is_some() {}
+            writer.await.unwrap();
+        });
+
+        let session = connect(Box::new(client), false).await.unwrap();
+        let permit = session.try_reserve().unwrap();
+        let mut tcp = Arc::clone(&session)
+            .open_stream(permit, "93.184.216.34:443".parse().unwrap(), None)
+            .await
+            .unwrap_or_else(|_| panic!("large-response TCP stream must open"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), sent_done)
+            .await
+            .expect("one-megabyte response stalled behind the initial H2 stream window")
+            .unwrap();
+        let mut response = Vec::new();
+        tcp.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response.len(), PAYLOAD_SIZE);
+        assert!(response.iter().all(|byte| *byte == 0x5a));
+
+        drop(tcp);
+        session.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_tcp_stream_leaves_connection_credit_for_udp() {
+        let capacity = H2_CONNECTION_RECV_WINDOW as usize + 1024 * 1024;
+        let (client, server) = tokio::io::duplex(capacity);
+        let (filled, filled_done) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let io = server_carrier(server, false).await;
+            let mut connection = h2::server::handshake(io).await.unwrap();
+            let mut filled = Some(filled);
+            let mut writers = Vec::new();
+            while let Some(request) = connection.accept().await {
+                let (request, mut respond) = request.unwrap();
+                if let Some(filled) = filled.take() {
+                    writers.push(tokio::spawn(async move {
+                        let mut recv = request.into_body();
+                        let mut request_body = BytesMut::new();
+                        assert!(receive_at_least(&mut recv, &mut request_body, 9).await);
+                        let mut send = respond
+                            .send_response(http::Response::new(()), false)
+                            .unwrap();
+                        let mut response = BytesMut::with_capacity(H2_STREAM_RECV_WINDOW as usize);
+                        response.extend_from_slice(&[0]);
+                        response.resize(H2_STREAM_RECV_WINDOW as usize, 0x5a);
+                        send_owned(&mut send, response.freeze()).await.unwrap();
+                        send.send_data(Bytes::new(), true).unwrap();
+                        let _ = filled.send(());
+                    }));
+                } else {
+                    writers.push(tokio::spawn(serve_logical_stream(request, respond)));
+                }
+            }
+            for writer in writers {
+                writer.await.unwrap();
+            }
+        });
+
+        let session = connect(Box::new(client), false).await.unwrap();
+        let tcp = Arc::clone(&session)
+            .open_stream(
+                session.try_reserve().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| match error {
+                OpenError::Session(error)
+                | OpenError::Draining(error)
+                | OpenError::Refused(error) => {
+                    panic!("stalled TCP stream must open: {error:#}")
+                }
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(2), filled_done)
+            .await
+            .expect("peer could not fill one TCP stream window")
+            .unwrap();
+
+        let udp_target = "8.8.8.8:53".parse().unwrap();
+        let udp = Arc::clone(&session)
+            .open_packet(session.try_reserve().unwrap(), udp_target, None)
+            .await
+            .unwrap_or_else(|_| panic!("sibling UDP stream must open"));
+        udp.send_packet_confirmed(b"dns").await.unwrap();
+        let mut answer = [0; 16];
+        let (size, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            udp.recv_packet(&mut answer),
+        )
+        .await
+        .expect("stalled TCP stream consumed all H2 connection credit")
+        .unwrap();
+        assert_eq!(peer, udp_target);
+        assert_eq!(&answer[..size], b"answer");
+
+        drop(udp);
+        drop(tcp);
+        session.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

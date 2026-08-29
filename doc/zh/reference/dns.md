@@ -101,8 +101,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | TCP | 支持通过出站 TCP stream。 |
 | DoT | 支持；TLS 在出站 TCP stream 上运行。 |
 | DoH | 支持；TLS 与 HTTP/2 在出站 TCP stream 上运行。 |
-| DoQ | 不支持；只能直连。 |
-| DoH3 | 不支持；只能直连。 |
+| DoQ | 支持经出站的 UDP-capable `PacketTransport`。 |
+| DoH3 | 支持经出站的 UDP-capable `PacketTransport`。 |
 
 ## DNS 路由
 

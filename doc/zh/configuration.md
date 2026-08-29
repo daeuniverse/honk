@@ -173,6 +173,8 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'ui'
+        external_ui_download_url: 'https://example.com/dashboard.zip'
+        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: 'Rule'
     }
@@ -223,7 +225,7 @@ honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>)
 
 ## DNS 设置
 
-上游可裸写 `host:port`（UDP），也可使用 `udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`quic://`、`h3://`。追加 `-> node-or-group` 可强制拨号路径；TCP、UDP、DoT、DoH 可使用代理出站，DoQ 与 DoH3 仅支持直连。请求路由选择 `reject`、`asis` 或命名上游；响应路由选择 `accept`、`reject` 或用于有界重查询的命名上游：
+上游可裸写 `host:port`（UDP），也可使用 `udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`quic://`、`h3://`。追加 `-> node-or-group` 可强制拨号路径；所选叶节点具备对应能力时，上述 transport 均可使用代理出站。DoQ 与 DoH3 要求叶节点提供 UDP-capable `PacketTransport`；缺少代理 registry 或 packet capability 时会 fail closed。请求路由选择 `reject`、`asis` 或命名上游；响应路由选择 `accept`、`reject` 或用于有界重查询的命名上游：
 
 ```dae
 dns {
@@ -257,7 +259,7 @@ dns {
 
 ## 启用 Clash API、缓存文件与首包保留 UDP
 
-**Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 通过 `data_dir` 解析，缺失时可在后台下载。
+**Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 通过 `data_dir` 解析，缺失时可在后台下载。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
 
 **缓存文件。** 设置 `experimental.cache_file.enabled: true` 可持久化 Selector 选择与 Clash 模式；`store_dns: true` 还会持久化符合条件的 DNS 应答。相对 `path` 使用 `data_dir`，并遵循前述旧路径规则。
 

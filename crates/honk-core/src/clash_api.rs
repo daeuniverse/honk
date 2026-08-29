@@ -75,7 +75,7 @@ impl Default for StreamSamplers {
 use crate::mode::{DatapathFlagsHandle, ModeState, SharedModeState};
 
 pub struct ClashState {
-    pub config: Arc<tokio::sync::RwLock<Config>>,
+    pub config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     pub stats: Arc<crate::stats::StatsManager>,
     pub alive_set: Arc<AliveDialerSet>,
     /// Hot-swappable group manager cell; a config reload swaps the inner
@@ -179,18 +179,31 @@ pub fn router(state: Arc<ClashState>) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(state: Arc<ClashState>, listen: std::net::SocketAddr) {
-    let app = router(state);
-    let listener = match tokio::net::TcpListener::bind(listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("clash API failed to bind {}: {}", listen, e);
-            return;
+async fn bind_listener(
+    listen: std::net::SocketAddr,
+    connection_tracker: &crate::connection_tracker::ConnectionTracker,
+) -> Option<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(listen).await {
+        Ok(listener) => {
+            connection_tracker.enable();
+            Some(listener)
         }
+        Err(error) => {
+            tracing::error!("clash API failed to bind {}: {}", listen, error);
+            None
+        }
+    }
+}
+
+pub async fn serve(state: Arc<ClashState>, listen: std::net::SocketAddr) {
+    let Some(listener) = bind_listener(listen, &state.connection_tracker).await else {
+        return;
     };
+    let app = router(state.clone());
     tracing::info!("clash API listening on http://{listen}");
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!("clash API server error: {}", e);
+    if let Err(error) = axum::serve(listener, app).await {
+        tracing::error!("clash API server error: {}", error);
+        state.connection_tracker.disable_api();
     }
 }
 
@@ -447,7 +460,7 @@ fn build_group_proxy_info(
 fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json::Value {
     let mut info = serde_json::json!({
         "name": node.name,
-        "type": clash_protocol_type(node.protocol),
+        "type": clash_protocol_type(node.protocol()),
         "udp": true,
         "history": [],
     });
@@ -469,9 +482,8 @@ fn delay_history_entry(ms: u64, at: std::time::SystemTime) -> serde_json::Value 
     })
 }
 
-/// Build the synthetic GLOBAL selector group: every group plus every node
-/// (clash semantics), with a virtual "Proxy" entry first for dashboard
-/// compatibility. `now` comes from the shared mode state.
+/// Build the synthetic GLOBAL selector from concrete configured groups and
+/// nodes. Every `all` member resolves to a top-level proxy document.
 fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_json::Value {
     let mut all: Vec<String> = Vec::new();
     let mut push_unique = |name: &str| {
@@ -485,14 +497,12 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
     for node in &config.nodes {
         push_unique(&node.name);
     }
-    if !all.is_empty() {
-        all.insert(0, "Proxy".to_string());
-    }
-    let now = if global_selection.is_empty() {
-        "Proxy"
-    } else {
-        global_selection
-    };
+    let now = all
+        .iter()
+        .find(|name| name.as_str() == global_selection)
+        .or_else(|| all.first())
+        .map(String::as_str)
+        .unwrap_or("");
     serde_json::json!({
         "name": "GLOBAL",
         "type": "selector",
@@ -570,8 +580,7 @@ async fn put_proxy(
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
         let config = s.config.read().await;
-        let valid = body.name == "Proxy"
-            || config.groups.iter().any(|g| g.name == body.name)
+        let valid = config.groups.iter().any(|g| g.name == body.name)
             || config.nodes.iter().any(|n| n.name == body.name);
         drop(config);
         if !valid {
@@ -656,7 +665,7 @@ async fn get_proxy_delay(
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
         drop(config);
-        let Some(entry) = s.proxy_registry.find(node.protocol) else {
+        let Some(entry) = s.proxy_registry.find(node.protocol()) else {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no handler for the node protocol",
@@ -862,6 +871,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                     "incumbentHeld": counters.incumbent_held,
                     "freshFailureBypass": counters.fresh_failure_bypass,
                     "deadFiltered": counters.dead_filtered,
+                    "switchFlap": counters.switch_flap,
                 })
             };
             serde_json::json!({
@@ -1570,6 +1580,19 @@ async fn get_rule_providers() -> Json<serde_json::Value> {
 #[cfg(test)]
 mod sampler_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_bind_leaves_connection_tracking_disabled() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker = crate::connection_tracker::ConnectionTracker::new();
+
+        assert!(
+            bind_listener(occupied.local_addr().unwrap(), &tracker)
+                .await
+                .is_none()
+        );
+        assert!(!tracker.is_enabled());
+    }
 
     #[test]
     fn connection_intervals_use_bounded_ceiling_buckets() {

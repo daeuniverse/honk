@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::SubscriptionType;
 
 /// A proxy subscription (e.g., subscription link).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
@@ -55,7 +55,7 @@ impl Default for Subscription {
 }
 
 /// Custom HTTP header for subscription fetch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionHeader {
     pub key: String,
     pub value: String,

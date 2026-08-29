@@ -37,7 +37,7 @@ use tokio::time::Instant;
 
 use anyhow::anyhow;
 use futures_util::FutureExt;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 /// Pool sizing and lifecycle policy.
 #[derive(Debug, Clone)]
@@ -342,6 +342,7 @@ pub struct SessionPool<S: ManagedSession + 'static> {
     state: Arc<AtomicUsize>,
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
     capacity_notify: Arc<Notify>,
+    dial_scope: RwLock<crate::runtime::CapturedDialScope>,
 }
 
 impl<S: ManagedSession + 'static> std::fmt::Debug for SessionPool<S> {
@@ -362,6 +363,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             state: Arc::new(AtomicUsize::new(PoolState::Running as usize)),
             shutdown_tx: Arc::new(shutdown_tx),
             capacity_notify: Arc::new(Notify::new()),
+            dial_scope: RwLock::new(crate::runtime::capture_dial_admission()),
         }
     }
 
@@ -583,7 +585,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let task_state = Arc::clone(&self.state);
                     let config = self.config.clone();
                     let mut task_shutdown_rx = self.shutdown_tx.subscribe();
-                    tokio::spawn(async move {
+                    let dial_scope = crate::runtime::capture_dial_scope();
+                    tokio::spawn(dial_scope.scope(async move {
                         let mut guard = DialGuard {
                             pool: Arc::clone(&task_pool),
                             inflight_id: id,
@@ -646,7 +649,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             }
                         };
                         let _ = done.send(signal);
-                    });
+                    }));
                     // Fall through: wait on the dial like everyone else.
                 }
             }
@@ -928,17 +931,31 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .max(if pool.warm_retained { 1 } else { 0 }),
                 )
             };
-            if current < min_idle
-                && let Ok(s) = self
-                    .offer({
+            if current < min_idle {
+                let dial_scope = self.dial_scope.read().clone();
+                if let Ok(s) = dial_scope
+                    .scope(self.offer({
                         let prewarm = prewarm.clone();
                         move || prewarm()
-                    })
+                    }))
                     .await
-            {
-                drop(s);
+                {
+                    drop(s);
+                }
             }
         }
+    }
+
+    pub(crate) fn set_dial_scope(&self, scope: crate::runtime::CapturedDialScope) {
+        *self.dial_scope.write() = scope;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dial_scope_matches(
+        &self,
+        registry: &crate::runtime::OutboundRuntimeRegistry,
+    ) -> bool {
+        self.dial_scope.read().matches_registry(registry)
     }
 
     /// Start the pool janitor (prune closed/expired, prewarm to the explicit
@@ -956,6 +973,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     {
         if self.state() != PoolState::Running {
             return;
+        }
+        if let Some(scope) = crate::runtime::try_capture_dial_admission() {
+            self.set_dial_scope(scope);
         }
         {
             let mut pool = self.pool.lock();
@@ -2091,5 +2111,75 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(next, SpeculativeCheckout::Shared { .. }));
+    }
+
+    #[tokio::test]
+    async fn janitor_replacement_waits_for_limit_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = Arc::new(pool(SessionPoolConfig {
+            max_sessions: 1,
+            janitor_interval: Duration::from_millis(10),
+            ..Default::default()
+        }));
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0,
+        );
+        let held = generation.acquire_dial_permit().await;
+        let started = Arc::new(AtomicBool::new(false));
+        let started_notify = Arc::new(tokio::sync::Notify::new());
+
+        generation
+            .scope_dials(async {
+                pool.set_dial_scope(crate::runtime::capture_dial_admission());
+            })
+            .await;
+        pool.ensure_janitor(1, Duration::from_secs(60), {
+            let started = Arc::clone(&started);
+            let started_notify = Arc::clone(&started_notify);
+            move || {
+                let started = Arc::clone(&started);
+                let started_notify = Arc::clone(&started_notify);
+                async move {
+                    let stream = crate::address_race::race_resolved_addrs(&[addr], move |addr| {
+                        let started = Arc::clone(&started);
+                        let started_notify = Arc::clone(&started_notify);
+                        async move {
+                            started.store(true, Ordering::Release);
+                            started_notify.notify_one();
+                            tokio::net::TcpStream::connect(addr).await
+                        }
+                    })
+                    .await
+                    .expect("one address")?;
+                    drop(stream);
+                    Ok(TestSession::new())
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !started.load(Ordering::Acquire),
+            "janitor replacement bypassed the physical dial limit"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), started_notify.notified())
+            .await
+            .expect("admitted janitor replacement did not start");
+        let (_server, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("janitor replacement opened no TCP connection")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.metrics().sessions == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("janitor did not publish its replacement session");
+        pool.shutdown();
     }
 }

@@ -384,10 +384,11 @@ impl Socks5Handler {
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("SOCKS5 UDP: connecting control channel to {}", addr);
         let mut control = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let config = node.socks5().unwrap();
         let relay_addr = Self::udp_associate(
             &mut control,
-            node.username.as_deref(),
-            node.password.as_deref(),
+            config.username.as_deref(),
+            config.password.as_deref(),
         )
         .await?;
 
@@ -552,12 +553,13 @@ impl TcpOutbound for Socks5Handler {
         mut stream: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
+        let config = node.socks5().unwrap();
         Self::handshake(
             &mut stream,
             target,
             target_domain,
-            node.username.as_deref(),
-            node.password.as_deref(),
+            config.username.as_deref(),
+            config.password.as_deref(),
         )
         .await?;
         Ok(ProxyStream {
@@ -732,7 +734,7 @@ mod tests {
     fn socks5_test_node(proxy_addr: SocketAddr) -> Node {
         Node {
             name: "test".into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: proxy_addr.ip().to_string(),
             host: String::new(),
             port: proxy_addr.port(),
@@ -1296,7 +1298,7 @@ mod tests {
 
         let node = Node {
             name: "test".into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: server_addr.ip().to_string(),
             host: String::new(),
             port: server_addr.port(),
@@ -1323,7 +1325,7 @@ mod tests {
 
         let node = Node {
             name: "test".into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             address: server_addr.ip().to_string(),
             host: String::new(),
             port: server_addr.port(),

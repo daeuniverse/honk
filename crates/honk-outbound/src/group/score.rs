@@ -14,14 +14,32 @@ use uuid::Uuid;
 const EXACT_CAPACITY: usize = 4096;
 const AGGREGATE_CAPACITY: usize = 4096;
 const RELIABILITY_CLOSE: f64 = 0.05;
+const RELIABILITY_CONFIDENCE_Z: f64 = 1.64;
 const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_MARGIN: f64 = 0.01;
+const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
+const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
+const SELECTION_HISTORY_CAPACITY: usize = 4096;
 const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
+const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
+/// Consecutive fresh failures that drop a leaf out of the reliability band
+/// while any healthier candidate exists. Decayed history must not shield a
+/// leaf that is failing right now.
+const SCORE_FAIL_STREAK_EXCLUDE: u32 = 3;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
+
+/// Exploration retry delay for a consecutive-failure streak, tracked outside
+/// the decaying evidence so a dead leaf is not rediscovered as cold.
+fn explore_backoff(streak: u32) -> Duration {
+    SCORE_EXPLORE_BACKOFF_BASE
+        .saturating_mul(2u32.saturating_pow(streak.saturating_sub(1).min(7)))
+        .min(SCORE_EXPLORE_BACKOFF_MAX)
+}
 
 fn exploration_target(candidate_count: usize) -> usize {
     if candidate_count <= 4 {
@@ -186,6 +204,8 @@ struct Stats {
     throughput_bytes: f64,
     throughput_seconds: f64,
     throughput_windows: f64,
+    fail_streak: u32,
+    explore_not_before: Option<Instant>,
     last_used: u64,
     updated_at: Option<Instant>,
     selected_at: u64,
@@ -200,7 +220,7 @@ impl Stats {
         self.useful_success + self.useful_failure
     }
 
-    fn reliability(&self, factor: f64) -> f64 {
+    fn reliability_bounds(&self, factor: f64) -> (f64, f64) {
         // Setup failure is already a useful failure. Counting two additional
         // failures makes it the strongest negative signal without a knob.
         let successes = self.useful_success * factor;
@@ -210,7 +230,10 @@ impl Stats {
         let sum = a + b;
         let mean = a / sum;
         let deviation = (a * b / (sum * sum * (sum + 1.0))).sqrt();
-        (mean - 1.64 * deviation).clamp(0.0, 1.0)
+        (
+            (mean - RELIABILITY_CONFIDENCE_Z * deviation).clamp(0.0, 1.0),
+            (mean + RELIABILITY_CONFIDENCE_Z * deviation).clamp(0.0, 1.0),
+        )
     }
 
     fn decay_to(&mut self, now: Instant) {
@@ -251,6 +274,17 @@ impl Stats {
             self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
             self.last_used = tick;
             return;
+        }
+        if !sample.streak_neutral {
+            if sample.outcome == ScoreOutcome::Success {
+                // Liveness is proven, but the streak steps down one at a
+                // time: a flapping leaf earns the fast cadence back.
+                self.fail_streak = self.fail_streak.saturating_sub(1);
+                self.explore_not_before = None;
+            } else {
+                self.fail_streak = self.fail_streak.saturating_add(1);
+                self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
+            }
         }
         if let Some(setup) = sample.setup {
             self.setup_success += 1.0;
@@ -354,6 +388,37 @@ impl SelectionCadenceKey {
     }
 }
 
+/// Flap history is scoped to the same target the pick was ranked for:
+/// unrelated targets interleaving their own winners is not a flap. The
+/// exploration cadence keeps the coarser [`SelectionCadenceKey`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SelectionHistoryKey {
+    group: String,
+    network: SelectionNetwork,
+    family: Option<IpVersion>,
+    target: Option<ScoreTarget>,
+}
+
+impl SelectionHistoryKey {
+    fn new(group: &str, context: &ScoreSelectionContext) -> Self {
+        Self {
+            group: group.to_owned(),
+            network: context.network,
+            family: context.target_family,
+            target: context.target.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SelectionHistory {
+    current: Uuid,
+    previous: Option<Uuid>,
+    /// Committed non-exploration selections seen by this target scope.
+    selections: u64,
+    switched_at: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionReason {
     ColdExplore,
@@ -407,6 +472,7 @@ struct SelectionReasonCounts {
     incumbent_held: u64,
     fresh_failure_bypass: u64,
     dead_filtered: u64,
+    switch_flap: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -418,6 +484,7 @@ pub struct ScoreReasonCounters {
     pub incumbent_held: u64,
     pub fresh_failure_bypass: u64,
     pub dead_filtered: u64,
+    pub switch_flap: u64,
 }
 
 impl ScoreReasonCounters {
@@ -430,6 +497,7 @@ impl ScoreReasonCounters {
             incumbent_held: counts.incumbent_held,
             fresh_failure_bypass: counts.fresh_failure_bypass,
             dead_filtered: counts.dead_filtered,
+            switch_flap: counts.switch_flap,
         }
     }
 }
@@ -447,6 +515,7 @@ struct StateInner {
     valid: HashSet<(String, Uuid)>,
     valid_groups: HashSet<String>,
     selection_counts: HashMap<SelectionCadenceKey, u64>,
+    selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, SelectionReasonCounts>,
     active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
@@ -464,6 +533,10 @@ impl Default for StateInner {
             valid: HashSet::new(),
             valid_groups: HashSet::new(),
             selection_counts: HashMap::new(),
+            selection_history: LruCache::new(
+                // SAFE-EXPECT: the capacity is a positive compile-time constant.
+                NonZeroUsize::new(SELECTION_HISTORY_CAPACITY).expect("non-zero capacity"),
+            ),
             selection_reasons: HashMap::new(),
             active_authority: None,
             tick: 0,
@@ -522,11 +595,38 @@ impl ScorePolicyState {
         let StateInner {
             selection_counts,
             selection_reasons,
+            selection_history,
+            valid,
             valid_groups,
             ..
         } = &mut *inner;
         selection_counts.retain(|key, _| valid_groups.contains(&key.group));
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
+        let invalid_history: Vec<_> = selection_history
+            .iter()
+            .filter(|(key, history)| {
+                !valid_groups.contains(&key.group)
+                    || !valid.contains(&(key.group.clone(), history.current))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in invalid_history {
+            selection_history.pop(&key);
+        }
+        let stale_previous: Vec<_> = selection_history
+            .iter()
+            .filter(|(key, history)| {
+                history
+                    .previous
+                    .is_some_and(|node_id| !valid.contains(&(key.group.clone(), node_id)))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_previous {
+            if let Some(history) = selection_history.get_mut(&key) {
+                history.previous = None;
+            }
+        }
         let invalid_exact: Vec<_> = inner
             .exact
             .iter()
@@ -584,6 +684,49 @@ impl ScorePolicyState {
             SelectionReason::FreshFailureBypass => &mut counts.fresh_failure_bypass,
         };
         *counter = counter.saturating_add(1);
+    }
+
+    fn record_switch_flap(
+        inner: &mut StateInner,
+        history_key: &SelectionHistoryKey,
+        node_id: Uuid,
+        reason: SelectionReason,
+    ) {
+        if reason.is_exploration() {
+            return;
+        }
+        let Some(history) = inner.selection_history.get_mut(history_key) else {
+            inner.selection_history.push(
+                history_key.clone(),
+                SelectionHistory {
+                    current: node_id,
+                    previous: None,
+                    selections: 1,
+                    switched_at: 0,
+                },
+            );
+            return;
+        };
+        history.selections = history.selections.saturating_add(1);
+        if history.current == node_id {
+            return;
+        }
+        let switch_flap = history.previous == Some(node_id)
+            && history.selections.saturating_sub(history.switched_at) <= SCORE_SWITCH_FLAP_WINDOW;
+        history.previous = Some(history.current);
+        history.current = node_id;
+        history.switched_at = history.selections;
+        if switch_flap {
+            let counter = &mut inner
+                .selection_reasons
+                .entry(SelectionReasonKey::new(
+                    &history_key.group,
+                    history_key.network,
+                ))
+                .or_default()
+                .switch_flap;
+            *counter = counter.saturating_add(1);
+        }
     }
 
     pub(super) fn record_dead_filtered(
@@ -832,9 +975,13 @@ impl ScorePolicyState {
             .iter()
             .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
+        let performance = performance_baseline(&snapshots);
         let cadence_key = SelectionCadenceKey::new(group, context);
         let selection_count = if authorized {
-            let count = inner.selection_counts.entry(cadence_key).or_default();
+            let count = inner
+                .selection_counts
+                .entry(cadence_key.clone())
+                .or_default();
             *count = count.saturating_add(1);
             *count
         } else {
@@ -849,7 +996,7 @@ impl ScorePolicyState {
                 count
             }
         };
-        let best = best_index(&snapshots, nodes, selection_count, apply);
+        let best = best_index(&snapshots, nodes, selection_count, apply, performance);
         let incumbent = snapshots
             .iter()
             .enumerate()
@@ -864,22 +1011,30 @@ impl ScorePolicyState {
             best
         } else {
             match incumbent.filter(|&index| index != best.index) {
-                Some(index) => match hold_decision(&snapshots[index], &snapshots[best.index]) {
-                    HoldDecision::Held => RankedSelection {
-                        index,
-                        reason: SelectionReason::IncumbentHeld,
-                    },
-                    HoldDecision::FreshFailureBypass => RankedSelection {
-                        index: best.index,
-                        reason: SelectionReason::FreshFailureBypass,
-                    },
-                    HoldDecision::UseBest => best,
-                },
+                Some(index) => {
+                    match hold_decision(&snapshots[index], &snapshots[best.index], performance) {
+                        HoldDecision::Held => RankedSelection {
+                            index,
+                            reason: SelectionReason::IncumbentHeld,
+                        },
+                        HoldDecision::FreshFailureBypass => RankedSelection {
+                            index: best.index,
+                            reason: SelectionReason::FreshFailureBypass,
+                        },
+                        HoldDecision::UseBest => best,
+                    }
+                }
                 None => best,
             }
         };
         if authorized {
             Self::record_selection_reason(&mut inner, group, context.network, selection);
+            Self::record_switch_flap(
+                &mut inner,
+                &SelectionHistoryKey::new(group, context),
+                nodes[selection.index].id,
+                selection.reason,
+            );
             inner.tick = inner.tick.saturating_add(1);
             let selection_tick = inner.tick;
             mark_selected(
@@ -999,6 +1154,7 @@ fn best_index(
     nodes: &[&Node],
     selection_count: u64,
     explore: bool,
+    performance: PerformanceBaseline,
 ) -> RankedSelection {
     if explore {
         let candidate_count = snapshots.len();
@@ -1010,7 +1166,9 @@ fn best_index(
         let cold = snapshots
             .iter()
             .enumerate()
-            .filter(|(_, score)| exploration_completed(score) < MIN_TRAINED_EVIDENCE)
+            .filter(|(_, score)| {
+                exploration_completed(score) < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
+            })
             .min_by(|(left_index, left), (right_index, right)| {
                 exploration_attempts(left)
                     .total_cmp(&exploration_attempts(right))
@@ -1022,15 +1180,11 @@ fn best_index(
             && selection_count != 0
             && selection_count.is_multiple_of(exploration_period(candidate_count));
         if let Some(index) = cold
-            && (explored < target || candidate_count <= target || periodic)
+            && (explored < target || candidate_count <= target)
         {
             return RankedSelection {
                 index,
-                reason: if periodic && explored >= target && candidate_count > target {
-                    SelectionReason::PeriodicExplore
-                } else {
-                    SelectionReason::ColdExplore
-                },
+                reason: SelectionReason::ColdExplore,
             };
         }
         if periodic {
@@ -1043,12 +1197,15 @@ fn best_index(
             if let Some((index, _)) = snapshots
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| Some(*index) != incumbent)
-                .min_by(|(left_index, left), (right_index, right)| {
-                    exploration_attempts(left)
-                        .total_cmp(&exploration_attempts(right))
-                        .then_with(|| left_index.cmp(right_index))
-                        .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+                .filter(|(index, score)| Some(*index) != incumbent && !score.explore_backed_off)
+                .max_by(|(left_index, left), (right_index, right)| {
+                    left.reliability_upper
+                        .total_cmp(&right.reliability_upper)
+                        .then_with(|| {
+                            exploration_attempts(right).total_cmp(&exploration_attempts(left))
+                        })
+                        .then_with(|| right_index.cmp(left_index))
+                        .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
                 })
             {
                 return RankedSelection {
@@ -1058,17 +1215,26 @@ fn best_index(
             }
         }
     }
+    // Fresh consecutive failures outweigh decayed success history.
+    let any_healthy = snapshots
+        .iter()
+        .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
+    let rankable =
+        |score: &&ScoreSnapshot| !any_healthy || score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE;
     let best_reliability = snapshots
         .iter()
+        .filter(rankable)
         .map(|score| score.reliability)
         .fold(0.0_f64, f64::max);
     let index = snapshots
         .iter()
         .enumerate()
-        .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+        .filter(|(_, score)| {
+            rankable(score) && best_reliability - score.reliability <= RELIABILITY_CLOSE
+        })
         .max_by(|(left_index, left), (right_index, right)| {
-            utility(left)
-                .total_cmp(&utility(right))
+            utility(left, performance)
+                .total_cmp(&utility(right, performance))
                 .then_with(|| right_index.cmp(left_index))
                 .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
         })
@@ -1088,10 +1254,20 @@ fn best_index(
     RankedSelection { index, reason }
 }
 
-fn hold_decision(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> HoldDecision {
+fn switch_margin(completed: f64) -> f64 {
+    SCORE_SWITCH_MARGIN * (completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0)
+}
+
+fn hold_decision(
+    incumbent: &ScoreSnapshot,
+    best: &ScoreSnapshot,
+    performance: PerformanceBaseline,
+) -> HoldDecision {
     let trained =
         incumbent.completed >= MIN_TRAINED_EVIDENCE && best.completed >= MIN_TRAINED_EVIDENCE;
-    let within_switch_margin = utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN;
+    let margin = switch_margin(incumbent.hysteresis_completed);
+    let within_switch_margin =
+        utility(best, performance) - utility(incumbent, performance) < margin;
     if !trained || !within_switch_margin {
         HoldDecision::UseBest
     } else if incumbent.failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD {
@@ -1201,13 +1377,17 @@ fn record_aggregate_finish(
 struct ScoreSnapshot {
     attempts: f64,
     completed: f64,
+    hysteresis_completed: f64,
     reliability: f64,
+    reliability_upper: f64,
     useful_completed: f64,
     latency_ms: Option<f64>,
     latency_confidence: f64,
     throughput: Option<f64>,
     throughput_confidence: f64,
     failures: f64,
+    explore_backed_off: bool,
+    fail_streak: u32,
     selected_at: u64,
     targeted: bool,
     target_attempts: f64,
@@ -1250,10 +1430,20 @@ fn score_snapshot(
         ScoreSnapshot {
             attempts: family.attempts,
             completed: global_score.completed + family.completed,
+            hysteresis_completed: if family.completed > 0.0 {
+                family.hysteresis_completed
+            } else {
+                global_score.hysteresis_completed
+            },
             useful_completed: global_score.useful_completed + family.useful_completed,
             reliability: blend(
                 global_score.reliability,
                 family.reliability,
+                reliability_weight,
+            ),
+            reliability_upper: blend(
+                global_score.reliability_upper,
+                family.reliability_upper,
                 reliability_weight,
             ),
             latency_ms: blend_option(global_score.latency_ms, family.latency_ms, setup_weight),
@@ -1273,6 +1463,8 @@ fn score_snapshot(
                 reliability_weight,
             ),
             failures: global_score.failures.max(family.failures),
+            explore_backed_off: global_score.explore_backed_off,
+            fail_streak: global_score.fail_streak,
             selected_at: global_score.selected_at.max(family.selected_at),
             targeted: false,
             target_attempts: 0.0,
@@ -1300,10 +1492,20 @@ fn score_snapshot(
     ScoreSnapshot {
         attempts: exact.attempts,
         completed: aggregate_score.completed + exact.completed,
+        hysteresis_completed: if exact.completed > 0.0 {
+            exact.hysteresis_completed
+        } else {
+            aggregate_score.hysteresis_completed
+        },
         useful_completed: aggregate_score.useful_completed + exact.useful_completed,
         reliability: blend(
             aggregate_score.reliability,
             exact.reliability,
+            reliability_weight,
+        ),
+        reliability_upper: blend(
+            aggregate_score.reliability_upper,
+            exact.reliability_upper,
             reliability_weight,
         ),
         latency_ms: blend_option(aggregate_score.latency_ms, exact.latency_ms, setup_weight),
@@ -1323,6 +1525,8 @@ fn score_snapshot(
             reliability_weight,
         ),
         failures: aggregate_score.failures.max(exact.failures),
+        explore_backed_off: aggregate_score.explore_backed_off,
+        fail_streak: aggregate_score.fail_streak,
         selected_at: aggregate_score.selected_at.max(exact.selected_at),
         targeted: exact.completed >= MIN_TRAINED_EVIDENCE
             || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
@@ -1339,21 +1543,24 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         .mean()
         .map(|mean| (Some(mean), stats.first_response_ms.weight))
         .unwrap_or_else(|| (stats.setup_ms.mean(), stats.setup_ms.weight));
-    let throughput = (stats.throughput_seconds > 0.0).then(|| {
-        (1.0 + stats.throughput_bytes / stats.throughput_seconds)
-            .log2()
-            .clamp(0.0, 30.0)
-    });
+    // Dominant-direction bytes per second; utility normalizes this within the group.
+    let throughput =
+        (stats.throughput_seconds > 0.0).then(|| stats.throughput_bytes / stats.throughput_seconds);
+    let (reliability, reliability_upper) = stats.reliability_bounds(factor);
     ScoreSnapshot {
         attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
+        hysteresis_completed: stats.completed() * factor,
         useful_completed: stats.useful_completed() * factor,
-        reliability: stats.reliability(factor),
+        reliability,
+        reliability_upper,
         latency_ms,
         latency_confidence: (latency_weight * factor / 8.0).clamp(0.0, 1.0),
         throughput,
         throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
         failures: (stats.setup_failure + stats.useful_failure) * factor,
+        explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
+        fail_streak: stats.fail_streak,
         selected_at: stats.selected_at,
         targeted: false,
         target_attempts: 0.0,
@@ -1372,15 +1579,46 @@ fn blend_option(base: Option<f64>, exact: Option<f64>, exact_weight: f64) -> Opt
     }
 }
 
-fn utility(score: &ScoreSnapshot) -> f64 {
-    let latency_penalty = score
-        .latency_ms
-        .map(|latency| latency.max(1.0).log2().min(20.0) / 20.0 * 0.03 * score.latency_confidence)
-        .unwrap_or(0.0);
-    let throughput_bonus = score
-        .throughput
-        .map(|throughput| throughput / 30.0 * 0.02 * score.throughput_confidence)
-        .unwrap_or(0.0);
+#[derive(Clone, Copy)]
+struct PerformanceBaseline {
+    latency_ms: Option<f64>,
+    throughput: Option<f64>,
+}
+
+fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBaseline {
+    let best_reliability = snapshots
+        .iter()
+        .map(|score| score.reliability)
+        .fold(0.0_f64, f64::max);
+    let eligible = || {
+        snapshots
+            .iter()
+            .filter(|score| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+    };
+    PerformanceBaseline {
+        latency_ms: eligible()
+            .filter_map(|score| score.latency_ms)
+            .map(|latency| latency.max(1.0))
+            .min_by(f64::total_cmp),
+        throughput: eligible()
+            .filter_map(|score| score.throughput)
+            .max_by(f64::total_cmp),
+    }
+}
+
+fn utility(score: &ScoreSnapshot, baseline: PerformanceBaseline) -> f64 {
+    let latency_penalty = match (score.latency_ms, baseline.latency_ms) {
+        (Some(latency), Some(best)) => {
+            (1.0 - best / latency.max(1.0)).clamp(0.0, 1.0) * 0.03 * score.latency_confidence
+        }
+        _ => 0.0,
+    };
+    let throughput_bonus = match (score.throughput, baseline.throughput) {
+        (Some(throughput), Some(best)) if best > 0.0 => {
+            (throughput / best).clamp(0.0, 1.0) * 0.02 * score.throughput_confidence
+        }
+        _ => 0.0,
+    };
     score.reliability + throughput_bonus - latency_penalty
 }
 
@@ -1390,6 +1628,7 @@ pub struct ScoreFeedback {
     authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
+    streak_neutral: bool,
 }
 
 impl std::fmt::Debug for ScoreFeedback {
@@ -1411,7 +1650,16 @@ impl ScoreFeedback {
             authority,
             context,
             attributions: attributions.into(),
+            streak_neutral: false,
         }
+    }
+
+    /// Probe, urltest, and warm-up outcomes must not touch the failure
+    /// streak: a probe succeeding through a half-dead leaf must not wash out
+    /// consecutive real-flow failures (and vice versa).
+    pub fn streak_neutral(mut self) -> Self {
+        self.streak_neutral = true;
+        self
     }
 
     pub fn attributions(&self) -> &[ScoreAttribution] {
@@ -1465,6 +1713,7 @@ impl ScoreFeedback {
                 tx: AtomicU64::new(0),
                 rx: AtomicU64::new(0),
                 progress: Mutex::new(ReporterProgress::default()),
+                streak_neutral: self.streak_neutral,
             }),
         }
     }
@@ -1488,6 +1737,7 @@ struct ReporterShared {
     tx: AtomicU64,
     rx: AtomicU64,
     progress: Mutex<ReporterProgress>,
+    streak_neutral: bool,
 }
 
 /// Cloneable exact-once flow reporter. The first terminal call wins; dropping
@@ -1539,6 +1789,7 @@ impl ScoreReporter {
             authority: Arc::clone(&self.shared.authority),
             context: self.shared.context.clone(),
             attributions: Arc::clone(&self.shared.attributions),
+            streak_neutral: self.shared.streak_neutral,
         }
     }
 
@@ -1569,6 +1820,7 @@ impl ScoreReporter {
             rx: self.shared.rx.load(Ordering::Relaxed),
             elapsed: self.shared.started.elapsed(),
             count_usefulness,
+            streak_neutral: self.shared.streak_neutral,
         };
         self.shared.state.finish(
             &self.shared.context,
@@ -1601,6 +1853,7 @@ struct FlowSample {
     rx: u64,
     elapsed: Duration,
     count_usefulness: bool,
+    streak_neutral: bool,
 }
 
 impl super::GroupManager {
@@ -2142,7 +2395,9 @@ mod tests {
         let candidate = |attempts, latency_ms| ScoreSnapshot {
             attempts,
             completed: 8.0,
+            hysteresis_completed: 8.0,
             reliability: 0.9,
+            reliability_upper: 0.9,
             useful_completed: 8.0,
             latency_ms: Some(latency_ms),
             latency_confidence: 1.0,
@@ -2150,22 +2405,61 @@ mod tests {
             throughput_confidence: 0.0,
             failures: 0.0,
             selected_at: 0,
+            explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
         };
 
-        let faster_incumbent = candidate(100.0, 50.0);
-        let underused_slow_node = candidate(8.0, 500.0);
-        assert!(utility(&faster_incumbent) > utility(&underused_slow_node));
+        let scores = [candidate(100.0, 50.0), candidate(8.0, 500.0)];
+        let baseline = performance_baseline(&scores);
+        assert!(utility(&scores[0], baseline) > utility(&scores[1], baseline));
     }
 
     #[test]
-    fn hold_decision_classifies_every_boundary_once() {
+    fn relative_performance_is_scale_invariant() {
+        let candidate = |latency_ms, throughput| ScoreSnapshot {
+            attempts: 8.0,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability: 0.9,
+            reliability_upper: 0.9,
+            useful_completed: 8.0,
+            latency_ms: Some(latency_ms),
+            latency_confidence: 1.0,
+            throughput: Some(throughput),
+            throughput_confidence: 1.0,
+            failures: 0.0,
+            selected_at: 0,
+            explore_backed_off: false,
+            fail_streak: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let local = [candidate(30.0, 20_000_000.0), candidate(60.0, 10_000_000.0)];
+        let remote = [
+            candidate(300.0, 200_000_000.0),
+            candidate(600.0, 100_000_000.0),
+        ];
+        let local_baseline = performance_baseline(&local);
+        let remote_baseline = performance_baseline(&remote);
+
+        assert_close(
+            utility(&local[0], local_baseline) - utility(&local[1], local_baseline),
+            utility(&remote[0], remote_baseline) - utility(&remote[1], remote_baseline),
+        );
+    }
+
+    #[test]
+    fn hold_decision_scales_margin_with_incumbent_evidence() {
         let candidate = |completed, reliability, latency_ms, failures| ScoreSnapshot {
             attempts: completed,
             completed,
+            hysteresis_completed: completed,
             reliability,
+            reliability_upper: reliability,
             useful_completed: completed,
             latency_ms,
             latency_confidence: f64::from(latency_ms.is_some()),
@@ -2173,54 +2467,115 @@ mod tests {
             throughput_confidence: 0.0,
             failures,
             selected_at: 0,
+            explore_backed_off: false,
+            fail_streak: 0,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
         };
+        let decision = |incumbent: ScoreSnapshot, best: ScoreSnapshot| {
+            let performance = performance_baseline(&[incumbent, best]);
+            hold_decision(&incumbent, &best, performance)
+        };
         let trained = MIN_TRAINED_EVIDENCE;
+        let low_margin = switch_margin(trained);
         let incumbent = candidate(trained, 0.0, None, 0.0);
+        let proven = candidate(SCORE_SWITCH_FULL_EVIDENCE, 0.0, None, 0.0);
 
         assert_eq!(
-            hold_decision(
-                &candidate(trained - f64::EPSILON, 0.0, None, 0.0),
-                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            decision(
+                candidate(trained - f64::EPSILON, 0.0, None, 0.0),
+                candidate(trained, low_margin / 2.0, None, 0.0),
             ),
             HoldDecision::UseBest,
         );
         assert_eq!(
-            hold_decision(
-                &incumbent,
-                &candidate(trained, SCORE_SWITCH_MARGIN, None, 0.0),
-            ),
+            decision(incumbent, candidate(trained, low_margin * 1.01, None, 0.0),),
             HoldDecision::UseBest,
         );
         assert_eq!(
-            hold_decision(
-                &incumbent,
-                &candidate(trained, SCORE_SWITCH_MARGIN * 2.0, None, 0.0),
-            ),
-            HoldDecision::UseBest,
+            decision(incumbent, candidate(trained, low_margin / 2.0, None, 0.0),),
+            HoldDecision::Held,
         );
         assert_eq!(
-            hold_decision(
-                &candidate(trained, 0.0, Some(1_048_576.0), 0.0),
-                &candidate(trained, 0.0, Some(1.0), 0.0),
-            ),
-            HoldDecision::UseBest,
-        );
-        assert_eq!(
-            hold_decision(
-                &incumbent,
-                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            decision(
+                proven,
+                candidate(
+                    SCORE_SWITCH_FULL_EVIDENCE,
+                    SCORE_SWITCH_MARGIN / 2.0,
+                    None,
+                    0.0,
+                ),
             ),
             HoldDecision::Held,
         );
         assert_eq!(
-            hold_decision(
-                &candidate(trained, 0.0, None, SCORE_FAILURE_FORGIVENESS_THRESHOLD,),
-                &candidate(trained, SCORE_SWITCH_MARGIN / 2.0, None, 0.0),
+            decision(
+                proven,
+                candidate(
+                    SCORE_SWITCH_FULL_EVIDENCE,
+                    SCORE_SWITCH_MARGIN * 1.01,
+                    None,
+                    0.0,
+                ),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            decision(
+                candidate(trained, 0.0, Some(1_048_576.0), 0.0),
+                candidate(trained, 0.0, Some(1.0), 0.0),
+            ),
+            HoldDecision::UseBest,
+        );
+        assert_eq!(
+            decision(
+                candidate(trained, 0.0, None, SCORE_FAILURE_FORGIVENESS_THRESHOLD,),
+                candidate(trained, low_margin / 2.0, None, 0.0),
             ),
             HoldDecision::FreshFailureBypass,
+        );
+    }
+
+    #[test]
+    fn hysteresis_evidence_counts_each_reporter_completion_once() {
+        let assert_near = |actual: f64, expected: f64| {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        };
+        let node = node("only");
+        let manager = super::super::GroupManager::new(
+            &[group("score", std::slice::from_ref(&node))],
+            std::slice::from_ref(&node),
+        );
+        let context = context("evidence.example", IpVersion::V4);
+        for _ in 0..3 {
+            finish_success(&manager.selection_plan_for_target("score", &context));
+        }
+        let score = {
+            let state = manager.score_state();
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, node.id, Instant::now())
+        };
+        assert_near(score.completed, 9.0);
+        assert_near(score.hysteresis_completed, 3.0);
+        assert_near(
+            switch_margin(score.hysteresis_completed),
+            SCORE_SWITCH_MARGIN * 3.0 / SCORE_SWITCH_FULL_EVIDENCE,
+        );
+
+        for _ in 3..8 {
+            finish_success(&manager.selection_plan_for_target("score", &context));
+        }
+        let score = {
+            let state = manager.score_state();
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, node.id, Instant::now())
+        };
+        assert_near(score.completed, 24.0);
+        assert_near(score.hysteresis_completed, 8.0);
+        assert_near(
+            switch_margin(score.hysteresis_completed),
+            SCORE_SWITCH_MARGIN,
         );
     }
 
@@ -2233,6 +2588,177 @@ mod tests {
         assert_eq!(exploration_period(3), SCORE_EXPLORATION_MIN_PERIOD);
         assert_eq!(exploration_period(28), 56);
         assert_eq!(exploration_period(128), SCORE_EXPLORATION_MAX_PERIOD);
+    }
+
+    #[test]
+    fn cold_exploration_skips_backed_off_candidates() {
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let cold = |backed_off| ScoreSnapshot {
+            attempts: 0.0,
+            completed: 0.0,
+            hysteresis_completed: 0.0,
+            reliability: 0.0,
+            reliability_upper: 0.5,
+            useful_completed: 0.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            explore_backed_off: backed_off,
+            fail_streak: 0,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let snapshots = [cold(true), cold(false)];
+        let performance = performance_baseline(&snapshots);
+        let selection = best_index(&snapshots, &node_refs, 1, true, performance);
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.reason, SelectionReason::ColdExplore);
+
+        let snapshots = [cold(false), cold(false)];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, true, performance).index,
+            0
+        );
+
+        // All backed off: exploration skips, ranking still returns a leaf.
+        let snapshots = [cold(true), cold(true)];
+        let performance = performance_baseline(&snapshots);
+        let selection = best_index(&snapshots, &node_refs, 1, true, performance);
+        assert!(!selection.reason.is_exploration());
+        assert_eq!(selection.reason, SelectionReason::PerformanceWinner);
+    }
+
+    #[test]
+    fn consecutive_failures_exclude_leaf_from_ranking() {
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let trained = |reliability, fail_streak| ScoreSnapshot {
+            attempts: 8.0,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability,
+            reliability_upper: reliability,
+            useful_completed: 8.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            explore_backed_off: false,
+            fail_streak,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let snapshots = [trained(0.9, SCORE_FAIL_STREAK_EXCLUDE), trained(0.8, 0)];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, false, performance).index,
+            1
+        );
+        // Pinned fallback: with every candidate excluded, rank the full set.
+        let snapshots = [
+            trained(0.9, SCORE_FAIL_STREAK_EXCLUDE),
+            trained(0.8, SCORE_FAIL_STREAK_EXCLUDE),
+        ];
+        let performance = performance_baseline(&snapshots);
+        assert_eq!(
+            best_index(&snapshots, &node_refs, 1, false, performance).index,
+            0
+        );
+    }
+
+    #[test]
+    fn exploration_backoff_grows_with_failures_and_shrinks_with_success() {
+        let state = ScorePolicyState::default();
+        let leaf = node("leaf");
+        state.publish_membership([("score".into(), leaf.id)]);
+        let context = context("example.com", IpVersion::V4);
+        let attributions = [ScoreAttribution {
+            group: "score".into(),
+            node_id: leaf.id,
+        }];
+        let now = Instant::now();
+        let sample = |outcome, setup| FlowSample {
+            outcome,
+            setup,
+            first_response: None,
+            tx: 0,
+            rx: 0,
+            elapsed: Duration::ZERO,
+            count_usefulness: true,
+            streak_neutral: false,
+        };
+        let backed_off = |at: Instant| {
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, leaf.id, at).explore_backed_off
+        };
+        let fail = |at: Instant| {
+            let cells = state.start_at(&context, &attributions, at);
+            state.finish_at(
+                &context,
+                &attributions,
+                &cells,
+                &sample(ScoreOutcome::Timeout, None),
+                at,
+            );
+        };
+        let neutral = |outcome, at: Instant| {
+            let cells = state.start_at(&context, &attributions, at);
+            let mut neutral_sample = sample(outcome, None);
+            neutral_sample.streak_neutral = true;
+            state.finish_at(&context, &attributions, &cells, &neutral_sample, at);
+        };
+        let streak = |at: Instant| {
+            let inner = state.inner.lock();
+            score_snapshot(&inner, "score", &context, leaf.id, at).fail_streak
+        };
+
+        fail(now);
+        // Probe/urltest/warm outcomes never move the streak or the backoff.
+        neutral(ScoreOutcome::Success, now);
+        neutral(ScoreOutcome::Timeout, now);
+        assert_eq!(streak(now), 1);
+        assert!(backed_off(now + Duration::from_secs(1)));
+        assert!(!backed_off(
+            now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
+        ));
+
+        let second = now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(2);
+        fail(second);
+        assert!(backed_off(
+            second + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
+        ));
+        assert!(!backed_off(
+            second + SCORE_EXPLORE_BACKOFF_BASE * 2 + Duration::from_secs(1)
+        ));
+
+        let cells = state.start_at(&context, &attributions, second);
+        state.finish_at(
+            &context,
+            &attributions,
+            &cells,
+            &sample(ScoreOutcome::Success, Some(Duration::from_millis(10))),
+            second,
+        );
+        // Success steps the streak down (2 → 1), so the next failure lands
+        // back on the doubled cadence rather than the base one.
+        assert!(!backed_off(second + Duration::from_secs(1)));
+        let third = second + Duration::from_secs(2);
+        fail(third);
+        assert!(backed_off(
+            third + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
+        ));
+        assert!(!backed_off(
+            third + SCORE_EXPLORE_BACKOFF_BASE * 2 + Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -2273,6 +2799,47 @@ mod tests {
         }
 
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
+    fn periodic_exploration_prefers_reliability_upper_bound() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let candidate = |attempts, reliability_upper, selected_at| ScoreSnapshot {
+            attempts,
+            completed: 8.0,
+            hysteresis_completed: 8.0,
+            reliability: 0.2,
+            reliability_upper,
+            useful_completed: 8.0,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            selected_at,
+            explore_backed_off: false,
+            fail_streak: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let mut snapshots = vec![candidate(8.0, 0.2, 0); nodes.len()];
+        snapshots[0] = candidate(8.0, 0.9, 1);
+        snapshots[1] = candidate(1.0, 0.3, 0);
+        snapshots[2] = candidate(8.0, 0.8, 0);
+        let performance = performance_baseline(&snapshots);
+
+        let selected = best_index(
+            &snapshots,
+            &node_refs,
+            exploration_period(nodes.len()),
+            true,
+            performance,
+        );
+
+        assert_eq!(selected.index, 2);
+        assert_eq!(selected.reason, SelectionReason::PeriodicExplore);
     }
 
     #[test]
@@ -2759,25 +3326,34 @@ mod tests {
         let incumbent = ScoreSnapshot {
             attempts: 1.0,
             completed: 1.0,
+            hysteresis_completed: 1.0,
             reliability: 0.8,
+            reliability_upper: 0.8,
             useful_completed: 1.0,
             latency_ms: None,
             latency_confidence: 0.0,
             throughput: None,
             throughput_confidence: 0.0,
             failures: aged,
+            explore_backed_off: false,
+            fail_streak: 0,
             selected_at: 1,
             targeted: false,
             target_attempts: 0.0,
             target_completed: 0.0,
         };
         let challenger = ScoreSnapshot {
-            reliability: 0.805,
+            reliability: 0.8005,
+            reliability_upper: 0.8005,
             failures: 0.0,
             selected_at: 0,
             ..incumbent
         };
-        let retained = hold_decision(&incumbent, &challenger) == HoldDecision::Held;
+        let retained = hold_decision(
+            &incumbent,
+            &challenger,
+            performance_baseline(&[incumbent, challenger]),
+        ) == HoldDecision::Held;
         println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
         assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
         assert!(retained);
@@ -2867,8 +3443,12 @@ mod tests {
                 .iter()
                 .all(|score| score.completed >= MIN_TRAINED_EVIDENCE)
         );
-        assert!(utility(&snapshots[1]) > utility(&snapshots[0]));
-        assert!(utility(&snapshots[1]) - utility(&snapshots[0]) < SCORE_SWITCH_MARGIN);
+        let performance = performance_baseline(&snapshots);
+        assert!(utility(&snapshots[1], performance) > utility(&snapshots[0], performance));
+        assert!(
+            utility(&snapshots[1], performance) - utility(&snapshots[0], performance)
+                < switch_margin(snapshots[0].completed)
+        );
 
         // When: the scorer ranks the candidates.
         let selected = state.rank_at("score", &context, &node_refs, now);
@@ -2900,6 +3480,7 @@ mod tests {
             rx,
             elapsed,
             count_usefulness: true,
+            streak_neutral: false,
         };
 
         stats.record_finish(
@@ -2918,7 +3499,7 @@ mod tests {
         assert_close(stats.throughput_seconds, 4.0);
         assert_close(stats.throughput_windows, 2.0);
         let score = snapshot(&stats, now);
-        assert_close(score.throughput.unwrap(), (1.0_f64 + 49_152.0).log2());
+        assert_close(score.throughput.unwrap(), 49_152.0);
         assert_close(score.throughput_confidence, 0.25);
     }
 
@@ -3002,6 +3583,8 @@ mod tests {
             throughput_bytes: 1_000_000.0,
             throughput_seconds: 10.0,
             throughput_windows: 4.0,
+            fail_streak: 0,
+            explore_not_before: None,
             last_used: 9,
             updated_at: Some(start),
             selected_at: 0,
@@ -3057,6 +3640,7 @@ mod tests {
                     rx: u64::from(success),
                     elapsed: Duration::from_secs(1),
                     count_usefulness: true,
+                    streak_neutral: false,
                 },
                 now,
             );
@@ -3230,6 +3814,173 @@ group {
         assert_eq!(peek, nodes[0].name);
         assert_eq!(singleton_selected, singleton.id);
         assert_eq!(last_resort_selected, last_resort.id);
+    }
+
+    #[test]
+    fn switch_flap_counts_only_quick_committed_reversals() {
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let key = SelectionHistoryKey::new("score", &context);
+        let first = node("first").id;
+        let second = node("second").id;
+        let mut inner = StateInner::default();
+
+        let record = |inner: &mut StateInner, node_id, reason| {
+            ScorePolicyState::record_switch_flap(inner, &key, node_id, reason);
+        };
+        record(&mut inner, first, SelectionReason::PerformanceWinner);
+        // Exploration never touches flap history.
+        record(&mut inner, second, SelectionReason::PeriodicExplore);
+        record(&mut inner, second, SelectionReason::PerformanceWinner);
+        // Same-winner selections push the next reversal out of the window.
+        for _ in 0..SCORE_SWITCH_FLAP_WINDOW {
+            record(&mut inner, second, SelectionReason::PerformanceWinner);
+        }
+        record(&mut inner, first, SelectionReason::ReliabilityWinner);
+        record(&mut inner, second, SelectionReason::PerformanceWinner);
+
+        assert_eq!(
+            inner
+                .selection_reasons
+                .get(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+                .unwrap()
+                .switch_flap,
+            1
+        );
+    }
+
+    #[test]
+    fn switch_flap_ignores_cross_target_interleaving() {
+        let first = node("first").id;
+        let second = node("second").id;
+        let mut inner = StateInner::default();
+        let key_a = SelectionHistoryKey::new("score", &context("a.example", IpVersion::V4));
+        let key_b = SelectionHistoryKey::new("score", &context("b.example", IpVersion::V4));
+        let flap_count = |inner: &StateInner| {
+            inner
+                .selection_reasons
+                .get(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+                .map_or(0, |counts| counts.switch_flap)
+        };
+
+        // A→first, B→second, A→first: neither target reversed its own winner.
+        for (key, node_id) in [(&key_a, first), (&key_b, second), (&key_a, first)] {
+            ScorePolicyState::record_switch_flap(
+                &mut inner,
+                key,
+                node_id,
+                SelectionReason::PerformanceWinner,
+            );
+        }
+        assert_eq!(flap_count(&inner), 0);
+
+        // A same-target reversal within the window still counts.
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key_a,
+            second,
+            SelectionReason::PerformanceWinner,
+        );
+        ScorePolicyState::record_switch_flap(
+            &mut inner,
+            &key_a,
+            first,
+            SelectionReason::PerformanceWinner,
+        );
+        assert_eq!(flap_count(&inner), 1);
+    }
+
+    #[test]
+    fn applied_score_selection_records_switch_flap() {
+        let nodes = [node("first"), node("second")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".to_owned(), node.id)));
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let now = Instant::now();
+        let keys = nodes.each_ref().map(|node| AggregateKey {
+            group: "score".to_owned(),
+            network: SelectionNetwork::Tcp,
+            family: None,
+            node_id: node.id,
+        });
+        {
+            let mut inner = state.inner.lock();
+            inner
+                .aggregate
+                .put(keys[0].clone(), trained_stats(8.0, 50.0, now));
+            inner
+                .aggregate
+                .put(keys[1].clone(), trained_stats(8.0, 200.0, now));
+        }
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+
+        inner_update_response(&state, keys[0].clone(), 200.0);
+        inner_update_response(&state, keys[1].clone(), 50.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+
+        inner_update_response(&state, keys[0].clone(), 50.0);
+        inner_update_response(&state, keys[1].clone(), 200.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+        assert_eq!(
+            state
+                .selection_reason_counts("score", SelectionNetwork::Tcp)
+                .switch_flap,
+            1
+        );
+    }
+
+    #[test]
+    fn score_reload_prunes_removed_switch_history_members() {
+        let state = ScorePolicyState::default();
+        let first = node("first").id;
+        let second = node("second").id;
+        state.publish_membership([("score".to_owned(), first), ("score".to_owned(), second)]);
+        let removed_key =
+            SelectionHistoryKey::new("score", &context("removed.example", IpVersion::V4));
+        let retained_key =
+            SelectionHistoryKey::new("score", &context("retained.example", IpVersion::V6));
+        {
+            let mut inner = state.inner.lock();
+            inner.selection_history.push(
+                removed_key.clone(),
+                SelectionHistory {
+                    current: first,
+                    previous: Some(second),
+                    selections: 1,
+                    switched_at: 1,
+                },
+            );
+            inner.selection_history.push(
+                retained_key.clone(),
+                SelectionHistory {
+                    current: second,
+                    previous: Some(first),
+                    selections: 1,
+                    switched_at: 1,
+                },
+            );
+        }
+
+        state.publish_membership([("score".to_owned(), second)]);
+
+        let inner = state.inner.lock();
+        assert!(!inner.selection_history.contains(&removed_key));
+        assert_eq!(
+            inner
+                .selection_history
+                .peek(&retained_key)
+                .unwrap()
+                .previous,
+            None
+        );
     }
 
     #[test]
@@ -3594,6 +4345,7 @@ group {
             incumbent_held: u64::MAX,
             fresh_failure_bypass: u64::MAX,
             dead_filtered: u64::MAX,
+            switch_flap: u64::MAX,
         };
         stale_state.inner.lock().selection_reasons.insert(
             SelectionReasonKey::new("stale", SelectionNetwork::Tcp),
@@ -3764,6 +4516,7 @@ group {
             incumbent_held: _,
             fresh_failure_bypass: _,
             dead_filtered: _,
+            switch_flap: _,
         } = snapshot[0].tcp;
 
         let _ = manager.selection_plan_for_target(
@@ -3782,6 +4535,7 @@ group {
             incumbent_held: u64::MAX,
             fresh_failure_bypass: u64::MAX,
             dead_filtered: u64::MAX,
+            switch_flap: u64::MAX,
         };
         state.inner.lock().selection_reasons.insert(
             SelectionReasonKey::new("z-score", SelectionNetwork::Udp),
@@ -4507,6 +5261,7 @@ group {
             rx: 1,
             elapsed: Duration::from_millis(1),
             count_usefulness: true,
+            streak_neutral: false,
         };
         state.finish(
             &context,

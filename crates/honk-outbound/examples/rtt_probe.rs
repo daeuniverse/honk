@@ -26,8 +26,19 @@ async fn main() -> anyhow::Result<()> {
         name: "probe".into(),
         host: host.clone(),
         port,
-        sni: Some(sni.clone()),
-        skip_cert_verify: true,
+        outbound: honk_config::node::OutboundConfig::Hysteria2(
+            honk_config::node::Hysteria2Config {
+                quic: honk_config::node::QuicOptions {
+                    tls: honk_config::node::TlsOptions {
+                        sni: Some(sni.clone()),
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
         ..Default::default()
     };
     let config = quic::client_config(&node, &[alpn.as_bytes()], Default::default()).await?;

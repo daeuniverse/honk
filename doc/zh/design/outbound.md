@@ -149,7 +149,7 @@ pool 不会在调用方 abort 后残留。Single XUDP 没有 generation runtime�
 
 ### 拨号准入
 
-物理代理连接与协议握手获取两个 permit：
+物理出站连接（包括 direct TCP 与代理 TCP/QUIC 尝试）及其协议握手获取两个 permit：
 
 1. 捕获 generation 的配置拨号 gate；然后
 2. 所有重叠 reload generation 共享、启动时固定的进程级 ceiling。
@@ -199,6 +199,14 @@ frame 不设置 `END_STREAM`，TLS 请求使用 `:scheme: https`。DATA 携带 g
 直接调用裸 `lookup_host`。配置的 bootstrap resolver 通过带 bypass mark
 的 UDP/TCP 查询；失败时回退系统 resolver。`query_ech_config` 通过同一
 raw 路径查询 DNS HTTPS 记录（`qtype 65`），并提取 SVCB `ech` 参数。
+
+解析完成后，代理服务器 TCP 与共享 QUIC client 会稳定交错两种地址族，并且
+最多同时竞速两个地址。首个地址立即开始；fallback 在 250 ms 后启动。首个
+地址若更早失败会提前 fallback，但物理尝试之间仍至少间隔 10 ms。每个进行中
+的地址尝试分别持有 generation 与进程级拨号 permit；达到配置上限时，fallback
+必须等待先前尝试结束，因此
+`max_concurrent_dials: 1` 会串行尝试地址。竞速始终位于已经选定的同一节点
+内部：socket mark 与安全配置保持一致，QUIC 协议认证也只对胜出连接执行。
 
 ## TLS、指纹、ECH 与 pin
 
@@ -316,6 +324,12 @@ HTTP/2 flow control 驱动 backpressure。GOAWAY 使 carrier 进入 draining，
 并把新工作滚动到 replacement。driver failure 向其 child 扩散；half-close、
 reset、receive-window 释放与 lazy response error 仍按 stream 隔离。
 
+接收 credit 固定为每条 stream 2 MiB；connection credit 能为 128 条可接收
+stream 中的每一条容纳一个最大 UoT response frame（8 MiB + 256 bytes）。
+增大的 stream window 消除了长肥 TCP 路径原先每 RTT 只能推进一个 datagram
+的上限。per-stream 上限防止一条未读取的 child 耗尽全部 connection credit；
+aggregate 上限则保证交错的最大 UDP frame 都能完成。
+
 ### Mux.Cool 与 XUDP
 
 Mux.Cool 发送 Xray VLESS mux command，并复用 child TCP 与 XUDP record。
@@ -325,6 +339,10 @@ Mux.Cool 发送 Xray VLESS mux command，并复用 child TCP 与 XUDP record。
 pool 最多接收两条 active carrier，每条最多 128 个 child。Draining carrier
 不占 active cap，但会为现有 child 保持存活。饱和时等待容量，而不是绕过
 pool。
+
+接收 payload 共用每条 carrier 8 MiB 的预算。TCP delivery 会为瞬时预算或
+队列压力保留 100 ms，超时后只 reset 停滞的 child；UDP 仍在队列满时丢包。
+这既容忍线速调度 burst，也避免未读取的 child 无限期阻塞 carrier。
 
 XUDP reply metadata 可以改变逻辑 peer，因此支持 full-cone 回包源地址。
 池化 Mux.Cool packet 上限为 8 KiB。Single XUDP 在专用、不入池的 carrier
@@ -445,6 +463,11 @@ AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spre
 least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每条代理 flow
 各执行一次物理连接。
 
+协商 v2 server settings 后，每个复用逻辑 stream（SID 2 及以后）都必须在三秒内
+收到 SYNACK。每次新建 stream 会替换前一个 deadline，任意 SYNACK 都会清除它，
+与 sing-anytls 一致。deadline 到期会退役物理 session，让 pool 重新拨号，而不是
+继续复用无响应的 carrier。
+
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor 与 idle timeout 输入同一个节点局部 janitor。Selector 或
 UDP warm 所有权分别提高有效保留值；最后一个所有者释放时只排干未来复用，
@@ -452,9 +475,10 @@ UDP warm 所有权分别提高有效保留值；最后一个所有者释放时�
 
 ### 有序 write 路径
 
-所有 frame 都通过一个 `WriterQueue` 与一个物理 writer task。Data 使用
-有界 permit；control frame 保留 queue headroom。stream 的 SYN 与第一个
-PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。
+所有 frame 都通过一个 `WriterQueue` 与一个物理 writer task。Data 使用有界
+permit，control frame 保留 queue headroom，整个 queue 封顶 1,024 个 frame。
+queue 耗尽时 session 会转为 terminal，而不会继续增长内存。stream 的 SYN 与
+第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。
 
 完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 64
 frame 或 256 KiB，再执行一次 `write_all` 与一次 `flush`。它绝不等待

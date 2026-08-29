@@ -91,6 +91,27 @@ fn data_directory_change_requires_restart() {
         vec!["global.data_dir"]
     );
 }
+
+#[test]
+fn external_ui_download_settings_require_restart() {
+    let current = Config::default();
+    let mut replacement = current.clone();
+    replacement.experimental.clash_api.external_ui_download_url =
+        "https://example.com/ui.zip".into();
+    replacement
+        .experimental
+        .clash_api
+        .external_ui_download_detour = "proxy".into();
+
+    assert_eq!(
+        restart_required_changes(&current, &replacement),
+        vec![
+            "experimental.clash_api.external_ui_download_url",
+            "experimental.clash_api.external_ui_download_detour"
+        ]
+    );
+}
+
 #[test]
 fn log_file_change_requires_restart() {
     let current = Config::default();
@@ -257,6 +278,16 @@ async fn test_cp() -> ControlPlane {
         test_dns_forwarder(),
     )
     .unwrap();
+    let initial_plan = control_plane.active_routing_plan.read().clone();
+    routing_matcher::RoutingMatcherBuilder::push_plan(
+        &mut **control_plane.ebpf.write().await,
+        &initial_plan,
+    )
+    .unwrap();
+    routing_matcher::RoutingMatcherBuilder::activate_projection(&initial_plan);
+    control_plane
+        .routing_publication_dirty
+        .store(false, std::sync::atomic::Ordering::Release);
     control_plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
         crate::mode::ModeState::new("Rule", "Proxy"),
     )));
@@ -268,11 +299,30 @@ async fn test_cp() -> ControlPlane {
     control_plane
 }
 
+fn changed_routing_config() -> Config {
+    let mut config = Config::default();
+    config
+        .routing
+        .rules
+        .push(honk_config::routing::RoutingRule {
+            name: "reload-change".into(),
+            condition: honk_config::routing::RoutingCondition {
+                domain: vec!["reload.example".into()],
+                ..Default::default()
+            },
+            outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        });
+    config
+}
+
 fn score_reload_config(interval: u64) -> Config {
     let nodes = ["score-a", "score-b"].map(|name| Node {
         id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     });
@@ -303,7 +353,7 @@ fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
 
 #[tokio::test]
 async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
-    let cp = test_cp().await;
+    let cp = Arc::new(test_cp().await);
     let first_interval = Config::default().global.check_interval_secs + 1;
     assert!(
         cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new(),)
@@ -314,7 +364,9 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
     let old_manager = cp.group_manager.read().clone();
     let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_at_hook = Arc::clone(&observed);
+    let lock_at_hook = Arc::clone(&cp);
     let _hook_guard = cp.set_pre_dns_publication_hook(move |new_manager| {
+        assert!(lock_at_hook.reload_lock.try_lock().is_err());
         let first = new_manager.selection_plan_for_target("score", &score_reload_context());
         let first_id = first.entries[0].node.id;
         let reporter = first.entries[0].feedback.as_ref().unwrap().start();
@@ -519,7 +571,7 @@ async fn empty_subscription_merge_does_not_publish_runtime() {
 async fn reload_clamps_dials_to_startup_descriptor_reservation() {
     let cp = test_cp().await;
     let ceiling = cp.resource_budget.transient_dials;
-    let mut config = cp.config_handle().read().await.clone();
+    let mut config = cp.config_handle().read().await.as_ref().clone();
     config.global.max_concurrent_dials = usize::MAX;
 
     assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
@@ -793,30 +845,210 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     assert!(pool.is_empty());
 }
 
-/// A valid reload commits: config is swapped and eBPF routing is pushed.
+/// A non-routing reload publishes a fresh DNS generation without rewriting
+/// the static routing bank or retaining its generation-owned upstream pool.
 #[tokio::test]
 async fn valid_reload_commits() {
     let expected_interval = Config::default().global.check_interval_secs + 1;
     let cp = test_cp().await;
+    let before_routing_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
     let before_runtime = cp.dns_controller.runtime_provider().acquire();
     let cache = before_runtime.runtime().cache();
+    let before_forwarder = Arc::clone(before_runtime.runtime().forwarder());
+    let before_dns_router = before_forwarder.routing_snapshot();
+    let before_upstream_pool = Arc::clone(&before_forwarder.upstream_pool);
     assert_eq!(
         before_runtime.runtime().routing_projection().generation(),
         0
     );
     drop(before_runtime);
+
     let mut good = Config::default();
     good.global.check_interval_secs = expected_interval;
-    let drain = DrainTracker::new();
-    cp.apply_runtime_config(good, &drain).await;
+    assert!(cp.apply_runtime_config(good, &DrainTracker::new()).await);
+
     assert_eq!(
         cp.config_handle().read().await.global.check_interval_secs,
         expected_interval,
         "valid reload should swap the live config"
     );
+    assert_eq!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        before_routing_generation,
+    );
     let after_runtime = cp.dns_controller.runtime_provider().acquire();
+    let after_forwarder = Arc::clone(after_runtime.runtime().forwarder());
     assert!(Arc::ptr_eq(&after_runtime.runtime().cache(), &cache));
     assert_eq!(after_runtime.runtime().routing_projection().generation(), 1);
+    assert!(!Arc::ptr_eq(&before_forwarder, &after_forwarder));
+    assert!(Arc::ptr_eq(
+        &before_dns_router,
+        &after_forwarder.routing_snapshot()
+    ));
+    assert!(!Arc::ptr_eq(
+        &before_upstream_pool,
+        &after_forwarder.upstream_pool
+    ));
+}
+
+#[tokio::test]
+async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing() {
+    let cp = test_cp().await;
+    assert!(
+        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+            .await
+    );
+    let config = cp.config_handle().read().await.as_ref().clone();
+    let dns_generation = cp
+        .dns_controller
+        .runtime_provider()
+        .current_generation()
+        .get();
+    let routing_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let forwarder = cp.dns_controller.forwarder();
+    let cache = forwarder.cache();
+    let group_manager = cp.group_manager.read().clone();
+    let runtime_registry = cp.runtime_registry.read().clone();
+    let routing_plan = cp.active_routing_plan.read().clone();
+    cp.ebpf.write().await.clear_datapath_flags_write_log();
+    let drain = DrainTracker::new();
+
+    assert!(cp.apply_runtime_config(config, &drain).await);
+
+    assert_eq!(
+        cp.dns_controller
+            .runtime_provider()
+            .current_generation()
+            .get(),
+        dns_generation
+    );
+    assert_eq!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        routing_generation
+    );
+    assert!(cp.ebpf.read().await.datapath_flags_write_log().is_empty());
+    assert!(Arc::ptr_eq(&cp.dns_controller.forwarder(), &forwarder));
+    assert!(Arc::ptr_eq(&cp.dns_controller.forwarder().cache(), &cache));
+    assert!(Arc::ptr_eq(&cp.group_manager.read(), &group_manager));
+    assert!(Arc::ptr_eq(&cp.runtime_registry.read(), &runtime_registry));
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read(), &routing_plan));
+    assert!(!drain.should_reject());
+}
+
+#[tokio::test]
+async fn router_only_semantic_reload_fences_sniffed_bitmap_writers() {
+    let cp = test_cp().await;
+    let mut first = changed_routing_config();
+    first.routing.rules[0].condition.domain = vec!["first.example".into()];
+    assert!(
+        cp.apply_runtime_config(first.clone(), &DrainTracker::new())
+            .await
+    );
+    let ebpf_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let bitmap_generation =
+        routing_matcher::DOMAIN_BITMAPS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+
+    first.routing.rules[0].condition.domain = vec!["second.example".into()];
+    assert!(cp.apply_runtime_config(first, &DrainTracker::new()).await);
+
+    assert_eq!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        ebpf_generation,
+        "equal eBPF plan bytes should not flip the map bank"
+    );
+    assert!(
+        routing_matcher::DOMAIN_BITMAPS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+            > bitmap_generation,
+        "replacing the userspace Router must fence stale bitmap writers"
+    );
+}
+#[tokio::test]
+async fn identical_subscription_merge_skips_runtime_generation() {
+    let subscription_id = uuid::Uuid::new_v4();
+    let mut node = Node {
+        name: "subscription-node".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+        address: "127.0.0.1:1080".into(),
+        subscription_id: Some(subscription_id),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+
+    let cp = test_cp().await;
+    let mut initial = Config::default();
+    initial.nodes.push(node.clone());
+    assert!(cp.apply_runtime_config(initial, &DrainTracker::new()).await);
+    let before = cp
+        .dns_controller
+        .runtime_provider()
+        .current_generation()
+        .get();
+
+    let mut fetched = node;
+    fetched.created_at += chrono::Duration::seconds(1);
+    fetched.updated_at += chrono::Duration::seconds(1);
+    cp.merge_subscription_nodes(subscription_id, vec![fetched])
+        .await;
+
+    assert_eq!(
+        cp.dns_controller
+            .runtime_provider()
+            .current_generation()
+            .get(),
+        before,
+        "identical effective subscription data must not publish a generation"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_reload_retries_dirty_startup_routing() {
+    let cp = test_cp().await;
+    let before = cp.ebpf.read().await.active_routing_generation().unwrap();
+    cp.routing_publication_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    assert!(
+        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+            .await
+    );
+    assert_ne!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        before
+    );
+    assert!(
+        !cp.routing_publication_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+#[tokio::test]
+async fn changed_hosts_file_rebuilds_reload_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("hosts.rules");
+    std::fs::write(&path, "full:reload.invalid 192.0.2.1\n").unwrap();
+    let cp = test_cp().await;
+    let mut config = Config::default();
+    config.dns.hosts = vec![path.to_string_lossy().into_owned()];
+
+    assert!(
+        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+            .await
+    );
+    let first_forwarder = cp.dns_controller.forwarder();
+    let first = first_forwarder.hosts_snapshot();
+    let first_hosts = first.hosts().unwrap();
+    let first_policy = first_forwarder.policy_id().unwrap();
+    let cache = first_forwarder.cache();
+
+    std::fs::write(&path, "full:reload.invalid 192.0.2.2\n").unwrap();
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    let second_forwarder = cp.dns_controller.forwarder();
+    let second = second_forwarder.hosts_snapshot();
+
+    assert_ne!(first.fingerprint(), second.fingerprint());
+    assert!(!Arc::ptr_eq(&first_hosts, &second.hosts().unwrap()));
+    assert_ne!(first_policy, second_forwarder.policy_id().unwrap());
+    assert!(Arc::ptr_eq(&cache, &second_forwarder.cache()));
 }
 
 #[tokio::test]
@@ -840,8 +1072,14 @@ async fn client_subnet_reload_injects_upstream_query() {
     let expected_policy = crate::dns::policy::PolicyId::from_config(&config.dns).unwrap();
     let runtime = cp.dns_controller.runtime_provider().acquire();
     assert_eq!(
-        runtime.runtime().forwarder().policy_id.as_ref(),
-        Some(&expected_policy)
+        runtime
+            .runtime()
+            .forwarder()
+            .policy_id
+            .as_ref()
+            .unwrap()
+            .canonical_bytes(),
+        expected_policy.canonical_bytes()
     );
     let forwarder = Arc::clone(runtime.runtime().forwarder());
     drop(runtime);
@@ -874,7 +1112,7 @@ async fn routing_push_failure_replays_old_plan_and_keeps_userspace_generation() 
         .await
         .inject_routing_fault(RoutingPushPhase::Meta, 1)
         .unwrap();
-    let mut replacement = Config::default();
+    let mut replacement = changed_routing_config();
     replacement.global.check_interval_secs += 1;
 
     cp.apply_runtime_config(replacement, &DrainTracker::new())
@@ -897,7 +1135,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
         .await
         .inject_routing_fault(RoutingPushPhase::DomainRouting, 1)
         .unwrap();
-    let mut replacement = Config::default();
+    let mut replacement = changed_routing_config();
     replacement.global.check_interval_secs += 1;
 
     cp.apply_runtime_config(replacement, &DrainTracker::new())
@@ -923,7 +1161,7 @@ async fn replay_failure_marks_unhealthy_and_rejects_connections() {
         .inject_routing_fault(RoutingPushPhase::Meta, 2)
         .unwrap();
 
-    cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+    cp.apply_runtime_config(changed_routing_config(), &DrainTracker::new())
         .await;
 
     assert!(!cp.is_datapath_healthy());
@@ -967,8 +1205,8 @@ fn selector_warm_candidates_follow_configured_leaves_and_deduplicate() {
     let node = |name: &str, protocol| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol,
         address: "127.0.0.1:9".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         ..Default::default()
     };
     let anytls = node("selector-anytls", NodeProtocol::AnyTLS);
@@ -1028,7 +1266,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     let first = Node {
         id: uuid::Uuid::new_v4(),
         name: "selector-first".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: first_addr.clone(),
         host: first_socket.ip().to_string(),
         port: first_socket.port(),
@@ -1037,7 +1275,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "selector-second".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: second_addr.clone(),
         host: second_socket.ip().to_string(),
         port: second_socket.port(),
@@ -1064,7 +1302,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
         vec![first.id]
     );
     let cp = test_cp().await;
-    *cp.config.write().await = config;
+    *cp.config.write().await = Arc::new(config);
     *cp.group_manager.write() = Arc::clone(&manager);
     *cp.runtime_registry.write() = Arc::clone(&generation);
     install_selector_warm_callback(&manager, &cp.selector_warm_notify);
@@ -1111,7 +1349,7 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "selector-moved".into(),
-        protocol: NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: old_addr.clone(),
         host: old_socket.ip().to_string(),
         port: old_socket.port(),
@@ -1167,8 +1405,8 @@ fn udp_warm_candidates_only_use_authoritative_group_leaves() {
     let node = |name: &str, protocol| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol,
         address: "127.0.0.1:9".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         ..Default::default()
     };
     let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS);
@@ -1239,7 +1477,9 @@ fn udp_warm_candidates_bound_capacity_and_exclude_explicitly_dead_udp_leaves() {
     let node = |name: &str| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol: honk_config::types::NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::AnyTLS,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -1298,7 +1538,9 @@ fn udp_warm_candidates_enforce_a_process_wide_latency_ordered_cap() {
             let node = Node {
                 id: uuid::Uuid::new_v4(),
                 name: format!("n{g}-{i}"),
-                protocol: honk_config::types::NodeProtocol::AnyTLS,
+                outbound: honk_config::node::OutboundConfig::from_protocol(
+                    honk_config::types::NodeProtocol::AnyTLS,
+                ),
                 address: "127.0.0.1:9".into(),
                 ..Default::default()
             };
@@ -1341,7 +1583,9 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
     let node = |name: &str| Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol: honk_config::types::NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::AnyTLS,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -1444,7 +1688,9 @@ async fn udp_warm_coordinator_limits_concurrency_and_keeps_shutdown_errors_neutr
         .map(|n| Node {
             id: uuid::Uuid::new_v4(),
             name: format!("node-{n}"),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
             address: "127.0.0.1:9".into(),
             ..Default::default()
         })
@@ -1527,7 +1773,9 @@ async fn udp_warm_dispatch_metrics_distinguish_live_and_terminal_errors_and_pani
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "warm-node".into(),
-        protocol: honk_config::types::NodeProtocol::Socks5,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };
@@ -1624,7 +1872,9 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "warm-node".into(),
-        protocol: honk_config::types::NodeProtocol::AnyTLS,
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::AnyTLS,
+        ),
         address: "127.0.0.1:9".into(),
         ..Default::default()
     };

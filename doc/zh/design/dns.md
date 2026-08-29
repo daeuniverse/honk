@@ -177,10 +177,10 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | TCP | RFC 7766 空闲 stream 池。 | 支持经所选节点或组叶子。 |
 | DoT | 空闲 TLS stream 池。 | 支持经代理 TCP 基础 stream。 |
 | DoH | 一个长生命周期、可复用并发请求的 HTTP/2-only TLS session。 | 支持经代理 TCP 基础 stream。 |
-| DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 仅直连。 |
-| DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | 仅直连。 |
+| DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 支持经所选叶节点的 `PacketTransport`。 |
+| DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | 支持经所选叶节点的 `PacketTransport`。 |
 
-DoQ 与 DoH3 目前仅支持直连，因为它们的客户端会在带 bypass mark 的原生 UDP socket 上创建 quinn endpoint，而 DNS 代理拨号路径当前只提供 boxed TCP 字节流；QUIC 无法运行在这种 stream 上。代理支持需要把所选出站的 `PacketTransport` 适配到 quinn 的 `AsyncUdpSocket` 接口，并保留 datagram 边界、地址元数据、MTU 行为、generation 所有权、重连与关闭语义。在该适配层完成前，选到代理的 DoQ/DoH3 上游会在拨号前失败，而不会静默绕过所选路由；需要代理加密 DNS 时应使用 DoT 或 DoH。
+代理 DoQ 与 DoH3 会把 generation 固定的叶节点 `PacketTransport` 适配为 quinn `AsyncUdpSocket`。每个池化 QUIC connection 或 HTTP/3 session 持有一个有界 adapter 与 client endpoint，直到 retry 或 shutdown 将其关闭；datagram 边界和 peer 元数据保持不变，内层 QUIC payload 上限为 1252 bytes。缺少代理 registry 或 packet capability 时会 fail closed，不会绕过为直连。直连 QUIC 仍复用带 bypass mark 的原生 endpoint。
 
 `-> node-or-group` 强制选择一个由 generation 固定的拨号叶子。没有显式目标时，上游 endpoint 经过固定的流量 Router 与组快照。UDP+代理有意使用 TCP-DNS；此策略独立于普通代理 UDP 流量使用的 SOCKS5 RFC 1928 UDP transport。
 

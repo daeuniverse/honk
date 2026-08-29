@@ -5,6 +5,8 @@
 //! - `alive` — Per-protocol-per-IP-version alive detection with exponential backoff
 //! - `group` — Node group manager with load balancing policies
 
+mod address_race;
+
 pub mod alive;
 pub mod bootstrap;
 pub mod descriptor;

@@ -426,7 +426,7 @@ impl TcpOutbound for VmessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.password.as_deref().unwrap_or("");
+        let password = node.vmess().unwrap().uuid.as_deref().unwrap_or("");
         let uuid = uuid::Uuid::parse_str(password)
             .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
         let uuid_bytes = uuid.as_bytes();
@@ -443,7 +443,7 @@ impl TcpOutbound for VmessHandler {
         tcp: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.password.as_deref().unwrap_or("");
+        let password = node.vmess().unwrap().uuid.as_deref().unwrap_or("");
         let uuid = uuid::Uuid::parse_str(password)
             .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
         let uuid_bytes = uuid.as_bytes();
@@ -982,13 +982,18 @@ mod tests {
 
         let node = Node {
             name: "vmess-ws".into(),
-            protocol: NodeProtocol::VMess,
-            address: format!("127.0.0.1:{}", port),
+            address: format!("127.0.0.1:{port}"),
             host: "127.0.0.1".into(),
             port,
-            password: Some(uuid_str.into()),
-            transport: "ws".into(),
-            ws_path: Some("/vmess".into()),
+            outbound: honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+                uuid: Some(uuid_str.into()),
+                transport: honk_config::node::StreamTransportOptions {
+                    transport: "ws".into(),
+                    ws_path: Some("/vmess".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();

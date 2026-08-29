@@ -46,7 +46,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `username` / `password` | string? | null | Authentication, UUID, or secret from userinfo |
 | `encryption` | string? | null | SS/VMess cipher or VLESS Encryption client string |
 | `vless_mode` | `WireMode` | `legacy` | `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, or `mux-cool` |
-| `plugin` / `plugin_opts` | string? | null | SIP002 plugin name/options (`plugin`, `plugin-opts`) |
+| `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, VLESS historically defaults on |
 | `sni` | string? | null | TLS server name from `sni`, or an unconsumed `host` query |
@@ -82,6 +82,10 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `created_at` / `updated_at` | datetime | now | Runtime metadata |
 
 Validation requires every non-built-in node to have a non-empty name and either `address` or `host`.
+
+### Structured-loader compatibility
+
+TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol`; non-default fields left over from other protocols are stripped without rejecting the node, and one warning lists the stripped field names. For example, `tls: true` on an `ss` node is ignored with a warning rather than enabling TLS. `username` is not a credential alias for Trojan, VLESS, Hysteria2, or AnyTLS; when supplied without that protocol's effective credential field, it is stripped with a targeted warning, preserving legacy behavior and IDs. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
 
 ## Protocols
 

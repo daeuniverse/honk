@@ -13,6 +13,7 @@ Start from the root [README.md](../README.md) for a project overview. New to the
 | Document | English | 中文 |
 | ---------- | --------- | ------ |
 | Configuration guide | [en/configuration.md](./en/configuration.md) | [zh/configuration.md](./zh/configuration.md) |
+| Startup guide | [en/how-to-start.md](./en/how-to-start.md) | [zh/how-to-start.md](./zh/how-to-start.md) |
 
 ## Design / 设计
 

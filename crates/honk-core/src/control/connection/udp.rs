@@ -248,6 +248,17 @@ impl ControlPlaneHandle {
                         self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
                             .await;
                     }
+                    info!(
+                        network = "udp",
+                        outbound = %outbound_name,
+                        ip = %original_dst,
+                        src = %client_addr,
+                        sniffed = quic_domain.as_deref().unwrap_or(""),
+                        ebpf_offload = true,
+                        "UDP offloaded to eBPF: {} -> {}",
+                        client_addr,
+                        original_dst,
+                    );
                     return Ok(());
                 }
                 "block" => {
@@ -497,39 +508,42 @@ impl ControlPlaneHandle {
         ));
         endpoint.record_pending_reply_peer(relay_addr);
 
-        let conn_id = uuid::Uuid::new_v4().to_string();
-        let (rule, rule_payload) = matched_rule
-            .clone()
-            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-        let chains = connection_chains(selection_chain, &node.name);
-        let (conn_upload, conn_download) = endpoint.byte_counters();
-        self.connection_tracker
-            .register(crate::connection_tracker::ConnectionEntry {
-                id: conn_id.clone(),
+        let tracker_id = if let Some(conn_id) = self.connection_tracker.register_if_enabled(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let (rule, rule_payload) =
+                matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+            let (upload, download) = endpoint.byte_counters();
+            crate::connection_tracker::ConnectionEntry {
+                id,
                 source: client_addr.to_string(),
                 destination: original_dst.to_string(),
                 proxy: node.name.clone(),
                 rule,
                 rule_payload,
-                chains,
-                upload: conn_upload,
-                download: conn_download,
+                chains: connection_chains(selection_chain, &node.name),
+                upload,
+                download,
                 start_time: std::time::Instant::now(),
                 domain: quic_domain.clone(),
                 network: "udp".to_string(),
                 process: handoff.as_ref().and_then(|ho| ho.process_name()),
                 process_path: None,
-            });
-        endpoint.set_tracker(conn_id.clone());
-        if !lease.set_tracker_id(conn_id.clone()) {
-            // The generation was cancelled between route selection and
-            // registration. No pool entry owns this tracker, so retire it
-            // directly rather than leaking it.
-            self.connection_tracker.remove(&conn_id);
-            return Err(anyhow::anyhow!(
-                "UDP initializer generation was cancelled before tracker attachment"
-            ));
-        }
+            }
+        }) {
+            endpoint.set_tracker(conn_id.clone());
+            if !lease.set_tracker_id(conn_id.clone()) {
+                // The generation was cancelled between route selection and
+                // registration. No pool entry owns this tracker, so retire it
+                // directly rather than leaking it.
+                self.connection_tracker.remove(&conn_id);
+                return Err(anyhow::anyhow!(
+                    "UDP initializer generation was cancelled before tracker attachment"
+                ));
+            }
+            Some(conn_id)
+        } else {
+            None
+        };
 
         let queue_rx = match follower_rx {
             // Already taken while collecting a fragmented ClientHello.
@@ -565,16 +579,26 @@ impl ControlPlaneHandle {
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;
         driver.start_with_followers(first, sniffed_followers)?;
-        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
+        if let Some(conn_id) = tracker_id {
+            self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
+        }
         if let Err(error) = driver.wait_first_ack().await {
             // First-send failures are terminal for this endpoint; once the
             // transport call starts, the packet is never replayed.
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
-        debug!(
-            "Proxying UDP {} -> {} via {} (endpoint driver ready)",
-            client_addr, original_dst, node.name
+        info!(
+            network = "udp",
+            outbound = %outbound_name,
+            dialer = %node.name,
+            sniffed = quic_domain.as_deref().unwrap_or(""),
+            ip = %original_dst,
+            src = %client_addr,
+            "UDP connection: {} -> {} via {} (endpoint driver ready)",
+            client_addr,
+            original_dst,
+            node.name,
         );
         Ok(())
     }

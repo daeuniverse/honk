@@ -11,7 +11,6 @@
 use std::time::Duration;
 
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use honk_outbound::proxy::TcpOutbound;
 use honk_outbound::proxy::vmess::VmessHandler;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,16 +22,24 @@ const UUID_WS: &str = "216b9040-3f89-4103-b4d6-5f013ee0b1c4";
 fn node(host: &str, port: u16, uuid: &str, ws_tls: bool) -> Node {
     Node {
         name: format!("lab59-{port}"),
-        protocol: NodeProtocol::VMess,
         address: format!("{host}:{port}"),
         host: host.into(),
         port,
-        password: Some(uuid.into()),
-        transport: if ws_tls { "ws".into() } else { "tcp".into() },
-        tls: ws_tls,
-        sni: ws_tls.then(|| "test.local".into()),
-        skip_cert_verify: ws_tls,
-        ws_path: ws_tls.then(|| "/vmess".into()),
+        outbound: honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some(uuid.into()),
+            transport: honk_config::node::StreamTransportOptions {
+                transport: if ws_tls { "ws".into() } else { "tcp".into() },
+                ws_path: ws_tls.then(|| "/vmess".into()),
+                ..Default::default()
+            },
+            tls: honk_config::node::TlsOptions {
+                enabled: ws_tls,
+                sni: ws_tls.then(|| "test.local".into()),
+                skip_cert_verify: ws_tls,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }

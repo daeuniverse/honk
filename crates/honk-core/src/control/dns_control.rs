@@ -152,18 +152,22 @@ impl DnsController {
         }
     }
 
-    pub(crate) fn update_projection_snapshot(
-        &self,
-        snapshot: Arc<crate::dns::projection::RoutingProjectionSnapshot>,
-    ) {
-        self.routing_projection.update_snapshot(snapshot);
-    }
-
+    #[cfg(test)]
     pub(crate) fn project_routes(
         &self,
         snapshot: &crate::dns::projection::RoutingProjectionSnapshot,
     ) -> Vec<(std::net::IpAddr, honk_ebpf_common::DomainRouting)> {
         self.routing_projection.project(snapshot)
+    }
+
+    pub(crate) fn forwarder(&self) -> Arc<crate::dns::forwarder::DnsForwarder> {
+        self.dns_service.forwarder()
+    }
+
+    pub(crate) fn prepare_projection_publication(
+        &self,
+    ) -> crate::dns::projection::PreparedProjectionPublication<'_> {
+        self.routing_projection.prepare_snapshot_publication()
     }
 
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {

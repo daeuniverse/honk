@@ -126,7 +126,7 @@ async fn urltest_node_impl(
     } else {
         timeout
     };
-    if node.protocol == honk_config::types::NodeProtocol::Direct {
+    if node.protocol() == honk_config::types::NodeProtocol::Direct {
         let (host, port, is_https) = parse_url_host_port(url)?;
         let addr = {
             let hook = URLTEST_RESOLVER.read().clone();
@@ -154,16 +154,18 @@ async fn urltest_node_impl(
             let target = host
                 .parse::<std::net::IpAddr>()
                 .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
-            manager.feedback_for_node(
-                node.id,
-                ScoreSelectionContext {
-                    network: SelectionNetwork::Tcp,
-                    probe_domain: ProbeDomain::Tcp,
-                    target_family: Some(family),
-                    health_family: family,
-                    target: Some(target),
-                },
-            )
+            manager
+                .feedback_for_node(
+                    node.id,
+                    ScoreSelectionContext {
+                        network: SelectionNetwork::Tcp,
+                        probe_domain: ProbeDomain::Tcp,
+                        target_family: Some(family),
+                        health_family: family,
+                        target: Some(target),
+                    },
+                )
+                .map(|feedback| feedback.streak_neutral())
         });
         return measure_head_exchange(
             runtime,
@@ -202,16 +204,18 @@ async fn urltest_node_impl(
         let target = host
             .parse::<std::net::IpAddr>()
             .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
-        manager.feedback_for_node(
-            node.id,
-            ScoreSelectionContext {
-                network: SelectionNetwork::Tcp,
-                probe_domain: ProbeDomain::Tcp,
-                target_family: Some(family),
-                health_family: family,
-                target: Some(target),
-            },
-        )
+        manager
+            .feedback_for_node(
+                node.id,
+                ScoreSelectionContext {
+                    network: SelectionNetwork::Tcp,
+                    probe_domain: ProbeDomain::Tcp,
+                    target_family: Some(family),
+                    health_family: family,
+                    target: Some(target),
+                },
+            )
+            .map(|feedback| feedback.streak_neutral())
     });
     measure_head_exchange(
         runtime,
@@ -284,44 +288,49 @@ async fn urltest_node_in_generation_impl(
         timeout
     };
     let (runtime, guard) = probe_runtime(generation, node);
-    let result = async {
-        if !runtime.is_warm_or_stateless() {
-            let warm_reporter = start_feedback(group_manager.and_then(|manager| {
-                manager.feedback_for_node(
-                    node.id,
-                    ScoreSelectionContext::aggregate(
-                        SelectionNetwork::Tcp,
-                        ProbeDomain::Tcp,
-                        IpVersion::V4,
-                    ),
-                )
-            }));
-            let warmed = match warmable {
-                Some(warmable) => {
-                    warmable
-                        .warm(
-                            Arc::clone(&runtime),
-                            timeout,
-                            crate::proxy::WarmRequirement::Session,
+    let result = generation
+        .scope_dials(async {
+            if !runtime.is_warm_or_stateless() {
+                let warm_reporter = start_feedback(group_manager.and_then(|manager| {
+                    manager
+                        .feedback_for_node(
+                            node.id,
+                            ScoreSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                IpVersion::V4,
+                            ),
                         )
-                        .await
-                }
-                None => Err(anyhow!("no warm handler for node '{}'", node.name)),
-            };
-            match warmed {
-                Ok(()) => {
-                    reporter_setup(&warm_reporter);
-                    reporter_success(&warm_reporter);
-                }
-                Err(error) => {
-                    reporter_error(&warm_reporter, &error);
-                    return Err(error);
+                        .map(|feedback| feedback.streak_neutral())
+                }));
+                let warmed = match warmable {
+                    Some(warmable) => {
+                        crate::runtime::capture_dial_admission()
+                            .scope(warmable.warm(
+                                Arc::clone(&runtime),
+                                timeout,
+                                crate::proxy::WarmRequirement::Session,
+                            ))
+                            .await
+                    }
+                    None => Err(anyhow!("no warm handler for node '{}'", node.name)),
+                };
+                match warmed {
+                    Ok(()) => {
+                        reporter_setup(&warm_reporter);
+                        if let Some(reporter) = &warm_reporter {
+                            reporter.finish_setup_only();
+                        }
+                    }
+                    Err(error) => {
+                        reporter_error(&warm_reporter, &error);
+                        return Err(error);
+                    }
                 }
             }
-        }
-        urltest_node_impl(&runtime, handler, url, timeout, group_manager).await
-    }
-    .await;
+            urltest_node_impl(&runtime, handler, url, timeout, group_manager).await
+        })
+        .await;
     if let Some(guard) = guard {
         guard.close().await;
     }
@@ -359,8 +368,8 @@ async fn measure_head_exchange(
     let reporter = start_feedback(feedback);
     let timed = async {
         let mut start = Instant::now();
-        let proxy = match handler
-            .dial_runtime(Arc::clone(runtime), addr, target_domain, timeout)
+        let proxy = match crate::runtime::capture_dial_admission()
+            .scope(handler.dial_runtime(Arc::clone(runtime), addr, target_domain, timeout))
             .await
         {
             Ok(proxy) => proxy,
@@ -371,7 +380,7 @@ async fn measure_head_exchange(
         };
         reporter_setup(&reporter);
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
-        if matches!(node.protocol, honk_config::types::NodeProtocol::Hysteria2) {
+        if matches!(node.protocol(), honk_config::types::NodeProtocol::Hysteria2) {
             start = Instant::now();
         }
         let stream = proxy.stream;
@@ -549,7 +558,7 @@ async fn urltest_group_impl(
         let group_manager = group_manager.clone();
         join_set.spawn(async move {
             let _permit = permit.acquire_owned().await;
-            let result = match registry.find(node.protocol) {
+            let result = match registry.find(node.protocol()) {
                 Some(entry) => {
                     urltest_node_in_generation_impl(
                         &generation,
@@ -562,7 +571,7 @@ async fn urltest_group_impl(
                     )
                     .await
                 }
-                None => Err(anyhow!("no handler for protocol {:?}", node.protocol)),
+                None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
             match &result {
                 Ok(latency) => alive_set.record_probe_latency(
@@ -762,7 +771,7 @@ mod tests {
         Node {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            protocol: NodeProtocol::Socks5,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             ..Default::default()
         }
     }
@@ -813,9 +822,9 @@ mod tests {
 
     fn reusable_node(name: &str, protocol: NodeProtocol) -> Node {
         let mut node = make_node(name);
-        node.protocol = protocol;
-        if protocol == NodeProtocol::VLess {
-            node.vless_mode = honk_config::node::WireMode::H2mux;
+        node.outbound = honk_config::node::OutboundConfig::from_protocol(protocol);
+        if let Some(vless) = node.vless_mut() {
+            vless.mode = honk_config::node::WireMode::H2mux;
         }
         node
     }
@@ -1127,7 +1136,7 @@ mod tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "hysteria2".into(),
-            protocol: NodeProtocol::Hysteria2,
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Hysteria2),
             ..Default::default()
         };
         let elapsed = urltest_node_addr(
@@ -1342,7 +1351,9 @@ mod direct_urltest_tests {
         });
         let node = Node {
             name: honk_config::Config::BUILTIN_DIRECT_NODE.to_string(),
-            protocol: honk_config::types::NodeProtocol::Direct,
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Direct,
+            ),
             ..Default::default()
         };
         let handler = crate::proxy::direct::DirectHandler::new();

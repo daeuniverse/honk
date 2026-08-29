@@ -9,7 +9,6 @@ use honk_outbound::group::{
     GroupManager, ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
 };
 use uuid::Uuid;
-
 fn node(name: &str) -> Node {
     Node {
         id: Uuid::new_v5(&NODE_ID_NAMESPACE, name.as_bytes()),
@@ -56,6 +55,13 @@ fn bench_group_selection(c: &mut Criterion) {
         target: Some(ScoreTarget::domain("example.com", 443)),
     };
 
+    let score_nodes: Vec<_> = (0..64)
+        .map(|index| node(&format!("score-{index}")))
+        .collect();
+    let score_manager = GroupManager::new(
+        &[group("score", GroupPolicy::Score, &score_nodes)],
+        &score_nodes,
+    );
     let mut group = c.benchmark_group("group_selection");
     group.bench_function("direct_selector_plan", |b| {
         b.iter(|| {
@@ -113,6 +119,15 @@ fn bench_group_selection(c: &mut Criterion) {
                     .select_node_for_domain(black_box("fallback"), ProbeDomain::Tcp, IpVersion::V4)
                     .expect("fallback node")
                     .id,
+            )
+        });
+    });
+    group.bench_function("score_peek_64", |b| {
+        b.iter(|| {
+            black_box(
+                score_manager
+                    .get_score_selection_for_network(black_box("score"), SelectionNetwork::Tcp)
+                    .expect("score node"),
             )
         });
     });

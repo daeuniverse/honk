@@ -162,7 +162,7 @@ aborted caller. Single XUDP has no generation runtime.
 
 ### Dial admission
 
-Physical proxied connects and protocol handshakes acquire two permits:
+Physical outbound connects—including direct TCP and proxy TCP/QUIC attempts—and their protocol handshakes acquire two permits:
 
 1. the captured generation's configured dial gate; then
 2. the immutable process-wide startup ceiling shared by overlapping reload
@@ -219,6 +219,16 @@ intercepted DNS path. Node dial sites use `bootstrap::resolve` through
 The configured bootstrap resolver is queried over bypass-marked UDP/TCP; failure
 falls back to the system resolver. `query_ech_config` uses the same raw path for
 DNS HTTPS records (`qtype 65`) and extracts the SVCB `ech` parameter.
+
+After resolution, proxy-server TCP and shared QUIC clients stably interleave
+address families and race at most two addresses. The first starts immediately;
+the fallback starts after 250 ms. An earlier failure advances the fallback,
+while keeping physical attempts at least 10 ms apart. Every in-flight address
+attempt holds its own generation and process dial permits, so
+at the configured ceiling a fallback waits for an earlier attempt to finish;
+`max_concurrent_dials: 1` serializes addresses. The race stays inside the
+already selected node: socket marks and security settings are identical, and
+QUIC protocol authentication runs only for the winner.
 
 ## TLS, fingerprinting, ECH, and pins
 
@@ -347,6 +357,13 @@ rolls new work to a replacement. Driver failure fans out to its children;
 half-close, reset, receive-window release, and lazy response errors remain
 per-stream.
 
+Receive credit is fixed at 2 MiB per stream. Connection credit covers one
+maximum UoT response frame for each of the 128 admitted streams
+(8 MiB + 256 bytes). The larger stream window removes the old
+one-datagram-per-RTT ceiling on long-fat TCP paths. The per-stream cap prevents
+one unread child from consuming all connection credit, while the aggregate
+bound lets interleaved maximum UDP frames always complete.
+
 ### Mux.Cool and XUDP
 
 Mux.Cool sends the Xray VLESS mux command and multiplexes child TCP and XUDP
@@ -357,6 +374,11 @@ replacement accepts new children.
 The pool admits no more than two active carriers and 128 children per carrier.
 Draining carriers do not consume the active cap but remain alive for existing
 children. Saturation waits for capacity instead of bypassing the pool.
+
+Receive payloads share an 8 MiB carrier budget. TCP delivery allows 100 ms for
+transient budget or queue pressure before resetting only the stalled child;
+UDP remains drop-on-full. This tolerates line-rate scheduler bursts without
+letting an unread child pin the carrier indefinitely.
 
 XUDP reply metadata can change the logical peer and therefore enables full-cone
 reply sources. Pooled Mux.Cool packets are capped at 8 KiB. Single XUDP reuses
@@ -484,6 +506,11 @@ It spreads work: after the first session becomes busy, the pool establishes the
 second before adding more load, then schedules least-loaded. Consecutive dial
 failures use bounded backoff instead of one physical connect per proxied flow.
 
+After v2 server-settings negotiation, every reused logical stream (SID 2 and
+later) must receive a SYNACK within three seconds. Each new open replaces the
+previous deadline and any SYNACK clears it, matching sing-anytls. Expiry retires
+the physical session so the pool redials instead of reusing a silent carrier.
+
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor and idle timeout feed one node-local janitor.
 Selector or UDP warm ownership independently raises effective retention; the
@@ -492,9 +519,10 @@ last owner release drains future reuse without terminating live streams.
 ### Ordered write path
 
 Every frame crosses one `WriterQueue` and one physical writer task. Data uses
-bounded permits; control frames retain reserved queue headroom. A stream's SYN
-and first PSH are inserted as one atomic batch, so another stream cannot
-interleave between them.
+bounded permits, control frames retain reserved headroom, and the whole queue is
+capped at 1,024 frames. Queue exhaustion makes the session terminal instead of
+growing memory. A stream's SYN and first PSH are inserted as one atomic batch,
+so another stream cannot interleave between them.
 
 After one blocking pop, the writer gathers only frames already queued, up to 64
 frames or 256 KiB, into one `write_all` and one `flush`. It never waits to fill

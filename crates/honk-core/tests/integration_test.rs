@@ -277,7 +277,7 @@ protocol = "udp"
         assert_eq!(config.global.tproxy_port, 12345);
         assert_eq!(config.nodes.len(), 2);
         assert_eq!(config.nodes[0].name, "us-proxy");
-        assert_eq!(config.nodes[0].protocol, types::NodeProtocol::Socks5);
+        assert_eq!(config.nodes[0].protocol(), types::NodeProtocol::Socks5);
         assert_eq!(config.routing.rules.len(), 1);
         assert_eq!(config.dns.upstream.len(), 1);
     }
@@ -287,9 +287,9 @@ protocol = "udp"
         let mut config = Config::default();
         config.nodes.push(node::Node {
             name: "".into(),
-            protocol: types::NodeProtocol::Socks5,
             address: "127.0.0.1".into(),
             port: 1080,
+            outbound: node::OutboundConfig::Socks5(Default::default()),
             ..Default::default()
         });
 
@@ -308,10 +308,8 @@ protocol = "udp"
         let mut config = Config::default();
         config.nodes.push(node::Node {
             name: "test-node".into(),
-            protocol: types::NodeProtocol::Socks5,
-            address: "".into(),
-            host: "".into(),
             port: 1080,
+            outbound: node::OutboundConfig::Socks5(Default::default()),
             ..Default::default()
         });
 
@@ -398,9 +396,9 @@ protocol = "udp"
 
         let bad_node = Node {
             name: "bad".into(),
-            protocol: types::NodeProtocol::Socks5,
             address: "127.0.0.1".into(),
-            port: 19999, // unlikely to be open
+            port: 19999,
+            outbound: node::OutboundConfig::Socks5(Default::default()),
             ..Default::default()
         };
 
@@ -634,7 +632,7 @@ protocol = "udp"
             groups: vec![selector("proxy", &[&a, &b]), selector("extra", &[&c]), ut],
             ..Default::default()
         };
-        *cp.config_handle().write().await = config_v2;
+        *cp.config_handle().write().await = Arc::new(config_v2);
         cp.reload_group_manager().await;
 
         {
@@ -662,7 +660,7 @@ protocol = "udp"
             groups: vec![selector("proxy", &[&a])],
             ..Default::default()
         };
-        *cp.config_handle().write().await = config_v3;
+        *cp.config_handle().write().await = Arc::new(config_v3);
         cp.reload_group_manager().await;
 
         {
@@ -691,10 +689,10 @@ protocol = "udp"
             Node {
                 id: uuid::Uuid::new_v4(),
                 name: name.into(),
-                protocol: honk_config::types::NodeProtocol::Socks5,
                 address: "127.0.0.1:1080".into(),
                 host: "127.0.0.1".into(),
                 port: 1080,
+                outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
                 subscription_id: sub,
                 ..Default::default()
             }
@@ -1201,9 +1199,9 @@ protocol = "udp"
 
         let _node = Node {
             name: "socks5-out".into(),
-            protocol: NodeProtocol::Socks5,
             address: "127.0.0.1".into(),
             port: 1080,
+            outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
             ..Default::default()
         };
 

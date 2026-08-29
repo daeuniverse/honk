@@ -244,7 +244,7 @@ fn stage_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, routing_meta_raw: u64
     scratch.redirect.outbound = OUTBOUND_CONTROL_PLANE_ROUTING;
     scratch.redirect.decision_token = decision_token;
     if REDIRECT_TRACK
-        .insert(&scratch.redirect_key, &scratch.redirect, 0)
+        .insert(scratch.redirect_key, scratch.redirect, 0)
         .is_err()
     {
         increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
@@ -264,7 +264,7 @@ fn stage_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, routing_meta_raw: u64
         .mac
         .copy_from_slice(&pkt.ethh.src_addr);
     if ROUTING_HANDOFF_MAP
-        .insert(&pkt.tuples.five, &scratch.handoff, 0)
+        .insert(pkt.tuples.five, scratch.handoff, 0)
         .is_err()
     {
         increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
@@ -662,16 +662,14 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
     if pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP {
         let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
-        let tuple_size: u32;
-
-        if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
             unsafe {
                 tuple.__bindgen_anon_1.ipv4.daddr = pkt.tuples.five.dst_ip.u6_addr32[3];
                 tuple.__bindgen_anon_1.ipv4.saddr = pkt.tuples.five.src_ip.u6_addr32[3];
                 tuple.__bindgen_anon_1.ipv4.dport = pkt.tuples.five.dst_port.to_be();
                 tuple.__bindgen_anon_1.ipv4.sport = pkt.tuples.five.src_port.to_be();
             }
-            tuple_size = mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32;
+            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32
         } else {
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -687,8 +685,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 tuple.__bindgen_anon_1.ipv6.dport = pkt.tuples.five.dst_port.to_be();
                 tuple.__bindgen_anon_1.ipv6.sport = pkt.tuples.five.src_port.to_be();
             }
-            tuple_size = mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32;
-        }
+            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
+        };
 
         if pkt.l4proto == IPPROTO_TCP {
             // Preserve the general pure-SYN lookup skip. TCP DNS is the sole
@@ -715,12 +713,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             let param = PARAM.load();
             if let Some(probe) =
                 sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+                && !probe.is_dae_socket
+                && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
             {
-                if !probe.is_dae_socket
-                    && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-                {
-                    return pass_through_classified(ctx);
-                }
+                return pass_through_classified(ctx);
             }
         }
     }
@@ -728,13 +724,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // DNS fast path: skip the expensive route_loop + LPM/domain lookups.
     if pkt.tuples.five.dst_port == 53 {
         // Update conn state for TCP DNS (UDP DNS is short-lived, skipped anyway)
-        if pkt.l4proto == IPPROTO_TCP {
-            if let Some(state) = &mut tcp_state {
-                state.mac.copy_from_slice(&pkt.ethh.src_addr);
-                let meta =
-                    crate::contrack::build_routing_meta(OUTBOUND_DIRECT, 0, 0, pkt.tuples.dscp);
-                crate::contrack::publish_routing_meta(&mut state.meta, meta);
-            }
+        if pkt.l4proto == IPPROTO_TCP
+            && let Some(state) = &mut tcp_state
+        {
+            state.mac.copy_from_slice(&pkt.ethh.src_addr);
+            let meta = crate::contrack::build_routing_meta(OUTBOUND_DIRECT, 0, 0, pkt.tuples.dscp);
+            crate::contrack::publish_routing_meta(&mut state.meta, meta);
         }
         return redirect_lan_packet_to_control_plane(
             ctx,
@@ -1149,7 +1144,7 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> 
     // SockMap keys differentiate IPv4 vs IPv6 to match the per-family
     // listeners published by userspace.
     let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
-    let key = if listener_l4proto == IPPROTO_TCP as u8 {
+    let key = if listener_l4proto == IPPROTO_TCP {
         if is_v6 { KEY_TCP6 } else { KEY_TCP4 }
     } else {
         let h = udp_listener_hash(ctx, is_v6);
@@ -1172,7 +1167,7 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> 
 fn udp_listener_hash(ctx: &TcContext, is_v6: bool) -> u32 {
     // Guarantee the headers are in the linear data area; bounds checks
     // below still guard the actual reads.
-    let _ = ctx.pull_data((ETH_HLEN + 40 + 8) as u32);
+    let _ = ctx.pull_data(ETH_HLEN + 40 + 8);
     let data = ctx.data() as *const u8;
     let data_end = ctx.data_end() as *const u8;
     if unsafe { data.add(mem::size_of::<EthHdr>()) } > data_end {

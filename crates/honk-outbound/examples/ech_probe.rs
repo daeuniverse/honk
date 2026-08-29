@@ -39,8 +39,14 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Node {
         name: "ech-probe".into(),
-        ech_enabled: true,
-        skip_cert_verify: skip_verify,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            tls: honk_config::node::TlsOptions {
+                ech_enabled: true,
+                skip_cert_verify: skip_verify,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let connector = tls::build_connector(&node)?;
