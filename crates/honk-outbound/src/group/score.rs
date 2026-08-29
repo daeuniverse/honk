@@ -32,9 +32,8 @@ const SCORE_FAIL_STREAK_EXCLUDE: u32 = 3;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
 
-/// Exploration retry delay for a consecutive-failure streak. Tracked outside
-/// the decaying evidence so a dead leaf is re-probed on a growing cadence
-/// instead of turning cold again after a few half-lives.
+/// Exploration retry delay for a consecutive-failure streak, tracked outside
+/// the decaying evidence so a dead leaf is not rediscovered as cold.
 fn explore_backoff(streak: u32) -> Duration {
     SCORE_EXPLORE_BACKOFF_BASE
         .saturating_mul(2u32.saturating_pow(streak.saturating_sub(1).min(7)))
@@ -276,9 +275,8 @@ impl Stats {
             return;
         }
         if sample.outcome == ScoreOutcome::Success {
-            // A success proves current liveness, so the leaf rejoins
-            // exploration immediately, but the streak only works down one
-            // step: a flapping leaf must earn the fast cadence back.
+            // Liveness is proven, but the streak steps down one at a
+            // time: a flapping leaf earns the fast cadence back.
             self.fail_streak = self.fail_streak.saturating_sub(1);
             self.explore_not_before = None;
         } else {
@@ -1176,9 +1174,7 @@ fn best_index(
             }
         }
     }
-    // A leaf failing consecutively right now yields to any healthier
-    // candidate no matter how strong its decayed history is; with every
-    // candidate failing, rank the full set so a pick always exists.
+    // Fresh consecutive failures outweigh decayed success history.
     let any_healthy = snapshots
         .iter()
         .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
@@ -2574,8 +2570,7 @@ mod tests {
             0
         );
 
-        // Every candidate backed off must never yield no pick: exploration
-        // simply skips and the reliability ranking still returns a leaf.
+        // All backed off: exploration skips, ranking still returns a leaf.
         let snapshots = [cold(true), cold(true)];
         let performance = performance_baseline(&snapshots);
         let selection = best_index(&snapshots, &node_refs, 1, true, performance);
@@ -2606,14 +2601,13 @@ mod tests {
             target_attempts: 0.0,
             target_completed: 0.0,
         };
-        // The historically stronger leaf yields while it fails consecutively.
         let snapshots = [trained(0.9, SCORE_FAIL_STREAK_EXCLUDE), trained(0.8, 0)];
         let performance = performance_baseline(&snapshots);
         assert_eq!(
             best_index(&snapshots, &node_refs, 1, false, performance).index,
             1
         );
-        // Every candidate failing: the full-set fallback still returns a leaf.
+        // Pinned fallback: with every candidate excluded, rank the full set.
         let snapshots = [
             trained(0.9, SCORE_FAIL_STREAK_EXCLUDE),
             trained(0.8, SCORE_FAIL_STREAK_EXCLUDE),
@@ -2683,9 +2677,8 @@ mod tests {
             &sample(ScoreOutcome::Success, Some(Duration::from_millis(10))),
             second,
         );
-        // The streak steps down (2 → 1) instead of resetting: liveness
-        // returns immediately, but the next failure lands back on the
-        // doubled cadence rather than the base one.
+        // Success steps the streak down (2 → 1), so the next failure lands
+        // back on the doubled cadence rather than the base one.
         assert!(!backed_off(second + Duration::from_secs(1)));
         let third = second + Duration::from_secs(2);
         fail(third);

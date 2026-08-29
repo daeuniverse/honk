@@ -531,10 +531,8 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     Err("UDP probe timeout".to_string())
                 }
             };
-            // A failed DNS UDP probe already proves this node's UDP path dead
-            // and feeds Score a failure; the DataUdp handshake through the
-            // same dead path only adds a doomed quinn endpoint and its ERROR
-            // log, so skip it until the node healthily passes again.
+            // The DNS probe failure already recorded the Score evidence; a
+            // handshake through the same dead path only adds quinn ERROR noise.
             if health_result.is_ok()
                 && let Some(target) = quic_score_target.as_ref()
             {
