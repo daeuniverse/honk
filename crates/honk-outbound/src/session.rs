@@ -630,6 +630,14 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                             (config.dial_backoff.saturating_mul(1u32 << shift))
                                                 .min(config.max_dial_backoff);
                                         pool.next_dial_at = Some(Instant::now() + backoff);
+                                        // The waiter only sees the outer context; keep
+                                        // the full chain available for diagnostics.
+                                        tracing::debug!(
+                                            consecutive = pool.dial_failures,
+                                            ?backoff,
+                                            "session dial failed: {:#}",
+                                            e
+                                        );
                                         DialSignal::Failed(Arc::new(e.context(anyhow!(
                                             "session dial failed ({} consecutive, backoff {:?})",
                                             pool.dial_failures,
