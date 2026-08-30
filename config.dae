@@ -19,9 +19,6 @@ global {
     # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
     nfqueue_enable: true
 
-    # Group will switch node only when new_latency <= old_latency - tolerance.
-    check_tolerance: 30ms
-
     # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/zh/configuration.md)
     # 大订阅基线关闭额外 UDP 预热；Selector 选择仍单独保活。
     udp_warm_node_count: 0
@@ -34,6 +31,9 @@ global {
 # 代理节点链
 node {
     iris: 'socks5://10.10.10.1:2077'
+    # Hysteria2 端口跳跃,两种等价写法（mport 参数 / 官方内嵌形式）:
+    # hy2-a: 'hysteria2://pass@example.com:443?mport=20000-30000&mhop=30#hy2-a'
+    # hy2-b: 'hysteria2://pass@example.com:443,20000-30000?mhop=30#hy2-b'
 }
 
 subscription {
@@ -43,10 +43,17 @@ subscription {
 # 对于中国大陆域名使用 alidns，其他使用 googledns 查询。
 dns {
     #ipversion_prefer: 4
-    #client_subnet: auto
+    # 向上游携带 ECS(客户端近似网段),改善 CDN 解析本地性;仅直连拨号注入
+    client_subnet: auto
+    # 独立 DNS 监听器（默认关闭；无认证递归,必须用防火墙限制来源）
+    # bind: 'tcp+udp://:1053'
+    # hosts 快照:true 加入 /etc/hosts,路径加载 OxiDNS 兼容规则文件;可重复
+    # use_host: true
     upstream {
         local: 'udp://127.0.0.1:53'
         remote: 'tcp+udp://dns.google:53'
+        # 上游末尾的 -> tag 强制经指定节点/组拨号
+        # remote_doh: 'https://dns.google/dns-query' -> omg
     }
     routing {
         request {
@@ -72,42 +79,50 @@ group {
         policy: fixed(0)
     }
 
-    # 按地区自动选择最低延迟节点
+    # 按地区分组;score 策略基于真实流量按目标自适应选择可靠节点
+    # （无需 tolerance/url 等旋钮;健康检查失败自动排除）
     hk {
         filter: name(keyword: '🇭🇰')
-        policy: min_moving_avg
+        policy: score
         final: iris
     }
     jp {
         filter: name(keyword: '🇯🇵')
         filter: name('tokyo')
-        policy: min_moving_avg
+        policy: score
         final: iris
     }
     kr {
         filter: name(keyword: '🇰🇷')
-        policy: min_moving_avg
+        policy: score
         final: iris
     }
     tw {
         filter: name(keyword: '🇹🇼')
-        policy: min_moving_avg
+        policy: score
         final: iris
     }
     sgp {
         filter: name(keyword: '🇸🇬')
-        policy: min_moving_avg
+        policy: score
         final: iris
     }
     us {
         filter: name(keyword: '🇺🇸')
-        policy: min_moving_avg
+        policy: score
         final: iris
     }
 
     # 通用代理（无地区过滤，用于未匹配到具体地区的流量）
     omg {
-        policy: min_moving_avg
+        policy: score
+        final: iris
+    }
+
+    # 嵌套组:子组的策略选择各贡献一个候选,本组在其上再跑一次自己的策略
+    asia {
+        filter: group('hk', 'jp', 'kr', 'tw', 'sgp')
+        policy: score
         final: iris
     }
 }
