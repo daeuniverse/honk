@@ -55,7 +55,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。精确目标证据衡量 transport 质量，并不是语义解锁能力的结果；需要这种粗粒度 cohort 时，可用已有 routing 或 geosite 规则选择专用服务 Score 组。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
 
-一次已授权的多候选 Apply 按优先级恰好增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`。`deadFiltered` 独立计数被活性过滤移除的唯一叶候选。`switchFlap` 独立计数同一 `(group, network, family, target)` 作用域内已提交胜者在八次选择内切回前一胜者——无关目标交错各自的胜者永远不计入；无目标选择共享一个桶，历史由 4,096 项 LRU 封顶。冷探索与周期探索不修改这段后悔窗口。Peek、proxy/stat 读取、单例旁路和最后尝试选择均保持中性。经鉴权的 `/stats.score.groups[]` 快照只公开这些按组的 TCP/UDP 计数，不包含 cell、节点、目标、cadence 或 manager authority。
+一次已授权的多候选 Apply 按优先级恰好增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`。`deadFiltered` 独立计数被活性过滤移除的唯一叶候选。`switchFlap` 独立计数同一 `(group, network, family, target)` 作用域内已提交胜者在八次选择内切回前一胜者——无关目标交错各自的胜者永远不计入；无目标选择共享一个桶，历史由 4,096 项 LRU 封顶。冷探索与周期探索不修改这段后悔窗口。`failStreakExcluded` 按每次已授权 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek、proxy/stat 读取、单例旁路和最后尝试选择均保持中性。经鉴权的 `/stats.score.groups[]` 快照只公开这些按组的 TCP/UDP 计数，不包含 cell、节点、目标、cadence 或 manager authority。`/stats.score.cache` 公开两个 4,096 项证据 LRU 各自的当前 cell 数与累计淘汰数，同样不含任何组、节点或目标身份。
 
 ### URLTest 排名与滞后
 

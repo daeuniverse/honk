@@ -76,7 +76,7 @@ Score 先用普通健康过滤排除死亡候选，再作出权威的单成员�
 
 全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
-每次已授权的多候选 Apply 按固定优先级只记录一个原因：初始探索（`coldExplore`）、周期探索（`periodicExplore`）、保持现任（`incumbentHeld`）、新鲜失败绕过（`freshFailureBypass`）、可靠性胜出（`reliabilityWinner`）或性能胜出（`performanceWinner`）。`deadFiltered` 独立记录活性过滤移除的唯一叶候选。`switchFlap` 记录已提交胜者在八次选择内返回前一胜者；探索不进入该窗口。Peek 与展示/API 读取保持中性。经鉴权的 `/stats.score.groups[]` 只导出这些按组汇总的 TCP/UDP 计数和组名，不导出 cell、节点、目标、cadence 或 manager authority。
+每次已授权的多候选 Apply 按固定优先级只记录一个原因：初始探索（`coldExplore`）、周期探索（`periodicExplore`）、保持现任（`incumbentHeld`）、新鲜失败绕过（`freshFailureBypass`）、可靠性胜出（`reliabilityWinner`）或性能胜出（`performanceWinner`）。`deadFiltered` 独立记录活性过滤移除的唯一叶候选。`switchFlap` 记录已提交胜者在八次选择内返回前一胜者；探索不进入该窗口。`failStreakExcluded` 按每次 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek 与展示/API 读取保持中性。经鉴权的 `/stats.score.groups[]` 只导出这些按组汇总的 TCP/UDP 计数和组名，不导出 cell、节点、目标、cadence 或 manager authority。`/stats.score.cache` 导出两个 4,096 项证据 LRU 的当前 cell 数与累计淘汰数，不含任何组、节点或目标身份。
 
 ## 过滤解析
 

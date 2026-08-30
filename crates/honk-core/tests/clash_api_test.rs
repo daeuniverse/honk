@@ -689,6 +689,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
                     "switchFlap": 0,
+                    "failStreakExcluded": 0,
+                    "exploreBackedOff": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -699,6 +701,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
                     "switchFlap": 0,
+                    "failStreakExcluded": 0,
+                    "exploreBackedOff": 0,
                 },
             },
             {
@@ -712,6 +716,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
                     "switchFlap": 0,
+                    "failStreakExcluded": 0,
+                    "exploreBackedOff": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -722,9 +728,17 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "freshFailureBypass": 0,
                     "deadFiltered": 0,
                     "switchFlap": 0,
+                    "failStreakExcluded": 0,
+                    "exploreBackedOff": 0,
                 },
             },
         ],
+        "cache": {
+            "exactCells": 0,
+            "aggregateCells": 2,
+            "exactEvictions": 0,
+            "aggregateEvictions": 0,
+        },
     });
     assert_eq!(score, expected_score);
     let mut unexpected_counter = expected_score.clone();
