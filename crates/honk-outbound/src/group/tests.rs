@@ -1492,7 +1492,10 @@ fn test_user_style_nested_layout() {
     let picked = m.select_nodes_in_order_for_domain("🍃 wind", ProbeDomain::Tcp, IpVersion::V4);
     let names: Vec<&str> = picked.iter().map(|n| n.name.as_str()).collect();
     assert_eq!(names, vec!["hk-1", "tw-1", "jp-1"]);
-    // `now` reports the member (sub-group) tag, not the leaf.
+    // `now` caches the member (sub-group) tag once wind is reached as a
+    // Selector's chosen sub-group with applied effects.
+    m.set_selector_choice("🥗 proxy", "🍃 wind");
+    let _ = m.select_nodes_in_order_for_domain("🥗 proxy", ProbeDomain::Tcp, IpVersion::V4);
     let wind_now = m.get_urltest_selection("🍃 wind").unwrap();
     assert!(["🇭🇰 hongkong", "🇨🇳 taiwan", "🇯🇵 japan"].contains(&wind_now.as_str()));
 

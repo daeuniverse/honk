@@ -4726,6 +4726,58 @@ group {
     }
 
     #[test]
+    fn selector_parent_peeks_unchosen_score_subgroups() {
+        let nodes = [
+            node("sel-sub-alpha-a"),
+            node("sel-sub-alpha-b"),
+            node("sel-sub-beta-a"),
+            node("sel-sub-beta-b"),
+        ];
+        let sub_a = group("sel-sub-a", &nodes[..2]);
+        let sub_b = group("sel-sub-b", &nodes[2..]);
+        let parent = Group {
+            id: Uuid::new_v4(),
+            name: "sel-parent".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![],
+            groups: vec!["sel-sub-a".into(), "sel-sub-b".into()],
+            ..Default::default()
+        };
+        let manager = super::super::GroupManager::new(&[sub_a, sub_b, parent], &nodes);
+        let state = manager.score_state();
+
+        // Default choice is the first member: only sub-a commits a rank.
+        let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(
+            state
+                .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
+                .cold_explore,
+            1
+        );
+        assert_eq!(
+            state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp),
+            SelectionReasonCounts::default()
+        );
+        assert!(state.inner.lock().selection_history.is_empty());
+
+        // Switching the choice moves the committed rank to sub-b.
+        manager.set_selector_choice("sel-parent", "sel-sub-b");
+        let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(
+            state
+                .selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp)
+                .cold_explore,
+            1
+        );
+        assert_eq!(
+            state
+                .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
+                .cold_explore,
+            1
+        );
+    }
+
+    #[test]
     fn score_reason_snapshot_reload_policy_is_name_based() {
         let nodes = [node("private-reload-alpha"), node("private-reload-beta")];
         let score = group("persist", &nodes);

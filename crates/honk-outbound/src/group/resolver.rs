@@ -94,6 +94,19 @@ impl GroupManager {
             return Vec::new();
         }
         visited.push(group.name.as_str());
+        // A Selector commits only its chosen sub-group's pick; resolving the
+        // rest is candidate bookkeeping and must not record Score ranks,
+        // incumbent marks, or flap history on their state.
+        let chosen_tag = if group.policy == GroupPolicy::Selector && effects.applies() {
+            self.selector_choice
+                .read()
+                .get(&group.name)
+                .cloned()
+                .or_else(|| group.default.clone())
+                .or_else(|| self.member_tags(group).first().map(|tag| tag.to_string()))
+        } else {
+            None
+        };
         let mut out: Vec<Candidate<'a>> = group
             .nodes
             .iter()
@@ -109,14 +122,18 @@ impl GroupManager {
             let Some(sub) = self.groups.get(sub_tag.as_str()) else {
                 continue;
             };
+            let sub_effects = match &chosen_tag {
+                Some(tag) if tag.as_str() != sub_tag.as_str() => SelectionEffects::Peek,
+                _ => effects,
+            };
             // Sub-group participation counts as activity only for real
             // traffic. Peek follows the same nested policy without waking
             // health checks or updating idle timestamps.
-            if effects.applies() {
+            if sub_effects.applies() {
                 self.mark_used(sub_tag);
             }
             if let Some(mut candidate) =
-                self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, effects)
+                self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, sub_effects)
             {
                 candidate.tag = sub_tag.as_str();
                 out.push(candidate);
