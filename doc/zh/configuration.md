@@ -217,7 +217,7 @@ experimental {
 
 ## 编写路由规则
 
-规则按源码顺序执行，写作 `matcher(...) [&& !matcher(...)] -> outbound`，最后是 `fallback: outbound`。目标可以是 `direct`、`block`、节点或组。`direct(must)` 标记不终结的 must 决策，后续匹配会继续携带该语义；Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
+规则按源码顺序执行，写作 `matcher(...) [&& !matcher(...)] -> outbound`，最后是 `fallback: outbound`。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先包一层组（例如 `filter: name('节点名')`）。`(must)` 决策是终局的：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
 
 honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>) -> direct(must)`，使网关服务不依赖代理健康状态。失活出站通常执行 fail-closed：新流会被丢弃而不会泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。应保留 `dip(geoip: private) -> direct(must)`，让公网 `fallback` 指向多成员且 `policy: fallback`、带显式 fail-closed `final` 的组，并至少保留一个强制经 `direct` 的 DNS 上游。
 

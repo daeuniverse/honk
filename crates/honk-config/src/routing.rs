@@ -262,8 +262,9 @@ fn clash_api_rule_type(kind: &'static str) -> &'static str {
     }
 }
 
-/// A routing target. Dae and supported structured formats use one node or
-/// group tag; partially wired chain/balancer variants were removed.
+/// A routing target: one group tag or the built-in `direct`/`block`.
+/// `Config::validate` rejects bare node names (they have no eBPF outbound id);
+/// partially wired chain/balancer variants were removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RoutingOutbound {

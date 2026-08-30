@@ -50,7 +50,8 @@ routing {
 | `direct` | 内建直连出站 |
 | `block` | 内建阻断出站 |
 | 组名 | 按该出站组及其策略解析 |
-| 节点名 | 直接使用该节点 |
+
+裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。
 
 追加 `(must)` 会启用兼容 Go dae 的 must 语义。must 规则命中后不会结束规则搜索；匹配继续，并把 must 状态传播到最终出站。Clash `Global` 和 `Direct` 模式绝不会覆盖 must 结果，也绝不会覆盖 `block`。
 
@@ -110,14 +111,14 @@ routing {
         regex: '^bad[0-9]+\.example$',
         geosite: category-games@cn
     ) -> proxy
-    dip(geoip: cn, 203.0.113.0/24) && sport(1024-65535) && dscp(46) -> hk-1
+    dip(geoip: cn, 203.0.113.0/24) && sport(1024-65535) && dscp(46) -> hk
     l4proto(tcp) && dport(80, 443, 8080-8090) -> proxy
     !domain(geosite: category-ads-all) && !dip(geoip: cn) -> resilient
     fallback: resilient
 }
 ```
 
-这里 `proxy` 和 `resilient` 是组名，`hk-1` 是节点名。
+这里 `proxy`、`hk` 和 `resilient` 都是组名。
 
 ## 相关文档
 

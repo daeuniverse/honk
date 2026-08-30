@@ -254,12 +254,15 @@ port = 443
 tls = true
 sni = "jp.proxy.example.com"
 
+[[groups]]
+name = "proxy"
+
 [routing]
 default_outbound = "direct"
 
 [[routing.rules]]
 name = "google-proxy"
-outbound = "us-proxy"
+outbound = "proxy"
 priority = 0
 [condition]
 domain_suffix = ["google.com"]
