@@ -1314,6 +1314,38 @@ fn test_parse_port_hopping() {
     assert_eq!(parse_port_hopping("0-10"), None);
 }
 
+/// The share-link parser validates embedded hop ports with its own copy of
+/// these rules; an accepted embedded spec must never fail at dial time.
+#[test]
+fn test_embedded_hop_spec_parity_with_share_link_parser() {
+    for spec in [
+        "123,5000-6000",
+        "8080, 9000-9001",
+        "5000-5000",
+        " 443 , 5000 ",
+    ] {
+        let link = format!("hysteria2://pass@example.com:{spec}/");
+        assert!(Node::from_share_link(&link).is_ok(), "{spec}");
+        assert!(parse_port_hopping(spec).is_some(), "{spec}");
+    }
+    for spec in [
+        "0-10",
+        "9000-8000",
+        "abc-def",
+        "443,-500",
+        "0,6000",
+        "65536-65537",
+    ] {
+        let link = format!("hysteria2://pass@example.com:{spec}/");
+        assert!(Node::from_share_link(&link).is_err(), "{spec}");
+        assert!(parse_port_hopping(spec).is_none(), "{spec}");
+    }
+    // Empty segments are intentionally stricter at parse time than at dial.
+    let link = "hysteria2://pass@example.com:443,/";
+    assert!(Node::from_share_link(link).is_err());
+    assert!(parse_port_hopping("443,").is_some());
+}
+
 #[test]
 fn test_hop_state_rotation() {
     let mut hop = HopState::new(vec![], Duration::from_millis(10));

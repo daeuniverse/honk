@@ -644,6 +644,81 @@ fn test_hysteria2_auth_and_obfs_params() {
 }
 
 #[test]
+fn test_hysteria2_embedded_hop_ports() {
+    // Official client style: the hop set lives in the authority; the first
+    // entry becomes the nominal port.
+    let node = Node::from_share_link(
+        "hysteria2://letmein@example.com:123,5000-6000/?insecure=1&obfs=salamander&obfs-password=gawrgura&pinSHA256=deadbeef&sni=real.example.com#cool-server",
+    )
+    .unwrap();
+    assert_eq!(node.port, 123);
+    assert_eq!(node.address, "example.com:123");
+    assert_eq!(
+        node.hysteria2().unwrap().port_hopping.as_deref(),
+        Some("123,5000-6000")
+    );
+    assert_eq!(node.name, "cool-server");
+    assert_eq!(node.tls().unwrap().sni.as_deref(), Some("real.example.com"));
+    assert!(node.tls().unwrap().skip_cert_verify);
+    assert_eq!(node.hysteria2().unwrap().obfs.as_deref(), Some("gawrgura"));
+
+    // Range-only form; the `hysteria` alias scheme works too.
+    let node = Node::from_share_link("hysteria://pass@example.com:5000-6000/").unwrap();
+    assert_eq!(node.port, 5000);
+    assert_eq!(
+        node.hysteria2().unwrap().port_hopping.as_deref(),
+        Some("5000-6000")
+    );
+
+    // Both spellings of the same hop set derive the same node identity.
+    let embedded =
+        Node::from_share_link("hysteria2://pass@example.com:123,5000-6000/?insecure=1").unwrap();
+    let query_form =
+        Node::from_share_link("hysteria2://pass@example.com:123/?mport=123,5000-6000&insecure=1")
+            .unwrap();
+    assert_eq!(embedded.id, query_form.id);
+
+    // Specifying hop ports twice is ambiguous and rejected.
+    assert!(Node::from_share_link("hysteria2://pass@example.com:443,6000/?mport=7000").is_err());
+
+    // Structurally invalid lists fail at parse time.
+    for link in [
+        "hysteria2://pass@example.com:0,6000/",
+        "hysteria2://pass@example.com:6000-5000/",
+        "hysteria2://pass@example.com:abc,6000/",
+        "hysteria2://pass@example.com:443,/",
+        "hysteria2://pass@example.com:70000-70001/",
+    ] {
+        assert!(Node::from_share_link(link).is_err(), "{link}");
+    }
+
+    // A plain single port and IPv6 bracket hosts are untouched.
+    let node = Node::from_share_link("hysteria2://pass@example.com:443/").unwrap();
+    assert!(node.hysteria2().unwrap().port_hopping.is_none());
+    let node = Node::from_share_link("hysteria2://pass@[2001:db8::1]:443,6000/").unwrap();
+    assert_eq!(node.port, 443);
+    assert_eq!(
+        node.hysteria2().unwrap().port_hopping.as_deref(),
+        Some("443,6000")
+    );
+
+    // No path/query/fragment suffix; whitespace-only lists are invalid.
+    let node = Node::from_share_link("hysteria2://pass@example.com:443,6000").unwrap();
+    assert_eq!(
+        node.hysteria2().unwrap().port_hopping.as_deref(),
+        Some("443,6000")
+    );
+    assert!(Node::from_share_link("hysteria2://pass@example.com: ,6000/").is_err());
+
+    // An empty mport value is absent, not a conflict with the address form.
+    let node = Node::from_share_link("hysteria2://pass@example.com:443,6000/?mport=").unwrap();
+    assert_eq!(
+        node.hysteria2().unwrap().port_hopping.as_deref(),
+        Some("443,6000")
+    );
+}
+
+#[test]
 fn test_ech_query_params() {
     // ech_config=<base64url ECHConfigList> enables ECH and carries the config.
     let node = Node::from_share_link(
