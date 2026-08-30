@@ -145,7 +145,7 @@ impl GroupManager {
 
     /// Borrowed member tags of a group (direct node names, then sub-group
     /// tags; deduplicated). Missing sub-group tags are skipped.
-    fn member_tags<'a>(&'a self, group: &'a Group) -> Vec<&'a str> {
+    pub(super) fn member_tags<'a>(&'a self, group: &'a Group) -> Vec<&'a str> {
         let mut out: Vec<&'a str> = Vec::new();
         for id in &group.nodes {
             if let Some(n) = self.nodes.get(id)

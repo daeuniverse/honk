@@ -2380,6 +2380,19 @@ impl super::GroupManager {
             return Vec::new();
         }
         visited.push(group.name.as_str());
+        // Same rule as `flatten_candidates`: a Selector commits only its
+        // chosen sub-group's pick, the rest are peeked.
+        let chosen_tag =
+            if group.policy == honk_config::group::GroupPolicy::Selector && effects.applies() {
+                self.selector_choice
+                    .read()
+                    .get(&group.name)
+                    .cloned()
+                    .or_else(|| group.default.clone())
+                    .or_else(|| self.member_tags(group).first().map(|tag| tag.to_string()))
+            } else {
+                None
+            };
         let mut candidates: Vec<_> = group
             .nodes
             .iter()
@@ -2395,11 +2408,15 @@ impl super::GroupManager {
             let Some(subgroup) = self.groups.get(tag.as_str()) else {
                 continue;
             };
-            if effects.applies() {
+            let sub_effects = match &chosen_tag {
+                Some(chosen) if chosen.as_str() != tag.as_str() => super::SelectionEffects::Peek,
+                _ => effects,
+            };
+            if sub_effects.applies() {
                 self.mark_used(tag);
             }
             if let Some(mut candidate) =
-                self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects)
+                self.pick_candidate_for_target(subgroup, context, visited, depth + 1, sub_effects)
             {
                 candidate.tag = tag.as_str();
                 candidates.push(candidate);
@@ -4774,6 +4791,23 @@ group {
                 .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
                 .cold_explore,
             1
+        );
+
+        // The target-aware dial path applies the same rule.
+        manager.set_selector_choice("sel-parent", "sel-sub-a");
+        let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
+        let before_b = state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp);
+        let _ = manager.selection_plan_for_target(
+            "sel-parent",
+            &context("sel-target.internal", IpVersion::V4),
+        );
+        assert_ne!(
+            state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp),
+            before_a
+        );
+        assert_eq!(
+            state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp),
+            before_b
         );
     }
 
