@@ -855,9 +855,12 @@ fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> 
 /// standard; handy for headless ops.
 async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let snap = s.stats.snapshot();
-    let score_groups = {
+    let (score_groups, score_cache) = {
         let group_manager = s.group_manager.read();
-        group_manager.score_reason_snapshot()
+        (
+            group_manager.score_reason_snapshot(),
+            group_manager.score_cache_snapshot(),
+        )
     };
     let score_groups: Vec<_> = score_groups
         .into_iter()
@@ -872,6 +875,8 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                     "freshFailureBypass": counters.fresh_failure_bypass,
                     "deadFiltered": counters.dead_filtered,
                     "switchFlap": counters.switch_flap,
+                    "failStreakExcluded": counters.fail_streak_excluded,
+                    "exploreBackedOff": counters.explore_backed_off,
                 })
             };
             serde_json::json!({
@@ -902,7 +907,15 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
     Json(serde_json::json!({
         "outbounds": per_outbound,
-        "score": { "groups": score_groups },
+        "score": {
+            "groups": score_groups,
+            "cache": {
+                "exactCells": score_cache.exact_cells,
+                "aggregateCells": score_cache.aggregate_cells,
+                "exactEvictions": score_cache.exact_evictions,
+                "aggregateEvictions": score_cache.aggregate_evictions,
+            },
+        },
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,

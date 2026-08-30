@@ -36,8 +36,9 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use state::UrlTestSelections;
 
 pub use score::{
-    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReasonCounters,
-    ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext, ScoreTarget,
+    ScoreAttribution, ScoreCacheSnapshot, ScoreFeedback, ScoreOutcome, ScorePolicyState,
+    ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,
+    ScoreTarget,
 };
 pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 
@@ -219,6 +220,10 @@ impl GroupManager {
             .collect();
         group_names.sort_unstable();
         self.score_state.reason_snapshot(group_names)
+    }
+
+    pub fn score_cache_snapshot(&self) -> ScoreCacheSnapshot {
+        self.score_state.cache_snapshot()
     }
 
     pub fn new(groups: &[Group], nodes: &[Node]) -> Self {

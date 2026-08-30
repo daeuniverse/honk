@@ -319,7 +319,13 @@ fn evidence_decay(elapsed: Duration) -> f64 {
     (-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()).exp2()
 }
 
-fn record_cell_start<K>(cache: &mut LruCache<K, Stats>, key: K, now: Instant, tick: u64) -> u64
+fn record_cell_start<K>(
+    cache: &mut LruCache<K, Stats>,
+    key: K,
+    now: Instant,
+    tick: u64,
+    evictions: &mut u64,
+) -> u64
 where
     K: std::hash::Hash + Eq,
 {
@@ -332,6 +338,10 @@ where
         ..Default::default()
     };
     stats.record_start(now, tick);
+    // A full cache means this put evicts the LRU tail.
+    if cache.len() == cache.cap().get() {
+        *evictions = evictions.saturating_add(1);
+    }
     cache.put(key, stats);
     tick
 }
@@ -473,6 +483,8 @@ struct SelectionReasonCounts {
     fresh_failure_bypass: u64,
     dead_filtered: u64,
     switch_flap: u64,
+    fail_streak_excluded: u64,
+    explore_backed_off: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -485,6 +497,8 @@ pub struct ScoreReasonCounters {
     pub fresh_failure_bypass: u64,
     pub dead_filtered: u64,
     pub switch_flap: u64,
+    pub fail_streak_excluded: u64,
+    pub explore_backed_off: u64,
 }
 
 impl ScoreReasonCounters {
@@ -498,6 +512,8 @@ impl ScoreReasonCounters {
             fresh_failure_bypass: counts.fresh_failure_bypass,
             dead_filtered: counts.dead_filtered,
             switch_flap: counts.switch_flap,
+            fail_streak_excluded: counts.fail_streak_excluded,
+            explore_backed_off: counts.explore_backed_off,
         }
     }
 }
@@ -507,6 +523,16 @@ pub struct ScoreReasonGroupSnapshot {
     pub name: String,
     pub tcp: ScoreReasonCounters,
     pub udp: ScoreReasonCounters,
+}
+
+/// Occupancy and eviction totals of the two bounded evidence LRUs; carries no
+/// group, node, or target identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScoreCacheSnapshot {
+    pub exact_cells: usize,
+    pub aggregate_cells: usize,
+    pub exact_evictions: u64,
+    pub aggregate_evictions: u64,
 }
 
 struct StateInner {
@@ -519,6 +545,8 @@ struct StateInner {
     selection_reasons: HashMap<SelectionReasonKey, SelectionReasonCounts>,
     active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
+    exact_evictions: u64,
+    aggregate_evictions: u64,
 }
 
 impl Default for StateInner {
@@ -540,6 +568,8 @@ impl Default for StateInner {
             selection_reasons: HashMap::new(),
             active_authority: None,
             tick: 0,
+            exact_evictions: 0,
+            aggregate_evictions: 0,
         }
     }
 }
@@ -575,6 +605,16 @@ impl ScorePolicyState {
             *destination = ScoreReasonCounters::from_private(*counts);
         }
         groups
+    }
+
+    pub(super) fn cache_snapshot(&self) -> ScoreCacheSnapshot {
+        let inner = self.inner.lock();
+        ScoreCacheSnapshot {
+            exact_cells: inner.exact.len(),
+            aggregate_cells: inner.aggregate.len(),
+            exact_evictions: inner.exact_evictions,
+            aggregate_evictions: inner.aggregate_evictions,
+        }
     }
 
     /// Atomically publish committed Score group/leaf membership and prune
@@ -830,7 +870,12 @@ impl ScorePolicyState {
                         target: target.clone(),
                         node_id: attribution.node_id,
                     };
-                    started.exact = Some(record_cell_start(&mut inner.exact, key, now, tick));
+                    let StateInner {
+                        exact,
+                        exact_evictions,
+                        ..
+                    } = &mut *inner;
+                    started.exact = Some(record_cell_start(exact, key, now, tick, exact_evictions));
                 }
             }
             cells.push(started);
@@ -1028,6 +1073,26 @@ impl ScorePolicyState {
             }
         };
         if authorized {
+            let any_healthy = snapshots
+                .iter()
+                .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
+            let streak_excluded = snapshots
+                .iter()
+                .filter(|score| any_healthy && score.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE)
+                .count() as u64;
+            let backed_off = snapshots
+                .iter()
+                .filter(|score| score.explore_backed_off)
+                .count() as u64;
+            if streak_excluded > 0 || backed_off > 0 {
+                let counts = inner
+                    .selection_reasons
+                    .entry(SelectionReasonKey::new(group, context.network))
+                    .or_default();
+                counts.fail_streak_excluded =
+                    counts.fail_streak_excluded.saturating_add(streak_excluded);
+                counts.explore_backed_off = counts.explore_backed_off.saturating_add(backed_off);
+            }
             Self::record_selection_reason(&mut inner, group, context.network, selection);
             Self::record_switch_flap(
                 &mut inner,
@@ -1293,6 +1358,10 @@ fn mark_selected(
     if let Some(stats) = inner.aggregate.get_mut(&key) {
         stats.selected_at = tick;
     } else {
+        // A full cache means this put evicts the LRU tail.
+        if inner.aggregate.len() == inner.aggregate.cap().get() {
+            inner.aggregate_evictions = inner.aggregate_evictions.saturating_add(1);
+        }
         inner.aggregate.put(
             key,
             Stats {
@@ -1337,7 +1406,13 @@ fn record_aggregate_start(
             family,
             node_id: attribution.node_id,
         };
-        cells[index] = Some(record_cell_start(&mut inner.aggregate, key, now, tick));
+        cells[index] = Some(record_cell_start(
+            &mut inner.aggregate,
+            key,
+            now,
+            tick,
+            &mut inner.aggregate_evictions,
+        ));
     }
     cells
 }
@@ -2673,6 +2748,73 @@ mod tests {
             best_index(&snapshots, &node_refs, 1, false, performance).index,
             0
         );
+    }
+
+    #[test]
+    fn rank_counts_fail_streak_excluded_candidates() {
+        let state = ScorePolicyState::default();
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        state.publish_membership([("score".into(), nodes[0].id), ("score".into(), nodes[1].id)]);
+        let context = context("example.com", IpVersion::V4);
+        let attributions = [ScoreAttribution {
+            group: "score".into(),
+            node_id: nodes[0].id,
+        }];
+        let now = Instant::now();
+        let sample = FlowSample {
+            outcome: ScoreOutcome::Timeout,
+            setup: None,
+            first_response: None,
+            tx: 0,
+            rx: 0,
+            elapsed: Duration::ZERO,
+            count_usefulness: true,
+            streak_neutral: false,
+        };
+        for _ in 0..SCORE_FAIL_STREAK_EXCLUDE {
+            let cells = state.start_at(&context, &attributions, now);
+            state.finish_at(&context, &attributions, &cells, &sample, now);
+        }
+        let _ = state.rank_at("score", &context, &node_refs, now);
+        let counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        assert_eq!(counts.fail_streak_excluded, 1);
+        assert_eq!(counts.explore_backed_off, 1);
+
+        let _ = state.peek_rank("score", &context, &node_refs);
+        let counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        assert_eq!(counts.fail_streak_excluded, 1);
+        assert_eq!(counts.explore_backed_off, 1);
+    }
+
+    #[test]
+    fn rank_counts_explore_backed_off_candidates() {
+        let state = ScorePolicyState::default();
+        let nodes = [node("a"), node("b")];
+        let node_refs: Vec<_> = nodes.iter().collect();
+        state.publish_membership([("score".into(), nodes[0].id), ("score".into(), nodes[1].id)]);
+        let context = context("backoff.example", IpVersion::V4);
+        let attributions = [ScoreAttribution {
+            group: "score".into(),
+            node_id: nodes[0].id,
+        }];
+        let now = Instant::now();
+        let sample = FlowSample {
+            outcome: ScoreOutcome::Timeout,
+            setup: None,
+            first_response: None,
+            tx: 0,
+            rx: 0,
+            elapsed: Duration::ZERO,
+            count_usefulness: true,
+            streak_neutral: false,
+        };
+        let cells = state.start_at(&context, &attributions, now);
+        state.finish_at(&context, &attributions, &cells, &sample, now);
+        let _ = state.rank_at("score", &context, &node_refs, now);
+        let counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        assert_eq!(counts.explore_backed_off, 1);
+        assert_eq!(counts.fail_streak_excluded, 0);
     }
 
     #[test]
@@ -4346,6 +4488,8 @@ group {
             fresh_failure_bypass: u64::MAX,
             dead_filtered: u64::MAX,
             switch_flap: u64::MAX,
+            fail_streak_excluded: u64::MAX,
+            explore_backed_off: u64::MAX,
         };
         stale_state.inner.lock().selection_reasons.insert(
             SelectionReasonKey::new("stale", SelectionNetwork::Tcp),
@@ -4517,6 +4661,8 @@ group {
             fresh_failure_bypass: _,
             dead_filtered: _,
             switch_flap: _,
+            fail_streak_excluded: _,
+            explore_backed_off: _,
         } = snapshot[0].tcp;
 
         let _ = manager.selection_plan_for_target(
@@ -4536,6 +4682,8 @@ group {
             fresh_failure_bypass: u64::MAX,
             dead_filtered: u64::MAX,
             switch_flap: u64::MAX,
+            fail_streak_excluded: u64::MAX,
+            explore_backed_off: u64::MAX,
         };
         state.inner.lock().selection_reasons.insert(
             SelectionReasonKey::new("z-score", SelectionNetwork::Udp),
@@ -5179,6 +5327,8 @@ group {
             drop(state.start(&context, &[ScoreAttribution { group, node_id }]));
         }
         assert_eq!(state.inner.lock().aggregate.len(), AGGREGATE_CAPACITY);
+        assert_eq!(state.inner.lock().aggregate_evictions, 1);
+        assert_eq!(state.inner.lock().exact_evictions, 0);
     }
 
     #[test]
