@@ -20,6 +20,42 @@ impl GroupManager {
             .map(|candidate| candidate.node)
     }
 
+    /// After a Selector pick, commit the serving sub-group's own selection:
+    /// sub-groups are peeked during flattening, so only the real service
+    /// path records selection state (ranks, incumbent marks, URLTest
+    /// caches), whatever member the pick landed on — stored choice, default,
+    /// or alive fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn commit_selector_pick<'a>(
+        &'a self,
+        group: &'a Group,
+        picked: Candidate<'a>,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: SelectionEffects,
+    ) -> Candidate<'a> {
+        if !effects.applies() {
+            return picked;
+        }
+        let Some(sub) = self.groups.get(picked.tag) else {
+            return picked;
+        };
+        self.mark_used(picked.tag);
+        visited.push(group.name.as_str());
+        let committed =
+            self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, effects);
+        visited.pop();
+        match committed {
+            Some(mut committed) => {
+                committed.tag = picked.tag;
+                committed
+            }
+            None => picked,
+        }
+    }
+
     pub(super) fn pick_candidate_in_group<'a>(
         &'a self,
         group: &'a Group,
@@ -56,7 +92,10 @@ impl GroupManager {
                 });
         }
         let candidate = match group.policy {
-            GroupPolicy::Selector => self.pick_selector(&candidates, group),
+            GroupPolicy::Selector => {
+                let picked = self.pick_selector(&candidates, group);
+                self.commit_selector_pick(group, picked, domain, ipver, visited, depth, effects)
+            }
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
             GroupPolicy::LoadBalance => {
                 self.pick_load_balance(&candidates, group, network, effects)
@@ -94,18 +133,12 @@ impl GroupManager {
             return Vec::new();
         }
         visited.push(group.name.as_str());
-        // A Selector commits only its chosen sub-group's pick; resolving the
-        // rest is candidate bookkeeping and must not record Score ranks,
-        // incumbent marks, or flap history on their state.
-        let chosen_tag = if group.policy == GroupPolicy::Selector && effects.applies() {
-            self.selector_choice
-                .read()
-                .get(&group.name)
-                .cloned()
-                .or_else(|| group.default.clone())
-                .or_else(|| self.member_tags(group).first().map(|tag| tag.to_string()))
+        // A Selector peeks all sub-groups here; `commit_selector_pick`
+        // re-resolves the serving one with applied effects after the pick.
+        let sub_effects = if group.policy == GroupPolicy::Selector && effects.applies() {
+            SelectionEffects::Peek
         } else {
-            None
+            effects
         };
         let mut out: Vec<Candidate<'a>> = group
             .nodes
@@ -121,10 +154,6 @@ impl GroupManager {
         for sub_tag in &group.groups {
             let Some(sub) = self.groups.get(sub_tag.as_str()) else {
                 continue;
-            };
-            let sub_effects = match &chosen_tag {
-                Some(tag) if tag.as_str() != sub_tag.as_str() => SelectionEffects::Peek,
-                _ => effects,
             };
             // Sub-group participation counts as activity only for real
             // traffic. Peek follows the same nested policy without waking

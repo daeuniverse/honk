@@ -2236,7 +2236,17 @@ impl super::GroupManager {
             )
         } else {
             let candidate = match group.policy {
-                honk_config::group::GroupPolicy::Selector => self.pick_selector(&candidates, group),
+                honk_config::group::GroupPolicy::Selector => {
+                    let picked = self.pick_selector(&candidates, group);
+                    self.commit_selector_pick_for_target(
+                        group,
+                        picked,
+                        context,
+                        &mut visited,
+                        0,
+                        super::SelectionEffects::Apply,
+                    )
+                }
                 honk_config::group::GroupPolicy::URLTest => self.pick_urltest(
                     &candidates,
                     group,
@@ -2342,7 +2352,12 @@ impl super::GroupManager {
             self.last_resort_candidate_for_target(group, context, visited, depth, effects)
         } else {
             Some(match group.policy {
-                honk_config::group::GroupPolicy::Selector => self.pick_selector(&candidates, group),
+                honk_config::group::GroupPolicy::Selector => {
+                    let picked = self.pick_selector(&candidates, group);
+                    self.commit_selector_pick_for_target(
+                        group, picked, context, visited, depth, effects,
+                    )
+                }
                 honk_config::group::GroupPolicy::URLTest => self.pick_urltest(
                     &candidates,
                     group,
@@ -2368,6 +2383,35 @@ impl super::GroupManager {
         Some(candidate)
     }
 
+    /// Target-aware counterpart of `commit_selector_pick`.
+    fn commit_selector_pick_for_target<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        picked: super::Candidate<'a>,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: super::SelectionEffects,
+    ) -> super::Candidate<'a> {
+        if !effects.applies() {
+            return picked;
+        }
+        let Some(sub) = self.groups.get(picked.tag) else {
+            return picked;
+        };
+        self.mark_used(picked.tag);
+        visited.push(group.name.as_str());
+        let committed = self.pick_candidate_for_target(sub, context, visited, depth + 1, effects);
+        visited.pop();
+        match committed {
+            Some(mut committed) => {
+                committed.tag = picked.tag;
+                committed
+            }
+            None => picked,
+        }
+    }
+
     fn flatten_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -2380,18 +2424,12 @@ impl super::GroupManager {
             return Vec::new();
         }
         visited.push(group.name.as_str());
-        // Same rule as `flatten_candidates`: a Selector commits only its
-        // chosen sub-group's pick, the rest are peeked.
-        let chosen_tag =
+        // Same rule as `flatten_candidates` (see `commit_selector_pick`).
+        let sub_effects =
             if group.policy == honk_config::group::GroupPolicy::Selector && effects.applies() {
-                self.selector_choice
-                    .read()
-                    .get(&group.name)
-                    .cloned()
-                    .or_else(|| group.default.clone())
-                    .or_else(|| self.member_tags(group).first().map(|tag| tag.to_string()))
+                super::SelectionEffects::Peek
             } else {
-                None
+                effects
             };
         let mut candidates: Vec<_> = group
             .nodes
@@ -2407,10 +2445,6 @@ impl super::GroupManager {
         for tag in &group.groups {
             let Some(subgroup) = self.groups.get(tag.as_str()) else {
                 continue;
-            };
-            let sub_effects = match &chosen_tag {
-                Some(chosen) if chosen.as_str() != tag.as_str() => super::SelectionEffects::Peek,
-                _ => effects,
             };
             if sub_effects.applies() {
                 self.mark_used(tag);
@@ -4408,8 +4442,8 @@ group {
         ];
         for (group, cold_explore, dead_filtered) in applied {
             let counts = state.selection_reason_counts(group, SelectionNetwork::Tcp);
-            assert_eq!(counts.cold_explore, cold_explore);
-            assert_eq!(counts.dead_filtered, dead_filtered);
+            assert_eq!(counts.cold_explore, cold_explore, "{group} cold_explore");
+            assert_eq!(counts.dead_filtered, dead_filtered, "{group} dead_filtered");
             assert_eq!(
                 counts.periodic_explore
                     + counts.reliability_winner
@@ -4808,6 +4842,78 @@ group {
         assert_eq!(
             state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp),
             before_b
+        );
+
+        // A stale stored choice names no member: the fallback serving
+        // sub-group still commits its rank instead of everything peeking.
+        manager.set_selector_choice("sel-parent", "sel-sub-renamed-away");
+        let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
+        let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
+        assert_ne!(
+            state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp),
+            before_a
+        );
+    }
+
+    #[test]
+    fn selector_commit_follows_non_first_default() {
+        let nodes = [
+            node("def-alpha-a"),
+            node("def-alpha-b"),
+            node("def-beta-a"),
+            node("def-beta-b"),
+        ];
+        let sub_a = group("def-sub-a", &nodes[..2]);
+        let sub_b = group("def-sub-b", &nodes[2..]);
+        let mut parent = selector_with_children("def-parent", &[], &["def-sub-a", "def-sub-b"]);
+        parent.default = Some("def-sub-b".into());
+        let manager = super::super::GroupManager::new(&[sub_a, sub_b, parent], &nodes);
+        let state = manager.score_state();
+
+        // No stored choice: the default (non-first) member serves and must
+        // be the one committing its rank.
+        let _ = manager.selection_plan_for_domain("def-parent", ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(
+            state
+                .selection_reason_counts("def-sub-b", SelectionNetwork::Tcp)
+                .cold_explore,
+            1
+        );
+        assert_eq!(
+            state.selection_reason_counts("def-sub-a", SelectionNetwork::Tcp),
+            SelectionReasonCounts::default()
+        );
+    }
+
+    #[test]
+    fn selector_commit_follows_alive_fallback() {
+        let dead = node("fallback-dead");
+        let nodes = [dead.clone(), node("fallback-alpha"), node("fallback-beta")];
+        let sub = group("fallback-sub", &nodes[1..]);
+        let parent = Group {
+            id: Uuid::new_v4(),
+            name: "fallback-parent".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![dead.id],
+            groups: vec!["fallback-sub".into()],
+            ..Default::default()
+        };
+        let alive = Arc::new(super::super::AliveDialerSet::new());
+        alive.report_unavailable_forced(dead.id, ProbeDomain::Tcp, IpVersion::V4);
+        let manager =
+            super::super::GroupManager::with_alive_set(&[sub, parent], &nodes, Some(alive));
+        let state = manager.score_state();
+
+        // The chosen direct member is dead; the fallback serving sub-group
+        // must be the one committing its rank.
+        manager.set_selector_choice("fallback-parent", "fallback-dead");
+        let _ =
+            manager.selection_plan_for_domain("fallback-parent", ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(
+            state
+                .selection_reason_counts("fallback-sub", SelectionNetwork::Tcp)
+                .cold_explore,
+            1
         );
     }
 
