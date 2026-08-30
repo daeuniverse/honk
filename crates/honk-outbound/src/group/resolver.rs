@@ -358,6 +358,9 @@ impl GroupManager {
                 continue;
             };
             let mut visited = Vec::new();
+            // Delay tests and provider listings only display the sub-group's
+            // current pick: peek, or a dashboard poll would record phantom
+            // Score selections and flap history for unused groups.
             let leaf = self
                 .pick_in_group(
                     sub,
@@ -365,7 +368,7 @@ impl GroupManager {
                     IpVersion::V4,
                     &mut visited,
                     0,
-                    SelectionEffects::Apply,
+                    SelectionEffects::Peek,
                 )
                 .or_else(|| {
                     let mut visited = Vec::new();

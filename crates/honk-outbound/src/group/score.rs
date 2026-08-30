@@ -4700,6 +4700,32 @@ group {
     }
 
     #[test]
+    fn delay_test_members_do_not_record_score_selection() {
+        let nodes = [node("delay-peek-alpha"), node("delay-peek-beta")];
+        let sub = group("delay-peek-sub", &nodes);
+        let parent = Group {
+            id: Uuid::new_v4(),
+            name: "delay-peek-parent".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![],
+            groups: vec!["delay-peek-sub".into()],
+            ..Default::default()
+        };
+        let manager = super::super::GroupManager::new(&[parent, sub], &nodes);
+
+        let members = manager.delay_test_members("delay-peek-parent");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, "delay-peek-sub");
+
+        let state = manager.score_state();
+        assert_eq!(
+            state.selection_reason_counts("delay-peek-sub", SelectionNetwork::Tcp),
+            SelectionReasonCounts::default()
+        );
+        assert!(state.inner.lock().selection_history.is_empty());
+    }
+
+    #[test]
     fn score_reason_snapshot_reload_policy_is_name_based() {
         let nodes = [node("private-reload-alpha"), node("private-reload-beta")];
         let score = group("persist", &nodes);
