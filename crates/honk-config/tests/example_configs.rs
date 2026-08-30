@@ -26,7 +26,7 @@ fn test_config_dae_parses() {
     // One socks5 share-link node plus at least one group. (config.dae is a
     // live example: assert shape, not exact rule counts.)
     assert_eq!(config.nodes.len(), 1);
-    assert_eq!(config.nodes[0].name, "iris");
+    assert_eq!(config.nodes[0].name, "iris-1");
     assert!(!config.groups.is_empty());
     assert_eq!(config.groups[0].name, "iris");
 
@@ -52,7 +52,7 @@ fn test_config_min_dae_parses() {
 
     assert_eq!(config.global.lan_interface, vec!["veth0".to_string()]);
     assert_eq!(config.nodes.len(), 1);
-    assert_eq!(config.nodes[0].name, "iris");
+    assert_eq!(config.nodes[0].name, "iris-1");
     assert_eq!(config.groups.len(), 1);
     assert_eq!(config.groups[0].name, "iris");
     assert_eq!(config.routing.rules.len(), 1);

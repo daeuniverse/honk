@@ -30,7 +30,7 @@ global {
 
 # 代理节点链
 node {
-    iris: 'socks5://10.10.10.1:2077'
+    iris-1: 'socks5://10.10.10.1:2077'
     # Hysteria2 端口跳跃,两种等价写法（mport 参数 / 官方内嵌形式）:
     # hy2-a: 'hysteria2://pass@example.com:443?mport=20000-30000&mhop=30#hy2-a'
     # hy2-b: 'hysteria2://pass@example.com:443,20000-30000?mhop=30#hy2-b'
@@ -75,7 +75,7 @@ group {
     # 按订阅 tag 过滤示例：filter: subtag(sub) && !name(keyword: 'ExpireAt-')
     # 固定节点
     iris {
-        filter: name('iris')
+        filter: name('iris-1')
         policy: fixed(0)
     }
 

@@ -15,12 +15,12 @@ global {
 }
 
 node {
-    iris: 'socks5://10.10.10.1:2077'
+    iris-1: 'socks5://10.10.10.1:2077'
 }
 
 group {
     iris {
-        filter: name('iris')
+        filter: name('iris-1')
         policy: fixed(0)
     }
 }

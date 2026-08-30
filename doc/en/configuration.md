@@ -217,7 +217,7 @@ See the [group reference](./reference/groups.md).
 
 ## Writing routing rules
 
-Rules are source-ordered and use `matcher(...) [&& !matcher(...)] -> outbound`, followed by `fallback: outbound`. Targets are `direct`, `block`, a node, or a group. `direct(must)` marks a non-finalizing must decision that later matches carry forward; Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
+Rules are source-ordered and use `matcher(...) [&& !matcher(...)] -> outbound`, followed by `fallback: outbound`. Targets are `direct`, `block`, or a group; a bare node name is rejected at load — wrap it in a group (e.g. `filter: name('node')`). A `(must)` decision is final: sniffing is skipped, and Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
 
 honk injects `dip(<every configured LAN/WAN interface address>) -> direct(must)` at startup and reload so gateway services do not depend on proxy health. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` keeps that same proxy as a last resort; UDP and all-dead multi-leaf groups remain fail-closed. Keep `dip(geoip: private) -> direct(must)`, point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
 

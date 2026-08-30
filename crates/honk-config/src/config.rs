@@ -719,7 +719,47 @@ impl Config {
                     "Group name cannot be empty".into(),
                 ));
             }
+            if self.nodes.iter().any(|node| {
+                node.id != DIRECT_NODE_ID && node.id != BLOCK_NODE_ID && node.name == group.name
+            }) {
+                return Err(crate::ConfigError::Validation(format!(
+                    "name '{}' is defined as both a node and a group; rename one of them",
+                    group.name
+                )));
+            }
         }
+        // Routing outbounds resolve only against group names and the built-in
+        // direct/block. A bare node name has no eBPF outbound id, so accepting
+        // it would silently misroute; subscription nodes arrive at runtime and
+        // are deliberately out of scope here. group.final and DNS upstream
+        // detours legitimately accept node names and stay unchecked.
+        let is_config_node = |name: &str| {
+            self.nodes.iter().any(|node| {
+                node.id != DIRECT_NODE_ID && node.id != BLOCK_NODE_ID && node.name == name
+            })
+        };
+        let check_outbound = |outbound: &str, fallback: bool| -> Result<(), crate::ConfigError> {
+            let kind = if fallback { "fallback" } else { "outbound" };
+            if matches!(
+                outbound,
+                Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE
+            ) || self.groups.iter().any(|group| group.name == outbound)
+            {
+                return Ok(());
+            }
+            if is_config_node(outbound) {
+                return Err(crate::ConfigError::Validation(format!(
+                    "{kind} '{outbound}' is a node, not a group; wrap it in a group (e.g. filter: name('{outbound}')) or reference a group"
+                )));
+            }
+            Err(crate::ConfigError::Validation(format!(
+                "unknown {kind} '{outbound}' (expected a group name, 'direct', or 'block')"
+            )))
+        };
+        for rule in &self.routing.rules {
+            check_outbound(rule.outbound.as_str(), false)?;
+        }
+        check_outbound(&self.routing.default_outbound, true)?;
         Ok(())
     }
 }
@@ -1070,6 +1110,101 @@ mod builtin_nodes_tests {
                 .iter()
                 .all(|rule| !rule.name.starts_with("__local_direct_")),
             "stale generated rules must be removed"
+        );
+    }
+
+    fn test_node(name: &str) -> crate::node::Node {
+        let mut node =
+            crate::node::Node::from_share_link("trojan://secret@example.com:443").unwrap();
+        node.name = name.into();
+        node
+    }
+
+    fn rule_to(outbound: &str) -> crate::routing::RoutingRule {
+        crate::routing::RoutingRule {
+            name: String::new(),
+            condition: crate::routing::RoutingCondition::default(),
+            outbound: crate::routing::RoutingOutbound::Simple(outbound.into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_bare_node_outbounds() {
+        let mut config = Config::default();
+        config.nodes.push(test_node("vn"));
+
+        config.routing.rules.push(rule_to("vn"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outbound 'vn' is a node, not a group; wrap it in a group (e.g. filter: name('vn')) or reference a group"),
+            "{err}"
+        );
+
+        config.routing.rules.clear();
+        config.routing.default_outbound = "vn".into();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fallback 'vn' is a node, not a group; wrap it in a group (e.g. filter: name('vn')) or reference a group"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_group_and_builtin_outbounds() {
+        let mut config = Config::default();
+        config.nodes.push(test_node("vn"));
+        config.groups.push(crate::group::Group {
+            name: "proxy".into(),
+            ..Default::default()
+        });
+        for outbound in ["proxy", "direct", "block"] {
+            config.routing.rules = vec![rule_to(outbound)];
+            config.routing.default_outbound = outbound.into();
+            assert!(config.validate().is_ok(), "outbound '{outbound}' must pass");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_outbounds() {
+        let mut config = Config::default();
+        config.routing.rules.push(rule_to("missing"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "unknown outbound 'missing' (expected a group name, 'direct', or 'block')"
+            ),
+            "{err}"
+        );
+
+        config.routing.rules.clear();
+        config.routing.default_outbound = "missing".into();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "unknown fallback 'missing' (expected a group name, 'direct', or 'block')"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_node_group_name_collision() {
+        let mut config = Config::default();
+        config.nodes.push(test_node("dup"));
+        config.groups.push(crate::group::Group {
+            name: "dup".into(),
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("name 'dup' is defined as both a node and a group; rename one of them"),
+            "{err}"
         );
     }
 }

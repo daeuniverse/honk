@@ -50,7 +50,8 @@ Every positive field has a corresponding list under `RoutingCondition.not`; the 
 | `direct` | Built-in direct outbound |
 | `block` | Built-in blocking outbound |
 | Group name | Resolve through that outbound group and its policy |
-| Node name | Use that node directly |
+
+Bare node names are not valid outbound targets: `Config::validate` rejects them. Wrap the node in a group (for example `filter: name('node')`) and reference the group instead. A group and a node also may not share a name.
 
 Appending `(must)` gives Go dae-compatible must semantics. A matching must rule does not finalize the rule search; evaluation continues and propagates the must state to the resulting outbound. Clash `Global` and `Direct` modes never override a must result. They also never override `block`.
 
@@ -110,14 +111,14 @@ routing {
         regex: '^bad[0-9]+\.example$',
         geosite: category-games@cn
     ) -> proxy
-    dip(geoip: cn, 203.0.113.0/24) && sport(1024-65535) && dscp(46) -> hk-1
+    dip(geoip: cn, 203.0.113.0/24) && sport(1024-65535) && dscp(46) -> hk
     l4proto(tcp) && dport(80, 443, 8080-8090) -> proxy
     !domain(geosite: category-ads-all) && !dip(geoip: cn) -> resilient
     fallback: resilient
 }
 ```
 
-Here `proxy` and `resilient` are group names, while `hk-1` is a node name.
+Here `proxy`, `hk`, and `resilient` are all group names.
 
 ## Related docs
 
