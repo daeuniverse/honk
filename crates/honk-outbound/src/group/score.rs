@@ -24,6 +24,10 @@ const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 /// capped at 2^3 = 8x. Fresh failures still bypass; a merely less reliable
 /// but non-failing incumbent can stay held, which is the intended trade.
 const SCORE_SWITCH_FLAP_MAX_LEVEL: u8 = 3;
+/// One damping level releases only after this many consecutive same-winner
+/// selections — derived from the flap window so a switch:hold ratio up to
+/// 1:8 still accumulates damping instead of cancelling it.
+const SCORE_SWITCH_STABLE_RELEASE: u8 = 2 * SCORE_SWITCH_FLAP_WINDOW as u8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
 const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
@@ -432,8 +436,11 @@ struct SelectionHistory {
     selections: u64,
     switched_at: u64,
     /// Flap-damping level: each detected flap raises the hold margin by one
-    /// power of two, each held selection lowers it by one.
+    /// power of two. One level releases after `SCORE_SWITCH_STABLE_RELEASE`
+    /// consecutive same-winner selections; any committed switch resets the
+    /// streak.
     margin_level: u8,
+    stable_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -751,15 +758,21 @@ impl ScorePolicyState {
                     selections: 1,
                     switched_at: 0,
                     margin_level: 0,
+                    stable_count: 0,
                 },
             );
             return;
         };
         history.selections = history.selections.saturating_add(1);
         if history.current == node_id {
-            history.margin_level = history.margin_level.saturating_sub(1);
+            history.stable_count = history.stable_count.saturating_add(1);
+            if history.stable_count >= SCORE_SWITCH_STABLE_RELEASE {
+                history.margin_level = history.margin_level.saturating_sub(1);
+                history.stable_count = 0;
+            }
             return;
         }
+        history.stable_count = 0;
         let switch_flap = history.previous == Some(node_id)
             && history.selections.saturating_sub(history.switched_at) <= SCORE_SWITCH_FLAP_WINDOW;
         history.previous = Some(history.current);
@@ -4095,14 +4108,27 @@ group {
         record(&mut inner, second);
         assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL);
 
-        // Held selections decay the damping one level at a time.
+        // Held selections release one level only after a full stable streak.
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE - 1 {
+            record(&mut inner, second);
+        }
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL);
         record(&mut inner, second);
-        assert_eq!(level(&inner), 2);
-        record(&mut inner, second);
-        assert_eq!(level(&inner), 1);
-        record(&mut inner, second);
-        assert_eq!(level(&inner), 0);
-        record(&mut inner, second);
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL - 1);
+
+        // A committed switch resets the streak before it can release.
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE - 1 {
+            record(&mut inner, second);
+        }
+        record(&mut inner, first);
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL - 1);
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE {
+            record(&mut inner, first);
+        }
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL - 2);
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE * 2 {
+            record(&mut inner, first);
+        }
         assert_eq!(level(&inner), 0);
     }
 
@@ -4239,6 +4265,7 @@ group {
                     selections: 1,
                     switched_at: 0,
                     margin_level: 2,
+                    stable_count: 0,
                 },
             );
         }
@@ -4275,6 +4302,7 @@ group {
                     selections: 1,
                     switched_at: 1,
                     margin_level: 0,
+                    stable_count: 0,
                 },
             );
             inner.selection_history.push(
@@ -4285,6 +4313,7 @@ group {
                     selections: 1,
                     switched_at: 1,
                     margin_level: 0,
+                    stable_count: 0,
                 },
             );
         }
