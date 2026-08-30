@@ -17,6 +17,7 @@
 //! config parser and the core subscription fetcher both delegate to
 //! [`Node::from_share_link`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use base64::Engine as _;
@@ -45,7 +46,8 @@ impl Node {
             },
             None => first,
         };
-        let url = url::Url::parse(first)
+        let (first, embedded_hop_ports) = extract_hy2_hop_ports(first)?;
+        let url = url::Url::parse(first.as_ref())
             .map_err(|_| ConfigError::Parse("invalid share link syntax".into()))?;
         let scheme = url.scheme();
         let protocol = match scheme {
@@ -256,10 +258,13 @@ impl Node {
             }
             config.up_mbps = query.get("upmbps").and_then(|value| value.parse().ok());
             config.down_mbps = query.get("downmbps").and_then(|value| value.parse().ok());
-            config.port_hopping = query
-                .get("mport")
-                .filter(|value| !value.is_empty())
-                .cloned();
+            let mport = query.get("mport").filter(|value| !value.is_empty());
+            if mport.is_some() && embedded_hop_ports.is_some() {
+                return Err(ConfigError::Parse(
+                    "hysteria2 port hopping specified in both address and mport".into(),
+                ));
+            }
+            config.port_hopping = mport.cloned().or(embedded_hop_ports);
             config.hop_interval = query.get("mhop").and_then(|value| value.parse().ok());
             config.init_stream_recv_window = query
                 .get("initStreamReceiveWindow")
@@ -591,6 +596,81 @@ fn decode_full_base64_ss_link(rest: &str) -> Option<String> {
         return None;
     }
     Some(format!("ss://{}{}", text, &rest[end..]))
+}
+
+/// Split official-style hop ports out of a hysteria2 authority
+/// (`hysteria2://auth@host:443,5000-6000/...`). The whole list is the hop
+/// set; the first entry stays in the rebuilt address as the nominal port so
+/// generic URL parsing and node identity keep working.
+fn extract_hy2_hop_ports(link: &str) -> Result<(Cow<'_, str>, Option<String>), ConfigError> {
+    let Some(scheme_len) = ["hysteria2://", "hysteria://"]
+        .iter()
+        .find(|prefix| link.starts_with(**prefix))
+        .map(|prefix| prefix.len())
+    else {
+        return Ok((Cow::Borrowed(link), None));
+    };
+    let rest = &link[scheme_len..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let colon = if host_port.starts_with('[') {
+        match host_port.find(']') {
+            Some(close) if host_port.as_bytes().get(close + 1) == Some(&b':') => close + 1,
+            _ => return Ok((Cow::Borrowed(link), None)),
+        }
+    } else {
+        // A bare IPv6 literal has no place in a valid URL; leave it for the
+        // URL parser to reject rather than guessing at its last colon.
+        let mut colons = host_port.match_indices(':');
+        let Some((first, _)) = colons.next() else {
+            return Ok((Cow::Borrowed(link), None));
+        };
+        if colons.next().is_some() {
+            return Ok((Cow::Borrowed(link), None));
+        }
+        first
+    };
+    let port_spec = &host_port[colon + 1..];
+    if !port_spec.contains([',', '-']) {
+        return Ok((Cow::Borrowed(link), None));
+    }
+    if !valid_hop_port_spec(port_spec) {
+        return Err(ConfigError::Parse(format!(
+            "invalid hysteria2 hop port list '{port_spec}'"
+        )));
+    }
+    let first_port = port_spec
+        .split([',', '-'])
+        .next()
+        .and_then(|part| part.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .ok_or_else(|| ConfigError::Parse(format!("invalid hysteria2 port '{port_spec}'")))?;
+    let spec_start = scheme_len + (authority.len() - host_port.len()) + colon + 1;
+    let rebuilt = format!(
+        "{}{}{}",
+        &link[..spec_start],
+        first_port,
+        &link[scheme_len + authority_end..]
+    );
+    Ok((Cow::Owned(rebuilt), Some(port_spec.to_string())))
+}
+
+/// Comma-separated ports and inclusive port ranges, all nonzero.
+fn valid_hop_port_spec(spec: &str) -> bool {
+    !spec.is_empty()
+        && spec.split(',').all(|segment| {
+            let segment = segment.trim();
+            match segment.split_once('-') {
+                None => segment.parse::<u16>().is_ok_and(|port| port > 0),
+                Some((low, high)) => {
+                    match (low.trim().parse::<u16>(), high.trim().parse::<u16>()) {
+                        (Ok(low), Ok(high)) => low > 0 && low <= high,
+                        _ => false,
+                    }
+                }
+            }
+        })
 }
 
 /// Base64-decode tolerantly: URL-safe without padding first, then the other

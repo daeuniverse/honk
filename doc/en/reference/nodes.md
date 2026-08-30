@@ -143,7 +143,7 @@ Live interoperability has been verified for VLESS TCP+REALITY+Vision, TCP+REALIT
 | userinfo secret | `username`, `password`, and `hy2_auth` |
 | `obfs=salamander&obfs-password=...` | Non-empty password becomes `hy2_obfs`; other/incomplete obfs input stays disabled |
 | `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`; a positive upload value enables Brutal, otherwise BBR is used; download is advertised in bytes/s |
-| `mport` / `mhop` | Port list/ranges and hop interval in seconds; interval defaults to 30 and clamps to the upstream minimum of 5 |
+| `mport` / `mhop` | Port list/ranges and hop interval in seconds; interval defaults to 30 and clamps to the upstream minimum of 5. The official client form with hop ports embedded in the authority (`:443,5000-6000`) is equivalent to `mport`; specifying both is rejected, and a malformed embedded list fails at parse time |
 | `pinSHA256` | `tls_pin_sha256`, replacing PKI/hostname verification |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC receive-window overrides |
 | `disablePathMTUDiscovery` | Disables QUIC PMTU discovery when `1`/`true` |
