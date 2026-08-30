@@ -543,10 +543,22 @@ impl GroupManager {
             };
         }
         match group.policy {
-            GroupPolicy::Selector => SelectionPlan {
-                mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_selector(&candidates, group).node],
-            },
+            GroupPolicy::Selector => {
+                let picked = self.pick_selector(&candidates, group);
+                let committed = self.commit_selector_pick(
+                    group,
+                    picked,
+                    domain,
+                    ipver,
+                    &mut visited,
+                    0,
+                    effects,
+                );
+                SelectionPlan {
+                    mode: SelectionPlanMode::Authoritative,
+                    nodes: vec![committed.node],
+                }
+            }
             GroupPolicy::URLTest => {
                 if urltest_has_data {
                     SelectionPlan {
