@@ -169,3 +169,6 @@ strip = true
 [patch.crates-io]
 # honk rprx fork: preset X25519 keyshare + ClientHello fixup hooks (REALITY)
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "630d5030ee281371231f2c8c0b7206178032f62e" }
+# honk fork: raise the receive-assembler chunk bound so large receive windows
+# survive lossy paths (upstream MAX_CHUNKS=1024 kills the whole connection).
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "a147057a8dfbfcd583be395f5fa13adbb91ccfe5" }

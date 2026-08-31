@@ -2584,8 +2584,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+source = "git+https://github.com/Glassyiris/quinn?rev=a147057a8dfbfcd583be395f5fa13adbb91ccfe5#a147057a8dfbfcd583be395f5fa13adbb91ccfe5"
 dependencies = [
  "aws-lc-rs",
  "bytes",
