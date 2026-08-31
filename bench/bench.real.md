@@ -89,9 +89,44 @@ degraded UDP where quinn (post-#110) degrades gracefully.
 
 Ruled out for the good-window gap: client CPU (15% of one core at 33 MB/s),
 kernel UDP drops (0 RcvbufErrors during runs), receive-window size (8 MiB @
-65 ms RTT = 126 MB/s ceiling), MTU alone (`mtu=1450` only +25%). Remaining
-suspects: quinn per-packet/ACK dynamics vs quic-go (GRO coalescing measured
-at only ~2 segments), to be isolated in the controlled netem lab.
+65 ms RTT = 126 MB/s ceiling), MTU alone (`mtu=1450` only +25%), and the
+honk-core datapath/relay (handler-direct download via
+`crates/honk-outbound/examples/hy2_dl.rs` = 24–28 MB/s, identical to the
+in-engine number).
+
+### Interleaved A/B, second session (same evening, worse link phase)
+
+| round | honk MB/s | kdae MB/s |
+|---|---|---|
+| 1 | 23.1 | 0.2 (exit 28) |
+| 2 | 24.2 | 1.0 (exit 28) |
+| 3 | 13.4 | **62.3** |
+| 4 | 22.4 | 18.0 |
+| 5 | 0.3 (exit 28) | 1.4 (exit 28) |
+| 6 | 18.5 | 3.5 (exit 28) |
+
+Totals over both sessions (12 rounds): honk 11/12 complete, 13–30 MB/s;
+kdae 5/12 complete, peaks 54–62. Round-3 same-window pair (honk 13.4 / kdae
+62.3) reconfirms the good-window gap.
+
+## Controlled lab (netns on .49, sing-box server in `labsrv`, setup
+script `/root/labsrv-setup.sh`, configs `/root/{honk,dae}-lab-223.dae`)
+
+iperf3 download through the full datapath, median of 3:
+
+| condition | honk hy2 | dae hy2 |
+|---|---|---|
+| clean LAN | **7403 Mbps** | 6484 Mbps |
+| 1% random loss | **6523 Mbps** | 3848 Mbps |
+| 65 ms RTT + 1% loss | **515 Mbps** | 335 Mbps |
+
+tuic clean LAN: honk 10230 vs dae 8061 Mbps. quinn matches or beats quic-go
+on every controlled condition — the WAN good-window gap is not base
+efficiency, random-loss sensitivity, or delay+loss interaction. What remains
+unreproduced in the lab: real WAN burst-loss/policing dynamics. Next
+instrument for that: WAN packet capture. Also noteworthy: quic-go's
+good-window peaks come with a 50% connection-death rate in bad windows;
+quinn never died after #110.
 
 ## Conclusions
 
