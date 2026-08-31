@@ -66,15 +66,42 @@ exceeds it. quic-go has no such cap. After raising the bound to 16384:
 
 RSS during transfer stayed flat (38.7 → 39.2 MB).
 
+## Follow-up: tightly interleaved hy2 A/B (2026-09-01, same path)
+
+The protocol matrix above ran all honk rows before all kdae rows; link
+conditions drift over minutes, so a per-protocol alternating A/B (6 rounds,
+same fallback group, engine restarted per run) was run to separate
+implementation from time variance:
+
+| round | honk MB/s | kdae MB/s |
+|---|---|---|
+| 1 | 25.2 | FAIL (0 B, exit 28) |
+| 2 | 15.9 | FAIL (exit 56) |
+| 3 | 16.1 | FAIL (exit 56) |
+| 4 | 17.3 | 54.1 |
+| 5 | 30.1 | 55.3 |
+| 6 | 28.2 | FAIL (exit 28) |
+
+honk 6/6 complete (avg 22.1); kdae 3/6 complete but 54–55 when the link
+window is good. Round 4/5 prove the good-window gap is real (~2–3×) and not
+time drift; the failures prove quic-go connections die outright under
+degraded UDP where quinn (post-#110) degrades gracefully.
+
+Ruled out for the good-window gap: client CPU (15% of one core at 33 MB/s),
+kernel UDP drops (0 RcvbufErrors during runs), receive-window size (8 MiB @
+65 ms RTT = 126 MB/s ceiling), MTU alone (`mtu=1450` only +25%). Remaining
+suspects: quinn per-packet/ACK dynamics vs quic-go (GRO coalescing measured
+at only ~2 segments), to be isolated in the controlled netem lab.
+
 ## Conclusions
 
 - Latency: honk's pooling / shared-QUIC-connection model beats kdae broadly
   (1 RTT on hits; kdae pays 2–3 RTT, socks5 ~8 RTT). honk gaps: ss2022,
   vmess, vless never hit the pool; trojan/socks5 miss rate ~50%.
-- Throughput: TCP-carried protocols are parity or honk-favored; QUIC
-  protocols are 50–60% of kdae (quinn send path: 1252 default MTU with GSO
-  off explains ~+25%, the rest is pacing/GSO depth vs quic-go). Input for
-  feat-quic-opt P2.
+- Throughput: TCP-carried protocols are parity or honk-favored. QUIC: kdae
+  is ~2–3× honk in good windows but fails outright in degraded ones
+  (3/6 runs died with 0 bytes); honk never died. The trade-off is
+  efficiency vs robustness, not a uniform honk deficit.
 - Reliability watch: the one-time anytls/vless bench-window failures did
   not reproduce; server log shows only expected v4-only-server health-check
   noise. Re-observe before attributing.
