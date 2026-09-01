@@ -200,13 +200,14 @@ impl PendingUdpVerdicts {
                     self.drop_one(held, DropOutcome::Cancel);
                     return NfqueueIngest::Dropped;
                 };
-                let result = self.endpoints.reserve_owned_or_enqueue(
+                let result = self.endpoints.reserve_owned_or_enqueue_at(
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
                     decision_token,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
+                    held.received_at,
                     &self.stats,
                 );
                 match result {
@@ -249,13 +250,14 @@ impl PendingUdpVerdicts {
                     self.drop_one(held, DropOutcome::Other);
                     return NfqueueIngest::Dropped;
                 };
-                let result = self.endpoints.reserve_owned_or_enqueue(
+                let result = self.endpoints.reserve_owned_or_enqueue_at(
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
                     decision_token,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
+                    held.received_at,
                     &self.stats,
                 );
                 drop(state);
@@ -350,13 +352,14 @@ impl PendingUdpVerdicts {
                     self.drop_one(held, DropOutcome::Cancel);
                     return NfqueueIngest::Dropped;
                 };
-                match self.endpoints.reserve_owned_or_enqueue(
+                match self.endpoints.reserve_owned_or_enqueue_at(
                     key.client,
                     key.destination,
                     payload,
                     decision_token,
                     None,
                     slow_permit,
+                    held.received_at,
                     &self.stats,
                 ) {
                     EndpointReservation::Initializing(lease) => {
@@ -421,11 +424,12 @@ impl PendingUdpVerdicts {
             }
             RetainedState::Proxy => {
                 drop(slow_permit);
-                match self.endpoints.enqueue_owned_by_token(
+                match self.endpoints.enqueue_owned_by_token_at(
                     key.client,
                     key.destination,
                     payload,
                     decision_token,
+                    held.received_at,
                     &self.stats,
                 ) {
                     Ok(generation) => {

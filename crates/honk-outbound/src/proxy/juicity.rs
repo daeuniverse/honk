@@ -2,8 +2,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -72,6 +72,8 @@ struct JuicityConnState {
     open: Arc<AtomicUsize>,
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
+    path_health: Arc<crate::quic::QuicPathHealth>,
+    metrics: OnceLock<crate::quic::QuicConnectionMonitor>,
 }
 
 impl QuicConnState for JuicityConnState {
@@ -82,16 +84,25 @@ impl QuicConnState for JuicityConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
+    fn install_metrics_monitor(&self, conn: quinn::Connection) {
+        self.path_health.enable_telemetry();
+        self.metrics
+            .get_or_init(|| crate::quic::monitor_quic_connection(&conn));
+    }
 }
 
 impl JuicityConnState {
     fn new(conn: quinn::Connection, auth_stream: quinn::SendStream) -> Self {
+        let path_health = crate::quic::QuicPathHealth::new(&conn);
         let state = Self {
             _conn: conn.clone(),
             _auth_stream: auth_stream,
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
+            path_health: Arc::clone(&path_health),
+            metrics: OnceLock::new(),
         };
+        crate::quic::spawn_quic_path_watchdog(conn.clone(), path_health);
         crate::quic::spawn_conn_reaper(
             conn,
             Arc::downgrade(&state.open),
@@ -116,6 +127,10 @@ impl crate::runtime::QuicRuntimeClient for JuicityClient {
         self
     }
 
+    async fn enable_metrics(&self) {
+        self.quic.enable_metrics().await;
+    }
+
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
@@ -133,7 +148,7 @@ impl JuicityClient {
         let uuid = self.uuid;
         let password = self.password.clone();
         self.quic
-            .connection_with(connect_timeout, move |conn| async move {
+            .connection_with_metrics(connect_timeout, move |conn| async move {
                 let auth_stream = crate::quic::exporter_auth(
                     &conn,
                     &uuid,
@@ -263,30 +278,37 @@ impl JuicityHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let stream_addr = JuiceAddr::new(target, target_domain);
-        let addr = stream_addr.clone();
-        let stream = crate::quic::dial_quic_stream(
-            &client.quic,
-            |timeout| {
-                let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
-            },
-            connect_timeout,
-            move |conn| {
-                let addr = addr.clone();
-                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
-            },
-            |_| true,
-            "Juicity",
-        )
-        .await?;
-        let (send, recv, guard) = stream.into_parts();
-        Ok(Arc::new(JuicityUdpTransport {
-            send: tokio::sync::Mutex::new(send),
-            recv: tokio::sync::Mutex::new(recv),
-            _guard: guard,
-            target_addr: stream_addr,
-            target,
-        }))
+        let mut last_error = None;
+        for _ in 0..2 {
+            let (conn, state) = client.connection(connect_timeout).await?;
+            state.touch();
+            match Self::open_stream(&conn, NETWORK_UDP, &stream_addr).await {
+                Ok((send, recv)) => {
+                    state.open.fetch_add(1, Ordering::Relaxed);
+                    let open = Arc::clone(&state.open);
+                    let stream_state = Arc::clone(&state);
+                    let stream =
+                        crate::quic::QuicBiStream::new(send, recv).with_on_drop(move || {
+                            open.fetch_sub(1, Ordering::Relaxed);
+                            let _state_kept_alive_under_this_stream = &stream_state;
+                        });
+                    let (send, recv, guard) = stream.into_parts();
+                    return Ok(Arc::new(JuicityUdpTransport {
+                        state,
+                        send: tokio::sync::Mutex::new(send),
+                        recv: tokio::sync::Mutex::new(recv),
+                        _guard: guard,
+                        target_addr: stream_addr,
+                        target,
+                    }));
+                }
+                Err(error) => {
+                    client.quic.invalidate(&conn).await;
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("Juicity UDP stream attempts are non-empty"))
     }
 }
 
@@ -403,6 +425,7 @@ impl ProbeableOutbound for JuicityHandler {
 /// Framed UDP transport over a Juicity UDP bi stream: datagrams are framed
 /// as `[metadata][len u16][payload]` directly on the QUIC stream.
 struct JuicityUdpTransport {
+    state: Arc<JuicityConnState>,
     send: tokio::sync::Mutex<quinn::SendStream>,
     recv: tokio::sync::Mutex<quinn::RecvStream>,
     /// Keeps the connection's open-stream accounting alive for the
@@ -425,6 +448,45 @@ impl PacketTransport for JuicityUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
     }
+    fn send_timeout(&self) -> Duration {
+        self.state.path_health.send_timeout()
+    }
+
+    fn record_quic_send_started(&self) -> super::QuicSendToken {
+        self.state
+            .path_health
+            .record_send_started(&self.state._conn)
+    }
+
+    fn record_quic_send_success(&self, token: super::QuicSendToken) {
+        self.state
+            .path_health
+            .record_send_success(token, &self.state._conn);
+    }
+
+    fn record_quic_send_timeout(&self, token: super::QuicSendToken) {
+        if self
+            .state
+            .path_health
+            .record_send_timeout(token, &self.state._conn)
+        {
+            crate::quic::record_quic_send_timeout();
+        }
+    }
+
+    fn record_quic_send_failure(&self, token: super::QuicSendToken) {
+        self.state.path_health.record_send_failure(token);
+    }
+
+    fn quic_path_stalled(&self) -> bool {
+        self.state.path_health.is_stalled()
+    }
+
+    fn send_timeout_is_congestion(&self) -> bool {
+        // write_chunk is not cancellation-safe; a timed-out write can leave a
+        // partial frame on this long-lived stream, so retire the endpoint.
+        false
+    }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
         if data.len() > u16::MAX as usize {
@@ -433,6 +495,7 @@ impl PacketTransport for JuicityUdpTransport {
                 "juicity datagram too large",
             ));
         }
+        self.state.touch();
         // SealUDP: `[metadata][len u16][payload]`
         // (`stream_packet_conn.go:83-90`).
         let mut frame = Vec::with_capacity(self.target_addr.encoded_len() + 2 + data.len());

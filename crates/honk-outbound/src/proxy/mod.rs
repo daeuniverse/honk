@@ -237,10 +237,91 @@ pub fn packet_error_class(error: &std::io::Error) -> PacketErrorClass {
     }
 }
 
+/// Snapshot identifying one asynchronous QUIC packet send.
+///
+/// The token binds completion to the ACK epoch and packet counts observed
+/// before the send. A cancelled send is completed as a failure by
+/// [`QuicSendAttempt`] so it cannot leave a phantom path wait.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuicSendToken {
+    pub(crate) ack_epoch: u64,
+    pub(crate) ack_baseline: u64,
+    pub(crate) sent_baseline: u64,
+    pub(crate) started_at: u64,
+}
+
+impl QuicSendToken {
+    pub(crate) const INACTIVE: Self = Self {
+        ack_epoch: 0,
+        ack_baseline: 0,
+        sent_baseline: 0,
+        started_at: 0,
+    };
+
+    pub(crate) fn new(
+        ack_epoch: u64,
+        ack_baseline: u64,
+        sent_baseline: u64,
+        started_at: u64,
+    ) -> Self {
+        Self {
+            ack_epoch,
+            ack_baseline,
+            sent_baseline,
+            started_at,
+        }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        self.started_at != 0
+    }
+}
+
+/// Completes one asynchronous QUIC packet send exactly once.
+#[must_use]
+pub struct QuicSendAttempt<'a> {
+    transport: &'a dyn PacketTransport,
+    token: QuicSendToken,
+    completed: bool,
+}
+
+impl<'a> QuicSendAttempt<'a> {
+    pub fn new(transport: &'a dyn PacketTransport) -> Self {
+        Self {
+            token: transport.record_quic_send_started(),
+            transport,
+            completed: false,
+        }
+    }
+
+    pub fn success(mut self) {
+        self.completed = true;
+        self.transport.record_quic_send_success(self.token);
+    }
+
+    pub fn timeout(mut self) {
+        self.completed = true;
+        self.transport.record_quic_send_timeout(self.token);
+    }
+
+    pub fn failure(mut self) {
+        self.completed = true;
+        self.transport.record_quic_send_failure(self.token);
+    }
+}
+
+impl Drop for QuicSendAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed && self.token.is_active() {
+            self.transport.record_quic_send_failure(self.token);
+        }
+    }
+}
+
 /// Framed UDP packet transport — the production UDP contract. Native UDP
 /// protocols wrap a real `UdpSocket`; tunnel protocols implement their
 /// framing directly on the tunnel instead of bouncing datagrams through a
-/// loopback socket pair (extra FD + bridge task + 1–2 copies per packet).
+/// loopback socket pair (extra FD + 1–2 copies per packet).
 #[async_trait]
 pub trait PacketTransport: Send + Sync + Debug {
     /// The relay target a flow reports as its destination.
@@ -248,6 +329,26 @@ pub trait PacketTransport: Send + Sync + Debug {
     /// Whether server-carried metadata may authoritatively name a logical
     /// reply source before the endpoint has observed its first response.
     fn allows_full_cone_replies(&self) -> bool {
+        false
+    }
+    /// Per-packet send deadline. QUIC transports derive this from SRTT;
+    /// non-QUIC transports retain the five-second driver default.
+    fn send_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+    /// Capture the ACK baseline before an asynchronous QUIC send begins.
+    fn record_quic_send_started(&self) -> QuicSendToken {
+        QuicSendToken::INACTIVE
+    }
+    /// Record a packet accepted by the QUIC transport; the path watchdog
+    /// waits for its ACK before declaring a black hole.
+    fn record_quic_send_success(&self, _token: QuicSendToken) {}
+    /// Record a QUIC packet wait that reached its deadline.
+    fn record_quic_send_timeout(&self, _token: QuicSendToken) {}
+    /// Record a non-timeout send failure so a failed send cannot arm a path wait.
+    fn record_quic_send_failure(&self, _token: QuicSendToken) {}
+    /// Whether this transport's shared QUIC path was retired by the watchdog.
+    fn quic_path_stalled(&self) -> bool {
         false
     }
     /// Whether a driver send deadline is packet-local congestion rather than
@@ -324,6 +425,24 @@ impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
     fn allows_full_cone_replies(&self) -> bool {
         self.inner.allows_full_cone_replies()
     }
+    fn send_timeout(&self) -> std::time::Duration {
+        self.inner.send_timeout()
+    }
+    fn record_quic_send_started(&self) -> QuicSendToken {
+        self.inner.record_quic_send_started()
+    }
+    fn record_quic_send_success(&self, token: QuicSendToken) {
+        self.inner.record_quic_send_success(token);
+    }
+    fn record_quic_send_timeout(&self, token: QuicSendToken) {
+        self.inner.record_quic_send_timeout(token);
+    }
+    fn record_quic_send_failure(&self, token: QuicSendToken) {
+        self.inner.record_quic_send_failure(token);
+    }
+    fn quic_path_stalled(&self) -> bool {
+        self.inner.quic_path_stalled()
+    }
     fn send_timeout_is_congestion(&self) -> bool {
         self.inner.send_timeout_is_congestion()
     }
@@ -385,7 +504,6 @@ impl PreparedUdpTransport {
             commit: Box::new(move || Box::pin(commit())),
         }
     }
-
     /// Wrap an already-authoritative ordinary transport. This deliberately
     /// preserves `dial_udp_transport` semantics for protocols with no
     /// speculative ownership to promote.

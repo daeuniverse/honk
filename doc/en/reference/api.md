@@ -91,6 +91,13 @@ A non-empty `external_ui_download_detour` forces the initial request and redirec
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
   pool: { readyHits, readyMisses, entries },
+  quic: {
+    activeConnections, srttUs, cwndBytes, lossRatePpm, sentPackets, ackFrames,
+    lostPackets, sentPlpmtudProbes, lostPlpmtudProbes, currentMtu, blackHoles,
+    congestionEvents, txBytes, rxBytes, txDatagrams, rxDatagrams, txIos, rxIos,
+    transportTxWouldBlock, transportTxDrops, transportRxDrops, sessionRxDrops,
+    sendTimeouts, pathStalls
+  },
   warm: {
     nodes: { preconnect, health, udp, selector, traffic },
     sessions: { anytls, vless, tuic, juicity, hysteria2 }
@@ -138,6 +145,22 @@ R = {
 | `activeFlows` | Accepted transparent TCP flows currently holding an admission permit. |
 | `limit` | Current process-wide TCP-flow admission ceiling; it starts at the descriptor-derived floor and scales with idle descriptor headroom. |
 | `capacity.rejected` | Monotonic count of accept-loop iterations that waited for a permit because the TCP budget was full; accepted sockets remain in the kernel backlog rather than being dropped. |
+
+### QUIC fields
+
+`srttUs`, `cwndBytes`, and `currentMtu` are averages across active connections and are
+zero when none are active. Packet, byte, I/O, loss, black-hole, and congestion
+counters include completed pooled connections. `ackFrames` counts received ACK
+frames and is a path-progress signal; duplicate ACK frames may count more than
+once. `lossRatePpm` excludes PLPMTUD probes: its denominator is
+`sentPackets - sentPlpmtudProbes`, while `lostPackets` likewise excludes probe
+losses. `sentPlpmtudProbes` and `lostPlpmtudProbes` expose those probes separately.
+`txIos` and `rxIos` expose batching efficiency. `transportTxWouldBlock` counts
+full 64-packet adapter queues (Quinn retries); `transportTxDrops` counts
+datagrams intentionally discarded after the proxied transport reports
+congestion or timeout. `transportRxDrops` counts full adapter receive queues,
+and `sessionRxDrops` counts full 256-packet TUIC/Hysteria2 session queues.
+`sendTimeouts` and `pathStalls` are process-lifetime recovery events.
 
 ### Score selection-reason fields
 

@@ -2584,7 +2584,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "git+https://github.com/Glassyiris/quinn?rev=a147057a8dfbfcd583be395f5fa13adbb91ccfe5#a147057a8dfbfcd583be395f5fa13adbb91ccfe5"
+source = "git+https://github.com/Glassyiris/quinn?rev=b0acb533#b0acb53397902059fb2fa4ce5a2081734dd4d69e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -3367,7 +3367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

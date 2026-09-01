@@ -91,6 +91,13 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
   pool: { readyHits, readyMisses, entries },
+  quic: {
+    activeConnections, srttUs, cwndBytes, lossRatePpm, sentPackets, ackFrames,
+    lostPackets, sentPlpmtudProbes, lostPlpmtudProbes, currentMtu, blackHoles,
+    congestionEvents, txBytes, rxBytes, txDatagrams, rxDatagrams, txIos, rxIos,
+    transportTxWouldBlock, transportTxDrops, transportRxDrops, sessionRxDrops,
+    sendTimeouts, pathStalls
+  },
   warm: {
     nodes: { preconnect, health, udp, selector, traffic },
     sessions: { anytls, vless, tuic, juicity, hysteria2 }
@@ -138,6 +145,10 @@ R = {
 | `activeFlows` | 当前持有 TCP admission permit 的透明 TCP 流。 |
 | `limit` | 当前进程级 TCP 流准入上限；从描述符导出的 floor 开始，并随空闲描述符余量动态扩缩。 |
 | `capacity.rejected` | 因 TCP 预算已满而等待 permit 的 accept-loop 单调计数；accepted socket 保留在内核 backlog 中，不会被丢弃。 |
+
+### QUIC 字段
+
+`srttUs`、`cwndBytes` 与 `currentMtu` 是活动连接的平均值；没有活动连接时为零。报文、字节、I/O、丢包、黑洞和拥塞计数包含已完成的池化连接。`ackFrames` 统计收到的 ACK frame，是路径进度信号；重复 ACK frame 可能被重复计数。`lossRatePpm` 排除 PLPMTUD 探测：分母为 `sentPackets - sentPlpmtudProbes`，而 `lostPackets` 同样不包含探测丢包。`sentPlpmtudProbes` 与 `lostPlpmtudProbes` 单独暴露探测计数。`txIos` 与 `rxIos` 表示批处理效率。`transportTxWouldBlock` 统计满载的 64 包 adapter 队列（Quinn 会重试）；底层代理报告拥塞或超时后主动丢弃的报文计入 `transportTxDrops`；满载的 adapter 接收队列计入 `transportRxDrops`，满载的 TUIC/Hysteria2 256 包会话队列计入 `sessionRxDrops`。`sendTimeouts` 与 `pathStalls` 是进程生命周期内的恢复事件。
 
 ### Score 选路原因字段
 

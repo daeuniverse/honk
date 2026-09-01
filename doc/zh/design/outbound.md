@@ -424,6 +424,15 @@ pair。当 holder 替换已关闭或失效连接时，新工作使用 replacemen
 flow 可以在旧 clone 上完成。移除最后一份 warm 所有权只会移除未来复用，
 不会切断 active flow。
 
+每条池化 QUIC connection 每秒采样一次 Quinn path 与 UDP I/O counter，汇总到
+`/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。
+endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`。连续三次发送
+超时，或超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC packet 被确认，endpoint 会被退役
+并关闭该 connection，让下一条 flow 重新拨号。发送成功会重置超时 streak；确认进度
+会同时重置两个时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn
+PING keepalive，包括无法发送协议 heartbeat datagram 的 UDP-over-stream
+fallback。
+
 ### 协议契约
 
 | 协议 | 认证与 TCP | UDP | Transport 策略 |

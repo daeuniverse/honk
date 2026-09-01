@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -18,7 +18,8 @@ use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_e
 
 use super::addr::{self, SocksAddr};
 use super::{
-    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, QuicSendToken, TcpOutbound,
+    WarmableOutbound,
 };
 
 const TUIC_VERSION: u8 = 0x05;
@@ -247,6 +248,8 @@ struct TuicConnState {
     open: Arc<AtomicUsize>,
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
+    path_health: Arc<crate::quic::QuicPathHealth>,
+    metrics: OnceLock<crate::quic::QuicConnectionMonitor>,
 }
 
 impl QuicConnState for TuicConnState {
@@ -257,11 +260,17 @@ impl QuicConnState for TuicConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
+    fn install_metrics_monitor(&self, conn: quinn::Connection) {
+        self.path_health.enable_telemetry();
+        self.metrics
+            .get_or_init(|| crate::quic::monitor_quic_connection(&conn));
+    }
 }
 
 impl TuicConnState {
     fn new(conn: quinn::Connection) -> Self {
         let sessions: SessionMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let path_health = crate::quic::QuicPathHealth::new(&conn);
         let state = Self {
             udp_over_stream: conn.max_datagram_size().is_none(),
             conn: conn.clone(),
@@ -269,36 +278,42 @@ impl TuicConnState {
             next_session: AtomicU16::new(0),
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
+            path_health: Arc::clone(&path_health),
+            metrics: OnceLock::new(),
         };
-        tokio::spawn(Self::datagram_loop(conn.clone(), Arc::clone(&sessions)));
-        tokio::spawn(Self::uni_stream_loop(conn.clone(), Arc::clone(&sessions)));
+        tokio::spawn(Self::datagram_loop(
+            conn.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&path_health),
+        ));
+        tokio::spawn(Self::uni_stream_loop(
+            conn.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&path_health),
+        ));
+        crate::quic::spawn_quic_path_watchdog(conn.clone(), Arc::clone(&path_health));
         let open = Arc::downgrade(&state.open);
         let last_activity = Arc::downgrade(&state.last_activity);
-        if state.udp_over_stream {
-            // No heartbeat frames without datagram support; idle reaping only.
-            crate::quic::spawn_conn_reaper(
-                conn,
-                open,
-                last_activity,
-                HEARTBEAT_INTERVAL,
-                CONN_IDLE_TIMEOUT,
-                None,
-            );
-        } else {
-            // Heartbeat datagrams every 10s while the connection is in use
-            // (`client.go:216-230`); ends the loop when the send fails.
-            crate::quic::spawn_conn_reaper(
-                conn,
-                open,
-                last_activity,
-                HEARTBEAT_INTERVAL,
-                CONN_IDLE_TIMEOUT,
+        crate::quic::spawn_conn_reaper(
+            conn,
+            open,
+            last_activity,
+            HEARTBEAT_INTERVAL,
+            CONN_IDLE_TIMEOUT,
+            if state.udp_over_stream {
+                None
+            } else {
                 Some(Box::new(|conn: &quinn::Connection| {
-                    conn.send_datagram(bytes::Bytes::from_static(&[TUIC_VERSION, CMD_HEARTBEAT]))
-                        .is_ok()
-                })),
-            );
-        }
+                    !matches!(
+                        conn.send_datagram(bytes::Bytes::from_static(&[
+                            TUIC_VERSION,
+                            CMD_HEARTBEAT,
+                        ])),
+                        Err(quinn::SendDatagramError::ConnectionLost(_))
+                    )
+                }))
+            },
+        );
         state
     }
 
@@ -308,7 +323,11 @@ impl TuicConnState {
 
     /// Inbound QUIC datagrams: PACKET frames are demultiplexed by session id
     /// (sing `loopMessages`, `client_packet.go:12-50`).
-    async fn datagram_loop(conn: quinn::Connection, sessions: SessionMap) {
+    async fn datagram_loop(
+        conn: quinn::Connection,
+        sessions: SessionMap,
+        path_health: Arc<crate::quic::QuicPathHealth>,
+    ) {
         loop {
             let data = match conn.read_datagram().await {
                 Ok(data) => data,
@@ -321,8 +340,11 @@ impl TuicConnState {
                 CMD_PACKET => {
                     if let Ok(msg) = decode_udp_message(&data[2..]) {
                         let tx = sessions.lock().get(&msg.session_id).cloned();
-                        if let Some(tx) = tx {
-                            let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
+                        if let Some(tx) = tx
+                            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                                tx.try_send(msg)
+                        {
+                            path_health.record_session_rx_drop();
                         }
                     }
                 }
@@ -336,13 +358,18 @@ impl TuicConnState {
 
     /// Inbound uni streams carry one PACKET frame each in UDP-over-stream
     /// mode (sing `loopUniStreams`, `client_packet.go:52-93`).
-    async fn uni_stream_loop(conn: quinn::Connection, sessions: SessionMap) {
+    async fn uni_stream_loop(
+        conn: quinn::Connection,
+        sessions: SessionMap,
+        path_health: Arc<crate::quic::QuicPathHealth>,
+    ) {
         loop {
             let mut recv = match conn.accept_uni().await {
                 Ok(recv) => recv,
                 Err(_) => break,
             };
             let sessions = Arc::clone(&sessions);
+            let path_health = Arc::clone(&path_health);
             tokio::spawn(async move {
                 let mut head = [0u8; 2];
                 if read_exact(&mut recv, &mut head).await.is_err() {
@@ -353,8 +380,11 @@ impl TuicConnState {
                 }
                 if let Ok(msg) = read_udp_message_stream(&mut recv).await {
                     let tx = sessions.lock().get(&msg.session_id).cloned();
-                    if let Some(tx) = tx {
-                        let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
+                    if let Some(tx) = tx
+                        && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            tx.try_send(msg)
+                    {
+                        path_health.record_session_rx_drop();
                     }
                 }
             });
@@ -374,6 +404,10 @@ impl crate::runtime::QuicRuntimeClient for TuicClient {
         self
     }
 
+    async fn enable_metrics(&self) {
+        self.quic.enable_metrics().await;
+    }
+
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
@@ -391,7 +425,7 @@ impl TuicClient {
         let uuid = self.uuid;
         let password = self.password.clone();
         self.quic
-            .connection_with(connect_timeout, move |conn| async move {
+            .connection_with_metrics(connect_timeout, move |conn| async move {
                 crate::quic::exporter_auth(&conn, &uuid, &password, TUIC_VERSION, true, AUTH_GRACE)
                     .await?;
                 Ok(TuicConnState::new(conn))
@@ -440,12 +474,10 @@ impl TuicHandler {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![b"tuic".to_vec()]);
-        // quinn's default stream window (1.25MB) caps a single stream at
-        // ~12.5MB/s per 100ms of RTT — unusable on long-fat links. Default
-        // to 8MB stream / 8MB conn (conn window = memory budget, see hy2).
-        // Explicit node fields override.
         let options = crate::quic::QuicClientOptions {
             congestion: Some(crate::quic::congestion_factory(tuic.congestion.as_deref())),
+            // Keep both protocol and QUIC PING liveness in fallback mode.
+            keep_alive: Some(HEARTBEAT_INTERVAL),
             stream_receive_window: Some(tuic.init_stream_recv_window.unwrap_or(8 << 20)),
             conn_receive_window: Some(tuic.init_conn_recv_window.unwrap_or(8 << 20)),
             max_udp_payload_size: tuic.quic.mtu,
@@ -528,7 +560,7 @@ impl TuicHandler {
             session_id,
             packet_id: AtomicU16::new(0),
             rx: tokio::sync::Mutex::new(rx),
-            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
+            defrag: tokio::sync::Mutex::new(Defragmenter::new(u16::MAX as usize)),
             target_addr: TuicAddr::new(target, target_domain),
             target,
         }))
@@ -725,6 +757,33 @@ impl Drop for TuicUdpTransport {
 impl PacketTransport for TuicUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
+    }
+    fn send_timeout(&self) -> Duration {
+        self.state.path_health.send_timeout()
+    }
+    fn record_quic_send_started(&self) -> QuicSendToken {
+        self.state.path_health.record_send_started(&self.state.conn)
+    }
+    fn record_quic_send_success(&self, token: QuicSendToken) {
+        self.state
+            .path_health
+            .record_send_success(token, &self.state.conn);
+    }
+    fn record_quic_send_timeout(&self, token: QuicSendToken) {
+        if self
+            .state
+            .path_health
+            .record_send_timeout(token, &self.state.conn)
+        {
+            crate::quic::record_quic_send_timeout();
+        }
+    }
+    fn record_quic_send_failure(&self, token: QuicSendToken) {
+        self.state.path_health.record_send_failure(token);
+    }
+
+    fn quic_path_stalled(&self) -> bool {
+        self.state.path_health.is_stalled()
     }
     fn send_timeout_is_congestion(&self) -> bool {
         !self.state.udp_over_stream
@@ -1132,7 +1191,7 @@ mod tests {
         assert_eq!(frags.len(), 3);
         assert!(frags.iter().all(|f| f.len() <= max));
 
-        let mut defrag = Defragmenter::new();
+        let mut defrag = Defragmenter::new(u16::MAX as usize);
         let mut out = None;
         // Feed out of order; only the last missing fragment completes it.
         for pkt in frags.iter().rev() {

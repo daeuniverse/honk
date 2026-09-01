@@ -922,6 +922,7 @@ pub(super) enum UdpSlowPathWork {
         permit: tokio::sync::OwnedSemaphorePermit,
         data: Bytes,
         validated: ValidatedDnsQuery,
+        enqueued_at: u32,
     },
     /// Fully handled in the receive loop (enqueued / rejected / dropped).
     Done,
@@ -933,6 +934,7 @@ pub(super) enum UdpSlowPathWork {
 /// Only strict DNS queries whose authoritative destination is port 53 return
 /// [`UdpSlowPathWork::DnsThenMaybeInitialize`]; DNS-shaped non-53 UDP stays
 /// on ordinary forwarding.
+#[cfg(test)]
 pub(super) fn begin_udp_slow_path(
     pool: &Arc<UdpEndpointPool>,
     stats: &StatsManager,
@@ -941,6 +943,29 @@ pub(super) fn begin_udp_slow_path(
     original_dst: SocketAddr,
     data: &[u8],
     validated_dns: Option<ValidatedDnsQuery>,
+) -> UdpSlowPathWork {
+    begin_udp_slow_path_at(
+        pool,
+        stats,
+        concurrency_limit,
+        src_addr,
+        original_dst,
+        data,
+        validated_dns,
+        udp_endpoint::queue_now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn begin_udp_slow_path_at(
+    pool: &Arc<UdpEndpointPool>,
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+    validated_dns: Option<ValidatedDnsQuery>,
+    enqueued_at: u32,
 ) -> UdpSlowPathWork {
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
         return UdpSlowPathWork::Done;
@@ -954,9 +979,10 @@ pub(super) fn begin_udp_slow_path(
             permit,
             data: Bytes::copy_from_slice(data),
             validated,
+            enqueued_at,
         };
     }
-    match pool.reserve_or_enqueue(src_addr, original_dst, data, permit, stats) {
+    match pool.reserve_or_enqueue_at(src_addr, original_dst, data, permit, enqueued_at, stats) {
         EndpointReservation::Initializing(lease) => UdpSlowPathWork::Initialize(lease),
         EndpointReservation::Enqueued
         | EndpointReservation::CapacityRejected
@@ -982,6 +1008,7 @@ pub(super) async fn complete_udp_dns_slow_path(
     context: UdpDnsSlowPathContext<'_>,
     permit: tokio::sync::OwnedSemaphorePermit,
     data: &[u8],
+    enqueued_at: u32,
     validated: ValidatedDnsQuery,
 ) -> Option<UdpInitLease> {
     let UdpDnsSlowPathContext {
@@ -1007,7 +1034,7 @@ pub(super) async fn complete_udp_dns_slow_path(
             );
         }
     }
-    match pool.reserve_or_enqueue(src_addr, original_dst, data, permit, stats) {
+    match pool.reserve_or_enqueue_at(src_addr, original_dst, data, permit, enqueued_at, stats) {
         EndpointReservation::Initializing(mut lease) => {
             // The controller was invoked exactly once for this packet. Carry
             // that fact into initialize_udp_connection so an Ok(false) or
@@ -1062,6 +1089,7 @@ async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: 
             error!("{} UDP recv error: {}", family, error);
             continue;
         }
+        let batch_received_at = udp_endpoint::queue_now();
         for index in 0..batch.len() {
             let (data, src_addr, recv_meta) = match batch.packet(index) {
                 Ok(packet) => packet,
@@ -1086,23 +1114,32 @@ async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: 
                 state.stats.record_udp_slow_permit_closed();
                 continue;
             }
-            if udp_fast_path(
+            if udp_fast_path_at(
                 &state.udp_pool,
                 &state.stats,
                 data,
                 src_addr,
                 original_dst,
                 validated_dns,
+                batch_received_at,
             )
             .await
             {
                 continue;
             }
-            dispatch_udp_slow_path(&state, src_addr, original_dst, data, validated_dns);
+            dispatch_udp_slow_path_at(
+                &state,
+                src_addr,
+                original_dst,
+                data,
+                validated_dns,
+                batch_received_at,
+            );
         }
     }
 }
 
+#[cfg(test)]
 pub(super) fn dispatch_udp_slow_path(
     state: &UdpLoopState,
     src_addr: SocketAddr,
@@ -1110,12 +1147,30 @@ pub(super) fn dispatch_udp_slow_path(
     data: &[u8],
     validated_dns: Option<ValidatedDnsQuery>,
 ) {
+    dispatch_udp_slow_path_at(
+        state,
+        src_addr,
+        original_dst,
+        data,
+        validated_dns,
+        udp_endpoint::queue_now(),
+    );
+}
+
+fn dispatch_udp_slow_path_at(
+    state: &UdpLoopState,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+    validated_dns: Option<ValidatedDnsQuery>,
+    enqueued_at: u32,
+) {
     let concurrency_limit = if original_dst.port() == 53 && validated_dns.is_some() {
         &state.dns_concurrency_limit
     } else {
         &state.udp_concurrency_limit
     };
-    match begin_udp_slow_path(
+    match begin_udp_slow_path_at(
         &state.udp_pool,
         &state.stats,
         concurrency_limit,
@@ -1123,6 +1178,7 @@ pub(super) fn dispatch_udp_slow_path(
         original_dst,
         data,
         validated_dns,
+        enqueued_at,
     ) {
         UdpSlowPathWork::Done => {}
         UdpSlowPathWork::Initialize(lease) => {
@@ -1142,6 +1198,7 @@ pub(super) fn dispatch_udp_slow_path(
             permit,
             data,
             validated,
+            enqueued_at,
         } => {
             let handle = state.handle.clone();
             let guard = ConnectionGuard::new(Arc::clone(&state.drain));
@@ -1163,6 +1220,7 @@ pub(super) fn dispatch_udp_slow_path(
                     },
                     permit,
                     &data,
+                    enqueued_at,
                     validated,
                 )
                 .await
@@ -1201,8 +1259,20 @@ pub(super) fn reserve_udp_slow_path(
         None,
     ) {
         UdpSlowPathWork::Initialize(lease) => Some(lease),
-        UdpSlowPathWork::DnsThenMaybeInitialize { permit, data, .. } => {
-            match pool.reserve_or_enqueue(src_addr, original_dst, &data, permit, stats) {
+        UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data,
+            enqueued_at,
+            ..
+        } => {
+            match pool.reserve_or_enqueue_at(
+                src_addr,
+                original_dst,
+                &data,
+                permit,
+                enqueued_at,
+                stats,
+            ) {
                 EndpointReservation::Initializing(lease) => Some(lease),
                 _ => None,
             }

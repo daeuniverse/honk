@@ -35,13 +35,13 @@ pub enum GenerationRuntime {
 }
 
 impl GenerationRuntime {
-    pub(crate) fn build(self) -> ProtocolRuntime {
+    pub(crate) fn build(self, metrics_enabled: bool) -> ProtocolRuntime {
         match self {
             Self::None => ProtocolRuntime::None,
             Self::AnyTls => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
             Self::VlessH2Mux => ProtocolRuntime::VlessMux(VlessMuxRuntime::h2()),
             Self::VlessCoolMux => ProtocolRuntime::VlessMux(VlessMuxRuntime::cool()),
-            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new()),
+            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new(metrics_enabled)),
         }
     }
 }
@@ -67,6 +67,8 @@ pub enum ProtocolRuntime {
 #[async_trait::async_trait]
 pub trait QuicRuntimeClient: Send + Sync + 'static {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
+    /// Start aggregate telemetry for a persistent QUIC client.
+    async fn enable_metrics(&self) {}
     /// Close the cached connection and endpoint, awaiting any in-flight
     /// dial so its late-arriving connection is closed too.
     async fn force_close(&self);
@@ -89,6 +91,7 @@ pub struct QuicRuntime {
 struct QuicRuntimeState {
     client: Option<Arc<dyn QuicRuntimeClient>>,
     closed: bool,
+    metrics_enabled: bool,
 }
 
 impl std::fmt::Debug for QuicRuntime {
@@ -96,11 +99,13 @@ impl std::fmt::Debug for QuicRuntime {
         f.debug_struct("QuicRuntime").finish_non_exhaustive()
     }
 }
-
 impl QuicRuntime {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(metrics_enabled: bool) -> Self {
         Self {
-            state: tokio::sync::Mutex::new(QuicRuntimeState::default()),
+            state: tokio::sync::Mutex::new(QuicRuntimeState {
+                metrics_enabled,
+                ..Default::default()
+            }),
         }
     }
 
@@ -121,6 +126,9 @@ impl QuicRuntime {
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"));
         }
         let client = build().await?;
+        if state.metrics_enabled {
+            client.enable_metrics().await;
+        }
         state.client = Some(Arc::clone(&client) as Arc<dyn QuicRuntimeClient>);
         Ok(client)
     }
@@ -143,7 +151,13 @@ impl QuicRuntime {
                 .into_erased()
                 .downcast::<T>()
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"))?;
+            if state.metrics_enabled {
+                client.enable_metrics().await;
+            }
             return Ok(());
+        }
+        if state.metrics_enabled {
+            client.enable_metrics().await;
         }
         state.client = Some(client as Arc<dyn QuicRuntimeClient>);
         Ok(())
@@ -456,7 +470,7 @@ impl NodeRuntime {
             udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
             runtime: crate::descriptor::descriptor(node.protocol())
                 .generation_runtime(node)
-                .build(),
+                .build(false),
             ephemeral: true,
             warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
         })
@@ -1023,7 +1037,7 @@ impl OutboundRuntimeRegistry {
                     ),
                     runtime: crate::descriptor::descriptor(node.protocol())
                         .generation_runtime(node)
-                        .build(),
+                        .build(true),
                     ephemeral: false,
                     warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
                 }),
@@ -1803,7 +1817,7 @@ mod tests {
 
     #[tokio::test]
     async fn speculative_quic_publish_keeps_a_concurrent_incumbent() {
-        let runtime = QuicRuntime::new();
+        let runtime = QuicRuntime::new(true);
         let incumbent: Arc<FakeQuicClient> = runtime
             .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
             .await
@@ -1824,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_quic_publish_before_slot_lock_changes_nothing() {
-        let runtime = Arc::new(QuicRuntime::new());
+        let runtime = Arc::new(QuicRuntime::new(true));
         let state_guard = runtime.state.lock().await;
         let detached = Arc::new(FakeQuicClient::default());
         let detached_weak = Arc::downgrade(&detached);
@@ -1891,7 +1905,7 @@ mod tests {
 
     #[tokio::test]
     async fn quic_runtime_close_covers_client_and_rejects_new_builds() {
-        let runtime = QuicRuntime::new();
+        let runtime = QuicRuntime::new(true);
         let client: Arc<FakeQuicClient> = runtime
             .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
             .await
