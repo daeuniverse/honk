@@ -19,6 +19,7 @@ The project cares more about authors **understanding** what the code does, **pla
 The following carry honk's core invariants — generation ownership, lock ordering, eBPF two-phase commit semantics, failure-direction guarantees. Changes here must be originated by a human who can defend the design line by line. LLMs may analyze, review, and suggest, but must not create the change:
 
 - `crates/honk-core/src/ebpf/` (real backend, map lifecycle, routing push plans)
+- `crates/honk-ebpf-common/` (ABI， aya Pods)
 - `crates/honk-core/src/control/reload/` (transaction, fingerprints, retention decisions)
 - `crates/honk-core/src/control/routing_matcher.rs` and the eBPF publication pipeline
 - Lock acquisition order across `config`, `router`, `ebpf`, `group_manager`, `outbound_id_map`, `active_routing_plan`, `runtime_registry`, `reload_lock`
