@@ -56,7 +56,12 @@ pub struct SessionPoolConfig {
     /// First dial-failure backoff; doubles per consecutive failure up to
     /// [`Self::max_dial_backoff`].
     pub dial_backoff: Duration,
-    /// Cap for the dial-failure backoff.
+    /// Cap for the dial-failure backoff. Must stay well below a flow's dial
+    /// budget (`connect_timeout * 3`): a caller parked in a longer backoff
+    /// window dies by its own outer timeout without ever attempting a dial,
+    /// so a brief outage would keep failing flows long after the server
+    /// recovers. Single-flight already paces concurrent dials; this only
+    /// paces redials after a failure.
     pub max_dial_backoff: Duration,
     /// Max session age before it drains (no new streams; existing ones
     /// finish). Jittered ±10% per session to avoid reconnect storms.
@@ -72,7 +77,7 @@ impl Default for SessionPoolConfig {
             spread_sessions: false,
             janitor_interval: Duration::from_secs(30),
             dial_backoff: Duration::from_secs(1),
-            max_dial_backoff: Duration::from_secs(30),
+            max_dial_backoff: Duration::from_secs(2),
             max_session_age: None,
         }
     }
@@ -1867,6 +1872,7 @@ mod tests {
     async fn dial_failures_back_off() {
         let pool = pool(SessionPoolConfig {
             dial_backoff: Duration::from_secs(10),
+            max_dial_backoff: Duration::from_secs(60),
             ..Default::default()
         });
         let fail = || async { anyhow::bail!("boom") };
@@ -1876,6 +1882,20 @@ mod tests {
         // Second attempt waits out the backoff before re-dialing.
         assert!(pool.offer::<fn() -> _, _>(fail).await.is_err());
         assert!(start.elapsed() >= Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_backoff_cap_keeps_redial_inside_flow_budget() {
+        let pool = pool(SessionPoolConfig::default());
+        let fail = || async { anyhow::bail!("boom") };
+        // Enough consecutive failures to push the raw backoff far past the
+        // cap; every further attempt must still redial within it.
+        for _ in 0..8 {
+            assert!(pool.offer::<fn() -> _, _>(fail).await.is_err());
+        }
+        let start = Instant::now();
+        assert!(pool.offer::<fn() -> _, _>(fail).await.is_err());
+        assert!(start.elapsed() <= Duration::from_secs(2));
     }
 
     #[tokio::test(start_paused = true)]
