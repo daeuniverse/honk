@@ -623,6 +623,83 @@ async fn settings_wait_for_the_first_stream_open() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn concurrent_first_open_keeps_settings_ahead_of_syn() {
+    let (client, mut server) = tokio::io::duplex(1 << 20);
+    let (read, write) = tokio::io::split(client);
+    let session = AnyTlsSession::establish(
+        "concurrent-first-open",
+        Box::new(read),
+        Box::new(write),
+        TEST_AUTH,
+        bytes::Bytes::from_static(TEST_SETTINGS),
+        test_padding(),
+    )
+    .await
+    .unwrap();
+
+    let mut auth = vec![0; TEST_AUTH.len()];
+    server.read_exact(&mut auth).await.unwrap();
+    assert_eq!(auth, TEST_AUTH);
+
+    let writer_guard = session.writer_q.queue.lock();
+    let first = tokio::spawn({
+        let session = Arc::clone(&session);
+        let permit = session.try_reserve().unwrap();
+        async move { session.open_stream_direct(b"first".to_vec(), permit).await }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(settings) = session.initial_settings.try_lock() {
+            assert!(
+                settings.is_some(),
+                "first opener released SETTINGS before committing its queue order"
+            );
+            drop(settings);
+            assert!(Instant::now() < deadline, "first opener did not start");
+            std::thread::yield_now();
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            session.initial_settings.try_lock().is_none(),
+            "first opener released SETTINGS while waiting for the writer queue"
+        );
+        break;
+    }
+
+    let second = tokio::spawn({
+        let session = Arc::clone(&session);
+        let permit = session.try_reserve().unwrap();
+        async move { session.open_stream_direct(b"second".to_vec(), permit).await }
+    });
+    drop(writer_guard);
+
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SETTINGS, 0, TEST_SETTINGS.to_vec())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SYN, first.sid, Vec::new())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_PSH, first.sid, b"first".to_vec())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SYN, second.sid, Vec::new())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_PSH, second.sid, b"second".to_vec())
+    );
+}
+
 #[tokio::test]
 async fn empty_control_frames_do_not_close_the_session() {
     let (session, mut server) = establish_test_session("empty-controls").await;

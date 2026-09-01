@@ -1398,8 +1398,9 @@ impl AnyTlsSession {
             return Err(anyhow::anyhow!("AnyTLS session {} is closed", self.seq));
         }
         self.register_synack(sid);
-        let initial_settings = self.initial_settings.lock().take();
-        let queued = if let Some(settings) = initial_settings {
+        let mut initial_settings = self.initial_settings.lock();
+        // Keep ownership through the queue write: another opener must not enqueue SYN first.
+        let queued = if let Some(settings) = initial_settings.take() {
             self.writer_q
                 .push_batch([
                     FrameCommand::Control {
@@ -1435,6 +1436,7 @@ impl AnyTlsSession {
                 ])
                 .map_err(drop)
         };
+        drop(initial_settings);
         queued.map_err(|_| self.writer_queue_error())?;
         guard.frame_started = false;
         Ok((sid, rx, guard))
