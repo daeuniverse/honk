@@ -1607,9 +1607,8 @@ async fn synack_deadlines_do_not_share_elapsed_time() {
 
     tokio::time::advance(SYNACK_TIMEOUT).await;
     tokio::task::yield_now().await;
-    // The third stream's own deadline fires — and because the session kept
-    // receiving frames (the second stream's SYNACK), only the stream is
-    // reset rather than the session.
+    // The third stream's own deadline fires; the session kept receiving
+    // frames (the second stream's SYNACK), so only the stream is reset.
     assert!(
         !session.is_closed(),
         "an active session survives a single unanswered open"
@@ -1620,10 +1619,9 @@ async fn synack_deadlines_do_not_share_elapsed_time() {
     );
 }
 
-/// Production case (gateway 2026-09-01): a healthy session carrying 13 live
-/// streams was killed because one chatgpt.com open went unanswered — the
-/// server was slow to dial that target. A session that kept receiving frames
-/// through the window must reset only the unanswered stream.
+/// A live session that never acknowledges one open (the server's own target
+/// dial stalled) must reset only that stream, not die with its siblings.
+/// Killed 13 healthy streams per burst on the production gateway before this.
 #[tokio::test(start_paused = true)]
 async fn synack_timeout_on_active_session_resets_only_the_stream() {
     let (session, mut server) = establish_test_session("127.0.0.1:443").await;

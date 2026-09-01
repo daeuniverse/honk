@@ -1079,10 +1079,9 @@ pub(crate) struct AnyTlsSession {
     stream_permits: Arc<tokio::sync::Semaphore>,
     /// Demux task handle, aborted on close.
     demux: Mutex<Option<tokio::task::AbortHandle>>,
-    /// Inbound frame counter, bumped by the demux per frame. The SYNACK
-    /// deadline uses it to tell a silently-dead session (no frames during
-    /// the whole window) apart from a live session whose server is merely
-    /// slow to open one stream.
+    /// Inbound frame counter, bumped by the demux per frame; lets the SYNACK
+    /// deadline distinguish a silently-dead session from one whose server is
+    /// merely slow to open a stream.
     rx_frame_seq: AtomicU64,
 }
 
@@ -1180,11 +1179,10 @@ impl AnyTlsSession {
                     return;
                 }
                 if session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker {
-                    // The session kept receiving frames through the window:
-                    // the server is alive but never acknowledged this open
-                    // (e.g. its own dial to the target stalled). Reset only
-                    // this stream — killing the session would take every
-                    // healthy sibling stream down with it.
+                    // Frames kept arriving through the window: the server is
+                    // alive but never acknowledged this open. Reset only this
+                    // stream — failing the session would kill every healthy
+                    // sibling with it.
                     session
                         .dispatch_error(sid, Arc::from("stream open not acknowledged"))
                         .await;
