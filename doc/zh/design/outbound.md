@@ -483,8 +483,10 @@ least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每�
 
 协商 v2 server settings 后，每个复用逻辑 stream（SID 2 及以后）的 SYN 写出后
 即加入按 SID 跟踪的 pending 集合，SYNACK 只结清自己的 SID——无关 stream 的应答
-不会清除其他 stream 的 deadline。任何在 SYN 写出三秒后仍 pending 的 open 都会退役
-物理 session，让 pool 重新拨号，而不是继续复用无响应的 carrier。
+不会清除其他 stream 的 deadline，本地拆流同样取消对应定时器。SYN 写出三秒后
+仍 pending 的 open，若窗口内 session 仍有入站帧（服务端活着只是未应答该开流）
+则只重置该 stream；窗口内完全静默才退役物理 session，让 pool 重新拨号而不是
+继续复用已死 carrier。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor 与 idle timeout 输入同一个节点局部 janitor。Selector 或

@@ -1544,9 +1544,15 @@ async fn synack_deadline_is_tracked_per_stream() {
 
     tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
+    // The third stream's own deadline still fires, but the session was
+    // receiving frames through the window, so only the stream is reset.
     assert!(
-        session.is_closed(),
-        "an unrelated SYNACK must not clear another stream's deadline"
+        !session.is_closed(),
+        "an active session must survive one unanswered open"
+    );
+    assert!(
+        session.streams.lock().unwrap().contains_key(&second.sid),
+        "the acknowledged sibling stream is untouched"
     );
 }
 
@@ -1580,6 +1586,7 @@ async fn synack_deadlines_do_not_share_elapsed_time() {
         )
         .await
         .unwrap();
+    let third_sid = _third.sid;
     read_frame(&mut server).await.unwrap();
     read_frame(&mut server).await.unwrap();
     tokio::task::yield_now().await;
@@ -1600,7 +1607,138 @@ async fn synack_deadlines_do_not_share_elapsed_time() {
 
     tokio::time::advance(SYNACK_TIMEOUT).await;
     tokio::task::yield_now().await;
-    assert!(session.is_closed(), "the third stream's own deadline fires");
+    // The third stream's own deadline fires; the session kept receiving
+    // frames (the second stream's SYNACK), so only the stream is reset.
+    assert!(
+        !session.is_closed(),
+        "an active session survives a single unanswered open"
+    );
+    assert!(
+        !session.synack_pending.lock().sids.contains_key(&third_sid),
+        "the third stream's deadline entry is consumed"
+    );
+}
+
+/// A live session that never acknowledges one open (the server's own target
+/// dial stalled) must reset only that stream, not die with its siblings.
+/// Killed 13 healthy streams per burst on the production gateway before this.
+#[tokio::test(start_paused = true)]
+async fn synack_timeout_on_active_session_resets_only_the_stream() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let mut first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        read_frame(&mut server).await.unwrap();
+    }
+    tokio::task::yield_now().await;
+
+    // The sibling keeps receiving data while the second open stays unanswered.
+    write_frame(&mut server, CMD_PSH, first.sid, b"ok")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        !session.is_closed(),
+        "a session with inbound activity must not die for one unanswered open"
+    );
+    let mut buf = [0u8; 16];
+    let err = second.read(&mut buf).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(err.to_string().contains("not acknowledged"), "{err}");
+    let n = first.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"ok", "the sibling stream keeps its data");
+}
+
+/// Dropping a stream whose open was never answered must settle its pending
+/// entry: an orphaned deadline would otherwise fire later and fail a healthy
+/// session.
+#[tokio::test(start_paused = true)]
+async fn dropped_unanswered_stream_cancels_its_synack_deadline() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let _first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        read_frame(&mut server).await.unwrap();
+    }
+    tokio::task::yield_now().await;
+    assert!(session.synack_pending.lock().sids.contains_key(&second.sid));
+
+    drop(second);
+    assert!(
+        session.synack_pending.lock().sids.is_empty(),
+        "dropping the stream settles its pending entry"
+    );
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "an orphaned deadline must not fail the session"
+    );
+}
+
+/// The activity marker is sampled before the batch write, so frames that
+/// arrive while a blocked flush is still in flight count as window activity.
+#[tokio::test(start_paused = true)]
+async fn synack_activity_marker_is_a_pre_write_snapshot() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    session.register_synack(2);
+    let marker = session.rx_frame_seq.load(Ordering::Relaxed);
+    session.start_synack_deadline(2, marker);
+    session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "post-marker frames must count as window activity"
+    );
 }
 
 /// A SYNACK that arrives while the SYN is still queued must settle the open:
