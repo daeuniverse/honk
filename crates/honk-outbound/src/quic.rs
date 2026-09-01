@@ -1910,7 +1910,14 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         };
         state.endpoint = Some((ipv6, endpoint.clone()));
         let mut close_guard = ConnectionCloseGuard::new(conn.clone());
-        let ctx = setup(conn.clone()).await?;
+        let ctx = match setup(conn.clone()).await {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                close_guard.disarm();
+                conn.close(VarInt::from_u32(0), b"setup failed");
+                return Err(error);
+            }
+        };
         let ctx = Arc::new(ctx);
         // The single-flight mutex makes this unreachable today; keep the
         // freshly dialed connection out of a closed client if that changes.
