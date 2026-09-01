@@ -633,7 +633,7 @@ fn test_udp_message_rejects_invalid_fragments() {
 async fn test_short_salamander_password_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
     node.hysteria2_mut().unwrap().obfs = Some("abc".to_string());
-    let result = Hysteria2Handler::new().build_client(&node).await;
+    let result = Hysteria2Handler::new().build_client(&node, None).await;
     let error = match result {
         Ok(_) => panic!("short Salamander password must be rejected"),
         Err(error) => error,
@@ -645,7 +645,7 @@ async fn test_short_salamander_password_rejected_before_dial() {
 async fn test_invalid_port_hopping_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
     node.hysteria2_mut().unwrap().port_hopping = Some("0-10".to_string());
-    let error = match Hysteria2Handler::new().build_client(&node).await {
+    let error = match Hysteria2Handler::new().build_client(&node, None).await {
         Ok(_) => panic!("invalid port hopping list must be rejected"),
         Err(error) => error,
     };
@@ -656,7 +656,10 @@ async fn test_invalid_port_hopping_rejected_before_dial() {
 async fn test_downlink_mbps_is_serialized_as_bytes_per_second() {
     let mut node = test_node(443, TEST_PASSWORD);
     node.hysteria2_mut().unwrap().down_mbps = Some(1);
-    let client = Hysteria2Handler::new().build_client(&node).await.unwrap();
+    let client = Hysteria2Handler::new()
+        .build_client(&node, None)
+        .await
+        .unwrap();
     let frame = auth_request_frame(TEST_PASSWORD, client.rx_bytes_per_second);
     let mut offset = 0;
     assert_eq!(parse_varint(&frame, &mut offset), Some(H3_FRAME_HEADERS));

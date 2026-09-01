@@ -169,6 +169,7 @@ strip = true
 [patch.crates-io]
 # honk rprx fork: preset X25519 keyshare + ClientHello fixup hooks (REALITY)
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "630d5030ee281371231f2c8c0b7206178032f62e" }
-# honk fork: raise the receive-assembler chunk bound and expose ACK-eliciting
-# delivery counters for path-stall detection and QUIC telemetry.
-quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "b0acb533" }
+# honk fork: bound receive fragmentation, expose delivery and flow-control state,
+# and allow runtime flow-control window tuning.
+quinn = { git = "https://github.com/Glassyiris/quinn", rev = "7f13718a" }
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "7f13718a" }

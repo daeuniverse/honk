@@ -670,6 +670,257 @@ pub(crate) fn spawn_quic_path_watchdog(conn: Connection, health: Arc<QuicPathHea
     });
 }
 
+const FLOW_CONTROL_MIN_RTT: Duration = Duration::from_millis(80);
+const FLOW_CONTROL_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const FLOW_CONTROL_MIN_WINDOW: u64 = 8 << 20;
+const FLOW_CONTROL_MAX_WINDOW: u64 = 32 << 20;
+const FLOW_CONTROL_PROMOTION_SAMPLES: u8 = 3;
+
+#[derive(Debug, Default)]
+struct AdaptiveFlowProfile {
+    connection_receive_floor: u64,
+    stream_receive_floor: u64,
+    send_floor: u64,
+    last_connection_receive_adjust_ms: Option<u64>,
+    last_stream_receive_adjust_ms: Option<u64>,
+    last_send_adjust_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AdaptiveFlowProfiles(SyncMutex<[AdaptiveFlowProfile; 2]>);
+
+impl AdaptiveFlowProfiles {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, [AdaptiveFlowProfile; 2]> {
+        self.0.lock()
+    }
+}
+
+#[derive(Debug)]
+struct AdaptiveFlowSampler {
+    last_sample_ms: u64,
+    last_received_bytes: u64,
+    last_sent_bytes: u64,
+    last_stream_data_blocked: u64,
+    receive_rate_ewma: u64,
+    send_rate_ewma: u64,
+    connection_receive_high_samples: u8,
+    send_high_samples: u8,
+}
+
+impl AdaptiveFlowSampler {
+    fn new(stats: &quinn::ConnectionStats, now: u64) -> Self {
+        Self {
+            last_sample_ms: now,
+            last_received_bytes: stats.flow_control.received_bytes,
+            last_sent_bytes: stats.flow_control.sent_bytes,
+            last_stream_data_blocked: stats.frame_rx.stream_data_blocked,
+            receive_rate_ewma: 0,
+            send_rate_ewma: 0,
+            connection_receive_high_samples: 0,
+            send_high_samples: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        profile: &mut AdaptiveFlowProfile,
+        stats: &quinn::ConnectionStats,
+        now: u64,
+    ) {
+        let elapsed_ms = now.saturating_sub(self.last_sample_ms);
+        if elapsed_ms == 0 {
+            return;
+        }
+        let received = stats
+            .flow_control
+            .received_bytes
+            .saturating_sub(self.last_received_bytes);
+        let sent = stats
+            .flow_control
+            .sent_bytes
+            .saturating_sub(self.last_sent_bytes);
+        let stream_data_blocked = stats
+            .frame_rx
+            .stream_data_blocked
+            .saturating_sub(self.last_stream_data_blocked);
+        self.last_sample_ms = now;
+        self.last_received_bytes = stats.flow_control.received_bytes;
+        self.last_sent_bytes = stats.flow_control.sent_bytes;
+        self.last_stream_data_blocked = stats.frame_rx.stream_data_blocked;
+        self.receive_rate_ewma = flow_rate_ewma(
+            self.receive_rate_ewma,
+            bytes_per_second(received, elapsed_ms),
+        );
+        self.send_rate_ewma =
+            flow_rate_ewma(self.send_rate_ewma, bytes_per_second(sent, elapsed_ms));
+
+        let receive_bdp = flow_bdp_bytes(self.receive_rate_ewma, stats.path.rtt);
+        let send_bdp = flow_bdp_bytes(self.send_rate_ewma, stats.path.rtt);
+        let receive_credit_pressured = flow_credit_pressured(
+            stats.flow_control.receive_window_available,
+            stats.flow_control.receive_window,
+        );
+        let receive_near = stats.path.rtt >= FLOW_CONTROL_MIN_RTT
+            && flow_nears_window(
+                receive_bdp,
+                stats.flow_control.receive_window,
+                receive_credit_pressured,
+            );
+        update_flow_window(
+            &mut self.connection_receive_high_samples,
+            &mut profile.connection_receive_floor,
+            &mut profile.last_connection_receive_adjust_ms,
+            received != 0 && receive_near,
+            received == 0 && receive_near && receive_credit_pressured,
+            receive_bdp,
+            now,
+        );
+        update_stream_receive_window(
+            &mut profile.stream_receive_floor,
+            &mut profile.last_stream_receive_adjust_ms,
+            stats.path.rtt >= FLOW_CONTROL_MIN_RTT && stream_data_blocked != 0,
+            stats.flow_control.stream_receive_window,
+            now,
+        );
+        let send_credit_pressured = flow_credit_pressured(
+            stats.flow_control.send_window_available,
+            stats.flow_control.send_window,
+        );
+        let send_near = stats.path.rtt >= FLOW_CONTROL_MIN_RTT
+            && flow_nears_window(
+                send_bdp,
+                stats.flow_control.send_window,
+                send_credit_pressured,
+            );
+        update_flow_window(
+            &mut self.send_high_samples,
+            &mut profile.send_floor,
+            &mut profile.last_send_adjust_ms,
+            sent != 0 && send_near,
+            sent == 0 && send_near && send_credit_pressured,
+            send_bdp,
+            now,
+        );
+    }
+}
+
+fn bytes_per_second(bytes: u64, elapsed_ms: u64) -> u64 {
+    (u128::from(bytes) * 1_000 / u128::from(elapsed_ms.max(1))).min(u128::from(u64::MAX)) as u64
+}
+
+fn flow_rate_ewma(previous: u64, sample: u64) -> u64 {
+    if previous == 0 {
+        sample
+    } else {
+        ((u128::from(previous) * 9 + u128::from(sample)) / 10).min(u128::from(u64::MAX)) as u64
+    }
+}
+
+fn flow_bdp_bytes(rate: u64, rtt: Duration) -> u64 {
+    (u128::from(rate) * rtt.as_nanos() / 1_000_000_000).min(u128::from(u64::MAX)) as u64
+}
+
+fn flow_credit_pressured(available: u64, window: u64) -> bool {
+    window != 0 && u128::from(available) * 4 <= u128::from(window)
+}
+
+fn flow_nears_window(bdp: u64, window: u64, credit_pressured: bool) -> bool {
+    window != 0
+        && (u128::from(bdp) * 4 >= u128::from(window) * 3
+            || (credit_pressured && u128::from(bdp) * 2 >= u128::from(window)))
+}
+
+fn adaptive_window(bdp: u64) -> u64 {
+    bdp.saturating_mul(2)
+        .clamp(FLOW_CONTROL_MIN_WINDOW, FLOW_CONTROL_MAX_WINDOW)
+        .next_multiple_of(1 << 20)
+        .min(FLOW_CONTROL_MAX_WINDOW)
+}
+
+fn update_flow_window(
+    high_samples: &mut u8,
+    floor: &mut u64,
+    last_adjust_ms: &mut Option<u64>,
+    high: bool,
+    preserve: bool,
+    bdp: u64,
+    now: u64,
+) {
+    if high {
+        *high_samples = high_samples
+            .saturating_add(1)
+            .min(FLOW_CONTROL_PROMOTION_SAMPLES);
+    } else if !preserve {
+        *high_samples = 0;
+    }
+    if *high_samples < FLOW_CONTROL_PROMOTION_SAMPLES
+        || last_adjust_ms
+            .is_some_and(|last| now.saturating_sub(last) < FLOW_CONTROL_COOLDOWN.as_millis() as u64)
+    {
+        return;
+    }
+    let target = adaptive_window(bdp);
+    if target > *floor {
+        *floor = target;
+        *last_adjust_ms = Some(now);
+    }
+    *high_samples = 0;
+}
+
+fn update_stream_receive_window(
+    floor: &mut u64,
+    last_adjust_ms: &mut Option<u64>,
+    blocked: bool,
+    current_window: u64,
+    now: u64,
+) {
+    if !blocked
+        || last_adjust_ms
+            .is_some_and(|last| now.saturating_sub(last) < FLOW_CONTROL_COOLDOWN.as_millis() as u64)
+    {
+        return;
+    }
+    let target = current_window
+        .saturating_mul(2)
+        .clamp(FLOW_CONTROL_MIN_WINDOW, FLOW_CONTROL_MAX_WINDOW);
+    if target > *floor {
+        *floor = target;
+        *last_adjust_ms = Some(now);
+    }
+}
+
+fn apply_flow_control_profile(
+    conn: &Connection,
+    stats: &quinn::ConnectionStats,
+    profile: &AdaptiveFlowProfile,
+) {
+    if profile.stream_receive_floor > stats.flow_control.stream_receive_window {
+        conn.set_stream_receive_window(
+            VarInt::try_from(profile.stream_receive_floor)
+                .expect("stream receive floor originated from a QUIC window"),
+        );
+    }
+    if profile.connection_receive_floor > stats.flow_control.receive_window {
+        conn.set_receive_window(
+            VarInt::try_from(profile.connection_receive_floor)
+                .expect("connection receive floor originated from a QUIC window"),
+        );
+    }
+    if profile.send_floor > stats.flow_control.send_window {
+        conn.set_send_window(profile.send_floor);
+    }
+}
+
+fn seed_flow_control_profile(profile: &mut AdaptiveFlowProfile, stats: &quinn::ConnectionStats) {
+    profile.connection_receive_floor = profile
+        .connection_receive_floor
+        .max(stats.flow_control.receive_window);
+    profile.stream_receive_floor = profile
+        .stream_receive_floor
+        .max(stats.flow_control.stream_receive_window);
+    profile.send_floor = profile.send_floor.max(stats.flow_control.send_window);
+}
+
 /// Process-wide QUIC path telemetry. Connection labels are intentionally not
 /// retained; the snapshot is suitable for the aggregate `/stats` surface.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -677,6 +928,13 @@ pub struct QuicStatsSnapshot {
     pub active_connections: u64,
     pub srtt_us: u64,
     pub cwnd_bytes: u64,
+    pub flow_received_bytes: u64,
+    pub flow_sent_bytes: u64,
+    pub receive_window_bytes: u64,
+    pub receive_window_available_bytes: u64,
+    pub stream_receive_window_bytes: u64,
+    pub send_window_bytes: u64,
+    pub send_window_available_bytes: u64,
     pub loss_rate_ppm: u64,
     pub sent_packets: u64,
     pub ack_frames: u64,
@@ -709,6 +967,8 @@ struct QuicMetricTotals {
     lost_plpmtud_probes: AtomicU64,
     black_holes: AtomicU64,
     congestion_events: AtomicU64,
+    flow_received_bytes: AtomicU64,
+    flow_sent_bytes: AtomicU64,
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
     tx_datagrams: AtomicU64,
@@ -739,6 +999,10 @@ impl QuicMetricTotals {
             .fetch_add(stats.path.black_holes_detected, Ordering::Relaxed);
         self.congestion_events
             .fetch_add(stats.path.congestion_events, Ordering::Relaxed);
+        self.flow_received_bytes
+            .fetch_add(stats.flow_control.received_bytes, Ordering::Relaxed);
+        self.flow_sent_bytes
+            .fetch_add(stats.flow_control.sent_bytes, Ordering::Relaxed);
         self.tx_bytes
             .fetch_add(stats.udp_tx.bytes, Ordering::Relaxed);
         self.rx_bytes
@@ -749,6 +1013,10 @@ impl QuicMetricTotals {
             .fetch_add(stats.udp_rx.datagrams, Ordering::Relaxed);
         self.tx_ios.fetch_add(stats.udp_tx.ios, Ordering::Relaxed);
         self.rx_ios.fetch_add(stats.udp_rx.ios, Ordering::Relaxed);
+    }
+
+    fn add_received_bytes(&self, bytes: u64) {
+        self.flow_received_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -787,11 +1055,53 @@ fn update_quic_connection(id: u64, stats: quinn::ConnectionStats) {
     }
 }
 
-fn finish_quic_connection(id: u64, stats: quinn::ConnectionStats) {
+fn finish_quic_connection(id: u64, stats: quinn::ConnectionStats) -> bool {
     let metrics = quic_metrics();
     let mut entries = metrics.entries.lock();
-    if entries.remove(&id).is_some() {
-        metrics.totals.add_stats(&stats);
+    if entries.remove(&id).is_none() {
+        return false;
+    }
+    metrics.totals.add_stats(&stats);
+    true
+}
+
+#[derive(Debug, Default)]
+struct QuicMetricTracker {
+    id: Option<u64>,
+    closed_received_bytes: Option<u64>,
+    finished: bool,
+}
+
+impl QuicMetricTracker {
+    fn sample(&mut self, stats: quinn::ConnectionStats) {
+        if self.finished || self.closed_received_bytes.is_some() {
+            return;
+        }
+        match self.id {
+            Some(id) => update_quic_connection(id, stats),
+            None => self.id = Some(register_quic_connection(stats)),
+        }
+    }
+
+    fn close(&mut self, stats: quinn::ConnectionStats) {
+        let Some(id) = self.id else {
+            return;
+        };
+        if finish_quic_connection(id, stats) {
+            self.closed_received_bytes = Some(stats.flow_control.received_bytes);
+        }
+    }
+
+    fn finish(&mut self, stats: quinn::ConnectionStats) {
+        self.finished = true;
+        if let Some(closed) = self.closed_received_bytes.take() {
+            quic_metrics()
+                .totals
+                .add_received_bytes(stats.flow_control.received_bytes.saturating_sub(closed));
+        } else if let Some(id) = self.id {
+            finish_quic_connection(id, stats);
+        }
+        self.id = None;
     }
 }
 
@@ -815,6 +1125,12 @@ fn add_active_stats(snapshot: &mut QuicStatsSnapshot, stats: &quinn::ConnectionS
     snapshot.congestion_events = snapshot
         .congestion_events
         .saturating_add(stats.path.congestion_events);
+    snapshot.flow_received_bytes = snapshot
+        .flow_received_bytes
+        .saturating_add(stats.flow_control.received_bytes);
+    snapshot.flow_sent_bytes = snapshot
+        .flow_sent_bytes
+        .saturating_add(stats.flow_control.sent_bytes);
     snapshot.tx_bytes = snapshot.tx_bytes.saturating_add(stats.udp_tx.bytes);
     snapshot.rx_bytes = snapshot.rx_bytes.saturating_add(stats.udp_rx.bytes);
     snapshot.tx_datagrams = snapshot.tx_datagrams.saturating_add(stats.udp_tx.datagrams);
@@ -836,6 +1152,8 @@ pub fn quic_stats_snapshot() -> QuicStatsSnapshot {
         lost_plpmtud_probes: metrics.totals.lost_plpmtud_probes.load(Ordering::Relaxed),
         black_holes: metrics.totals.black_holes.load(Ordering::Relaxed),
         congestion_events: metrics.totals.congestion_events.load(Ordering::Relaxed),
+        flow_received_bytes: metrics.totals.flow_received_bytes.load(Ordering::Relaxed),
+        flow_sent_bytes: metrics.totals.flow_sent_bytes.load(Ordering::Relaxed),
         tx_bytes: metrics.totals.tx_bytes.load(Ordering::Relaxed),
         rx_bytes: metrics.totals.rx_bytes.load(Ordering::Relaxed),
         tx_datagrams: metrics.totals.tx_datagrams.load(Ordering::Relaxed),
@@ -857,11 +1175,21 @@ pub fn quic_stats_snapshot() -> QuicStatsSnapshot {
     let mut rtt_us = 0u128;
     let mut cwnd_bytes = 0u128;
     let mut mtu = 0u128;
+    let mut receive_window = 0u128;
+    let mut receive_window_available = 0u128;
+    let mut stream_receive_window = 0u128;
+    let mut send_window = 0u128;
+    let mut send_window_available = 0u128;
     for entry in entries.values() {
         add_active_stats(&mut snapshot, &entry.stats);
         rtt_us += entry.stats.path.rtt.as_micros();
         cwnd_bytes += entry.stats.path.cwnd as u128;
         mtu += entry.stats.path.current_mtu as u128;
+        receive_window += u128::from(entry.stats.flow_control.receive_window);
+        receive_window_available += u128::from(entry.stats.flow_control.receive_window_available);
+        stream_receive_window += u128::from(entry.stats.flow_control.stream_receive_window);
+        send_window += u128::from(entry.stats.flow_control.send_window);
+        send_window_available += u128::from(entry.stats.flow_control.send_window_available);
     }
     let data_sent = snapshot
         .sent_packets
@@ -876,6 +1204,14 @@ pub fn quic_stats_snapshot() -> QuicStatsSnapshot {
         let active = u128::from(active);
         snapshot.srtt_us = (rtt_us / active).min(u128::from(u64::MAX)) as u64;
         snapshot.cwnd_bytes = (cwnd_bytes / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.receive_window_bytes = (receive_window / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.receive_window_available_bytes =
+            (receive_window_available / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.stream_receive_window_bytes =
+            (stream_receive_window / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.send_window_bytes = (send_window / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.send_window_available_bytes =
+            (send_window_available / active).min(u128::from(u64::MAX)) as u64;
         snapshot.current_mtu = (mtu / active).min(u128::from(u64::MAX)) as u64;
     }
     snapshot
@@ -1097,6 +1433,191 @@ mod path_health_tests {
             path_stalled: AtomicBool::new(false),
             telemetry_enabled: AtomicBool::new(false),
         }
+    }
+
+    fn flow_stats(received: u64, sent: u64, window: u64) -> quinn::ConnectionStats {
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(125);
+        stats.flow_control.received_bytes = received;
+        stats.flow_control.sent_bytes = sent;
+        stats.flow_control.receive_window = window;
+        stats.flow_control.receive_window_available = window;
+        stats.flow_control.stream_receive_window = window;
+        stats.flow_control.send_window = window;
+        stats.flow_control.send_window_available = window;
+        stats
+    }
+
+    #[test]
+    fn sustained_high_bdp_promotes_with_cooldown_and_cap() {
+        const MIB: u64 = 1 << 20;
+        let mut stats = flow_stats(0, 0, 8 * MIB);
+        let mut sampler = AdaptiveFlowSampler::new(&stats, 1_000);
+        let mut profile = AdaptiveFlowProfile::default();
+
+        for step in 1..=3 {
+            stats.flow_control.received_bytes += 48 * MIB;
+            stats.flow_control.sent_bytes += 48 * MIB;
+            sampler.observe(&mut profile, &stats, 1_000 + step * 1_000);
+            if step < 3 {
+                assert_eq!(
+                    (
+                        profile.connection_receive_floor,
+                        profile.stream_receive_floor,
+                        profile.send_floor,
+                    ),
+                    (0, 0, 0),
+                );
+            }
+        }
+        assert_eq!(
+            (
+                profile.connection_receive_floor,
+                profile.stream_receive_floor,
+                profile.send_floor,
+            ),
+            (12 * MIB, 0, 12 * MIB),
+        );
+
+        stats.flow_control.receive_window = 12 * MIB;
+        stats.flow_control.stream_receive_window = 12 * MIB;
+        stats.flow_control.send_window = 12 * MIB;
+        let mut cooldown_sampler = AdaptiveFlowSampler::new(&stats, 4_000);
+        for step in 1..=3 {
+            stats.flow_control.received_bytes += 256 * MIB;
+            stats.flow_control.sent_bytes += 256 * MIB;
+            cooldown_sampler.observe(&mut profile, &stats, 4_000 + step * 1_000);
+        }
+        assert_eq!(
+            (
+                profile.connection_receive_floor,
+                profile.stream_receive_floor,
+                profile.send_floor,
+            ),
+            (12 * MIB, 0, 12 * MIB),
+        );
+
+        let mut resumed_sampler = AdaptiveFlowSampler::new(&stats, 304_000);
+        for step in 1..=3 {
+            stats.flow_control.received_bytes += 256 * MIB;
+            stats.flow_control.sent_bytes += 256 * MIB;
+            resumed_sampler.observe(&mut profile, &stats, 304_000 + step * 1_000);
+        }
+        assert_eq!(
+            (
+                profile.connection_receive_floor,
+                profile.stream_receive_floor,
+                profile.send_floor,
+            ),
+            (FLOW_CONTROL_MAX_WINDOW, 0, FLOW_CONTROL_MAX_WINDOW),
+        );
+
+        let mut idle_sampler = AdaptiveFlowSampler::new(&stats, 307_000);
+        for step in 1..=60 {
+            idle_sampler.observe(&mut profile, &stats, 307_000 + step * 1_000);
+        }
+        assert_eq!(
+            (
+                profile.connection_receive_floor,
+                profile.stream_receive_floor,
+                profile.send_floor,
+            ),
+            (FLOW_CONTROL_MAX_WINDOW, 0, FLOW_CONTROL_MAX_WINDOW),
+        );
+        assert!(!flow_nears_window(4 * MIB, 8 * MIB, false));
+        assert!(flow_nears_window(4 * MIB, 8 * MIB, true));
+        assert_eq!(adaptive_window(u64::MAX), FLOW_CONTROL_MAX_WINDOW);
+    }
+
+    #[test]
+    fn aggregate_bdp_does_not_train_stream_window() {
+        const MIB: u64 = 1 << 20;
+        let mut stats = flow_stats(0, 0, 8 * MIB);
+        let mut sampler = AdaptiveFlowSampler::new(&stats, 1_000);
+        let mut profile = AdaptiveFlowProfile::default();
+        for step in 1..=3 {
+            stats.flow_control.received_bytes += 48 * MIB;
+            sampler.observe(&mut profile, &stats, 1_000 + step * 1_000);
+        }
+        assert_eq!(profile.connection_receive_floor, 12 * MIB);
+        assert_eq!(profile.stream_receive_floor, 0);
+
+        stats.frame_rx.stream_data_blocked += 1;
+        sampler.observe(&mut profile, &stats, 5_000);
+        assert_eq!(profile.stream_receive_floor, 16 * MIB);
+    }
+
+    #[test]
+    fn credit_stalls_preserve_but_do_not_advance_promotion() {
+        const MIB: u64 = 1 << 20;
+        fn sampled_floor(pressured: bool) -> u64 {
+            let mut stats = flow_stats(0, 0, 8 * MIB);
+            stats.flow_control.send_window_available = if pressured { 0 } else { 8 * MIB };
+            let mut sampler = AdaptiveFlowSampler::new(&stats, 1_000);
+            let mut profile = AdaptiveFlowProfile::default();
+            for step in 1..=7 {
+                if matches!(step, 1 | 4 | 7) {
+                    stats.flow_control.sent_bytes += 48 * MIB;
+                }
+                sampler.observe(&mut profile, &stats, 1_000 + step * 1_000);
+            }
+            profile.send_floor
+        }
+
+        assert!(sampled_floor(true) > 8 * MIB);
+        assert_eq!(sampled_floor(false), 0);
+    }
+
+    #[test]
+    fn configured_window_does_not_start_cooldown() {
+        const MIB: u64 = 1 << 20;
+        let mut seeded = AdaptiveFlowProfile::default();
+        seed_flow_control_profile(&mut seeded, &flow_stats(0, 0, 16 * MIB));
+        let mut samples = 0;
+        for now in 1..=3 {
+            update_flow_window(
+                &mut samples,
+                &mut seeded.connection_receive_floor,
+                &mut seeded.last_connection_receive_adjust_ms,
+                true,
+                false,
+                4 * MIB,
+                now,
+            );
+        }
+        assert_eq!(seeded.connection_receive_floor, 16 * MIB);
+        assert_eq!(seeded.last_connection_receive_adjust_ms, None);
+        for now in 4..=6 {
+            update_flow_window(
+                &mut samples,
+                &mut seeded.connection_receive_floor,
+                &mut seeded.last_connection_receive_adjust_ms,
+                true,
+                false,
+                12 * MIB,
+                now,
+            );
+        }
+        assert_eq!(seeded.connection_receive_floor, 24 * MIB);
+        assert_eq!(seeded.last_connection_receive_adjust_ms, Some(6));
+    }
+
+    #[test]
+    fn metric_tracker_counts_post_close_reads_once() {
+        const DELIVERED: u64 = 1 << 50;
+        let totals = &quic_metrics().totals.flow_received_bytes;
+        let before = totals.load(Ordering::Relaxed);
+        let mut tracker = QuicMetricTracker::default();
+        let stats = quinn::ConnectionStats::default();
+        tracker.sample(stats);
+        tracker.close(stats);
+        let mut drained = stats;
+        drained.flow_control.received_bytes = DELIVERED;
+        tracker.finish(drained);
+
+        assert!(totals.load(Ordering::Relaxed).wrapping_sub(before) >= DELIVERED);
+        tracker.sample(stats);
+        assert!(tracker.id.is_none());
     }
 
     #[test]
@@ -1578,25 +2099,90 @@ impl quinn::UdpPoller for NoGsoUdpPoller {
 /// Keeps one QUIC connection in the aggregate metrics registry until it is
 /// closed or the owning pooled client drops it.
 pub struct QuicConnectionMonitor {
-    id: u64,
     conn: Connection,
+    tracker: Arc<SyncMutex<QuicMetricTracker>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for QuicConnectionMonitor {
     fn drop(&mut self) {
         self.task.abort();
-        finish_quic_connection(self.id, self.conn.stats());
+        self.tracker.lock().finish(self.conn.stats());
     }
 }
 
 /// Register a pooled QUIC connection for one-second aggregate sampling.
 pub fn monitor_quic_connection(conn: &Connection) -> QuicConnectionMonitor {
-    spawn_quic_connection_monitor(conn.clone())
-}
-fn spawn_quic_connection_monitor(conn: Connection) -> QuicConnectionMonitor {
-    let id = register_quic_connection(conn.stats());
+    let tracker = Arc::new(SyncMutex::new(QuicMetricTracker::default()));
+    tracker.lock().sample(conn.stats());
     let task_conn = conn.clone();
+    let task_tracker = Arc::clone(&tracker);
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + QUIC_SAMPLE_INTERVAL,
+            QUIC_SAMPLE_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = task_conn.closed() => break,
+                _ = ticker.tick() => task_tracker.lock().sample(task_conn.stats()),
+            }
+        }
+        task_tracker.lock().close(task_conn.stats());
+    });
+    QuicConnectionMonitor {
+        conn: conn.clone(),
+        tracker,
+        task,
+    }
+}
+
+struct QuicClientConnectionMonitor {
+    conn: Connection,
+    metrics_enabled: Arc<AtomicBool>,
+    tracker: Arc<SyncMutex<QuicMetricTracker>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl QuicClientConnectionMonitor {
+    fn enable_metrics(&self) {
+        self.metrics_enabled.store(true, Ordering::Release);
+        self.tracker.lock().sample(self.conn.stats());
+    }
+}
+
+impl Drop for QuicClientConnectionMonitor {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.tracker.lock().finish(self.conn.stats());
+    }
+}
+
+fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
+    conn: Connection,
+    profiles: Arc<AdaptiveFlowProfiles>,
+    ipv6: bool,
+    owner: Weak<C>,
+    metrics_enabled: bool,
+) -> QuicClientConnectionMonitor {
+    let family = usize::from(ipv6);
+    let initial_stats = conn.stats();
+    {
+        let mut profiles = profiles.lock();
+        let profile = &mut profiles[family];
+        seed_flow_control_profile(profile, &initial_stats);
+        apply_flow_control_profile(&conn, &initial_stats, profile);
+    }
+    let mut sampler = AdaptiveFlowSampler::new(&initial_stats, path_now_millis());
+    let tracker = Arc::new(SyncMutex::new(QuicMetricTracker::default()));
+    if metrics_enabled {
+        tracker.lock().sample(initial_stats);
+    }
+    let enabled = Arc::new(AtomicBool::new(metrics_enabled));
+    let task_conn = conn.clone();
+    let task_tracker = Arc::clone(&tracker);
+    let task_enabled = Arc::clone(&enabled);
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + QUIC_SAMPLE_INTERVAL,
@@ -1607,15 +2193,35 @@ fn spawn_quic_connection_monitor(conn: Connection) -> QuicConnectionMonitor {
             tokio::select! {
                 _ = task_conn.closed() => break,
                 _ = ticker.tick() => {
-                    update_quic_connection(id, task_conn.stats());
+                    if owner.upgrade().is_none() {
+                        break;
+                    }
+                    let stats = task_conn.stats();
+                    {
+                        let mut profiles = profiles.lock();
+                        let profile = &mut profiles[family];
+                        sampler.observe(profile, &stats, path_now_millis());
+                        apply_flow_control_profile(&task_conn, &stats, profile);
+                    }
+                    if task_enabled.load(Ordering::Acquire) {
+                        task_tracker.lock().sample(stats);
+                    }
                 }
             }
         }
-        let final_stats = task_conn.stats();
-        update_quic_connection(id, final_stats);
-        finish_quic_connection(id, final_stats);
+        let stats = task_conn.stats();
+        let mut tracker = task_tracker.lock();
+        if task_enabled.load(Ordering::Acquire) {
+            tracker.sample(stats);
+        }
+        tracker.close(stats);
     });
-    QuicConnectionMonitor { id, conn, task }
+    QuicClientConnectionMonitor {
+        conn,
+        metrics_enabled: enabled,
+        tracker,
+        task,
+    }
 }
 
 struct TrackedConnection<C> {
@@ -1623,6 +2229,7 @@ struct TrackedConnection<C> {
     connection: Connection,
     _endpoint: Endpoint,
     state: Weak<C>,
+    monitor: Arc<QuicClientConnectionMonitor>,
 }
 
 struct State<C> {
@@ -1642,15 +2249,14 @@ struct State<C> {
 impl<C> State<C> {
     fn prune_connections(&mut self) {
         self.connections.retain(|tracked| {
-            if tracked.connection.close_reason().is_some() {
-                return false;
-            }
             if tracked.state.upgrade().is_some() {
                 return true;
             }
-            tracked
-                .connection
-                .close(VarInt::from_u32(0), b"state dropped");
+            if tracked.connection.close_reason().is_none() {
+                tracked
+                    .connection
+                    .close(VarInt::from_u32(0), b"state dropped");
+            }
             false
         });
     }
@@ -1661,19 +2267,30 @@ fn spawn_tracked_connection_cleanup<C: Send + Sync + 'static>(
     id: u64,
     connection: Connection,
     owner: Weak<C>,
+    monitor: Arc<QuicClientConnectionMonitor>,
 ) {
     tokio::spawn(async move {
+        let _monitor = monitor;
+        let mut removed = false;
         loop {
             if owner.upgrade().is_none() {
-                connection.close(VarInt::from_u32(0), b"state dropped");
+                if connection.close_reason().is_none() {
+                    connection.close(VarInt::from_u32(0), b"state dropped");
+                }
                 break;
             }
             tokio::select! {
-                _ = connection.closed() => break,
+                _ = connection.closed(), if !removed => {
+                    if let Some(state) = state.upgrade() {
+                        let mut state = state.lock().await;
+                        state.connections.retain(|tracked| tracked.id != id);
+                    }
+                    removed = true;
+                }
                 _ = tokio::time::sleep(QUIC_SAMPLE_INTERVAL) => {}
             }
         }
-        if let Some(state) = state.upgrade() {
+        if !removed && let Some(state) = state.upgrade() {
             let mut state = state.lock().await;
             state.connections.retain(|tracked| tracked.id != id);
         }
@@ -1725,9 +2342,9 @@ pub struct QuicClient<C> {
     /// Advertised `max_udp_payload_size` cap for the default endpoint (see
     /// [`client_endpoint`] for the safe 1252 default).
     mtu: u16,
+    flow_control_profiles: Arc<AdaptiveFlowProfiles>,
     state: Arc<Mutex<State<C>>>,
 }
-
 impl<C: Send + Sync + 'static> QuicClient<C> {
     pub fn new(
         server_host: impl Into<String>,
@@ -1742,6 +2359,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             config,
             endpoint_factory: None,
             mtu: 1252,
+            flow_control_profiles: Arc::new(AdaptiveFlowProfiles::default()),
             state: Arc::new(Mutex::new(State {
                 endpoint: None,
                 conn: None,
@@ -1751,6 +2369,16 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 closed: false,
             })),
         }
+    }
+
+    pub(crate) fn with_flow_control_profiles(
+        mut self,
+        profiles: Option<Arc<AdaptiveFlowProfiles>>,
+    ) -> Self {
+        if let Some(profiles) = profiles {
+            self.flow_control_profiles = profiles;
+        }
+        self
     }
 
     /// Advertise a larger `max_udp_payload_size` on paths known to carry it
@@ -1778,8 +2406,11 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     {
         let mut state = self.state.lock().await;
         state.metrics_enabled = true;
-        if let Some((conn, ctx)) = state.conn.as_ref() {
-            ctx.install_metrics_monitor(conn.clone());
+        for tracked in &state.connections {
+            tracked.monitor.enable_metrics();
+            if let Some(ctx) = tracked.state.upgrade() {
+                ctx.enable_telemetry();
+            }
         }
     }
 
@@ -1811,8 +2442,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
-        self.connection_with_inner(connect_timeout, setup, |ctx, conn| {
-            ctx.install_metrics_monitor(conn.clone());
+        self.connection_with_inner(connect_timeout, setup, |ctx, _| {
+            ctx.enable_telemetry();
         })
         .await
     }
@@ -1931,13 +2562,27 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         let id = state.next_connection_id;
         state.next_connection_id = state.next_connection_id.wrapping_add(1).max(1);
         let owner = Arc::downgrade(&ctx);
+        let monitor = Arc::new(spawn_quic_client_connection_monitor(
+            conn.clone(),
+            Arc::clone(&self.flow_control_profiles),
+            ipv6,
+            owner.clone(),
+            state.metrics_enabled,
+        ));
         state.connections.push(TrackedConnection {
             id,
             connection: conn.clone(),
             _endpoint: endpoint.clone(),
             state: owner.clone(),
+            monitor: Arc::clone(&monitor),
         });
-        spawn_tracked_connection_cleanup(Arc::downgrade(&self.state), id, conn.clone(), owner);
+        spawn_tracked_connection_cleanup(
+            Arc::downgrade(&self.state),
+            id,
+            conn.clone(),
+            owner,
+            monitor,
+        );
         state.conn = Some((conn.clone(), Arc::clone(&ctx)));
         Ok((conn, ctx))
     }
@@ -2099,9 +2744,8 @@ pub(crate) trait QuicConnState: Send + Sync + 'static {
     fn touch(&self);
     /// Counter of open streams/bridges on this connection.
     fn open_counter(&self) -> &Arc<AtomicUsize>;
-    /// Keep aggregate metrics alive with active protocol flows after the
-    /// reusable client releases its cached connection.
-    fn install_metrics_monitor(&self, conn: Connection);
+    /// Include watchdog retirements from this connection in aggregate telemetry.
+    fn enable_telemetry(&self);
 }
 
 /// TUIC-style exporter authentication (sing `clientHandshake`,
@@ -2506,6 +3150,105 @@ mod client_tests {
                 });
             }
         });
+    }
+
+    #[tokio::test]
+    async fn adaptive_profile_updates_live_connection_windows() {
+        const MIB: u64 = 1 << 20;
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        let accepted = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { endpoint.accept().await.unwrap().await.unwrap() }
+        });
+        let mut node = skip_verify_node();
+        node.host = "127.0.0.1".to_string();
+        node.address = format!("127.0.0.1:{}", addr.port());
+        node.port = addr.port();
+        let config = client_config(
+            &node,
+            &[b"h3"],
+            QuicClientOptions {
+                stream_receive_window: Some(8 * MIB),
+                conn_receive_window: Some(8 * MIB),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let profiles = Arc::new(AdaptiveFlowProfiles::default());
+        let client = QuicClient::new("127.0.0.1", addr.port(), "localhost", config)
+            .with_flow_control_profiles(Some(Arc::clone(&profiles)));
+        let (conn, state) = client
+            .connection_with(Duration::from_secs(1), |_| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&profiles, &client.flow_control_profiles));
+        assert_eq!(Arc::strong_count(&profiles), 3);
+        let server = accepted.await.unwrap();
+        let profile = AdaptiveFlowProfile {
+            connection_receive_floor: 16 * MIB,
+            stream_receive_floor: 16 * MIB,
+            send_floor: 20 * MIB,
+            ..Default::default()
+        };
+
+        apply_flow_control_profile(&conn, &conn.stats(), &profile);
+        let stats = conn.stats().flow_control;
+        assert_eq!(stats.stream_receive_window, 16 * MIB);
+        assert_eq!(stats.receive_window, 16 * MIB);
+        assert_eq!(stats.send_window, 20 * MIB);
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(Arc::strong_count(&profiles), 2);
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&profiles) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adaptive monitor outlived its flow state");
+
+        conn.close(VarInt::from_u32(0), b"test complete");
+        endpoint.close(VarInt::from_u32(0), b"test complete");
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn closed_connection_tracking_is_pruned_while_flow_state_lives() {
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        let accepted = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { endpoint.accept().await.unwrap().await.unwrap() }
+        });
+        let client = test_client(addr.port()).await;
+        let (conn, flow_state) = client
+            .connection_with(Duration::from_secs(1), |_| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+        let server = accepted.await.unwrap();
+        assert_eq!(client.state.lock().await.connections.len(), 1);
+
+        conn.close(VarInt::from_u32(0), b"test complete");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.state.lock().await.connections.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed connection remained in client tracking");
+
+        drop(flow_state);
+        client.force_close().await;
+        endpoint.close(VarInt::from_u32(0), b"test complete");
+        drop(server);
     }
 
     #[tokio::test]

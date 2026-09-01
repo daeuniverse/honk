@@ -466,10 +466,22 @@ Rotation overlaps naturally: each flow owns its `(Connection, protocol state)`
 pair. When the holder replaces a closed or invalidated connection, new work
 uses the replacement while existing flows can finish on their old clones.
 Dropping final warm ownership removes future reuse without cutting active flows.
+The per-family adaptive receive/send floors and cooldowns belong to the runtime,
+not the optional client slot, so warm release, rebuild, and speculative clients
+reuse the same learned path profile.
 
 Each pooled QUIC connection samples Quinn path and UDP I/O counters once per
 second for the aggregate `quic` section of `/stats`. Temporary URL/health probe
 connections are intentionally excluded.
+The same sample drives per-address-family flow-control profiles. Ten-second
+receive and send goodput EWMAs require three consecutive high-BDP samples at
+SRTT >= 80 ms before raising the connection receive or send floor toward
+`2 x BDP`. A peer `STREAM_DATA_BLOCKED` frame independently doubles the stream
+receive floor; aggregate connection goodput cannot safely identify one stream's
+demand. Each floor is capped at 32 MiB, has its own five-minute promotion
+cooldown, never shrinks automatically, and applies to the live connection and
+future streams without reconnecting. Zero-progress samples preserve a pending
+promotion only while the corresponding connection credit remains pressured.
 Native TUIC and Hysteria2 UDP
 endpoints use a per-send deadline of `clamp(4 × SRTT, 1 s, 5 s)`. Three
 consecutive send deadlines, or no newly acknowledged QUIC packet is observed for

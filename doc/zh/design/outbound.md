@@ -423,9 +423,18 @@ Rotation 天然重叠：每个 flow 拥有自己的 `(Connection, protocol state
 pair。当 holder 替换已关闭或失效连接时，新工作使用 replacement，而现有
 flow 可以在旧 clone 上完成。移除最后一份 warm 所有权只会移除未来复用，
 不会切断 active flow。
+按地址族保存的自适应收发 floor 与 cooldown 属于 runtime，而不是可选的
+client 槽，因此 warm 释放、重建与 speculative client 会复用同一份已学习路径画像。
 
 每条池化 QUIC connection 每秒采样一次 Quinn path 与 UDP I/O counter，汇总到
 `/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。
+同一份采样也驱动按地址族保存的流控画像。收发方向使用 10 秒 goodput EWMA；
+只有 SRTT >= 80 ms 且连续三个样本确认高 BDP，才会把 connection 接收或发送
+floor 提高到约 `2 x BDP`。peer 发来的 `STREAM_DATA_BLOCKED` 会独立地把 stream
+接收 floor 加倍；connection 聚合 goodput 无法安全判断某一条 stream 的需求。
+每个 floor 独立执行五分钟升档冷却，最大 32 MiB，不自动缩小，并且无需重连即可
+更新当前 connection 与后续 stream。零进度样本只有在对应 connection credit
+仍受压时才会保留尚未完成的升档 streak。
 endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`。连续三次发送
 超时，或超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC packet 被确认，endpoint 会被退役
 并关闭该 connection，让下一条 flow 重新拨号。发送成功会重置超时 streak；确认进度
