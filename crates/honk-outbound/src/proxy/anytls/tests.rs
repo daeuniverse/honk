@@ -2,10 +2,82 @@ use super::*;
 
 #[test]
 fn test_settings_payload_format() {
+    let scheme = PaddingScheme::parse(DEFAULT_PADDING_SCHEME).unwrap();
+    assert_eq!(scheme.md5, "75cff2ad89aadf5e257059ee571ebe11");
     assert_eq!(
-        AnyTlsHandler::settings_payload(),
-        b"v=2\nclient=dae\npadding-md5=dda34b9d9b470e6259f75776159e605b\n"
+        scheme.settings_payload().as_ref(),
+        b"v=2\nclient=honk/0.0.1-alpha\npadding-md5=75cff2ad89aadf5e257059ee571ebe11\n"
     );
+}
+
+#[test]
+fn padding_scheme_matches_upstream_map_boundaries() {
+    assert!(PaddingScheme::parse(b"0=30-30").is_none());
+
+    let scheme =
+        PaddingScheme::parse(b"stop=bad\nstop=3\n01=900-900\n1=20-10,c\nignored=\xff").unwrap();
+    assert_eq!(scheme.stop, 3);
+    assert!(!scheme.packets.contains_key(&0));
+    let packet_one = scheme.packets.get(&1).unwrap();
+    assert!(matches!(packet_one[0], PaddingInstruction::Range(10, 20)));
+    assert!(matches!(packet_one[1], PaddingInstruction::Check));
+
+    assert!(PaddingScheme::parse(b"stop=1\n0=c,30-30").is_none());
+}
+
+#[test]
+fn authentication_packet_covers_padding_length_boundaries() {
+    let scheme = PaddingScheme::parse(b"stop=1\n0=30-30").unwrap();
+    let auth = authentication_payload("secret", &scheme);
+    assert_eq!(auth.len(), 64);
+    assert_eq!(&auth[..32], &Sha256::digest(b"secret")[..]);
+    assert_eq!(&auth[32..34], &30u16.to_be_bytes());
+    assert!(auth[34..].iter().all(|byte| *byte == 0));
+
+    let too_large = PaddingScheme::parse(b"stop=1\n0=65536-65536").unwrap();
+    assert_eq!(authentication_payload("secret", &too_large).len(), 34);
+}
+
+#[test]
+fn server_settings_use_the_final_version_value() {
+    assert_eq!(server_synack_setting(b"v=2\n"), Some(true));
+    assert_eq!(server_synack_setting(b"v=2\nv=1\n"), Some(false));
+    assert_eq!(server_synack_setting(b"v=-1\n"), Some(true));
+    assert_eq!(server_synack_setting(b"v=256\n"), Some(false));
+    assert_eq!(server_synack_setting(b"v=invalid\n"), None);
+    assert_eq!(server_synack_setting(b"client=anytls\n"), None);
+}
+
+#[tokio::test]
+async fn padding_writer_honors_check_and_frame_size_boundaries() {
+    let scheme = PaddingScheme::parse(b"stop=3\n1=20-20,c,30-30").unwrap();
+
+    let mut short = Vec::new();
+    write_padded(&mut short, b"hello", &scheme, 1)
+        .await
+        .unwrap();
+    assert_eq!(short.len(), 20);
+    assert_eq!(&short[..5], b"hello");
+    assert_eq!(short[5], CMD_WASTE);
+    assert_eq!(&short[10..12], &8u16.to_be_bytes());
+
+    let payload = [7u8; 25];
+    let mut long = Vec::new();
+    write_padded(&mut long, &payload, &scheme, 1).await.unwrap();
+    assert_eq!(&long[..25], &payload);
+    assert_eq!(long.len(), 50);
+    assert_eq!(long[25], CMD_WASTE);
+    assert_eq!(&long[30..32], &18u16.to_be_bytes());
+
+    let mut frame = Vec::new();
+    write_frame(&mut frame, CMD_PSH, 1, &vec![0; u16::MAX as usize])
+        .await
+        .unwrap();
+    assert_eq!(frame.len(), FRAME_HEADER_LEN + u16::MAX as usize);
+    let error = write_frame(&mut Vec::new(), CMD_PSH, 1, &vec![0; u16::MAX as usize + 1])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -327,7 +399,13 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
     // When: a pool-owned physical AnyTLS session dial reaches that server.
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        dial_session(&node, &address, Duration::from_millis(50), None),
+        dial_session(
+            &node,
+            &address,
+            Duration::from_millis(50),
+            None,
+            Arc::new(PaddingState::default()),
+        ),
     )
     .await;
     server.abort();
@@ -466,20 +544,29 @@ fn writer_queue_bounds_control_pressure_and_rejects_after_close() {
 const TEST_AUTH: &[u8] = b"test-auth";
 const TEST_SETTINGS: &[u8] = b"test-settings";
 
+fn test_padding() -> Arc<PaddingState> {
+    Arc::new(PaddingState {
+        current: parking_lot::RwLock::new(Arc::new(PaddingScheme::parse(b"stop=0").unwrap())),
+    })
+}
+
 /// Establish a session over an in-memory duplex; returns the session
 /// and the server end of the transport.
 async fn establish_test_session(addr: &str) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
     let (client_end, server_end) = tokio::io::duplex(1 << 20);
     let (read, write) = tokio::io::split(client_end);
+    let padding_state = test_padding();
     let session = AnyTlsSession::establish(
         addr,
         Box::new(read),
         Box::new(write),
         TEST_AUTH,
-        TEST_SETTINGS,
+        bytes::Bytes::from_static(TEST_SETTINGS),
+        padding_state,
     )
     .await
     .unwrap();
+    session.flush_initial_settings_for_test().unwrap();
     (session, server_end)
 }
 
@@ -492,6 +579,225 @@ async fn expect_handshake(server: &mut tokio::io::DuplexStream) {
     assert_eq!(cmd, CMD_SETTINGS);
     assert_eq!(sid, 0);
     assert_eq!(data, TEST_SETTINGS);
+}
+
+#[tokio::test]
+async fn settings_wait_for_the_first_stream_open() {
+    let (client, mut server) = tokio::io::duplex(1 << 20);
+    let (read, write) = tokio::io::split(client);
+    let session = AnyTlsSession::establish(
+        "deferred-settings",
+        Box::new(read),
+        Box::new(write),
+        TEST_AUTH,
+        bytes::Bytes::from_static(TEST_SETTINGS),
+        test_padding(),
+    )
+    .await
+    .unwrap();
+
+    let mut auth = vec![0; TEST_AUTH.len()];
+    server.read_exact(&mut auth).await.unwrap();
+    assert_eq!(auth, TEST_AUTH);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read_frame(&mut server))
+            .await
+            .is_err()
+    );
+
+    let stream = session
+        .open_stream_direct(b"target".to_vec(), session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SETTINGS, 0, TEST_SETTINGS.to_vec())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SYN, stream.sid, Vec::new())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_PSH, stream.sid, b"target".to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn concurrent_first_open_keeps_settings_ahead_of_syn() {
+    let (client, mut server) = tokio::io::duplex(1 << 20);
+    let (read, write) = tokio::io::split(client);
+    let session = AnyTlsSession::establish(
+        "concurrent-first-open",
+        Box::new(read),
+        Box::new(write),
+        TEST_AUTH,
+        bytes::Bytes::from_static(TEST_SETTINGS),
+        test_padding(),
+    )
+    .await
+    .unwrap();
+
+    let mut auth = vec![0; TEST_AUTH.len()];
+    server.read_exact(&mut auth).await.unwrap();
+    assert_eq!(auth, TEST_AUTH);
+
+    let writer_guard = session.writer_q.queue.lock();
+    let first = tokio::spawn({
+        let session = Arc::clone(&session);
+        let permit = session.try_reserve().unwrap();
+        async move { session.open_stream_direct(b"first".to_vec(), permit).await }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(settings) = session.initial_settings.try_lock() {
+            assert!(
+                settings.is_some(),
+                "first opener released SETTINGS before committing its queue order"
+            );
+            drop(settings);
+            assert!(Instant::now() < deadline, "first opener did not start");
+            std::thread::yield_now();
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            session.initial_settings.try_lock().is_none(),
+            "first opener released SETTINGS while waiting for the writer queue"
+        );
+        break;
+    }
+
+    let second = tokio::spawn({
+        let session = Arc::clone(&session);
+        let permit = session.try_reserve().unwrap();
+        async move { session.open_stream_direct(b"second".to_vec(), permit).await }
+    });
+    drop(writer_guard);
+
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SETTINGS, 0, TEST_SETTINGS.to_vec())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SYN, first.sid, Vec::new())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_PSH, first.sid, b"first".to_vec())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SYN, second.sid, Vec::new())
+    );
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_PSH, second.sid, b"second".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn empty_control_frames_do_not_close_the_session() {
+    let (session, mut server) = establish_test_session("empty-controls").await;
+    expect_handshake(&mut server).await;
+    let mut stream = session
+        .open_stream_direct(b"target".to_vec(), session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+    let padding_md5 = session.padding_state.snapshot().md5.clone();
+
+    write_frame(&mut server, CMD_ALERT, 0, &[]).await.unwrap();
+    write_frame(&mut server, CMD_UPDATE_PADDING_SCHEME, 0, &[])
+        .await
+        .unwrap();
+    write_frame(&mut server, CMD_PSH, stream.sid, &[])
+        .await
+        .unwrap();
+    write_frame(&mut server, CMD_PSH, stream.sid, b"alive")
+        .await
+        .unwrap();
+    let mut response = [0; 5];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"alive");
+    assert!(!session.is_closed());
+    assert_eq!(session.padding_state.snapshot().md5, padding_md5);
+
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !session.peer_supports_synack.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=1\n")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while session.peer_supports_synack.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn padding_update_applies_to_an_active_session_before_stop() {
+    let padding_state = Arc::new(PaddingState {
+        current: parking_lot::RwLock::new(Arc::new(PaddingScheme::parse(b"stop=8").unwrap())),
+    });
+    let (client, mut server) = tokio::io::duplex(1 << 20);
+    let (read, write) = tokio::io::split(client);
+    let session = AnyTlsSession::establish(
+        "padding-update",
+        Box::new(read),
+        Box::new(write),
+        TEST_AUTH,
+        bytes::Bytes::from_static(TEST_SETTINGS),
+        Arc::clone(&padding_state),
+    )
+    .await
+    .unwrap();
+    session.flush_initial_settings_for_test().unwrap();
+    expect_handshake(&mut server).await;
+
+    let update = b"stop=4\n2=30-30";
+    let updated_md5 = PaddingScheme::parse(update).unwrap().md5;
+    write_frame(&mut server, CMD_UPDATE_PADDING_SCHEME, 0, update)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while padding_state.snapshot().md5 != updated_md5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let stream = session
+        .open_stream_direct(b"target".to_vec(), session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_SYN, stream.sid, Vec::new())
+    );
+    let (cmd, sid, padding) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, sid, padding.len()), (CMD_WASTE, 0, 16));
+    assert!(padding.iter().all(|byte| *byte == 0));
+    assert_eq!(
+        read_frame(&mut server).await.unwrap(),
+        (CMD_PSH, stream.sid, b"target".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -2578,7 +2884,7 @@ async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
 async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
     let handler = AnyTlsHandler::new();
     let node = zero_idle_anytls_node("speculative-shared");
-    let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
+    let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let (session, _server) = establish_test_session("speculative-shared").await;
     pool.insert(&session);
     let prepared = handler
@@ -2609,7 +2915,7 @@ async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
 async fn speculative_detached_winner_commits_into_captured_pool_once() {
     let handler = AnyTlsHandler::new();
     let node = zero_idle_anytls_node("speculative-detached-commit");
-    let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
+    let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let (session, _server) = establish_test_session("speculative-detached-commit").await;
     let prepared = handler
         .dial_udp_transport_speculative_with(
@@ -2679,7 +2985,7 @@ async fn speculative_commit_binds_initial_generation_admission() {
 async fn speculative_detached_commit_fails_closed_after_generation_shutdown() {
     let handler = AnyTlsHandler::new();
     let node = zero_idle_anytls_node("speculative-detached-shutdown");
-    let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
+    let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let (session, _server) = establish_test_session("speculative-detached-shutdown").await;
     let prepared = handler
         .dial_udp_transport_speculative_with(
@@ -2714,7 +3020,7 @@ impl Drop for CancelledDial {
 async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
     let handler = Arc::new(AnyTlsHandler::new());
     let node = zero_idle_anytls_node("speculative-abort");
-    let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
+    let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -2769,7 +3075,7 @@ async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
 async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
     let handler = Arc::new(AnyTlsHandler::new());
     let node = zero_idle_anytls_node("speculative-shutdown");
-    let pool: Arc<AnyTlsPool> = Arc::new(crate::session::SessionPool::new(session_pool_config()));
+    let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({

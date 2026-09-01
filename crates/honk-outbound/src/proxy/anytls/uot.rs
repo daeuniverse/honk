@@ -11,8 +11,8 @@ use crate::proxy::uot::{
 
 #[cfg(test)]
 use super::{
-    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT,
-    WRITER_QUEUE_CAP, read_frame, write_frame,
+    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED,
+    WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP, read_frame, write_frame,
 };
 #[cfg(test)]
 use crate::proxy::addr;
@@ -307,15 +307,20 @@ mod uot_transport_tests {
         let addr = "127.0.0.1:2443";
         let (client_end, mut server_end) = tokio::io::duplex(capacity);
         let (read, write) = tokio::io::split(client_end);
+        let padding_state = Arc::new(PaddingState {
+            current: parking_lot::RwLock::new(Arc::new(PaddingScheme::parse(b"stop=0").unwrap())),
+        });
         let session = AnyTlsSession::establish(
             addr,
             Box::new(read),
             Box::new(write),
             TEST_AUTH,
-            TEST_SETTINGS,
+            bytes::Bytes::from_static(TEST_SETTINGS),
+            padding_state,
         )
         .await
         .unwrap();
+        session.flush_initial_settings_for_test().unwrap();
 
         let mut auth = vec![0u8; TEST_AUTH.len()];
         server_end.read_exact(&mut auth).await.unwrap();
