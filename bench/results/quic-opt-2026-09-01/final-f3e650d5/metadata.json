@@ -1,0 +1,23 @@
+{
+  "date_utc": "2026-09-01",
+  "scope": "isolated P1 adaptive QUIC flow-control A/B",
+  "baseline_revision": "3e7d446 (P0 source, merged as 899dbb4)",
+  "candidate_revision": "P1 working tree, later committed as f0bd8ea",
+  "network": "loopback with tc netem",
+  "stream_sampling": {
+    "completed_per_arm": 8,
+    "warmups_discarded": 2,
+    "median_samples": 6,
+    "arm_order": "alternated by scenario"
+  },
+  "adapter_probe": {
+    "samples_per_protocol_arm": 10,
+    "purpose": "exploratory handshake stability; not the throughput acceptance gate",
+    "extreme_case": "300 ms delay and 10% loss exceeded some protocol handshake deadlines"
+  },
+  "sanitization": [
+    "node links and credentials omitted",
+    "usernames, hostnames, and absolute paths omitted",
+    "benchmark binaries not retained"
+  ]
+}
