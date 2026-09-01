@@ -1,9 +1,12 @@
 use super::*;
+use honk_outbound::proxy::QuicSendAttempt;
 
 /// How long the endpoint driver waits for proxy data before giving up.
 pub(super) const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Setup may consume the dynamic send deadline; queue retention still has one fixed bound.
+const QUEUED_PACKET_MAX_AGE: Duration = Duration::from_secs(5);
 pub(super) const TRAFFIC_ALIVE_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 pub(super) const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 pub(super) const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -15,6 +18,9 @@ enum PacketSendFailure {
     Congestion(io::Error),
     Transport(io::Error),
 }
+
+const QUEUED_PACKET_EXPIRED: &str = "UDP packet expired in endpoint queue";
+
 /// Marker separating receiver-idle expiry from a transport send timeout.
 #[derive(Debug)]
 pub(super) struct ReplyIdleTimeout;
@@ -256,6 +262,9 @@ pub(super) fn score_driver_outcome(
         } else {
             ScoreOutcome::Cancelled
         };
+    }
+    if endpoint.proxy_socket.quic_path_stalled() {
+        return ScoreOutcome::Timeout;
     }
     match result {
         Ok(()) => ScoreOutcome::Success,
@@ -531,26 +540,32 @@ async fn send_one(
     packet: QueuedDatagram,
     first: bool,
 ) -> Result<(), PacketSendFailure> {
-    // This is the application-send linearization point. Node death that wins
-    // before it prevents any transport call; congestion or a post-send error
-    // never causes this packet to be replayed.
+    let started = first.then(Instant::now);
+    if packet.expired(QUEUED_PACKET_MAX_AGE) {
+        if first {
+            stats.record_udp_first_send_failure();
+        }
+        return Err(PacketSendFailure::Congestion(io::Error::new(
+            io::ErrorKind::TimedOut,
+            QUEUED_PACKET_EXPIRED,
+        )));
+    }
     endpoint
         .begin_send_attempt()
         .map_err(PacketSendFailure::Transport)?;
-    let started = first.then(Instant::now);
+    let transport = endpoint.proxy_socket.as_ref();
+    let attempt = QuicSendAttempt::new(transport);
+    let timeout = transport.send_timeout().max(Duration::from_millis(1));
     send_timeout
         .as_mut()
-        .reset(tokio::time::Instant::now() + TRANSPORT_SEND_TIMEOUT);
+        .reset(tokio::time::Instant::now() + timeout);
     let sent = tokio::select! {
         biased;
         result = async {
             if first {
-                endpoint
-                    .proxy_socket
-                    .send_packet_confirmed(&packet.data)
-                    .await
+                transport.send_packet_confirmed(&packet.data).await
             } else {
-                endpoint.proxy_socket.send_packet(&packet.data).await
+                transport.send_packet(&packet.data).await
             }
         } => Ok(result),
         _ = send_timeout.as_mut() => Err(io::Error::new(
@@ -558,10 +573,29 @@ async fn send_one(
             "UDP PacketTransport send timed out",
         )),
     };
-    let result = match sent {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(classify_send_error(endpoint.proxy_socket.as_ref(), error)),
-        Err(error) => Err(classify_send_error(endpoint.proxy_socket.as_ref(), error)),
+    let timed_out = match &sent {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
+    };
+    let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
+    match &sent {
+        Ok(Ok(())) if endpoint_retired => attempt.failure(),
+        Ok(Ok(())) => attempt.success(),
+        Ok(Err(_)) | Err(_) if endpoint_retired => attempt.failure(),
+        Ok(Err(_)) | Err(_) if timed_out => attempt.timeout(),
+        Ok(Err(_)) | Err(_) => attempt.failure(),
+    };
+    let result = if endpoint_retired {
+        Err(PacketSendFailure::Transport(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "UDP endpoint retired while sending",
+        )))
+    } else {
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(classify_send_error(transport, error)),
+            Err(error) => Err(classify_send_error(transport, error)),
+        }
     };
     if let Some(started) = started {
         stats.record_udp_first_send_latency(started.elapsed());
@@ -606,13 +640,13 @@ async fn receive_loop(
             .reset(tokio::time::Instant::now() + REPLY_IDLE_TIMEOUT);
         let received = tokio::select! {
             biased;
-            packet = endpoint.proxy_socket.recv_packet(&mut buf) => Ok(packet),
-            _ = reply_idle_timeout.as_mut() => Err(()),
+            packet = endpoint.proxy_socket.recv_packet(&mut buf) => Some(packet),
+            _ = reply_idle_timeout.as_mut() => None,
         };
         let (n, source) = match received {
-            Ok(Ok(packet)) => packet,
-            Ok(Err(error)) => return Err(error),
-            Err(()) => {
+            Some(Ok(packet)) => packet,
+            Some(Err(error)) => return Err(error),
+            None => {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
             }
         };
@@ -675,9 +709,28 @@ async fn receive_loop(
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn monotonic_nanos() -> i64 {
-    // Use std Instant as monotonic clock (handles suspend correctly).
-    // We only need relative comparisons, so offset from a fixed epoch is fine.
+    // Queue expiry is second-scale; the coarse clock keeps receive-batch stamping cheap.
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) } == 0 {
+        ts.tv_sec
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec)
+    } else {
+        fallback_monotonic_nanos()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn monotonic_nanos() -> i64 {
+    fallback_monotonic_nanos()
+}
+
+fn fallback_monotonic_nanos() -> i64 {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_nanos() as i64

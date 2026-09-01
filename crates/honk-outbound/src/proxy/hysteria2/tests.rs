@@ -604,7 +604,7 @@ fn test_fragmentation_and_defrag() {
     assert_eq!(frags.len(), 3);
     assert!(frags.iter().all(|f| f.len() <= 1200));
     // Every fragment repeats the full header (sing parity).
-    let mut defrag = Defragmenter::new();
+    let mut defrag = Defragmenter::new(MAX_UDP_SIZE);
     let mut out = None;
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(pkt).unwrap();

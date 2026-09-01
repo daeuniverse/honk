@@ -841,6 +841,49 @@ fn udp_fast_path_queue_closed_entry_retires_and_allows_recreation() {
 }
 
 #[tokio::test]
+async fn udp_init_started_before_cancellation_cannot_publish_after_fence() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let client = make_addr("10.0.0.1", 12345);
+    let dst = make_addr("8.8.8.8", 53);
+    let hook = Arc::new(ReservationGateHook {
+        entered: Arc::new(std::sync::Barrier::new(2)),
+        resume: Arc::new(std::sync::Barrier::new(2)),
+    });
+    pool.set_reservation_gate_hook(Some(Arc::clone(&hook)));
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let reserving_pool = Arc::clone(&pool);
+    let reserving_stats = Arc::clone(&stats);
+    let reserver = std::thread::spawn(move || {
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let result =
+            reserving_pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &reserving_stats);
+        result_tx.send(result).unwrap();
+    });
+
+    hook.entered.wait();
+    let mut cancellation_sent = pool.cancel_epoch.subscribe();
+    let cancelling_pool = Arc::clone(&pool);
+    let cancelling =
+        tokio::spawn(async move { cancelling_pool.cancel_initializers_and_wait().await });
+    cancellation_sent
+        .changed()
+        .await
+        .expect("cancellation sender must remain live");
+
+    hook.resume.wait();
+    let result = tokio::task::spawn_blocking(move || result_rx.recv().unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(result, EndpointReservation::QueueClosed));
+    assert!(cancelling.await.unwrap());
+    reserver.join().unwrap();
+    pool.set_reservation_gate_hook(None);
+    assert!(pool.is_empty());
+}
+
+#[tokio::test]
 async fn udp_init_lease_registers_cancellation_before_publishing() {
     let pool = Arc::new(UdpEndpointPool::new());
     let stats = Arc::new(StatsManager::new());
@@ -1274,6 +1317,38 @@ async fn udp_endpoint_worker_sends_first_then_fifo_followers() {
     worker.abort();
 }
 
+#[tokio::test]
+async fn udp_endpoint_worker_rejects_stale_first_packet() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let client = make_addr("10.0.0.1", 12345);
+    let dst = make_addr("8.8.8.8", 53);
+    let relay = make_addr("192.168.1.1", 1080);
+    let (mut first, queue_rx) = reserve_driver_packets(&pool, &stats, client, dst, b"first", &[]);
+    first.age_for_test(Duration::from_secs(6));
+    let transport = Arc::new(ScriptedPacketTransport::new(relay, []));
+    let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
+    let (first_ack_tx, first_ack_rx) = oneshot::channel();
+    let worker = tokio::spawn(run_endpoint_driver(
+        endpoint,
+        queue_rx,
+        test_reply_socket().await,
+        client,
+        dst,
+        Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+        Arc::clone(&stats),
+        "test-node".to_owned(),
+        first,
+        first_ack_tx,
+    ));
+
+    assert!(first_ack_rx.await.unwrap().is_err());
+    assert!(transport.sent_packets().is_empty());
+    assert_eq!(transport.confirmed_send_count(), 0);
+    assert_eq!(stats.udp_snapshot().first_send_failures, 1);
+    worker.await.unwrap().unwrap_err();
+}
+
 #[tokio::test(start_paused = true)]
 async fn udp_endpoint_worker_treats_stream_send_timeout_as_connection_dead() {
     let pool = Arc::new(UdpEndpointPool::new());
@@ -1454,7 +1529,10 @@ async fn udp_endpoint_node_death_stops_after_blocked_first_send() {
     transport.wait_for_send_count(1).await;
     endpoint.kill();
     release.notify_waiters();
-    first_ack_rx.await.unwrap().unwrap();
+    assert_eq!(
+        first_ack_rx.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
     assert_eq!(
         worker.await.unwrap().unwrap_err().kind(),
         io::ErrorKind::ConnectionAborted

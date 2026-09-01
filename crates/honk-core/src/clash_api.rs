@@ -905,6 +905,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
     let warm = s
         .stats
         .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
+    let quic = honk_outbound::quic::quic_stats_snapshot();
     Json(serde_json::json!({
         "outbounds": per_outbound,
         "score": {
@@ -920,6 +921,32 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
             "readyHits": pool.hits,
             "readyMisses": pool.misses,
             "entries": pool.entries,
+        },
+        "quic": {
+            "activeConnections": quic.active_connections,
+            "srttUs": quic.srtt_us,
+            "cwndBytes": quic.cwnd_bytes,
+            "lossRatePpm": quic.loss_rate_ppm,
+            "sentPackets": quic.sent_packets,
+            "ackFrames": quic.ack_frames,
+            "lostPackets": quic.lost_packets,
+            "sentPlpmtudProbes": quic.sent_plpmtud_probes,
+            "lostPlpmtudProbes": quic.lost_plpmtud_probes,
+            "currentMtu": quic.current_mtu,
+            "blackHoles": quic.black_holes,
+            "congestionEvents": quic.congestion_events,
+            "txBytes": quic.tx_bytes,
+            "rxBytes": quic.rx_bytes,
+            "txDatagrams": quic.tx_datagrams,
+            "rxDatagrams": quic.rx_datagrams,
+            "txIos": quic.tx_ios,
+            "rxIos": quic.rx_ios,
+            "transportTxWouldBlock": quic.transport_tx_would_block,
+            "transportTxDrops": quic.transport_tx_drops,
+            "transportRxDrops": quic.transport_rx_drops,
+            "sessionRxDrops": quic.session_rx_drops,
+            "sendTimeouts": quic.send_timeouts,
+            "pathStalls": quic.path_stalls,
         },
         "warm": {
             "nodes": {

@@ -29,10 +29,12 @@ pub(crate) use retirement::{EndpointRemoval, RemovalReason};
 pub mod bench_support;
 #[cfg(feature = "ebpf")]
 pub(in crate::control) use admission::OwnedEnqueueError;
-#[cfg(test)]
-use admission::ReservationPublicationHook;
 use admission::{EndpointEntry, EndpointKey, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY};
-pub(in crate::control) use admission::{EndpointReservation, QueuedDatagram, UdpInitLease};
+pub(in crate::control) use admission::{
+    EndpointReservation, QueuedDatagram, UdpInitLease, queue_now,
+};
+#[cfg(test)]
+use admission::{ReservationGateHook, ReservationPublicationHook};
 
 const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
@@ -62,7 +64,7 @@ pub struct UdpEndpoint {
     created_at: Instant,
     /// Reference count for active operations.
     ref_count: AtomicI64,
-    /// Set when the endpoint is being destroyed.
+    /// Set when node retirement wins before a packet send starts.
     dead: AtomicBool,
     /// Serializes node-death retirement with the linearization point for an
     /// application send attempt. This lock is held only synchronously; no
@@ -107,6 +109,7 @@ impl UdpEndpoint {
     ) -> Self {
         let now = monotonic_nanos();
         Self {
+            dead: AtomicBool::new(false),
             proxy_socket,
             relay_addr,
             node_id,
@@ -116,7 +119,6 @@ impl UdpEndpoint {
             next_alive_report_at: AtomicI64::new(0),
             created_at: Instant::now(),
             ref_count: AtomicI64::new(1),
-            dead: AtomicBool::new(false),
             send_gate: Mutex::new(()),
             pending_reply_peers: Mutex::new(
                 [(
@@ -282,6 +284,10 @@ pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, EndpointEntry>,
     endpoint_slots: Arc<Semaphore>,
     global_payload_bytes: Arc<Semaphore>,
+    /// Linearizes finalized-node binding against node-death scans. Without
+    /// this gate a scan can observe an unbound initializer, then binding can
+    /// publish a dead winner after the scan has passed.
+    node_binding_gate: Mutex<()>,
     /// Monotonic per-reservation incarnation; used only for map ownership.
     next_generation: AtomicU64,
     /// Serializes initializer publication, cancellation bumps, and Ready
@@ -307,6 +313,8 @@ pub struct UdpEndpointPool {
     /// without introducing an await into reservation.
     #[cfg(test)]
     reservation_publication_hook: Mutex<Option<Arc<ReservationPublicationHook>>>,
+    #[cfg(test)]
+    reservation_gate_hook: Mutex<Option<Arc<ReservationGateHook>>>,
 }
 
 impl UdpEndpointPool {
@@ -335,6 +343,7 @@ impl UdpEndpointPool {
             endpoints: DashMap::new(),
             endpoint_slots: Arc::new(Semaphore::new(capacity_limit)),
             global_payload_bytes: Arc::new(Semaphore::new(GLOBAL_PAYLOAD_CAPACITY)),
+            node_binding_gate: Mutex::new(()),
             next_generation: AtomicU64::new(1),
             initialization_epoch: Mutex::new(0),
             cancel_epoch,
@@ -350,6 +359,8 @@ impl UdpEndpointPool {
             retirements_empty: Notify::new(),
             #[cfg(test)]
             reservation_publication_hook: Mutex::new(None),
+            #[cfg(test)]
+            reservation_gate_hook: Mutex::new(None),
         }
     }
 

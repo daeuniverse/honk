@@ -3723,12 +3723,24 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
     // Fast path must force DNS-shaped traffic slow even with Ready present.
     assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
 
-    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query, Some(validated)) {
+    let received_at = crate::control::udp_endpoint::queue_now().wrapping_sub(1_234);
+    match super::runtime::begin_udp_slow_path_at(
+        &pool,
+        &stats,
+        &slow,
+        client,
+        dst,
+        &query,
+        Some(validated),
+        received_at,
+    ) {
         super::UdpSlowPathWork::DnsThenMaybeInitialize {
             permit,
             data,
             validated,
+            enqueued_at,
         } => {
+            assert_eq!(enqueued_at, received_at);
             let lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
@@ -3739,6 +3751,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
                 },
                 permit,
                 &data,
+                enqueued_at,
                 validated,
             )
             .await;
@@ -3795,6 +3808,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
             permit,
             data,
             validated,
+            enqueued_at,
         } => {
             let maybe_lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
@@ -3806,6 +3820,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
                 },
                 permit,
                 &data,
+                enqueued_at,
                 validated,
             )
             .await;

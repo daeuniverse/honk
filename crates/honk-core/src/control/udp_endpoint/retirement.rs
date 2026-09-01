@@ -174,6 +174,7 @@ impl UdpEndpointPool {
     /// removed; an unbound reservation is still awaiting a winner. Removal is
     /// generation-safe.
     pub fn remove_by_node(&self, node_id: uuid::Uuid) {
+        let _binding_gate = self.node_binding_gate.lock();
         let stale: Vec<(EndpointKey, u32, u64)> = self
             .endpoints
             .iter()

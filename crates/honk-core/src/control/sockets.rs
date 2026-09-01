@@ -1176,6 +1176,7 @@ pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr>
 /// accounting. Skipping the QUIC sniffer on Ready hits is safe because
 /// routing for this flow was already decided when its first packet took the
 /// slow path.
+#[cfg(test)]
 pub(super) async fn udp_fast_path(
     udp_pool: &UdpEndpointPool,
     stats: &StatsManager,
@@ -1183,6 +1184,27 @@ pub(super) async fn udp_fast_path(
     client_addr: SocketAddr,
     original_dst: SocketAddr,
     validated_dns: Option<ValidatedDnsQuery>,
+) -> bool {
+    udp_fast_path_at(
+        udp_pool,
+        stats,
+        data,
+        client_addr,
+        original_dst,
+        validated_dns,
+        udp_endpoint::queue_now(),
+    )
+    .await
+}
+
+pub(super) async fn udp_fast_path_at(
+    udp_pool: &UdpEndpointPool,
+    stats: &StatsManager,
+    data: &[u8],
+    client_addr: SocketAddr,
+    original_dst: SocketAddr,
+    validated_dns: Option<ValidatedDnsQuery>,
+    enqueued_at: u32,
 ) -> bool {
     // Same drop pre-checks as serve_udp_connection: honk-internal subnet and
     // broadcast/multicast traffic must never be proxied.
@@ -1209,7 +1231,9 @@ pub(super) async fn udp_fast_path(
     // The receive loop only performs a synchronous bounded enqueue. Transport
     // I/O belongs exclusively to the per-endpoint driver, so a blocked send
     // on one flow cannot delay classification of another datagram.
-    let Some(result) = udp_pool.fast_path_enqueue(client_addr, original_dst, data, stats) else {
+    let Some(result) =
+        udp_pool.fast_path_enqueue_at(client_addr, original_dst, data, enqueued_at, stats)
+    else {
         stats.record_udp_endpoint_miss();
         return false;
     };

@@ -2,12 +2,13 @@
 //!
 //! Used by the TUIC v5, Juicity, and Hysteria2 outbounds.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,7 +74,6 @@ impl congestion::ControllerFactory for BrutalConfig {
         })
     }
 }
-
 struct Brutal {
     /// Target send rate, bytes per second.
     rate: u64,
@@ -84,8 +84,8 @@ struct Brutal {
 
 impl Brutal {
     fn bdp(&self) -> u64 {
-        let bdp = self.rate as u128 * self.rtt.as_micros() / 1_000_000;
-        bdp as u64
+        (u128::from(self.rate).saturating_mul(self.rtt.as_micros()) / 1_000_000)
+            .min(u128::from(u64::MAX)) as u64
     }
 }
 
@@ -124,7 +124,7 @@ impl congestion::Controller for Brutal {
         // the crate, mutate a default value instead.
         let mut metrics = congestion::ControllerMetrics::default();
         metrics.congestion_window = self.window();
-        metrics.pacing_rate = Some(self.rate * 8);
+        metrics.pacing_rate = Some(self.rate.saturating_mul(8));
         metrics
     }
 
@@ -145,6 +145,785 @@ impl congestion::Controller for Brutal {
     }
 }
 
+const QUIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const PATH_TIMEOUT_STREAK: u8 = 3;
+const PATH_MIN_UNACKED_SENDS: u64 = 3;
+const PATH_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+static PATH_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn path_now_millis() -> u64 {
+    PATH_CLOCK
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX - 1)) as u64
+        + 1
+}
+
+const PATH_EPOCH_MASK: u64 = (1_u64 << 62) - 1;
+const PATH_WAITING: u64 = 1_u64 << 62;
+const PATH_MUTATING: u64 = 1_u64 << 63;
+const PATH_TIMEOUT_BITS: u32 = 2;
+const PATH_TIMEOUT_MASK: u64 = (1_u64 << PATH_TIMEOUT_BITS) - 1;
+
+fn path_epoch(state: u64) -> u64 {
+    state & PATH_EPOCH_MASK
+}
+
+fn path_state(epoch: u64, waiting: bool) -> u64 {
+    (epoch & PATH_EPOCH_MASK) | if waiting { PATH_WAITING } else { 0 }
+}
+
+fn timeout_state(epoch: u64, streak: u8) -> u64 {
+    (epoch << PATH_TIMEOUT_BITS) | u64::from(streak.min(PATH_TIMEOUT_STREAK))
+}
+
+fn timeout_state_epoch(state: u64) -> u64 {
+    state >> PATH_TIMEOUT_BITS
+}
+
+fn timeout_state_streak(state: u64) -> u8 {
+    (state & PATH_TIMEOUT_MASK) as u8
+}
+
+/// Connection-wide QUIC delivery progress. Packet sends only read atomics;
+/// Quinn statistics are sampled at most once per second, plus on a send
+/// deadline and the watchdog's one-second tick.
+#[derive(Debug)]
+pub(crate) struct QuicPathHealth {
+    ack_state: AtomicU64,
+    last_acked_packets: AtomicU64,
+    sampled_acked_packets: AtomicU64,
+    sampled_sent_ack_eliciting_packets: AtomicU64,
+    waiting_sent_baseline: AtomicU64,
+    waiting_acked_baseline: AtomicU64,
+    unacked_since_ms: AtomicU64,
+    last_sample_ms: AtomicU64,
+    timeout_state: AtomicU64,
+    waiting_since_ms: AtomicU64,
+    send_timeout_ms: AtomicU64,
+    path_stall_timeout_ms: AtomicU64,
+    path_stalled: AtomicBool,
+    telemetry_enabled: AtomicBool,
+}
+
+enum SendCompletion {
+    Success,
+    Timeout,
+    Failure,
+}
+
+impl QuicPathHealth {
+    pub(crate) fn new(conn: &Connection) -> Arc<Self> {
+        let stats = conn.stats();
+        let now = path_now_millis();
+        let rtt = stats.path.rtt;
+        Arc::new(Self {
+            ack_state: AtomicU64::new(0),
+            last_acked_packets: AtomicU64::new(stats.path.acked_ack_eliciting_packets),
+            sampled_acked_packets: AtomicU64::new(stats.path.acked_ack_eliciting_packets),
+            sampled_sent_ack_eliciting_packets: AtomicU64::new(
+                stats.path.sent_ack_eliciting_packets,
+            ),
+            waiting_sent_baseline: AtomicU64::new(stats.path.sent_ack_eliciting_packets),
+            waiting_acked_baseline: AtomicU64::new(stats.path.acked_ack_eliciting_packets),
+            unacked_since_ms: AtomicU64::new(0),
+            last_sample_ms: AtomicU64::new(now),
+            timeout_state: AtomicU64::new(timeout_state(0, 0)),
+            waiting_since_ms: AtomicU64::new(0),
+            send_timeout_ms: AtomicU64::new(duration_millis(bounded_quic_send_timeout(rtt))),
+            path_stall_timeout_ms: AtomicU64::new(duration_millis(
+                quic_path_stall_timeout_from_rtt(rtt),
+            )),
+            path_stalled: AtomicBool::new(false),
+            telemetry_enabled: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn send_timeout(&self) -> Duration {
+        Duration::from_millis(self.send_timeout_ms.load(Ordering::Acquire).max(1))
+    }
+
+    pub(crate) fn enable_telemetry(&self) {
+        self.telemetry_enabled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn telemetry_enabled(&self) -> bool {
+        self.telemetry_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_session_rx_drop(&self) {
+        if self.telemetry_enabled() {
+            record_quic_session_rx_drop();
+        }
+    }
+
+    fn refresh_timing_from_rtt(&self, rtt: Duration) {
+        self.send_timeout_ms.store(
+            duration_millis(bounded_quic_send_timeout(rtt)),
+            Ordering::Release,
+        );
+        self.path_stall_timeout_ms.store(
+            duration_millis(quic_path_stall_timeout_from_rtt(rtt)),
+            Ordering::Release,
+        );
+    }
+    fn unacked_sends_since_wait(&self) -> u64 {
+        let sent = self
+            .sampled_sent_ack_eliciting_packets
+            .load(Ordering::Acquire)
+            .saturating_sub(self.waiting_sent_baseline.load(Ordering::Acquire));
+        let acked = self
+            .last_acked_packets
+            .load(Ordering::Acquire)
+            .saturating_sub(self.waiting_acked_baseline.load(Ordering::Acquire));
+        sent.saturating_sub(acked)
+    }
+
+    fn refresh_unacked_since(&self, now: u64) {
+        let state = self.ack_state.load(Ordering::Acquire);
+        if state & (PATH_WAITING | PATH_MUTATING) != PATH_WAITING {
+            self.unacked_since_ms.store(0, Ordering::Release);
+            return;
+        }
+        if self.unacked_sends_since_wait() != 0 {
+            let _ =
+                self.unacked_since_ms
+                    .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        } else {
+            self.unacked_since_ms.store(0, Ordering::Release);
+        }
+    }
+
+    fn note_ack_progress(&self, current: u64) -> bool {
+        if self.path_stalled.load(Ordering::Acquire)
+            || current <= self.last_acked_packets.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        loop {
+            if self.path_stalled.load(Ordering::Acquire) {
+                return false;
+            }
+            let state = self.ack_state.load(Ordering::Acquire);
+            if state & PATH_MUTATING != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if current <= self.last_acked_packets.load(Ordering::Acquire) {
+                return false;
+            }
+            if self
+                .ack_state
+                .compare_exchange(
+                    state,
+                    state | PATH_MUTATING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if current <= self.last_acked_packets.load(Ordering::Acquire) {
+                self.ack_state.store(state, Ordering::Release);
+                return false;
+            }
+            let epoch = path_epoch(state).wrapping_add(1) & PATH_EPOCH_MASK;
+            self.last_acked_packets.store(current, Ordering::Release);
+            self.waiting_sent_baseline.store(
+                self.sampled_sent_ack_eliciting_packets
+                    .load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            self.waiting_acked_baseline
+                .store(current, Ordering::Release);
+            self.timeout_state
+                .store(timeout_state(epoch, 0), Ordering::Release);
+            self.waiting_since_ms.store(0, Ordering::Release);
+            self.unacked_since_ms.store(0, Ordering::Release);
+            self.ack_state
+                .store(path_state(epoch, false), Ordering::Release);
+            return true;
+        }
+    }
+
+    fn apply_sample(&self, stats: quinn::ConnectionStats, now: u64) -> u64 {
+        // A newer sampler may have claimed the next interval while this
+        // snapshot was waiting for Quinn's state lock; never publish its
+        // older RTT after that sampler.
+        if self.last_sample_ms.load(Ordering::Acquire) <= now {
+            self.refresh_timing_from_rtt(stats.path.rtt);
+        }
+        self.last_sample_ms.fetch_max(now, Ordering::Release);
+        self.sampled_acked_packets
+            .fetch_max(stats.path.acked_ack_eliciting_packets, Ordering::Release);
+        self.sampled_sent_ack_eliciting_packets
+            .fetch_max(stats.path.sent_ack_eliciting_packets, Ordering::Release);
+        let current = self.sampled_acked_packets.load(Ordering::Acquire);
+        self.note_ack_progress(current);
+        self.refresh_unacked_since(now);
+        current
+    }
+    /// Refresh Quinn statistics at most once per second on packet send paths.
+    fn refresh_sample(&self, conn: &Connection) -> u64 {
+        let now = path_now_millis();
+        let last = self.last_sample_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last) >= QUIC_SAMPLE_INTERVAL.as_millis() as u64
+            && self
+                .last_sample_ms
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return self.apply_sample(conn.stats(), now);
+        }
+        self.sampled_acked_packets.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_send_started(&self, conn: &Connection) -> crate::proxy::QuicSendToken {
+        self.refresh_sample(conn);
+        loop {
+            if self.path_stalled.load(Ordering::Acquire) {
+                return crate::proxy::QuicSendToken::INACTIVE;
+            }
+            let state = self.ack_state.load(Ordering::Acquire);
+            if state & PATH_MUTATING != 0 {
+                if self.path_stalled.load(Ordering::Acquire) {
+                    return crate::proxy::QuicSendToken::INACTIVE;
+                }
+                std::hint::spin_loop();
+                continue;
+            }
+            let ack_baseline = self.last_acked_packets.load(Ordering::Acquire);
+            let sent_baseline = self
+                .sampled_sent_ack_eliciting_packets
+                .load(Ordering::Acquire);
+            if state == self.ack_state.load(Ordering::Acquire) {
+                return crate::proxy::QuicSendToken::new(
+                    path_epoch(state),
+                    ack_baseline,
+                    sent_baseline,
+                    path_now_millis(),
+                );
+            }
+        }
+    }
+    fn complete_send(
+        &self,
+        token: crate::proxy::QuicSendToken,
+        completion: SendCompletion,
+        observed_acks: u64,
+    ) -> bool {
+        if !token.is_active() {
+            return false;
+        }
+        self.note_ack_progress(observed_acks);
+        if matches!(completion, SendCompletion::Failure) {
+            return false;
+        }
+        loop {
+            if self.path_stalled.load(Ordering::Acquire) {
+                return false;
+            }
+            let state = self.ack_state.load(Ordering::Acquire);
+            if state & PATH_MUTATING != 0 {
+                if self.path_stalled.load(Ordering::Acquire) {
+                    return false;
+                }
+                std::hint::spin_loop();
+                continue;
+            }
+            if path_epoch(state) != token.ack_epoch
+                || self.last_acked_packets.load(Ordering::Acquire) > token.ack_baseline
+            {
+                return false;
+            }
+            if self
+                .ack_state
+                .compare_exchange(
+                    state,
+                    state | PATH_MUTATING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if self.last_acked_packets.load(Ordering::Acquire) > token.ack_baseline {
+                self.ack_state.store(state, Ordering::Release);
+                return false;
+            }
+            let epoch = path_epoch(state);
+            let timeout = self.timeout_state.load(Ordering::Acquire);
+            let previous_streak = if timeout_state_epoch(timeout) == epoch {
+                timeout_state_streak(timeout)
+            } else {
+                0
+            };
+            let streak = if matches!(completion, SendCompletion::Timeout) {
+                previous_streak.saturating_add(1).min(PATH_TIMEOUT_STREAK)
+            } else {
+                0
+            };
+            self.timeout_state
+                .store(timeout_state(epoch, streak), Ordering::Release);
+            if state & PATH_WAITING == 0 {
+                self.waiting_sent_baseline
+                    .store(token.sent_baseline, Ordering::Release);
+                self.waiting_acked_baseline
+                    .store(token.ack_baseline, Ordering::Release);
+                self.waiting_since_ms
+                    .store(token.started_at, Ordering::Release);
+                self.unacked_since_ms.store(0, Ordering::Release);
+            } else {
+                // Concurrent sends can complete out of order. Keep the
+                // earliest accepted packet in the watchdog's accounting.
+                self.waiting_sent_baseline
+                    .fetch_min(token.sent_baseline, Ordering::AcqRel);
+                self.waiting_since_ms
+                    .fetch_min(token.started_at, Ordering::AcqRel);
+            }
+            self.ack_state
+                .store(path_state(epoch, true), Ordering::Release);
+            self.refresh_unacked_since(path_now_millis());
+            return true;
+        }
+    }
+
+    pub(crate) fn record_send_success(
+        &self,
+        token: crate::proxy::QuicSendToken,
+        conn: &Connection,
+    ) {
+        let observed = self.refresh_sample(conn);
+        self.complete_send(token, SendCompletion::Success, observed);
+    }
+
+    pub(crate) fn record_send_timeout(
+        &self,
+        token: crate::proxy::QuicSendToken,
+        conn: &Connection,
+    ) -> bool {
+        let observed = self.refresh_sample(conn);
+        self.complete_send(token, SendCompletion::Timeout, observed) && self.telemetry_enabled()
+    }
+
+    pub(crate) fn record_send_failure(&self, token: crate::proxy::QuicSendToken) {
+        self.complete_send(
+            token,
+            SendCompletion::Failure,
+            self.sampled_acked_packets.load(Ordering::Acquire),
+        );
+    }
+
+    fn check_stalled(&self, conn: &Connection) -> bool {
+        if conn.close_reason().is_some() {
+            return false;
+        }
+        let state = self.ack_state.load(Ordering::Acquire);
+        if state & PATH_WAITING == 0 || state & PATH_MUTATING != 0 {
+            return false;
+        }
+        self.refresh_sample(conn);
+        let state = self.ack_state.load(Ordering::Acquire);
+        if state & PATH_WAITING == 0 || state & PATH_MUTATING != 0 {
+            return false;
+        }
+        let epoch = path_epoch(state);
+        let unacked_sends = self.unacked_sends_since_wait();
+        let timeout = self.timeout_state.load(Ordering::Acquire);
+        let streak = if timeout_state_epoch(timeout) == epoch {
+            timeout_state_streak(timeout)
+        } else {
+            0
+        };
+        let now = path_now_millis();
+        let timeout_elapsed = Duration::from_millis(
+            now.saturating_sub(self.waiting_since_ms.load(Ordering::Acquire)),
+        );
+        let no_ack_elapsed =
+            elapsed_since_millis(now, self.unacked_since_ms.load(Ordering::Acquire));
+        if !should_retire_path(
+            timeout_elapsed,
+            no_ack_elapsed,
+            streak,
+            unacked_sends,
+            self.send_timeout(),
+            self.path_stall_timeout(),
+        ) {
+            return false;
+        }
+        if self
+            .ack_state
+            .compare_exchange(
+                state,
+                state | PATH_MUTATING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if conn.close_reason().is_some() {
+            self.ack_state.store(state, Ordering::Release);
+            return false;
+        }
+        // An ACK may arrive between the last sample and the claim. Recheck
+        // while the mutation bit blocks send completions and ACK samplers.
+        let latest = conn.stats();
+        if latest.path.acked_ack_eliciting_packets > self.last_acked_packets.load(Ordering::Acquire)
+        {
+            self.sampled_acked_packets
+                .fetch_max(latest.path.acked_ack_eliciting_packets, Ordering::Release);
+            self.sampled_sent_ack_eliciting_packets
+                .fetch_max(latest.path.sent_ack_eliciting_packets, Ordering::Release);
+            self.last_acked_packets
+                .store(latest.path.acked_ack_eliciting_packets, Ordering::Release);
+            self.waiting_sent_baseline.store(
+                self.sampled_sent_ack_eliciting_packets
+                    .load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            self.waiting_acked_baseline
+                .store(latest.path.acked_ack_eliciting_packets, Ordering::Release);
+            self.unacked_since_ms.store(0, Ordering::Release);
+            let next_epoch = path_epoch(state).wrapping_add(1) & PATH_EPOCH_MASK;
+            self.timeout_state
+                .store(timeout_state(next_epoch, 0), Ordering::Release);
+            self.waiting_since_ms.store(0, Ordering::Release);
+            self.ack_state
+                .store(path_state(next_epoch, false), Ordering::Release);
+            return false;
+        }
+        self.path_stalled.store(true, Ordering::Release);
+        conn.close(VarInt::from_u32(0), b"QUIC path stalled");
+        true
+    }
+
+    fn path_stall_timeout(&self) -> Duration {
+        Duration::from_millis(self.path_stall_timeout_ms.load(Ordering::Acquire).max(1))
+    }
+
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.path_stalled.load(Ordering::Acquire)
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX - 1)).max(1) as u64
+}
+
+fn elapsed_since_millis(now: u64, since: u64) -> Duration {
+    if since == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(now.saturating_sub(since))
+    }
+}
+fn bounded_quic_send_timeout(rtt: Duration) -> Duration {
+    rtt.checked_mul(4)
+        .unwrap_or(Duration::MAX)
+        .clamp(Duration::from_secs(1), Duration::from_secs(5))
+}
+
+fn should_retire_path(
+    timeout_elapsed: Duration,
+    no_ack_elapsed: Duration,
+    timeout_streak: u8,
+    unacked_sends: u64,
+    send_timeout: Duration,
+    no_ack_timeout: Duration,
+) -> bool {
+    (no_ack_elapsed >= no_ack_timeout && unacked_sends >= PATH_MIN_UNACKED_SENDS)
+        || (timeout_streak >= PATH_TIMEOUT_STREAK && timeout_elapsed >= send_timeout)
+}
+
+fn quic_path_stall_timeout_from_rtt(rtt: Duration) -> Duration {
+    rtt.checked_mul(8)
+        .unwrap_or(Duration::MAX)
+        .max(Duration::from_secs(10))
+}
+
+/// Close a shared QUIC path only after repeated send deadlines or a full
+/// no-ACK grace period. Any new packet acknowledgement clears both clocks.
+pub(crate) fn spawn_quic_path_watchdog(conn: Connection, health: Arc<QuicPathHealth>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + PATH_WATCH_INTERVAL,
+            PATH_WATCH_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = conn.closed() => break,
+                _ = ticker.tick() => {
+                    if health.check_stalled(&conn) {
+                        if health.telemetry_enabled() {
+                            record_quic_path_stall();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Process-wide QUIC path telemetry. Connection labels are intentionally not
+/// retained; the snapshot is suitable for the aggregate `/stats` surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicStatsSnapshot {
+    pub active_connections: u64,
+    pub srtt_us: u64,
+    pub cwnd_bytes: u64,
+    pub loss_rate_ppm: u64,
+    pub sent_packets: u64,
+    pub ack_frames: u64,
+    pub lost_packets: u64,
+    pub sent_plpmtud_probes: u64,
+    pub lost_plpmtud_probes: u64,
+    pub current_mtu: u64,
+    pub black_holes: u64,
+    pub congestion_events: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_datagrams: u64,
+    pub rx_datagrams: u64,
+    pub tx_ios: u64,
+    pub rx_ios: u64,
+    pub transport_tx_would_block: u64,
+    pub transport_rx_drops: u64,
+    pub transport_tx_drops: u64,
+    pub session_rx_drops: u64,
+    pub send_timeouts: u64,
+    pub path_stalls: u64,
+}
+
+#[derive(Debug, Default)]
+struct QuicMetricTotals {
+    sent_packets: AtomicU64,
+    ack_frames: AtomicU64,
+    lost_packets: AtomicU64,
+    sent_plpmtud_probes: AtomicU64,
+    lost_plpmtud_probes: AtomicU64,
+    black_holes: AtomicU64,
+    congestion_events: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_bytes: AtomicU64,
+    tx_datagrams: AtomicU64,
+    rx_datagrams: AtomicU64,
+    tx_ios: AtomicU64,
+    rx_ios: AtomicU64,
+    transport_tx_would_block: AtomicU64,
+    transport_rx_drops: AtomicU64,
+    transport_tx_drops: AtomicU64,
+    session_rx_drops: AtomicU64,
+    send_timeouts: AtomicU64,
+    path_stalls: AtomicU64,
+}
+
+impl QuicMetricTotals {
+    fn add_stats(&self, stats: &quinn::ConnectionStats) {
+        self.sent_packets
+            .fetch_add(stats.path.sent_packets, Ordering::Relaxed);
+        self.ack_frames
+            .fetch_add(stats.frame_rx.acks, Ordering::Relaxed);
+        self.lost_packets
+            .fetch_add(stats.path.lost_packets, Ordering::Relaxed);
+        self.sent_plpmtud_probes
+            .fetch_add(stats.path.sent_plpmtud_probes, Ordering::Relaxed);
+        self.lost_plpmtud_probes
+            .fetch_add(stats.path.lost_plpmtud_probes, Ordering::Relaxed);
+        self.black_holes
+            .fetch_add(stats.path.black_holes_detected, Ordering::Relaxed);
+        self.congestion_events
+            .fetch_add(stats.path.congestion_events, Ordering::Relaxed);
+        self.tx_bytes
+            .fetch_add(stats.udp_tx.bytes, Ordering::Relaxed);
+        self.rx_bytes
+            .fetch_add(stats.udp_rx.bytes, Ordering::Relaxed);
+        self.tx_datagrams
+            .fetch_add(stats.udp_tx.datagrams, Ordering::Relaxed);
+        self.rx_datagrams
+            .fetch_add(stats.udp_rx.datagrams, Ordering::Relaxed);
+        self.tx_ios.fetch_add(stats.udp_tx.ios, Ordering::Relaxed);
+        self.rx_ios.fetch_add(stats.udp_rx.ios, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct QuicMetricEntry {
+    stats: quinn::ConnectionStats,
+}
+
+#[derive(Debug, Default)]
+struct QuicMetrics {
+    entries: SyncMutex<HashMap<u64, QuicMetricEntry>>,
+    next_id: AtomicU64,
+    totals: QuicMetricTotals,
+}
+
+static QUIC_METRICS: LazyLock<QuicMetrics> = LazyLock::new(QuicMetrics::default);
+
+fn quic_metrics() -> &'static QuicMetrics {
+    &QUIC_METRICS
+}
+
+fn register_quic_connection(stats: quinn::ConnectionStats) -> u64 {
+    let metrics = quic_metrics();
+    let id = metrics
+        .next_id
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    metrics.entries.lock().insert(id, QuicMetricEntry { stats });
+    id
+}
+
+fn update_quic_connection(id: u64, stats: quinn::ConnectionStats) {
+    let metrics = quic_metrics();
+    if let Some(entry) = metrics.entries.lock().get_mut(&id) {
+        entry.stats = stats;
+    }
+}
+
+fn finish_quic_connection(id: u64, stats: quinn::ConnectionStats) {
+    let metrics = quic_metrics();
+    let mut entries = metrics.entries.lock();
+    if entries.remove(&id).is_some() {
+        metrics.totals.add_stats(&stats);
+    }
+}
+
+fn add_active_stats(snapshot: &mut QuicStatsSnapshot, stats: &quinn::ConnectionStats) {
+    snapshot.sent_packets = snapshot
+        .sent_packets
+        .saturating_add(stats.path.sent_packets);
+    snapshot.ack_frames = snapshot.ack_frames.saturating_add(stats.frame_rx.acks);
+    snapshot.lost_packets = snapshot
+        .lost_packets
+        .saturating_add(stats.path.lost_packets);
+    snapshot.sent_plpmtud_probes = snapshot
+        .sent_plpmtud_probes
+        .saturating_add(stats.path.sent_plpmtud_probes);
+    snapshot.lost_plpmtud_probes = snapshot
+        .lost_plpmtud_probes
+        .saturating_add(stats.path.lost_plpmtud_probes);
+    snapshot.black_holes = snapshot
+        .black_holes
+        .saturating_add(stats.path.black_holes_detected);
+    snapshot.congestion_events = snapshot
+        .congestion_events
+        .saturating_add(stats.path.congestion_events);
+    snapshot.tx_bytes = snapshot.tx_bytes.saturating_add(stats.udp_tx.bytes);
+    snapshot.rx_bytes = snapshot.rx_bytes.saturating_add(stats.udp_rx.bytes);
+    snapshot.tx_datagrams = snapshot.tx_datagrams.saturating_add(stats.udp_tx.datagrams);
+    snapshot.rx_datagrams = snapshot.rx_datagrams.saturating_add(stats.udp_rx.datagrams);
+    snapshot.tx_ios = snapshot.tx_ios.saturating_add(stats.udp_tx.ios);
+    snapshot.rx_ios = snapshot.rx_ios.saturating_add(stats.udp_rx.ios);
+}
+
+/// Return aggregate QUIC counters and averages for active paths.
+pub fn quic_stats_snapshot() -> QuicStatsSnapshot {
+    let metrics = quic_metrics();
+    let entries = metrics.entries.lock();
+    let active = entries.len() as u64;
+    let mut snapshot = QuicStatsSnapshot {
+        sent_packets: metrics.totals.sent_packets.load(Ordering::Relaxed),
+        ack_frames: metrics.totals.ack_frames.load(Ordering::Relaxed),
+        lost_packets: metrics.totals.lost_packets.load(Ordering::Relaxed),
+        sent_plpmtud_probes: metrics.totals.sent_plpmtud_probes.load(Ordering::Relaxed),
+        lost_plpmtud_probes: metrics.totals.lost_plpmtud_probes.load(Ordering::Relaxed),
+        black_holes: metrics.totals.black_holes.load(Ordering::Relaxed),
+        congestion_events: metrics.totals.congestion_events.load(Ordering::Relaxed),
+        tx_bytes: metrics.totals.tx_bytes.load(Ordering::Relaxed),
+        rx_bytes: metrics.totals.rx_bytes.load(Ordering::Relaxed),
+        tx_datagrams: metrics.totals.tx_datagrams.load(Ordering::Relaxed),
+        rx_datagrams: metrics.totals.rx_datagrams.load(Ordering::Relaxed),
+        tx_ios: metrics.totals.tx_ios.load(Ordering::Relaxed),
+        rx_ios: metrics.totals.rx_ios.load(Ordering::Relaxed),
+        transport_tx_would_block: metrics
+            .totals
+            .transport_tx_would_block
+            .load(Ordering::Relaxed),
+        transport_rx_drops: metrics.totals.transport_rx_drops.load(Ordering::Relaxed),
+        transport_tx_drops: metrics.totals.transport_tx_drops.load(Ordering::Relaxed),
+        session_rx_drops: metrics.totals.session_rx_drops.load(Ordering::Relaxed),
+        send_timeouts: metrics.totals.send_timeouts.load(Ordering::Relaxed),
+        path_stalls: metrics.totals.path_stalls.load(Ordering::Relaxed),
+        active_connections: active,
+        ..Default::default()
+    };
+    let mut rtt_us = 0u128;
+    let mut cwnd_bytes = 0u128;
+    let mut mtu = 0u128;
+    for entry in entries.values() {
+        add_active_stats(&mut snapshot, &entry.stats);
+        rtt_us += entry.stats.path.rtt.as_micros();
+        cwnd_bytes += entry.stats.path.cwnd as u128;
+        mtu += entry.stats.path.current_mtu as u128;
+    }
+    let data_sent = snapshot
+        .sent_packets
+        .saturating_sub(snapshot.sent_plpmtud_probes);
+    snapshot.loss_rate_ppm = if data_sent == 0 {
+        0
+    } else {
+        (u128::from(snapshot.lost_packets) * 1_000_000 / u128::from(data_sent)).min(1_000_000)
+            as u64
+    };
+    if active != 0 {
+        let active = u128::from(active);
+        snapshot.srtt_us = (rtt_us / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.cwnd_bytes = (cwnd_bytes / active).min(u128::from(u64::MAX)) as u64;
+        snapshot.current_mtu = (mtu / active).min(u128::from(u64::MAX)) as u64;
+    }
+    snapshot
+}
+
+/// Count a QUIC packet-send timeout observed by the core driver.
+pub fn record_quic_send_timeout() {
+    quic_metrics()
+        .totals
+        .send_timeouts
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a QUIC path retired by the core driver watchdog.
+pub fn record_quic_path_stall() {
+    quic_metrics()
+        .totals
+        .path_stalls
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_transport_tx_would_block() {
+    quic_metrics()
+        .totals
+        .transport_tx_would_block
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_transport_rx_drop() {
+    quic_metrics()
+        .totals
+        .transport_rx_drops
+        .fetch_add(1, Ordering::Relaxed);
+}
+fn record_transport_tx_drop() {
+    quic_metrics()
+        .totals
+        .transport_tx_drops
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_quic_session_rx_drop() {
+    quic_metrics()
+        .totals
+        .session_rx_drops
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 /// Caller-tunable options for [`client_config`]. Everything defaults to the
 /// quinn/cubic behavior; protocol handlers override only what they need.
 #[derive(Clone, Default)]
@@ -152,8 +931,7 @@ pub struct QuicClientOptions {
     /// Congestion controller; `None` = cubic. Use [`congestion_factory`] for
     /// named algorithms or [`BrutalConfig`] for hysteria2's fixed-rate sender.
     pub congestion: Option<Arc<dyn congestion::ControllerFactory + Send + Sync>>,
-    /// QUIC keep-alive interval (Juicity uses 5s per the daeuniverse
-    /// reference client; TUIC relies on its own heartbeat datagrams instead).
+    /// QUIC keep-alive interval.
     pub keep_alive: Option<Duration>,
     /// Initial per-stream receive window, bytes.
     pub stream_receive_window: Option<u64>,
@@ -231,10 +1009,6 @@ pub async fn client_config(
             chrome: crate::tls::chrome_mode(),
             ech_config_list: ech,
             pin_sha256,
-            // Tickets belong to a specific service, not a hostname:
-            // address|port|SNI|ALPN — different protocols, different
-            // servers behind one certificate, and reloaded configs never
-            // cross-resume into each other.
             ticket_key: Some(format!(
                 "{}|{}|{}|{}",
                 node.host(),
@@ -247,7 +1021,6 @@ pub async fn client_config(
             )),
         })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
-
     let mut transport = TransportConfig::default();
     transport
         .congestion_controller_factory(
@@ -255,9 +1028,6 @@ pub async fn client_config(
                 .congestion
                 .unwrap_or_else(|| congestion_factory(None)),
         )
-        // Protocols like TUIC deliver inbound UDP packets on server-initiated
-        // uni streams (one stream per packet) — allow a generous number
-        // (sing-quic sets MaxIncomingUniStreams to 1<<60).
         .max_concurrent_uni_streams(VarInt::from_u32(4096));
     if let Some(w) = options.stream_receive_window {
         transport.stream_receive_window(VarInt::from_u64(w)?);
@@ -266,10 +1036,7 @@ pub async fn client_config(
         transport.receive_window(VarInt::from_u64(w)?);
     }
     if let Some(mtu) = options.max_udp_payload_size {
-        // UDP payload size, not link MTU. Valid range per RFC 9000 (initial
-        // packets must carry 1200) and quinn's cap; invalid values are
-        // clamped rather than failing the first dial later.
-        let mtu = mtu.clamp(1200, 65527);
+        let mtu = clamp_quic_payload_size(mtu);
         transport.initial_mtu(mtu);
         if !options.disable_mtu_discovery {
             let mut mtud = quinn::MtuDiscoveryConfig::default();
@@ -287,8 +1054,6 @@ pub async fn client_config(
     Ok(cfg)
 }
 
-/// Current unix time in seconds (0 on clock skew); used for the idle
-/// accounting of shared connections.
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -296,16 +1061,12 @@ pub(crate) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `RecvStream::read_exact` with quinn's error mapped to
-/// `io::ErrorKind::UnexpectedEof` (protocol framing helpers return
-/// `io::Result`).
 pub(crate) async fn recv_read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> io::Result<()> {
     recv.read_exact(buf)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))
 }
-/// Wait long enough for a server to reject zero-grace authentication after
-/// the handshake. The final close check covers a close racing the timer.
+
 pub(crate) async fn survives_auth_close_window(conn: &Connection) -> bool {
     let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
     tokio::select! {
@@ -314,40 +1075,229 @@ pub(crate) async fn survives_auth_close_window(conn: &Connection) -> bool {
     }
 }
 
+#[cfg(test)]
+mod path_health_tests {
+    use super::*;
+    use crate::proxy::QuicSendToken;
+
+    fn health(last_ack: u64, epoch: u64, streak: u8, since: u64) -> QuicPathHealth {
+        QuicPathHealth {
+            ack_state: AtomicU64::new(path_state(epoch, since != 0)),
+            last_acked_packets: AtomicU64::new(last_ack),
+            sampled_acked_packets: AtomicU64::new(last_ack),
+            sampled_sent_ack_eliciting_packets: AtomicU64::new(last_ack),
+            waiting_sent_baseline: AtomicU64::new(last_ack),
+            waiting_acked_baseline: AtomicU64::new(last_ack),
+            unacked_since_ms: AtomicU64::new(0),
+            last_sample_ms: AtomicU64::new(path_now_millis()),
+            timeout_state: AtomicU64::new(timeout_state(epoch, streak)),
+            waiting_since_ms: AtomicU64::new(since),
+            send_timeout_ms: AtomicU64::new(1_000),
+            path_stall_timeout_ms: AtomicU64::new(10_000),
+            path_stalled: AtomicBool::new(false),
+            telemetry_enabled: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn send_deadline_is_bounded_by_rtt() {
+        assert_eq!(
+            bounded_quic_send_timeout(Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            bounded_quic_send_timeout(Duration::from_millis(250)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            bounded_quic_send_timeout(Duration::from_secs(2)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(elapsed_since_millis(20_000, 0), Duration::ZERO);
+        assert_eq!(
+            elapsed_since_millis(20_000, 19_990),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn repeated_timeouts_or_long_silence_retire() {
+        assert!(!should_retire_path(
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+            PATH_TIMEOUT_STREAK,
+            0,
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+        ));
+        assert!(should_retire_path(
+            Duration::from_secs(4),
+            Duration::ZERO,
+            PATH_TIMEOUT_STREAK,
+            0,
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+        ));
+        assert!(!should_retire_path(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            0,
+            1,
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+        ));
+        assert!(should_retire_path(
+            Duration::ZERO,
+            Duration::from_secs(10),
+            0,
+            PATH_MIN_UNACKED_SENDS,
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+        ));
+    }
+    #[test]
+    fn ack_progress_clears_wait_and_stale_completion_cannot_rearm() {
+        let h = health(3, 0, 2, 42);
+        assert!(h.note_ack_progress(4));
+        assert!(!h.complete_send(QuicSendToken::new(0, 3, 3, 10), SendCompletion::Timeout, 4,));
+        assert_eq!(h.ack_state.load(Ordering::Acquire) & PATH_WAITING, 0);
+        assert_eq!(
+            timeout_state_streak(h.timeout_state.load(Ordering::Acquire)),
+            0
+        );
+    }
+
+    #[test]
+    fn historical_losses_do_not_count_as_current_unacked_sends() {
+        let h = health(95, 0, 0, 0);
+        h.sampled_sent_ack_eliciting_packets
+            .store(100, Ordering::Release);
+        assert!(h.complete_send(
+            QuicSendToken::new(0, 95, 100, 10),
+            SendCompletion::Timeout,
+            95,
+        ));
+        h.sampled_sent_ack_eliciting_packets
+            .store(101, Ordering::Release);
+        assert_eq!(h.unacked_sends_since_wait(), 1);
+        assert!(!should_retire_path(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            0,
+            h.unacked_sends_since_wait(),
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+        ));
+    }
+
+    #[test]
+    fn timeout_streak_is_scoped_to_ack_epoch() {
+        let h = health(0, 0, 0, 0);
+        assert!(h.complete_send(QuicSendToken::new(0, 0, 0, 10), SendCompletion::Timeout, 0,));
+        assert!(h.complete_send(QuicSendToken::new(0, 0, 0, 20), SendCompletion::Timeout, 0,));
+        assert_eq!(
+            timeout_state_streak(h.timeout_state.load(Ordering::Acquire)),
+            2
+        );
+        assert_ne!(h.ack_state.load(Ordering::Acquire) & PATH_WAITING, 0);
+    }
+
+    #[test]
+    fn concurrent_send_completion_keeps_earliest_baseline() {
+        let h = health(0, 0, 0, 0);
+        assert!(h.complete_send(
+            QuicSendToken::new(0, 0, 20, 200),
+            SendCompletion::Success,
+            0,
+        ));
+        assert!(h.complete_send(
+            QuicSendToken::new(0, 0, 10, 100),
+            SendCompletion::Success,
+            0,
+        ));
+        h.sampled_sent_ack_eliciting_packets
+            .store(20, Ordering::Release);
+        assert_eq!(h.waiting_sent_baseline.load(Ordering::Acquire), 10);
+        assert_eq!(h.waiting_since_ms.load(Ordering::Acquire), 100);
+        assert_eq!(h.unacked_sends_since_wait(), 10);
+    }
+
+    #[test]
+    fn successful_send_preserves_first_stall_deadline() {
+        let h = health(0, 0, 2, 42);
+        assert!(h.complete_send(QuicSendToken::new(0, 0, 0, 100), SendCompletion::Success, 0,));
+        assert_eq!(h.waiting_since_ms.load(Ordering::Acquire), 42);
+        assert_eq!(
+            timeout_state_streak(h.timeout_state.load(Ordering::Acquire)),
+            0
+        );
+    }
+
+    #[test]
+    fn ack_progress_invalidates_all_old_send_tokens() {
+        let h = health(0, 0, 0, 0);
+        let token = QuicSendToken::new(0, 0, 0, 100);
+        assert!(h.note_ack_progress(1));
+        assert!(!h.complete_send(token, SendCompletion::Success, 1));
+        assert_eq!(h.ack_state.load(Ordering::Acquire) & PATH_WAITING, 0);
+    }
+}
 /// UDP fragment reassembly shared by the TUIC and Hysteria2 session bridges
 /// (sing `udpDefragger` parity).
 pub(crate) mod defrag {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
-    /// Maximum pending fragmented packets kept for reassembly per session.
     const DEFRAG_MAX_PENDING: usize = 64;
-    /// Maximum age of a pending fragmented packet before it is dropped.
+    const DEFRAG_MAX_FRAGMENTS: usize = 64;
     const DEFRAG_MAX_AGE: Duration = Duration::from_secs(10);
 
-    /// Reassembly state for one fragmented packet.
     struct DefragBuffer {
         frags: Vec<Option<Vec<u8>>>,
         count: usize,
+        bytes: usize,
         updated: Instant,
     }
 
-    /// Reassembles fragmented UDP packets, bounding memory by capping the
-    /// number of pending packets and expiring stale ones.
-    #[derive(Default)]
     pub(crate) struct Defragmenter {
-        map: HashMap<u16, DefragBuffer>,
+        map: HashMap<u64, DefragBuffer>,
+        latest_packet: Option<u64>,
+        max_payload: usize,
     }
 
     impl Defragmenter {
-        pub(crate) fn new() -> Self {
-            Self::default()
+        pub(crate) fn new(max_payload: usize) -> Self {
+            Self {
+                map: HashMap::new(),
+                latest_packet: None,
+                max_payload,
+            }
         }
 
-        /// Feed one fragment; returns the reassembled payload when the last
-        /// missing fragment arrives. Unfragmented packets (`frag_total <= 1`)
-        /// pass through immediately; invalid or duplicate fragments are
-        /// dropped (`None`).
+        fn packet_key(&mut self, packet_id: u16) -> u64 {
+            let packet_id = u64::from(packet_id);
+            let Some(latest) = self.latest_packet else {
+                // Leave one complete cycle below the initial key for delayed fragments.
+                let key = (1 << 16) | packet_id;
+                self.latest_packet = Some(key);
+                return key;
+            };
+            let base = latest & !u64::from(u16::MAX);
+            let candidate = base | packet_id;
+            let delta = candidate as i128 - latest as i128;
+            let key = if delta > i128::from(1u64 << 15) {
+                candidate.saturating_sub(1 << 16)
+            } else if delta < -i128::from(1u64 << 15) {
+                candidate.saturating_add(1 << 16)
+            } else {
+                candidate
+            };
+            if key > latest {
+                self.latest_packet = Some(key);
+            }
+            key
+        }
+
         pub(crate) fn feed(
             &mut self,
             packet_id: u16,
@@ -355,45 +1305,112 @@ pub(crate) mod defrag {
             frag_total: u8,
             data: Vec<u8>,
         ) -> Option<Vec<u8>> {
-            if frag_total <= 1 {
-                return Some(data);
-            }
-            if frag_id >= frag_total {
+            if frag_total == 0
+                || usize::from(frag_id) >= usize::from(frag_total)
+                || usize::from(frag_total) > DEFRAG_MAX_FRAGMENTS
+                || data.len() > self.max_payload
+            {
                 return None;
             }
-            let map = &mut self.map;
-            if map.len() >= DEFRAG_MAX_PENDING && !map.contains_key(&packet_id) {
-                map.retain(|_, b| b.updated.elapsed() < DEFRAG_MAX_AGE);
-                if map.len() >= DEFRAG_MAX_PENDING {
+            let packet_key = self.packet_key(packet_id);
+            if frag_total == 1 {
+                return Some(data);
+            }
+            let frag_total = usize::from(frag_total);
+            if self.map.len() >= DEFRAG_MAX_PENDING && !self.map.contains_key(&packet_key) {
+                self.map
+                    .retain(|_, buffer| buffer.updated.elapsed() < DEFRAG_MAX_AGE);
+                if self.map.len() >= DEFRAG_MAX_PENDING {
                     return None;
                 }
             }
-            let frag_total = frag_total as usize;
-            let entry = map.entry(packet_id).or_insert_with(|| DefragBuffer {
+            let entry = self.map.entry(packet_key).or_insert_with(|| DefragBuffer {
                 frags: (0..frag_total).map(|_| None).collect(),
                 count: 0,
+                bytes: 0,
                 updated: Instant::now(),
             });
             if entry.frags.len() != frag_total {
                 entry.frags = (0..frag_total).map(|_| None).collect();
                 entry.count = 0;
+                entry.bytes = 0;
             }
-            let frag_id = frag_id as usize;
+            let frag_id = usize::from(frag_id);
             if entry.frags[frag_id].is_some() {
+                return None;
+            }
+            let Some(bytes) = entry.bytes.checked_add(data.len()) else {
+                self.map.remove(&packet_key);
+                return None;
+            };
+            if bytes > self.max_payload {
+                self.map.remove(&packet_key);
                 return None;
             }
             entry.frags[frag_id] = Some(data);
             entry.count += 1;
+            entry.bytes = bytes;
             entry.updated = Instant::now();
             if entry.count != entry.frags.len() {
                 return None;
             }
-            let entry = map.remove(&packet_id).expect("entry just inserted");
-            let mut data = Vec::new();
+            let entry = self.map.remove(&packet_key).expect("entry just inserted");
+            let mut data = Vec::with_capacity(entry.bytes);
             for frag in entry.frags.into_iter().flatten() {
                 data.extend_from_slice(&frag);
             }
             Some(data)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reassembly_is_bounded_and_packet_id_wrap_is_distinct() {
+            let mut defrag = Defragmenter::new(4);
+            assert!(defrag.feed(7, 0, 65, vec![]).is_none());
+            assert!(defrag.feed(8, 0, 2, vec![1, 2, 3]).is_none());
+            assert!(defrag.feed(8, 1, 2, vec![4, 5]).is_none());
+
+            assert!(defrag.feed(0, 0, 2, vec![0]).is_none());
+            assert_eq!(defrag.feed(32_767, 0, 1, vec![0]), Some(vec![0]));
+            assert_eq!(defrag.feed(65_534, 0, 1, vec![0]), Some(vec![0]));
+            assert_eq!(defrag.feed(1, 0, 1, vec![0]), Some(vec![0]));
+            assert!(defrag.feed(0, 0, 2, vec![2]).is_none());
+            assert_eq!(defrag.feed(0, 1, 2, vec![3]), Some(vec![2, 3]));
+        }
+
+        #[test]
+        fn inferred_previous_cycle_ids_never_alias() {
+            let mut defrag = Defragmenter::new(8);
+            assert!(defrag.feed(1, 0, 2, vec![1]).is_none());
+            assert!(defrag.feed(40_001, 0, 2, vec![2]).is_none());
+            assert!(defrag.feed(50_001, 1, 2, vec![3]).is_none());
+            assert_eq!(defrag.feed(40_001, 1, 2, vec![4]), Some(vec![2, 4]));
+            assert_eq!(defrag.feed(50_001, 0, 2, vec![5]), Some(vec![5, 3]));
+        }
+
+        #[test]
+        fn delayed_previous_cycle_fragments_do_not_collide() {
+            let mut defrag = Defragmenter::new(8);
+            assert!(defrag.feed(65_530, 0, 2, vec![1]).is_none());
+            assert!(defrag.feed(100, 0, 2, vec![2]).is_none());
+            assert!(defrag.feed(0, 0, 2, vec![3]).is_none());
+            assert!(defrag.feed(65_500, 0, 2, vec![4]).is_none());
+            assert_eq!(defrag.feed(0, 1, 2, vec![5]), Some(vec![3, 5]));
+            assert_eq!(defrag.feed(65_500, 1, 2, vec![6]), Some(vec![4, 6]));
+        }
+
+        #[test]
+        fn malformed_fragments_do_not_advance_packet_epoch() {
+            let mut defrag = Defragmenter::new(8);
+            assert_eq!(defrag.packet_key(10), (1 << 16) | 10);
+            assert!(defrag.feed(65_000, 0, 65, vec![1]).is_none());
+            assert_eq!(defrag.latest_packet, Some((1 << 16) | 10));
+            assert!(defrag.feed(11, 0, 2, vec![2]).is_none());
+            assert_eq!(defrag.feed(11, 1, 2, vec![3]), Some(vec![2, 3]));
         }
     }
 }
@@ -429,6 +1446,10 @@ pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
     client_endpoint_with_mtu(ipv6, 1252)
 }
 
+fn clamp_quic_payload_size(mtu: u16) -> u16 {
+    mtu.clamp(1200, 65527)
+}
+
 fn default_gso_enabled(max_udp_payload_size: u16) -> bool {
     max_udp_payload_size > 1252
 }
@@ -448,6 +1469,7 @@ fn gso_transmit_segments(enabled: bool, kernel_max: usize) -> usize {
 /// the operator has already declared that the path carries larger datagrams.
 /// `HONK_QUIC_GSO=0|1` overrides that policy process-wide.
 pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Result<Endpoint> {
+    let max_udp_payload_size = clamp_quic_payload_size(max_udp_payload_size);
     let socket = marked_udp_socket(ipv6)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
@@ -472,7 +1494,9 @@ pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Re
 /// for why 1252 is the safe default on PMTU-black-holed last miles).
 pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
     let mut config = EndpointConfig::default();
-    config.max_udp_payload_size(mtu).map_err(io::Error::other)?;
+    config
+        .max_udp_payload_size(clamp_quic_payload_size(mtu))
+        .map_err(io::Error::other)?;
     Ok(config)
 }
 
@@ -551,14 +1575,129 @@ impl quinn::UdpPoller for NoGsoUdpPoller {
     }
 }
 
+/// Keeps one QUIC connection in the aggregate metrics registry until it is
+/// closed or the owning pooled client drops it.
+pub struct QuicConnectionMonitor {
+    id: u64,
+    conn: Connection,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for QuicConnectionMonitor {
+    fn drop(&mut self) {
+        self.task.abort();
+        finish_quic_connection(self.id, self.conn.stats());
+    }
+}
+
+/// Register a pooled QUIC connection for one-second aggregate sampling.
+pub fn monitor_quic_connection(conn: &Connection) -> QuicConnectionMonitor {
+    spawn_quic_connection_monitor(conn.clone())
+}
+fn spawn_quic_connection_monitor(conn: Connection) -> QuicConnectionMonitor {
+    let id = register_quic_connection(conn.stats());
+    let task_conn = conn.clone();
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + QUIC_SAMPLE_INTERVAL,
+            QUIC_SAMPLE_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = task_conn.closed() => break,
+                _ = ticker.tick() => {
+                    update_quic_connection(id, task_conn.stats());
+                }
+            }
+        }
+        let final_stats = task_conn.stats();
+        update_quic_connection(id, final_stats);
+        finish_quic_connection(id, final_stats);
+    });
+    QuicConnectionMonitor { id, conn, task }
+}
+
+struct TrackedConnection<C> {
+    id: u64,
+    connection: Connection,
+    _endpoint: Endpoint,
+    state: Weak<C>,
+}
+
 struct State<C> {
     /// Lazily created endpoint, tagged with its address family. Recreated when
     /// the family of the resolved server address changes.
     endpoint: Option<(bool, Endpoint)>,
     conn: Option<(Connection, Arc<C>)>,
+    connections: Vec<TrackedConnection<C>>,
+    next_connection_id: u64,
+    metrics_enabled: bool,
+
     /// Set by [`QuicClient::force_close`]: future dials fail instead of
     /// re-dialing into a closed client.
     closed: bool,
+}
+
+impl<C> State<C> {
+    fn prune_connections(&mut self) {
+        self.connections.retain(|tracked| {
+            if tracked.connection.close_reason().is_some() {
+                return false;
+            }
+            if tracked.state.upgrade().is_some() {
+                return true;
+            }
+            tracked
+                .connection
+                .close(VarInt::from_u32(0), b"state dropped");
+            false
+        });
+    }
+}
+
+fn spawn_tracked_connection_cleanup<C: Send + Sync + 'static>(
+    state: Weak<Mutex<State<C>>>,
+    id: u64,
+    connection: Connection,
+    owner: Weak<C>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if owner.upgrade().is_none() {
+                connection.close(VarInt::from_u32(0), b"state dropped");
+                break;
+            }
+            tokio::select! {
+                _ = connection.closed() => break,
+                _ = tokio::time::sleep(QUIC_SAMPLE_INTERVAL) => {}
+            }
+        }
+        if let Some(state) = state.upgrade() {
+            let mut state = state.lock().await;
+            state.connections.retain(|tracked| tracked.id != id);
+        }
+    });
+}
+
+struct ConnectionCloseGuard(Option<Connection>);
+
+impl ConnectionCloseGuard {
+    fn new(conn: Connection) -> Self {
+        Self(Some(conn))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ConnectionCloseGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            conn.close(VarInt::from_u32(0), b"connection setup cancelled");
+        }
+    }
 }
 
 /// Per-server QUIC connection holder.
@@ -586,10 +1725,10 @@ pub struct QuicClient<C> {
     /// Advertised `max_udp_payload_size` cap for the default endpoint (see
     /// [`client_endpoint`] for the safe 1252 default).
     mtu: u16,
-    state: Mutex<State<C>>,
+    state: Arc<Mutex<State<C>>>,
 }
 
-impl<C> QuicClient<C> {
+impl<C: Send + Sync + 'static> QuicClient<C> {
     pub fn new(
         server_host: impl Into<String>,
         server_port: u16,
@@ -603,11 +1742,14 @@ impl<C> QuicClient<C> {
             config,
             endpoint_factory: None,
             mtu: 1252,
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 endpoint: None,
                 conn: None,
+                connections: Vec::new(),
+                next_connection_id: 1,
+                metrics_enabled: false,
                 closed: false,
-            }),
+            })),
         }
     }
 
@@ -616,7 +1758,7 @@ impl<C> QuicClient<C> {
     /// Larger datagrams directly lower the per-packet processing cost that
     /// caps single-connection QUIC throughput (~180k pps at 1252B).
     pub fn with_max_udp_payload_size(mut self, mtu: u16) -> Self {
-        self.mtu = mtu;
+        self.mtu = clamp_quic_payload_size(mtu);
         self
     }
 
@@ -629,6 +1771,16 @@ impl<C> QuicClient<C> {
     ) -> Self {
         self.endpoint_factory = Some(Arc::new(factory));
         self
+    }
+    pub(crate) async fn enable_metrics(&self)
+    where
+        C: QuicConnState,
+    {
+        let mut state = self.state.lock().await;
+        state.metrics_enabled = true;
+        if let Some((conn, ctx)) = state.conn.as_ref() {
+            ctx.install_metrics_monitor(conn.clone());
+        }
     }
 
     /// Return the shared connection (plus its protocol state), dialing and
@@ -645,13 +1797,48 @@ impl<C> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
+        self.connection_with_inner(connect_timeout, setup, |_, _| {})
+            .await
+    }
+
+    pub(crate) async fn connection_with_metrics<F, Fut>(
+        &self,
+        connect_timeout: Duration,
+        setup: F,
+    ) -> anyhow::Result<(Connection, Arc<C>)>
+    where
+        C: QuicConnState,
+        F: FnOnce(Connection) -> Fut,
+        Fut: Future<Output = anyhow::Result<C>>,
+    {
+        self.connection_with_inner(connect_timeout, setup, |ctx, conn| {
+            ctx.install_metrics_monitor(conn.clone());
+        })
+        .await
+    }
+
+    async fn connection_with_inner<F, Fut, H>(
+        &self,
+        connect_timeout: Duration,
+        setup: F,
+        mut on_publish: H,
+    ) -> anyhow::Result<(Connection, Arc<C>)>
+    where
+        F: FnOnce(Connection) -> Fut,
+        Fut: Future<Output = anyhow::Result<C>>,
+        H: FnMut(&C, &Connection),
+    {
         let mut state = self.state.lock().await;
         if state.closed {
             anyhow::bail!("QUIC client is closed");
         }
+        state.prune_connections();
         if let Some((conn, ctx)) = &state.conn
             && conn.close_reason().is_none()
         {
+            if state.metrics_enabled {
+                on_publish(ctx.as_ref(), conn);
+            }
             return Ok((conn.clone(), Arc::clone(ctx)));
         }
         state.conn = None;
@@ -673,6 +1860,7 @@ impl<C> QuicClient<C> {
             .map(|(ipv6, endpoint)| (*ipv6, endpoint.clone()));
         let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
             let ipv6 = server_addr.is_ipv6();
+            let dial_config = self.config.clone();
             let endpoint = cached_endpoint
                 .as_ref()
                 .filter(|(cached_ipv6, _)| *cached_ipv6 == ipv6)
@@ -691,7 +1879,7 @@ impl<C> QuicClient<C> {
                 // races addresses for this node, never protocol attempts or nodes.
                 for attempt in 1..=3u8 {
                     let connecting = match endpoint.connect_with(
-                        self.config.clone(),
+                        dial_config.clone(),
                         server_addr,
                         &self.server_name,
                     ) {
@@ -720,18 +1908,29 @@ impl<C> QuicClient<C> {
             Some(result) => result?,
             None => anyhow::bail!("resolve {host}: no addresses"),
         };
-        state.endpoint = Some((ipv6, endpoint));
-        let ctx = setup(conn.clone()).await.inspect_err(|_| {
-            conn.close(VarInt::from_u32(0), b"setup failed");
-        })?;
+        state.endpoint = Some((ipv6, endpoint.clone()));
+        let mut close_guard = ConnectionCloseGuard::new(conn.clone());
+        let ctx = setup(conn.clone()).await?;
         let ctx = Arc::new(ctx);
-        // The single-flight mutex makes this unreachable today; the guard
-        // keeps a freshly dialed connection out of a closed client if the
-        // critical section is ever narrowed.
+        // The single-flight mutex makes this unreachable today; keep the
+        // freshly dialed connection out of a closed client if that changes.
         if state.closed {
-            conn.close(VarInt::from_u32(0), b"generation shutdown");
             anyhow::bail!("QUIC client closed during dial");
         }
+        if state.metrics_enabled {
+            on_publish(ctx.as_ref(), &conn);
+        }
+        close_guard.disarm();
+        let id = state.next_connection_id;
+        state.next_connection_id = state.next_connection_id.wrapping_add(1).max(1);
+        let owner = Arc::downgrade(&ctx);
+        state.connections.push(TrackedConnection {
+            id,
+            connection: conn.clone(),
+            _endpoint: endpoint.clone(),
+            state: owner.clone(),
+        });
+        spawn_tracked_connection_cleanup(Arc::downgrade(&self.state), id, conn.clone(), owner);
         state.conn = Some((conn.clone(), Arc::clone(&ctx)));
         Ok((conn, ctx))
     }
@@ -746,6 +1945,7 @@ impl<C> QuicClient<C> {
         {
             state.conn = None;
         }
+        state.prune_connections();
     }
 
     /// Release the reusable holder without closing flows that already own
@@ -754,6 +1954,7 @@ impl<C> QuicClient<C> {
         let mut state = self.state.lock().await;
         state.conn = None;
         state.endpoint = None;
+        state.prune_connections();
     }
 
     /// Close the cached connection and endpoint, terminating every flow that
@@ -763,8 +1964,11 @@ impl<C> QuicClient<C> {
     pub async fn force_close(&self) {
         let mut state = self.state.lock().await;
         state.closed = true;
-        if let Some((conn, _)) = state.conn.take() {
-            conn.close(VarInt::from_u32(0), b"generation shutdown");
+        state.conn = None;
+        for tracked in state.connections.drain(..) {
+            tracked
+                .connection
+                .close(VarInt::from_u32(0), b"generation shutdown");
         }
         if let Some((_, endpoint)) = state.endpoint.take() {
             endpoint.close(VarInt::from_u32(0), b"generation shutdown");
@@ -888,6 +2092,9 @@ pub(crate) trait QuicConnState: Send + Sync + 'static {
     fn touch(&self);
     /// Counter of open streams/bridges on this connection.
     fn open_counter(&self) -> &Arc<AtomicUsize>;
+    /// Keep aggregate metrics alive with active protocol flows after the
+    /// reusable client releases its cached connection.
+    fn install_metrics_monitor(&self, conn: Connection);
 }
 
 /// TUIC-style exporter authentication (sing `clientHandshake`,
@@ -980,13 +2187,8 @@ pub(crate) fn spawn_conn_reaper(
     });
 }
 
-/// Shared TCP-over-QUIC dial skeleton (TUIC/Juicity/Hysteria2): get the
-/// shared connection via `connect` (re-dialing when needed), run the
-/// protocol's stream handshake (`make`), and retry once with a fresh
-/// connection when the handshake fails on a half-dead cached connection and
-/// `retryable` allows it (Hysteria2's server-side refusals are not
-/// retryable). The returned stream decrements the connection's open counter
-/// on drop.
+/// Shared TCP-over-QUIC dial skeleton (TUIC/Juicity/Hysteria2). The returned
+/// stream decrements the connection's open counter on drop.
 pub(crate) async fn dial_quic_stream<S, Connect, Fut, Make, MakeFut>(
     client: &QuicClient<S>,
     connect: Connect,
@@ -1010,13 +2212,10 @@ where
             Ok((send, recv)) => {
                 let open = Arc::clone(state.open_counter());
                 open.fetch_add(1, Ordering::Relaxed);
-                // The flow owns its `(Connection, Arc<S>)` pair: the guard
-                // must hold the state, not just the open counter — a
-                // dropped state makes the connection reaper kill the live
-                // connection ("state dropped") under the stream.
+                let stream_state = Arc::clone(&state);
                 let stream = QuicBiStream::new(send, recv).with_on_drop(move || {
                     open.fetch_sub(1, Ordering::Relaxed);
-                    let _state_kept_alive_under_this_stream = &state;
+                    let _state_kept_alive_under_this_stream = &stream_state;
                 });
                 return Ok(stream);
             }
@@ -1154,6 +2353,16 @@ mod brutal_tests {
         // Initial RTT guess 333ms: BDP = 12.5e6 × 0.333 ≈ 4.16 MB.
         let w = cc.window();
         assert!((4_000_000..4_400_000).contains(&w), "window {w}");
+    }
+
+    #[test]
+    fn bdp_divides_before_u64_clamp() {
+        let brutal = Brutal {
+            rate: 1_000_000_000_000_000,
+            rtt: Duration::from_secs(1),
+            mtu: 1200,
+        };
+        assert_eq!(brutal.bdp(), 1_000_000_000_000_000);
     }
 
     #[test]
@@ -1431,6 +2640,8 @@ mod client_tests {
             .unwrap();
         assert_ne!(first.stable_id(), second.stable_id());
         client.force_close().await;
+        assert!(first.close_reason().is_some());
+        assert!(second.close_reason().is_some());
     }
 
     /// A cold-node health probe dials QUIC through an ephemeral runtime;
@@ -1536,13 +2747,22 @@ mod client_tests {
 // QUIC over a proxied UDP tunnel
 // ---------------------------------------------------------------------------
 
-use crate::proxy::{PacketErrorClass, PacketTransport, packet_error_class};
+use crate::proxy::{PacketErrorClass, PacketTransport, QuicSendAttempt, packet_error_class};
 
 /// quinn [`AsyncUdpSocket`] over a framed [`PacketTransport`]: outbound
 /// datagrams ride a bounded channel drained by a forwarder task (the
 /// transport's async send cannot run in a poll context), while inbound
 /// datagrams are accepted only from the configured QUIC peer.
 const TRANSPORT_QUEUE_CAP: usize = 64;
+/// A queued QUIC datagram must not wait behind a full adapter queue longer
+/// than the longest per-packet send deadline.
+const TRANSPORT_PACKET_MAX_AGE: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct QueuedTransportPacket {
+    data: Vec<u8>,
+    enqueued_at: Instant,
+}
 
 #[derive(Debug)]
 struct TransportIoError {
@@ -1586,18 +2806,27 @@ type SharedTransportError = Arc<SyncMutex<Option<TransportIoError>>>;
 #[derive(Debug)]
 struct TransportQuinnSocket {
     remote: SocketAddr,
-    outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+    outbound: tokio::sync::mpsc::Sender<QueuedTransportPacket>,
     inbound: SyncMutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     send_error: SharedTransportError,
     recv_error: SharedTransportError,
     recv_waker: SharedRecvWaker,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    metrics_enabled: bool,
 }
 
 impl TransportQuinnSocket {
     fn new(transport: Arc<dyn PacketTransport>, remote: SocketAddr) -> Arc<Self> {
+        Self::new_with_metrics(transport, remote, false)
+    }
+
+    fn new_with_metrics(
+        transport: Arc<dyn PacketTransport>,
+        remote: SocketAddr,
+        metrics_enabled: bool,
+    ) -> Arc<Self> {
         let (outbound_tx, mut outbound_rx) =
-            tokio::sync::mpsc::channel::<Vec<u8>>(TRANSPORT_QUEUE_CAP);
+            tokio::sync::mpsc::channel::<QueuedTransportPacket>(TRANSPORT_QUEUE_CAP);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TRANSPORT_QUEUE_CAP);
         let send_error = Arc::new(SyncMutex::new(None));
         let recv_error = Arc::new(SyncMutex::new(None));
@@ -1608,20 +2837,56 @@ impl TransportQuinnSocket {
             let recv_waker = Arc::clone(&recv_waker);
             async move {
                 let mut first_datagram = true;
-                while let Some(data) = outbound_rx.recv().await {
-                    let result = if first_datagram {
-                        transport.send_packet_confirmed(&data).await
-                    } else {
-                        transport.send_packet(&data).await
+                while let Some(queued) = outbound_rx.recv().await {
+                    if queued.enqueued_at.elapsed() >= TRANSPORT_PACKET_MAX_AGE {
+                        if metrics_enabled {
+                            record_transport_tx_drop();
+                        }
+                        continue;
+                    }
+                    let first = first_datagram;
+                    let data = queued.data;
+                    let timeout = transport.send_timeout().max(Duration::from_millis(1));
+                    let attempt = QuicSendAttempt::new(transport.as_ref());
+                    let result = tokio::time::timeout(timeout, async {
+                        if first {
+                            transport.send_packet_confirmed(&data).await
+                        } else {
+                            transport.send_packet(&data).await
+                        }
+                    })
+                    .await;
+                    let timed_out = match &result {
+                        Err(_) => true,
+                        Ok(Err(error)) => error.kind() == io::ErrorKind::TimedOut,
+                        Ok(Ok(())) => false,
+                    };
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "QUIC PacketTransport send deadline exceeded",
+                        )),
                     };
                     match result {
-                        Ok(()) => first_datagram = false,
+                        Ok(()) => {
+                            first_datagram = false;
+                            attempt.success();
+                        }
                         Err(error) => {
+                            if timed_out {
+                                attempt.timeout();
+                            } else {
+                                attempt.failure();
+                            }
                             let congestion = packet_error_class(&error)
                                 == PacketErrorClass::Congestion
                                 || (error.kind() == io::ErrorKind::TimedOut
                                     && transport.send_timeout_is_congestion());
                             if congestion {
+                                if metrics_enabled {
+                                    record_transport_tx_drop();
+                                }
                                 continue;
                             }
                             *send_error.lock() = Some(TransportIoError::fatal(error));
@@ -1664,8 +2929,21 @@ impl TransportQuinnSocket {
                     }
                     // A full queue drops the datagram (UDP semantics); the
                     // transport read must never backpressure or allocate for a drop.
-                    if let Ok(permit) = inbound_tx.try_reserve() {
-                        permit.send(buf[..n].to_vec());
+                    match inbound_tx.try_reserve() {
+                        Ok(permit) => permit.send(buf[..n].to_vec()),
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            if metrics_enabled {
+                                record_transport_rx_drop();
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            *recv_error.lock() = Some(TransportIoError::fatal(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "QUIC adapter receive queue closed",
+                            )));
+                            wake_recv(&recv_waker);
+                            return;
+                        }
                     }
                 }
             }
@@ -1678,6 +2956,7 @@ impl TransportQuinnSocket {
             recv_error,
             recv_waker,
             tasks: Mutex::new(vec![sender, receiver]),
+            metrics_enabled,
         })
     }
 
@@ -1719,8 +2998,10 @@ impl Drop for TransportQuinnSocket {
     }
 }
 
-type TransportSendPermit =
-    Result<tokio::sync::mpsc::OwnedPermit<Vec<u8>>, tokio::sync::mpsc::error::SendError<()>>;
+type TransportSendPermit = Result<
+    tokio::sync::mpsc::OwnedPermit<QueuedTransportPacket>,
+    tokio::sync::mpsc::error::SendError<()>,
+>;
 
 struct TransportUdpPoller {
     socket: Arc<TransportQuinnSocket>,
@@ -1762,7 +3043,6 @@ impl quinn::UdpPoller for TransportUdpPoller {
         }
     }
 }
-
 impl quinn::AsyncUdpSocket for TransportQuinnSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
         Box::pin(TransportUdpPoller {
@@ -1790,10 +3070,16 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
 
         match self.outbound.try_reserve() {
             Ok(permit) => {
-                permit.send(transmit.contents.to_vec());
+                permit.send(QueuedTransportPacket {
+                    data: transmit.contents.to_vec(),
+                    enqueued_at: Instant::now(),
+                });
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if self.metrics_enabled {
+                    record_transport_tx_would_block();
+                }
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(self
@@ -1801,7 +3087,6 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
                 .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))),
         }
     }
-
     fn poll_recv(
         &self,
         cx: &mut Context<'_>,
@@ -1821,12 +3106,17 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
         for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
             match inbound.poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
-                    // quic-go may coalesce a 1280-byte first flight despite the
-                    // 1252-byte advertisement. Preserve complete leading packets
-                    // as a bounded native UDP receive would; Quinn discards a
-                    // truncated tail and requests retransmission.
-                    let len = data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&data[..len]);
+                    // The endpoint advertises a 1252-byte receive buffer. Never hand Quinn a
+                    // truncated packet: a partial QUIC packet is indistinguishable from wire
+                    // corruption. Fail the adapter so the caller can redial with a safe path.
+                    if data.len() > buf.len() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PacketTransport returned a datagram larger than the QUIC receive buffer",
+                        )));
+                    }
+                    let len = data.len();
+                    buf[..len].copy_from_slice(&data);
                     *meta_slot = quinn::udp::RecvMeta {
                         addr: self.remote,
                         len,
@@ -1846,10 +3136,14 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
                     };
                 }
                 Poll::Pending => {
-                    return if count == 0 {
-                        Poll::Pending
+                    if count != 0 {
+                        return Poll::Ready(Ok(count));
+                    }
+                    drop(inbound);
+                    return if let Some(error) = self.terminal_error() {
+                        Poll::Ready(Err(error))
                     } else {
-                        Poll::Ready(Ok(count))
+                        Poll::Pending
                     };
                 }
             }
@@ -1909,10 +3203,21 @@ impl PacketTransportEndpoint {
 }
 
 /// Create a [`PacketTransportEndpoint`] pinned to `remote` with the safe
-/// 1252-byte UDP payload cap.
+/// 1252-byte UDP payload cap. Metrics are disabled because this constructor is
+/// also used by temporary health probes.
 pub fn packet_transport_endpoint(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
+) -> io::Result<PacketTransportEndpoint> {
+    packet_transport_endpoint_with_metrics(transport, remote, false)
+}
+
+/// Create a packet-backed endpoint whose adapter pressure counters belong to a
+/// persistent pooled DNS connection.
+pub fn packet_transport_endpoint_with_metrics(
+    transport: Arc<dyn PacketTransport>,
+    remote: SocketAddr,
+    metrics_enabled: bool,
 ) -> io::Result<PacketTransportEndpoint> {
     if transport.relay_addr() != remote {
         return Err(io::Error::new(
@@ -1922,7 +3227,11 @@ pub fn packet_transport_endpoint(
     }
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    let socket = TransportQuinnSocket::new(transport, remote);
+    let socket = if metrics_enabled {
+        TransportQuinnSocket::new_with_metrics(transport, remote, true)
+    } else {
+        TransportQuinnSocket::new(transport, remote)
+    };
     let endpoint = Endpoint::new_with_abstract_socket(
         endpoint_config_with_mtu(1252)?,
         None,
@@ -1957,7 +3266,6 @@ pub async fn quic_handshake_probe(
         .context("QUIC handshake timeout")??;
     let elapsed = start.elapsed();
     conn.close(quinn::VarInt::from_u32(0), b"probe");
-    // `wait_idle` cannot complete while this handle is still alive.
     drop(conn);
     endpoint.close(Duration::ZERO).await;
     Ok(elapsed)
@@ -2289,9 +3597,9 @@ mod probe_tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
-        let mut data = [0; 64];
+        let mut data = [0u8; 64];
         let mut meta = [quinn::udp::RecvMeta::default()];
-        let received = tokio::time::timeout(
+        let error = tokio::time::timeout(
             Duration::from_secs(1),
             std::future::poll_fn(|cx| {
                 let mut bufs = [std::io::IoSliceMut::new(&mut data)];
@@ -2300,11 +3608,8 @@ mod probe_tests {
         )
         .await
         .unwrap()
-        .unwrap();
-        assert_eq!(received, 1);
-        assert_eq!(meta[0].len, data.len());
-        assert_eq!(data, [0x5a; 64]);
-        assert_eq!(meta[0].addr, remote);
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

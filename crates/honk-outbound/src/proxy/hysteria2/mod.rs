@@ -46,8 +46,8 @@ use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -64,7 +64,8 @@ use crate::quic::defrag::Defragmenter;
 use crate::quic::{QuicClient, QuicConnState, now_secs};
 
 use super::{
-    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, QuicSendToken, TcpOutbound,
+    WarmableOutbound,
 };
 
 /// QUIC keep-alive (`hysteria/protocol.go:21`).
@@ -121,6 +122,8 @@ struct Hy2ConnState {
     open: Arc<AtomicUsize>,
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
+    path_health: Arc<crate::quic::QuicPathHealth>,
+    metrics: OnceLock<crate::quic::QuicConnectionMonitor>,
     /// H3 client preface streams (control + QPACK encoder/decoder). Held
     /// open for the life of the connection: dropping the send half finishes
     /// the stream, and closing a critical H3 stream is a connection error.
@@ -135,6 +138,11 @@ impl QuicConnState for Hy2ConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
+    fn install_metrics_monitor(&self, conn: quinn::Connection) {
+        self.path_health.enable_telemetry();
+        self.metrics
+            .get_or_init(|| crate::quic::monitor_quic_connection(&conn));
+    }
 }
 
 impl Hy2ConnState {
@@ -143,6 +151,7 @@ impl Hy2ConnState {
         udp_disabled: bool,
         preface: (quinn::SendStream, quinn::SendStream, quinn::SendStream),
     ) -> Self {
+        let path_health = crate::quic::QuicPathHealth::new(&conn);
         let sessions: SessionMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let state = Self {
             conn: conn.clone(),
@@ -151,22 +160,31 @@ impl Hy2ConnState {
             next_session: AtomicU32::new(0),
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
+            path_health: Arc::clone(&path_health),
+            metrics: OnceLock::new(),
             _preface: preface,
         };
         if !udp_disabled {
             // Inbound QUIC datagrams demultiplexed by session id
             // (`client_packet.go:5-19`).
+            let recv_conn = conn.clone();
+            let recv_sessions = Arc::clone(&sessions);
+            let recv_health = Arc::clone(&path_health);
             tokio::spawn(async move {
                 loop {
-                    let Ok(data) = conn.read_datagram().await else {
+                    let Ok(data) = recv_conn.read_datagram().await else {
                         break;
                     };
                     let Some(msg) = decode_udp_message(&data) else {
                         continue;
                     };
-                    let tx = sessions.lock().get(&msg.session_id).cloned();
+                    let tx = recv_sessions.lock().get(&msg.session_id).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            tx.try_send(msg)
+                        {
+                            recv_health.record_session_rx_drop();
+                        }
                     } else {
                         debug!(
                             session_id = msg.session_id,
@@ -175,8 +193,11 @@ impl Hy2ConnState {
                     }
                 }
                 // Connection died: drop all session senders so bridges end.
-                sessions.lock().clear();
+                recv_sessions.lock().clear();
             });
+        }
+        if !udp_disabled {
+            crate::quic::spawn_quic_path_watchdog(conn, path_health);
         }
         crate::quic::spawn_conn_reaper(
             state.conn.clone(),
@@ -397,6 +418,10 @@ impl crate::runtime::QuicRuntimeClient for Hy2Client {
         self
     }
 
+    async fn enable_metrics(&self) {
+        self.quic.enable_metrics().await;
+    }
+
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
@@ -414,7 +439,7 @@ impl Hy2Client {
         let password = self.password.clone();
         let rx_bytes_per_second = self.rx_bytes_per_second;
         self.quic
-            .connection_with(connect_timeout, move |conn| async move {
+            .connection_with_metrics(connect_timeout, move |conn| async move {
                 authenticate(&conn, &password, rx_bytes_per_second, connect_timeout).await
             })
             .await
@@ -687,7 +712,7 @@ impl Hysteria2Handler {
             session_id,
             packet_id: AtomicU16::new(0),
             rx: tokio::sync::Mutex::new(rx),
-            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
+            defrag: tokio::sync::Mutex::new(Defragmenter::new(MAX_UDP_SIZE)),
             addr,
             max_datagram,
             target,
@@ -825,6 +850,33 @@ impl Drop for Hy2UdpTransport {
 impl PacketTransport for Hy2UdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
+    }
+    fn send_timeout(&self) -> Duration {
+        self.state.path_health.send_timeout()
+    }
+    fn record_quic_send_started(&self) -> QuicSendToken {
+        self.state.path_health.record_send_started(&self.state.conn)
+    }
+    fn record_quic_send_success(&self, token: QuicSendToken) {
+        self.state
+            .path_health
+            .record_send_success(token, &self.state.conn);
+    }
+    fn record_quic_send_timeout(&self, token: QuicSendToken) {
+        if self
+            .state
+            .path_health
+            .record_send_timeout(token, &self.state.conn)
+        {
+            crate::quic::record_quic_send_timeout();
+        }
+    }
+    fn record_quic_send_failure(&self, token: QuicSendToken) {
+        self.state.path_health.record_send_failure(token);
+    }
+
+    fn quic_path_stalled(&self) -> bool {
+        self.state.path_health.is_stalled()
     }
     fn send_timeout_is_congestion(&self) -> bool {
         true

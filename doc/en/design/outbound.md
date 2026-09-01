@@ -467,6 +467,18 @@ pair. When the holder replaces a closed or invalidated connection, new work
 uses the replacement while existing flows can finish on their old clones.
 Dropping final warm ownership removes future reuse without cutting active flows.
 
+Each pooled QUIC connection samples Quinn path and UDP I/O counters once per
+second for the aggregate `quic` section of `/stats`. Temporary URL/health probe
+connections are intentionally excluded.
+Native TUIC and Hysteria2 UDP
+endpoints use a per-send deadline of `clamp(4 × SRTT, 1 s, 5 s)`. Three
+consecutive send deadlines, or no newly acknowledged QUIC packet is observed for
+`max(8 × SRTT, 10 s)`, retires the endpoint and closes that connection so the
+next flow redials. A successful send resets the send streak; observed delivery
+progress resets both clocks. Attempted UDP packets are never replayed. TUIC
+also enables Quinn PING keepalive, including its UDP-over-stream fallback where
+protocol heartbeat datagrams are unavailable.
+
 ### Protocol contracts
 
 | Protocol | Authentication and TCP | UDP | Transport policy |

@@ -21,6 +21,7 @@ use super::{
 struct DoqConnection {
     connection: Connection,
     endpoint: Option<honk_outbound::quic::PacketTransportEndpoint>,
+    _metrics: honk_outbound::quic::QuicConnectionMonitor,
 }
 
 /// DoQ client for one upstream.
@@ -109,7 +110,6 @@ impl DoqClient {
         }
         Ok(connection.connection.clone())
     }
-
     async fn dial(&self) -> anyhow::Result<DoqConnection> {
         let (connection, endpoint) = quic_connect_endpoint(
             &self.dial,
@@ -120,9 +120,11 @@ impl DoqClient {
             "DoQ",
         )
         .await?;
+        let metrics = honk_outbound::quic::monitor_quic_connection(&connection);
         Ok(DoqConnection {
             connection,
             endpoint,
+            _metrics: metrics,
         })
     }
 

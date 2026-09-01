@@ -84,6 +84,7 @@ struct QueuedBatch {
     client: SocketAddr,
     destination: SocketAddr,
     receiver: mpsc::Receiver<super::QueuedDatagram>,
+    enqueued_at: u32,
     _lease: super::UdpInitLease,
 }
 
@@ -93,11 +94,13 @@ impl QueuedBatch {
         let stats = StatsManager::new();
         let slow_slots = Arc::new(Semaphore::new(slow_capacity));
         let (client, destination) = bench_addresses();
-        let lease = match pool.reserve_or_enqueue(
+        let enqueued_at = super::queue_now();
+        let lease = match pool.reserve_or_enqueue_at(
             client,
             destination,
             first,
             acquire_slow_permit(&slow_slots),
+            enqueued_at,
             &stats,
         ) {
             EndpointReservation::Initializing(lease) => lease,
@@ -114,16 +117,18 @@ impl QueuedBatch {
             client,
             destination,
             receiver,
+            enqueued_at,
             _lease: lease,
         }
     }
 
     fn enqueue(&mut self, payload: &[u8]) -> EndpointReservation {
-        self.pool.reserve_or_enqueue(
+        self.pool.reserve_or_enqueue_at(
             self.client,
             self.destination,
             payload,
             acquire_slow_permit(&self.slow_slots),
+            self.enqueued_at,
             &self.stats,
         )
     }
@@ -137,6 +142,7 @@ struct ReadyBatch {
     client: SocketAddr,
     destination: SocketAddr,
     receiver: mpsc::Receiver<super::QueuedDatagram>,
+    enqueued_at: u32,
 }
 
 impl ReadyBatch {
@@ -149,6 +155,7 @@ impl ReadyBatch {
             client,
             destination,
             receiver,
+            enqueued_at,
             _lease: mut lease,
         } = QueuedBatch::new(1, first);
         drop(
@@ -173,13 +180,20 @@ impl ReadyBatch {
             slow_capacity,
             client,
             destination,
+            enqueued_at,
             receiver,
         }
     }
 
     fn enqueue(&self, payload: &[u8]) -> EndpointReservation {
         self.pool
-            .fast_path_enqueue(self.client, self.destination, payload, &self.stats)
+            .fast_path_enqueue_at(
+                self.client,
+                self.destination,
+                payload,
+                self.enqueued_at,
+                &self.stats,
+            )
             .unwrap_or_else(|| panic!("benchmark Ready mapping must hit the UDP fast path"))
     }
 
@@ -237,13 +251,15 @@ pub fn reserve_rollback_batch(iterations: usize) {
     let (client, destination) = bench_addresses();
     let (remove_tx, mut remove_rx) = mpsc::channel(1);
     pool.set_remove_sink(remove_tx);
+    let enqueued_at = super::queue_now();
 
     for _ in 0..iterations {
-        let lease = match pool.reserve_or_enqueue(
+        let lease = match pool.reserve_or_enqueue_at(
             client,
             destination,
             b"rollback",
             acquire_slow_permit(&slow_slots),
+            enqueued_at,
             &stats,
         ) {
             EndpointReservation::Initializing(lease) => lease,

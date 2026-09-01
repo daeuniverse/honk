@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use h3::client::SendRequest;
@@ -28,7 +29,17 @@ struct H3Session {
     sender: Mutex<Option<H3Sender>>,
     connection: quinn::Connection,
     endpoint: Option<honk_outbound::quic::PacketTransportEndpoint>,
+    _metrics: honk_outbound::quic::QuicConnectionMonitor,
     driver: OwnedTask,
+}
+async fn close_failed_connection(
+    connection: &quinn::Connection,
+    endpoint: &Option<honk_outbound::quic::PacketTransportEndpoint>,
+) {
+    connection.close(0_u32.into(), b"DoH3 setup failed");
+    if let Some(endpoint) = endpoint {
+        endpoint.close(Duration::ZERO).await;
+    }
 }
 
 /// DoH3 client for one upstream.
@@ -168,10 +179,21 @@ impl Doh3Client {
         )
         .await?;
         let quinn_conn = H3QuinnConnection::new(conn.clone());
-        let (mut driver, sender) = tokio::time::timeout_at(deadline, h3::client::new(quinn_conn))
-            .await
-            .map_err(|_| anyhow::anyhow!("DoH3 dial timed out after {:?}", self.dial.dial_timeout))?
-            .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
+        let h3 = tokio::time::timeout_at(deadline, h3::client::new(quinn_conn)).await;
+        let (mut driver, sender) = match h3 {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                close_failed_connection(&conn, &endpoint).await;
+                return Err(anyhow::anyhow!("DoH3 h3::client::new: {error}"));
+            }
+            Err(_) => {
+                close_failed_connection(&conn, &endpoint).await;
+                return Err(anyhow::anyhow!(
+                    "DoH3 dial timed out after {:?}",
+                    self.dial.dial_timeout
+                ));
+            }
+        };
 
         let driver = OwnedTask::spawn(
             async move {
@@ -186,8 +208,9 @@ impl Doh3Client {
         );
         Ok(H3Session {
             sender: Mutex::new(Some(sender)),
-            connection: conn,
+            connection: conn.clone(),
             endpoint,
+            _metrics: honk_outbound::quic::monitor_quic_connection(&conn),
             driver,
         })
     }

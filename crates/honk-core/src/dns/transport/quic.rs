@@ -71,8 +71,9 @@ async fn quic_connect(
     let deadline = tokio::time::Instant::now() + budget;
     let (connecting, owner) = if dial.proxy.is_some() {
         let transport = dial.dial_packet_transport_until(addr, deadline).await?;
-        let owner = honk_outbound::quic::packet_transport_endpoint(transport, addr)
-            .map_err(|error| anyhow::anyhow!("{label} packet endpoint: {error}"))?;
+        let owner =
+            honk_outbound::quic::packet_transport_endpoint_with_metrics(transport, addr, true)
+                .map_err(|error| anyhow::anyhow!("{label} packet endpoint: {error}"))?;
         let connecting = owner
             .endpoint()
             .connect_with(config.clone(), addr, sni)

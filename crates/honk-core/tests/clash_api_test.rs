@@ -2003,6 +2003,35 @@ async fn stats_exposes_udp_metrics() {
     // UDP is additive: existing dashboard keys retain their shapes.
     assert!(body["outbounds"].is_array());
     assert!(body["pool"].is_object());
+    assert!(body["quic"].is_object());
+    assert!(body["quic"]["activeConnections"].is_u64());
+    for key in [
+        "srttUs",
+        "cwndBytes",
+        "lossRatePpm",
+        "sentPackets",
+        "ackFrames",
+        "lostPackets",
+        "sentPlpmtudProbes",
+        "lostPlpmtudProbes",
+        "currentMtu",
+        "blackHoles",
+        "congestionEvents",
+        "txBytes",
+        "rxBytes",
+        "txDatagrams",
+        "rxDatagrams",
+        "txIos",
+        "rxIos",
+        "transportTxWouldBlock",
+        "transportTxDrops",
+        "transportRxDrops",
+        "sessionRxDrops",
+        "sendTimeouts",
+        "pathStalls",
+    ] {
+        assert!(body["quic"][key].is_u64(), "missing QUIC stat {key}");
+    }
 
     let tcp = &body["tcp"];
     assert!(tcp["activeFlows"].is_u64());

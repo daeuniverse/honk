@@ -695,7 +695,7 @@ impl StatsManager {
         self.udp.reply_ready_latency.record(elapsed);
     }
 
-    /// Record the fixed five-second first-send attempt latency.
+    /// Record latency for a first-send transport attempt.
     pub fn record_udp_first_send_latency(&self, elapsed: std::time::Duration) {
         self.udp.first_send_latency.record(elapsed);
     }
