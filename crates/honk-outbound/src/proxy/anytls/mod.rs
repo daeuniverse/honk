@@ -1079,6 +1079,11 @@ pub(crate) struct AnyTlsSession {
     stream_permits: Arc<tokio::sync::Semaphore>,
     /// Demux task handle, aborted on close.
     demux: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Inbound frame counter, bumped by the demux per frame. The SYNACK
+    /// deadline uses it to tell a silently-dead session (no frames during
+    /// the whole window) apart from a live session whose server is merely
+    /// slow to open one stream.
+    rx_frame_seq: AtomicU64,
 }
 
 impl AnyTlsSession {
@@ -1117,6 +1122,7 @@ impl AnyTlsSession {
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             demux: Mutex::new(None),
+            rx_frame_seq: AtomicU64::new(0),
         });
 
         let demux_handle = {
@@ -1164,12 +1170,25 @@ impl AnyTlsSession {
         if slot.is_some() || self.is_closed() {
             return;
         }
+        let activity_marker = self.rx_frame_seq.load(Ordering::Relaxed);
         let session = Arc::clone(self);
         *slot = Some(
             tokio::spawn(async move {
                 tokio::time::sleep(SYNACK_TIMEOUT).await;
                 let overdue = session.synack_pending.lock().sids.remove(&sid).is_some();
-                if overdue {
+                if !overdue {
+                    return;
+                }
+                if session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker {
+                    // The session kept receiving frames through the window:
+                    // the server is alive but never acknowledged this open
+                    // (e.g. its own dial to the target stalled). Reset only
+                    // this stream — killing the session would take every
+                    // healthy sibling stream down with it.
+                    session
+                        .dispatch_error(sid, Arc::from("stream open not acknowledged"))
+                        .await;
+                } else {
                     session.fail(anyhow::anyhow!(
                         "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
                     ));
@@ -1892,6 +1911,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                 break;
             }
         };
+        session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
         match cmd {
             CMD_PSH if !data.is_empty() => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
