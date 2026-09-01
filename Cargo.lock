@@ -477,9 +477,9 @@ dependencies = [
 
 [[package]]
 name = "boring"
-version = "5.1.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b573999d5cb0fdb9e9bb495058981752547b6475ba5e346247ebbd329917549"
+checksum = "47bf58283ad1560da95ab8dcbb6c71e18a89df30e6011e3582ddf755abe55c4a"
 dependencies = [
  "bitflags",
  "boring-sys",
@@ -490,8 +490,8 @@ dependencies = [
 
 [[package]]
 name = "boring-sys"
-version = "5.1.0"
-source = "git+https://github.com/Glassyiris/boring-sys?rev=630d5030ee281371231f2c8c0b7206178032f62e#630d5030ee281371231f2c8c0b7206178032f62e"
+version = "5.2.0"
+source = "git+https://github.com/Glassyiris/boring-sys?rev=3beb573b65ecaa69b7eefe3c2fecd074b97facd2#3beb573b65ecaa69b7eefe3c2fecd074b97facd2"
 dependencies = [
  "bindgen",
  "cmake",
@@ -2614,7 +2614,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3484,9 +3484,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-boring"
-version = "5.1.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c8b403954655fa821f069961b8c414b52d3bc67597e993463946c633fe4b46"
+checksum = "80b0cb8797d5f375289c1d478929ac08f98c535d6d000dcd01de05ad703782cd"
 dependencies = [
  "boring",
  "boring-sys",
