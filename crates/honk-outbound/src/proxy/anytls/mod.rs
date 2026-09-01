@@ -86,8 +86,8 @@ impl PaddingScheme {
 
         let stop = std::str::from_utf8(values.get(b"stop".as_slice()).copied()?)
             .ok()?
-            .parse::<i64>()
-            .ok()? as u32;
+            .parse::<u32>()
+            .ok()?;
         let mut packets = HashMap::new();
         for (key, value) in values {
             if key == b"stop"
