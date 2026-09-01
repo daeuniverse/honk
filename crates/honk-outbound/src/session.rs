@@ -60,12 +60,10 @@ pub struct SessionPoolConfig {
     /// First dial-failure backoff; doubles per consecutive failure up to
     /// [`Self::max_dial_backoff`].
     pub dial_backoff: Duration,
-    /// Cap for the dial-failure backoff. Must stay well below a flow's dial
-    /// budget (`connect_timeout * 3`): a caller parked in a longer backoff
-    /// window dies by its own outer timeout without ever attempting a dial,
-    /// so a brief outage would keep failing flows long after the server
-    /// recovers. Single-flight already paces concurrent dials; this only
-    /// paces redials after a failure.
+    /// Cap for the dial-failure backoff. Callers fail fast inside the
+    /// window, so this cap is the recovery latency after a failure: how soon
+    /// the next arriving flow redials. Keep it small — single-flight already
+    /// paces concurrent dials.
     pub max_dial_backoff: Duration,
     /// Max session age before it drains (no new streams; existing ones
     /// finish). Jittered ±10% per session to avoid reconnect storms.
@@ -380,7 +378,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         PoolState::from(self.state.load(Ordering::Acquire))
     }
 
-    /// Active session count for diagnostics (capacity-park logging).
     fn active_session_total(&self) -> usize {
         self.pool
             .lock()
@@ -529,13 +526,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                 && s.active_streams() < self.config.max_streams_per_session
                         })
                         .min_by_key(|s| s.active_streams());
-                    // The normal dial path is bounded by real sessions
-                    // only: provisional slots are caller-owned speculative
-                    // reservations that may never publish, and parked
-                    // offers have no timeout of their own — counting them
-                    // here let hung speculative work starve normal dials
-                    // until the caller's outer deadline killed them without
-                    // a dial ever being attempted.
+                    // Normal offers are bounded by real sessions only:
+                    // provisional slots belong to caller-owned speculative
+                    // dials that may never publish — counting them here once
+                    // let hung speculative work park normal dials with no
+                    // timeout of their own.
                     let occupied_slots = pool
                         .sessions
                         .iter()
@@ -586,9 +581,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
                 Step::Backoff(wait, failures) => {
                     // The breaker only paces redials; callers fail fast
-                    // instead of parking — a parked caller rode retry cycles
-                    // until its outer dial deadline killed it without a dial
-                    // ever being attempted.
+                    // instead of parking inside the window.
                     return Err(anyhow!(
                         "session dial backing off ({failures} consecutive, {wait:?} remaining)"
                     ));
@@ -625,15 +618,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     // Pool-owned dial task: no caller's cancellation can
                     // poison it; the DialGuard is the panic backstop.
                     let Some(dial_fut) = dial.take().map(|d| d()) else {
-                        // A previous Register in this very call consumed
-                        // the closure, and the freshly dialed session was
-                        // dead on arrival (pruned before it could be
-                        // offered). This second registration never spawns a
-                        // dial, so its inflight entry is a phantom: clear it
-                        // (dropping the sender wakes the waiters to re-elect)
-                        // and count the dead session as a dial failure so the
-                        // breaker paces redials instead of hot-spinning
-                        // against a server that kills every fresh session.
+                        // The closure was consumed by this call's earlier
+                        // Register, and the fresh session was pruned dead on
+                        // arrival. This second registration spawns no task,
+                        // so its inflight entry is a phantom nobody will ever
+                        // signal: clear it (dropping the sender wakes waiters
+                        // to re-elect) and count the dead session as a dial
+                        // failure so the breaker paces redials.
                         let backoff = {
                             let mut pool = self.pool.lock();
                             if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
