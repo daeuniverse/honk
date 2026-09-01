@@ -275,9 +275,7 @@ pub struct AnyTlsRuntime {
 impl AnyTlsRuntime {
     fn new() -> Self {
         Self {
-            pool: Arc::new(crate::session::SessionPool::new(
-                crate::proxy::anytls::session_pool_config(),
-            )),
+            pool: Arc::new(crate::proxy::anytls::AnyTlsPool::new()),
             tls: TlsConnectorSlot::default(),
         }
     }

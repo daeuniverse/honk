@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 #[cfg(test)]
 use honk_config::types::NodeProtocol;
+use md5::Md5;
+use rand::RngExt as _;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -46,9 +48,165 @@ const FRAME_HEADER_LEN: usize = 7;
 /// sing-anytls defaults (session/client.go): values below 5s clamp to 30s.
 const DEFAULT_IDLE_CHECK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
-const SETTINGS_PAYLOAD: &[u8] = b"v=2\nclient=dae\npadding-md5=dda34b9d9b470e6259f75776159e605b\n";
+const CLIENT_NAME: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_PADDING_SCHEME: &[u8] = b"stop=8\n\
+0=30-30\n\
+1=100-400\n\
+2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n\
+3=9-9,500-1000\n\
+4=500-1000\n\
+5=500-1000\n\
+6=500-1000\n\
+7=500-1000";
 /// Reused v2 sessions must prove that a newly opened target is still live.
 const SYNACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug)]
+enum PaddingInstruction {
+    Range(u16, u16),
+    Check,
+}
+
+#[derive(Debug)]
+struct PaddingScheme {
+    stop: u32,
+    packets: HashMap<u32, Vec<PaddingInstruction>>,
+    md5: String,
+}
+
+impl PaddingScheme {
+    fn parse(raw: &[u8]) -> Option<Self> {
+        let mut values = HashMap::<&[u8], &[u8]>::new();
+        for line in raw.split(|byte| *byte == b'\n') {
+            let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            values.insert(&line[..separator], &line[separator + 1..]);
+        }
+
+        let stop = std::str::from_utf8(values.get(b"stop".as_slice()).copied()?)
+            .ok()?
+            .parse::<i64>()
+            .ok()? as u32;
+        let mut packets = HashMap::new();
+        for (key, value) in values {
+            if key == b"stop"
+                || key.is_empty()
+                || (key.len() > 1 && key[0] == b'0')
+                || !key.iter().all(u8::is_ascii_digit)
+            {
+                continue;
+            }
+            let Ok(packet) = std::str::from_utf8(key).unwrap().parse::<u32>() else {
+                continue;
+            };
+            let instructions: Vec<_> = value
+                .split(|byte| *byte == b',')
+                .filter_map(|part| {
+                    if part == b"c" {
+                        return Some(PaddingInstruction::Check);
+                    }
+                    let mut bounds = part.split(|byte| *byte == b'-');
+                    let (Some(start), Some(end), None) =
+                        (bounds.next(), bounds.next(), bounds.next())
+                    else {
+                        return None;
+                    };
+                    let (mut start, mut end) = (
+                        std::str::from_utf8(start).ok()?.parse::<i64>().ok()?,
+                        std::str::from_utf8(end).ok()?.parse::<i64>().ok()?,
+                    );
+                    if start <= 0 || end <= 0 {
+                        return None;
+                    }
+                    if start > end {
+                        std::mem::swap(&mut start, &mut end);
+                    }
+                    Some(PaddingInstruction::Range(
+                        u16::try_from(start).ok()?,
+                        u16::try_from(end).ok()?,
+                    ))
+                })
+                .collect();
+            if instructions.is_empty() {
+                packets.remove(&packet);
+            } else {
+                packets.insert(packet, instructions);
+            }
+        }
+        if packets
+            .get(&0)
+            .and_then(|instructions| instructions.first())
+            .is_some_and(|instruction| matches!(instruction, PaddingInstruction::Check))
+        {
+            return None;
+        }
+        let digest = Md5::digest(raw);
+        let mut md5 = String::with_capacity(32);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest {
+            md5.push(HEX[(byte >> 4) as usize] as char);
+            md5.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Some(Self { stop, packets, md5 })
+    }
+
+    fn sample_range(start: u16, end: u16) -> usize {
+        if start == end {
+            start as usize
+        } else {
+            rand::rng().random_range(start..end) as usize
+        }
+    }
+
+    fn auth_padding_len(&self) -> usize {
+        match self
+            .packets
+            .get(&0)
+            .and_then(|instructions| instructions.first())
+        {
+            Some(PaddingInstruction::Range(start, end)) => Self::sample_range(*start, *end),
+            Some(PaddingInstruction::Check) | None => 0,
+        }
+    }
+
+    fn settings_payload(&self) -> bytes::Bytes {
+        bytes::Bytes::from(format!(
+            "v=2\nclient={CLIENT_NAME}\npadding-md5={}\n",
+            self.md5
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct PaddingState {
+    current: parking_lot::RwLock<Arc<PaddingScheme>>,
+}
+
+impl Default for PaddingState {
+    fn default() -> Self {
+        Self {
+            current: parking_lot::RwLock::new(Arc::new(
+                PaddingScheme::parse(DEFAULT_PADDING_SCHEME)
+                    .expect("built-in AnyTLS padding scheme is valid"),
+            )),
+        }
+    }
+}
+
+impl PaddingState {
+    fn snapshot(&self) -> Arc<PaddingScheme> {
+        Arc::clone(&self.current.read())
+    }
+
+    fn update(&self, raw: &[u8]) -> bool {
+        let Some(scheme) = PaddingScheme::parse(raw) else {
+            return false;
+        };
+        *self.current.write() = Arc::new(scheme);
+        true
+    }
+}
 
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
@@ -572,6 +730,7 @@ impl FrameCommand {
             FrameCommand::Data { sid, payload, .. } => (CMD_PSH, *sid, payload),
             FrameCommand::Control { cmd, sid, payload } => (*cmd, *sid, payload),
         };
+        debug_assert!(payload.len() <= u16::MAX as usize);
         buf.put_u8(cmd);
         buf.put_u32(sid);
         buf.put_u16(payload.len() as u16);
@@ -686,6 +845,60 @@ impl WriterQueue {
 const WRITER_BATCH_MAX_FRAMES: usize = 64;
 const WRITER_BATCH_MAX_BYTES: usize = 256 * 1024;
 
+async fn write_padded<W>(
+    writer: &mut W,
+    mut payload: &[u8],
+    scheme: &PaddingScheme,
+    packet: u32,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(instructions) = (packet < scheme.stop)
+        .then(|| scheme.packets.get(&packet))
+        .flatten()
+    else {
+        return writer.write_all(payload).await;
+    };
+
+    for instruction in instructions {
+        let PaddingInstruction::Range(start, end) = instruction else {
+            if payload.is_empty() {
+                return Ok(());
+            }
+            continue;
+        };
+        let target = PaddingScheme::sample_range(*start, *end);
+        if payload.len() > target {
+            writer.write_all(&payload[..target]).await?;
+            payload = &payload[target..];
+        } else if !payload.is_empty() {
+            let padding_len = target.saturating_sub(payload.len() + FRAME_HEADER_LEN);
+            if padding_len == 0 {
+                writer.write_all(payload).await?;
+            } else {
+                let mut padded = Vec::with_capacity(payload.len() + FRAME_HEADER_LEN + padding_len);
+                padded.extend_from_slice(payload);
+                padded.push(CMD_WASTE);
+                padded.extend_from_slice(&0u32.to_be_bytes());
+                padded.extend_from_slice(&(padding_len as u16).to_be_bytes());
+                padded.resize(padded.len() + padding_len, 0);
+                writer.write_all(&padded).await?;
+            }
+            payload = &[];
+        } else {
+            let mut waste = vec![0; FRAME_HEADER_LEN + target];
+            waste[0] = CMD_WASTE;
+            waste[5..7].copy_from_slice(&(target as u16).to_be_bytes());
+            writer.write_all(&waste).await?;
+        }
+    }
+    if !payload.is_empty() {
+        writer.write_all(payload).await?;
+    }
+    Ok(())
+}
+
 /// The single writer task for a session: drains the queue in order and
 /// gather-writes whole batches per flush — one `write_all` of the
 /// concatenated frames instead of a header/payload write pair plus flush
@@ -701,24 +914,47 @@ async fn session_writer(
 ) {
     let mut batch: Vec<FrameCommand> = Vec::with_capacity(WRITER_BATCH_MAX_FRAMES);
     let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
+    let mut packet = 0u32;
+    let mut send_padding = true;
     loop {
         let Some(first) = queue.pop().await else {
             break;
         };
-        batch.push(first);
-        queue.drain_available(
-            &mut batch,
-            WRITER_BATCH_MAX_FRAMES - 1,
-            WRITER_BATCH_MAX_BYTES,
+        let initial = matches!(
+            &first,
+            FrameCommand::Control {
+                cmd: CMD_SETTINGS,
+                ..
+            }
         );
+        batch.push(first);
+        let next_packet = packet.wrapping_add(1);
+        let padding = session.padding_state.snapshot();
+        let apply_padding = send_padding && next_packet < padding.stop;
+        if send_padding && !apply_padding {
+            send_padding = false;
+        }
+        let extra_frames = if initial {
+            2
+        } else if apply_padding {
+            0
+        } else {
+            WRITER_BATCH_MAX_FRAMES - 1
+        };
+        queue.drain_available(&mut batch, extra_frames, WRITER_BATCH_MAX_BYTES);
         buf.clear();
         buf.reserve(batch.iter().map(FrameCommand::wire_len).sum());
         for cmd in &batch {
             cmd.encode_into(&mut buf);
         }
+        packet = next_packet;
         let succeeded = matches!(
             tokio::time::timeout(WRITER_IO_TIMEOUT, async {
-                write.write_all(&buf).await?;
+                if apply_padding {
+                    write_padded(&mut write, &buf, &padding, packet).await?;
+                } else {
+                    write.write_all(&buf).await?;
+                }
                 write.flush().await
             })
             .await,
@@ -726,8 +962,6 @@ async fn session_writer(
         );
         for command in &mut batch {
             match command {
-                // The deadline starts when the SYN is on the wire, not at
-                // registration: writer backlog must not eat the budget.
                 FrameCommand::Control {
                     cmd: CMD_SYN, sid, ..
                 } if succeeded => {
@@ -754,8 +988,33 @@ async fn session_writer(
     }
 }
 
-/// Session pool type for one AnyTLS node, either generation-owned or ephemeral.
-pub(crate) type AnyTlsPool = crate::session::SessionPool<AnyTlsSession>;
+/// Session pool plus server-specific padding state for one AnyTLS node.
+#[derive(Debug)]
+pub(crate) struct AnyTlsPool {
+    sessions: Arc<crate::session::SessionPool<AnyTlsSession>>,
+    padding: Arc<PaddingState>,
+}
+
+impl AnyTlsPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            sessions: Arc::new(crate::session::SessionPool::new(session_pool_config())),
+            padding: Arc::new(PaddingState::default()),
+        }
+    }
+
+    fn padding_state(&self) -> Arc<PaddingState> {
+        Arc::clone(&self.padding)
+    }
+}
+
+impl std::ops::Deref for AnyTlsPool {
+    type Target = Arc<crate::session::SessionPool<AnyTlsSession>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sessions
+    }
+}
 
 /// Per-session stream capacity (v3.1): the semaphore is the single
 /// capacity truth — 128 concurrent streams per session (initial value,
@@ -769,6 +1028,10 @@ pub(crate) struct AnyTlsSession {
     seq: u64,
     /// AnyTLS server address retained for diagnostics.
     addr: String,
+    /// Server-specific scheme shared by every live session in this pool.
+    padding_state: Arc<PaddingState>,
+    /// Settings waits for the first stream so packet 1 is SETTINGS+SYN+PSH.
+    initial_settings: parking_lot::Mutex<Option<bytes::Bytes>>,
     /// Ordered writer queue: every frame goes out through the single
     /// writer task (no cross-stream mutex, uncancellable once queued).
     writer_q: Arc<WriterQueue>,
@@ -819,24 +1082,24 @@ pub(crate) struct AnyTlsSession {
 }
 
 impl AnyTlsSession {
-    /// Establish a session on a connected transport: write the auth blob
-    /// and the settings frame (sid 0, sing `Session.Run` parity) and spawn
-    /// the demux task. Pool membership is the caller's business (the
-    /// [`SessionPool`] offer/insert paths).
+    /// Establish a session on a connected transport: write packet 0 auth,
+    /// retain settings for the first stream, and spawn the session tasks.
     async fn establish(
         addr: &str,
         transport_read: BoxedReader,
         mut transport_write: BoxedWriter,
         auth: &[u8],
-        settings: &[u8],
+        settings: bytes::Bytes,
+        padding_state: Arc<PaddingState>,
     ) -> anyhow::Result<Arc<Self>> {
         transport_write.write_all(auth).await?;
-        write_frame(&mut transport_write, CMD_SETTINGS, 0, settings).await?;
         transport_write.flush().await?;
 
         let session = Arc::new(Self {
             seq: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             addr: addr.to_string(),
+            padding_state,
+            initial_settings: parking_lot::Mutex::new(Some(settings)),
             writer_q: Arc::new(WriterQueue::new()),
             writer_task: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
@@ -870,6 +1133,14 @@ impl AnyTlsSession {
 
         debug!("AnyTLS session {} for {} established", session.seq, addr);
         Ok(session)
+    }
+
+    #[cfg(test)]
+    fn flush_initial_settings_for_test(&self) -> std::io::Result<()> {
+        let Some(settings) = self.initial_settings.lock().take() else {
+            return Ok(());
+        };
+        self.enqueue_control(CMD_SETTINGS, 0, settings)
     }
 
     fn is_closed(&self) -> bool {
@@ -1127,20 +1398,44 @@ impl AnyTlsSession {
             return Err(anyhow::anyhow!("AnyTLS session {} is closed", self.seq));
         }
         self.register_synack(sid);
-        self.writer_q
-            .push_batch([
-                FrameCommand::Control {
-                    cmd: CMD_SYN,
-                    sid,
-                    payload: bytes::Bytes::new(),
-                },
-                FrameCommand::Control {
-                    cmd: CMD_PSH,
-                    sid,
-                    payload: bytes::Bytes::from(target_addr),
-                },
-            ])
-            .map_err(|_| self.writer_queue_error())?;
+        let initial_settings = self.initial_settings.lock().take();
+        let queued = if let Some(settings) = initial_settings {
+            self.writer_q
+                .push_batch([
+                    FrameCommand::Control {
+                        cmd: CMD_SETTINGS,
+                        sid: 0,
+                        payload: settings,
+                    },
+                    FrameCommand::Control {
+                        cmd: CMD_SYN,
+                        sid,
+                        payload: bytes::Bytes::new(),
+                    },
+                    FrameCommand::Control {
+                        cmd: CMD_PSH,
+                        sid,
+                        payload: bytes::Bytes::from(target_addr),
+                    },
+                ])
+                .map_err(drop)
+        } else {
+            self.writer_q
+                .push_batch([
+                    FrameCommand::Control {
+                        cmd: CMD_SYN,
+                        sid,
+                        payload: bytes::Bytes::new(),
+                    },
+                    FrameCommand::Control {
+                        cmd: CMD_PSH,
+                        sid,
+                        payload: bytes::Bytes::from(target_addr),
+                    },
+                ])
+                .map_err(drop)
+        };
+        queued.map_err(|_| self.writer_queue_error())?;
         guard.frame_started = false;
         Ok((sid, rx, guard))
     }
@@ -1573,13 +1868,15 @@ impl AnyTlsSession {
     }
 }
 
-fn server_supports_synack(data: &[u8]) -> bool {
-    data.split(|byte| *byte == b'\n').any(|line| {
-        line.strip_prefix(b"v=")
-            .and_then(|version| std::str::from_utf8(version).ok())
-            .and_then(|version| version.parse::<u8>().ok())
-            .is_some_and(|version| version >= 2)
-    })
+fn server_synack_setting(data: &[u8]) -> Option<bool> {
+    let mut value = None;
+    for line in data.split(|byte| *byte == b'\n') {
+        if let Some(version) = line.strip_prefix(b"v=") {
+            value = Some(version);
+        }
+    }
+    let version = std::str::from_utf8(value?).ok()?.parse::<i64>().ok()?;
+    Some((version as u8) >= 2)
 }
 
 async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
@@ -1594,7 +1891,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             }
         };
         match cmd {
-            CMD_PSH => session.dispatch_data(sid, data).await,
+            CMD_PSH if !data.is_empty() => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
                 session.acknowledge_syn(sid);
@@ -1624,7 +1921,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                     break;
                 }
             }
-            CMD_ALERT => {
+            CMD_ALERT if !data.is_empty() => {
                 warn!(
                     "AnyTLS session {} alert from server: {}",
                     session.seq,
@@ -1633,12 +1930,33 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                 break;
             }
             CMD_SERVER_SETTINGS => {
-                if server_supports_synack(&data) {
-                    session.peer_supports_synack.store(true, Ordering::Release);
+                if let Some(supports_synack) = server_synack_setting(&data) {
+                    session
+                        .peer_supports_synack
+                        .store(supports_synack, Ordering::Release);
                 }
             }
-            CMD_WASTE | CMD_SETTINGS | CMD_HEART_RESPONSE | CMD_UPDATE_PADDING_SCHEME | CMD_SYN => {
+            CMD_UPDATE_PADDING_SCHEME if !data.is_empty() => {
+                if session.padding_state.update(&data) {
+                    debug!(
+                        session = session.seq,
+                        md5 = %session.padding_state.snapshot().md5,
+                        "AnyTLS padding scheme updated"
+                    );
+                } else {
+                    warn!(
+                        session = session.seq,
+                        "AnyTLS server sent an invalid padding scheme"
+                    );
+                }
             }
+            CMD_WASTE
+            | CMD_SETTINGS
+            | CMD_HEART_RESPONSE
+            | CMD_SYN
+            | CMD_PSH
+            | CMD_ALERT
+            | CMD_UPDATE_PADDING_SCHEME => {}
             other => {
                 debug!(
                     "AnyTLS session {} ignoring unknown cmd {}",
@@ -1774,30 +2092,40 @@ async fn dial_session(
     addr: &str,
     connect_timeout: Duration,
     tls_connector: Option<Arc<TlsConnector>>,
+    padding_state: Arc<PaddingState>,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
     let timeout = connect_timeout.saturating_mul(3);
     tokio::time::timeout(timeout, async {
-        let (read, write, auth, settings) =
-            connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
-        AnyTlsSession::establish(addr, read, write, &auth, settings).await
+        let padding = padding_state.snapshot();
+        let settings = padding.settings_payload();
+        let (read, write, auth) =
+            connect_transport(node, addr, connect_timeout, None, tls_connector, &padding).await?;
+        AnyTlsSession::establish(addr, read, write, &auth, settings, padding_state).await
     })
     .await
     .map_err(|_| anyhow::anyhow!("AnyTLS session dial timed out after {timeout:?}"))?
 }
 
+fn authentication_payload(password: &str, padding: &PaddingScheme) -> Vec<u8> {
+    let auth_key: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+    let padding_len = padding.auth_padding_len();
+    let mut auth = vec![0u8; 34 + padding_len];
+    auth[..32].copy_from_slice(&auth_key);
+    auth[32..34].copy_from_slice(&(padding_len as u16).to_be_bytes());
+    auth
+}
+
 /// Connect to the AnyTLS server (using `tcp` when the caller provides a
-/// pre-connected stream) and wrap the connection in TLS. Returns boxed
-/// transport halves plus the auth blob and settings payload needed for
-/// session establishment.
+/// pre-connected stream), wrap it in TLS, and build packet 0 authentication.
 async fn connect_transport(
     node: &Node,
     addr: &str,
     connect_timeout: Duration,
     tcp: Option<TcpStream>,
     tls_connector: Option<Arc<TlsConnector>>,
-) -> anyhow::Result<(BoxedReader, BoxedWriter, [u8; 34], &'static [u8])> {
-    let password = AnyTlsHandler::resolve_password(node);
-    let auth_key: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+    padding: &PaddingScheme,
+) -> anyhow::Result<(BoxedReader, BoxedWriter, Vec<u8>)> {
+    let auth = authentication_payload(AnyTlsHandler::resolve_password(node), padding);
 
     let tcp = match tcp {
         Some(tcp) => tcp,
@@ -1825,15 +2153,7 @@ async fn connect_transport(
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
 
-    let mut auth = [0u8; 34];
-    auth[..32].copy_from_slice(&auth_key);
-
-    Ok((
-        Box::new(read),
-        Box::new(write),
-        auth,
-        AnyTlsHandler::settings_payload(),
-    ))
+    Ok((Box::new(read), Box::new(write), auth))
 }
 
 impl AnyTlsHandler {
@@ -1846,9 +2166,6 @@ impl AnyTlsHandler {
         node.anytls().unwrap().password.as_deref().unwrap_or("")
     }
 
-    fn settings_payload() -> &'static [u8] {
-        SETTINGS_PAYLOAD
-    }
     /// Lazily start the pool janitor for this node (once per pool).
     fn ensure_janitor(
         node: &Node,
@@ -1864,16 +2181,25 @@ impl AnyTlsHandler {
         );
         let prewarm_node = node.clone();
         let label = format!("{}:{}", node.host(), node.port);
+        let padding_state = pool.padding_state();
         pool.ensure_janitor(min_idle, idle_timeout, move || {
             let node = prewarm_node.clone();
             let label = label.clone();
             let runtime = runtime.clone();
+            let padding_state = Arc::clone(&padding_state);
             async move {
                 let tls_connector = runtime
                     .as_ref()
                     .map(|runtime| runtime.anytls_tls_connector())
                     .transpose()?;
-                dial_session(&node, &label, Duration::from_secs(10), tls_connector).await
+                dial_session(
+                    &node,
+                    &label,
+                    Duration::from_secs(10),
+                    tls_connector,
+                    padding_state,
+                )
+                .await
             }
         });
     }
@@ -2015,18 +2341,27 @@ impl AnyTlsHandler {
         }
         let dial_node = Arc::clone(&node);
         let dial_addr = addr.clone();
+        let padding_state = pool.padding_state();
         let transport = pool
             .open_with(
                 move || {
                     let node = Arc::clone(&dial_node);
                     let addr = dial_addr.clone();
                     let runtime = runtime.clone();
+                    let padding_state = Arc::clone(&padding_state);
                     async move {
                         let tls_connector = runtime
                             .as_ref()
                             .map(|runtime| runtime.anytls_tls_connector())
                             .transpose()?;
-                        dial_session(node.as_ref(), &addr, connect_timeout, tls_connector).await
+                        dial_session(
+                            node.as_ref(),
+                            &addr,
+                            connect_timeout,
+                            tls_connector,
+                            padding_state,
+                        )
+                        .await
                     }
                 },
                 move |session, permit| {
@@ -2334,9 +2669,17 @@ impl WarmableOutbound for AnyTlsHandler {
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
         let dial_runtime = Arc::clone(&runtime);
+        let padding_state = runtime.anytls_pool()?.padding_state();
         Self::warm_pool_with(runtime, move || async move {
             let tls_connector = dial_runtime.anytls_tls_connector()?;
-            dial_session(&node, &addr, connect_timeout, Some(tls_connector)).await
+            dial_session(
+                &node,
+                &addr,
+                connect_timeout,
+                Some(tls_connector),
+                padding_state,
+            )
+            .await
         })
         .await
     }
@@ -2373,6 +2716,7 @@ impl TcpOutbound for AnyTlsHandler {
         let dial_node = Arc::clone(&node);
         let dial_addr = format!("{}:{}", node.host(), node.port);
         let dial_runtime = Arc::clone(&runtime);
+        let padding_state = pool.padding_state();
         let domain = target_domain.map(str::to_string);
         let stream = pool
             .open_with(
@@ -2380,9 +2724,17 @@ impl TcpOutbound for AnyTlsHandler {
                     let node = Arc::clone(&dial_node);
                     let addr = dial_addr.clone();
                     let runtime = Arc::clone(&dial_runtime);
+                    let padding_state = Arc::clone(&padding_state);
                     async move {
                         let tls_connector = runtime.anytls_tls_connector()?;
-                        dial_session(&node, &addr, connect_timeout, Some(tls_connector)).await
+                        dial_session(
+                            &node,
+                            &addr,
+                            connect_timeout,
+                            Some(tls_connector),
+                            padding_state,
+                        )
+                        .await
                     }
                 },
                 move |session, permit| {
@@ -2447,6 +2799,7 @@ impl PacketOutbound for AnyTlsHandler {
         let dial_node = Arc::clone(&node);
         let dial_runtime = Arc::clone(&runtime);
         let dial_addr = format!("{}:{}", node.host(), node.port);
+        let padding_state = pool.padding_state();
         Self::dial_udp_transport_speculative_for_pool_with(
             node.as_ref(),
             pool,
@@ -2455,11 +2808,13 @@ impl PacketOutbound for AnyTlsHandler {
             Some(runtime),
             move || async move {
                 let tls_connector = dial_runtime.anytls_tls_connector()?;
+                let padding_state = Arc::clone(&padding_state);
                 dial_session(
                     dial_node.as_ref(),
                     &dial_addr,
                     connect_timeout,
                     Some(tls_connector),
+                    padding_state,
                 )
                 .await
             },
@@ -2471,15 +2826,22 @@ impl PacketOutbound for AnyTlsHandler {
 #[async_trait]
 impl ProbeableOutbound for AnyTlsHandler {}
 
+#[cfg(test)]
 /// Write a single AnyTLS frame.
 async fn write_frame<W>(writer: &mut W, cmd: u8, sid: u32, data: &[u8]) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
 {
+    let len = u16::try_from(data.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AnyTLS frame payload exceeds 65535 bytes",
+        )
+    })?;
     let mut header = [0u8; FRAME_HEADER_LEN];
     header[0] = cmd;
     header[1..5].copy_from_slice(&sid.to_be_bytes());
-    header[5..7].copy_from_slice(&(data.len() as u16).to_be_bytes());
+    header[5..7].copy_from_slice(&len.to_be_bytes());
     writer.write_all(&header).await?;
     if !data.is_empty() {
         writer.write_all(data).await?;
