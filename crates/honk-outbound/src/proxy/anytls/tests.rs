@@ -1671,6 +1671,76 @@ async fn synack_timeout_on_active_session_resets_only_the_stream() {
     assert_eq!(&buf[..n], b"ok", "the sibling stream keeps its data");
 }
 
+/// Dropping a stream whose open was never answered must settle its pending
+/// entry: an orphaned deadline would otherwise fire later and fail a healthy
+/// session.
+#[tokio::test(start_paused = true)]
+async fn dropped_unanswered_stream_cancels_its_synack_deadline() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let _first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        read_frame(&mut server).await.unwrap();
+    }
+    tokio::task::yield_now().await;
+    assert!(session.synack_pending.lock().sids.contains_key(&second.sid));
+
+    drop(second);
+    assert!(
+        session.synack_pending.lock().sids.is_empty(),
+        "dropping the stream settles its pending entry"
+    );
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "an orphaned deadline must not fail the session"
+    );
+}
+
+/// The activity marker is sampled before the batch write, so frames that
+/// arrive while a blocked flush is still in flight count as window activity.
+#[tokio::test(start_paused = true)]
+async fn synack_activity_marker_is_a_pre_write_snapshot() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    session.register_synack(2);
+    let marker = session.rx_frame_seq.load(Ordering::Relaxed);
+    session.start_synack_deadline(2, marker);
+    session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "post-marker frames must count as window activity"
+    );
+}
+
 /// A SYNACK that arrives while the SYN is still queued must settle the open:
 /// registering at queue time means the wire-time arm finds nothing to do.
 #[tokio::test(start_paused = true)]

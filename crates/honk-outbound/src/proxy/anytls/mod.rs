@@ -948,6 +948,10 @@ async fn session_writer(
             cmd.encode_into(&mut buf);
         }
         packet = next_packet;
+        // The activity marker for any SYN in this batch must be sampled
+        // before the write: frames arriving while a blocked flush is still
+        // in flight belong to the window and must count as session activity.
+        let pre_write_activity = session.rx_frame_seq.load(Ordering::Relaxed);
         let succeeded = matches!(
             tokio::time::timeout(WRITER_IO_TIMEOUT, async {
                 if apply_padding {
@@ -965,7 +969,7 @@ async fn session_writer(
                 FrameCommand::Control {
                     cmd: CMD_SYN, sid, ..
                 } if succeeded => {
-                    session.start_synack_deadline(*sid);
+                    session.start_synack_deadline(*sid, pre_write_activity);
                 }
                 FrameCommand::Data { completion, .. } => {
                     if let Some(completion) = completion.take() {
@@ -1161,7 +1165,10 @@ impl AnyTlsSession {
 
     /// The SYN is on the wire; start its deadline. A fast peer may have
     /// acked while the frame sat in the queue — then there is nothing to arm.
-    fn start_synack_deadline(self: &Arc<Self>, sid: u32) {
+    /// `activity_marker` is the inbound frame count sampled just before the
+    /// write, so frames received while a blocked flush was in flight still
+    /// count as session activity.
+    fn start_synack_deadline(self: &Arc<Self>, sid: u32, activity_marker: u64) {
         let mut pending = self.synack_pending.lock();
         let Some(slot) = pending.sids.get_mut(&sid) else {
             return;
@@ -1169,7 +1176,6 @@ impl AnyTlsSession {
         if slot.is_some() || self.is_closed() {
             return;
         }
-        let activity_marker = self.rx_frame_seq.load(Ordering::Relaxed);
         let session = Arc::clone(self);
         *slot = Some(
             tokio::spawn(async move {
@@ -1196,9 +1202,10 @@ impl AnyTlsSession {
         );
     }
 
-    /// A SYNACK settles only its own SID; acknowledging an unrelated stream
-    /// must not extend the deadline of opens the peer never answered.
-    fn acknowledge_syn(&self, sid: u32) {
+    /// Settle a pending open: cancel its deadline and drop the entry. A SYNACK
+    /// settles only its own SID; a locally torn-down stream must do the same,
+    /// or its orphaned timer fires later and fails a healthy session.
+    fn settle_syn_pending(&self, sid: u32) {
         if let Some(timer) = self.synack_pending.lock().sids.remove(&sid).flatten() {
             timer.abort();
         }
@@ -1499,6 +1506,7 @@ impl AnyTlsSession {
     /// Unregister a UoT stream, optionally notifying the server with FIN.
     /// Stream capacity is released by the transport permit, not this map.
     fn end_uot_stream(&self, sid: u32, notify_fin: bool) {
+        self.settle_syn_pending(sid);
         let (was_registered, received_fin) = {
             let mut remote_fin = self.remote_fin.lock();
             let received_fin = remote_fin.remove(&sid);
@@ -1515,6 +1523,7 @@ impl AnyTlsSession {
     /// synchronous so cleanup is ordered before the stream permit is dropped.
     /// Returns whether the watchdog had killed this stream.
     fn end_stream(&self, sid: u32, notify_fin: bool) -> bool {
+        self.settle_syn_pending(sid);
         let (was_registered, received_fin, was_killed) = {
             let mut remote_fin = self.remote_fin.lock();
             let mut killed_streams = self.killed_streams.lock().unwrap();
@@ -1533,6 +1542,7 @@ impl AnyTlsSession {
     }
 
     fn kill_stream(&self, sid: u32) -> Option<usize> {
+        self.settle_syn_pending(sid);
         let queue_capacity = {
             let mut remote_fin = self.remote_fin.lock();
             let mut killed_streams = self.killed_streams.lock().unwrap();
@@ -1914,7 +1924,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             CMD_PSH if !data.is_empty() => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
-                session.acknowledge_syn(sid);
+                session.settle_syn_pending(sid);
                 if !data.is_empty() {
                     let shown = &data[..data.len().min(MAX_STREAM_ERROR_SOURCE_BYTES)];
                     let suffix = if shown.len() == data.len() {
