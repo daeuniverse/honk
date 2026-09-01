@@ -13,7 +13,9 @@
 //!   (outcomes broadcast to every waiter);
 //! - caller-owned speculative checkout: atomically reserve an existing stream
 //!   permit or a provisional, cap-counted physical-dial slot that cancellation
-//!   drops and only an explicit winner commit may publish;
+//!   drops and only an explicit winner commit may publish; provisional slots
+//!   bound speculative work only — normal offers are bounded by real sessions,
+//!   so hung speculative dials can never starve them;
 //! - dial circuit breaker: consecutive establishment failures back off
 //!   exponentially before the pool dials again (a dead server must not
 //!   eat a TCP connect per proxied flow);
@@ -502,7 +504,18 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                 && s.active_streams() < self.config.max_streams_per_session
                         })
                         .min_by_key(|s| s.active_streams());
-                    let occupied_slots = Self::occupied_slots(&pool);
+                    // The normal dial path is bounded by real sessions
+                    // only: provisional slots are caller-owned speculative
+                    // reservations that may never publish, and parked
+                    // offers have no timeout of their own — counting them
+                    // here let hung speculative work starve normal dials
+                    // until the caller's outer deadline killed them without
+                    // a dial ever being attempted.
+                    let occupied_slots = pool
+                        .sessions
+                        .iter()
+                        .filter(|session| session.state() == SessionState::Active)
+                        .count();
                     let should_spread = self.config.spread_sessions
                         && candidate.is_some_and(|session| session.active_streams() > 0)
                         && occupied_slots < self.config.max_sessions;
@@ -2036,44 +2049,24 @@ mod tests {
         assert_eq!(pool.metrics().sessions, 0);
     }
 
-    #[tokio::test]
-    async fn provisional_slot_blocks_normal_offer_until_released() {
+    #[tokio::test(start_paused = true)]
+    async fn provisional_slot_does_not_block_normal_offer() {
         let pool = Arc::new(pool(SessionPoolConfig {
             max_sessions: 1,
-            janitor_interval: Duration::from_millis(1),
             ..Default::default()
         }));
-        let reservation = match pool.checkout_speculative().await.unwrap() {
+        let _reservation = match pool.checkout_speculative().await.unwrap() {
             SpeculativeCheckout::Detached(reservation) => reservation,
             SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
         };
-        let dials = Arc::new(AtomicUsize::new(0));
-        let offer = tokio::spawn({
-            let pool = Arc::clone(&pool);
-            let dials = Arc::clone(&dials);
-            async move {
-                pool.offer(move || async move {
-                    dials.fetch_add(1, Ordering::Relaxed);
-                    Ok(TestSession::new())
-                })
-                .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(
-            dials.load(Ordering::Relaxed),
-            0,
-            "a provisional slot counts against normal pool-owned dial admission"
-        );
-
-        drop(reservation);
-        let session = tokio::time::timeout(Duration::from_secs(1), offer)
+        // A held speculative reservation must not park the normal dial path:
+        // parked offers have no timeout of their own, so a hung speculative
+        // dial would otherwise kill real flows at their outer deadline.
+        let session = pool
+            .offer(|| async { Ok(TestSession::new()) })
             .await
-            .expect("normal offer remained blocked after provisional release")
-            .unwrap()
             .unwrap();
         assert!(!session.is_closed());
-        assert_eq!(dials.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
