@@ -46,8 +46,8 @@ use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -123,7 +123,6 @@ struct Hy2ConnState {
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
     path_health: Arc<crate::quic::QuicPathHealth>,
-    metrics: OnceLock<crate::quic::QuicConnectionMonitor>,
     /// H3 client preface streams (control + QPACK encoder/decoder). Held
     /// open for the life of the connection: dropping the send half finishes
     /// the stream, and closing a critical H3 stream is a connection error.
@@ -138,10 +137,8 @@ impl QuicConnState for Hy2ConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
-    fn install_metrics_monitor(&self, conn: quinn::Connection) {
+    fn enable_telemetry(&self) {
         self.path_health.enable_telemetry();
-        self.metrics
-            .get_or_init(|| crate::quic::monitor_quic_connection(&conn));
     }
 }
 
@@ -161,7 +158,6 @@ impl Hy2ConnState {
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             path_health: Arc::clone(&path_health),
-            metrics: OnceLock::new(),
             _preface: preface,
         };
         if !udp_disabled {
@@ -542,7 +538,11 @@ impl Hysteria2Handler {
         node.hysteria2().unwrap().auth.as_deref().unwrap_or("")
     }
 
-    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
+    async fn build_client(
+        &self,
+        node: &Node,
+        profiles: Option<Arc<crate::quic::AdaptiveFlowProfiles>>,
+    ) -> anyhow::Result<Arc<Hy2Client>> {
         let hy2 = node.hysteria2().unwrap();
         let password = Self::resolve_password(node);
         let obfs = hy2.obfs.as_deref().filter(|s| !s.is_empty());
@@ -603,7 +603,8 @@ impl Hysteria2Handler {
             },
         )
         .await?;
-        let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
+        let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config)
+            .with_flow_control_profiles(profiles);
         let mtu = hy2.quic.mtu.unwrap_or(1252);
         let quic = quic.with_max_udp_payload_size(mtu);
         let quic = match (obfs, hop) {
@@ -625,8 +626,9 @@ impl Hysteria2Handler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<Hy2Client>> {
+        let profiles = runtime.quic_flow_control_profiles()?;
         runtime
-            .quic_client(|| self.build_client(runtime.node.as_ref()))
+            .quic_client(|| self.build_client(runtime.node.as_ref(), Some(profiles)))
             .await
     }
 }
@@ -729,7 +731,7 @@ impl TcpOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.dial_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -767,7 +769,7 @@ impl PacketOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.udp_transport_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -791,7 +793,10 @@ impl PacketOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        let client = self.build_client(runtime.node.as_ref()).await?;
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             self.udp_transport_via_client(client, target, target_domain, connect_timeout)
                 .await
@@ -803,7 +808,7 @@ impl PacketOutbound for Hysteria2Handler {
 #[async_trait]
 impl ProbeableOutbound for Hysteria2Handler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.build_client(node).await {
+        match self.build_client(node, None).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
             Err(e) => {
                 debug!(

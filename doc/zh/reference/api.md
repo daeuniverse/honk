@@ -92,8 +92,11 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
   pool: { readyHits, readyMisses, entries },
   quic: {
-    activeConnections, srttUs, cwndBytes, lossRatePpm, sentPackets, ackFrames,
-    lostPackets, sentPlpmtudProbes, lostPlpmtudProbes, currentMtu, blackHoles,
+    activeConnections, srttUs, cwndBytes, flowReceivedBytes, flowSentBytes,
+    receiveWindowBytes, receiveWindowAvailableBytes, streamReceiveWindowBytes,
+    sendWindowBytes, sendWindowAvailableBytes, lossRatePpm, sentPackets,
+    ackFrames, lostPackets,
+    sentPlpmtudProbes, lostPlpmtudProbes, currentMtu, blackHoles,
     congestionEvents, txBytes, rxBytes, txDatagrams, rxDatagrams, txIos, rxIos,
     transportTxWouldBlock, transportTxDrops, transportRxDrops, sessionRxDrops,
     sendTimeouts, pathStalls
@@ -148,7 +151,11 @@ R = {
 
 ### QUIC 字段
 
-`srttUs`、`cwndBytes` 与 `currentMtu` 是活动连接的平均值；没有活动连接时为零。报文、字节、I/O、丢包、黑洞和拥塞计数包含已完成的池化连接。`ackFrames` 统计收到的 ACK frame，是路径进度信号；重复 ACK frame 可能被重复计数。`lossRatePpm` 排除 PLPMTUD 探测：分母为 `sentPackets - sentPlpmtudProbes`，而 `lostPackets` 同样不包含探测丢包。`sentPlpmtudProbes` 与 `lostPlpmtudProbes` 单独暴露探测计数。`txIos` 与 `rxIos` 表示批处理效率。`transportTxWouldBlock` 统计满载的 64 包 adapter 队列（Quinn 会重试）；底层代理报告拥塞或超时后主动丢弃的报文计入 `transportTxDrops`；满载的 adapter 接收队列计入 `transportRxDrops`，满载的 TUIC/Hysteria2 256 包会话队列计入 `sessionRxDrops`。`sendTimeouts` 与 `pathStalls` 是进程生命周期内的恢复事件。
+`srttUs`、`cwndBytes`、`currentMtu`、`receiveWindowBytes`、`receiveWindowAvailableBytes`、`streamReceiveWindowBytes`、`sendWindowBytes` 和 `sendWindowAvailableBytes` 是活动连接的平均值；没有活动连接时为零。`flowReceivedBytes` 统计已交付给应用的 stream 字节，`flowSentBytes` 统计已被对端确认的 stream 字节；与报文、UDP 字节、I/O、丢包、黑洞和拥塞计数一样，它们包含已完成的池化连接。
+
+池化 TUIC、Juicity 与 Hysteria2 连接每秒采样一次 flow-control 状态。收发方向的十秒 goodput EWMA 必须在 RTT 至少 80 ms 且连续三个样本确认高 BDP 后，才会把 connection 接收或发送 floor 提高到约 `2 x BDP`。peer 发来的 `STREAM_DATA_BLOCKED` 会独立地把 stream 接收 floor 加倍；connection 聚合 goodput 无法判断某一条 stream 的需求。零进展样本只有在对应 connection credit 仍受压时才会保留但不推进 streak。每个 floor 独立执行五分钟升档冷却，自动升档最大为 32 MiB，但不会降低更大的显式配置。honk 不会因应用需求低而缩小已学习窗口，也不会热切换拥塞控制。
+
+`ackFrames` 统计收到的 ACK frame，是路径进度信号；重复 ACK frame 可能被重复计数。`lossRatePpm` 排除 PLPMTUD 探测：分母为 `sentPackets - sentPlpmtudProbes`，而 `lostPackets` 同样不包含探测丢包。`sentPlpmtudProbes` 与 `lostPlpmtudProbes` 单独暴露探测计数。`txIos` 与 `rxIos` 表示批处理效率。`transportTxWouldBlock` 统计满载的 64 包 adapter 队列（Quinn 会重试）；底层代理报告拥塞或超时后主动丢弃的报文计入 `transportTxDrops`；满载的 adapter 接收队列计入 `transportRxDrops`，满载的 TUIC/Hysteria2 256 包会话队列计入 `sessionRxDrops`。`sendTimeouts` 与 `pathStalls` 是进程生命周期内的恢复事件。
 
 ### Score 选路原因字段
 

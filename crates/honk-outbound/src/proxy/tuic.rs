@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -249,7 +249,6 @@ struct TuicConnState {
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
     path_health: Arc<crate::quic::QuicPathHealth>,
-    metrics: OnceLock<crate::quic::QuicConnectionMonitor>,
 }
 
 impl QuicConnState for TuicConnState {
@@ -260,10 +259,8 @@ impl QuicConnState for TuicConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
-    fn install_metrics_monitor(&self, conn: quinn::Connection) {
+    fn enable_telemetry(&self) {
         self.path_health.enable_telemetry();
-        self.metrics
-            .get_or_init(|| crate::quic::monitor_quic_connection(&conn));
     }
 }
 
@@ -279,7 +276,6 @@ impl TuicConnState {
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             path_health: Arc::clone(&path_health),
-            metrics: OnceLock::new(),
         };
         tokio::spawn(Self::datagram_loop(
             conn.clone(),
@@ -444,7 +440,11 @@ impl TuicHandler {
         Self
     }
 
-    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<TuicClient>> {
+    async fn build_client(
+        &self,
+        node: &Node,
+        profiles: Option<Arc<crate::quic::AdaptiveFlowProfiles>>,
+    ) -> anyhow::Result<Arc<TuicClient>> {
         let tuic = node.tuic().unwrap();
         let uuid_str = tuic
             .uuid
@@ -487,6 +487,7 @@ impl TuicHandler {
         let config = crate::quic::client_config(node, &alpn_refs, options).await?;
         Ok(Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                .with_flow_control_profiles(profiles)
                 .with_max_udp_payload_size(tuic.quic.mtu.unwrap_or(1252)),
             uuid: *uuid.as_bytes(),
             password,
@@ -497,8 +498,9 @@ impl TuicHandler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<TuicClient>> {
+        let profiles = runtime.quic_flow_control_profiles()?;
         runtime
-            .quic_client(|| self.build_client(runtime.node.as_ref()))
+            .quic_client(|| self.build_client(runtime.node.as_ref(), Some(profiles)))
             .await
     }
 
@@ -631,7 +633,7 @@ impl TcpOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.dial_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -669,7 +671,7 @@ impl PacketOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.udp_transport_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -693,7 +695,10 @@ impl PacketOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        let client = self.build_client(runtime.node.as_ref()).await?;
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             self.udp_transport_via_client(client, target, target_domain, connect_timeout)
                 .await
@@ -705,7 +710,7 @@ impl PacketOutbound for TuicHandler {
 #[async_trait]
 impl ProbeableOutbound for TuicHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.build_client(node).await {
+        match self.build_client(node, None).await {
             Ok(client) => match client.connection(Duration::from_secs(5)).await {
                 Ok((conn, _)) => crate::quic::survives_auth_close_window(&conn).await,
                 Err(_) => false,

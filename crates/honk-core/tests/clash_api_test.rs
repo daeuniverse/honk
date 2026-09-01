@@ -2008,6 +2008,13 @@ async fn stats_exposes_udp_metrics() {
     for key in [
         "srttUs",
         "cwndBytes",
+        "flowReceivedBytes",
+        "flowSentBytes",
+        "receiveWindowBytes",
+        "receiveWindowAvailableBytes",
+        "streamReceiveWindowBytes",
+        "sendWindowBytes",
+        "sendWindowAvailableBytes",
         "lossRatePpm",
         "sentPackets",
         "ackFrames",

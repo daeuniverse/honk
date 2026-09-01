@@ -92,8 +92,11 @@ A non-empty `external_ui_download_detour` forces the initial request and redirec
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
   pool: { readyHits, readyMisses, entries },
   quic: {
-    activeConnections, srttUs, cwndBytes, lossRatePpm, sentPackets, ackFrames,
-    lostPackets, sentPlpmtudProbes, lostPlpmtudProbes, currentMtu, blackHoles,
+    activeConnections, srttUs, cwndBytes, flowReceivedBytes, flowSentBytes,
+    receiveWindowBytes, receiveWindowAvailableBytes, streamReceiveWindowBytes,
+    sendWindowBytes, sendWindowAvailableBytes, lossRatePpm, sentPackets,
+    ackFrames, lostPackets,
+    sentPlpmtudProbes, lostPlpmtudProbes, currentMtu, blackHoles,
     congestionEvents, txBytes, rxBytes, txDatagrams, rxDatagrams, txIos, rxIos,
     transportTxWouldBlock, transportTxDrops, transportRxDrops, sessionRxDrops,
     sendTimeouts, pathStalls
@@ -148,19 +151,38 @@ R = {
 
 ### QUIC fields
 
-`srttUs`, `cwndBytes`, and `currentMtu` are averages across active connections and are
-zero when none are active. Packet, byte, I/O, loss, black-hole, and congestion
-counters include completed pooled connections. `ackFrames` counts received ACK
-frames and is a path-progress signal; duplicate ACK frames may count more than
-once. `lossRatePpm` excludes PLPMTUD probes: its denominator is
-`sentPackets - sentPlpmtudProbes`, while `lostPackets` likewise excludes probe
-losses. `sentPlpmtudProbes` and `lostPlpmtudProbes` expose those probes separately.
-`txIos` and `rxIos` expose batching efficiency. `transportTxWouldBlock` counts
-full 64-packet adapter queues (Quinn retries); `transportTxDrops` counts
-datagrams intentionally discarded after the proxied transport reports
-congestion or timeout. `transportRxDrops` counts full adapter receive queues,
-and `sessionRxDrops` counts full 256-packet TUIC/Hysteria2 session queues.
-`sendTimeouts` and `pathStalls` are process-lifetime recovery events.
+`srttUs`, `cwndBytes`, `currentMtu`, `receiveWindowBytes`,
+`receiveWindowAvailableBytes`, `streamReceiveWindowBytes`, `sendWindowBytes`, and
+`sendWindowAvailableBytes` are averages across active connections and are zero
+when none are active. `flowReceivedBytes` counts stream bytes delivered to
+applications, and `flowSentBytes` counts stream bytes acknowledged by peers;
+like the packet, UDP-byte, I/O, loss, black-hole, and congestion counters, they
+include completed pooled connections.
+
+Pooled TUIC, Juicity, and Hysteria2 connections sample this flow-control state
+once per second. Ten-second receive and send goodput EWMAs require at least
+80 ms RTT and three consecutive high-BDP samples before honk raises the live
+connection receive or send floor toward `2 x BDP`. A peer
+`STREAM_DATA_BLOCKED` frame independently doubles the stream receive floor;
+aggregate connection goodput cannot identify one stream's demand. A
+zero-progress sample preserves but does not advance a connection-level streak
+only while its credit remains pressured. Each floor has its own five-minute
+promotion cooldown, and automatic promotions are capped at 32 MiB without
+lowering a larger explicit configuration. honk never shrinks a learned window
+from low application demand and never changes congestion control on a live
+connection.
+
+`ackFrames` counts received ACK frames and is a path-progress signal; duplicate
+ACK frames may count more than once. `lossRatePpm` excludes PLPMTUD probes: its
+denominator is `sentPackets - sentPlpmtudProbes`, while `lostPackets` likewise
+excludes probe losses. `sentPlpmtudProbes` and `lostPlpmtudProbes` expose those
+probes separately. `txIos` and `rxIos` expose batching efficiency.
+`transportTxWouldBlock` counts full 64-packet adapter queues (Quinn retries);
+`transportTxDrops` counts datagrams intentionally discarded after the proxied
+transport reports congestion or timeout. `transportRxDrops` counts full adapter
+receive queues, and `sessionRxDrops` counts full 256-packet TUIC/Hysteria2
+session queues. `sendTimeouts` and `pathStalls` are process-lifetime recovery
+events.
 
 ### Score selection-reason fields
 

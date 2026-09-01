@@ -85,6 +85,7 @@ pub trait QuicRuntimeClient: Send + Sync + 'static {
 /// speculative transport must converge on one reusable client.
 pub struct QuicRuntime {
     state: tokio::sync::Mutex<QuicRuntimeState>,
+    flow_control_profiles: Arc<crate::quic::AdaptiveFlowProfiles>,
 }
 
 #[derive(Default)]
@@ -102,11 +103,16 @@ impl std::fmt::Debug for QuicRuntime {
 impl QuicRuntime {
     pub(crate) fn new(metrics_enabled: bool) -> Self {
         Self {
+            flow_control_profiles: Arc::new(crate::quic::AdaptiveFlowProfiles::default()),
             state: tokio::sync::Mutex::new(QuicRuntimeState {
                 metrics_enabled,
                 ..Default::default()
             }),
         }
+    }
+
+    pub(crate) fn flow_control_profiles(&self) -> Arc<crate::quic::AdaptiveFlowProfiles> {
+        Arc::clone(&self.flow_control_profiles)
     }
 
     pub async fn client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
@@ -613,6 +619,15 @@ impl NodeRuntime {
             anyhow::bail!("node '{}' has no QUIC runtime", self.node.name);
         };
         runtime.client(build).await
+    }
+
+    pub(crate) fn quic_flow_control_profiles(
+        &self,
+    ) -> anyhow::Result<Arc<crate::quic::AdaptiveFlowProfiles>> {
+        let ProtocolRuntime::Quic(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no QUIC runtime", self.node.name);
+        };
+        Ok(runtime.flow_control_profiles())
     }
 
     pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
@@ -1861,6 +1876,7 @@ mod tests {
         let node = node("tuic-release", NodeProtocol::Tuic);
         let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let runtime = registry.get(&node.id).unwrap();
+        let profiles = runtime.quic_flow_control_profiles().unwrap();
         let client: Arc<FakeQuicClient> = runtime
             .quic_client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
             .await
@@ -1901,6 +1917,10 @@ mod tests {
         .await
         .expect("detached cleanup must clear the QUIC client slot");
         assert!(client.warm_released.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &profiles,
+            &runtime.quic_flow_control_profiles().unwrap()
+        ));
     }
 
     #[tokio::test]
