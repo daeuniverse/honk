@@ -34,12 +34,15 @@ pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Apply TCP keepalive tuning (idle 60s, interval 10s, 3 probes) via
-/// socket2's safe API — no raw setsockopt.
+/// Apply TCP keepalive tuning (idle 15s, interval 10s, 3 probes) via
+/// socket2's safe API — no raw setsockopt. The first probe must fire well
+/// inside a server's idle-kill window (AnyTLS servers drop idle sessions
+/// around 30s): with a 60s first probe, warm mux sessions silently became
+/// corpses that only a real flow would discover (mihomo #1891).
 #[cfg(target_os = "linux")]
 fn apply_tcp_keepalive(socket: &socket2::Socket) -> io::Result<()> {
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
+        .with_time(Duration::from_secs(15))
         .with_interval(Duration::from_secs(10))
         .with_retries(3);
     socket.set_tcp_keepalive(&keepalive)
