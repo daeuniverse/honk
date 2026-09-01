@@ -13,10 +13,14 @@
 //!   (outcomes broadcast to every waiter);
 //! - caller-owned speculative checkout: atomically reserve an existing stream
 //!   permit or a provisional, cap-counted physical-dial slot that cancellation
-//!   drops and only an explicit winner commit may publish;
-//! - dial circuit breaker: consecutive establishment failures back off
-//!   exponentially before the pool dials again (a dead server must not
-//!   eat a TCP connect per proxied flow);
+//!   drops and only an explicit winner commit may publish; provisional slots
+//!   bound speculative work only — normal offers are bounded by real sessions,
+//!   so hung speculative dials can never starve them;
+//! - dial circuit breaker: consecutive establishment failures (including
+//!   dead-on-arrival sessions) pace redials with a capped backoff, and
+//!   callers fail fast inside the window instead of parking — a dead server
+//!   neither eats a TCP connect per proxied flow nor stalls flows until
+//!   their outer dial deadline;
 //! - RAII stream-slot permits (`SessionPermit`) as the single capacity
 //!   truth, and [`SessionPool::open_with`] for atomic reserve+open;
 //! - idle reaping, jittered max-age drains and optional prewarm
@@ -56,7 +60,10 @@ pub struct SessionPoolConfig {
     /// First dial-failure backoff; doubles per consecutive failure up to
     /// [`Self::max_dial_backoff`].
     pub dial_backoff: Duration,
-    /// Cap for the dial-failure backoff.
+    /// Cap for the dial-failure backoff. Callers fail fast inside the
+    /// window, so this cap is the recovery latency after a failure: how soon
+    /// the next arriving flow redials. Keep it small — single-flight already
+    /// paces concurrent dials.
     pub max_dial_backoff: Duration,
     /// Max session age before it drains (no new streams; existing ones
     /// finish). Jittered ±10% per session to avoid reconnect storms.
@@ -72,7 +79,7 @@ impl Default for SessionPoolConfig {
             spread_sessions: false,
             janitor_interval: Duration::from_secs(30),
             dial_backoff: Duration::from_secs(1),
-            max_dial_backoff: Duration::from_secs(30),
+            max_dial_backoff: Duration::from_secs(2),
             max_session_age: None,
         }
     }
@@ -371,6 +378,28 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         PoolState::from(self.state.load(Ordering::Acquire))
     }
 
+    fn active_session_total(&self) -> usize {
+        self.pool
+            .lock()
+            .sessions
+            .iter()
+            .filter(|session| session.state() == SessionState::Active)
+            .count()
+    }
+
+    /// Record one establishment failure and arm the redial backoff. A session
+    /// that is dead on arrival (closed before it could serve a stream) also
+    /// counts — treating it as success would reset the breaker and let the
+    /// pool hot-spin against a server that kills every fresh session.
+    fn record_dial_failure(pool: &mut KeyPool<S>, config: &SessionPoolConfig) -> Duration {
+        pool.dial_failures += 1;
+        let shift = pool.dial_failures.min(8) - 1;
+        let backoff =
+            (config.dial_backoff.saturating_mul(1u32 << shift)).min(config.max_dial_backoff);
+        pool.next_dial_at = Some(Instant::now() + backoff);
+        backoff
+    }
+
     fn occupied_slots(pool: &KeyPool<S>) -> usize {
         pool.sessions
             .iter()
@@ -479,7 +508,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 Have(Arc<S>),
                 Register(u64, tokio::sync::watch::Sender<DialSignal>),
                 Wait(tokio::sync::watch::Receiver<DialSignal>),
-                Backoff(Duration),
+                Backoff(Duration, u32),
                 Capacity,
             }
             let step = {
@@ -497,7 +526,16 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                 && s.active_streams() < self.config.max_streams_per_session
                         })
                         .min_by_key(|s| s.active_streams());
-                    let occupied_slots = Self::occupied_slots(&pool);
+                    // Normal offers are bounded by real sessions only:
+                    // provisional slots belong to caller-owned speculative
+                    // dials that may never publish — counting them here once
+                    // let hung speculative work park normal dials with no
+                    // timeout of their own.
+                    let occupied_slots = pool
+                        .sessions
+                        .iter()
+                        .filter(|session| session.state() == SessionState::Active)
+                        .count();
                     let should_spread = self.config.spread_sessions
                         && candidate.is_some_and(|session| session.active_streams() > 0)
                         && occupied_slots < self.config.max_sessions;
@@ -510,7 +548,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .and_then(|t| t.checked_duration_since(Instant::now()))
                         .filter(|w| *w > Duration::ZERO)
                     {
-                        candidate.map_or(Step::Backoff(wait), |session| {
+                        candidate.map_or(Step::Backoff(wait, pool.dial_failures), |session| {
                             Step::Have(Arc::clone(session))
                         })
                     } else if occupied_slots >= self.config.max_sessions {
@@ -529,6 +567,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 Step::Closed => return Err(Self::pool_closed_err()),
                 Step::Have(s) => return Ok(s),
                 Step::Capacity => {
+                    tracing::debug!(
+                        active_sessions = self.active_session_total(),
+                        max = self.config.max_sessions,
+                        "offer parked on pool capacity"
+                    );
                     tokio::select! {
                         _ = self.capacity_notify.notified() => {}
                         _ = shutdown_rx.changed() => {
@@ -536,15 +579,15 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         }
                     }
                 }
-                Step::Backoff(wait) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = shutdown_rx.changed() => {
-                            return Err(Self::pool_closed_err());
-                        }
-                    }
+                Step::Backoff(wait, failures) => {
+                    // The breaker only paces redials; callers fail fast
+                    // instead of parking inside the window.
+                    return Err(anyhow!(
+                        "session dial backing off ({failures} consecutive, {wait:?} remaining)"
+                    ));
                 }
                 Step::Wait(mut rx) => {
+                    tracing::debug!("offer parked on in-flight dial");
                     let signal = tokio::select! {
                         // `wait_for` checks the current value first — no
                         // race with a dial that completed before parking.
@@ -575,17 +618,30 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     // Pool-owned dial task: no caller's cancellation can
                     // poison it; the DialGuard is the panic backstop.
                     let Some(dial_fut) = dial.take().map(|d| d()) else {
-                        // A previous Register in this very call consumed
-                        // the closure, and the freshly dialed session was
-                        // dead on arrival (pruned before it could be
-                        // offered) — fail instead of panic/re-dialing.
-                        return Err(anyhow!("session established but immediately unusable"));
+                        // The closure was consumed by this call's earlier
+                        // Register, and the fresh session was pruned dead on
+                        // arrival. This second registration spawns no task,
+                        // so its inflight entry is a phantom nobody will ever
+                        // signal: clear it (dropping the sender wakes waiters
+                        // to re-elect) and count the dead session as a dial
+                        // failure so the breaker paces redials.
+                        let backoff = {
+                            let mut pool = self.pool.lock();
+                            if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
+                                pool.dial_done = None;
+                            }
+                            Self::record_dial_failure(&mut pool, &self.config)
+                        };
+                        return Err(anyhow!(
+                            "session established but immediately unusable (backoff {backoff:?})"
+                        ));
                     };
                     let task_pool = Arc::clone(&self.pool);
                     let task_state = Arc::clone(&self.state);
                     let config = self.config.clone();
                     let mut task_shutdown_rx = self.shutdown_tx.subscribe();
                     let dial_scope = crate::runtime::capture_dial_scope();
+                    tracing::debug!(id, "pool dial task spawned");
                     tokio::spawn(dial_scope.scope(async move {
                         let mut guard = DialGuard {
                             pool: Arc::clone(&task_pool),
@@ -620,16 +676,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                     Ok(Ok(session)) => {
                                         pool.dial_failures = 0;
                                         pool.next_dial_at = None;
+                                        tracing::debug!(id, "pool dial succeeded");
                                         pool.sessions.push(session);
                                         DialSignal::Done
                                     }
                                     Ok(Err(e)) => {
-                                        pool.dial_failures += 1;
-                                        let shift = pool.dial_failures.min(8) - 1;
                                         let backoff =
-                                            (config.dial_backoff.saturating_mul(1u32 << shift))
-                                                .min(config.max_dial_backoff);
-                                        pool.next_dial_at = Some(Instant::now() + backoff);
+                                            Self::record_dial_failure(&mut pool, &config);
                                         // The waiter only sees the outer context; keep
                                         // the full chain available for diagnostics.
                                         tracing::debug!(
@@ -738,10 +791,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     }
                 }
                 Step::Backoff(wait) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = shutdown_rx.changed() => return Err(Self::pool_closed_err()),
-                    }
+                    // Same fast-fail contract as offer(): speculative callers
+                    // are exploratory by definition and must not park.
+                    return Err(anyhow!("session dial backing off ({wait:?} remaining)"));
                 }
                 Step::Wait(mut rx) => {
                     let signal = tokio::select! {
@@ -1867,15 +1919,89 @@ mod tests {
     async fn dial_failures_back_off() {
         let pool = pool(SessionPoolConfig {
             dial_backoff: Duration::from_secs(10),
+            max_dial_backoff: Duration::from_secs(60),
             ..Default::default()
         });
-        let fail = || async { anyhow::bail!("boom") };
+        let dials = Arc::new(AtomicUsize::new(0));
+        let offer_once = |dials: &Arc<AtomicUsize>| {
+            let dials = Arc::clone(dials);
+            pool.offer(move || async move {
+                dials.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("boom")
+            })
+        };
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        // Inside the window callers fail fast instead of parking.
         let start = Instant::now();
-        assert!(pool.offer::<fn() -> _, _>(fail).await.is_err());
+        assert!(offer_once(&dials).await.is_err());
         assert_eq!(start.elapsed(), Duration::ZERO);
-        // Second attempt waits out the backoff before re-dialing.
-        assert!(pool.offer::<fn() -> _, _>(fail).await.is_err());
-        assert!(start.elapsed() >= Duration::from_secs(10));
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        // Past the window the pool redials: 10s base, doubling to 20s.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_backoff_is_capped() {
+        let pool = pool(SessionPoolConfig {
+            dial_backoff: Duration::from_secs(10),
+            max_dial_backoff: Duration::from_secs(15),
+            ..Default::default()
+        });
+        let dials = Arc::new(AtomicUsize::new(0));
+        let offer_once = |dials: &Arc<AtomicUsize>| {
+            let dials = Arc::clone(dials);
+            pool.offer(move || async move {
+                dials.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("boom")
+            })
+        };
+        assert!(offer_once(&dials).await.is_err());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+        // The raw doubling would give 20s; the cap holds it at 15s.
+        tokio::time::advance(Duration::from_secs(14)).await;
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(offer_once(&dials).await.is_err());
+        assert_eq!(dials.load(Ordering::Relaxed), 3);
+    }
+
+    /// A session that dies before serving a stream counts as a dial failure:
+    /// the breaker arms and the next caller fails fast instead of hot-spinning
+    /// fresh dials against a server that kills every fresh session.
+    #[tokio::test(start_paused = true)]
+    async fn dead_on_arrival_session_engages_the_breaker() {
+        let pool = pool(SessionPoolConfig::default());
+        let dials = Arc::new(AtomicUsize::new(0));
+        let offer_dead = |dials: &Arc<AtomicUsize>| {
+            let dials = Arc::clone(dials);
+            pool.offer(move || async move {
+                dials.fetch_add(1, Ordering::Relaxed);
+                let session = TestSession::new();
+                session.close();
+                Ok(session)
+            })
+        };
+        let error = offer_dead(&dials).await.unwrap_err().to_string();
+        assert!(error.contains("immediately unusable"), "{error}");
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        let error = offer_dead(&dials).await.unwrap_err().to_string();
+        assert!(error.contains("backing off"), "{error}");
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let _ = offer_dead(&dials).await;
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2016,44 +2142,24 @@ mod tests {
         assert_eq!(pool.metrics().sessions, 0);
     }
 
-    #[tokio::test]
-    async fn provisional_slot_blocks_normal_offer_until_released() {
+    #[tokio::test(start_paused = true)]
+    async fn provisional_slot_does_not_block_normal_offer() {
         let pool = Arc::new(pool(SessionPoolConfig {
             max_sessions: 1,
-            janitor_interval: Duration::from_millis(1),
             ..Default::default()
         }));
-        let reservation = match pool.checkout_speculative().await.unwrap() {
+        let _reservation = match pool.checkout_speculative().await.unwrap() {
             SpeculativeCheckout::Detached(reservation) => reservation,
             SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
         };
-        let dials = Arc::new(AtomicUsize::new(0));
-        let offer = tokio::spawn({
-            let pool = Arc::clone(&pool);
-            let dials = Arc::clone(&dials);
-            async move {
-                pool.offer(move || async move {
-                    dials.fetch_add(1, Ordering::Relaxed);
-                    Ok(TestSession::new())
-                })
-                .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(
-            dials.load(Ordering::Relaxed),
-            0,
-            "a provisional slot counts against normal pool-owned dial admission"
-        );
-
-        drop(reservation);
-        let session = tokio::time::timeout(Duration::from_secs(1), offer)
+        // A held speculative reservation must not park the normal dial path:
+        // parked offers have no timeout of their own, so a hung speculative
+        // dial would otherwise kill real flows at their outer deadline.
+        let session = pool
+            .offer(|| async { Ok(TestSession::new()) })
             .await
-            .expect("normal offer remained blocked after provisional release")
-            .unwrap()
             .unwrap();
         assert!(!session.is_closed());
-        assert_eq!(dials.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
