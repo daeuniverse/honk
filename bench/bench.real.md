@@ -2,7 +2,7 @@
 
 Lab-free A/B over a real international path. Engine host `10.10.10.49`
 (Arch, kernel 7.1.8, x86-64) behind gateway `10.10.10.1` (MAC-exempted from
-the gateway's own honk). Server `103.26.8.157` (Debian 13, 2C/2G) runs
+the gateway's own honk). Server `103.26.8.xx`(gomami sg) (Debian 13, 2C/2G) runs
 sing-box 1.13.19 inbounds (socks5/ss/ss2022/trojan/vmess+ws/vless+tls/anytls/
 tuic/hy2) + juicity-server 0.4.3, plus the measurement targets:
 `python3 -m http.server 18080` serving a 256 MiB random file and a 1 KiB
@@ -51,7 +51,7 @@ hits complete a proxied request in **1 RTT**.
 
 ## Same-day episode: quinn MAX_CHUNKS kills lossy-link transfers (PR #110)
 
-Different server (`23.238.9.47`, hy2, ~450 ms RTT, bursty loss). honk with
+Different server (`23.238.9.xx`(rn ameria), hy2, ~450 ms RTT, bursty loss). honk with
 the 8 MiB receive window died ~3 s into every 50 MiB transfer
 (`too many gaps in stream buffer`): quinn-proto aborts the connection past
 1024 unmergeable buffered chunks; ~6500 packets in flight × burst loss
