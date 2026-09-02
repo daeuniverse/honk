@@ -265,7 +265,13 @@ async fn async_main() -> anyhow::Result<()> {
         return honk_core::handle_clash_command(&cli).await;
     }
 
-    honk_core::run(cli).await
+    // Mirror fatal failures through tracing: the anyhow return only reaches
+    // stderr, but deployments commonly collect just the log file.
+    let result = honk_core::run(cli).await;
+    if let Err(error) = &result {
+        tracing::error!("fatal error, shutting down: {error:#}");
+    }
+    result
 }
 
 #[cfg(test)]
