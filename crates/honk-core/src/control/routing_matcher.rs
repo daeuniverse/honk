@@ -317,8 +317,8 @@ impl RoutingMatcherBuilder {
     /// 1. compile the whole ruleset (MatchSets + LPM plan + group bitmaps)
     ///    without touching any map;
     /// 2. fill the inactive `ROUTING_MAP` bank;
-    /// 3. publish LPM values containing both the active and staged generation,
-    ///    pruning only keys referenced by neither;
+    /// 3. prune keys referenced by neither bank, then publish LPM values
+    ///    containing both the active and staged generation;
     /// 4. write the staged generation's exploded introspection metadata and
     ///    all four packed `RoutingGroupMeta` entries;
     /// 5. flip the one-slot generation selector only after that bank is
@@ -486,8 +486,8 @@ impl RoutingMatcherBuilder {
             generation,
         );
         ebpf.set_routing_rules(generation, &plan.match_sets)?;
-        lpm.apply(ebpf)?;
         ebpf.prune_lpm_entries(&lpm.keep_set())?;
+        lpm.apply(ebpf)?;
         ebpf.publish_routing_generation(
             generation,
             plan.match_sets.len() as u32,
@@ -1820,6 +1820,46 @@ mod tests {
         assert_eq!(backend.dest_lpm_bitmap.len(), 1);
         assert!(!backend.dest_lpm_bitmap.contains_key(&old_key));
         assert!(backend.dest_lpm_bitmap.contains_key(&new_key));
+    }
+
+    #[test]
+    fn reload_prunes_retired_lpm_keys_before_writing_replacement() {
+        let mut backend = MockEbpfBackend::new();
+        let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
+        let compile = |name: &str, cidr: &str| {
+            let nets = vec![cidr.parse().unwrap()];
+            RoutingMatcherBuilder::compile(
+                &[CompiledRoute {
+                    ip_nets: nets.clone(),
+                    ip_trie: crate::routing::BinaryLpmTrie::from_nets(&nets),
+                    ..make_route(name, "direct")
+                }],
+                &outbound_map,
+                "direct",
+                DialMode::Ip,
+            )
+            .unwrap()
+        };
+        let first = compile("first", "10.0.0.0/8");
+        let second = compile("second", "192.168.0.0/16");
+        let third = compile("third", "172.16.0.0/12");
+
+        RoutingMatcherBuilder::push_plan(&mut backend, &first).unwrap();
+        RoutingMatcherBuilder::push_transition(&mut backend, Some(&first), &second).unwrap();
+        let accepted = backend.routing_snapshot();
+        let first_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("10.0.0.0/8").unwrap());
+        let second_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("192.168.0.0/16").unwrap());
+
+        backend.fail_next_routing_phase(RoutingPushPhase::DestinationLpm);
+        assert!(
+            RoutingMatcherBuilder::push_transition(&mut backend, Some(&second), &third).is_err()
+        );
+
+        assert!(!backend.dest_lpm_bitmap.contains_key(&first_key));
+        assert!(backend.dest_lpm_bitmap.contains_key(&second_key));
+        assert_eq!(backend.routing_snapshot(), accepted);
+        RoutingMatcherBuilder::push_transition(&mut backend, Some(&second), &second).unwrap();
+        assert_eq!(backend.routing_snapshot(), accepted);
     }
 
     #[test]
