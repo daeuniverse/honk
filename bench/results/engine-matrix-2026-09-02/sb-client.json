@@ -1,0 +1,170 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "udp",
+        "server": "223.5.5.5"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sb0",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "10.10.10.70",
+      "server_port": 8443,
+      "password": "testpass123",
+      "tls": {
+        "enabled": true,
+        "server_name": "hy2.test",
+        "insecure": true
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic",
+      "server": "10.10.10.70",
+      "server_port": 2444,
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "password": "testpass123",
+      "congestion_control": "cubic",
+      "tls": {
+        "enabled": true,
+        "server_name": "hy2.test",
+        "insecure": true,
+        "alpn": [
+          "tuic"
+        ]
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022",
+      "server": "10.10.10.70",
+      "server_port": 2447,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "8JCsHssyVTFyPy5lYdNhZg==",
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan",
+      "server": "10.10.10.70",
+      "server_port": 2446,
+      "password": "testpass123",
+      "tls": {
+        "enabled": true,
+        "server_name": "hy2.test",
+        "insecure": true
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-sb",
+      "server": "10.10.10.70",
+      "server_port": 2445,
+      "password": "testpass123",
+      "tls": {
+        "enabled": true,
+        "insecure": true
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-go",
+      "server": "10.10.10.70",
+      "server_port": 2443,
+      "password": "testpass123",
+      "tls": {
+        "enabled": true,
+        "insecure": true
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "direct",
+      "tag": "direct",
+      "bind_interface": "veth-client"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "port": [
+          8443,
+          2443,
+          2444,
+          2445,
+          2446,
+          2447
+        ],
+        "outbound": "direct"
+      },
+      {
+        "port": [
+          5201,
+          8001
+        ],
+        "outbound": "hy2"
+      },
+      {
+        "port": [
+          5202,
+          8002
+        ],
+        "outbound": "tuic"
+      },
+      {
+        "port": [
+          5203,
+          8003
+        ],
+        "outbound": "ss2022"
+      },
+      {
+        "port": [
+          5204,
+          8004
+        ],
+        "outbound": "trojan"
+      },
+      {
+        "port": [
+          5205,
+          8005
+        ],
+        "outbound": "anytls-sb"
+      },
+      {
+        "port": [
+          5206,
+          8006
+        ],
+        "outbound": "anytls-go"
+      }
+    ],
+    "final": "direct"
+  }
+}
