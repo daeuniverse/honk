@@ -74,6 +74,9 @@ impl UotReceiveState {
 const UOT_MAX_V1_HEADER_BYTES: usize = 1 + 1 + u8::MAX as usize + 2 + 2;
 const UOT_MAX_BUFFERED_BYTES: usize =
     UOT_MAX_V1_HEADER_BYTES + u16::MAX as usize + u16::MAX as usize - 1;
+// anytls-go 0.0.13 relays through sing v0.5.1's 16 KiB UDP buffer; a larger
+// UoT packet makes the reference server close the logical stream.
+const UOT_MAX_PACKET_SIZE: usize = 16 * 1024;
 
 impl AnyTlsUotTransport {
     fn detect_uot_mode(&self, data: &[u8]) -> std::io::Result<Option<UotMode>> {
@@ -159,8 +162,8 @@ impl std::fmt::Debug for AnyTlsUotTransport {
 
 impl AnyTlsUotTransport {
     async fn send_packet_inner(&self, data: &[u8], confirmed: bool) -> std::io::Result<()> {
+        let packet = crate::proxy::uot::encode_packet(data, UOT_MAX_PACKET_SIZE)?;
         self.session.ensure_stream_registered(self.sid)?;
-        let packet = crate::proxy::uot::encode_packet(data, u16::MAX as usize - 2)?;
         let mut setup = self.setup.lock().await;
         let Some(request) = setup.as_ref() else {
             drop(setup);
@@ -175,41 +178,23 @@ impl AnyTlsUotTransport {
 
         let permit = self.session.acquire_data_permit().await?;
         self.session.ensure_stream_registered(self.sid)?;
-        if request.len() + packet.len() <= u16::MAX as usize {
-            let mut payload = bytes::BytesMut::with_capacity(request.len() + packet.len());
-            payload.extend_from_slice(request);
-            payload.extend_from_slice(&packet);
-            if confirmed {
-                let completed = self.session.enqueue_confirmed_data_with_permit(
-                    self.sid,
-                    payload.freeze(),
-                    permit,
-                )?;
-                setup.take();
-                drop(setup);
-                AnyTlsSession::wait_for_confirmed_data(completed).await
-            } else {
-                self.session
-                    .enqueue_data_with_permit(self.sid, payload.freeze(), permit)?;
-                setup.take();
-                Ok(())
-            }
-        } else {
+        let mut payload = bytes::BytesMut::with_capacity(request.len() + packet.len());
+        payload.extend_from_slice(request);
+        payload.extend_from_slice(&packet);
+        if confirmed {
             let completed = self.session.enqueue_confirmed_data_with_permit(
                 self.sid,
-                request.clone(),
+                payload.freeze(),
                 permit,
             )?;
             setup.take();
             drop(setup);
-            AnyTlsSession::wait_for_confirmed_data(completed).await?;
-            if confirmed {
-                self.session
-                    .write_uot_datagram_confirmed(self.sid, packet)
-                    .await
-            } else {
-                self.session.write_uot_datagram(self.sid, packet).await
-            }
+            AnyTlsSession::wait_for_confirmed_data(completed).await
+        } else {
+            self.session
+                .enqueue_data_with_permit(self.sid, payload.freeze(), permit)?;
+            setup.take();
+            Ok(())
         }
     }
 }
@@ -272,12 +257,13 @@ mod uot_tests {
 
     #[test]
     fn test_uot_request_uses_socks5_address_form() {
-        let v4 = addr::encode_address("1.2.3.4:53".parse().unwrap(), None);
+        let v4 = addr::encode_address("1.2.3.4:53".parse().unwrap(), None).unwrap();
         assert_eq!(v4, vec![0x01, 1, 2, 3, 4, 0, 53]);
-        let v6 = addr::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None);
+        let v6 = addr::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None).unwrap();
         assert_eq!(v6[0], 0x04);
         assert_eq!(v6.len(), 1 + 16 + 2);
-        let fqdn = addr::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com"));
+        let fqdn =
+            addr::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com")).unwrap();
         assert_eq!(fqdn[0], 0x03);
         assert_eq!(fqdn[1], 11);
         assert_eq!(&fqdn[2..13], b"example.com");
@@ -417,25 +403,34 @@ mod uot_transport_tests {
     }
 
     #[tokio::test]
-    async fn oversized_first_uot_datagram_uses_ordered_setup_fallback() {
+    async fn uot_send_enforces_anytls_go_packet_limit_without_poisoning_stream() {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let request = crate::proxy::uot::connect_request(target, None).unwrap();
         let (transport, mut server) = uot_test_transport(target).await;
-        let payload = vec![0x5a; u16::MAX as usize - 2];
+        let payload = vec![0x5a; UOT_MAX_PACKET_SIZE];
 
         transport.send_packet(&payload).await.unwrap();
-        let (cmd, sid, setup) = read_frame(&mut server).await.unwrap();
-        assert_eq!(
-            (cmd, sid, setup.as_slice()),
-            (CMD_PSH, transport.sid, request.as_ref())
-        );
-        let (cmd, sid, packet) = read_frame(&mut server).await.unwrap();
+        let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
         assert_eq!((cmd, sid), (CMD_PSH, transport.sid));
+        assert_eq!(&data[..request.len()], request.as_ref());
         assert_eq!(
-            u16::from_be_bytes([packet[0], packet[1]]) as usize,
+            u16::from_be_bytes([data[request.len()], data[request.len() + 1]]) as usize,
             payload.len()
         );
-        assert_eq!(&packet[2..], payload);
+        assert_eq!(&data[request.len() + 2..], payload);
+
+        let error = transport
+            .send_packet(&vec![0; UOT_MAX_PACKET_SIZE + 1])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        transport.send_packet(b"kept").await.unwrap();
+        let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
+        assert_eq!(
+            (cmd, sid, data.as_slice()),
+            (CMD_PSH, transport.sid, &b"\0\x04kept"[..])
+        );
     }
 
     #[tokio::test]
@@ -485,17 +480,6 @@ mod uot_transport_tests {
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         tokio::task::yield_now().await;
         assert!(session.is_closed());
-    }
-
-    #[tokio::test]
-    async fn uot_send_rejects_outer_frame_length_overflow() {
-        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let (transport, _server) = uot_test_transport(target).await;
-        let error = transport
-            .send_packet(&vec![0; u16::MAX as usize - 1])
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

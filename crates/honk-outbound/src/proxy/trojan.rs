@@ -32,14 +32,14 @@ impl TrojanHandler {
         password: &str,
         target: SocketAddr,
         target_domain: Option<&str>,
-    ) -> Vec<u8> {
+    ) -> std::io::Result<Vec<u8>> {
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
         header.extend_from_slice(hex_sha224(password).as_bytes());
         header.extend_from_slice(CRLF);
         header.push(CMD_TCP);
-        header.extend_from_slice(&addr::encode_address(target, target_domain));
+        header.extend_from_slice(&addr::encode_address(target, target_domain)?);
         header.extend_from_slice(CRLF);
-        header
+        Ok(header)
     }
 
     /// Connect to the server and optionally wrap with WebSocket or gRPC
@@ -70,7 +70,7 @@ impl TcpOutbound for TrojanHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let header = Self::build_request_header(password, target, target_domain);
+        let header = Self::build_request_header(password, target, target_domain)?;
         let mut stream = Self::connect_server(node, connect_timeout).await?;
         stream.write_all(&header).await?;
         Ok(ProxyStream {
@@ -89,7 +89,7 @@ impl TcpOutbound for TrojanHandler {
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let header = Self::build_request_header(password, target, target_domain);
+        let header = Self::build_request_header(password, target, target_domain)?;
         let mut stream = Self::maybe_tls_wrap(node, tcp).await?;
         stream.write_all(&header).await?;
         Ok(ProxyStream {
@@ -117,11 +117,12 @@ impl PacketOutbound for TrojanHandler {
         }
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let mut control = Self::connect_server(node, connect_timeout).await?;
+        let addr_header = addr::encode_address(target, target_domain)?;
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
         header.extend_from_slice(hex_sha224(password).as_bytes());
         header.extend_from_slice(CRLF);
         header.push(CMD_UDP);
-        header.extend_from_slice(&addr::encode_address(target, target_domain));
+        header.extend_from_slice(&addr_header);
         header.extend_from_slice(CRLF);
         control.write_all(&header).await?;
 
@@ -129,7 +130,7 @@ impl PacketOutbound for TrojanHandler {
         Ok(Arc::new(TrojanUdpTransport {
             writer: tokio::sync::Mutex::new(wr),
             reader: tokio::sync::Mutex::new(rd),
-            addr_header: addr::encode_address(target, target_domain),
+            addr_header,
             relay_addr: target,
         }))
     }
@@ -167,7 +168,7 @@ mod tests {
         let password = "password123";
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
-        let header = TrojanHandler::build_request_header(password, target, None);
+        let header = TrojanHandler::build_request_header(password, target, None).unwrap();
 
         // First 56 bytes are the hex-encoded SHA224(password).
         let expected_hash = hex_sha224(password);
@@ -186,7 +187,7 @@ mod tests {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let domain = "example.com";
 
-        let header = TrojanHandler::build_request_header(password, target, Some(domain));
+        let header = TrojanHandler::build_request_header(password, target, Some(domain)).unwrap();
 
         let expected_hash = hex_sha224(password);
         assert_eq!(&header[..56], expected_hash.as_bytes());
@@ -313,20 +314,20 @@ mod udp_transport_tests {
         let transport = TrojanUdpTransport {
             writer: tokio::sync::Mutex::new(wr),
             reader: tokio::sync::Mutex::new(rd),
-            addr_header: addr::encode_address(target, None),
+            addr_header: addr::encode_address(target, None).unwrap(),
             relay_addr: target,
         };
 
         // client → server frame
         transport.send_packet(b"hello-trojan-udp").await.unwrap();
-        let mut head = vec![0u8; addr::encode_address(target, None).len() + 4];
+        let mut head = vec![0u8; addr::encode_address(target, None).unwrap().len() + 4];
         server.read_exact(&mut head).await.unwrap();
         let mut payload = [0u8; 16];
         server.read_exact(&mut payload).await.unwrap();
         assert_eq!(&payload, b"hello-trojan-udp");
 
         // server → client frame
-        let mut frame = addr::encode_address(target, None);
+        let mut frame = addr::encode_address(target, None).unwrap();
         frame.extend_from_slice(&5u16.to_be_bytes());
         frame.extend_from_slice(b"\r\n");
         frame.extend_from_slice(b"pong!");

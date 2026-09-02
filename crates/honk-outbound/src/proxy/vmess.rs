@@ -253,9 +253,9 @@ impl VmessHandler {
         padding: &[u8],
         target: SocketAddr,
         target_domain: Option<&str>,
-    ) -> Vec<u8> {
+    ) -> anyhow::Result<Vec<u8>> {
         debug_assert_eq!(padding_len as usize, padding.len());
-        let addr = SocksAddr::new(target, target_domain);
+        let addr = SocksAddr::new(target, target_domain)?;
         let mut plain = Vec::with_capacity(41 + addr.encoded_len() + padding.len() + 4);
         plain.push(VMESS_VERSION);
         plain.extend_from_slice(&session.req_iv);
@@ -279,13 +279,13 @@ impl VmessHandler {
             }
             SocksAddr::Domain(domain, _) => {
                 plain.push(addr::ATYP_VMESS.domain);
-                plain.push(domain.len().min(u8::MAX as usize) as u8);
+                plain.push(domain.len() as u8);
                 plain.extend_from_slice(domain.as_bytes());
             }
         }
         plain.extend_from_slice(padding);
         plain.extend_from_slice(&fnv1a32(&plain).to_be_bytes());
-        plain
+        Ok(plain)
     }
 
     /// `SealVMessAEADHeader`: auth_id | enc_len | conn_nonce | enc_header,
@@ -400,7 +400,7 @@ impl VmessHandler {
         rng.fill_bytes(&mut padding);
 
         let plain =
-            Self::build_header_plain(&session, padding_len, &padding, target, target_domain);
+            Self::build_header_plain(&session, padding_len, &padding, target, target_domain)?;
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
         let (client_half, server_half) = tokio::io::duplex(65536);
@@ -748,7 +748,8 @@ mod tests {
         let session = fixed_session();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let plain =
-            VmessHandler::build_header_plain(&session, 3, &[0xaa, 0xbb, 0xcc], target, None);
+            VmessHandler::build_header_plain(&session, 3, &[0xaa, 0xbb, 0xcc], target, None)
+                .unwrap();
         assert_eq!(plain, hex(HEADER_PLAIN));
     }
 
@@ -757,7 +758,8 @@ mod tests {
         let session = fixed_session();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let plain =
-            VmessHandler::build_header_plain(&session, 3, &[0xaa, 0xbb, 0xcc], target, None);
+            VmessHandler::build_header_plain(&session, 3, &[0xaa, 0xbb, 0xcc], target, None)
+                .unwrap();
         let wire = VmessHandler::seal_request_header(
             &fixed_cmd_key(),
             &hex(AUTH_ID).try_into().unwrap(),

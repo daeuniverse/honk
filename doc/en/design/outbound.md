@@ -595,11 +595,11 @@ chunk and continuing a corrupted length-delimited byte stream.
 ### Lazy UoT creation
 
 Opening an AnyTLS UDP transport reserves a stream but defers its UoT connect
-request. When the first datagram fits the AnyTLS frame-size bound, the connect
-request and encoded datagram are emitted together as one ordered PSH. An
-oversized combination sends a confirmed setup first, then the datagram. This
-avoids an otherwise empty setup round trip without permitting first-packet
-replay.
+request. The connect request and first encoded datagram are emitted together as
+one ordered PSH. Payloads are limited to 16 KiB, matching anytls-go 0.0.13's
+sing v0.5.1 relay buffer; larger inputs fail before consuming the lazy setup or
+poisoning the logical stream. This avoids an otherwise empty setup round trip
+without permitting first-packet replay.
 
 ## Cold URLTest speculative preparation
 

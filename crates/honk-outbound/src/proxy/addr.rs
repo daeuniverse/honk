@@ -66,14 +66,20 @@ pub(crate) enum SocksAddr {
 impl SocksAddr {
     /// A domain override takes precedence over the IP form; the port always
     /// comes from `target`.
-    pub(crate) fn new(target: SocketAddr, target_domain: Option<&str>) -> Self {
+    pub(crate) fn new(target: SocketAddr, target_domain: Option<&str>) -> io::Result<Self> {
         if let Some(domain) = target_domain {
-            return SocksAddr::Domain(domain.to_string(), target.port());
+            if domain.is_empty() || domain.len() > u8::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "proxy target domain must contain 1..=255 bytes",
+                ));
+            }
+            return Ok(SocksAddr::Domain(domain.to_string(), target.port()));
         }
-        match target {
+        Ok(match target {
             SocketAddr::V4(v4) => SocksAddr::V4(v4),
             SocketAddr::V6(v6) => SocksAddr::V6(v6),
-        }
+        })
     }
 
     /// Length of the encoded form in bytes (same for every ATYP scheme).
@@ -105,7 +111,7 @@ impl SocksAddr {
             }
             SocksAddr::Domain(domain, port) => {
                 out.push(scheme.domain);
-                out.push(domain.len().min(u8::MAX as usize) as u8);
+                out.push(domain.len() as u8);
                 out.extend_from_slice(domain.as_bytes());
                 out.extend_from_slice(&port.to_be_bytes());
             }
@@ -143,6 +149,12 @@ impl SocksAddr {
             )))
         } else if atyp == scheme.domain {
             let len = take(cursor, 1)?[0] as usize;
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proxy wire domain is empty",
+                ));
+            }
             let domain = take(cursor, len)?;
             let domain = std::str::from_utf8(domain)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -213,8 +225,11 @@ fn take<'a>(cursor: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
 }
 
 /// Encode `target` (+ optional domain override) as SOCKS5-style wire bytes.
-pub(crate) fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-    SocksAddr::new(target, target_domain).to_vec()
+pub(crate) fn encode_address(
+    target: SocketAddr,
+    target_domain: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    Ok(SocksAddr::new(target, target_domain)?.to_vec())
 }
 
 /// Length in bytes of the SOCKS5-ATYP address at the start of `buf`.
@@ -231,6 +246,9 @@ pub(crate) fn socks_addr_len(buf: &[u8]) -> anyhow::Result<usize> {
                 anyhow::bail!("truncated domain socks address");
             }
             let len = buf[1] as usize;
+            if len == 0 {
+                anyhow::bail!("empty domain socks address");
+            }
             if buf.len() < 2 + len + 2 {
                 anyhow::bail!("truncated domain socks address");
             }
@@ -261,14 +279,14 @@ mod tests {
     #[test]
     fn test_encode_ipv4() {
         assert_eq!(
-            encode_address("93.184.216.34:80".parse().unwrap(), None),
+            encode_address("93.184.216.34:80".parse().unwrap(), None).unwrap(),
             vec![0x01, 93, 184, 216, 34, 0x00, 0x50]
         );
     }
 
     #[test]
     fn test_encode_ipv6() {
-        let encoded = encode_address("[2001:db8::1]:8080".parse().unwrap(), None);
+        let encoded = encode_address("[2001:db8::1]:8080".parse().unwrap(), None).unwrap();
         assert_eq!(encoded[0], 0x04);
         assert_eq!(
             &encoded[1..17],
@@ -283,12 +301,23 @@ mod tests {
 
     #[test]
     fn test_encode_domain() {
-        let encoded = encode_address("127.0.0.1:443".parse().unwrap(), Some("example.com"));
+        let encoded =
+            encode_address("127.0.0.1:443".parse().unwrap(), Some("example.com")).unwrap();
         assert_eq!(encoded[0], 0x03);
         assert_eq!(encoded[1], 11);
         assert_eq!(&encoded[2..13], b"example.com");
         assert_eq!(&encoded[13..15], &[0x01, 0xbb]);
         assert_eq!(encoded.len(), 15);
+    }
+
+    #[test]
+    fn test_encode_enforces_domain_length_bounds() {
+        let target = "127.0.0.1:443".parse().unwrap();
+        let maximum = encode_address(target, Some(&"x".repeat(255))).unwrap();
+        assert_eq!(maximum.len(), 259);
+        assert_eq!(maximum[1], 255);
+        assert!(encode_address(target, Some("")).is_err());
+        assert!(encode_address(target, Some(&"x".repeat(256))).is_err());
     }
 
     #[test]
@@ -350,6 +379,7 @@ mod tests {
         assert!(decode_socks5(&mut &[0x04, 1, 2][..]).is_err());
         assert!(decode_socks5(&mut &[0x05, 1, 2][..]).is_err());
         assert!(decode_socks5(&mut &[][..]).is_err());
+        assert!(decode_socks5(&mut &[0x03, 0, 0, 0][..]).is_err());
     }
 
     #[tokio::test]
@@ -371,11 +401,12 @@ mod tests {
 
     #[test]
     fn test_socks_addr_len() {
-        let v4 = encode_address("1.2.3.4:53".parse().unwrap(), None);
+        let v4 = encode_address("1.2.3.4:53".parse().unwrap(), None).unwrap();
         assert_eq!(socks_addr_len(&v4).unwrap(), 7);
-        let domain = encode_address("127.0.0.1:443".parse().unwrap(), Some("example.com"));
+        let domain = encode_address("127.0.0.1:443".parse().unwrap(), Some("example.com")).unwrap();
         assert_eq!(socks_addr_len(&domain).unwrap(), 15);
         assert!(socks_addr_len(&[0x05, 1, 2]).is_err());
         assert!(socks_addr_len(&[0x01, 1]).is_err());
+        assert!(socks_addr_len(&[0x03, 0, 0, 0]).is_err());
     }
 }

@@ -2068,7 +2068,8 @@ impl super::MuxSession for AnyTlsSession {
                 self.seq,
                 self.active_streams(),
             );
-            let address = addr::encode_address(target, target_domain);
+            let address = addr::encode_address(target, target_domain)
+                .map_err(|error| crate::session::OpenError::Refused(anyhow::Error::new(error)))?;
             self.open_stream_direct(address, permit)
                 .await
                 .map_err(|error| {
@@ -2093,7 +2094,8 @@ impl super::MuxSession for AnyTlsSession {
             let magic = addr::encode_address(
                 "0.0.0.0:0".parse().unwrap(),
                 Some(crate::proxy::uot::MAGIC_ADDRESS),
-            );
+            )
+            .expect("UoT magic domain fits SOCKS address");
             let (sid, rx, guard) = self.open_uot_stream(magic, permit).await.map_err(|error| {
                 if self.is_closed() {
                     crate::session::OpenError::Session(error)

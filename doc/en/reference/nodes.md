@@ -103,7 +103,7 @@ TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields 
 | `direct` | — | Yes | Yes | Reserved built-in bypass outbound; no share-link scheme |
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
 
-`network` may further disable packet dialing for Trojan, AnyTLS, and non-legacy VLESS. Legacy VLESS has no UDP, and VMess UDP is not implemented.
+`network` may further disable packet dialing for Trojan, AnyTLS, and non-legacy VLESS. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Legacy VLESS has no UDP, and VMess UDP is not implemented.
 
 VMess and VLESS nodes still parse without the `rprx` Cargo feature, but no handler is registered and dialing fails with `No handler for protocol`. `honk-core` enables `rprx` by default.
 
