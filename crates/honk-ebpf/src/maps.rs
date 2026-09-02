@@ -18,11 +18,9 @@ use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
 use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
 
-/// Maximum LPM trie size: 65,536 entries.
-/// Reduced from 2,048,000 to stay under kernel memory limits.
-/// Each entry consumes ~20 bytes of kernel memory, so 65,536 entries
-/// ≈ 1.3 MB per LPM map.
-pub const MAX_LPM_SIZE: usize = 65536;
+/// LPM tries allocate entries on demand; the shared limit preserves large
+/// GeoIP sets without reserving their maximum capacity at map creation.
+pub const MAX_LPM_SIZE: usize = honk_ebpf_common::MAX_LPM_SIZE as usize;
 pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
 pub const MAX_LPM_NUM: usize = MAX_MATCH_SET_LEN + 8;
 pub const MAX_COOKIE_PID_PNAME_MAPPING_NUM: usize = 65536;
