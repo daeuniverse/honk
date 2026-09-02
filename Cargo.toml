@@ -67,10 +67,10 @@ network-types = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 
 # TLS / crypto
-# REALITY hooks are carried by the 5.1.0 boring-sys fork below.
-boring = { version = "=5.1.0", features = ["mlkem"] }
-boring-sys = "=5.1.0"
-tokio-boring = "=5.1.0"
+# REALITY hooks are carried by the 5.2.0 boring-sys fork below.
+boring = { version = "=5.2.0", features = ["mlkem"] }
+boring-sys = "=5.2.0"
+tokio-boring = "=5.2.0"
 brotli = "8"
 webpki-root-certs = "1"
 foreign-types = "0.5"
@@ -168,7 +168,7 @@ strip = true
 
 [patch.crates-io]
 # honk rprx fork: preset X25519 keyshare + ClientHello fixup hooks (REALITY)
-boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "630d5030ee281371231f2c8c0b7206178032f62e" }
+boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b65ecaa69b7eefe3c2fecd074b97facd2" }
 # honk fork: bound receive fragmentation, expose delivery and flow-control state,
 # and allow runtime flow-control window tuning.
 quinn = { git = "https://github.com/Glassyiris/quinn", rev = "7f13718a" }
