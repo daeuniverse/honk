@@ -1,9 +1,9 @@
-//! VMess AEAD interop probe against the lab server (sing-box 1.13 vmess
-//! inbounds): 10.10.10.59:8446 (bare TCP) and 10.10.10.59:8445
+//! VMess AEAD interop probe against the lab server (sing-box vmess
+//! inbounds): 10.10.10.70:8446 (bare TCP) and 10.10.10.70:8445
 //! (ws+tls, self-signed cert, skip verify). Tunnels an HTTP/1.1 GET through
 //! the node and expects a real HTTP reply. The default target is the LAN
-//! bench server (.59 currently has no direct egress to the internet);
-//! pass a target to use e.g. www.gstatic.com:80 instead.
+//! bench server on the lab machine itself; pass a target to use e.g.
+//! www.gstatic.com:80 instead.
 //!
 //! Run: cargo run -p honk-outbound --features rprx --example vmess_lab59
 //!      [8446|8445|all] [host] [target-addr] [target-host] [port]
@@ -15,7 +15,7 @@ use honk_outbound::proxy::TcpOutbound;
 use honk_outbound::proxy::vmess::VmessHandler;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const HOST: &str = "10.10.10.59";
+const HOST: &str = "10.10.10.70";
 const UUID_TCP: &str = "82166345-d1bb-48f8-bd3b-cf0c152a863c";
 const UUID_WS: &str = "216b9040-3f89-4103-b4d6-5f013ee0b1c4";
 
