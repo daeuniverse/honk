@@ -37,7 +37,13 @@ node {
 }
 
 subscription {
-    sub: 'http://sub'
+    sub: 'http://sub'(honk/1.0 like)
+    # 需要独立刷新周期时使用块形式；interval: 0 可禁用定期刷新
+    # sub2: {
+    #     url: 'http://sub'
+    #     ua: 'honk/1.0'
+    #     interval: '10000s'
+    # }
 }
 
 # 对于中国大陆域名使用 alidns，其他使用 googledns 查询。

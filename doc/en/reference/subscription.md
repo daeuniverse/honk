@@ -4,18 +4,23 @@ This reference defines `subscription {}` entries, durable recovery, and the subs
 
 ## `subscription {}` syntax
 
-Each non-empty, non-comment line is `tag: URL`. The URL value may be single-quoted or bare:
+Each entry has one of these forms:
 
 ```dae
 subscription {
     primary: 'https://example.com/sub'
-    backup: https://example.net/sub
+    compatible: 'https://example.net/sub'(honk/1.0 like)
+    detailed: {
+        url: 'https://example.org/sub'
+        ua: 'honk/1.0'
+        interval: '10000s'
+    }
 }
 ```
 
-Here, “bare” means an unquoted URL value. Use a tag for ordinary HTTP(S) URLs: the current parser dispatches on the first `:`, so a tagless URL is not parsed as a tagless entry.
+The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append `(UA)` after a quoted URL to override it. The block form accepts `url`, optional `ua`, and optional `interval`; `interval` is a duration and defaults to `86400s`. Set it to `0` to disable periodic refresh.
 
-The dae surface sets only the subscription tag (`name`) and `url`. Every other field keeps its model default and is not settable in dae syntax. In particular, a dae subscription always has `sub_type: simple`; it does not auto-detect Clash YAML.
+The URL may otherwise be single-quoted or bare, but ordinary HTTP(S) URLs must have a tag because the parser dispatches on the first `:`. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`; dae subscriptions do not auto-detect Clash YAML.
 
 ## Internal model
 
@@ -25,8 +30,8 @@ The dae surface sets only the subscription tag (`name`) and `url`. Every other f
 | `name` | string | `""` | Yes, as the tag | Display tag and the value used by group `subtag(...)` filters. |
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
-| `update_interval` | u64 | `86400` | No | Periodic refresh interval in seconds; `0` disables periodic refresh. |
-| `user_agent` | string or null | `honk/<version>` | No | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
+| `update_interval` | u64 | `86400` | Yes, as block `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
+| `user_agent` | string or null | `honk/<version>` | Yes, as `(UA)` or block `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
@@ -42,7 +47,7 @@ The internal body-selector behavior is:
 | `sip008` | Currently uses the same share-link-list parser as `simple`. |
 | `custom` | Tries `simple`, then Clash YAML. |
 
-Only non-dae model consumers can set these values. `honk-tool sub` uses `custom` for a fetched URL.
+`honk-tool sub` uses `custom` for a fetched URL; dae entries remain `simple`.
 
 ## Fetch, persistence, and recovery
 

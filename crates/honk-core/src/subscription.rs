@@ -1397,6 +1397,51 @@ not-proxies: []
         );
     }
 
+    #[tokio::test]
+    async fn configured_subscription_user_agent_reaches_fetch_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 256];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&chunk[..size]);
+            }
+            assert!(String::from_utf8_lossy(&request).lines().any(|line| {
+                line.trim_end_matches('\r')
+                    .eq_ignore_ascii_case("user-agent: provider/2.0")
+            }));
+            let body = "socks5://127.0.0.1:1080#node";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let config = honk_config::parser::parse_dae_config(&format!(
+            "subscription {{\nprovider: {{\nurl: 'http://{address}/sub'\nua: 'provider/2.0'\ninterval: 0\n}}\n}}"
+        ))
+        .unwrap();
+
+        let nodes = SubscriptionManager::new()
+            .unwrap()
+            .fetch(&config.subscriptions[0])
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(nodes.len(), 1);
+    }
+
     #[test]
     fn subscription_cache_identity_is_stable_with_default_user_agent() {
         let mut sub = Subscription {

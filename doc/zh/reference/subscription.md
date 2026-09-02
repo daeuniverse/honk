@@ -4,18 +4,23 @@
 
 ## `subscription {}` 语法
 
-每个非空、非注释行都采用 `tag: URL`。URL 值可以使用单引号，也可以不加引号：
+每个条目支持以下两种形式：
 
 ```dae
 subscription {
     primary: 'https://example.com/sub'
-    backup: https://example.net/sub
+    compatible: 'https://example.net/sub'(honk/1.0 like)
+    detailed: {
+        url: 'https://example.org/sub'
+        ua: 'honk/1.0'
+        interval: '10000s'
+    }
 }
 ```
 
-这里的“裸 URL”是指不加引号的 URL 值。普通 HTTP(S) URL 必须带 tag：当前解析器按第一个 `:` 分派，因此无 tag 的 URL 不会被解析成无 tag 条目。
+简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua` 和可选的 `interval`；`interval` 是 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。
 
-dae 配置面只设置订阅 tag（`name`）和 `url`。其他所有字段都保留模型默认值，不能在 dae 语法中设置。特别是，dae 订阅始终为 `sub_type: simple`，不会自动检测 Clash YAML。
+其他情况下 URL 可以使用单引号，也可以不加引号；普通 HTTP(S) URL 必须带 tag，因为解析器按第一个 `:` 分派。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，不会自动检测 Clash YAML。
 
 ## 内部模型
 
@@ -25,8 +30,8 @@ dae 配置面只设置订阅 tag（`name`）和 `url`。其他所有字段都保
 | `name` | string | `""` | 是，作为 tag | 显示 tag，也是组 `subtag(...)` filter 使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
-| `update_interval` | u64 | `86400` | 否 | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
-| `user_agent` | string 或 null | `honk/<version>` | 否 | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
+| `update_interval` | u64 | `86400` | 是，对应块内 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
+| `user_agent` | string 或 null | `honk/<version>` | 是，对应 `(UA)` 或块内 `ua` | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
 | `headers` | `{key,value}[]` | `[]` | 否 | 有序的额外请求 header。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不会恢复、拉取或刷新。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型元数据；当前 core runtime 不更新它。 |
@@ -42,7 +47,7 @@ dae 配置面只设置订阅 tag（`name`）和 `url`。其他所有字段都保
 | `sip008` | 当前使用与 `simple` 相同的分享链接列表解析器。 |
 | `custom` | 先尝试 `simple`，再尝试 Clash YAML。 |
 
-只有非 dae 模型使用方才能设置这些值。`honk-tool sub` 拉取 URL 时使用 `custom`。
+`honk-tool sub` 拉取 URL 时使用 `custom`；dae 条目仍保持为 `simple`。
 
 ## 拉取、持久化与恢复
 
