@@ -457,10 +457,11 @@ group {
 subscription {
     my_sub: 'https://www.example.com/subscription/link'
     another_sub: 'https://example.com/another_sub'
+    bare: https://example.com/sub?filter=(hk)#token
 }
 "#;
         let config = parse_dae_config(input).unwrap();
-        assert_eq!(config.subscriptions.len(), 2);
+        assert_eq!(config.subscriptions.len(), 3);
         assert!(config.subscriptions.iter().all(|sub| sub.enabled));
         assert!(
             config
@@ -469,6 +470,38 @@ subscription {
                 .all(|sub| sub.update_interval == 86_400 && !sub.id.is_nil())
         );
         assert_ne!(config.subscriptions[0].id, config.subscriptions[1].id);
+        assert_eq!(
+            config.subscriptions[2].url,
+            "https://example.com/sub?filter=(hk)#token"
+        );
+    }
+
+    #[test]
+    fn test_parse_subscription_user_agent_forms() {
+        let input = r#"
+subscription {
+    detailed: {
+        url: 'http://example.test/subscription'
+        ua: 'provider/2.0'
+        interval: '10000s'
+    }
+    inline: 'http://example.test/sub'(honk/1.0 like)
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+        assert_eq!(config.subscriptions.len(), 2);
+
+        let detailed = &config.subscriptions[0];
+        assert_eq!(detailed.name, "detailed");
+        assert_eq!(detailed.url, "http://example.test/subscription");
+        assert_eq!(detailed.user_agent.as_deref(), Some("provider/2.0"));
+        assert_eq!(detailed.update_interval, 10_000);
+
+        let inline = &config.subscriptions[1];
+        assert_eq!(inline.name, "inline");
+        assert_eq!(inline.url, "http://example.test/sub");
+        assert_eq!(inline.user_agent.as_deref(), Some("honk/1.0 like"));
+        assert_eq!(inline.update_interval, 86_400);
     }
 
     #[test]

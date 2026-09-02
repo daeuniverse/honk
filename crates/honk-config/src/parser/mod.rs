@@ -1698,29 +1698,75 @@ fn parse_group_policy(policy: &str) -> Result<crate::group::GroupPolicy, crate::
 
 fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, crate::ConfigError> {
     let mut subs = Vec::new();
-    for line in section.body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+    let mut lines = section.body.lines();
+
+    while let Some(raw_line) = lines.next() {
+        let line = raw_line.trim();
+        if line.is_empty() {
             continue;
         }
-        if let Some(pos) = trimmed.find(':') {
-            let tag = trimmed[..pos].trim().trim_matches('\'').to_string();
-            let url = trimmed[pos + 1..].trim().trim_matches('\'').to_string();
+        let Some((tag, value)) = line.split_once(':') else {
+            continue;
+        };
+        let tag = unquote_filter_argument(tag).to_string();
+        let value = value.trim();
+
+        if value == "{" {
+            let mut body = String::new();
+            for raw_line in lines.by_ref() {
+                let setting = strip_unquoted_comment(raw_line.trim()).trim();
+                if setting == "}" {
+                    break;
+                }
+                if !setting.is_empty() {
+                    body.push_str(setting);
+                    body.push('\n');
+                }
+            }
+            let kv = parse_kv_pairs(&body);
+            let mut sub = Subscription {
+                name: tag,
+                ..Default::default()
+            };
+            if let Some(url) = kv.get("url") {
+                sub.url = url.clone();
+            }
+            if let Some(ua) = kv.get("ua") {
+                sub.user_agent = Some(ua.clone());
+            }
+            if let Some(interval) = kv.get("interval") {
+                sub.update_interval = parse_duration_secs(interval);
+            }
+            subs.push(sub);
+        } else {
+            let (url, user_agent) = parse_subscription_value(value);
             subs.push(Subscription {
                 name: tag,
                 url,
-                ..Default::default()
-            });
-        } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-            let url = trimmed[1..trimmed.len() - 1].to_string();
-            subs.push(Subscription {
-                name: url.clone(),
-                url,
+                user_agent,
                 ..Default::default()
             });
         }
     }
+
     Ok(subs)
+}
+
+fn parse_subscription_value(value: &str) -> (String, Option<String>) {
+    let value = value.trim();
+    if matches!(value.as_bytes().first().copied(), Some(b'\'' | b'"'))
+        && let Some(end) = quoted_end(value.as_bytes(), 0)
+        && let Some(ua) = value[end..]
+            .trim()
+            .strip_prefix('(')
+            .and_then(|ua| ua.strip_suffix(')'))
+    {
+        return (
+            value[1..end - 1].to_string(),
+            Some(unquote_filter_argument(ua).to_string()),
+        );
+    }
+    (unquote_filter_argument(value).to_string(), None)
 }
 
 fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
