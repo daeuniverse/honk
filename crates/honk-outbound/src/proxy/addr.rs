@@ -110,6 +110,10 @@ impl SocksAddr {
                 out.extend_from_slice(&v6.port().to_be_bytes());
             }
             SocksAddr::Domain(domain, port) => {
+                assert!(
+                    !domain.is_empty() && domain.len() <= u8::MAX as usize,
+                    "proxy wire domain must contain 1..=255 bytes"
+                );
                 out.push(scheme.domain);
                 out.push(domain.len() as u8);
                 out.extend_from_slice(domain.as_bytes());
@@ -318,6 +322,12 @@ mod tests {
         assert_eq!(maximum[1], 255);
         assert!(encode_address(target, Some("")).is_err());
         assert!(encode_address(target, Some(&"x".repeat(256))).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "proxy wire domain must contain 1..=255 bytes")]
+    fn test_encode_rejects_directly_constructed_oversized_domain() {
+        SocksAddr::Domain("x".repeat(256), 443).to_vec();
     }
 
     #[test]
