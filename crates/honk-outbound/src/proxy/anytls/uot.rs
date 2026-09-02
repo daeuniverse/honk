@@ -468,16 +468,39 @@ mod uot_transport_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn blocked_anytls_writer_becomes_terminal() {
+    async fn blocked_data_writer_backpressures_without_killing_session() {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let (transport, _server) = uot_test_transport_with_capacity(target, 64).await;
+        let (transport, mut server) = uot_test_transport_with_capacity(target, 64).await;
         let session = Arc::clone(&transport.session);
         let send =
             tokio::spawn(async move { transport.send_packet_confirmed(&vec![0x5a; 256]).await });
         tokio::task::yield_now().await;
+        tokio::time::advance(WRITER_IO_TIMEOUT * 10).await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
+
+        let mut sink = vec![0u8; 4096];
+        while !send.is_finished() {
+            tokio::task::yield_now().await;
+            let n = tokio::io::AsyncReadExt::read(&mut server, &mut sink)
+                .await
+                .unwrap();
+            assert!(n > 0);
+        }
+        send.await.unwrap().unwrap();
+        assert!(!session.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_control_write_becomes_terminal() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (transport, _server) = uot_test_transport_with_capacity(target, 64).await;
+        let session = Arc::clone(&transport.session);
+        session
+            .enqueue_control(CMD_SETTINGS, 0, bytes::Bytes::from(vec![0u8; 4096]))
+            .unwrap();
+        tokio::task::yield_now().await;
         tokio::time::advance(WRITER_IO_TIMEOUT + Duration::from_millis(1)).await;
-        let error = send.await.unwrap().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         tokio::task::yield_now().await;
         assert!(session.is_closed());
     }
