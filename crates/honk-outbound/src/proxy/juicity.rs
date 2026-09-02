@@ -249,7 +249,7 @@ impl JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = JuiceAddr::new(target, target_domain);
+        let addr = JuiceAddr::new(target, target_domain)?;
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
             |timeout| {
@@ -279,7 +279,7 @@ impl JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let stream_addr = JuiceAddr::new(target, target_domain);
+        let stream_addr = JuiceAddr::new(target, target_domain)?;
         let mut last_error = None;
         for _ in 0..2 {
             let (conn, state) = client.connection(connect_timeout).await?;

@@ -434,13 +434,7 @@ fn stream_request(
     target: std::net::SocketAddr,
     target_domain: Option<&str>,
 ) -> io::Result<Bytes> {
-    if target_domain.is_some_and(|domain| domain.len() > u8::MAX as usize) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "H2MUX target domain exceeds 255 bytes",
-        ));
-    }
-    let address = super::addr::encode_address(target, target_domain);
+    let address = super::addr::encode_address(target, target_domain)?;
     let mut request = BytesMut::with_capacity(2 + address.len());
     request.extend_from_slice(&flags.to_be_bytes());
     request.extend_from_slice(&address);

@@ -427,7 +427,7 @@ impl TcpOutbound for ShadowsocksHandler {
         debug!("Shadowsocks: connecting to {} for target {}", addr, target);
         let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
 
-        let header = addr::encode_address(target, target_domain);
+        let header = addr::encode_address(target, target_domain)?;
         self.start_relay(method, password, server, header, target, target_domain)
             .await
     }
@@ -443,7 +443,7 @@ impl TcpOutbound for ShadowsocksHandler {
         let config = node.shadowsocks().unwrap();
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = config.password.as_deref().unwrap_or("");
-        let header = addr::encode_address(target, target_domain);
+        let header = addr::encode_address(target, target_domain)?;
         self.start_relay(method, password, server, header, target, target_domain)
             .await
     }
@@ -484,7 +484,7 @@ impl ShadowsocksHandler {
         let config = node.shadowsocks().unwrap();
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = config.password.as_deref().unwrap_or("");
-        let socks = addr::encode_address(target, target_domain);
+        let socks = addr::encode_address(target, target_domain)?;
 
         let crypto = if is_2022_method(method) {
             SsUdpCrypto::V2022(Box::new(Ss2022UdpSession::new(Ss2022Method::new(
@@ -835,7 +835,8 @@ mod tests {
         let socks = addr::encode_address(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53)),
             None,
-        );
+        )
+        .unwrap();
         let payload = b"\xde\xad\xbe\xef dns query";
         let packet = crypto.seal(&socks, payload).unwrap();
         // salt + tag minimum
@@ -855,7 +856,7 @@ mod tests {
             crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
                 LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
             )),
-            socks: addr::encode_address(target, None),
+            socks: addr::encode_address(target, None).unwrap(),
             target,
         });
         let guard = transport.crypto.lock().await;
@@ -886,7 +887,8 @@ mod tests {
         let socks = addr::encode_address(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443)),
             Some("one.one"),
-        );
+        )
+        .unwrap();
         let payload = b"quic initial";
         let packet = crypto.seal(&socks, payload).unwrap();
         let opened = crypto.open(&packet).unwrap();
@@ -992,7 +994,7 @@ mod tests {
                 let (n, src) = server.recv_from(&mut buf).await.unwrap();
                 let payload = server_crypto.open(&buf[..n]).unwrap();
                 let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
-                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None);
+                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None).unwrap();
                 let packet = server_crypto.seal(&socks, &reply).unwrap();
                 server.send_to(&packet, src).await.unwrap();
             }
@@ -1154,7 +1156,7 @@ mod tests {
                 let (n, src) = server.recv_from(&mut buf).await.unwrap();
                 let payload = server_crypto.open(&buf[..n]).unwrap();
                 let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
-                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None);
+                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None).unwrap();
                 let packet = server_crypto.seal(&socks, &reply).unwrap();
                 server.send_to(&packet, src).await.unwrap();
             }

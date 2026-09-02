@@ -541,9 +541,10 @@ UoT delivery 使用非阻塞 `try_send`。UoT sink 满时会移除该 sink 并�
 ### Lazy UoT 创建
 
 打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT connect request。
-第一条 datagram 符合 AnyTLS frame-size 上限时，connect request 与编码后
-datagram 作为一个有序 PSH 一起发送。组合过大时先发送 confirmed setup，
-再发送 datagram。这样避免原本空的 setup round trip，同时不允许首包重放。
+connect request 与第一条编码后 datagram 作为一个有序 PSH 一起发送。payload
+上限为 16 KiB，与 anytls-go 0.0.13 及 sing v0.5.1 的 relay buffer 一致；
+更大的输入会在消耗 lazy setup 或破坏逻辑 stream 之前失败。这样既避免原本
+空的 setup round trip，也不允许首包重放。
 
 ## 冷 URLTest speculative preparation
 

@@ -103,7 +103,7 @@ TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所�
 | `direct` | — | 是 | 是 | 保留的内置直连出站；没有分享链接 scheme |
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接 scheme |
 
-`network` 还可关闭 Trojan、AnyTLS 与非 legacy VLESS 的 packet 拨号。Legacy VLESS 没有 UDP，VMess UDP 尚未实现。
+`network` 还可关闭 Trojan、AnyTLS 与非 legacy VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。Legacy VLESS 没有 UDP，VMess UDP 尚未实现。
 
 没有 `rprx` Cargo feature 时，VMess 与 VLESS 节点仍能解析，但不会注册 handler，拨号以 `No handler for protocol` 失败。`honk-core` 默认启用 `rprx`。
 

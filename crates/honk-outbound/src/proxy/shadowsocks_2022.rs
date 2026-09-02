@@ -790,7 +790,10 @@ mod tests {
 
     fn udp_target() -> (Vec<u8>, SocketAddr) {
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        (crate::proxy::addr::encode_address(target, None), target)
+        (
+            crate::proxy::addr::encode_address(target, None).unwrap(),
+            target,
+        )
     }
 
     /// Server-side parse of an AES-construction client packet; returns
@@ -1150,7 +1153,7 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let server_method = Ss2022Method::new("2022-blake3-aes-256-gcm", psk_b64).unwrap();
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let socks = crate::proxy::addr::encode_address(target, None);
+        let socks = crate::proxy::addr::encode_address(target, None).unwrap();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];

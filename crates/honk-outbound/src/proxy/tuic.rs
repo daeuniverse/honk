@@ -52,8 +52,8 @@ enum TuicAddr {
 }
 
 impl TuicAddr {
-    fn new(target: SocketAddr, target_domain: Option<&str>) -> Self {
-        TuicAddr::Addr(SocksAddr::new(target, target_domain))
+    fn new(target: SocketAddr, target_domain: Option<&str>) -> io::Result<Self> {
+        Ok(TuicAddr::Addr(SocksAddr::new(target, target_domain)?))
     }
 
     fn encoded_len(&self) -> usize {
@@ -511,7 +511,7 @@ impl TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = TuicAddr::new(target, target_domain);
+        let addr = TuicAddr::new(target, target_domain)?;
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
             |timeout| {
@@ -563,7 +563,7 @@ impl TuicHandler {
             packet_id: AtomicU16::new(0),
             rx: tokio::sync::Mutex::new(rx),
             defrag: tokio::sync::Mutex::new(Defragmenter::new(u16::MAX as usize)),
-            target_addr: TuicAddr::new(target, target_domain),
+            target_addr: TuicAddr::new(target, target_domain)?,
             target,
         }))
     }

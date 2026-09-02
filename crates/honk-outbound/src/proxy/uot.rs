@@ -72,14 +72,8 @@ pub(crate) fn connect_request(
     target: SocketAddr,
     target_domain: Option<&str>,
 ) -> io::Result<Bytes> {
-    if target_domain.is_some_and(|domain| domain.len() > u8::MAX as usize) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "UoT target domain exceeds 255 bytes",
-        ));
-    }
     let mut request = vec![1];
-    request.extend(addr::encode_address(target, target_domain));
+    request.extend(addr::encode_address(target, target_domain)?);
     Ok(Bytes::from(request))
 }
 
