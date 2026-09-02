@@ -407,15 +407,16 @@ Technology stack), so a build machine needs that checkout at the pinned path.
 Cross builds use the `ci/zig*` wrappers rather than cross containers.
 
 REALITY / xtls-rprx-vision interop is exercised against two live servers, not
-the unprivileged suite: lab peer `10.10.10.59` (sing-box 1.13, systemd
+the unprivileged suite: lab peer `10.10.10.70` (sing-box 1.12, systemd
 `sing-box-rprx`, config `/etc/sing-box/rprx.json` — 8443 vless+reality+vision,
 8444 vless+reality, 8445 vmess+ws+tls self-signed so the node must set
-`skip_cert_verify`/`insecure=1`, 8446 vmess bare tcp) and the degraded public
+`skip_cert_verify`/`insecure=1`, 8446 vmess bare tcp; LAN bench HTTP server on
+`10.10.10.70:18080` via systemd `bench-http18080`) and the degraded public
 peer `103.238.129.118` (Xray 26.3.27, same port matrix, `xray-rprx.service`,
 ~75 ms / ~15% loss link). Use a REALITY `dest` whose TLS Certificate message
 stays **under 8 KiB** (sing-box reality buffers 8192 bytes; `dl.google.com`
 works, `www.microsoft.com` at 8273 B fails). JA4 fingerprints were verified
-with the `ja4probe` tool on .59 (`/usr/local/bin/ja4probe`, source at
+with the `ja4probe` tool on .70 (`/usr/local/bin/ja4probe`, source at
 `/root/code/ja4probe`). `honk-outbound/examples/` carries the lab drivers
 (`reality_hook_spike.rs`, `reality_lab59.rs`).
 

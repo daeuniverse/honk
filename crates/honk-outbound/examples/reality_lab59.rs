@@ -1,9 +1,8 @@
-//! REALITY interop probe against the lab server at 10.10.10.59:8443
+//! REALITY interop probe against the lab server at 10.10.10.70:8443
 //! (vless+reality+xtls-rprx-vision). Positive case: TLS handshake +
 //! REALITY ed25519 server authentication + a minimal VLESS request
-//! tunneling an HTTP/1.1 HEAD to the LAN bench server (the lab has no
-//! direct internet egress). Negative case: a wrong public key must fail
-//! closed at the server-authentication step.
+//! tunneling an HTTP/1.1 request to the LAN bench server. Negative case:
+//! a wrong public key must fail closed at the server-authentication step.
 //!
 //! Run: cargo run -p honk-outbound --example reality_lab59
 
@@ -13,13 +12,12 @@ use honk_config::node::Node;
 use honk_outbound::reality::{RealityConfig, parse_reality_config, reality_connect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const ADDR: &str = "10.10.10.59:8443";
+const ADDR: &str = "10.10.10.70:8443";
 const UUID: &str = "4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a";
-const PUBLIC_KEY: &str = "ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518";
+const PUBLIC_KEY: &str = "zWJstB-evcsIr3bZlIOIhIfQsSWt98gsTkMZ72OcEEU";
 const SHORT_ID: &str = "a1b2c3d4e5f60718";
 const SNI: &str = "dl.google.com";
-// LAN bench server: the lab has no direct internet egress, so the probe
-// target lives on the probe machine itself.
+// LAN bench server: lives on the lab machine itself.
 const TARGET_HOST: &str = "10.10.10.70";
 const TARGET_PORT: u16 = 18080;
 
