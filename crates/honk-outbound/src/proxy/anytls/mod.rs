@@ -765,6 +765,9 @@ const WRITER_QUEUE_CAP: usize = 1024;
 const WRITER_CONTROL_RESERVED: usize = 128;
 /// sing-anytls bounds control writes at five seconds. A stuck shared writer
 /// must become terminal instead of remaining selectable by the session pool.
+/// Data batches stay unbounded like upstream: under uplink congestion the
+/// queue cap backpressures streams instead of killing the session and every
+/// sibling flow with it.
 const WRITER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WriterQueue {
@@ -952,18 +955,28 @@ async fn session_writer(
         // before the write: frames arriving while a blocked flush is still
         // in flight belong to the window and must count as session activity.
         let pre_write_activity = session.rx_frame_seq.load(Ordering::Relaxed);
-        let succeeded = matches!(
-            tokio::time::timeout(WRITER_IO_TIMEOUT, async {
-                if apply_padding {
-                    write_padded(&mut write, &buf, &padding, packet).await?;
-                } else {
-                    write.write_all(&buf).await?;
-                }
-                write.flush().await
-            })
-            .await,
-            Ok(Ok(()))
-        );
+        let control_only = !batch
+            .iter()
+            .any(|cmd| matches!(cmd, FrameCommand::Data { .. }));
+        let write_op = async {
+            if apply_padding {
+                write_padded(&mut write, &buf, &padding, packet).await?;
+            } else {
+                write.write_all(&buf).await?;
+            }
+            write.flush().await
+        };
+        let write_result = if control_only {
+            tokio::time::timeout(WRITER_IO_TIMEOUT, write_op).await
+        } else {
+            Ok(write_op.await)
+        };
+        let write_error = match &write_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("{e}")),
+            Err(_) => Some(format!("write timed out after {WRITER_IO_TIMEOUT:?}")),
+        };
+        let succeeded = write_error.is_none();
         for command in &mut batch {
             match command {
                 FrameCommand::Control {
@@ -981,9 +994,12 @@ async fn session_writer(
         }
 
         batch.clear();
-        if !succeeded {
-            debug!("AnyTLS session {} writer failed, closing", session.seq);
-            session.fail(anyhow::anyhow!("writer task write failed"));
+        if let Some(reason) = write_error {
+            debug!(
+                "AnyTLS session {} writer failed, closing: {}",
+                session.seq, reason
+            );
+            session.fail(anyhow::anyhow!("writer task write failed: {reason}"));
             break;
         }
         if session.is_closed() {
