@@ -701,6 +701,7 @@ struct AdaptiveFlowSampler {
     last_received_bytes: u64,
     last_sent_bytes: u64,
     last_stream_data_blocked: u64,
+    last_data_blocked: u64,
     receive_rate_ewma: u64,
     send_rate_ewma: u64,
     connection_receive_high_samples: u8,
@@ -714,6 +715,7 @@ impl AdaptiveFlowSampler {
             last_received_bytes: stats.flow_control.received_bytes,
             last_sent_bytes: stats.flow_control.sent_bytes,
             last_stream_data_blocked: stats.frame_rx.stream_data_blocked,
+            last_data_blocked: stats.frame_rx.data_blocked,
             receive_rate_ewma: 0,
             send_rate_ewma: 0,
             connection_receive_high_samples: 0,
@@ -743,10 +745,15 @@ impl AdaptiveFlowSampler {
             .frame_rx
             .stream_data_blocked
             .saturating_sub(self.last_stream_data_blocked);
+        let data_blocked = stats
+            .frame_rx
+            .data_blocked
+            .saturating_sub(self.last_data_blocked);
         self.last_sample_ms = now;
         self.last_received_bytes = stats.flow_control.received_bytes;
         self.last_sent_bytes = stats.flow_control.sent_bytes;
         self.last_stream_data_blocked = stats.frame_rx.stream_data_blocked;
+        self.last_data_blocked = stats.frame_rx.data_blocked;
         self.receive_rate_ewma = flow_rate_ewma(
             self.receive_rate_ewma,
             bytes_per_second(received, elapsed_ms),
@@ -766,19 +773,30 @@ impl AdaptiveFlowSampler {
                 stats.flow_control.receive_window,
                 receive_credit_pressured,
             );
+        // DATA_BLOCKED is direct peer evidence that our advertised window is
+        // the constraint: it fires below the RTT gate and independent of the
+        // goodput estimate, which is understated exactly while the window
+        // throttles the flow. Blocked growth doubles the current window
+        // because 2xBDP derived from that throttled rate would be a no-op.
+        let receive_blocked = data_blocked != 0;
         update_flow_window(
             &mut self.connection_receive_high_samples,
             &mut profile.connection_receive_floor,
             &mut profile.last_connection_receive_adjust_ms,
-            received != 0 && receive_near,
+            (received != 0 && receive_near) || receive_blocked,
             received == 0 && receive_near && receive_credit_pressured,
             receive_bdp,
+            if receive_blocked {
+                stats.flow_control.receive_window.saturating_mul(2)
+            } else {
+                0
+            },
             now,
         );
         update_stream_receive_window(
             &mut profile.stream_receive_floor,
             &mut profile.last_stream_receive_adjust_ms,
-            stats.path.rtt >= FLOW_CONTROL_MIN_RTT && stream_data_blocked != 0,
+            stream_data_blocked != 0,
             stats.flow_control.stream_receive_window,
             now,
         );
@@ -799,6 +817,7 @@ impl AdaptiveFlowSampler {
             sent != 0 && send_near,
             sent == 0 && send_near && send_credit_pressured,
             send_bdp,
+            0,
             now,
         );
     }
@@ -837,6 +856,7 @@ fn adaptive_window(bdp: u64) -> u64 {
         .min(FLOW_CONTROL_MAX_WINDOW)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_flow_window(
     high_samples: &mut u8,
     floor: &mut u64,
@@ -844,6 +864,7 @@ fn update_flow_window(
     high: bool,
     preserve: bool,
     bdp: u64,
+    min_target: u64,
     now: u64,
 ) {
     if high {
@@ -859,7 +880,9 @@ fn update_flow_window(
     {
         return;
     }
-    let target = adaptive_window(bdp);
+    let target = adaptive_window(bdp)
+        .max(min_target)
+        .min(FLOW_CONTROL_MAX_WINDOW);
     if target > *floor {
         *floor = target;
         *last_adjust_ms = Some(now);
@@ -1582,6 +1605,7 @@ mod path_health_tests {
                 true,
                 false,
                 4 * MIB,
+                0,
                 now,
             );
         }
@@ -1595,11 +1619,48 @@ mod path_health_tests {
                 true,
                 false,
                 12 * MIB,
+                0,
                 now,
             );
         }
         assert_eq!(seeded.connection_receive_floor, 24 * MIB);
         assert_eq!(seeded.last_connection_receive_adjust_ms, Some(6));
+    }
+
+    #[test]
+    fn blocked_frames_raise_windows_below_the_rtt_gate() {
+        const MIB: u64 = 1 << 20;
+        let mut stats = flow_stats(0, 0, 8 * MIB);
+        stats.path.rtt = Duration::from_millis(50);
+        let mut sampler = AdaptiveFlowSampler::new(&stats, 1_000);
+        let mut profile = AdaptiveFlowProfile::default();
+
+        // Throttled by the window: goodput-derived BDP stays far below the
+        // window, so the estimator path must stay silent at this RTT.
+        for step in 1..=3 {
+            stats.flow_control.received_bytes += MIB;
+            sampler.observe(&mut profile, &stats, 1_000 + step * 1_000);
+        }
+        assert_eq!(
+            (
+                profile.connection_receive_floor,
+                profile.stream_receive_floor,
+            ),
+            (0, 0),
+        );
+
+        stats.frame_rx.stream_data_blocked += 1;
+        stats.frame_rx.data_blocked += 1;
+        sampler.observe(&mut profile, &stats, 5_000);
+        assert_eq!(profile.stream_receive_floor, 16 * MIB);
+        assert_eq!(profile.connection_receive_floor, 0);
+
+        for step in 6..=7 {
+            stats.flow_control.received_bytes += MIB;
+            stats.frame_rx.data_blocked += 1;
+            sampler.observe(&mut profile, &stats, step * 1_000);
+        }
+        assert_eq!(profile.connection_receive_floor, 16 * MIB);
     }
 
     #[test]

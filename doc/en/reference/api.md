@@ -162,9 +162,11 @@ include completed pooled connections.
 Pooled TUIC, Juicity, and Hysteria2 connections sample this flow-control state
 once per second. Ten-second receive and send goodput EWMAs require at least
 80 ms RTT and three consecutive high-BDP samples before honk raises the live
-connection receive or send floor toward `2 x BDP`. A peer
-`STREAM_DATA_BLOCKED` frame independently doubles the stream receive floor;
-aggregate connection goodput cannot identify one stream's demand. A
+connection receive or send floor toward `2 x BDP`. Peer `DATA_BLOCKED` and
+`STREAM_DATA_BLOCKED` frames are direct evidence that an advertised window is
+the constraint: they bypass the RTT gate and double the connection or stream
+receive floor instead — the goodput-derived estimate is understated exactly
+while a window throttles the flow. A
 zero-progress sample preserves but does not advance a connection-level streak
 only while its credit remains pressured. Each floor has its own five-minute
 promotion cooldown, and automatic promotions are capped at 32 MiB without
