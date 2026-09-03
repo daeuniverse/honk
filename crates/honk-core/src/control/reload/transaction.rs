@@ -465,9 +465,12 @@ impl ControlPlane {
                     .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
                 new_domain_routes
                     .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
-                let routing_publication_needed = self
-                    .routing_publication_dirty
-                    .load(std::sync::atomic::Ordering::Acquire)
+                // An unhealthy latch may have left the routing bank torn;
+                // force a full re-push so a completed slow path repairs it.
+                let routing_publication_needed = !self.is_datapath_healthy()
+                    || self
+                        .routing_publication_dirty
+                        .load(std::sync::atomic::Ordering::Acquire)
                     || !old_plan.semantically_eq(&new_plan)
                     || !domain_routes_eq(&old_domain_routes, &new_domain_routes);
                 let bitmap_generation_fence_needed =
@@ -658,6 +661,10 @@ impl ControlPlane {
         }
         info!("Configuration applied — {} routes active", route_count);
 
+        // A completed slow path has republished everything a latch could
+        // have torn; re-arm.
+        self.datapath_healthy
+            .store(true, std::sync::atomic::Ordering::Release);
         self.stop_reload_rejection_if_healthy(drain);
         true
     }
@@ -732,6 +739,7 @@ impl ControlPlane {
     fn stop_reload_rejection_if_healthy(&self, drain: &DrainTracker) {
         if self.is_datapath_healthy() {
             drain.stop_rejecting();
+            self.drain_tracker.stop_rejecting();
         } else {
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();

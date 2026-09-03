@@ -136,7 +136,7 @@ An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP`
 4. Stage and activate routing, then publish the new outbound registry, DNS runtime pointer, router, config, groups, and projection snapshot as one serialized generation change.
 5. Publish new static datapath flags, reopen pending admission, and reopen NFQUEUE last. Only then stop rejecting new flows.
 
-A pre-commit build failure leaves the current generation untouched. If publication fails after the fence, the control plane replays the exact old routing plan, restores old static flags, and reopens the old generation. If restoration cannot prove the datapath healthy, admission remains rejected.
+A pre-commit build failure leaves the current generation untouched. If publication fails after the fence, the control plane replays the exact old routing plan, restores old static flags, and reopens the old generation. If restoration cannot prove the datapath healthy, admission remains rejected. A later reload that completes the full publication path — routing re-push included, which is forced while the latch is set — re-arms admission, because every map a failure could have torn has been republished by then (group-connectivity republication stays warn-only and fail-open by policy).
 
 `DnsServiceProvider` is the coherent DNS-generation pointer. A request lease retains its generation's forwarder, projection, transport pools, and outbound runtime until retirement. The outbound registry is also generation-owned: unchanged node runtimes transfer only at the commit point, the old registry marks those runtimes as moved, and then begins graceful retirement. Existing streams and `Ready` UDP endpoints keep their references while old reusable pools stop accepting new work and drain.
 

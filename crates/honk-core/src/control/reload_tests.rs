@@ -1127,6 +1127,33 @@ async fn unchanged_reload_retries_dirty_startup_routing() {
 }
 
 #[tokio::test]
+async fn dirty_startup_routing_is_republished_by_periodic_retry() {
+    let cp = test_cp().await;
+    cp.routing_publication_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+    let before = cp.ebpf.read().await.active_routing_generation().unwrap();
+
+    cp.repush_routing_if_dirty().await;
+
+    assert_ne!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        before
+    );
+    assert!(
+        !cp.routing_publication_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    let stable = cp.ebpf.read().await.active_routing_generation().unwrap();
+    cp.repush_routing_if_dirty().await;
+    assert_eq!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        stable,
+        "clean flag must make the retry a no-op"
+    );
+}
+
+#[tokio::test]
 async fn changed_hosts_file_rebuilds_reload_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("hosts.rules");
@@ -1258,7 +1285,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
 }
 
 #[tokio::test]
-async fn replay_failure_marks_unhealthy_and_rejects_connections() {
+async fn replay_failure_latches_until_a_successful_reload_repairs() {
     let cp = test_cp().await;
     cp.ebpf
         .write()
@@ -1272,14 +1299,26 @@ async fn replay_failure_marks_unhealthy_and_rejects_connections() {
     assert!(!cp.is_datapath_healthy());
     assert!(cp.drain_tracker.should_reject());
 
+    // A build-phase rejection changes nothing and must not re-arm the latch.
     let mut invalid = Config::default();
     invalid.dns.upstream[0].address.clear();
     cp.apply_runtime_config(invalid, &DrainTracker::new()).await;
-    cp.apply_runtime_config(Config::default(), &DrainTracker::new())
-        .await;
-
     assert!(!cp.is_datapath_healthy());
     assert!(cp.drain_tracker.should_reject());
+
+    // The next completed slow path re-pushes the torn bank and re-arms.
+    let bank_before = cp.ebpf.read().await.active_routing_generation().unwrap();
+    assert!(
+        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+            .await
+    );
+    assert!(cp.is_datapath_healthy());
+    assert!(!cp.drain_tracker.should_reject());
+    assert_ne!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        bank_before,
+        "an unchanged config must still re-push while latched unhealthy"
+    );
 }
 
 #[tokio::test]

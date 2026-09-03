@@ -909,6 +909,22 @@ async fn test_block_probe_exempt() {
     assert!(set.is_alive_for(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4));
 }
 
+/// block refuses flows by policy; those refusals must never mark it dead,
+/// or a Selector choice of `block` would silently fall through to another
+/// member once the strike threshold is reached.
+#[test]
+fn test_block_ignores_traffic_failures() {
+    let set = AliveDialerSet::new();
+    set.register_node(BLOCK_NODE_ID, "block".into(), String::new());
+    for _ in 0..20 {
+        set.report_unavailable_traffic(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.report_unavailable_forced(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.record_dial_failure(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+    }
+    assert!(set.is_alive_for(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.is_alive_for(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V6));
+}
+
 /// direct is probed against the dedicated direct check target (bootstrap
 /// resolver; default 223.5.5.5:53) instead of the proxy check URL, so the
 /// clash API gets a real direct latency. Uses a loopback listener as the

@@ -17,6 +17,24 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
+/// Fires the fatal channel when a critical background task exits for any
+/// reason (return, panic, abort): otherwise the process stays alive but
+/// deaf. Shutdown aborts land after the run loop has left its select, so
+/// they never deliver.
+pub(super) struct CriticalTaskExit {
+    name: &'static str,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+}
+
+impl Drop for CriticalTaskExit {
+    fn drop(&mut self) {
+        let _ = self.fatal_tx.send(anyhow::anyhow!(
+            "critical background task '{}' exited",
+            self.name
+        ));
+    }
+}
+
 async fn accept_tcp_with_admission(
     tcp4_listener: &tokio::io::unix::AsyncFd<std::net::TcpListener>,
     tcp6_listener: Option<&tokio::io::unix::AsyncFd<std::net::TcpListener>>,
@@ -220,6 +238,37 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
+    /// (Re)push the active routing plan when a previous publication failed;
+    /// reloads clear the dirty flag too. Without this retry a failed startup
+    /// push drops every new LAN flow until a reload or network event.
+    ///
+    /// `push_plan` stages with `active=None`, which prunes old-generation
+    /// LPM keys; that is safe here only because dirty means no publication
+    /// has ever succeeded, so no live readers exist on the other bank.
+    pub(in crate::control) async fn repush_routing_if_dirty(&self) {
+        if !self
+            .routing_publication_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        // Lock order matches the reload transaction (ebpf before
+        // active_routing_plan); the reverse would deadlock against it.
+        let mut ebpf = self.ebpf.write().await;
+        let plan = self.active_routing_plan.read().clone();
+        match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
+            Ok(_) => {
+                routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
+                self.routing_publication_dirty
+                    .store(false, std::sync::atomic::Ordering::Release);
+                info!("routing publication retry succeeded");
+            }
+            Err(e) => {
+                warn!("Failed to push routing to eBPF (non-fatal): {}", e);
+            }
+        }
+    }
+
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
@@ -255,8 +304,19 @@ impl ControlPlane {
                 Some(l)
             }
             Err(e) => {
-                warn!("TPROXY TCPv6 listener unavailable: {}", e);
-                None
+                // Same rule as the UDPv6 listeners: only a host without an
+                // IPv6 stack may continue with the slot empty (the published
+                // v4 fd fallback cannot accept v6 flows).
+                let no_ipv6 = e
+                    .downcast_ref::<io::Error>()
+                    .and_then(|error| error.raw_os_error())
+                    == Some(libc::EAFNOSUPPORT);
+                if no_ipv6 {
+                    warn!("TPROXY TCPv6 listener unavailable: {}", e);
+                    None
+                } else {
+                    return Err(e.context("bind TPROXY TCPv6 listener"));
+                }
             }
         };
 
@@ -288,8 +348,20 @@ impl ControlPlane {
                     sockets
                 }
                 Err(e) => {
-                    warn!("TPROXY UDPv6 listener unavailable: {}", e);
-                    Vec::new()
+                    // Only a host without an IPv6 stack may run with empty
+                    // sk_lookup slots; any other failure would black-hole
+                    // proxied IPv6 UDP until restart (slots are published
+                    // once), so fail startup and let the supervisor retry.
+                    let no_ipv6 = e
+                        .downcast_ref::<io::Error>()
+                        .and_then(|error| error.raw_os_error())
+                        == Some(libc::EAFNOSUPPORT);
+                    if no_ipv6 {
+                        warn!("TPROXY UDPv6 listener unavailable: {}", e);
+                        Vec::new()
+                    } else {
+                        return Err(e.context("bind TPROXY UDPv6 listener group"));
+                    }
                 }
             };
 
@@ -332,6 +404,7 @@ impl ControlPlane {
 
         // One receive loop per listener socket. The datapath hashes flows
         // into the group (see the comment above), so loops are flow-disjoint.
+        let (critical_fatal_tx, mut critical_fatal_rx) = mpsc::unbounded_channel();
         {
             let state = UdpLoopState {
                 udp_pool: Arc::clone(&self.udp_pool),
@@ -343,19 +416,22 @@ impl ControlPlane {
                 handle: self.spawn_handle(),
             };
             let mut tasks = self.background_tasks.lock().await;
-            for socket in &udp4_sockets {
-                tasks.push(tokio::spawn(udp_listener_loop(
-                    state.clone(),
-                    Arc::clone(socket),
-                    "v4",
-                )));
-            }
-            for socket in &udp6_sockets {
-                tasks.push(tokio::spawn(udp_listener_loop(
-                    state.clone(),
-                    Arc::clone(socket),
-                    "v6",
-                )));
+            for (socket, family) in udp4_sockets
+                .iter()
+                .map(|socket| (socket, "v4"))
+                .chain(udp6_sockets.iter().map(|socket| (socket, "v6")))
+            {
+                let state = state.clone();
+                let socket = Arc::clone(socket);
+                let fatal_tx = critical_fatal_tx.clone();
+                let name = match family {
+                    "v4" => "udp_listener_loop/v4",
+                    _ => "udp_listener_loop/v6",
+                };
+                tasks.push(tokio::spawn(async move {
+                    let _exit = CriticalTaskExit { name, fatal_tx };
+                    udp_listener_loop(state, socket, family).await;
+                }));
             }
         }
 
@@ -394,26 +470,16 @@ impl ControlPlane {
         #[cfg(not(feature = "ebpf"))]
         let mut nfqueue_runtime = ();
 
-        {
-            let plan = self.active_routing_plan.read().clone();
-            let mut ebpf = self.ebpf.write().await;
-            match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
-                Ok(_) => {
-                    routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
-                    self.routing_publication_dirty
-                        .store(false, std::sync::atomic::Ordering::Release);
-                }
-                Err(e) => {
-                    warn!("Failed to push routing to eBPF (non-fatal): {}", e);
-                }
-            }
-        }
+        self.repush_routing_if_dirty().await;
         let (mut udp_removal_task, mut udp_removal_fatal_rx) = {
             let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = self.background_tasks.lock().await;
 
             let janitor = BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone());
-            tasks.push(janitor.spawn());
+            tasks.push(janitor.spawn_supervised(CriticalTaskExit {
+                name: "bpf_janitor",
+                fatal_tx: critical_fatal_tx.clone(),
+            }));
             info!("BPF map janitor started");
 
             let removal_task = spawn_udp_removal_worker(
@@ -672,6 +738,12 @@ impl ControlPlane {
                     }));
                     break;
                 }
+                error = critical_fatal_rx.recv() => {
+                    fatal_error = Some(error.unwrap_or_else(|| {
+                        anyhow::anyhow!("critical task fatal channel closed unexpectedly")
+                    }));
+                    break;
+                }
                 event = wait_nfqueue_event(&mut nfqueue_runtime, &fatal_ebpf) => {
                     match event {
                         NfqueueRuntimeEvent::Fatal(error) => {
@@ -699,6 +771,7 @@ impl ControlPlane {
                         loop_count,
                         drain.active_count()
                     );
+                    self.repush_routing_if_dirty().await;
                     continue;
                 }
                 accept_result = accept_tcp_with_admission(
@@ -1378,5 +1451,30 @@ mod tests {
         accepted.read_exact(&mut payload).await.unwrap();
         assert_eq!(&payload, b"hello");
         assert_eq!(stats.tcp_snapshot().capacity_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn critical_task_exit_fires_on_drop() {
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        {
+            let _guard = CriticalTaskExit {
+                name: "probe_task",
+                fatal_tx,
+            };
+        }
+        let error = fatal_rx.recv().await.expect("guard drop must notify");
+        assert!(error.to_string().contains("probe_task"));
+    }
+
+    #[tokio::test]
+    async fn critical_task_exit_silent_while_alive() {
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        let _guard = CriticalTaskExit {
+            name: "probe_task",
+            fatal_tx,
+        };
+        fatal_rx
+            .try_recv()
+            .expect_err("a live guard must not notify");
     }
 }
