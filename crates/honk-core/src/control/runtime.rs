@@ -243,6 +243,10 @@ impl ControlPlane {
     /// Reloads clear the dirty flag too; this retry keeps a failed startup
     /// push from dropping every new LAN flow until someone happens to
     /// reload on a quiet network.
+    ///
+    /// `push_plan` stages with `active=None`, which prunes old-generation
+    /// LPM keys; that is safe here only because dirty means no publication
+    /// has ever succeeded, so no live readers exist on the other bank.
     pub(in crate::control) async fn repush_routing_if_dirty(&self) {
         if !self
             .routing_publication_dirty
@@ -302,8 +306,19 @@ impl ControlPlane {
                 Some(l)
             }
             Err(e) => {
-                warn!("TPROXY TCPv6 listener unavailable: {}", e);
-                None
+                // Same rule as the UDPv6 listeners: only a host without an
+                // IPv6 stack may continue with the slot empty (the published
+                // v4 fd fallback cannot accept v6 flows).
+                let no_ipv6 = e
+                    .downcast_ref::<io::Error>()
+                    .and_then(|error| error.raw_os_error())
+                    == Some(libc::EAFNOSUPPORT);
+                if no_ipv6 {
+                    warn!("TPROXY TCPv6 listener unavailable: {}", e);
+                    None
+                } else {
+                    return Err(e.context("bind TPROXY TCPv6 listener"));
+                }
             }
         };
 
@@ -1439,5 +1454,30 @@ mod tests {
         accepted.read_exact(&mut payload).await.unwrap();
         assert_eq!(&payload, b"hello");
         assert_eq!(stats.tcp_snapshot().capacity_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn critical_task_exit_fires_on_drop() {
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        {
+            let _guard = CriticalTaskExit {
+                name: "probe_task",
+                fatal_tx,
+            };
+        }
+        let error = fatal_rx.recv().await.expect("guard drop must notify");
+        assert!(error.to_string().contains("probe_task"));
+    }
+
+    #[tokio::test]
+    async fn critical_task_exit_silent_while_alive() {
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        let _guard = CriticalTaskExit {
+            name: "probe_task",
+            fatal_tx,
+        };
+        fatal_rx
+            .try_recv()
+            .expect_err("a live guard must not notify");
     }
 }

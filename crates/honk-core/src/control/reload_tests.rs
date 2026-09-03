@@ -1307,12 +1307,18 @@ async fn replay_failure_latches_until_a_successful_reload_repairs() {
     assert!(cp.drain_tracker.should_reject());
 
     // The next completed slow path re-pushes the torn bank and re-arms.
+    let bank_before = cp.ebpf.read().await.active_routing_generation().unwrap();
     assert!(
         cp.apply_runtime_config(Config::default(), &DrainTracker::new())
             .await
     );
     assert!(cp.is_datapath_healthy());
     assert!(!cp.drain_tracker.should_reject());
+    assert_ne!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        bank_before,
+        "an unchanged config must still re-push while latched unhealthy"
+    );
 }
 
 #[tokio::test]
