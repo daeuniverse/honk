@@ -1258,7 +1258,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
 }
 
 #[tokio::test]
-async fn replay_failure_marks_unhealthy_and_rejects_connections() {
+async fn replay_failure_latches_until_a_successful_reload_repairs() {
     let cp = test_cp().await;
     cp.ebpf
         .write()
@@ -1272,14 +1272,20 @@ async fn replay_failure_marks_unhealthy_and_rejects_connections() {
     assert!(!cp.is_datapath_healthy());
     assert!(cp.drain_tracker.should_reject());
 
+    // A build-phase rejection changes nothing and must not re-arm the latch.
     let mut invalid = Config::default();
     invalid.dns.upstream[0].address.clear();
     cp.apply_runtime_config(invalid, &DrainTracker::new()).await;
-    cp.apply_runtime_config(Config::default(), &DrainTracker::new())
-        .await;
-
     assert!(!cp.is_datapath_healthy());
     assert!(cp.drain_tracker.should_reject());
+
+    // The next completed slow path re-pushes the torn bank and re-arms.
+    assert!(
+        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+            .await
+    );
+    assert!(cp.is_datapath_healthy());
+    assert!(!cp.drain_tracker.should_reject());
 }
 
 #[tokio::test]
