@@ -661,8 +661,8 @@ impl ControlPlane {
         }
         info!("Configuration applied — {} routes active", route_count);
 
-        // Every map a failure latch could have torn has been republished on
-        // this path, so the datapath is coherent again and may re-arm.
+        // A completed slow path has republished everything a latch could
+        // have torn; re-arm.
         self.datapath_healthy
             .store(true, std::sync::atomic::Ordering::Release);
         self.stop_reload_rejection_if_healthy(drain);

@@ -17,11 +17,10 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
-/// Fires the control-plane fatal channel when a critical background task
-/// exits for any reason (return, panic, or abort). A dead listener loop or
-/// janitor otherwise leaves the process alive but unable to serve flows;
-/// exiting lets the service manager restart it. Shutdown aborts land after
-/// the run loop has left its select, so they never deliver.
+/// Fires the fatal channel when a critical background task exits for any
+/// reason (return, panic, abort): otherwise the process stays alive but
+/// deaf. Shutdown aborts land after the run loop has left its select, so
+/// they never deliver.
 pub(super) struct CriticalTaskExit {
     name: &'static str,
     fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
@@ -239,10 +238,9 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
-    /// (Re)push the active routing plan when a previous publication failed.
-    /// Reloads clear the dirty flag too; this retry keeps a failed startup
-    /// push from dropping every new LAN flow until someone happens to
-    /// reload on a quiet network.
+    /// (Re)push the active routing plan when a previous publication failed;
+    /// reloads clear the dirty flag too. Without this retry a failed startup
+    /// push drops every new LAN flow until a reload or network event.
     ///
     /// `push_plan` stages with `active=None`, which prunes old-generation
     /// LPM keys; that is safe here only because dirty means no publication
@@ -350,11 +348,10 @@ impl ControlPlane {
                     sockets
                 }
                 Err(e) => {
-                    // A host without an IPv6 stack never sees v6 flows, so
-                    // empty sk_lookup slots are harmless there. Any other
-                    // failure would black-hole proxied IPv6 UDP until
-                    // restart (slots 6-9 are published once) — fail instead
-                    // and let the service manager retry.
+                    // Only a host without an IPv6 stack may run with empty
+                    // sk_lookup slots; any other failure would black-hole
+                    // proxied IPv6 UDP until restart (slots are published
+                    // once), so fail startup and let the supervisor retry.
                     let no_ipv6 = e
                         .downcast_ref::<io::Error>()
                         .and_then(|error| error.raw_os_error())
