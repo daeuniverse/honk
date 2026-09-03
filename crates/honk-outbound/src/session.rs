@@ -1220,6 +1220,18 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             if self.pool.state() == PoolState::Running {
                 if let Some(session) = session {
                     pool.sessions.retain(|existing| !existing.is_closed());
+                    // Normal offers don't count provisional slots, so a commit
+                    // can arrive after the pool filled up meanwhile. Admit the
+                    // winner drain-only instead of exceeding max_sessions; its
+                    // already-reserved streams are unaffected.
+                    let active = pool
+                        .sessions
+                        .iter()
+                        .filter(|s| s.state() == SessionState::Active)
+                        .count();
+                    if active >= self.pool.config.max_sessions {
+                        session.begin_drain();
+                    }
                     pool.sessions.push(Arc::clone(&session));
                     Ok(session)
                 } else {
@@ -2186,6 +2198,36 @@ mod tests {
             1,
             "commit cannot duplicate insertion"
         );
+    }
+
+    #[tokio::test]
+    async fn detached_commit_at_capacity_admits_drain_only() {
+        let pool = Arc::new(pool(SessionPoolConfig {
+            max_sessions: 1,
+            ..Default::default()
+        }));
+        let mut reservation = match pool.checkout_speculative().await.unwrap() {
+            SpeculativeCheckout::Detached(reservation) => reservation,
+            SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
+        };
+        let winner = TestSession::new();
+        reservation.attach(&winner).unwrap();
+        // Normal offers don't count provisional slots, so the pool can fill
+        // while the speculative dial is detached.
+        let active = pool
+            .offer(|| async { Ok(TestSession::new()) })
+            .await
+            .unwrap();
+
+        let committed = reservation.commit().unwrap();
+
+        assert!(Arc::ptr_eq(&committed, &winner));
+        assert_eq!(
+            committed.state(),
+            SessionState::Draining,
+            "a commit arriving at a full pool must not exceed max_sessions"
+        );
+        assert_eq!(active.state(), SessionState::Active);
     }
 
     #[tokio::test]
