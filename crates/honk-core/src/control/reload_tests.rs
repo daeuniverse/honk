@@ -553,6 +553,54 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
     }
 }
 
+/// A fence failure rejects the reload before anything was torn down, so the
+/// datapath must stay healthy and keep admitting: restore old flags, reopen
+/// NFQUEUE, and leave both drain trackers alone.
+#[tokio::test]
+async fn fence_failure_rejects_reload_without_stranding_datapath() {
+    let cp = test_cp().await;
+    assert!(cp.datapath_flags.is_some());
+    let first_interval = Config::default().global.check_interval_secs + 1;
+    assert!(
+        cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new())
+            .await
+    );
+    let before_interval = cp.config.read().await.global.check_interval_secs;
+    {
+        let mut ebpf = cp.ebpf.write().await;
+        ebpf.clear_datapath_flags_write_log();
+        ebpf.arm_datapath_flags_write_fault(1).unwrap();
+    }
+    let drain = DrainTracker::new();
+    assert!(
+        !cp.apply_runtime_config(score_reload_config(first_interval + 1), &drain)
+            .await,
+        "fence failure must reject the reload"
+    );
+    assert_eq!(
+        cp.config.read().await.global.check_interval_secs,
+        before_interval,
+        "rejected reload keeps the old config"
+    );
+    assert!(cp.is_datapath_healthy());
+    assert!(!drain.should_reject());
+    assert!(!cp.drain_tracker.should_reject());
+    let ebpf = cp.ebpf.read().await;
+    let trace = ebpf.datapath_flags_write_trace();
+    let origins: Vec<_> = trace.iter().map(|write| write.origin).collect();
+    assert_eq!(
+        origins,
+        vec![
+            DatapathFlagsWriteOrigin::FenceNfqueue,
+            DatapathFlagsWriteOrigin::SetStatic,
+            DatapathFlagsWriteOrigin::ReopenNfqueue,
+        ],
+        "fence failure must restore old flags and reopen admission"
+    );
+    assert!(trace[0].failed);
+    assert!(!trace[1].failed && !trace[2].failed);
+}
+
 #[tokio::test]
 async fn empty_subscription_merge_does_not_publish_runtime() {
     let cp = test_cp().await;
