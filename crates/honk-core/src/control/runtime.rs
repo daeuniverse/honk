@@ -250,8 +250,10 @@ impl ControlPlane {
         {
             return;
         }
-        let plan = self.active_routing_plan.read().clone();
+        // Lock order matches the reload transaction (ebpf before
+        // active_routing_plan); the reverse would deadlock against it.
         let mut ebpf = self.ebpf.write().await;
+        let plan = self.active_routing_plan.read().clone();
         match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
             Ok(_) => {
                 routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
