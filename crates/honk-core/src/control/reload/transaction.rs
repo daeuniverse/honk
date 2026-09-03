@@ -46,13 +46,7 @@ fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
     for subscription in candidate.subscriptions.iter_mut().filter(|sub| sub.enabled) {
         let candidate_id = subscription.id;
         if let Some(previous) = current.subscriptions.iter().find(|previous| {
-            // Same fetch identity as the cache filename: url + UA + headers.
-            // URL-only matching can swap IDs when same-URL subscriptions with
-            // different user agents are reordered.
-            previous.url == subscription.url
-                && previous.user_agent.as_deref().unwrap_or_default()
-                    == subscription.user_agent.as_deref().unwrap_or_default()
-                && previous.headers == subscription.headers
+            crate::subscription::same_subscription_fetch_identity(previous, subscription)
                 && !matched_previous.contains(&previous.id)
         }) {
             matched_previous.insert(previous.id);
@@ -818,6 +812,17 @@ mod tests {
         }
     }
 
+    fn with_header(
+        mut sub: honk_config::subscription::Subscription,
+        value: &str,
+    ) -> honk_config::subscription::Subscription {
+        sub.headers = vec![honk_config::subscription::SubscriptionHeader {
+            key: "X-Token".into(),
+            value: value.into(),
+        }];
+        sub
+    }
+
     fn subscription_node(name: &str, subscription_id: u128) -> honk_config::node::Node {
         honk_config::node::Node {
             name: name.into(),
@@ -865,5 +870,23 @@ mod tests {
             let expected = if node.name == "node-a" { 1 } else { 2 };
             assert_eq!(node.subscription_id, Some(uuid::Uuid::from_u128(expected)));
         }
+    }
+
+    #[test]
+    fn rebase_treats_changed_headers_as_a_new_subscription() {
+        let current = Config {
+            subscriptions: vec![with_header(subscription(1, "a", None), "old")],
+            nodes: vec![subscription_node("node-a", 1)],
+            ..Default::default()
+        };
+        let mut candidate = Config {
+            subscriptions: vec![with_header(subscription(2, "a", None), "new")],
+            ..Default::default()
+        };
+
+        rebase_subscription_nodes(&current, &mut candidate);
+
+        assert_eq!(candidate.subscriptions[0].id, uuid::Uuid::from_u128(2));
+        assert!(candidate.nodes.is_empty());
     }
 }

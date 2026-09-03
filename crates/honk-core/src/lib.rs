@@ -1370,15 +1370,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     // The on-disk config contains no subscription nodes (they
                     // exist only in memory), so a naive reload would empty
                     // every subscription-fed group until the next periodic
-                    // refresh. Stabilize subscription IDs by URL and carry
-                    // the running subscription nodes over; then kick off an
-                    // immediate background refresh for fresh data.
+                    // refresh. Stabilize subscription IDs by fetch identity
+                    // and carry the running subscription nodes over; then
+                    // kick off an immediate background refresh for fresh data.
                     let refresh_subs: Vec<_> = {
                         let current = config_handle.read().await;
                         let mut matched_previous = std::collections::HashSet::new();
                         for sub in &mut new_config.subscriptions {
                             if let Some(old) = current.subscriptions.iter().find(|old| {
-                                old.url == sub.url && !matched_previous.contains(&old.id)
+                                crate::subscription::same_subscription_fetch_identity(old, sub)
+                                    && !matched_previous.contains(&old.id)
                             }) {
                                 matched_previous.insert(old.id);
                                 sub.id = old.id;
