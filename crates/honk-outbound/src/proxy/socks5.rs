@@ -130,9 +130,11 @@ impl Socks5Handler {
             }
 
             if let Some(domain) = target_domain {
+                let domain_len = u8::try_from(domain.len())
+                    .map_err(|_| anyhow::anyhow!("SOCKS5: domain exceeds 255 bytes"))?;
                 request[3] = ATYP_DOMAIN;
                 request.truncate(4);
-                request.push(domain.len() as u8);
+                request.push(domain_len);
                 request.extend_from_slice(domain.as_bytes());
                 request.extend_from_slice(&target.port().to_be_bytes());
             }
@@ -618,6 +620,32 @@ mod tests {
             Socks5Handler::username_password_auth_request("user", "pass").unwrap(),
             b"\x01\x04user\x04pass"
         );
+    }
+
+    #[tokio::test]
+    async fn socks5_tcp_connect_rejects_oversized_domain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0u8; greeting[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            stream
+                .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let oversized = "x".repeat(u8::MAX as usize + 1);
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let result =
+            Socks5Handler::handshake(&mut client, target, Some(&oversized), None, None).await;
+        server.await.unwrap();
+        let error = result.expect_err("oversized domain must fail the handshake");
+        assert!(error.to_string().contains("255"));
     }
 
     struct UdpAssociateTestServer {
