@@ -344,6 +344,8 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, _origin: DatapathFlagsWriteOrigin) {}
     #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {}
+    #[cfg(test)]
     fn datapath_flags_write_log(&self) -> Vec<u32> {
         Vec::new()
     }

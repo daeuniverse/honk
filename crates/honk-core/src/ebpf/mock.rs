@@ -205,6 +205,8 @@ pub struct MockEbpfBackend {
     #[cfg(test)]
     domain_bitmap_add_faults: usize,
     #[cfg(test)]
+    fail_next_quiesce: bool,
+    #[cfg(test)]
     datapath_flags_fault_nth: Option<usize>,
     #[cfg(test)]
     datapath_flags_writes_after_arm: usize,
@@ -681,6 +683,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {
+        self.fail_next_quiesce = true;
+    }
+
+    #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, origin: DatapathFlagsWriteOrigin) {
         self.datapath_flags_write_origin = origin;
     }
@@ -703,6 +710,10 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_quiesce) {
+            anyhow::bail!("injected quiesce failure");
+        }
         let staged = self
             .udp_conn_states
             .iter()

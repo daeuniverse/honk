@@ -269,6 +269,10 @@ fn group_connectivity_follows_reordered_outbound_ids() {
 }
 
 async fn test_cp() -> ControlPlane {
+    test_cp_with_nfq(false).await
+}
+
+async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
     let mut control_plane = ControlPlane::new(
         Config::default(),
         Box::new(MockEbpfBackend::new()),
@@ -293,7 +297,7 @@ async fn test_cp() -> ControlPlane {
     )));
     control_plane.start_datapath_flags_coordinator().unwrap();
     control_plane
-        .initialize_datapath_flags(false, false)
+        .initialize_datapath_flags(nfqueue, nfqueue)
         .await
         .unwrap();
     control_plane
@@ -599,6 +603,59 @@ async fn fence_failure_rejects_reload_without_stranding_datapath() {
     );
     assert!(trace[0].failed);
     assert!(!trace[1].failed && !trace[2].failed);
+}
+
+/// The production incident shape: quiesce fails after READY=false was
+/// published. The reload is rejected and restore must republish the exact
+/// pre-fence flags (READY set) while keeping admission open.
+#[tokio::test]
+async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
+    let cp = test_cp_with_nfq(true).await;
+    let expected_flags = {
+        let ebpf = cp.ebpf.read().await;
+        *ebpf.datapath_flags_write_log().last().unwrap()
+    };
+    assert_ne!(
+        expected_flags & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY,
+        0
+    );
+    {
+        let mut ebpf = cp.ebpf.write().await;
+        ebpf.clear_datapath_flags_write_log();
+        ebpf.arm_quiesce_fault();
+    }
+    let drain = DrainTracker::new();
+    let interval = Config::default().global.check_interval_secs + 1;
+    assert!(
+        !cp.apply_runtime_config(score_reload_config(interval), &drain)
+            .await,
+        "quiesce failure must reject the reload"
+    );
+    assert!(cp.is_datapath_healthy());
+    assert!(!drain.should_reject());
+    assert!(!cp.drain_tracker.should_reject());
+    let ebpf = cp.ebpf.read().await;
+    let trace = ebpf.datapath_flags_write_trace();
+    let origins: Vec<_> = trace.iter().map(|write| write.origin).collect();
+    assert_eq!(
+        origins,
+        vec![
+            DatapathFlagsWriteOrigin::FenceNfqueue,
+            DatapathFlagsWriteOrigin::SetStatic,
+            DatapathFlagsWriteOrigin::ReopenNfqueue,
+        ]
+    );
+    assert!(!trace.iter().any(|write| write.failed));
+    assert_eq!(
+        trace[0].flags & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY,
+        0,
+        "fence publishes READY=false before quiesce runs"
+    );
+    assert_eq!(
+        trace.last().unwrap().flags,
+        expected_flags,
+        "restore must republish the exact pre-fence flags (READY set)"
+    );
 }
 
 #[tokio::test]

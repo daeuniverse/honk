@@ -723,14 +723,14 @@ impl ControlPlane {
             pending.cancel_all().await;
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
-            warn!("UDP initializers did not drain after NFQUEUE reopen failure");
+            warn!("UDP initializers did not drain during admission teardown");
         }
         #[cfg(feature = "ebpf")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.wait_empty().await;
         }
         if !self.udp_pool.wait_for_retirements().await {
-            warn!("UDP endpoint retirements did not drain after NFQUEUE reopen failure");
+            warn!("UDP endpoint retirements did not drain during admission teardown");
         }
     }
 
