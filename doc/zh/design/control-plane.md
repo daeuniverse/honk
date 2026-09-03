@@ -137,7 +137,7 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 4. 暂存并激活路由，再把新的出站 registry、DNS runtime pointer、Router、配置、组和 projection snapshot 作为一次串行 generation 变更发布。
 5. 发布新的静态 datapath flag，开放 pending 准入，最后重开 NFQUEUE。此后才停止拒绝新流。
 
-提交前构建失败不会触碰当前 generation。若 fence 后发布失败，控制平面重放精确的旧路由计划，恢复旧静态 flag，并重开旧 generation。若恢复不能证明数据路径健康，则继续拒绝准入。
+提交前构建失败不会触碰当前 generation。若 fence 后发布失败，控制平面重放精确的旧路由计划，恢复旧静态 flag，并重开旧 generation。若恢复不能证明数据路径健康，则继续拒绝准入。之后任何一次完整走完发布路径的 reload（闩锁期间会强制重推路由）会重新放开准入，因为到那一刻所有可能被撕裂的 map 都已重建。
 
 `DnsServiceProvider` 是一致的 DNS generation pointer。请求 lease 保留其 generation 的 forwarder、projection、transport pool 和出站运行时，直到退役。出站 registry 同样按 generation 持有：未变化的 node runtime 只在提交点转移，旧 registry 把这些 runtime 标记为已移出，然后开始优雅退役。现有 stream 与 `Ready` UDP endpoint 保持引用，同时旧 reusable pool 停止接受新工作并排空。
 
