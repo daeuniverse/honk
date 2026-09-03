@@ -26,7 +26,7 @@ subscription {
 
 | 字段 | 类型 | 默认值 | 可在 dae 中设置 | 含义 |
 | --- | --- | --- | --- | --- |
-| `id` | UUID | 随机 UUID | 否 | runtime 订阅身份；SIGHUP 时，若 URL 与已有订阅匹配则保留该值。 |
+| `id` | UUID | 随机 UUID | 否 | runtime 订阅身份；SIGHUP 时，若 fetch 身份（URL + 配置的 `ua` + headers）与已有订阅匹配则保留该值。 |
 | `name` | string | `""` | 是，作为 tag | 显示 tag，也是组 `subtag(...)` filter 使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
@@ -65,7 +65,7 @@ subscription {
 
 启动时会在开始联网刷新前解析已存正文。有效的已恢复正文会立即提供活动节点，因此该订阅不参与 5 秒首次拉取等待；其联网刷新仍会在后台运行。缺失或无效的已存正文会被忽略，并让该订阅继续参与有界首次拉取等待，直至拉取结束或达到 deadline；后续有效刷新会替换损坏文件。
 
-SIGHUP 时，URL 相同的订阅保留 runtime ID。重载会沿用仍处于启用状态的订阅所属活动节点；只有某订阅没有存活节点时才恢复已存正文。随后提交重建后的配置，并立即开始后台刷新。
+SIGHUP 时，fetch 身份（URL + 配置的 `ua` + headers）相同的订阅保留 runtime ID。重载会沿用仍处于启用状态的订阅所属活动节点；只有某订阅没有存活节点时才恢复已存正文。随后提交重建后的配置，并立即开始后台刷新。
 
 失败处理会保留可用 runtime，而不会清空它：
 
