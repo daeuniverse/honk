@@ -46,7 +46,14 @@ fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
     for subscription in candidate.subscriptions.iter_mut().filter(|sub| sub.enabled) {
         let candidate_id = subscription.id;
         if let Some(previous) = current.subscriptions.iter().find(|previous| {
-            previous.url == subscription.url && !matched_previous.contains(&previous.id)
+            // Same fetch identity as the cache filename: url + UA + headers.
+            // URL-only matching can swap IDs when same-URL subscriptions with
+            // different user agents are reordered.
+            previous.url == subscription.url
+                && previous.user_agent.as_deref().unwrap_or_default()
+                    == subscription.user_agent.as_deref().unwrap_or_default()
+                && previous.headers == subscription.headers
+                && !matched_previous.contains(&previous.id)
         }) {
             matched_previous.insert(previous.id);
             subscription.id = previous.id;
@@ -790,5 +797,73 @@ impl ControlPlane {
             .with_hosts_snapshot(hosts_snapshot),
         );
         Ok((forwarder, dns_upstream_pool))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subscription(
+        id: u128,
+        name: &str,
+        ua: Option<&str>,
+    ) -> honk_config::subscription::Subscription {
+        honk_config::subscription::Subscription {
+            id: uuid::Uuid::from_u128(id),
+            name: name.into(),
+            url: "http://same-url".into(),
+            user_agent: ua.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn subscription_node(name: &str, subscription_id: u128) -> honk_config::node::Node {
+        honk_config::node::Node {
+            name: name.into(),
+            subscription_id: Some(uuid::Uuid::from_u128(subscription_id)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rebase_matches_subscription_identity_beyond_url() {
+        let current = Config {
+            subscriptions: vec![
+                subscription(1, "a", Some("ua-a")),
+                subscription(2, "b", Some("ua-b")),
+            ],
+            nodes: vec![
+                subscription_node("node-a", 1),
+                subscription_node("node-b", 2),
+            ],
+            ..Default::default()
+        };
+
+        // Same file with the subscription order swapped; a fresh parse assigns
+        // fresh IDs.
+        let mut candidate = Config {
+            subscriptions: vec![
+                subscription(3, "b", Some("ua-b")),
+                subscription(4, "a", Some("ua-a")),
+            ],
+            ..Default::default()
+        };
+
+        rebase_subscription_nodes(&current, &mut candidate);
+
+        assert_eq!(candidate.subscriptions[0].id, uuid::Uuid::from_u128(2));
+        assert_eq!(candidate.subscriptions[1].id, uuid::Uuid::from_u128(1));
+        let mut node_names: Vec<&str> = candidate
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        node_names.sort_unstable();
+        assert_eq!(node_names, ["node-a", "node-b"]);
+        for node in &candidate.nodes {
+            let expected = if node.name == "node-a" { 1 } else { 2 };
+            assert_eq!(node.subscription_id, Some(uuid::Uuid::from_u128(expected)));
+        }
     }
 }
