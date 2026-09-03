@@ -248,37 +248,48 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 http_probe_context(&check_url, addr),
             );
             // Dial and TLS are setup, not measurement: the reported latency
-            // is one warm-path round trip (see http1_exchange).
-            let attempt = async {
-                let proxy = generation
-                    .scope_dials(entry.tcp.dial_runtime(
-                        runtime,
-                        addr,
-                        domain.as_deref(),
-                        connect_timeout,
-                    ))
-                    .await?;
-                probe_setup(&reporter);
-                Self::http_check(proxy.stream, &check_url, &check_method, &reporter, timeout)
-                    .await
-                    .map_err(anyhow::Error::msg)
+            // is one warm-path round trip (see http1_exchange). Each phase
+            // has its own `timeout` budget; no single outer clock.
+            let dial = generation.scope_dials(entry.tcp.dial_runtime(
+                runtime,
+                addr,
+                domain.as_deref(),
+                connect_timeout,
+            ));
+            let proxy = match tokio::time::timeout(timeout, dial).await {
+                Ok(result) => match result {
+                    Ok(proxy) => proxy,
+                    Err(error) => {
+                        probe_finish(&reporter, ScoreOutcome::from_error(&error));
+                        close_ephemeral(ephemeral).await;
+                        return honk_outbound::alive::HttpProbeResult::ExchangeFailure(
+                            error.to_string(),
+                        );
+                    }
+                },
+                Err(_) => {
+                    probe_finish(&reporter, ScoreOutcome::Timeout);
+                    close_ephemeral(ephemeral).await;
+                    return honk_outbound::alive::HttpProbeResult::ExchangeFailure(
+                        "HTTP probe dial timeout".into(),
+                    );
+                }
             };
-            let result = tokio::time::timeout(timeout, attempt).await;
+            probe_setup(&reporter);
+            let result =
+                Self::http_check(proxy.stream, &check_url, &check_method, &reporter, timeout).await;
             close_ephemeral(ephemeral).await;
             match result {
-                Ok(Ok(elapsed)) => {
+                Ok(elapsed) => {
                     probe_finish(&reporter, ScoreOutcome::Success);
                     honk_outbound::alive::HttpProbeResult::WarmSuccess(elapsed)
                 }
-                Ok(Err(error)) => {
-                    probe_finish(&reporter, ScoreOutcome::from_error(&error));
-                    honk_outbound::alive::HttpProbeResult::ExchangeFailure(error.to_string())
-                }
-                Err(_) => {
-                    probe_finish(&reporter, ScoreOutcome::Timeout);
-                    honk_outbound::alive::HttpProbeResult::ExchangeFailure(
-                        "HTTP probe timeout".into(),
-                    )
+                Err(error) => {
+                    probe_finish(
+                        &reporter,
+                        ScoreOutcome::from_error(&anyhow::Error::msg(error.clone())),
+                    );
+                    honk_outbound::alive::HttpProbeResult::ExchangeFailure(error)
                 }
             }
         })
@@ -328,9 +339,10 @@ impl ProxyHttpProber {
         }
     }
 
-    /// Read one HTTP/1.x response head (up to the header boundary), returning
-    /// the buffered bytes. Bounded per read by `timeout`.
-    async fn read_response_head<S>(stream: &mut S, timeout: Duration) -> Result<Vec<u8>, String>
+    /// Read one HTTP/1.x response head (up to the header boundary),
+    /// returning the buffered bytes. Unbounded internally; the caller wraps
+    /// each round in its own timeout.
+    async fn read_response_head<S>(stream: &mut S) -> Result<Vec<u8>, String>
     where
         S: tokio::io::AsyncRead + Unpin + ?Sized,
     {
@@ -338,9 +350,9 @@ impl ProxyHttpProber {
         let mut buf = Vec::with_capacity(1024);
         let mut chunk = [0u8; 1024];
         loop {
-            let n = tokio::time::timeout(timeout, stream.read(&mut chunk))
+            let n = stream
+                .read(&mut chunk)
                 .await
-                .map_err(|_| "HTTP read timeout".to_string())?
                 .map_err(|error| format!("HTTP read failed: {error}"))?;
             if n == 0 {
                 if buf.is_empty() {
@@ -358,8 +370,10 @@ impl ProxyHttpProber {
 
     /// Two requests on the warmed connection: the first (untimed HEAD, any
     /// status accepted) absorbs every remaining setup cost, the second is
-    /// the reported warm-path sample. A server that closes after one
-    /// response falls back to the warm exchange's time.
+    /// the reported warm-path sample. Each round has its own `timeout`
+    /// budget: a slow warm-up fails the probe; a measured request that fails
+    /// or times out falls back to the warm exchange's time, but a bad status
+    /// on it fails the probe.
     async fn http1_exchange<S>(
         stream: &mut S,
         host: &str,
@@ -375,12 +389,18 @@ impl ProxyHttpProber {
         let warm_request =
             format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-health/1.0\r\n\r\n");
         let warm_start = std::time::Instant::now();
-        stream
-            .write_all(warm_request.as_bytes())
-            .await
-            .map_err(|error| format!("HTTP write failed: {error}"))?;
-        probe_tx(reporter, warm_request.len());
-        let head = Self::read_response_head(stream, timeout).await?;
+        let warm_round = async {
+            stream
+                .write_all(warm_request.as_bytes())
+                .await
+                .map_err(|error| format!("HTTP write failed: {error}"))?;
+            probe_tx(reporter, warm_request.len());
+            Self::read_response_head(stream).await
+        };
+        let head = match tokio::time::timeout(timeout, warm_round).await {
+            Ok(result) => result?,
+            Err(_) => return Err("HTTP warm-up timeout".to_string()),
+        };
         probe_first_response(reporter);
         probe_rx(reporter, head.len());
         let warm = warm_start.elapsed();
@@ -389,13 +409,17 @@ impl ProxyHttpProber {
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-health/1.0\r\nConnection: close\r\n\r\n"
         );
         let start = std::time::Instant::now();
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            return Ok(warm);
-        }
-        probe_tx(reporter, request.len());
-        let buf = match Self::read_response_head(stream, timeout).await {
-            Ok(buf) => buf,
-            Err(_) => return Ok(warm),
+        let measured_round = async {
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|error| format!("HTTP write failed: {error}"))?;
+            probe_tx(reporter, request.len());
+            Self::read_response_head(stream).await
+        };
+        let buf = match tokio::time::timeout(timeout, measured_round).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(_)) | Err(_) => return Ok(warm),
         };
         probe_rx(reporter, buf.len());
         let elapsed = start.elapsed();
@@ -925,7 +949,7 @@ pub(super) fn extract_url_host_path(url: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod http_probe_tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn https_health_check_starts_with_tls_client_hello() {
@@ -951,5 +975,70 @@ mod http_probe_tests {
 
         assert!(result.is_err());
         assert_eq!(peer.await.unwrap(), 22, "TLS handshake record expected");
+    }
+
+    /// The reported probe latency is the second request's round trip: a
+    /// stalled first response must not leak into the sample.
+    #[tokio::test]
+    async fn http_probe_reports_warm_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            for round in 0..2 {
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                if round == 0 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let reporter = empty_probe_reporter();
+        let measured = ProxyHttpProber::http_check(
+            Box::new(stream),
+            "http://localhost/",
+            "HEAD",
+            &reporter,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            measured < Duration::from_millis(100),
+            "warm round trip must exclude the stalled first response: {measured:?}"
+        );
+    }
+
+    /// A server that closes after one response still yields the warm
+    /// sample instead of failing the probe.
+    #[tokio::test]
+    async fn http_probe_falls_back_when_server_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let reporter = empty_probe_reporter();
+        ProxyHttpProber::http_check(
+            Box::new(stream),
+            "http://localhost/",
+            "HEAD",
+            &reporter,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("single-response server must fall back to the warm sample");
     }
 }

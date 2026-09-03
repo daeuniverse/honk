@@ -5,11 +5,11 @@
 //! request are all untimed; only the second `HEAD /` (or a real HTTP/2
 //! request when the server negotiates h2 via ALPN) is measured, so every
 //! protocol reports the same "already-warm node" latency — the number real
-//! traffic pays through the connection pool. Servers that close after one
-//! response fall back to the first exchange's time. Successful measurements
-//! feed the node's latency history in [`AliveDialerSet`]. A lone failure
-//! leaves history unchanged; a second consecutive failure adds a synthetic
-//! penalty and demotes the node.
+//! traffic pays through the connection pool. A second request that fails or
+//! times out falls back to the first exchange's time. Successful
+//! measurements feed the node's latency history in [`AliveDialerSet`]. A
+//! lone failure leaves history unchanged; a second consecutive failure adds
+//! a synthetic penalty and demotes the node.
 //!
 //! Used by the clash API delay endpoints; the periodic health check loop in
 //! `alive` is unaffected by these ad-hoc measurements.
@@ -367,54 +367,77 @@ async fn measure_head_exchange(
 ) -> anyhow::Result<Duration> {
     let node = runtime.node.as_ref();
     let reporter = start_feedback(feedback);
-    let timed = async {
-        let proxy = match crate::runtime::capture_dial_admission()
-            .scope(handler.dial_runtime(Arc::clone(runtime), addr, target_domain, timeout))
-            .await
-        {
-            Ok(proxy) => proxy,
-            Err(error) => {
-                reporter_error(&reporter, &error);
-                return Err(error);
-            }
-        };
-        reporter_setup(&reporter);
-        tracing::debug!(node = %node.name, %addr, "urltest: dial established");
-        let stream = proxy.stream;
-        let result = async {
-            if is_https {
-                let connector = https_connector()?;
-                let tls = connector.connect(host, stream).await.context("TLS handshake failed")?;
-                tracing::debug!(
-                    node = %node.name,
-                    alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
-                    "urltest: TLS established"
-                );
-                match tls.ssl().selected_alpn_protocol() {
-                    Some(b"h2") => exchange_head_h2(tls, host, &reporter).await,
-                    _ => { let mut tls = tls; exchange_head(&mut tls, host, &reporter).await }
-                }
-            } else {
-                let mut stream = stream;
-                exchange_head(&mut stream, host, &reporter).await
-            }
-        }.await;
-        match result {
-            Ok(elapsed) => {
-                reporter_success(&reporter);
-                Ok(elapsed)
-            }
-            Err(error) => {
-                reporter_error(&reporter, &error);
-                Err(error)
-            }
-        }
+    let timed_out = || {
+        anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "phase timed out",
+        ))
     };
-    match tokio::time::timeout(timeout, timed).await {
-        Ok(result) => result,
+    // Every phase gets its own `timeout` budget — dial, target TLS, the
+    // warm-up request, the measured request — so a slow node fails (or
+    // falls back) per phase instead of one outer clock killing
+    // slow-but-working measurements.
+    let dial = crate::runtime::capture_dial_admission().scope(handler.dial_runtime(
+        Arc::clone(runtime),
+        addr,
+        target_domain,
+        timeout,
+    ));
+    let proxy = match tokio::time::timeout(timeout, dial).await {
+        Ok(Ok(proxy)) => proxy,
+        Ok(Err(error)) => {
+            reporter_error(&reporter, &error);
+            return Err(error);
+        }
         Err(_) => {
             reporter_timeout(&reporter);
-            Err(anyhow!("urltest timed out after {:?}", timeout))
+            return Err(timed_out().context("urltest dial timed out"));
+        }
+    };
+    reporter_setup(&reporter);
+    tracing::debug!(node = %node.name, %addr, "urltest: dial established");
+    let stream = proxy.stream;
+    let result = async {
+        if is_https {
+            let connector = https_connector()?;
+            let tls = match tokio::time::timeout(timeout, connector.connect(host, stream)).await {
+                Ok(result) => result.context("TLS handshake failed")?,
+                Err(_) => return Err(timed_out().context("urltest TLS handshake timed out")),
+            };
+            tracing::debug!(
+                node = %node.name,
+                alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
+                "urltest: TLS established"
+            );
+            match tls.ssl().selected_alpn_protocol() {
+                Some(b"h2") => exchange_head_h2(tls, host, &reporter, timeout).await,
+                _ => {
+                    let mut tls = tls;
+                    exchange_head(&mut tls, host, &reporter, timeout).await
+                }
+            }
+        } else {
+            let mut stream = stream;
+            exchange_head(&mut stream, host, &reporter, timeout).await
+        }
+    }
+    .await;
+    match result {
+        Ok(elapsed) => {
+            reporter_success(&reporter);
+            Ok(elapsed)
+        }
+        Err(error) => {
+            if error.chain().any(|source| {
+                source
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+            }) {
+                reporter_timeout(&reporter);
+            } else {
+                reporter_error(&reporter, &error);
+            }
+            Err(error)
         }
     }
 }
@@ -432,10 +455,14 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
     }
 }
 
+/// HTTP/2 variant of [`exchange_head`]: two HEAD requests over a fresh H2
+/// session (same layer as the DoH transport); the second request is the
+/// reported warm-path sample, resolved when its response HEADERS arrive.
 async fn exchange_head_h2<S>(
     stream: S,
     host: &str,
     reporter: &Option<ScoreReporter>,
+    timeout: Duration,
 ) -> anyhow::Result<Duration>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -469,35 +496,63 @@ where
                 reporter_first_response(&reporter);
             }
             reporter_rx(&reporter, 1);
-            let elapsed = start.elapsed();
-            let code = response.status().as_u16();
-            if !(200..500).contains(&code) {
-                return Err(anyhow!("bad status code: {}", code));
-            }
-            Ok(elapsed)
+            Ok::<_, anyhow::Error>((start.elapsed(), response.status().as_u16()))
         }
     };
-    let warm = round(true).await?;
-    // H2 sessions are inherently reusable; a failed second request means the
-    // peer went away, so keep the warm sample.
-    Ok(round(false).await.unwrap_or(warm))
+    // Each round has its own budget: a slow warm-up fails the measurement
+    // (the old single-request shape); a slow or lost measured request falls
+    // back to the warm sample. A bad status on either request is a real
+    // measurement failure, never a fallback.
+    let (warm, warm_status) = match tokio::time::timeout(timeout, round(true)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "urltest warm-up request timed out",
+            )
+            .into());
+        }
+    };
+    if !(200..500).contains(&warm_status) {
+        return Err(anyhow!("bad status code: {}", warm_status));
+    }
+    match tokio::time::timeout(timeout, round(false)).await {
+        Ok(Ok((measured, status))) => {
+            if !(200..500).contains(&status) {
+                return Err(anyhow!("bad status code: {}", status));
+            }
+            Ok(measured)
+        }
+        Ok(Err(_)) | Err(_) => Ok(warm),
+    }
 }
 
+/// Two HEAD requests on one connection. The reported sample is the second
+/// request: the first absorbs the remaining warm-up (target connect/TLS
+/// already happened on this stream), so the number is one warm-path round
+/// trip. Each round has its own `timeout` budget; a second request that
+/// fails at I/O or times out falls back to the first exchange's time, while
+/// a bad status on either request fails the measurement.
 async fn exchange_head<S>(
     stream: &mut S,
     host: &str,
     reporter: &Option<ScoreReporter>,
+    timeout: Duration,
 ) -> anyhow::Result<Duration>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // One request: write HEAD, read to the header boundary. This is
+    // transfer only — status validation stays with the caller so a bad
+    // status on the measured request is never mistaken for a lost
+    // connection.
     async fn round<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
         host: &str,
         close: bool,
         reporter: &Option<ScoreReporter>,
         first_response: bool,
-    ) -> anyhow::Result<Duration> {
+    ) -> anyhow::Result<(Duration, Vec<u8>)> {
         let request = format!(
             "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-urltest/1.0\r\n{}\r\n",
             host,
@@ -522,13 +577,35 @@ where
                 break;
             }
         }
-        validate_status(&buf)?;
-        Ok(start.elapsed())
+        // An empty read-out means the peer closed without answering; that is
+        // a lost connection, not a status the caller can judge.
+        if buf.is_empty() {
+            return Err(anyhow!("connection closed without a response"));
+        }
+        Ok((start.elapsed(), buf))
     }
-    let warm = round(stream, host, false, reporter, true).await?;
-    match round(stream, host, true, reporter, false).await {
-        Ok(measured) => Ok(measured),
-        Err(_) => Ok(warm),
+
+    // Each round has its own budget: a slow warm-up fails the measurement
+    // (the old single-request shape); a lost or slow measured request falls
+    // back to the warm sample. A bad status on either request fails.
+    let (warm, warm_buf) =
+        match tokio::time::timeout(timeout, round(stream, host, false, reporter, true)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "urltest warm-up request timed out",
+                )
+                .into());
+            }
+        };
+    validate_status(&warm_buf)?;
+    match tokio::time::timeout(timeout, round(stream, host, true, reporter, false)).await {
+        Ok(Ok((measured, buf))) => {
+            validate_status(&buf)?;
+            Ok(measured)
+        }
+        Ok(Err(_)) | Err(_) => Ok(warm),
     }
 }
 
@@ -1082,9 +1159,14 @@ mod tests {
                 .await
                 .unwrap();
         });
-        exchange_head(&mut client, "localhost", &no_feedback())
-            .await
-            .unwrap();
+        exchange_head(
+            &mut client,
+            "localhost",
+            &no_feedback(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
     }
 
@@ -1160,7 +1242,7 @@ mod tests {
     async fn test_exchange_head_h2() {
         let addr = spawn_h2_server().await;
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_head_h2(stream, "localhost", &no_feedback())
+        exchange_head_h2(stream, "localhost", &no_feedback(), Duration::from_secs(5))
             .await
             .expect("h2 HEAD exchange must succeed");
 
@@ -1176,7 +1258,7 @@ mod tests {
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         assert!(
-            exchange_head_h2(stream, "localhost", &no_feedback())
+            exchange_head_h2(stream, "localhost", &no_feedback(), Duration::from_secs(5))
                 .await
                 .is_err()
         );
@@ -1248,9 +1330,14 @@ mod tests {
     async fn test_exchange_head_plain_http() {
         let addr = spawn_mock_http_server().await;
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_head(&mut stream, "localhost", &no_feedback())
-            .await
-            .expect("HEAD exchange against local HTTP server should succeed");
+        exchange_head(
+            &mut stream,
+            "localhost",
+            &no_feedback(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("HEAD exchange against local HTTP server should succeed");
     }
 
     /// A server that closes after the first response still yields a sample:
@@ -1259,9 +1346,14 @@ mod tests {
     async fn test_exchange_head_falls_back_when_server_closes() {
         let addr = spawn_close_after_response_server().await;
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_head(&mut stream, "localhost", &no_feedback())
-            .await
-            .expect("single-response server must fall back to the warm sample");
+        exchange_head(
+            &mut stream,
+            "localhost",
+            &no_feedback(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("single-response server must fall back to the warm sample");
     }
 
     /// The reported sample excludes warm-up: a server that stalls only the
@@ -1286,12 +1378,123 @@ mod tests {
             }
         });
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_head(&mut stream, "localhost", &no_feedback())
-            .await
-            .unwrap();
+        let measured = exchange_head(
+            &mut stream,
+            "localhost",
+            &no_feedback(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert!(
             measured < Duration::from_millis(100),
             "warm round trip must exclude the stalled first response: {measured:?}"
+        );
+    }
+
+    /// The sample really is the second request, not min(#1, #2): a stall on
+    /// the second response must show up in the sample.
+    #[tokio::test]
+    async fn test_exchange_head_reports_the_second_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            for round in 0..2 {
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                if round == 1 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let measured = exchange_head(
+            &mut stream,
+            "localhost",
+            &no_feedback(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            measured >= Duration::from_millis(150),
+            "the sample is the second request: {measured:?}"
+        );
+    }
+
+    /// A bad status on the measured request fails the measurement; only a
+    /// lost connection or a timeout falls back to the warm sample.
+    #[tokio::test]
+    async fn test_exchange_head_bad_status_on_second_request_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            for round in 0..2 {
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let response = if round == 0 {
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice()
+                } else {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".as_slice()
+                };
+                sock.write_all(response).await.unwrap();
+            }
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(
+            exchange_head(
+                &mut stream,
+                "localhost",
+                &no_feedback(),
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// A measured request that outlives its own budget falls back to the
+    /// warm sample instead of failing the whole measurement.
+    #[tokio::test]
+    async fn test_exchange_head_slow_second_request_falls_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            for round in 0..2 {
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                if round == 1 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let measured = exchange_head(
+            &mut stream,
+            "localhost",
+            &no_feedback(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert!(
+            measured < Duration::from_millis(100),
+            "timed-out measured request falls back to the warm sample: {measured:?}"
         );
     }
 

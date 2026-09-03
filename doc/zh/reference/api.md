@@ -51,7 +51,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 ### 延迟测量
 
-延迟测试报告的是节点热路径上的一个 round trip：代理拨号、目标站 TLS 握手与第一个探路请求都不计时，只测量已建立连接上的第二个请求（`HEAD /`；ALPN 协商出 h2 时为 HTTP/2 请求），到收到响应 header 为止。对端在第一个响应后关闭连接时，回退为第一个交换的耗时。冷可复用 transport——AnyTLS、VLESS H2MUX/Mux.Cool、Hysteria2、TUIC 与 Juicity——先在临时 runtime 中建立 session 或 QUIC client，再执行测量。临时 runtime 随后关闭，因此扫描大组不会为每个已测试节点留下常驻可复用状态。预热和正式测量各有一次 timeout，所以冷请求最坏可耗时为指定 timeout 的两倍。
+延迟测试报告的是节点热路径上的一个 round trip：代理拨号、目标站 TLS 握手与第一个探路请求都不计时，只测量已建立连接上的第二个请求（`HEAD /`；ALPN 协商出 h2 时为 HTTP/2 请求），到收到响应 header 为止。第二个请求失败或超时时，回退为第一个交换的耗时。预热、拨号、目标 TLS、探路请求、正式测量各自使用一份指定的 timeout 预算，慢节点按阶段失败（或回退），而不是共用一个时钟拖垮整个测量。冷可复用 transport——AnyTLS、VLESS H2MUX/Mux.Cool、Hysteria2、TUIC 与 Juicity——先在临时 runtime 中建立 session 或 QUIC client，再执行测量。临时 runtime 随后关闭，因此扫描大组不会为每个已测试节点留下常驻可复用状态。
 
 成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
 
