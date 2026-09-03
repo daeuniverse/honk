@@ -393,12 +393,16 @@ impl ControlPlane {
             .await
             .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::FenceNfqueue);
         if let Err(error) = datapath_flags.fence_nfqueue().await {
-            error!(%error, "failed to fence NFQUEUE before reload");
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
-            drain.start_rejecting();
-            self.drain_tracker.start_rejecting();
+            error!(error = %format_args!("{error:#}"), "failed to fence NFQUEUE before reload");
             self.close_and_drain_pending_udp_admission().await;
+            // Nothing was torn down yet: restore the old flags and keep
+            // serving instead of rejecting new connections forever.
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                old_static_flags,
+                drain,
+            )
+            .await;
             return false;
         }
         drain.start_rejecting();
@@ -713,14 +717,14 @@ impl ControlPlane {
             pending.cancel_all().await;
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
-            warn!("UDP initializers did not drain after NFQUEUE reopen failure");
+            warn!("UDP initializers did not drain during admission teardown");
         }
         #[cfg(feature = "ebpf")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.wait_empty().await;
         }
         if !self.udp_pool.wait_for_retirements().await {
-            warn!("UDP endpoint retirements did not drain after NFQUEUE reopen failure");
+            warn!("UDP endpoint retirements did not drain during admission teardown");
         }
     }
 
