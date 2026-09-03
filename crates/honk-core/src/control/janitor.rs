@@ -220,9 +220,25 @@ impl BpfJanitor {
     /// Returns a `JoinHandle` that completes when the janitor exits.
     /// The janitor runs until `stop()` is called or the stop receiver is dropped.
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        self.spawn_inner(None)
+    }
+
+    /// Spawn with a guard that reports task death to the control plane.
+    pub(super) fn spawn_supervised(
+        self,
+        exit_guard: super::runtime::CriticalTaskExit,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_inner(Some(exit_guard))
+    }
+
+    fn spawn_inner(
+        self,
+        exit_guard: Option<super::runtime::CriticalTaskExit>,
+    ) -> tokio::task::JoinHandle<()> {
         let mut stop_rx = self.stop_tx.subscribe();
 
         tokio::spawn(async move {
+            let _exit_guard = exit_guard;
             let tick_duration = Duration::from_secs(JANITOR_TICK_INTERVAL_SECS);
             let mut interval = tokio::time::interval(tick_duration);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -17,6 +17,25 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
+/// Fires the control-plane fatal channel when a critical background task
+/// exits for any reason (return, panic, or abort). A dead listener loop or
+/// janitor otherwise leaves the process alive but unable to serve flows;
+/// exiting lets the service manager restart it. Shutdown aborts land after
+/// the run loop has left its select, so they never deliver.
+pub(super) struct CriticalTaskExit {
+    name: &'static str,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+}
+
+impl Drop for CriticalTaskExit {
+    fn drop(&mut self) {
+        let _ = self.fatal_tx.send(anyhow::anyhow!(
+            "critical background task '{}' exited",
+            self.name
+        ));
+    }
+}
+
 async fn accept_tcp_with_admission(
     tcp4_listener: &tokio::io::unix::AsyncFd<std::net::TcpListener>,
     tcp6_listener: Option<&tokio::io::unix::AsyncFd<std::net::TcpListener>>,
@@ -332,6 +351,7 @@ impl ControlPlane {
 
         // One receive loop per listener socket. The datapath hashes flows
         // into the group (see the comment above), so loops are flow-disjoint.
+        let (critical_fatal_tx, mut critical_fatal_rx) = mpsc::unbounded_channel();
         {
             let state = UdpLoopState {
                 udp_pool: Arc::clone(&self.udp_pool),
@@ -343,19 +363,22 @@ impl ControlPlane {
                 handle: self.spawn_handle(),
             };
             let mut tasks = self.background_tasks.lock().await;
-            for socket in &udp4_sockets {
-                tasks.push(tokio::spawn(udp_listener_loop(
-                    state.clone(),
-                    Arc::clone(socket),
-                    "v4",
-                )));
-            }
-            for socket in &udp6_sockets {
-                tasks.push(tokio::spawn(udp_listener_loop(
-                    state.clone(),
-                    Arc::clone(socket),
-                    "v6",
-                )));
+            for (socket, family) in udp4_sockets
+                .iter()
+                .map(|socket| (socket, "v4"))
+                .chain(udp6_sockets.iter().map(|socket| (socket, "v6")))
+            {
+                let state = state.clone();
+                let socket = Arc::clone(socket);
+                let fatal_tx = critical_fatal_tx.clone();
+                let name = match family {
+                    "v4" => "udp_listener_loop/v4",
+                    _ => "udp_listener_loop/v6",
+                };
+                tasks.push(tokio::spawn(async move {
+                    let _exit = CriticalTaskExit { name, fatal_tx };
+                    udp_listener_loop(state, socket, family).await;
+                }));
             }
         }
 
@@ -413,7 +436,10 @@ impl ControlPlane {
             let mut tasks = self.background_tasks.lock().await;
 
             let janitor = BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone());
-            tasks.push(janitor.spawn());
+            tasks.push(janitor.spawn_supervised(CriticalTaskExit {
+                name: "bpf_janitor",
+                fatal_tx: critical_fatal_tx.clone(),
+            }));
             info!("BPF map janitor started");
 
             let removal_task = spawn_udp_removal_worker(
@@ -669,6 +695,12 @@ impl ControlPlane {
                 error = udp_removal_fatal_rx.recv() => {
                     fatal_error = Some(error.unwrap_or_else(|| {
                         anyhow::anyhow!("UDP removal fatal channel closed unexpectedly")
+                    }));
+                    break;
+                }
+                error = critical_fatal_rx.recv() => {
+                    fatal_error = Some(error.unwrap_or_else(|| {
+                        anyhow::anyhow!("critical task fatal channel closed unexpectedly")
                     }));
                     break;
                 }
