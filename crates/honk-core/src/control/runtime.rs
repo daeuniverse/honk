@@ -239,6 +239,32 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
+    /// (Re)push the active routing plan when a previous publication failed.
+    /// Reloads clear the dirty flag too; this retry keeps a failed startup
+    /// push from dropping every new LAN flow until someone happens to
+    /// reload on a quiet network.
+    pub(in crate::control) async fn repush_routing_if_dirty(&self) {
+        if !self
+            .routing_publication_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let plan = self.active_routing_plan.read().clone();
+        let mut ebpf = self.ebpf.write().await;
+        match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
+            Ok(_) => {
+                routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
+                self.routing_publication_dirty
+                    .store(false, std::sync::atomic::Ordering::Release);
+                info!("routing publication retry succeeded");
+            }
+            Err(e) => {
+                warn!("Failed to push routing to eBPF (non-fatal): {}", e);
+            }
+        }
+    }
+
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
@@ -430,20 +456,7 @@ impl ControlPlane {
         #[cfg(not(feature = "ebpf"))]
         let mut nfqueue_runtime = ();
 
-        {
-            let plan = self.active_routing_plan.read().clone();
-            let mut ebpf = self.ebpf.write().await;
-            match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
-                Ok(_) => {
-                    routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
-                    self.routing_publication_dirty
-                        .store(false, std::sync::atomic::Ordering::Release);
-                }
-                Err(e) => {
-                    warn!("Failed to push routing to eBPF (non-fatal): {}", e);
-                }
-            }
-        }
+        self.repush_routing_if_dirty().await;
         let (mut udp_removal_task, mut udp_removal_fatal_rx) = {
             let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = self.background_tasks.lock().await;
@@ -744,6 +757,7 @@ impl ControlPlane {
                         loop_count,
                         drain.active_count()
                     );
+                    self.repush_routing_if_dirty().await;
                     continue;
                 }
                 accept_result = accept_tcp_with_admission(

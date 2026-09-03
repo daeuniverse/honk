@@ -1127,6 +1127,33 @@ async fn unchanged_reload_retries_dirty_startup_routing() {
 }
 
 #[tokio::test]
+async fn dirty_startup_routing_is_republished_by_periodic_retry() {
+    let cp = test_cp().await;
+    cp.routing_publication_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+    let before = cp.ebpf.read().await.active_routing_generation().unwrap();
+
+    cp.repush_routing_if_dirty().await;
+
+    assert_ne!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        before
+    );
+    assert!(
+        !cp.routing_publication_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    let stable = cp.ebpf.read().await.active_routing_generation().unwrap();
+    cp.repush_routing_if_dirty().await;
+    assert_eq!(
+        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        stable,
+        "clean flag must make the retry a no-op"
+    );
+}
+
+#[tokio::test]
 async fn changed_hosts_file_rebuilds_reload_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("hosts.rules");
