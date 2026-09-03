@@ -278,7 +278,7 @@ dns {
 | UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每个 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，并将驻留节点封顶为 `4×N`。UDP 与 Selector 所有权互相独立。 |
 | 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接与握手。Ready 池命中、已热 transport 上的逻辑流、`direct` 与 `block` 不占额度；重叠的 reload generation 还共享启动时描述符 gate。 |
 
-周期 HTTP 健康检查与 Clash 延迟测试使用相同的临时暖路径计时：冷的可复用 transport 在计时外预热，并在结束后关闭。只有预热后的目标交换成功才报告健康并提供选择 RTT；setup 与交换失败都会更新活性/冷却，但不产生延迟样本或排名 strike。扫描也不会为每个节点保留一条空闲隧道。
+周期 HTTP 健康检查与 Clash 延迟测试使用相同的临时暖路径计时：冷的可复用 transport 在计时外预热，并在结束后关闭；报告的延迟是已热连接上第二个请求的耗时——一个 round trip，拨号与 TLS 握手不计。只有预热后的目标交换成功才报告健康并提供选择 RTT；setup 与交换失败都会更新活性/冷却，但不产生延迟样本或排名 strike。扫描也不会为每个节点保留一条空闲隧道。
 
 详见 [组选择设计](./design/groups.md)。
 

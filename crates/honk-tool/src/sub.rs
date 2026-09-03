@@ -549,11 +549,10 @@ async fn server_families(node: &Node) -> (bool, bool) {
 }
 
 /// Probe one address family end-to-end: dial the family-specific target
-/// through the node and time the full HTTP HEAD exchange (TLS handshake
-/// included for https targets).  This is what makes the v4/v6 columns
-/// meaningful — a bare dial() return is free for session-multiplexed
-/// protocols (AnyTLS reuses the pooled session and never waits for the
-/// target), so only a real round-trip proves family reachability.
+/// through the node and complete a real HTTP HEAD round trip (so a bare
+/// dial() return, which is free for session-multiplexed protocols, proves
+/// nothing). The reported value follows urltest's warm-path convention —
+/// one round trip over the established connection, setup excluded.
 async fn probe_family(
     registry: &ProxyRegistry,
     node: &Node,
