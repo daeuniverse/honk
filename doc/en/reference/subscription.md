@@ -26,7 +26,7 @@ The URL may otherwise be single-quoted or bare, but ordinary HTTP(S) URLs must h
 
 | Field | Type | Default | Settable in dae | Meaning |
 | --- | --- | --- | --- | --- |
-| `id` | UUID | random UUID | No | Runtime subscription identity; SIGHUP preserves it when the URL matches an existing subscription. |
+| `id` | UUID | random UUID | No | Runtime subscription identity; SIGHUP preserves it when the fetch identity (URL + configured `ua` + headers) matches an existing subscription. |
 | `name` | string | `""` | Yes, as the tag | Display tag and the value used by group `subtag(...)` filters. |
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
@@ -65,7 +65,7 @@ Subscription bodies and the nodes created from them remain runtime state; neithe
 
 Startup parses stored bodies before launching network refreshes. A valid restored body supplies active nodes immediately, so that subscription does not participate in the five-second first-fetch wait. Its network refresh still runs in the background. A missing or invalid stored body is ignored and keeps that subscription in the bounded first-fetch wait until the fetch finishes or the deadline expires; a later valid refresh replaces the corrupt file.
 
-On SIGHUP, subscriptions with the same URL retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, restores a stored body only when no nodes survive for that subscription, commits the rebuilt configuration, and then starts an immediate background refresh.
+On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + headers) retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, restores a stored body only when no nodes survive for that subscription, commits the rebuilt configuration, and then starts an immediate background refresh.
 
 Failure handling preserves a usable runtime rather than clearing it:
 

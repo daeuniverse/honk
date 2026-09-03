@@ -132,6 +132,15 @@ fn subscription_cache_user_agent(sub: &Subscription) -> &str {
     sub.user_agent.as_deref().unwrap_or_default()
 }
 
+/// Full fetch identity, matching the cache filename key: URL plus configured
+/// UA plus headers. URL-only reload matching can swap identities between
+/// same-URL subscriptions with different fetch options.
+pub(crate) fn same_subscription_fetch_identity(a: &Subscription, b: &Subscription) -> bool {
+    a.url == b.url
+        && subscription_cache_user_agent(a) == subscription_cache_user_agent(b)
+        && a.headers == b.headers
+}
+
 fn subscription_filename(sub: &Subscription) -> String {
     fn add_part(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
