@@ -307,8 +307,21 @@ impl ControlPlane {
                     sockets
                 }
                 Err(e) => {
-                    warn!("TPROXY UDPv6 listener unavailable: {}", e);
-                    Vec::new()
+                    // A host without an IPv6 stack never sees v6 flows, so
+                    // empty sk_lookup slots are harmless there. Any other
+                    // failure would black-hole proxied IPv6 UDP until
+                    // restart (slots 6-9 are published once) — fail instead
+                    // and let the service manager retry.
+                    let no_ipv6 = e
+                        .downcast_ref::<io::Error>()
+                        .and_then(|error| error.raw_os_error())
+                        == Some(libc::EAFNOSUPPORT);
+                    if no_ipv6 {
+                        warn!("TPROXY UDPv6 listener unavailable: {}", e);
+                        Vec::new()
+                    } else {
+                        return Err(e.context("bind TPROXY UDPv6 listener group"));
+                    }
                 }
             };
 
