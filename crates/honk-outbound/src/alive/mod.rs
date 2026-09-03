@@ -803,12 +803,19 @@ impl AliveDialerSet {
     /// so transient glitches don't immediately tear down the node's alive state.
     /// Matches Go's `Dialer.ReportUnavailable`.
     pub fn report_unavailable_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
+        // A blocked flow is policy working, not a health signal.
+        if node_id == BLOCK_NODE_ID {
+            return;
+        }
         self.mark_unavailable_internal(node_id, domain, ipver, false, true);
     }
 
     /// Force-mark a node as dead immediately (used on fatal errors).
     /// Matches Go's `Dialer.ReportUnavailableForced`.
     pub fn report_unavailable_forced(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
+        if node_id == BLOCK_NODE_ID {
+            return;
+        }
         self.mark_unavailable_internal(node_id, domain, ipver, true, true);
     }
 
@@ -1037,6 +1044,9 @@ impl AliveDialerSet {
     /// real successes clear it, which is what stops a fast-but-flaky node
     /// from reclaiming the top rank with a single lucky probe.
     pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
+        if node_id == BLOCK_NODE_ID {
+            return;
+        }
         self.get_or_create_collection(node_id, alive_index(domain, ipver))
             .record_dial_failure();
     }
