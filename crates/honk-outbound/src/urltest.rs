@@ -1,12 +1,15 @@
-//! On-demand URLTest latency measurement (sing-box `urltest` semantics).
+//! On-demand URLTest latency measurement.
 //!
-//! Dials a liveness URL through a proxy node and times the exchange up to
-//! the response headers: HTTP/1.1 `HEAD /` or a real HTTP/2 request when the
-//! server negotiates h2 via ALPN (dispatched per connection — the probe
-//! offers `h2,http/1.1` and speaks whichever the server picks, Go-client
-//! style). Successful measurements feed the node's latency history in
-//! [`AliveDialerSet`]. A lone failure leaves history unchanged; a second
-//! consecutive failure adds a synthetic penalty and demotes the node.
+//! Dials a liveness URL through a proxy node and reports one **warm-path
+//! round trip**: the proxy dial, target TLS handshake, and a first throwaway
+//! request are all untimed; only the second `HEAD /` (or a real HTTP/2
+//! request when the server negotiates h2 via ALPN) is measured, so every
+//! protocol reports the same "already-warm node" latency — the number real
+//! traffic pays through the connection pool. Servers that close after one
+//! response fall back to the first exchange's time. Successful measurements
+//! feed the node's latency history in [`AliveDialerSet`]. A lone failure
+//! leaves history unchanged; a second consecutive failure adds a synthetic
+//! penalty and demotes the node.
 //!
 //! Used by the clash API delay endpoints; the periodic health check loop in
 //! `alive` is unaffected by these ad-hoc measurements.
@@ -351,8 +354,6 @@ pub async fn urltest_node_addr(
     measure_head_exchange(runtime, handler, &host, None, is_https, addr, timeout, None).await
 }
 
-/// Dial `addr` through the node and time the full exchange up to the first
-/// response bytes (TLS handshake + HEAD for https, plain HEAD for http).
 #[allow(clippy::too_many_arguments)]
 async fn measure_head_exchange(
     runtime: &Arc<crate::runtime::NodeRuntime>,
@@ -367,7 +368,6 @@ async fn measure_head_exchange(
     let node = runtime.node.as_ref();
     let reporter = start_feedback(feedback);
     let timed = async {
-        let mut start = Instant::now();
         let proxy = match crate::runtime::capture_dial_admission()
             .scope(handler.dial_runtime(Arc::clone(runtime), addr, target_domain, timeout))
             .await
@@ -380,9 +380,6 @@ async fn measure_head_exchange(
         };
         reporter_setup(&reporter);
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
-        if matches!(node.protocol(), honk_config::types::NodeProtocol::Hysteria2) {
-            start = Instant::now();
-        }
         let stream = proxy.stream;
         let result = async {
             if is_https {
@@ -403,9 +400,9 @@ async fn measure_head_exchange(
             }
         }.await;
         match result {
-            Ok(()) => {
+            Ok(elapsed) => {
                 reporter_success(&reporter);
-                Ok(start.elapsed())
+                Ok(elapsed)
             }
             Err(error) => {
                 reporter_error(&reporter, &error);
@@ -435,78 +432,104 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
     }
 }
 
-/// HTTP/2 variant of [`exchange_head`]: one HEAD request over a fresh H2
-/// session (same layer as the DoH transport), resolved when the response
-/// HEADERS arrive — the same measurement point as the HTTP/1.1 path.
 async fn exchange_head_h2<S>(
     stream: S,
     host: &str,
     reporter: &Option<ScoreReporter>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Duration>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut sender, conn) = h2::client::handshake(stream)
+    let (sender, conn) = h2::client::handshake(stream)
         .await
         .map_err(|e| anyhow!("HTTP/2 handshake: {e}"))?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let req = http::Request::builder()
-        .method("HEAD")
-        .uri(format!("https://{host}/"))
-        .header("user-agent", "honk-urltest/1.0")
-        .body(())
-        .map_err(|e| anyhow!("h2 request build: {e}"))?;
-    let (response_fut, _send_stream) = sender
-        .send_request(req, true)
-        .map_err(|e| anyhow!("h2 send_request: {e}"))?;
-    reporter_tx(reporter, host.len().saturating_add(1));
-    let response = response_fut
-        .await
-        .map_err(|e| anyhow!("h2 response: {e}"))?;
-    reporter_first_response(reporter);
-    reporter_rx(reporter, 1);
-    let code = response.status().as_u16();
-    if !(200..500).contains(&code) {
-        return Err(anyhow!("bad status code: {}", code));
-    }
-    Ok(())
+    let round = |first_response: bool| {
+        let mut sender = sender.clone();
+        let host = host.to_string();
+        let reporter = reporter.clone();
+        async move {
+            let req = http::Request::builder()
+                .method("HEAD")
+                .uri(format!("https://{host}/"))
+                .header("user-agent", "honk-urltest/1.0")
+                .body(())
+                .map_err(|e| anyhow!("h2 request build: {e}"))?;
+            let start = Instant::now();
+            let (response_fut, _send_stream) = sender
+                .send_request(req, true)
+                .map_err(|e| anyhow!("h2 send_request: {e}"))?;
+            reporter_tx(&reporter, host.len().saturating_add(1));
+            let response = response_fut
+                .await
+                .map_err(|e| anyhow!("h2 response: {e}"))?;
+            if first_response {
+                reporter_first_response(&reporter);
+            }
+            reporter_rx(&reporter, 1);
+            let elapsed = start.elapsed();
+            let code = response.status().as_u16();
+            if !(200..500).contains(&code) {
+                return Err(anyhow!("bad status code: {}", code));
+            }
+            Ok(elapsed)
+        }
+    };
+    let warm = round(true).await?;
+    // H2 sessions are inherently reusable; a failed second request means the
+    // peer went away, so keep the warm sample.
+    Ok(round(false).await.unwrap_or(warm))
 }
 
-/// Send a minimal HTTP/1.1 HEAD request and wait for the response
-/// headers, validating the status line (200–499 counts as reachable).
 async fn exchange_head<S>(
     stream: &mut S,
     host: &str,
     reporter: &Option<ScoreReporter>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Duration>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = format!(
-        "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-urltest/1.0\r\nConnection: close\r\n\r\n",
-        host
-    );
-    stream.write_all(request.as_bytes()).await?;
-    reporter_tx(reporter, request.len());
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
+    async fn round<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        host: &str,
+        close: bool,
+        reporter: &Option<ScoreReporter>,
+        first_response: bool,
+    ) -> anyhow::Result<Duration> {
+        let request = format!(
+            "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-urltest/1.0\r\n{}\r\n",
+            host,
+            if close { "Connection: close\r\n" } else { "" }
+        );
+        let start = Instant::now();
+        stream.write_all(request.as_bytes()).await?;
+        reporter_tx(reporter, request.len());
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            if buf.is_empty() && first_response {
+                reporter_first_response(reporter);
+            }
+            reporter_rx(reporter, n);
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16 * 1024 {
+                break;
+            }
         }
-        if buf.is_empty() {
-            reporter_first_response(reporter);
-        }
-        reporter_rx(reporter, n);
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16 * 1024 {
-            break;
-        }
+        validate_status(&buf)?;
+        Ok(start.elapsed())
     }
-    validate_status(&buf)
+    let warm = round(stream, host, false, reporter, true).await?;
+    match round(stream, host, true, reporter, false).await {
+        Ok(measured) => Ok(measured),
+        Err(_) => Ok(warm),
+    }
 }
 
 /// Measure every member of a group concurrently (at most
@@ -1073,6 +1096,35 @@ mod tests {
             while let Ok((mut sock, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
+                    // Keep answering until the client closes: the measurement
+                    // sends a warm-up request before the timed one.
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if sock
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Legacy shape: one response per connection, then close — exercises the
+    /// single-exchange fallback.
+    async fn spawn_close_after_response_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
                     let _ = sock.read(&mut buf).await;
                     let _ = sock
                         .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -1199,6 +1251,48 @@ mod tests {
         exchange_head(&mut stream, "localhost", &no_feedback())
             .await
             .expect("HEAD exchange against local HTTP server should succeed");
+    }
+
+    /// A server that closes after the first response still yields a sample:
+    /// the warm-up exchange's own time is reported.
+    #[tokio::test]
+    async fn test_exchange_head_falls_back_when_server_closes() {
+        let addr = spawn_close_after_response_server().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        exchange_head(&mut stream, "localhost", &no_feedback())
+            .await
+            .expect("single-response server must fall back to the warm sample");
+    }
+
+    /// The reported sample excludes warm-up: a server that stalls only the
+    /// first response must still measure a fast second round trip.
+    #[tokio::test]
+    async fn test_exchange_head_reports_warm_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            for round in 0..2 {
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                if round == 0 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let measured = exchange_head(&mut stream, "localhost", &no_feedback())
+            .await
+            .unwrap();
+        assert!(
+            measured < Duration::from_millis(100),
+            "warm round trip must exclude the stalled first response: {measured:?}"
+        );
     }
 
     /// Regression test for the plaintext-over-443 bug: an https URL must

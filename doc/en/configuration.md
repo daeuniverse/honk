@@ -278,7 +278,7 @@ These mechanisms are independent and bounded by configured groups or explicit bu
 | UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, runs at most 4 attempts concurrently, and caps retained nodes at `4×N`. UDP and Selector ownership are independent. |
 | Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and handshakes per generation. Ready-pool hits, logical streams on warm transports, `direct`, and `block` are exempt; overlapping reload generations also share the startup descriptor gate. |
 
-Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests: cold reusable transports warm outside the timer and close afterward. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
+Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests: cold reusable transports warm outside the timer and close afterward, and the reported latency is the second request on the warmed connection — one round trip, with dial and TLS excluded. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
 
 See the [group selection design](./design/groups.md).
 
