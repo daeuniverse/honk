@@ -760,6 +760,26 @@ impl Config {
             check_outbound(rule.outbound.as_str(), false)?;
         }
         check_outbound(&self.routing.default_outbound, true)?;
+        for subscription in &self.subscriptions {
+            if subscription.name.is_empty() {
+                return Err(crate::ConfigError::Validation(
+                    "subscription name must not be empty".into(),
+                ));
+            }
+            if subscription.url.is_empty() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "subscription '{}' has an empty url",
+                    subscription.name
+                )));
+            }
+            if !subscription.url.starts_with("http://") && !subscription.url.starts_with("https://")
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "subscription '{}' url must use http:// or https://",
+                    subscription.name
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -816,6 +836,34 @@ mod builtin_nodes_tests {
         let mut config = Config::default();
         config.dns.bind = "tcp+udp://localhost:0".into();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_subscriptions() {
+        let valid = crate::subscription::Subscription {
+            name: "sub".into(),
+            url: "https://example.test/feed".into(),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.subscriptions.push(valid.clone());
+        config.validate().unwrap();
+
+        for (name, url) in [
+            ("", "https://example.test/feed"),
+            ("sub", ""),
+            ("sub", "ftp://example.test/feed"),
+        ] {
+            let mut config = Config::default();
+            let mut sub = valid.clone();
+            sub.name = name.into();
+            sub.url = url.into();
+            config.subscriptions.push(sub);
+            assert!(
+                config.validate().is_err(),
+                "name={name:?} url={url:?} must fail validation"
+            );
+        }
     }
 
     #[test]
