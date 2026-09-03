@@ -70,13 +70,13 @@ repo so the setup and the numbers stay in sync with the code.
 
 | Component | Binary | Config |
 | --- | --- | --- |
-| hy2 server | official `hysteria` | `:8443`, password `testpass123`, cert CN `hy2.test` |
-| TUIC server | `tuic-server` 1.0.0 | `:2444`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, requires SNI `hy2.test` |
+| hy2 server | sing-box 1.12.4 | `:8443`, password `testpass123`, cert CN `hy2.test` |
+| TUIC server | sing-box 1.12.4 | `:2444`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, requires SNI `hy2.test` |
 | Juicity server | official Go `juicity-server` v0.4.3 | `:2451`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, SNI `hy2.test` |
-| AnyTLS server | sing-box | `:2445`, password `testpass123` |
+| AnyTLS server | sing-box 1.12.4 | `:2445`, password `testpass123` |
 | AnyTLS server | Go reference `anytls-server` | `:2443`, `-p testpass123` |
-| SS 2022 server | sing-box | `:2447`, `2022-blake3-aes-128-gcm`, psk `8JCsHssyVTFyPy5lYdNhZg==` |
-| Trojan server | sing-box | `:2446`, password `testpass123`, SNI `hy2.test` |
+| SS 2022 server | sing-box 1.12.4 | `:2447`, `2022-blake3-aes-128-gcm`, psk `8JCsHssyVTFyPy5lYdNhZg==` |
+| Trojan server | sing-box 1.12.4 | `:2446`, password `testpass123`, SNI `hy2.test` |
 | Targets | python http.server, iperf3 | ports `8001-8006` + `8080` (direct), `5201-5206` + `5300` (direct); UDP echo `53531-53536` |
 
 Standard engine configs route by destination port so no API switching is
@@ -168,6 +168,73 @@ ssh root@10.10.10.50 \
 Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
+
+## Results (2026-09-02, dae-family matrix: dae / kdae / cdae vs sing-box)
+
+Same-host matrix on the x86 lab (`10.10.10.49`) with `bench/lab-bench.sh`
+over the full six-protocol set (hy2, tuic, ss2022, trojan, anytls-sb,
+anytls-go) plus the direct baseline. **No honk arm in this run** — the matrix
+compares the three dae-family builds against sing-box 1.13.18 (TUN client
+inside the lab netns).
+
+| Engine | Version |
+| --- | --- |
+| dae | upstream `unstable-20260729.r987.2a007b39` |
+| kdae | `unstable-20260824.r1142.ec957346` (go1.26.0 newinliner/simd) |
+| cdae | LostAttractor/dae `dev`, `unstable-20260828.r1.2630677` (built from source, go1.25.7) |
+| sing-box | 1.13.18 |
+
+**cdae's protocol surface is build-time limited.** `dev` comments out
+tuic/juicity/vless/vmess/ssr in `component/outbound/outbound.go`, and its
+anytls dialer fails to register at runtime ("no conn creator registered for
+anytls"), so the effective cdae surface is **hy2 + ss2022 + trojan**; its
+tuic/anytls rows are recorded as 0/invalid, not performance numbers. cdae's
+parser also rejects `dial_mode`, `tcp_check_url`, `udp_check_dns`,
+`check_interval`, and `check_tolerance`, so the harness's 3600s health-check
+suppression does not apply to the cdae arm (`cdae-lab.dae` is `dae-lab.dae`
+minus those keys).
+
+Bandwidth (iperf3 `-R`, median of 3, Mbps):
+
+| protocol | dae | kdae | cdae | sing-box |
+| --- | ---: | ---: | ---: | ---: |
+| direct | 9404 | 9407 | 9405 | 9404 |
+| hy2 | 3066 | 3105 | 3222 | 3206 |
+| tuic | 3339 | 3371 | n/a | 2910 |
+| ss2022 | 9394 | 9399 | 9405 | 9395 |
+| trojan | 9388 | 9388 | 9397 | 9384 |
+| anytls-sb | 5614 | 5600 | n/a | 5659 |
+| anytls-go | 9378 | 9380 | n/a | 9378 |
+
+UDP (offered 10 Gbps, receiver share of offered): hy2 ≈ 0.97–1.12 Gbps
+(84–86%), ss2022 ≈ 2.7–2.9 Gbps (~51%), trojan ≈ 2.9–3.7 Gbps (42–56%),
+anytls ≈ 1.3–1.8 Gbps (73–79%) — engines are within noise of each other on
+the shared rows.
+
+Latency: all engines measure ~2–9 ms cold and 1.7–3.7 ms hot p50/p95 except
+upstream dae's tuic path, which carries a persistent per-stream penalty —
+**cold 82.8 ms, hot p50 78.8 ms**, versus kdae 23.0 / 17.9 ms and sing-box
+7.6 / 2.2 ms. kdae removes most of the penalty; a ~18 ms residue remains.
+
+Loaded-latency stability (200 streams at 250 ms cadence over one reverse
+iperf3 stream on the same outbound; p99 ms):
+
+| protocol | dae | kdae | cdae | sing-box |
+| --- | ---: | ---: | ---: | ---: |
+| direct | 4.86 | 4.72 | 5.02 | 4.88 |
+| hy2 | 3.25 | 3.10 | 3.28 | 3.40 |
+| tuic | **77.50** | 17.28 | n/a | 2.93 |
+| ss2022 | arm-failed\* | 16.03 | 15.87 | 15.32 |
+| trojan | 25.58 | 22.42 | 19.62 | 22.42 |
+| anytls-sb | 2.70 | 2.86 | n/a | 2.69 |
+| anytls-go | 16.43 | 19.87 | n/a | 16.12 |
+
+\* upstream dae's ss2022 loaded-latency arm failed to collect after three
+retries; the row is absent rather than interpolated. All other cells: 0/200
+failures except kdae anytls-go (4/200).
+
+Harness stdout per engine, raw TSV rows, and the exact engine configs live
+under [`engine-matrix-2026-09-02`](../bench/results/engine-matrix-2026-09-02/).
 
 ## Results (2026-08-27, proxied QUIC adapter regression gate)
 

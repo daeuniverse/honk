@@ -60,13 +60,13 @@
 
 | 组件 | 二进制 | 配置 |
 | --- | --- | --- |
-| hy2 server | 官方 `hysteria` | `:8443`,密码 `testpass123`,证书 CN `hy2.test` |
-| TUIC server | `tuic-server` 1.0.0 | `:2444`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,要求 SNI `hy2.test` |
+| hy2 server | sing-box 1.12.4 | `:8443`,密码 `testpass123`,证书 CN `hy2.test` |
+| TUIC server | sing-box 1.12.4 | `:2444`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,要求 SNI `hy2.test` |
 | Juicity server | 官方 Go `juicity-server` v0.4.3 | `:2451`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,SNI `hy2.test` |
-| AnyTLS server | sing-box | `:2445`,密码 `testpass123` |
+| AnyTLS server | sing-box 1.12.4 | `:2445`,密码 `testpass123` |
 | AnyTLS server | Go 参考实现 `anytls-server` | `:2443`,`-p testpass123` |
-| SS 2022 server | sing-box | `:2447`,`2022-blake3-aes-128-gcm`,psk `8JCsHssyVTFyPy5lYdNhZg==` |
-| Trojan server | sing-box | `:2446`,密码 `testpass123`,SNI `hy2.test` |
+| SS 2022 server | sing-box 1.12.4 | `:2447`,`2022-blake3-aes-128-gcm`,psk `8JCsHssyVTFyPy5lYdNhZg==` |
+| Trojan server | sing-box 1.12.4 | `:2446`,密码 `testpass123`,SNI `hy2.test` |
 | 目标服务 | python http.server, iperf3 | 端口 `8001-8006` + `8080`(direct),`5201-5206` + `5300`(direct);UDP echo `53531-53536` |
 
 常规引擎配置按目标端口路由,无需 API 切换：`5201/8001 → hy2`、
@@ -148,6 +148,68 @@ ssh root@10.10.10.50 \
 
 候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
 点估计回退不超过 3% 时通过。
+
+## 结果(2026-09-02,dae 家族矩阵:dae / kdae / cdae 对 sing-box)
+
+在 x86 实验机(`10.10.10.49`)上用 `bench/lab-bench.sh` 做同机对照,协议面为完整
+六协议(hy2、tuic、ss2022、trojan、anytls-sb、anytls-go)加 direct 基线。
+**本轮无 honk arm** —— 矩阵只比较三个 dae 家族构建与 sing-box 1.13.18
+(TUN client 运行在 lab netns 内)。
+
+| 引擎 | 版本 |
+| --- | --- |
+| dae | 上游 `unstable-20260729.r987.2a007b39` |
+| kdae | `unstable-20260824.r1142.ec957346`(go1.26.0 newinliner/simd) |
+| cdae | LostAttractor/dae `dev`,`unstable-20260828.r1.2630677`(源码构建,go1.25.7) |
+| sing-box | 1.13.18 |
+
+**cdae 的协议面在编译期受限。** `dev` 分支在 `component/outbound/outbound.go`
+中注释掉了 tuic/juicity/vless/vmess/ssr,且其 anytls dialer 运行时注册失败
+("no conn creator registered for anytls"),因此 cdae 实际可用面只有
+**hy2 + ss2022 + trojan**;其 tuic/anytls 行记为 0/invalid,不是性能数字。
+cdae 的解析器还拒绝 `dial_mode`、`tcp_check_url`、`udp_check_dns`、
+`check_interval`、`check_tolerance`,harness 的 3600s 健康检查抑制对 cdae
+arm 不生效(`cdae-lab.dae` 即 `dae-lab.dae` 去掉这些键)。
+
+带宽(iperf3 `-R`,3 次取中位数,Mbps):
+
+| 协议 | dae | kdae | cdae | sing-box |
+| --- | ---: | ---: | ---: | ---: |
+| direct | 9404 | 9407 | 9405 | 9404 |
+| hy2 | 3066 | 3105 | 3222 | 3206 |
+| tuic | 3339 | 3371 | n/a | 2910 |
+| ss2022 | 9394 | 9399 | 9405 | 9395 |
+| trojan | 9388 | 9388 | 9397 | 9384 |
+| anytls-sb | 5614 | 5600 | n/a | 5659 |
+| anytls-go | 9378 | 9380 | n/a | 9378 |
+
+UDP(发送 10 Gbps,接收占发送比):hy2 ≈ 0.97–1.12 Gbps(84–86%),ss2022 ≈
+2.7–2.9 Gbps(~51%),trojan ≈ 2.9–3.7 Gbps(42–56%),anytls ≈ 1.3–1.8 Gbps
+(73–79%)—— 共有行上各引擎在噪声范围内一致。
+
+延迟:除上游 dae 的 tuic 路径外,所有引擎冷启动约 2–9 ms、热态 p50/p95 约
+1.7–3.7 ms;dae tuic 存在固定的每流惩罚 —— **冷 82.8 ms,热 p50 78.8 ms**,
+而 kdae 为 23.0 / 17.9 ms,sing-box 为 7.6 / 2.2 ms。kdae 已修掉大部分惩罚,
+仍残留约 18 ms。
+
+带载延迟稳定性(同一条 outbound 上一条反向 iperf3 流压载,200 个流以
+250 ms 节拍注入;p99 ms):
+
+| 协议 | dae | kdae | cdae | sing-box |
+| --- | ---: | ---: | ---: | ---: |
+| direct | 4.86 | 4.72 | 5.02 | 4.88 |
+| hy2 | 3.25 | 3.10 | 3.28 | 3.40 |
+| tuic | **77.50** | 17.28 | n/a | 2.93 |
+| ss2022 | arm-failed\* | 16.03 | 15.87 | 15.32 |
+| trojan | 25.58 | 22.42 | 19.62 | 22.42 |
+| anytls-sb | 2.70 | 2.86 | n/a | 2.69 |
+| anytls-go | 16.43 | 19.87 | n/a | 16.12 |
+
+\* 上游 dae 的 ss2022 带载延迟 arm 三次重试均未采到数据,该行留空而非插值。
+其余单元格失败数均为 0/200,仅 kdae anytls-go 为 4/200。
+
+各引擎完整 harness stdout、raw TSV 行与原始配置文件见
+[`engine-matrix-2026-09-02`](../bench/results/engine-matrix-2026-09-02/)。
 
 ## 结果(2026-08-27,代理 QUIC adapter 回归门槛)
 
