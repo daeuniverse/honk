@@ -271,6 +271,8 @@ impl ControlPlane {
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
+        let mut subscription_authorizations =
+            crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions)?;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
         #[cfg(feature = "ebpf")]
@@ -813,16 +815,31 @@ impl ControlPlane {
 
                 cmd = rx.recv() => {
                     match cmd {
-                        Some(ControlCommand::ReloadConfig { request_id, config }) => {
+                        Some(ControlCommand::ReloadConfig {
+                            request_id,
+                            config,
+                            result,
+                        }) => {
                             info!("SIGHUP reload request {request_id} started");
-                            if self.apply_sighup_config(*config, &drain).await {
+                            let applied = self
+                                .apply_sighup_config(
+                                    *config,
+                                    &drain,
+                                    &mut subscription_authorizations,
+                                )
+                                .await;
+                            let committed = if applied {
                                 info!("SIGHUP reload request {request_id} applied");
+                                Some(self.config.read().await.subscriptions.clone())
                             } else {
                                 warn!("SIGHUP reload request {request_id} rejected");
-                            }
+                                None
+                            };
+                            let _ = result.send(committed);
                         }
                         Some(ControlCommand::MergeSubscription {
                             subscription_id,
+                            revision,
                             name,
                             nodes,
                         }) => {
@@ -831,16 +848,11 @@ impl ControlPlane {
                                 nodes.len(),
                                 name
                             );
-                            if nodes.is_empty() {
-                                warn!(
-                                    subscription = %name,
-                                    "subscription returned no nodes; keeping active nodes"
-                                );
-                                continue;
-                            }
                             let _ = self
-                                .merge_subscription_nodes_with_drain(
+                                .merge_authorized_subscription_nodes_with_drain(
                                     subscription_id,
+                                    revision,
+                                    &subscription_authorizations,
                                     nodes,
                                     &drain,
                                 )

@@ -109,12 +109,19 @@ impl ControlPlane {
         &self,
         mut new_config: Config,
         drain: &DrainTracker,
+        authorizations: &mut crate::subscription::SubscriptionAuthorizations,
     ) -> bool {
         let _reload = self.reload_lock.lock().await;
         let current = self.config.read().await.clone();
         rebase_subscription_nodes(&current, &mut new_config);
         new_config.ensure_local_direct_rules();
-        self.apply_runtime_config_locked(new_config, drain).await
+        crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
+        self.apply_resolved_runtime_config_locked_with_authorizations(
+            new_config,
+            drain,
+            Some(authorizations),
+        )
+        .await
     }
 
     pub(in crate::control) async fn apply_runtime_config_locked(
@@ -136,9 +143,25 @@ impl ControlPlane {
 
     pub(in crate::control) async fn apply_resolved_runtime_config_locked(
         &self,
-        mut new_config: Config,
+        new_config: Config,
         drain: &DrainTracker,
     ) -> bool {
+        self.apply_resolved_runtime_config_locked_with_authorizations(new_config, drain, None)
+            .await
+    }
+
+    async fn apply_resolved_runtime_config_locked_with_authorizations(
+        &self,
+        mut new_config: Config,
+        drain: &DrainTracker,
+        mut authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
+    ) -> bool {
+        if let Err(error) =
+            crate::subscription::validate_subscription_ids(&new_config.subscriptions)
+        {
+            error!(%error, "reload rejected: invalid subscription ids");
+            return false;
+        }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
@@ -575,6 +598,12 @@ impl ControlPlane {
                 publication.commit();
                 *router_guard = new_router;
                 *config_guard = Arc::new(new_config);
+                if let Some(authorizations) = authorizations.as_deref_mut() {
+                    authorizations.publish(
+                        &current_config.subscriptions,
+                        &config_guard.subscriptions,
+                    );
+                }
                 *group_guard = Arc::clone(&new_group_manager);
                 *outbound_guard = new_outbound_id_map;
                 if routing_publication_needed {

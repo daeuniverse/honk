@@ -35,11 +35,7 @@ pub(in crate::control) fn config_with_subscription_nodes(
 }
 
 impl ControlPlane {
-    /// Merge freshly fetched subscription nodes into the running config,
-    /// replacing the previous node set of `subscription_id`, and run the
-    /// shared rebuild pipeline. The snapshot, no-op check, and build all stay
-    /// under the reload lock so a concurrent reload cannot be overwritten.
-    pub(in crate::control) async fn merge_subscription_nodes_with_drain(
+    async fn merge_subscription_nodes_locked(
         &self,
         subscription_id: uuid::Uuid,
         mut nodes: Vec<Node>,
@@ -48,7 +44,6 @@ impl ControlPlane {
         if nodes.is_empty() {
             return true;
         }
-        let _reload = self.reload_lock.lock().await;
         let current = self.config.read().await.clone();
         if subscription_nodes_unchanged(&current, subscription_id, &mut nodes) {
             info!(
@@ -61,11 +56,33 @@ impl ControlPlane {
         self.apply_runtime_config_locked(new_config, drain).await
     }
 
+    pub(in crate::control) async fn merge_authorized_subscription_nodes_with_drain(
+        &self,
+        subscription_id: uuid::Uuid,
+        revision: u64,
+        authorizations: &crate::subscription::SubscriptionAuthorizations,
+        nodes: Vec<Node>,
+        drain: &DrainTracker,
+    ) -> bool {
+        let _reload = self.reload_lock.lock().await;
+        if !authorizations.authorizes(subscription_id, revision) {
+            warn!(
+                %subscription_id,
+                revision,
+                "discarding stale subscription refresh"
+            );
+            return false;
+        }
+        self.merge_subscription_nodes_locked(subscription_id, nodes, drain)
+            .await
+    }
+
     /// Public test/control wrapper for a subscription merge.
     pub async fn merge_subscription_nodes(&self, subscription_id: uuid::Uuid, nodes: Vec<Node>) {
         let drain = Arc::clone(&self.drain_tracker);
+        let _reload = self.reload_lock.lock().await;
         let _ = self
-            .merge_subscription_nodes_with_drain(subscription_id, nodes, &drain)
+            .merge_subscription_nodes_locked(subscription_id, nodes, &drain)
             .await;
     }
 }
