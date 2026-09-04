@@ -649,6 +649,24 @@ impl AliveDialerSet {
             })
     }
 
+    /// Whether the sibling UDP domain (the one that did not just die) has
+    /// recorded, currently-alive state — the node is still carrying UDP
+    /// traffic despite this domain's death.
+    fn udp_sibling_explicitly_alive(&self, node_id: Uuid, dead: ProbeDomain) -> bool {
+        let sibling = match dead {
+            ProbeDomain::DataUdp => ProbeDomain::DnsUdp,
+            ProbeDomain::DnsUdp => ProbeDomain::DataUdp,
+            ProbeDomain::Tcp => return false,
+        };
+        let history = self.probe_history.read();
+        [IpVersion::V4, IpVersion::V6].into_iter().any(|v| {
+            self.is_alive_for(node_id, sibling, v)
+                && history
+                    .get(&(node_id, alive_index(sibling, v)))
+                    .is_some_and(|records| !records.is_empty())
+        })
+    }
+
     pub fn alive_nodes(&self) -> HashSet<Uuid> {
         let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
         self.states
@@ -789,7 +807,13 @@ impl AliveDialerSet {
             let still_alive = self.read_state(node_id, idx).alive;
             if !still_alive {
                 self.push_ebpf(node_id, domain, ipver, false);
-                if let Some(ref cb) = *self.death_callback.read() {
+                // A split UDP death (e.g. the DNS check target is blocked
+                // while data-path handshakes succeed) leaves the sibling
+                // domain carrying live flows; purging them would interrupt
+                // healthy traffic for no liveness gain.
+                if !self.udp_sibling_explicitly_alive(node_id, domain)
+                    && let Some(ref cb) = *self.death_callback.read()
+                {
                     cb(node_id, &self.node_name(node_id));
                 }
             }

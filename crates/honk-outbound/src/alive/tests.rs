@@ -845,6 +845,38 @@ fn test_death_callback_fires_on_flip_only() {
     assert_eq!(calls.lock().unwrap().len(), 3);
 }
 
+/// A split UDP death must not fire the death callback while the sibling
+/// UDP domain carries explicitly-alive state: purging would kill healthy
+/// data-path flows. Once the sibling is dead too, the callback fires.
+#[test]
+fn test_death_callback_skipped_while_udp_sibling_alive() {
+    let set = AliveDialerSet::new();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    set.set_death_callback(Some(Box::new(move |node: Uuid, _name: &str| {
+        calls2.lock().unwrap().push(node);
+    })));
+
+    set.mark_alive_for(id(1), ProbeDomain::DataUdp, IpVersion::V4);
+    for _ in 0..3 {
+        set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
+    }
+    assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "DnsUdp death with an explicitly-alive DataUdp must not purge"
+    );
+
+    for _ in 0..3 {
+        set.mark_dead_for(id(1), ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the purge fires once both UDP domains are dead"
+    );
+}
+
 /// Restored (persisted) delay samples seed ranking data without touching
 /// liveness: an unknown node stays in its default alive state, and a
 /// previously dead node stays dead.
