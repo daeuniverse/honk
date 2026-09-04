@@ -757,6 +757,17 @@ impl AliveDialerSet {
     ) {
         let idx = alive_index(domain, ipver);
 
+        // Builtins are the base layer, not candidates: direct failures are
+        // local-egress conditions (an unreachable target says nothing about
+        // direct itself), and block refusals are policy working. Marking
+        // either dead only fail-closes native traffic at TC and makes
+        // groups fall back to proxies for traffic that should not be
+        // proxied. Only the liveness verdict is suppressed — probes and
+        // dial outcomes still feed latency ranking.
+        if node_id == DIRECT_NODE_ID || node_id == BLOCK_NODE_ID {
+            return;
+        }
+
         // During the grace period (fresh registrations, e.g. right after a
         // restart) neither probe nor traffic failures count toward death:
         // a startup DNS/warm-up hiccup must not mass-mark every node dead
@@ -1085,7 +1096,9 @@ impl AliveDialerSet {
     /// real successes clear it, which is what stops a fast-but-flaky node
     /// from reclaiming the top rank with a single lucky probe.
     pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
-        if node_id == BLOCK_NODE_ID {
+        // block refusals are policy, and direct failures are local-egress
+        // conditions — neither says anything about node quality.
+        if node_id == BLOCK_NODE_ID || node_id == DIRECT_NODE_ID {
             return;
         }
         self.get_or_create_collection(node_id, alive_index(domain, ipver))
@@ -1358,24 +1371,8 @@ impl AliveDialerSet {
     /// the global path: a dead node needs RECOVERY_SUCCESSES_NEEDED
     /// consecutive successes to revive).
     pub(crate) fn record_url_probe_success(&self, node_id: &str, url: &str, latency: Duration) {
+        self.mark_url_probe_succeeded(node_id, url);
         let key = (node_id.to_string(), url.to_string());
-        {
-            let mut states = self.url_states.write();
-            let e = states.entry(key.clone()).or_insert_with(UrlProbeState::new);
-            if e.alive {
-                e.consecutive_failures = 0;
-                e.consecutive_successes = 0;
-                e.cooldown_until = Instant::now();
-            } else {
-                e.consecutive_successes += 1;
-                e.consecutive_failures = 0;
-                if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
-                    e.alive = true;
-                    e.consecutive_successes = 0;
-                    e.cooldown_until = Instant::now();
-                }
-            }
-        }
         let coll = {
             let mut cols = self.url_collections.write();
             cols.entry(key)
@@ -1384,6 +1381,29 @@ impl AliveDialerSet {
         };
         if self.is_alive_for_url(node_id, url) {
             coll.mark_available(latency);
+        }
+    }
+
+    /// Advance only the (tag, url) liveness state machine. A builtin leaf
+    /// (direct/block) is exempt from URL probing, but a state that died
+    /// under a previous non-builtin leaf must still recover once the member
+    /// resolves to a builtin, or the tag stays filtered forever.
+    pub(crate) fn mark_url_probe_succeeded(&self, node_id: &str, url: &str) {
+        let key = (node_id.to_string(), url.to_string());
+        let mut states = self.url_states.write();
+        let e = states.entry(key).or_insert_with(UrlProbeState::new);
+        if e.alive {
+            e.consecutive_failures = 0;
+            e.consecutive_successes = 0;
+            e.cooldown_until = Instant::now();
+        } else {
+            e.consecutive_successes += 1;
+            e.consecutive_failures = 0;
+            if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
+                e.alive = true;
+                e.consecutive_successes = 0;
+                e.cooldown_until = Instant::now();
+            }
         }
     }
 

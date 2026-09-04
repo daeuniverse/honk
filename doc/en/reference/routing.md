@@ -84,7 +84,7 @@ Addresses become host CIDRs (`/32` or `/128`). Missing interfaces and an unresol
 
 ## Fail-closed behavior
 
-When health checking marks an outbound dead, the eBPF datapath normally drops new flows routed to it with `TC_ACT_SHOT`; it never silently leaks them through `direct`. A TCP group with exactly one unique leaf and no `final` instead keeps that same proxy dialable as a last resort, so real traffic can prove recovery. UDP and all-dead multi-leaf groups remain fail-closed. Destination port `53` is exempt for both TCP and UDP so DNS can still reach the control plane.
+When health checking marks an outbound dead, the eBPF datapath normally drops new flows routed to it with `TC_ACT_SHOT`; it never silently leaks them through `direct`. A TCP group with exactly one unique leaf and no `final` instead keeps that same proxy dialable as a last resort, so real traffic can prove recovery. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. Destination port `53` is exempt for both TCP and UDP so DNS can still reach the control plane.
 
 For an outage-tolerant gateway:
 

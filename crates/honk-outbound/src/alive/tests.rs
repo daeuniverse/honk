@@ -992,9 +992,67 @@ fn test_block_ignores_traffic_failures() {
         set.report_unavailable_traffic(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
         set.report_unavailable_forced(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
         set.record_dial_failure(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.mark_dead(BLOCK_NODE_ID);
     }
     assert!(set.is_alive_for(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4));
     assert!(set.is_alive_for(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V6));
+}
+
+/// Builtins are the base layer: traffic failures (e.g. a LAN client
+/// hammering unreachable P2P peers), probe deaths, forced marks, and dial
+/// strikes must never change the direct liveness verdict — its death only
+/// fail-closes native traffic at TC and ejects it from groups.
+#[test]
+fn test_direct_ignores_failure_marks() {
+    let set = AliveDialerSet::new();
+    set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    // Age out of the registration grace period so non-forced failures count
+    // (the incident vector was the traffic-failure threshold).
+    set.node_registered_at
+        .write()
+        .insert(DIRECT_NODE_ID, Instant::now() - GRACE_PERIOD);
+    for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        for ipver in [IpVersion::V4, IpVersion::V6] {
+            for _ in 0..20 {
+                set.report_unavailable_traffic(DIRECT_NODE_ID, domain, ipver);
+                set.report_unavailable_forced(DIRECT_NODE_ID, domain, ipver);
+                set.record_dial_failure(DIRECT_NODE_ID, domain, ipver);
+                set.mark_dead_for(DIRECT_NODE_ID, domain, ipver);
+            }
+            set.mark_dead(DIRECT_NODE_ID);
+            assert!(set.is_alive_for(DIRECT_NODE_ID, domain, ipver));
+            assert!(!set.is_failure_demoted(DIRECT_NODE_ID, domain, ipver));
+        }
+    }
+}
+
+/// A custom-URL member whose tag died under a failing leaf recovers once
+/// the member resolves to a builtin: the vacuous builtin "probe" advances
+/// the (tag, url) state machine instead of leaving it dead forever.
+#[tokio::test]
+async fn test_builtin_leaf_probe_recovers_url_state() {
+    let set = AliveDialerSet::new();
+    let url = "http://check.example/";
+    for _ in 0..3 {
+        set.record_url_probe_failure("sub", url);
+    }
+    assert!(!set.is_alive_for_url("sub", url));
+
+    assert!(
+        set.probe_node_with_url("sub", "direct", url, Duration::from_millis(1))
+            .await
+    );
+    assert!(
+        !set.is_alive_for_url("sub", url),
+        "recovery keeps the two-success hysteresis"
+    );
+    assert!(
+        set.probe_node_with_url("sub", "direct", url, Duration::from_millis(1))
+            .await
+    );
+    assert!(set.is_alive_for_url("sub", url));
+    // No fake latency sample was recorded for the builtin.
+    assert_eq!(set.get_avg_latency_for_url("sub", url), None);
 }
 
 /// direct is probed against the dedicated direct check target (bootstrap

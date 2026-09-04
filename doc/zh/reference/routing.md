@@ -84,7 +84,7 @@ dip(<each LAN/WAN interface address>) -> direct(must)
 
 ## Fail-closed 行为
 
-健康检查把出站标记为死亡后，eBPF 数据面通常会用 `TC_ACT_SHOT` 丢弃路由到该出站的新流，绝不会静默泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试，使真实流量可以证明恢复。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。TCP 和 UDP 的目的端口 `53` 均受豁免，因此 DNS 仍可到达控制面。
+健康检查把出站标记为死亡后，eBPF 数据面通常会用 `TC_ACT_SHOT` 丢弃路由到该出站的新流，绝不会静默泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试，使真实流量可以证明恢复。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 和 UDP 的目的端口 `53` 均受豁免，因此 DNS 仍可到达控制面。
 
 要让网关能承受节点故障：
 

@@ -116,7 +116,7 @@ UDP 嗅探处理 QUIC v1 与 v2 Initial 包。它派生 Initial key、移除 hea
 
 重定向或原生转发前，数据平面检查 `OUTBOUND_CONNECTIVITY_MAP`。选中出站已死时返回 `TC_ACT_SHOT`：honk 以 fail-closed 方式处理，而不会把流量泄漏到 `direct`。TCP 与 UDP 的目的端口 53 都免除此检查，以便 DNS 到达控制平面并应用自己的 fallback 策略。
 
-组共享槽通常保存全部叶节点健康状态的 OR。未配置 `final` 且只有一个唯一叶节点的 TCP 组会保持该槽开放，作为用户态最后尝试；控制面仍拨同一个代理，成功的真实流量可以将其复活。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。Clash `Global` 与 `Direct` override 仍无法绕过 `must` 或 `block` 结果。精确重定向与丢弃路径见[数据平面设计](./datapath.md)。
+组共享槽通常保存全部叶节点健康状态的 OR。未配置 `final` 且只有一个唯一叶节点的 TCP 组会保持该槽开放，作为用户态最后尝试；控制面仍拨同一个代理，成功的真实流量可以将其复活。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。Clash `Global` 与 `Direct` override 仍无法绕过 `must` 或 `block` 结果。精确重定向与丢弃路径见[数据平面设计](./datapath.md)。
 
 ## 相关文档
 
