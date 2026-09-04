@@ -107,10 +107,17 @@ async fn resolve_dial_leaf_implicit_uses_traffic_router() {
 }
 
 #[tokio::test]
-async fn implicit_quic_routes_match_udp_traffic_rules() {
+async fn implicit_quic_routes_use_data_udp_health() {
     let node = test_node("proxy-leaf");
     let group = test_group("proxy", GroupPolicy::Score, vec![node.id]);
-    let manager = GroupManager::new(&[group], std::slice::from_ref(&node)).into_shared();
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    alive.report_unavailable_forced(
+        node.id,
+        honk_outbound::alive::ProbeDomain::DnsUdp,
+        honk_outbound::alive::IpVersion::V4,
+    );
+    let manager = GroupManager::with_alive_set(&[group], std::slice::from_ref(&node), Some(alive))
+        .into_shared();
     let traffic = Arc::new(RwLock::new(
         Router::new(
             &[RoutingRule {
@@ -145,9 +152,55 @@ async fn implicit_quic_routes_match_udp_traffic_rules() {
         assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Udp);
         assert_eq!(
             context.probe_domain,
-            honk_outbound::alive::ProbeDomain::DnsUdp
+            honk_outbound::alive::ProbeDomain::DataUdp
         );
     }
+}
+
+/// The proxied carrier of a plain `udp://` upstream is pooled TCP-DNS
+/// (never real UDP through the node), so its selection follows TCP health:
+/// a node whose `:53` UDP probe died keeps serving TCP-carried DNS.
+#[tokio::test]
+async fn implicit_udp_route_follows_tcp_carrier_health() {
+    let node = test_node("proxy-leaf");
+    let group = test_group("proxy", GroupPolicy::Score, vec![node.id]);
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    alive.report_unavailable_forced(
+        node.id,
+        honk_outbound::alive::ProbeDomain::DnsUdp,
+        honk_outbound::alive::IpVersion::V4,
+    );
+    let manager = GroupManager::with_alive_set(&[group], std::slice::from_ref(&node), Some(alive))
+        .into_shared();
+    let traffic = Arc::new(RwLock::new(
+        Router::new(
+            &[RoutingRule {
+                name: "udp-dns".into(),
+                condition: RoutingCondition {
+                    protocol: vec!["udp".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("proxy".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            }],
+            "direct",
+        )
+        .unwrap(),
+    ));
+    let upstreams = [make_upstream("udp", "192.0.2.53:53", DnsProtocol::Udp)];
+    let pool =
+        UpstreamPool::new_with_proxy(&upstreams, make_router(), None, vec![node.clone()], vec![])
+            .unwrap()
+            .with_group_manager(manager)
+            .with_traffic_router(traffic);
+
+    let route = pool.resolve_dial_route(&pool.entries["udp"]).await.unwrap();
+    assert_eq!(route.node.as_ref().expect("TCP-carried route").id, node.id);
+    let context = route.feedback.expect("Score feedback").context().clone();
+    assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Tcp);
+    assert_eq!(context.probe_domain, honk_outbound::alive::ProbeDomain::Tcp);
 }
 
 #[tokio::test]
