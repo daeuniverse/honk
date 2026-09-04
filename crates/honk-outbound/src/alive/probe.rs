@@ -35,9 +35,9 @@ impl AliveDialerSet {
         // direct is measured against the bootstrap resolver (default
         // 223.5.5.5:53) with a raw connect: the proxy check URL is chosen
         // for proxied egress and is commonly unreachable over a direct
-        // connection (e.g. google-analytics from CN). The result is a
-        // display-only latency signal — failure marks never apply to the
-        // direct builtin (see mark_unavailable_internal).
+        // connection (e.g. google-analytics from CN). The result feeds
+        // latency ranking but never the liveness verdict (see
+        // mark_unavailable_internal).
         if node_id == honk_config::config::DIRECT_NODE_ID {
             let target = self.direct_check_addr.read().clone();
             return self
@@ -204,8 +204,12 @@ impl AliveDialerSet {
         url: &str,
         timeout: Duration,
     ) -> bool {
-        // direct/block exemption, same rationale as probe_node.
+        // direct/block exemption, same rationale as probe_node. The
+        // vacuous success still advances the (tag, url) liveness machine:
+        // the tag may carry failures earned by a previous non-builtin leaf,
+        // and leaving them would filter this member forever.
         if matches!(leaf, "direct" | "block") {
+            self.mark_url_probe_succeeded(tag, url);
             return true;
         }
         let prober_opt = self.http_prober.read().clone();
