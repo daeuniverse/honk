@@ -83,7 +83,7 @@ impl GroupManager {
         }
         if candidates.is_empty() {
             return self
-                .last_resort_tcp_leaf(group, domain)
+                .last_resort_tcp_leaf(group, domain, effects)
                 .map(|node| Candidate {
                     tag: node.name.as_str(),
                     node,
@@ -93,7 +93,7 @@ impl GroupManager {
         }
         let candidate = match group.policy {
             GroupPolicy::Selector => {
-                let picked = self.pick_selector(&candidates, group);
+                let picked = self.pick_selector(&candidates, group, network, effects);
                 self.commit_selector_pick(group, picked, domain, ipver, visited, depth, effects)
             }
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
@@ -238,13 +238,17 @@ impl GroupManager {
         &'a self,
         group: &'a Group,
         domain: ProbeDomain,
+        effects: SelectionEffects,
     ) -> Option<&'a Node> {
         if domain != ProbeDomain::Tcp || group.final_outbound.is_some() {
             return None;
         }
         let leaves = self.leaf_nodes_in_group(&group.name);
         match leaves.as_slice() {
-            [node] => Some(*node),
+            [node] => {
+                self.warn_selector_last_resort(group, &node.name, effects);
+                Some(*node)
+            }
             _ => None,
         }
     }

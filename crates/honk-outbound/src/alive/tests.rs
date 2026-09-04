@@ -559,17 +559,28 @@ async fn raw_tcp_probe_with_v4_only_node_address_leaves_v6_untouched() {
 
 struct MockUdpProber {
     result: std::sync::Mutex<Result<Duration, String>>,
+    data_path: Option<Result<Duration, String>>,
 }
 
 impl MockUdpProber {
     fn ok(latency: Duration) -> Self {
         Self {
             result: std::sync::Mutex::new(Ok(latency)),
+            data_path: None,
         }
     }
     fn err(msg: &str) -> Self {
         Self {
             result: std::sync::Mutex::new(Err(msg.to_string())),
+            data_path: None,
+        }
+    }
+    /// DNS check target blocked, but the independent data-path handshake
+    /// succeeded (the relay blocks UDP/53 yet carries UDP fine).
+    fn dns_blocked_data_ok(latency: Duration) -> Self {
+        Self {
+            result: std::sync::Mutex::new(Err("dns probe refused".to_string())),
+            data_path: Some(Ok(latency)),
         }
     }
 }
@@ -579,9 +590,10 @@ impl UdpProber for MockUdpProber {
         &self,
         _node_name: &str,
         _timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         let r = self.result.lock().unwrap().clone();
-        Box::pin(async move { r })
+        let data_path = self.data_path.clone();
+        Box::pin(async move { UdpProbeOutcome { dns: r, data_path } })
     }
 }
 
@@ -592,11 +604,39 @@ impl UdpProber for PendingUdpProber {
         &self,
         _node_name: &str,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         Box::pin(async move {
             tokio::time::sleep(timeout).await;
-            Err("UDP probe timeout".into())
+            UdpProbeOutcome {
+                dns: Err("UDP probe timeout".into()),
+                data_path: None,
+            }
         })
+    }
+}
+
+#[tokio::test]
+async fn test_probe_node_udp_dns_blocked_but_data_path_ok_keeps_data_udp_alive() {
+    let set = AliveDialerSet::new();
+    // No register_node → outside the grace period, failures count
+    // immediately. Probe failure threshold for the UDP domains is 3.
+    set.set_udp_probe(Arc::new(MockUdpProber::dns_blocked_data_ok(
+        Duration::from_millis(12),
+    )));
+
+    for _ in 0..3 {
+        assert!(set.probe_node_udp(id(1), Duration::from_millis(200)).await);
+    }
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        // The DNS check target is unreachable through the node: DnsUdp dies.
+        assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, ipver));
+        // The data path provably works: DataUdp stays alive, so the node
+        // remains UDP-selectable and real traffic can flow.
+        assert!(set.is_alive_for(id(1), ProbeDomain::DataUdp, ipver));
+        assert_eq!(
+            set.get_last_latency(id(1), ProbeDomain::DataUdp, ipver),
+            Some(Duration::from_millis(12))
+        );
     }
 }
 
@@ -803,6 +843,38 @@ fn test_death_callback_fires_on_flip_only() {
         set.mark_dead_for(id(1), ProbeDomain::DataUdp, IpVersion::V4);
     }
     assert_eq!(calls.lock().unwrap().len(), 3);
+}
+
+/// A split UDP death must not fire the death callback while the sibling
+/// UDP domain carries explicitly-alive state: purging would kill healthy
+/// data-path flows. Once the sibling is dead too, the callback fires.
+#[test]
+fn test_death_callback_skipped_while_udp_sibling_alive() {
+    let set = AliveDialerSet::new();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    set.set_death_callback(Some(Box::new(move |node: Uuid, _name: &str| {
+        calls2.lock().unwrap().push(node);
+    })));
+
+    set.mark_alive_for(id(1), ProbeDomain::DataUdp, IpVersion::V4);
+    for _ in 0..3 {
+        set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
+    }
+    assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "DnsUdp death with an explicitly-alive DataUdp must not purge"
+    );
+
+    for _ in 0..3 {
+        set.mark_dead_for(id(1), ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the purge fires once both UDP domains are dead"
+    );
 }
 
 /// Restored (persisted) delay samples seed ranking data without touching

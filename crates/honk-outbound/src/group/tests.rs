@@ -177,6 +177,83 @@ fn test_selector_runtime_choice_overrides_default() {
 }
 
 #[test]
+fn selector_choice_filtered_by_health_falls_back_without_rewriting_choice() {
+    let (a, b) = (nid("sel-a"), nid("sel-b"));
+    let nodes = vec![make_node(a, "sel-a"), make_node(b, "sel-b")];
+    let group = make_group("g", GroupPolicy::Selector, vec![a, b]);
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
+    m.set_selector_choice("g", "sel-a");
+    alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
+
+    let selected = m
+        .select_node_for_domain("g", ProbeDomain::Tcp, IpVersion::V4)
+        .unwrap();
+    assert_eq!(
+        selected.name, "sel-b",
+        "a health-filtered choice falls back to the first alive member"
+    );
+    assert_eq!(
+        m.get_selector_choice("g").as_deref(),
+        Some("sel-a"),
+        "the stored choice is preserved so recovery restores it"
+    );
+
+    // The fallback is rate-limit logged once per (group, network); a second
+    // pick inside the cooldown leaves the timestamp untouched.
+    let key = ("g".to_string(), SelectionNetwork::Tcp);
+    let first_at = m.selector_fallback_log.read().get(&key).copied();
+    assert!(first_at.is_some(), "a filtered-choice fallback is logged");
+    m.select_node_for_domain("g", ProbeDomain::Tcp, IpVersion::V4)
+        .unwrap();
+    let second_at = m.selector_fallback_log.read().get(&key).copied();
+    assert_eq!(first_at, second_at, "the warn is rate-limited");
+}
+
+#[test]
+fn selector_default_filtered_by_health_falls_back_with_log() {
+    let (a, b) = (nid("def-a"), nid("def-b"));
+    let nodes = vec![make_node(a, "def-a"), make_node(b, "def-b")];
+    let mut group = make_group("gd", GroupPolicy::Selector, vec![a, b]);
+    group.default = Some("def-a".into());
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
+    alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
+
+    let selected = m
+        .select_node_for_domain("gd", ProbeDomain::Tcp, IpVersion::V4)
+        .unwrap();
+    assert_eq!(selected.name, "def-b");
+    assert!(
+        m.selector_fallback_log
+            .read()
+            .contains_key(&("gd".to_string(), SelectionNetwork::Tcp)),
+        "a health-filtered default is as invisible as a filtered choice"
+    );
+}
+
+#[test]
+fn selector_all_filtered_serves_last_resort_leaf_with_log() {
+    let a = nid("lr-a");
+    let nodes = vec![make_node(a, "lr-a")];
+    let group = make_group("lr", GroupPolicy::Selector, vec![a]);
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
+    alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
+
+    let selected = m
+        .select_node_for_domain("lr", ProbeDomain::Tcp, IpVersion::V4)
+        .unwrap();
+    assert_eq!(selected.name, "lr-a", "the sole leaf stays dialable");
+    assert!(
+        m.selector_fallback_log
+            .read()
+            .contains_key(&("lr".to_string(), SelectionNetwork::Tcp)),
+        "the last-resort serve is logged"
+    );
+}
+
+#[test]
 fn selector_warm_node_keeps_configured_dead_leaf_and_resolves_nested_choice() {
     let (a, b) = (nid("warm-a"), nid("warm-b"));
     let nodes = vec![make_node(a, "warm-a"), make_node(b, "warm-b")];

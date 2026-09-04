@@ -129,12 +129,29 @@ pub trait HttpProber: Send + Sync {
 /// Type-erased HTTP prober stored in `AliveDialerSet`.
 pub type HttpProberRef = Arc<dyn HttpProber>;
 
+/// Outcome of one node UDP health probe: two independent signals.
+///
+/// The DNS exchange against `udp_check_dns` and the Score data-path
+/// handshake (a real TLS-in-QUIC handshake to the HTTPS check URL) can
+/// disagree when the DNS target is blocked through the node — a common
+/// anti-amplification rule on relay servers — while the UDP data path
+/// itself works. Treating that as total UDP death excluded healthy nodes
+/// from UDP selection permanently (no traffic left to revive them).
+#[derive(Debug)]
+pub struct UdpProbeOutcome {
+    /// Round-trip of the minimal DNS query through the node's UDP transport.
+    pub dns: Result<Duration, String>,
+    /// Independent data-path handshake result; `None` when not run (no HTTPS
+    /// check URL, or the node belongs to no Score group).
+    pub data_path: Option<Result<Duration, String>>,
+}
+
 /// Trait for UDP-based health check probing through proxy nodes.
 ///
 /// Implemented by `honk-core` to route a minimal DNS query through the
 /// proxy handler's UDP data path (real UDP, UoT, QUIC datagrams — whatever
-/// `dial_udp_transport` provides), matching Go's `Dialer.UdpCheck`. Returns
-/// the measured round-trip latency on success, or an error string on failure.
+/// `dial_udp_transport` provides), matching Go's `Dialer.UdpCheck`, plus the
+/// Score data-path handshake as an independent second signal.
 ///
 /// This catches nodes whose TCP path works but whose UDP path is broken
 /// (e.g. an AnyTLS server without UoT support) — a plain TCP probe can
@@ -146,7 +163,7 @@ pub trait UdpProber: Send + Sync {
         &self,
         node_name: &str,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
+    ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>>;
 }
 
 /// Type-erased UDP prober stored in `AliveDialerSet`.
@@ -632,6 +649,24 @@ impl AliveDialerSet {
             })
     }
 
+    /// Whether the sibling UDP domain (the one that did not just die) has
+    /// recorded, currently-alive state — the node is still carrying UDP
+    /// traffic despite this domain's death.
+    fn udp_sibling_explicitly_alive(&self, node_id: Uuid, dead: ProbeDomain) -> bool {
+        let sibling = match dead {
+            ProbeDomain::DataUdp => ProbeDomain::DnsUdp,
+            ProbeDomain::DnsUdp => ProbeDomain::DataUdp,
+            ProbeDomain::Tcp => return false,
+        };
+        let history = self.probe_history.read();
+        [IpVersion::V4, IpVersion::V6].into_iter().any(|v| {
+            self.is_alive_for(node_id, sibling, v)
+                && history
+                    .get(&(node_id, alive_index(sibling, v)))
+                    .is_some_and(|records| !records.is_empty())
+        })
+    }
+
     pub fn alive_nodes(&self) -> HashSet<Uuid> {
         let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
         self.states
@@ -772,7 +807,13 @@ impl AliveDialerSet {
             let still_alive = self.read_state(node_id, idx).alive;
             if !still_alive {
                 self.push_ebpf(node_id, domain, ipver, false);
-                if let Some(ref cb) = *self.death_callback.read() {
+                // A split UDP death (e.g. the DNS check target is blocked
+                // while data-path handshakes succeed) leaves the sibling
+                // domain carrying live flows; purging them would interrupt
+                // healthy traffic for no liveness gain.
+                if !self.udp_sibling_explicitly_alive(node_id, domain)
+                    && let Some(ref cb) = *self.death_callback.read()
+                {
                     cb(node_id, &self.node_name(node_id));
                 }
             }

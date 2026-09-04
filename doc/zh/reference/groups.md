@@ -56,7 +56,7 @@ group {
 
 策略名按 ASCII 大小写不敏感匹配。解析器匹配前会去掉可选的括号后缀，因此接受 `fixed(0)`。无法识别的策略会静默变为 `selector`；旧策略名 `honk` 明确无效，必须改用 `score`。
 
-若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍会把同一节点作为最后尝试。节点保持 dead，直到真实流量或探测使其恢复；这绝不表示回退到 `direct`。UDP 继续正常排除死亡成员。
+若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍会把同一节点作为最后尝试。节点保持 dead，直到真实流量或探测使其恢复；这绝不表示回退到 `direct`。UDP 继续正常排除死亡成员。最后尝试服务与 Selector 已配置选择/`default` 因健康过滤回退到其他成员，都会记录限流警告（每组每网络 60 秒）。
 
 每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。
 
@@ -72,7 +72,7 @@ Score 先用普通健康过滤排除死亡候选，再作出权威的单成员�
 
 评分按组、TCP/UDP、目标 IPv4/IPv6 地址族、规范化精确目标（小写 domain 或 IP 加端口）及节点身份隔离。精确目标证据会与有界的组/网络/地址族聚合证据分层混合，随后随衰减逐渐取得或让出主导权。有真实目标的任务同时更新两层；无目标预热只更新聚合层。嵌套选择会把一次完成的尝试归因到路径经过的每个 Score 组。
 
-评分器的 instrumentation 虽然始终编译，但按需运行：非 Score 路径不会创建 reporter 或评分 cell。所有经过 Score 组且真实启动的 attempt 都会反馈，包括透明 TCP/UDP、DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay test、启动/Selector/UDP 预热，以及外部 UI 下载。有目标的任务使用真实 host/IP、端口、transport 和目标地址族；仅连接代理服务器的 preconnect 与 session warm-up 只更新聚合层，不会虚构业务目标。每个周期 UDP 探测还会通过属于 Score 组的每个节点，对第一个 HTTPS `global.tcp_check_url` 执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手；这个独立 `DataUdp` 样本只影响 Score 评分，不改变基于 DNS 的 UDP 健康判定。未配置 check URL 或 URL 不是 HTTPS 时不运行额外探测。该握手只记录双向有效性，不虚构 wire-byte 流量。每个已启动 attempt 都记录 setup、存在时的首响应、双向字节，以及唯一的紧凑终态；取消或进程 shutdown 保持中性，retry 则作为独立 attempt。
+评分器的 instrumentation 虽然始终编译，但按需运行：非 Score 路径不会创建 reporter 或评分 cell。所有经过 Score 组且真实启动的 attempt 都会反馈，包括透明 TCP/UDP、DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay test、启动/Selector/UDP 预热，以及外部 UI 下载。有目标的任务使用真实 host/IP、端口、transport 和目标地址族；仅连接代理服务器的 preconnect 与 session warm-up 只更新聚合层，不会虚构业务目标。每个周期 UDP 探测还会通过属于 Score 组的每个节点，对第一个 HTTPS `global.tcp_check_url` 执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，且无论 DNS 探测成败都会运行；这个独立 `DataUdp` 样本影响 Score 评分，并且当 DNS exchange 失败而握手成功时还会把 `DataUdp` 标记为存活，使被封禁的 `:53` 检查目标不能永久判死一条正常的 UDP 数据通路。未配置 check URL 或 URL 不是 HTTPS 时不运行额外探测。该握手只记录双向有效性，不虚构 wire-byte 流量。每个已启动 attempt 都记录 setup、存在时的首响应、双向字节，以及唯一的紧凑终态；取消或进程 shutdown 保持中性，retry 则作为独立 attempt。
 
 全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
