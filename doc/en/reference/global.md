@@ -24,7 +24,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The current health loop uses the first value; an empty list falls back to a plain TCP check. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method sent by the URL health check. An empty value is treated as `HEAD`. |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | Comma-separated DNS targets for UDP health checks; a missing port defaults to `53`. |
-| `check_interval` | `check_interval_secs` | `30s` | Global health-check interval. The UDP warm coordinator also uses it, with an effective minimum of 10 seconds. |
+| `check_interval` | `check_interval_secs` | `30s` | Global health-check interval. Must be positive; a value that fails to parse becomes zero and is rejected at validation. The UDP warm coordinator also uses it, with an effective minimum of 10 seconds. |
 | `check_tolerance` | `check_tolerance_ms` | `50ms` | Latency improvement required before URLTest changes its selected member. |
 | `dial_mode` | `dial_mode` | `"domain"` | Destination-domain discovery and routing mode: `ip`, `domain`, `domain+`, or `domain++`. See [Dial modes](#dial-modes). |
 | `allow_insecure` | `allow_insecure` | `false` | Compatibility global TLS-verification fallback. Current TLS connectors do not read it; certificate skipping is configured per node in its share link. |
