@@ -757,6 +757,13 @@ impl AliveDialerSet {
     ) {
         let idx = alive_index(domain, ipver);
 
+        // direct has no alternative to fail over to: marking it dead only
+        // fail-closes native traffic at TC and filters it out of groups,
+        // rerouting nothing. Its probe stays a display-only latency signal.
+        if node_id == DIRECT_NODE_ID {
+            return;
+        }
+
         // During the grace period (fresh registrations, e.g. right after a
         // restart) neither probe nor traffic failures count toward death:
         // a startup DNS/warm-up hiccup must not mass-mark every node dead
@@ -1085,7 +1092,9 @@ impl AliveDialerSet {
     /// real successes clear it, which is what stops a fast-but-flaky node
     /// from reclaiming the top rank with a single lucky probe.
     pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
-        if node_id == BLOCK_NODE_ID {
+        // block refusals are policy, and direct failures are local-egress
+        // conditions — neither says anything about node quality.
+        if node_id == BLOCK_NODE_ID || node_id == DIRECT_NODE_ID {
             return;
         }
         self.get_or_create_collection(node_id, alive_index(domain, ipver))

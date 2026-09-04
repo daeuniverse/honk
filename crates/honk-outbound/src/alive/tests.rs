@@ -997,6 +997,27 @@ fn test_block_ignores_traffic_failures() {
     assert!(set.is_alive_for(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V6));
 }
 
+/// direct has no alternative to fail over to: traffic failures (e.g. a LAN
+/// client hammering unreachable P2P peers) and probe failures must never
+/// mark it dead — its death only fail-closes native traffic at TC and
+/// ejects it from groups, rerouting nothing.
+#[test]
+fn test_direct_ignores_failure_marks() {
+    let set = AliveDialerSet::new();
+    set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    for _ in 0..20 {
+        set.report_unavailable_traffic(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.report_unavailable_forced(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.record_dial_failure(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.mark_dead_for(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.mark_dead_for(DIRECT_NODE_ID, ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert!(set.is_alive_for(DIRECT_NODE_ID, domain, IpVersion::V4));
+        assert!(set.is_alive_for(DIRECT_NODE_ID, domain, IpVersion::V6));
+    }
+}
+
 /// direct is probed against the dedicated direct check target (bootstrap
 /// resolver; default 223.5.5.5:53) instead of the proxy check URL, so the
 /// clash API gets a real direct latency. Uses a loopback listener as the
