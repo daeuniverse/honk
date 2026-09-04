@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -243,7 +243,7 @@ struct TuicConnState {
     /// UDP-over-stream fallback: the peer did not negotiate QUIC datagrams.
     udp_over_stream: bool,
     sessions: SessionMap,
-    next_session: AtomicU16,
+    next_session: AtomicU32,
     /// Number of open TCP streams + UDP bridges on this connection.
     open: Arc<AtomicUsize>,
     /// Last activity (unix seconds) for the idle-connection reaper.
@@ -272,7 +272,7 @@ impl TuicConnState {
             udp_over_stream: conn.max_datagram_size().is_none(),
             conn: conn.clone(),
             sessions: Arc::clone(&sessions),
-            next_session: AtomicU16::new(0),
+            next_session: AtomicU32::new(0),
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             path_health: Arc::clone(&path_health),
@@ -313,8 +313,13 @@ impl TuicConnState {
         state
     }
 
-    fn alloc_session(&self) -> u16 {
-        self.next_session.fetch_add(1, Ordering::Relaxed)
+    fn alloc_session(&self) -> Option<u16> {
+        self.next_session
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next <= u16::MAX as u32).then_some(next + 1)
+            })
+            .ok()
+            .map(|session| session as u16)
     }
 
     /// Inbound QUIC datagrams: PACKET frames are demultiplexed by session id
@@ -551,21 +556,27 @@ impl TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let (_conn, state) = client.connection(connect_timeout).await?;
-        state.touch();
-        let session_id = state.alloc_session();
-        let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
-        state.sessions.lock().insert(session_id, tx);
-        state.open.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(TuicUdpTransport {
-            state,
-            session_id,
-            packet_id: AtomicU16::new(0),
-            rx: tokio::sync::Mutex::new(rx),
-            defrag: tokio::sync::Mutex::new(Defragmenter::new(u16::MAX as usize)),
-            target_addr: TuicAddr::new(target, target_domain)?,
-            target,
-        }))
+        let target_addr = TuicAddr::new(target, target_domain)?;
+        loop {
+            let (conn, state) = client.connection(connect_timeout).await?;
+            let Some(session_id) = state.alloc_session() else {
+                client.quic.invalidate(&conn).await;
+                continue;
+            };
+            state.touch();
+            let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
+            state.sessions.lock().insert(session_id, tx);
+            state.open.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(TuicUdpTransport {
+                state,
+                session_id,
+                packet_id: AtomicU16::new(0),
+                rx: tokio::sync::Mutex::new(rx),
+                defrag: tokio::sync::Mutex::new(Defragmenter::new(u16::MAX as usize)),
+                target_addr,
+                target,
+            }));
+        }
     }
 
     async fn send_udp(
@@ -1117,6 +1128,66 @@ mod tests {
                 .unwrap();
         assert_eq!(src, target);
         assert_eq!(&buf[..n], b"stream-query");
+    }
+
+    async fn assert_udp_roundtrip(transport: &dyn PacketTransport, payload: &[u8]) {
+        transport.send_packet(payload).await.unwrap();
+        let mut buf = [0u8; 256];
+        let (n, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.recv_packet(&mut buf),
+        )
+        .await
+        .expect("reply timed out")
+        .unwrap();
+        assert_eq!(&buf[..n], payload);
+    }
+
+    async fn assert_udp_session_id_rotation(datagrams: bool) {
+        let server_addr = start_server(datagrams, TEST_PASSWORD).await;
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let handler = TuicHandler::new();
+        let client = handler.build_client(&node, None).await.unwrap();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let timeout = Duration::from_secs(5);
+
+        let old = handler
+            .udp_transport_via_client(Arc::clone(&client), target, None, timeout)
+            .await
+            .unwrap();
+        let (old_conn, old_state) = client.connection(timeout).await.unwrap();
+        assert!(old_state.sessions.lock().contains_key(&0));
+
+        old_state
+            .next_session
+            .store(u16::MAX.into(), Ordering::Relaxed);
+        let _last = handler
+            .udp_transport_via_client(Arc::clone(&client), target, None, timeout)
+            .await
+            .unwrap();
+        assert!(old_state.sessions.lock().contains_key(&u16::MAX));
+
+        let fresh = handler
+            .udp_transport_via_client(Arc::clone(&client), target, None, timeout)
+            .await
+            .unwrap();
+        let (fresh_conn, fresh_state) = client.connection(timeout).await.unwrap();
+        assert_ne!(old_conn.stable_id(), fresh_conn.stable_id());
+        assert!(fresh_state.sessions.lock().contains_key(&0));
+
+        assert_udp_roundtrip(old.as_ref(), b"old connection").await;
+        assert_udp_roundtrip(fresh.as_ref(), b"fresh connection").await;
+        drop(old);
+        tokio::task::yield_now().await;
+        assert!(!old_state.sessions.lock().contains_key(&0));
+        assert!(fresh_state.sessions.lock().contains_key(&0));
+        assert_udp_roundtrip(fresh.as_ref(), b"after old dissociate").await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_session_ids_rotate_connections_before_reuse() {
+        assert_udp_session_id_rotation(true).await;
+        assert_udp_session_id_rotation(false).await;
     }
 
     #[tokio::test]
