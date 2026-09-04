@@ -107,14 +107,20 @@ fn test_merge_check_addrs_dedup() {
 #[test]
 fn test_alive_set_basic() {
     let set = AliveDialerSet::new();
-    assert!(set.is_alive(id(1)));
+    assert!(set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
     // TCP probe threshold = 3: one transient failure must not kill the
     // node; three consecutive failures do.
     set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
-    assert!(set.is_alive(id(1)), "TCP survives one probe failure");
+    assert!(
+        set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4),
+        "TCP survives one probe failure"
+    );
     set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
     set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
-    assert!(!set.is_alive(id(1)), "TCP dies after 3 probe failures");
+    assert!(
+        !set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4),
+        "TCP dies after 3 probe failures"
+    );
     // DNS UDP probe threshold = 3 — verify per-protocol thresholds
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
@@ -124,7 +130,7 @@ fn test_alive_set_basic() {
     set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
     assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     set.mark_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
-    assert!(set.is_alive(id(1)));
+    assert!(set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
 }
 
 #[test]
@@ -277,21 +283,6 @@ async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
 
     assert!(set.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
     assert!(set.is_alive_for(node_id, ProbeDomain::DnsUdp, IpVersion::V6));
-}
-
-#[test]
-fn test_sticky_cache_ttl() {
-    let c = StickyCache::new(Duration::from_millis(10));
-    c.set_sticky(
-        "x".into(),
-        StickyTarget {
-            addr: "a:1".into(),
-            protocol: "t".into(),
-        },
-    );
-    assert!(c.get_sticky("x").is_some());
-    std::thread::sleep(Duration::from_millis(20));
-    assert!(c.get_sticky("x").is_none());
 }
 
 #[tokio::test]

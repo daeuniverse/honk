@@ -1,4 +1,4 @@
-//! Outbound dialer management — alive detection, sticky cache, recovery state.
+//! Outbound dialer management — alive detection and recovery state.
 
 pub mod collection;
 pub mod latencies;
@@ -620,14 +620,6 @@ impl AliveDialerSet {
             .is_none_or(|s| s[idx].alive)
     }
 
-    pub fn is_alive(&self, node_id: Uuid) -> bool {
-        self.is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4)
-    }
-
-    pub fn is_alive_udp(&self, node_id: Uuid) -> bool {
-        self.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4)
-    }
-
     /// Whether any UDP-domain state (DataUdp or DnsUdp, either IP version)
     /// has ever been recorded for this node — i.e. it was UDP-probed or had
     /// UDP traffic reported. Group selection uses this to distinguish
@@ -665,21 +657,6 @@ impl AliveDialerSet {
                     .get(&(node_id, alive_index(sibling, v)))
                     .is_some_and(|records| !records.is_empty())
         })
-    }
-
-    pub fn alive_nodes(&self) -> HashSet<Uuid> {
-        let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
-        self.states
-            .read()
-            .iter()
-            .filter(|(_, s)| s[idx].alive)
-            .map(|(k, _)| *k)
-            .collect()
-    }
-
-    pub fn count(&self) -> usize {
-        let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
-        self.states.read().values().filter(|s| s[idx].alive).count()
     }
 
     #[cfg(test)]
@@ -1733,43 +1710,3 @@ mod merge_check_addrs_tests {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct StickyTarget {
-    pub addr: String,
-    pub protocol: String,
-}
-
-pub struct StickyCache {
-    cache: Mutex<HashMap<String, (StickyTarget, Instant)>>,
-    ttl: Duration,
-}
-
-impl StickyCache {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
-            ttl,
-        }
-    }
-    pub fn get_sticky(&self, id: &str) -> Option<StickyTarget> {
-        self.cache
-            .lock()
-            .get(id)
-            .filter(|(_, exp)| Instant::now() < *exp)
-            .map(|(t, _)| t.clone())
-    }
-    pub fn set_sticky(&self, id: String, target: StickyTarget) {
-        self.cache
-            .lock()
-            .insert(id, (target, Instant::now() + self.ttl));
-    }
-    pub fn remove_sticky(&self, id: &str) {
-        self.cache.lock().remove(id);
-    }
-    pub fn prune_expired(&self) -> usize {
-        let mut c = self.cache.lock();
-        let n = c.len();
-        c.retain(|_, (_, e)| Instant::now() < *e);
-        n - c.len()
-    }
-}
