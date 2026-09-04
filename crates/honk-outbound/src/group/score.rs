@@ -20,6 +20,14 @@ const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_MARGIN: f64 = 0.01;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
+/// A detected flap doubles the incumbent hold margin for that target scope,
+/// capped at 2^3 = 8x. Fresh failures still bypass; a merely less reliable
+/// but non-failing incumbent can stay held, which is the intended trade.
+const SCORE_SWITCH_FLAP_MAX_LEVEL: u8 = 3;
+/// One damping level releases only after this many consecutive same-winner
+/// selections — derived from the flap window so a switch:hold ratio up to
+/// 1:8 still accumulates damping instead of cancelling it.
+const SCORE_SWITCH_STABLE_RELEASE: u8 = 2 * SCORE_SWITCH_FLAP_WINDOW as u8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
 const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
@@ -427,6 +435,12 @@ struct SelectionHistory {
     /// Committed non-exploration selections seen by this target scope.
     selections: u64,
     switched_at: u64,
+    /// Flap-damping level: each detected flap raises the hold margin by one
+    /// power of two. One level releases after `SCORE_SWITCH_STABLE_RELEASE`
+    /// consecutive same-winner selections; any committed switch resets the
+    /// streak.
+    margin_level: u8,
+    stable_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -743,20 +757,29 @@ impl ScorePolicyState {
                     previous: None,
                     selections: 1,
                     switched_at: 0,
+                    margin_level: 0,
+                    stable_count: 0,
                 },
             );
             return;
         };
         history.selections = history.selections.saturating_add(1);
         if history.current == node_id {
+            history.stable_count = history.stable_count.saturating_add(1);
+            if history.stable_count >= SCORE_SWITCH_STABLE_RELEASE {
+                history.margin_level = history.margin_level.saturating_sub(1);
+                history.stable_count = 0;
+            }
             return;
         }
+        history.stable_count = 0;
         let switch_flap = history.previous == Some(node_id)
             && history.selections.saturating_sub(history.switched_at) <= SCORE_SWITCH_FLAP_WINDOW;
         history.previous = Some(history.current);
         history.current = node_id;
         history.switched_at = history.selections;
         if switch_flap {
+            history.margin_level = (history.margin_level + 1).min(SCORE_SWITCH_FLAP_MAX_LEVEL);
             let counter = &mut inner
                 .selection_reasons
                 .entry(SelectionReasonKey::new(
@@ -1057,7 +1080,16 @@ impl ScorePolicyState {
         } else {
             match incumbent.filter(|&index| index != best.index) {
                 Some(index) => {
-                    match hold_decision(&snapshots[index], &snapshots[best.index], performance) {
+                    let margin_level = inner
+                        .selection_history
+                        .peek(&SelectionHistoryKey::new(group, context))
+                        .map_or(0, |history| history.margin_level);
+                    match hold_decision(
+                        &snapshots[index],
+                        &snapshots[best.index],
+                        performance,
+                        margin_level,
+                    ) {
                         HoldDecision::Held => RankedSelection {
                             index,
                             reason: SelectionReason::IncumbentHeld,
@@ -1327,10 +1359,11 @@ fn hold_decision(
     incumbent: &ScoreSnapshot,
     best: &ScoreSnapshot,
     performance: PerformanceBaseline,
+    margin_level: u8,
 ) -> HoldDecision {
     let trained =
         incumbent.completed >= MIN_TRAINED_EVIDENCE && best.completed >= MIN_TRAINED_EVIDENCE;
-    let margin = switch_margin(incumbent.hysteresis_completed);
+    let margin = switch_margin(incumbent.hysteresis_completed) * f64::from(1u32 << margin_level);
     let within_switch_margin =
         utility(best, performance) - utility(incumbent, performance) < margin;
     if !trained || !within_switch_margin {
@@ -2601,7 +2634,7 @@ mod tests {
         };
         let decision = |incumbent: ScoreSnapshot, best: ScoreSnapshot| {
             let performance = performance_baseline(&[incumbent, best]);
-            hold_decision(&incumbent, &best, performance)
+            hold_decision(&incumbent, &best, performance, 0)
         };
         let trained = MIN_TRAINED_EVIDENCE;
         let low_margin = switch_margin(trained);
@@ -3546,6 +3579,7 @@ mod tests {
             &incumbent,
             &challenger,
             performance_baseline(&[incumbent, challenger]),
+            0,
         ) == HoldDecision::Held;
         println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
         assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
@@ -4087,6 +4121,116 @@ group {
     }
 
     #[test]
+    fn switch_flap_damps_hold_margin_per_target() {
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let key = SelectionHistoryKey::new("score", &context);
+        let first = node("first").id;
+        let second = node("second").id;
+        let mut inner = StateInner::default();
+        let level = |inner: &StateInner| {
+            inner
+                .selection_history
+                .peek(&key)
+                .map_or(0, |history| history.margin_level)
+        };
+        let record = |inner: &mut StateInner, node_id| {
+            ScorePolicyState::record_switch_flap(
+                inner,
+                &key,
+                node_id,
+                SelectionReason::PerformanceWinner,
+            );
+        };
+
+        record(&mut inner, first);
+        record(&mut inner, second);
+        record(&mut inner, first);
+        assert_eq!(level(&inner), 1);
+
+        // Each further reversal is another flap, capped at the max level.
+        record(&mut inner, second);
+        assert_eq!(level(&inner), 2);
+        record(&mut inner, first);
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL);
+        record(&mut inner, second);
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL);
+
+        // Held selections release one level only after a full stable streak.
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE - 1 {
+            record(&mut inner, second);
+        }
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL);
+        record(&mut inner, second);
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL - 1);
+
+        // A committed switch resets the streak before it can release.
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE - 1 {
+            record(&mut inner, second);
+        }
+        record(&mut inner, first);
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL - 1);
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE {
+            record(&mut inner, first);
+        }
+        assert_eq!(level(&inner), SCORE_SWITCH_FLAP_MAX_LEVEL - 2);
+        for _ in 0..SCORE_SWITCH_STABLE_RELEASE * 2 {
+            record(&mut inner, first);
+        }
+        assert_eq!(level(&inner), 0);
+    }
+
+    #[test]
+    fn hold_decision_flap_margin_multiplies_switch_threshold() {
+        let snapshot = |reliability, failures| ScoreSnapshot {
+            attempts: SCORE_SWITCH_FULL_EVIDENCE,
+            completed: SCORE_SWITCH_FULL_EVIDENCE,
+            hysteresis_completed: SCORE_SWITCH_FULL_EVIDENCE,
+            useful_completed: SCORE_SWITCH_FULL_EVIDENCE,
+            reliability,
+            reliability_upper: reliability,
+            latency_ms: None,
+            latency_confidence: 0.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures,
+            selected_at: 0,
+            explore_backed_off: false,
+            fail_streak: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+        let margin = switch_margin(SCORE_SWITCH_FULL_EVIDENCE);
+        let decide = |gap, failures, level| {
+            let incumbent = snapshot(0.5, failures);
+            let best = snapshot(0.5 + gap, 0.0);
+            hold_decision(
+                &incumbent,
+                &best,
+                performance_baseline(&[incumbent, best]),
+                level,
+            )
+        };
+
+        assert_eq!(decide(margin * 1.5, 0.0, 0), HoldDecision::UseBest);
+        assert_eq!(decide(margin * 1.5, 0.0, 1), HoldDecision::Held);
+        assert_eq!(decide(margin * 2.1, 0.0, 1), HoldDecision::UseBest);
+        // Fresh failures bypass even the fully damped margin.
+        assert_eq!(
+            decide(
+                0.0,
+                SCORE_FAILURE_FORGIVENESS_THRESHOLD,
+                SCORE_SWITCH_FLAP_MAX_LEVEL
+            ),
+            HoldDecision::FreshFailureBypass
+        );
+    }
+
+    #[test]
     fn applied_score_selection_records_switch_flap() {
         let nodes = [node("first"), node("second")];
         let node_refs = [&nodes[0], &nodes[1]];
@@ -4131,6 +4275,65 @@ group {
     }
 
     #[test]
+    fn flap_margin_reaches_hold_decision() {
+        let nodes = [node("first"), node("second")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".to_owned(), node.id)));
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let now = Instant::now();
+        let keys = nodes.each_ref().map(|node| AggregateKey {
+            group: "score".to_owned(),
+            network: SelectionNetwork::Tcp,
+            family: None,
+            node_id: node.id,
+        });
+        {
+            let mut inner = state.inner.lock();
+            inner
+                .aggregate
+                .put(keys[0].clone(), trained_stats(8.0, 50.0, now));
+            inner
+                .aggregate
+                .put(keys[1].clone(), trained_stats(8.0, 200.0, now));
+        }
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+
+        // Latency reverses: the 50ms/200ms gap exceeds the bare 0.01 margin.
+        inner_update_response(&state, keys[0].clone(), 200.0);
+        inner_update_response(&state, keys[1].clone(), 50.0);
+        {
+            let mut inner = state.inner.lock();
+            inner.selection_history.push(
+                SelectionHistoryKey::new("score", &context),
+                SelectionHistory {
+                    current: nodes[0].id,
+                    previous: None,
+                    selections: 1,
+                    switched_at: 0,
+                    margin_level: 2,
+                    stable_count: 0,
+                },
+            );
+        }
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+
+        {
+            let mut inner = state.inner.lock();
+            inner
+                .selection_history
+                .get_mut(&SelectionHistoryKey::new("score", &context))
+                .unwrap()
+                .margin_level = 1;
+        }
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
     fn score_reload_prunes_removed_switch_history_members() {
         let state = ScorePolicyState::default();
         let first = node("first").id;
@@ -4149,6 +4352,8 @@ group {
                     previous: Some(second),
                     selections: 1,
                     switched_at: 1,
+                    margin_level: 0,
+                    stable_count: 0,
                 },
             );
             inner.selection_history.push(
@@ -4158,6 +4363,8 @@ group {
                     previous: Some(first),
                     selections: 1,
                     switched_at: 1,
+                    margin_level: 0,
+                    stable_count: 0,
                 },
             );
         }
