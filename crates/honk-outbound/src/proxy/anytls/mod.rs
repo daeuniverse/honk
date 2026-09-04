@@ -211,6 +211,9 @@ impl PaddingState {
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
+/// Inbound AnyTLS payload bytes retained by every live or draining
+/// physical session belonging to one node pool.
+const INBOUND_PAYLOAD_BUDGET: usize = 12 * 1024 * 1024;
 /// Soft caps on parked overflow (data frames/payload, session-wide and
 /// per stream). Tripping one never blocks the demux: the frame parks and
 /// the stall watchdog reaps consumers that make no flush progress for
@@ -219,7 +222,7 @@ const STREAM_QUEUE_CAP: usize = 64;
 const SESSION_OVERFLOW_CAP: usize = 512;
 const STREAM_OVERFLOW_BYTES_CAP: usize = 2 * 1024 * 1024;
 const SESSION_OVERFLOW_BYTES_CAP: usize = 8 * 1024 * 1024;
-/// Emergency session-wide hard caps. Tripping one reaps the most-stalled
+/// Emergency session-wide frame cap. Tripping it reaps the most-stalled
 /// parked stream on the spot when it is past the grace; while every
 /// stalled stream is inside the grace the demux waits bounded
 /// [`OVERFLOW_EMERGENCY_WAIT`] rounds for reader progress (woken by
@@ -227,7 +230,6 @@ const SESSION_OVERFLOW_BYTES_CAP: usize = 8 * 1024 * 1024;
 /// fills any feasible buffer before the reader task is first scheduled,
 /// so the only alternatives are blocking reads or killing the innocent.
 const SESSION_OVERFLOW_HARD_CAP: usize = 768;
-const SESSION_OVERFLOW_HARD_BYTES_CAP: usize = 12 * 1024 * 1024;
 /// Terminal events (Fin/Error) parked per stream. They bypass the frame
 /// quota — a full quota must not break stream termination — but are not
 /// unbounded: the stream is already terminating, so extras are dropped.
@@ -274,10 +276,55 @@ pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
 /// Monotonic diagnostic session id (sing `sessionCounter`).
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// One admitted inbound payload. Its owned permit follows the bytes through
+/// the primary queue, overflow, and consumer buffer, returning capacity on
+/// exact final-byte consumption or any dropped owner.
+#[derive(Debug)]
+struct InboundPayload {
+    data: Vec<u8>,
+    credit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl InboundPayload {
+    fn new(data: Vec<u8>, credit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        debug_assert_eq!(data.len(), credit.num_permits());
+        Self { data, credit }
+    }
+
+    #[cfg(test)]
+    fn for_test(data: Vec<u8>) -> Self {
+        let budget = Arc::new(tokio::sync::Semaphore::new(data.len()));
+        let credit = budget
+            .try_acquire_many_owned(data.len() as u32)
+            .expect("test payload budget");
+        Self::new(data, credit)
+    }
+
+    fn into_parts(self) -> (Vec<u8>, tokio::sync::OwnedSemaphorePermit) {
+        (self.data, self.credit)
+    }
+}
+
+impl std::ops::Deref for InboundPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<Vec<u8>> for InboundPayload {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.data.as_slice() == other.as_slice()
+    }
+}
+
+
 /// Inbound events delivered from the session demux to a stream task.
 #[derive(Debug)]
 enum StreamEvent {
-    Data(Vec<u8>),
+    Data(InboundPayload),
     Fin,
     Error(Arc<str>),
 }
@@ -564,16 +611,10 @@ impl OverflowState {
         victim
     }
 
-    /// Emergency session-wide bounds on parked data.
-    fn hard_limit_for(&self, event: &StreamEvent) -> Option<OverflowLimit> {
-        let bytes = event.payload_len();
-        if self.bytes.saturating_add(bytes) > SESSION_OVERFLOW_HARD_BYTES_CAP {
-            return Some(OverflowLimit::SessionBytes);
-        }
-        if self.frames >= SESSION_OVERFLOW_HARD_CAP {
-            return Some(OverflowLimit::SessionFrames);
-        }
-        None
+    /// Emergency session-wide bound on parked data frames. Payload bytes are
+    /// already bounded across every owner by the pool semaphore.
+    fn hard_limit(&self) -> Option<OverflowLimit> {
+        (self.frames >= SESSION_OVERFLOW_HARD_CAP).then_some(OverflowLimit::SessionFrames)
     }
 
     /// One wait round at a hard cap, clamped to the nearest grace expiry
@@ -615,7 +656,7 @@ impl OverflowState {
             self.push_back(sid, event);
             return OverflowAction::Parked;
         }
-        let Some(hard) = self.hard_limit_for(&event) else {
+        let Some(hard) = self.hard_limit() else {
             self.push_back(sid, event);
             return OverflowAction::Parked;
         };
@@ -642,9 +683,10 @@ enum StreamSink {
 impl StreamSink {
     #[cfg(test)]
     async fn send_data(&self, data: Vec<u8>) -> bool {
+        let event = StreamEvent::Data(InboundPayload::for_test(data));
         match self {
-            StreamSink::Tcp(tx) => tx.send(StreamEvent::Data(data)).await.is_ok(),
-            StreamSink::Uot(tx) => tx.try_send(StreamEvent::Data(data)).is_ok(),
+            StreamSink::Tcp(tx) => tx.send(event).await.is_ok(),
+            StreamSink::Uot(tx) => tx.try_send(event).is_ok(),
         }
     }
     #[cfg(test)]
@@ -1013,6 +1055,7 @@ async fn session_writer(
 pub(crate) struct AnyTlsPool {
     sessions: Arc<crate::session::SessionPool<AnyTlsSession>>,
     padding: Arc<PaddingState>,
+    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
 }
 
 impl AnyTlsPool {
@@ -1020,11 +1063,16 @@ impl AnyTlsPool {
         Self {
             sessions: Arc::new(crate::session::SessionPool::new(session_pool_config())),
             padding: Arc::new(PaddingState::default()),
+            inbound_payload_budget: Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET)),
         }
     }
 
     fn padding_state(&self) -> Arc<PaddingState> {
         Arc::clone(&self.padding)
+    }
+
+    fn inbound_payload_budget(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.inbound_payload_budget)
     }
 }
 
@@ -1097,6 +1145,9 @@ pub(crate) struct AnyTlsSession {
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
+    /// Shared across every physical session retained or draining under the
+    /// originating node pool.
+    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
     /// Demux task handle, aborted on close.
     demux: Mutex<Option<tokio::task::AbortHandle>>,
     /// Inbound frame counter, bumped by the demux per frame; lets the SYNACK
@@ -1115,6 +1166,7 @@ impl AnyTlsSession {
         auth: &[u8],
         settings: bytes::Bytes,
         padding_state: Arc<PaddingState>,
+        inbound_payload_budget: Arc<tokio::sync::Semaphore>,
     ) -> anyhow::Result<Arc<Self>> {
         transport_write.write_all(auth).await?;
         transport_write.flush().await?;
@@ -1140,6 +1192,7 @@ impl AnyTlsSession {
             overflow_notify: tokio::sync::Notify::new(),
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            inbound_payload_budget,
             demux: Mutex::new(None),
             rx_frame_seq: AtomicU64::new(0),
         });
@@ -1637,7 +1690,17 @@ impl AnyTlsSession {
     /// only missing flush progress past the grace kills. At a hard cap
     /// the demux waits bounded rounds for that progress (see
     /// [`Self::park_overflow`]). A saturated UoT sink retires only its sid.
+    #[cfg(test)]
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
+        let credit = Arc::clone(&self.inbound_payload_budget)
+            .acquire_many_owned(data.len() as u32)
+            .await
+            .expect("test session payload budget open");
+        self.dispatch_payload(sid, InboundPayload::new(data, credit))
+            .await;
+    }
+
+    async fn dispatch_payload(self: &Arc<Self>, sid: u32, data: InboundPayload) {
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
             Some(StreamSink::Tcp(tx)) => {
@@ -1927,17 +1990,145 @@ fn server_synack_setting(data: &[u8]) -> Option<bool> {
 async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
     let mut fail_reason: Option<anyhow::Error> = None;
     loop {
-        let (cmd, sid, data) = match read_frame(&mut read).await {
-            Ok(frame) => frame,
+        let (cmd, sid, payload_len) = match read_frame_header(&mut read).await {
+            Ok(header) => header,
             Err(e) => {
                 debug!("AnyTLS session {} demux read failed: {}", session.seq, e);
                 fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
                 break;
             }
         };
+
+        if cmd == CMD_PSH && payload_len != 0 {
+            let sink = session.streams.lock().unwrap().get(&sid).cloned();
+            match sink {
+                Some(StreamSink::Tcp(_)) => {
+                    let credit = match Arc::clone(&session.inbound_payload_budget)
+                        .acquire_many_owned(payload_len as u32)
+                        .await
+                    {
+                        Ok(credit) => credit,
+                        Err(e) => {
+                            fail_reason = Some(anyhow::anyhow!(
+                                "inbound payload budget closed: {e}"
+                            ));
+                            break;
+                        }
+                    };
+                    let live = matches!(
+                        session.streams.lock().unwrap().get(&sid),
+                        Some(StreamSink::Tcp(tx)) if !tx.is_closed()
+                    );
+                    if !live {
+                        drop(credit);
+                        session.end_stream(sid, false);
+                        if let Err(e) = drain_frame_body(&mut read, payload_len).await {
+                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            break;
+                        }
+                        session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let data = match read_frame_body(&mut read, payload_len).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            break;
+                        }
+                    };
+                    session
+                        .dispatch_payload(sid, InboundPayload::new(data, credit))
+                        .await;
+                }
+                Some(StreamSink::Uot(tx)) => {
+                    let queue = match tx.try_reserve_owned() {
+                        Ok(queue) => queue,
+                        Err(_) => {
+                            session.end_uot_stream(sid, true);
+                            if let Err(e) = drain_frame_body(&mut read, payload_len).await {
+                                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                                break;
+                            }
+                            session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let credit = match Arc::clone(&session.inbound_payload_budget)
+                        .try_acquire_many_owned(payload_len as u32)
+                    {
+                        Ok(credit) => credit,
+                        Err(_) => {
+                            drop(queue);
+                            session.end_uot_stream(sid, true);
+                            if let Err(e) = drain_frame_body(&mut read, payload_len).await {
+                                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                                break;
+                            }
+                            session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let live = matches!(
+                        session.streams.lock().unwrap().get(&sid),
+                        Some(StreamSink::Uot(tx)) if !tx.is_closed()
+                    );
+                    if !live {
+                        drop(queue);
+                        drop(credit);
+                        session.end_uot_stream(sid, true);
+                        if let Err(e) = drain_frame_body(&mut read, payload_len).await {
+                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            break;
+                        }
+                        session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let data = match read_frame_body(&mut read, payload_len).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            break;
+                        }
+                    };
+                    queue.send(StreamEvent::Data(InboundPayload::new(data, credit)));
+                }
+                None => {
+                    debug!(
+                        "AnyTLS session {} PSH for unknown sid={} ({} bytes)",
+                        session.seq, sid, payload_len
+                    );
+                    if let Err(e) = drain_frame_body(&mut read, payload_len).await {
+                        fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let retain_body = matches!(
+            cmd,
+            CMD_SYNACK | CMD_ALERT | CMD_SERVER_SETTINGS | CMD_UPDATE_PADDING_SCHEME
+        );
+        let data = if retain_body {
+            match read_frame_body(&mut read, payload_len).await {
+                Ok(data) => data,
+                Err(e) => {
+                    fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                    break;
+                }
+            }
+        } else {
+            if let Err(e) = drain_frame_body(&mut read, payload_len).await {
+                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                break;
+            }
+            Vec::new()
+        };
+
         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
         match cmd {
-            CMD_PSH if !data.is_empty() => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
                 session.settle_syn_pending(sid);
@@ -2141,6 +2332,7 @@ async fn dial_session(
     connect_timeout: Duration,
     tls_connector: Option<Arc<TlsConnector>>,
     padding_state: Arc<PaddingState>,
+    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
     let timeout = connect_timeout.saturating_mul(3);
     tokio::time::timeout(timeout, async {
@@ -2148,7 +2340,16 @@ async fn dial_session(
         let settings = padding.settings_payload();
         let (read, write, auth) =
             connect_transport(node, addr, connect_timeout, None, tls_connector, &padding).await?;
-        AnyTlsSession::establish(addr, read, write, &auth, settings, padding_state).await
+        AnyTlsSession::establish(
+            addr,
+            read,
+            write,
+            &auth,
+            settings,
+            padding_state,
+            inbound_payload_budget,
+        )
+        .await
     })
     .await
     .map_err(|_| anyhow::anyhow!("AnyTLS session dial timed out after {timeout:?}"))?
@@ -2230,11 +2431,13 @@ impl AnyTlsHandler {
         let prewarm_node = node.clone();
         let label = format!("{}:{}", node.host(), node.port);
         let padding_state = pool.padding_state();
+        let inbound_payload_budget = pool.inbound_payload_budget();
         pool.ensure_janitor(min_idle, idle_timeout, move || {
             let node = prewarm_node.clone();
             let label = label.clone();
             let runtime = runtime.clone();
             let padding_state = Arc::clone(&padding_state);
+            let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
             async move {
                 let tls_connector = runtime
                     .as_ref()
@@ -2246,6 +2449,7 @@ impl AnyTlsHandler {
                     Duration::from_secs(10),
                     tls_connector,
                     padding_state,
+                    inbound_payload_budget,
                 )
                 .await
             }
@@ -2390,6 +2594,7 @@ impl AnyTlsHandler {
         let dial_node = Arc::clone(&node);
         let dial_addr = addr.clone();
         let padding_state = pool.padding_state();
+        let inbound_payload_budget = pool.inbound_payload_budget();
         let transport = pool
             .open_with(
                 move || {
@@ -2397,6 +2602,7 @@ impl AnyTlsHandler {
                     let addr = dial_addr.clone();
                     let runtime = runtime.clone();
                     let padding_state = Arc::clone(&padding_state);
+                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
                     async move {
                         let tls_connector = runtime
                             .as_ref()
@@ -2408,6 +2614,7 @@ impl AnyTlsHandler {
                             connect_timeout,
                             tls_connector,
                             padding_state,
+                            inbound_payload_budget,
                         )
                         .await
                     }
@@ -2430,7 +2637,7 @@ pub(crate) struct AnyTlsStream {
     session: Arc<AnyTlsSession>,
     sid: u32,
     rx: mpsc::Receiver<StreamEvent>,
-    read_buf: Vec<u8>,
+    read_buf: Option<InboundPayload>,
     read_pos: usize,
     /// Set when the Fin/disconnect event was consumed in the same poll
     /// that also delivered data: the data goes out now, the zero-byte
@@ -2470,7 +2677,7 @@ impl AnyTlsStream {
             session,
             sid,
             rx,
-            read_buf: Vec::new(),
+            read_buf: None,
             read_pos: 0,
             read_eof: false,
             read_err: None,
@@ -2489,7 +2696,13 @@ impl std::fmt::Debug for AnyTlsStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnyTlsStream")
             .field("sid", &self.sid)
-            .field("pending_read", &(self.read_buf.len() - self.read_pos))
+            .field(
+                "pending_read",
+                &self
+                    .read_buf
+                    .as_ref()
+                    .map_or(0, |data| data.len() - self.read_pos),
+            )
             .finish()
     }
 }
@@ -2515,19 +2728,31 @@ impl tokio::io::AsyncRead for AnyTlsStream {
             return std::task::Poll::Ready(Err(e));
         }
 
-        let mut got_any = this.read_pos < this.read_buf.len();
+        let mut got_any = this
+            .read_buf
+            .as_ref()
+            .is_some_and(|data| this.read_pos < data.len());
         loop {
-            let n = (this.read_buf.len() - this.read_pos).min(out.remaining());
+            let n = this
+                .read_buf
+                .as_ref()
+                .map_or(0, |data| (data.len() - this.read_pos).min(out.remaining()));
             if n > 0 {
-                out.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
+                let data = this.read_buf.as_ref().expect("read payload present");
+                out.put_slice(&data[this.read_pos..this.read_pos + n]);
                 this.read_pos += n;
+            }
+            if this
+                .read_buf
+                .as_ref()
+                .is_some_and(|data| this.read_pos == data.len())
+            {
+                this.read_buf = None;
+                this.read_pos = 0;
             }
             if out.remaining() == 0 {
                 return std::task::Poll::Ready(Ok(()));
             }
-
-            this.read_buf.clear();
-            this.read_pos = 0;
 
             let next = if got_any {
                 match this.rx.try_recv() {
@@ -2546,7 +2771,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
             }
             match next {
                 std::task::Poll::Ready(Some(StreamEvent::Data(data))) => {
-                    this.read_buf = data;
+                    this.read_buf = Some(data);
                     got_any = true;
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Error(e))) => {
@@ -2717,7 +2942,9 @@ impl WarmableOutbound for AnyTlsHandler {
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
         let dial_runtime = Arc::clone(&runtime);
-        let padding_state = runtime.anytls_pool()?.padding_state();
+        let pool = runtime.anytls_pool()?;
+        let padding_state = pool.padding_state();
+        let inbound_payload_budget = pool.inbound_payload_budget();
         Self::warm_pool_with(runtime, move || async move {
             let tls_connector = dial_runtime.anytls_tls_connector()?;
             dial_session(
@@ -2726,6 +2953,7 @@ impl WarmableOutbound for AnyTlsHandler {
                 connect_timeout,
                 Some(tls_connector),
                 padding_state,
+                inbound_payload_budget,
             )
             .await
         })
@@ -2765,6 +2993,7 @@ impl TcpOutbound for AnyTlsHandler {
         let dial_addr = format!("{}:{}", node.host(), node.port);
         let dial_runtime = Arc::clone(&runtime);
         let padding_state = pool.padding_state();
+        let inbound_payload_budget = pool.inbound_payload_budget();
         let domain = target_domain.map(str::to_string);
         let stream = pool
             .open_with(
@@ -2773,6 +3002,7 @@ impl TcpOutbound for AnyTlsHandler {
                     let addr = dial_addr.clone();
                     let runtime = Arc::clone(&dial_runtime);
                     let padding_state = Arc::clone(&padding_state);
+                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
                     async move {
                         let tls_connector = runtime.anytls_tls_connector()?;
                         dial_session(
@@ -2781,6 +3011,7 @@ impl TcpOutbound for AnyTlsHandler {
                             connect_timeout,
                             Some(tls_connector),
                             padding_state,
+                            inbound_payload_budget,
                         )
                         .await
                     }
@@ -2848,6 +3079,7 @@ impl PacketOutbound for AnyTlsHandler {
         let dial_runtime = Arc::clone(&runtime);
         let dial_addr = format!("{}:{}", node.host(), node.port);
         let padding_state = pool.padding_state();
+        let inbound_payload_budget = pool.inbound_payload_budget();
         Self::dial_udp_transport_speculative_for_pool_with(
             node.as_ref(),
             pool,
@@ -2857,12 +3089,14 @@ impl PacketOutbound for AnyTlsHandler {
             move || async move {
                 let tls_connector = dial_runtime.anytls_tls_connector()?;
                 let padding_state = Arc::clone(&padding_state);
+                let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
                 dial_session(
                     dial_node.as_ref(),
                     &dial_addr,
                     connect_timeout,
                     Some(tls_connector),
                     padding_state,
+                    inbound_payload_budget,
                 )
                 .await
             },
@@ -2897,20 +3131,49 @@ where
     Ok(())
 }
 
-/// Read a single AnyTLS frame.
-async fn read_frame<R>(reader: &mut R) -> std::io::Result<(u8, u32, Vec<u8>)>
+async fn read_frame_header<R>(reader: &mut R) -> std::io::Result<(u8, u32, usize)>
 where
     R: AsyncReadExt + Unpin,
 {
     let mut header = [0u8; FRAME_HEADER_LEN];
     reader.read_exact(&mut header).await?;
-    let cmd = header[0];
-    let sid = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-    let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+    Ok((
+        header[0],
+        u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
+        u16::from_be_bytes([header[5], header[6]]) as usize,
+    ))
+}
+
+async fn read_frame_body<R>(reader: &mut R, len: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncReadExt + Unpin,
+{
     let mut data = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut data).await?;
+    reader.read_exact(&mut data).await?;
+    Ok(data)
+}
+
+async fn drain_frame_body<R>(reader: &mut R, mut len: usize) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut scratch = [0u8; 4096];
+    while len != 0 {
+        let chunk = len.min(scratch.len());
+        reader.read_exact(&mut scratch[..chunk]).await?;
+        len -= chunk;
     }
+    Ok(())
+}
+
+/// Read a single AnyTLS frame in tests.
+#[cfg(test)]
+async fn read_frame<R>(reader: &mut R) -> std::io::Result<(u8, u32, Vec<u8>)>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let (cmd, sid, len) = read_frame_header(reader).await?;
+    let data = read_frame_body(reader, len).await?;
     Ok((cmd, sid, data))
 }
 

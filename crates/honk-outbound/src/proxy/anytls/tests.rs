@@ -84,52 +84,67 @@ async fn padding_writer_honors_check_and_frame_size_boundaries() {
 fn overflow_state_enforces_frame_and_byte_caps_independently() {
     let mut frames = OverflowState::default();
     for _ in 0..SESSION_OVERFLOW_CAP {
-        frames.push_back(1, StreamEvent::Data(vec![1]));
+        frames.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     }
     assert_eq!(frames.usage().bytes, SESSION_OVERFLOW_CAP);
     assert_eq!(
-        frames.limit_for(2, &StreamEvent::Data(vec![1])),
+        frames.limit_for(
+            2,
+            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
+        ),
         Some(OverflowLimit::SessionFrames)
     );
 
     let mut stream_bytes = OverflowState::default();
-    stream_bytes.push_back(1, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+    stream_bytes.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
     assert_eq!(
-        stream_bytes.limit_for(1, &StreamEvent::Data(vec![1])),
+        stream_bytes.limit_for(
+            1,
+            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
+        ),
         Some(OverflowLimit::StreamBytes)
     );
 
     let mut session_bytes = OverflowState::default();
     for sid in 1..=4 {
-        session_bytes.push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+        session_bytes.push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
     }
     assert_eq!(session_bytes.usage().bytes, SESSION_OVERFLOW_BYTES_CAP);
     assert_eq!(
-        session_bytes.limit_for(5, &StreamEvent::Data(vec![1])),
+        session_bytes.limit_for(
+            5,
+            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
+        ),
         Some(OverflowLimit::SessionBytes)
     );
     assert_eq!(session_bytes.limit_for(5, &StreamEvent::Fin), None);
 
     let mut competing_limits = OverflowState::default();
-    competing_limits.push_back(9, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+    competing_limits.push_back(9, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
     for _ in 1..SESSION_OVERFLOW_CAP {
-        competing_limits.push_back(10, StreamEvent::Data(vec![2]));
+        competing_limits.push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![2])));
     }
     assert_eq!(
-        competing_limits.limit_for(9, &StreamEvent::Data(vec![1])),
+        competing_limits.limit_for(
+            9,
+            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
+        ),
         Some(OverflowLimit::SessionFrames)
     );
 
     let mut competing_session_limits = OverflowState::default();
     for sid in 1..=4 {
         competing_session_limits
-            .push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+            .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
     }
     for _ in 4..SESSION_OVERFLOW_CAP {
-        competing_session_limits.push_back(10, StreamEvent::Data(vec![3]));
+        competing_session_limits.push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![3])));
     }
     assert_eq!(
-        competing_session_limits.limit_for(11, &StreamEvent::Data(vec![1])),
+        competing_session_limits.limit_for(
+            11,
+            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
+        ),
         Some(OverflowLimit::SessionBytes)
     );
 
@@ -144,7 +159,7 @@ fn overflow_state_enforces_frame_and_byte_caps_independently() {
 fn overflow_terminal_events_cap_per_stream() {
     let mut overflow = OverflowState::default();
     for _ in 0..SESSION_OVERFLOW_CAP {
-        overflow.push_back(1, StreamEvent::Data(vec![1]));
+        overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     }
 
     assert!(matches!(
@@ -171,9 +186,9 @@ fn overflow_terminal_events_cap_per_stream() {
 #[test]
 fn overflow_state_accounting_tracks_every_queue_operation() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(1, StreamEvent::Data(vec![1, 2, 3]));
+    overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1, 2, 3])));
     overflow.push_back(1, StreamEvent::Fin);
-    overflow.push_back(2, StreamEvent::Data(vec![0; 5]));
+    overflow.push_back(2, StreamEvent::Data(InboundPayload::for_test(vec![0; 5])));
     assert_eq!(
         overflow.usage(),
         OverflowUsage {
@@ -226,7 +241,7 @@ fn overflow_state_accounting_tracks_every_queue_operation() {
 #[tokio::test(start_paused = true)]
 async fn overflow_full_requeue_preserves_stall_age() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(1, StreamEvent::Data(vec![1]));
+    overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     tokio::time::advance(Duration::from_secs(2)).await;
 
     let progress = overflow.last_progress_at(1);
@@ -240,7 +255,7 @@ async fn overflow_full_requeue_preserves_stall_age() {
 #[tokio::test(start_paused = true)]
 async fn overflow_flush_progress_resets_stall_age() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(1, StreamEvent::Data(vec![1]));
+    overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     tokio::time::advance(Duration::from_secs(2)).await;
     overflow.note_progress(1);
     tokio::time::advance(Duration::from_secs(2)).await;
@@ -253,10 +268,13 @@ async fn overflow_flush_progress_resets_stall_age() {
 #[tokio::test(start_paused = true)]
 async fn overflow_admit_below_hard_caps_never_kills() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(1, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+    overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
     tokio::time::advance(OVERFLOW_STALL_GRACE * 4).await;
     assert!(matches!(
-        overflow.admit(1, StreamEvent::Data(vec![1])),
+        overflow.admit(
+            1,
+            StreamEvent::Data(InboundPayload::for_test(vec![1])),
+        ),
         OverflowAction::Parked
     ));
     assert_eq!(
@@ -266,11 +284,14 @@ async fn overflow_admit_below_hard_caps_never_kills() {
 
     let mut session_soft = OverflowState::default();
     for _ in 0..SESSION_OVERFLOW_CAP {
-        session_soft.push_back(1, StreamEvent::Data(vec![1]));
+        session_soft.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     }
     tokio::time::advance(OVERFLOW_STALL_GRACE * 4).await;
     assert!(matches!(
-        session_soft.admit(2, StreamEvent::Data(vec![2])),
+        session_soft.admit(
+            2,
+            StreamEvent::Data(InboundPayload::for_test(vec![2])),
+        ),
         OverflowAction::Parked
     ));
     assert_eq!(session_soft.usage().frames, SESSION_OVERFLOW_CAP + 1);
@@ -283,11 +304,11 @@ async fn overflow_admit_below_hard_caps_never_kills() {
 async fn overflow_admit_hard_cap_reaps_past_grace_stream() {
     let mut overflow = OverflowState::default();
     for _ in 0..SESSION_OVERFLOW_HARD_CAP {
-        overflow.push_back(1, StreamEvent::Data(vec![1; 8]));
+        overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
     }
     tokio::time::advance(OVERFLOW_STALL_GRACE).await;
 
-    let OverflowAction::Kill(victim, event) = overflow.admit(2, StreamEvent::Data(vec![9])) else {
+    let OverflowAction::Kill(victim, event) = overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9]))) else {
         panic!("past-grace stream at the hard cap must be reaped")
     };
     assert_eq!(victim.sid, 1);
@@ -307,9 +328,9 @@ async fn overflow_admit_hard_cap_reaps_past_grace_stream() {
 async fn overflow_admit_hard_cap_waits_inside_the_grace() {
     let mut overflow = OverflowState::default();
     for _ in 0..SESSION_OVERFLOW_HARD_CAP {
-        overflow.push_back(1, StreamEvent::Data(vec![1; 8]));
+        overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
     }
-    let wait = match overflow.admit(2, StreamEvent::Data(vec![9])) {
+    let wait = match overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9]))) {
         OverflowAction::Wait(_, wait) => wait,
         _ => panic!("hard cap inside the grace must wait, not kill"),
     };
@@ -318,7 +339,7 @@ async fn overflow_admit_hard_cap_waits_inside_the_grace() {
     assert!(overflow.has(1));
 
     tokio::time::advance(OVERFLOW_STALL_GRACE).await;
-    let OverflowAction::Kill(victim, event) = overflow.admit(2, StreamEvent::Data(vec![9])) else {
+    let OverflowAction::Kill(victim, event) = overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9]))) else {
         panic!("hard cap past the grace must reap")
     };
     assert_eq!(victim.sid, 1);
@@ -326,26 +347,6 @@ async fn overflow_admit_hard_cap_waits_inside_the_grace() {
     assert!(matches!(overflow.admit(2, event), OverflowAction::Parked));
 }
 
-/// The byte hard cap follows the same wait-then-reap path as the
-/// frame cap.
-#[tokio::test(start_paused = true)]
-async fn overflow_admit_hard_byte_cap_waits_inside_the_grace() {
-    let mut overflow = OverflowState::default();
-    overflow.push_back(
-        1,
-        StreamEvent::Data(vec![0; SESSION_OVERFLOW_HARD_BYTES_CAP]),
-    );
-    assert!(matches!(
-        overflow.admit(2, StreamEvent::Data(vec![1])),
-        OverflowAction::Wait(..)
-    ));
-    tokio::time::advance(OVERFLOW_STALL_GRACE).await;
-    assert!(matches!(
-        overflow.admit(2, StreamEvent::Data(vec![1])),
-        OverflowAction::Kill(..)
-    ));
-    assert!(!overflow.has(1));
-}
 
 fn anytls_node(name: &str) -> Node {
     Node {
@@ -405,6 +406,7 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
             Duration::from_millis(50),
             None,
             Arc::new(PaddingState::default()),
+            Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET)),
         ),
     )
     .await;
@@ -550,9 +552,20 @@ fn test_padding() -> Arc<PaddingState> {
     })
 }
 
+fn test_inbound_payload_budget() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET))
+}
+
 /// Establish a session over an in-memory duplex; returns the session
 /// and the server end of the transport.
 async fn establish_test_session(addr: &str) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
+    establish_test_session_with_budget(addr, test_inbound_payload_budget()).await
+}
+
+async fn establish_test_session_with_budget(
+    addr: &str,
+    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
+) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
     let (client_end, server_end) = tokio::io::duplex(1 << 20);
     let (read, write) = tokio::io::split(client_end);
     let padding_state = test_padding();
@@ -563,6 +576,7 @@ async fn establish_test_session(addr: &str) -> (Arc<AnyTlsSession>, tokio::io::D
         TEST_AUTH,
         bytes::Bytes::from_static(TEST_SETTINGS),
         padding_state,
+        inbound_payload_budget,
     )
     .await
     .unwrap();
@@ -582,6 +596,88 @@ async fn expect_handshake(server: &mut tokio::io::DuplexStream) {
 }
 
 #[tokio::test]
+async fn inbound_payload_budget_is_held_until_consumed_or_dropped() {
+    const BUDGET: usize = 8;
+    let budget = Arc::new(tokio::sync::Semaphore::new(BUDGET));
+    let (draining, mut draining_server) =
+        establish_test_session_with_budget("draining", Arc::clone(&budget)).await;
+    let (sibling, mut sibling_server) =
+        establish_test_session_with_budget("sibling", Arc::clone(&budget)).await;
+    expect_handshake(&mut draining_server).await;
+    expect_handshake(&mut sibling_server).await;
+
+    let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    draining
+        .streams
+        .lock()
+        .unwrap()
+        .insert(101, StreamSink::Tcp(tx));
+    let permit = draining.try_reserve().unwrap();
+    let mut stream = AnyTlsStream::new(Arc::clone(&draining), 101, rx, permit);
+    let (sibling_tx, mut sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    sibling
+        .streams
+        .lock()
+        .unwrap()
+        .insert(202, StreamSink::Tcp(sibling_tx));
+
+    write_frame(&mut draining_server, CMD_PSH, 101, b"abcd")
+        .await
+        .unwrap();
+    write_frame(&mut draining_server, CMD_PSH, 101, b"efgh")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while budget.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two queued payloads fill the shared budget");
+    crate::session::ManagedSession::begin_drain(draining.as_ref());
+
+    write_frame(&mut sibling_server, CMD_PSH, 202, b"ijkl")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), sibling_rx.recv())
+            .await
+            .is_err(),
+        "a sibling session must backpressure at the pool-wide cap"
+    );
+
+    let mut partial = [0; 3];
+    stream.read_exact(&mut partial).await.unwrap();
+    assert_eq!(&partial, b"abc");
+    assert_eq!(budget.available_permits(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), sibling_rx.recv())
+            .await
+            .is_err(),
+        "a partial read must retain the whole payload credit"
+    );
+
+    let mut final_byte = [0; 1];
+    stream.read_exact(&mut final_byte).await.unwrap();
+    assert_eq!(&final_byte, b"d");
+    let sibling_payload = tokio::time::timeout(Duration::from_secs(1), sibling_rx.recv())
+        .await
+        .expect("exact final-byte consumption releases credit")
+        .expect("sibling stream remains registered");
+    match &sibling_payload {
+        StreamEvent::Data(data) => assert_eq!(&data[..], b"ijkl"),
+        StreamEvent::Fin | StreamEvent::Error(_) => panic!("sibling payload was terminated"),
+    }
+
+    draining.close();
+    sibling.close();
+    drop(sibling_payload);
+    drop(sibling_rx);
+    drop(stream);
+    assert_eq!(budget.available_permits(), BUDGET);
+}
+
+#[tokio::test]
 async fn settings_wait_for_the_first_stream_open() {
     let (client, mut server) = tokio::io::duplex(1 << 20);
     let (read, write) = tokio::io::split(client);
@@ -592,6 +688,7 @@ async fn settings_wait_for_the_first_stream_open() {
         TEST_AUTH,
         bytes::Bytes::from_static(TEST_SETTINGS),
         test_padding(),
+        test_inbound_payload_budget(),
     )
     .await
     .unwrap();
@@ -634,6 +731,7 @@ async fn concurrent_first_open_keeps_settings_ahead_of_syn() {
         TEST_AUTH,
         bytes::Bytes::from_static(TEST_SETTINGS),
         test_padding(),
+        test_inbound_payload_budget(),
     )
     .await
     .unwrap();
@@ -764,6 +862,7 @@ async fn padding_update_applies_to_an_active_session_before_stop() {
         TEST_AUTH,
         bytes::Bytes::from_static(TEST_SETTINGS),
         Arc::clone(&padding_state),
+        test_inbound_payload_budget(),
     )
     .await
     .unwrap();
@@ -1790,7 +1889,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
     session
         .overflow
         .lock()
-        .push_back(31, StreamEvent::Data(vec![1; 17]));
+        .push_back(31, StreamEvent::Data(InboundPayload::for_test(vec![1; 17])));
     session.end_stream(31, false);
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 
@@ -1810,7 +1909,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
     session
         .overflow
         .lock()
-        .push_back(32, StreamEvent::Data(vec![2; 19]));
+        .push_back(32, StreamEvent::Data(InboundPayload::for_test(vec![2; 19])));
     drop(registration);
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 
@@ -1823,7 +1922,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
     session
         .overflow
         .lock()
-        .push_back(33, StreamEvent::Data(vec![3; 23]));
+        .push_back(33, StreamEvent::Data(InboundPayload::for_test(vec![3; 23])));
     drop(closed_rx);
     session.dispatch_data(33, vec![4]).await;
     assert!(!session.streams.lock().unwrap().contains_key(&33));
@@ -1838,7 +1937,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
     session
         .overflow
         .lock()
-        .push_back(34, StreamEvent::Data(vec![5; 29]));
+        .push_back(34, StreamEvent::Data(InboundPayload::for_test(vec![5; 29])));
     session.close();
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 }
@@ -1852,7 +1951,7 @@ async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
     let sid = 41;
     let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(vec![0])).unwrap();
+        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
     }
     session
         .streams
@@ -1862,9 +1961,9 @@ async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
     session
         .overflow
         .lock()
-        .push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+        .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
 
-    session.park_overflow(sid, StreamEvent::Data(vec![1])).await;
+    session.park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1]))).await;
     tokio::time::advance(OVERFLOW_STALL_GRACE - OVERFLOW_WATCHDOG_TICK).await;
     tokio::task::yield_now().await;
     assert!(session.streams.lock().unwrap().contains_key(&sid));
@@ -1955,17 +2054,17 @@ async fn session_hard_cap_kills_stream_that_outwaits_the_stall_grace() {
     {
         let mut overflow = session.overflow.lock();
         for _ in 0..400 {
-            overflow.push_back(51, StreamEvent::Data(vec![1; 8]));
+            overflow.push_back(51, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
         }
         for _ in 0..368 {
-            overflow.push_back(52, StreamEvent::Data(vec![2; 8]));
+            overflow.push_back(52, StreamEvent::Data(InboundPayload::for_test(vec![2; 8])));
         }
         assert_eq!(overflow.usage().frames, SESSION_OVERFLOW_HARD_CAP);
     }
     tokio::time::advance(OVERFLOW_STALL_GRACE).await;
 
     session
-        .park_overflow(53, StreamEvent::Data(vec![9, 8, 7]))
+        .park_overflow(53, StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])))
         .await;
 
     assert!(session.killed_streams.lock().unwrap().contains(&51));
@@ -2004,7 +2103,7 @@ async fn session_hard_cap_waits_for_progress_and_spares_everyone() {
     let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     let (waiting_tx, mut waiting_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        waiting_tx.try_send(StreamEvent::Data(vec![7])).unwrap();
+        waiting_tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![7]))).unwrap();
     }
     {
         let mut streams = session.streams.lock().unwrap();
@@ -2014,7 +2113,7 @@ async fn session_hard_cap_waits_for_progress_and_spares_everyone() {
     {
         let mut overflow = session.overflow.lock();
         for _ in 0..SESSION_OVERFLOW_HARD_CAP {
-            overflow.push_back(slow_sid, StreamEvent::Data(vec![1; 8]));
+            overflow.push_back(slow_sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
         }
     }
 
@@ -2022,7 +2121,7 @@ async fn session_hard_cap_waits_for_progress_and_spares_everyone() {
         let session = Arc::clone(&session);
         async move {
             session
-                .park_overflow(waiting_sid, StreamEvent::Data(vec![9, 8, 7]))
+                .park_overflow(waiting_sid, StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])))
                 .await;
         }
     });
@@ -2076,11 +2175,11 @@ async fn session_hard_cap_kills_only_after_full_grace_of_waits() {
     {
         let mut overflow = session.overflow.lock();
         for _ in 0..SESSION_OVERFLOW_HARD_CAP {
-            overflow.push_back(71, StreamEvent::Data(vec![1; 8]));
+            overflow.push_back(71, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
         }
     }
 
-    session.park_overflow(72, StreamEvent::Data(vec![9])).await;
+    session.park_overflow(72, StreamEvent::Data(InboundPayload::for_test(vec![9]))).await;
 
     assert!(session.killed_streams.lock().unwrap().contains(&71));
     assert!(!session.streams.lock().unwrap().contains_key(&71));
@@ -2103,7 +2202,7 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
     let (fast_tx, mut fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     let (waiting_tx, mut waiting_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        waiting_tx.try_send(StreamEvent::Data(vec![7])).unwrap();
+        waiting_tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![7]))).unwrap();
     }
     {
         let mut streams = session.streams.lock().unwrap();
@@ -2114,12 +2213,12 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
     {
         let mut overflow = session.overflow.lock();
         for _ in 0..SESSION_OVERFLOW_CAP {
-            overflow.push_back(slow_sid, StreamEvent::Data(vec![1; 8]));
+            overflow.push_back(slow_sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
         }
     }
 
     session
-        .park_overflow(waiting_sid, StreamEvent::Data(vec![9, 8, 7]))
+        .park_overflow(waiting_sid, StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])))
         .await;
     assert!(
         !session
@@ -2170,7 +2269,7 @@ async fn overflow_transition_self_kicks_an_emptied_queue() {
         .insert(sid, StreamSink::Tcp(tx));
 
     session
-        .park_overflow(sid, StreamEvent::Data(vec![7, 8, 9]))
+        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![7, 8, 9])))
         .await;
 
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
@@ -2195,7 +2294,7 @@ async fn concurrent_overflow_flush_preserves_stream_order() {
     for index in 0..EVENTS {
         session.overflow.lock().push_back(
             sid,
-            StreamEvent::Data(u16::try_from(index).unwrap().to_be_bytes().to_vec()),
+            StreamEvent::Data(InboundPayload::for_test(u16::try_from(index).unwrap().to_be_bytes().to_vec())),
         );
     }
 
@@ -2222,7 +2321,7 @@ async fn concurrent_overflow_flush_preserves_stream_order() {
             .expect("ordered overflow channel closed");
         match event {
             StreamEvent::Data(data) => {
-                observed.push(u16::from_be_bytes(data.try_into().unwrap()) as usize);
+                observed.push(u16::from_be_bytes(data[..].try_into().unwrap()) as usize);
             }
             StreamEvent::Fin | StreamEvent::Error(_) => {
                 panic!("unexpected terminal event")
@@ -2276,7 +2375,7 @@ async fn stale_remote_fin_after_overflow_kill_is_reset() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
     let sid = 82;
     let (tx, rx) = mpsc::channel(1);
-    tx.try_send(StreamEvent::Data(vec![1])).unwrap();
+    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![1]))).unwrap();
     session
         .streams
         .lock()
@@ -2334,7 +2433,7 @@ async fn killed_stream_tombstone_follows_stream_owner() {
     session
         .overflow
         .lock()
-        .push_back(sid, StreamEvent::Data(vec![1]));
+        .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     let victim = session
         .overflow
         .lock()
@@ -2360,7 +2459,7 @@ async fn killed_stream_tombstone_follows_stream_owner() {
     session
         .overflow
         .lock()
-        .push_back(sid, StreamEvent::Data(vec![1]));
+        .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     let victim = session
         .overflow
         .lock()
@@ -2390,7 +2489,7 @@ async fn session_close_preserves_killed_reset_until_owner_reads() {
     session
         .overflow
         .lock()
-        .push_back(sid, StreamEvent::Data(vec![1]));
+        .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     let victim = session
         .overflow
         .lock()
@@ -2569,7 +2668,7 @@ async fn overflow_watchdog_spares_streams_with_flush_progress() {
     let sid = 44;
     let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(vec![0])).unwrap();
+        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
     }
     session
         .streams
@@ -2577,10 +2676,10 @@ async fn overflow_watchdog_spares_streams_with_flush_progress() {
         .unwrap()
         .insert(sid, StreamSink::Tcp(tx));
     session
-        .park_overflow(sid, StreamEvent::Data(vec![1; 8]))
+        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])))
         .await;
     session
-        .park_overflow(sid, StreamEvent::Data(vec![2; 8]))
+        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![2; 8])))
         .await;
 
     tokio::time::advance(Duration::from_secs(2)).await;
@@ -2611,7 +2710,7 @@ async fn overflow_watchdog_retires_when_the_overflow_drains() {
     let sid = 45;
     let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(vec![0])).unwrap();
+        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
     }
     session
         .streams
@@ -2619,7 +2718,7 @@ async fn overflow_watchdog_retires_when_the_overflow_drains() {
         .unwrap()
         .insert(sid, StreamSink::Tcp(tx));
     session
-        .park_overflow(sid, StreamEvent::Data(vec![1; 8]))
+        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])))
         .await;
     assert!(session.watchdog.lock().unwrap().is_some());
 
@@ -2640,7 +2739,7 @@ async fn uot_sink_saturation_retires_only_stream() {
     let (session, mut server) = establish_test_session("127.0.0.1:443").await;
     expect_handshake(&mut server).await;
     let (tx, _rx) = mpsc::channel(1);
-    tx.try_send(StreamEvent::Data(vec![0])).unwrap();
+    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
     session
         .streams
         .lock()

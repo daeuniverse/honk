@@ -11,8 +11,9 @@ use crate::proxy::uot::{
 
 #[cfg(test)]
 use super::{
-    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED,
-    WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP, read_frame, write_frame,
+    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, INBOUND_PAYLOAD_BUDGET, PaddingScheme,
+    PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP, read_frame,
+    write_frame,
 };
 #[cfg(test)]
 use crate::proxy::addr;
@@ -57,6 +58,7 @@ pub(super) struct UotReceiveState {
     rx: mpsc::Receiver<StreamEvent>,
     mode: Option<UotMode>,
     buffered: bytes::BytesMut,
+    credit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl UotReceiveState {
@@ -65,6 +67,7 @@ impl UotReceiveState {
             rx,
             mode: None,
             buffered: bytes::BytesMut::new(),
+            credit: None,
         }
     }
 }
@@ -217,7 +220,23 @@ impl PacketTransport for AnyTlsUotTransport {
         let mut receive = self.receive.lock().await;
         loop {
             if let Some(frame) = self.next_uot_frame(&mut receive)? {
+                let consumed = frame.frame_end;
                 let payload_len = crate::proxy::uot::copy_frame(&mut receive.buffered, frame, buf)?;
+                let empty = {
+                    let credit = receive
+                        .credit
+                        .as_mut()
+                        .expect("buffered UoT bytes own payload credit");
+                    drop(
+                        credit
+                            .split(consumed)
+                            .expect("UoT credit covers consumed frame"),
+                    );
+                    credit.num_permits() == 0
+                };
+                if empty {
+                    receive.credit = None;
+                }
                 return Ok((payload_len, self.target));
             }
 
@@ -232,7 +251,13 @@ impl PacketTransport for AnyTlsUotTransport {
                             "UoT stream frame exceeds buffer limit",
                         ));
                     }
+                    let (data, credit) = data.into_parts();
                     receive.buffered.extend_from_slice(&data);
+                    if let Some(held) = receive.credit.as_mut() {
+                        held.merge(credit);
+                    } else {
+                        receive.credit = Some(credit);
+                    }
                 }
                 StreamEvent::Fin => {
                     return Err(std::io::Error::new(
@@ -303,6 +328,7 @@ mod uot_transport_tests {
             TEST_AUTH,
             bytes::Bytes::from_static(TEST_SETTINGS),
             padding_state,
+            Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET)),
         )
         .await
         .unwrap();
