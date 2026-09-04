@@ -18,10 +18,13 @@ pub(super) struct DnsDialRoute {
 }
 
 pub(super) fn target_context(entry: &UpstreamEntry, target: SocketAddr) -> ScoreSelectionContext {
+    // Health gate and score bucket follow the carrier the dial actually
+    // exercises: proxied udp:// is pooled TCP-DNS (never real UDP through
+    // the node), while DoQ/DoH3 run QUIC over the leaf's PacketTransport.
+    // Direct dials never reach this context.
     let (network, probe_domain) = match entry.protocol {
-        DnsProtocol::Udp | DnsProtocol::Quic | DnsProtocol::H3 => {
-            (SelectionNetwork::Udp, ProbeDomain::DnsUdp)
-        }
+        DnsProtocol::Udp => (SelectionNetwork::Tcp, ProbeDomain::Tcp),
+        DnsProtocol::Quic | DnsProtocol::H3 => (SelectionNetwork::Udp, ProbeDomain::DataUdp),
         DnsProtocol::Tcp | DnsProtocol::Tls | DnsProtocol::Https => {
             (SelectionNetwork::Tcp, ProbeDomain::Tcp)
         }
