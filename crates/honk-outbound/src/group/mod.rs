@@ -325,8 +325,8 @@ impl GroupManager {
         // groups still take the guarded recursive path below.
         if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
             return self
-                .pick_direct_selector(group, domain, ipver)
-                .or_else(|| self.last_resort_tcp_leaf(group, domain));
+                .pick_direct_selector(group, domain, ipver, SelectionEffects::Apply)
+                .or_else(|| self.last_resort_tcp_leaf(group, domain, SelectionEffects::Apply));
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
         self.pick_in_group(
@@ -500,8 +500,8 @@ impl GroupManager {
             return SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: self
-                    .pick_direct_selector(group, domain, ipver)
-                    .or_else(|| self.last_resort_tcp_leaf(group, domain))
+                    .pick_direct_selector(group, domain, ipver, effects)
+                    .or_else(|| self.last_resort_tcp_leaf(group, domain, effects))
                     .into_iter()
                     .collect(),
             };
@@ -532,7 +532,7 @@ impl GroupManager {
                     != Duration::MAX
             });
         if candidates.is_empty() {
-            if let Some(node) = self.last_resort_tcp_leaf(group, domain) {
+            if let Some(node) = self.last_resort_tcp_leaf(group, domain, effects) {
                 return SelectionPlan {
                     mode: SelectionPlanMode::Authoritative,
                     nodes: vec![node],
@@ -549,7 +549,7 @@ impl GroupManager {
         }
         match group.policy {
             GroupPolicy::Selector => {
-                let picked = self.pick_selector(&candidates, group, network);
+                let picked = self.pick_selector(&candidates, group, network, effects);
                 let committed = self.commit_selector_pick(
                     group,
                     picked,

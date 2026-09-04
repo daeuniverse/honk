@@ -15,6 +15,7 @@ impl GroupManager {
         group: &'a Group,
         domain: ProbeDomain,
         ipver: IpVersion,
+        effects: SelectionEffects,
     ) -> Option<&'a Node> {
         let selectable = |node: &&Node| {
             if domain == ProbeDomain::Tcp
@@ -34,35 +35,42 @@ impl GroupManager {
                 .find(|node| node.name == tag && selectable(node))
         };
         let choice = self.selector_choice.read().get(&group.name).cloned();
-        if let Some(choice) = choice.as_deref()
-            && let Some(node) = find(choice)
-        {
-            return Some(node);
-        }
-        if let Some(default) = group.default.as_deref()
-            && let Some(node) = find(default)
-        {
-            if let Some(choice) = choice.as_deref() {
-                self.warn_selector_choice_filtered(
-                    group,
-                    choice,
-                    &node.name,
-                    SelectionNetwork::from_probe_domain(domain),
-                );
+        let mut filtered: Option<&str> = None;
+        if let Some(choice) = choice.as_deref() {
+            if let Some(node) = find(choice) {
+                return Some(node);
             }
-            return Some(node);
+            filtered = Some(choice);
+        }
+        if let Some(default) = group.default.as_deref() {
+            if let Some(node) = find(default) {
+                if let Some(preference) = filtered {
+                    self.warn_selector_choice_filtered(
+                        group,
+                        preference,
+                        &node.name,
+                        SelectionNetwork::from_probe_domain(domain),
+                        effects,
+                    );
+                }
+                return Some(node);
+            }
+            if filtered.is_none() {
+                filtered = Some(default);
+            }
         }
         let picked = group
             .nodes
             .iter()
             .filter_map(|id| self.nodes.get(id))
             .find(selectable);
-        if let (Some(choice), Some(node)) = (choice.as_deref(), picked) {
+        if let (Some(preference), Some(node)) = (filtered, picked) {
             self.warn_selector_choice_filtered(
                 group,
-                choice,
+                preference,
                 &node.name,
                 SelectionNetwork::from_probe_domain(domain),
+                effects,
             );
         }
         picked
@@ -74,51 +82,88 @@ impl GroupManager {
     /// behavior: picking a sub-group defers to that group's own pick,
     /// which flattening already resolved to its leaf).
     ///
-    /// When the configured choice is health-filtered for this network (e.g.
-    /// UDP-dead), the fallback is deliberate — but it is logged
-    /// (rate-limited) because the dashboard `now` field still displays the
-    /// configured choice while traffic silently rides another member.
+    /// When the configured choice or default is health-filtered for this
+    /// network (e.g. UDP-dead), the fallback is deliberate — but it is
+    /// logged (rate-limited) because the dashboard `now` field still
+    /// displays the configured choice while traffic silently rides another
+    /// member.
     pub(super) fn pick_selector<'a>(
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
         network: SelectionNetwork,
+        effects: SelectionEffects,
     ) -> Candidate<'a> {
         let choice = self.selector_choice.read().get(&group.name).cloned();
-        let mut choice_filtered = false;
+        let mut filtered: Option<&str> = None;
         if let Some(choice) = choice.as_deref() {
             if let Some(c) = candidates.iter().find(|c| c.tag == choice) {
                 return c.clone();
             }
-            choice_filtered = true;
+            filtered = Some(choice);
         }
-        let picked = group
+        let default_picked = group
             .default
             .as_deref()
-            .and_then(|default| candidates.iter().find(|c| c.tag == default))
-            .unwrap_or(&candidates[0]);
-        if choice_filtered {
-            self.warn_selector_choice_filtered(
-                group,
-                choice.as_deref().expect("filtered choice"),
-                picked.tag,
-                network,
-            );
+            .and_then(|default| candidates.iter().find(|c| c.tag == default));
+        if filtered.is_none()
+            && let Some(default) = group.default.as_deref()
+            && default_picked.is_none()
+        {
+            filtered = Some(default);
+        }
+        let picked = default_picked.unwrap_or(&candidates[0]);
+        if let Some(preference) = filtered {
+            self.warn_selector_choice_filtered(group, preference, picked.tag, network, effects);
         }
         picked.clone()
     }
 
-    /// Rate-limited warning for a health-filtered Selector choice: the
-    /// dashboard keeps displaying the configured choice while traffic rides
-    /// another member, so the fallback must be visible without logging once
-    /// per dial.
+    /// Rate-limited warning for a health-filtered Selector choice or
+    /// default: the dashboard keeps displaying the configured choice while
+    /// traffic rides another member, so the fallback must be visible
+    /// without logging once per dial. Peek paths (warm-up discovery) move
+    /// no traffic and stay silent.
     fn warn_selector_choice_filtered(
         &self,
         group: &Group,
-        choice: &str,
+        preferred: &str,
         picked: &str,
         network: SelectionNetwork,
+        effects: SelectionEffects,
     ) {
+        if !effects.applies() || !self.selector_fallback_log_allowed(group, network) {
+            return;
+        }
+        tracing::warn!(
+            group = %group.name,
+            network = ?network,
+            preferred = %preferred,
+            picked = %picked,
+            "selector choice is not alive for this network; traffic falls back to another member"
+        );
+    }
+
+    /// Rate-limited warning when every candidate was health-filtered and
+    /// the sole TCP leaf is served as a last resort: traffic still flows,
+    /// but every health signal voted no.
+    pub(super) fn warn_selector_last_resort(
+        &self,
+        group: &Group,
+        picked: &str,
+        effects: SelectionEffects,
+    ) {
+        if !effects.applies() || !self.selector_fallback_log_allowed(group, SelectionNetwork::Tcp) {
+            return;
+        }
+        tracing::warn!(
+            group = %group.name,
+            picked = %picked,
+            "no alive member for this network; serving the sole TCP leaf as last resort"
+        );
+    }
+
+    fn selector_fallback_log_allowed(&self, group: &Group, network: SelectionNetwork) -> bool {
         const LOG_COOLDOWN: Duration = Duration::from_secs(60);
         let key = (group.name.clone(), network);
         let now = Instant::now();
@@ -126,17 +171,10 @@ impl GroupManager {
         if let Some(previous) = last.get(&key)
             && now.duration_since(*previous) < LOG_COOLDOWN
         {
-            return;
+            return false;
         }
         last.insert(key, now);
-        drop(last);
-        tracing::warn!(
-            group = %group.name,
-            network = ?network,
-            choice = %choice,
-            picked = %picked,
-            "selector choice is not alive for this network; traffic falls back to another member"
-        );
+        true
     }
     pub(super) fn pick_score<'a>(
         &self,

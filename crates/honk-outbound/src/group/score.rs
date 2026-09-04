@@ -2237,7 +2237,12 @@ impl super::GroupManager {
         } else {
             let candidate = match group.policy {
                 honk_config::group::GroupPolicy::Selector => {
-                    let picked = self.pick_selector(&candidates, group, context.network);
+                    let picked = self.pick_selector(
+                        &candidates,
+                        group,
+                        context.network,
+                        super::SelectionEffects::Apply,
+                    );
                     self.commit_selector_pick_for_target(
                         group,
                         picked,
@@ -2296,7 +2301,7 @@ impl super::GroupManager {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
-        let node = self.last_resort_tcp_leaf(group, context.probe_domain)?;
+        let node = self.last_resort_tcp_leaf(group, context.probe_domain, effects)?;
         if group.nodes.contains(&node.id) {
             return Some(super::Candidate {
                 tag: node.name.as_str(),
@@ -2353,7 +2358,7 @@ impl super::GroupManager {
         } else {
             Some(match group.policy {
                 honk_config::group::GroupPolicy::Selector => {
-                    let picked = self.pick_selector(&candidates, group, context.network);
+                    let picked = self.pick_selector(&candidates, group, context.network, effects);
                     self.commit_selector_pick_for_target(
                         group, picked, context, visited, depth, effects,
                     )

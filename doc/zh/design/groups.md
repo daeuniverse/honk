@@ -25,13 +25,13 @@ facade 与内部实现按职责拆分：
 | `score.rs` | Score 评分、exact-once 反馈与 target-aware 选择 |
 | `state.rs` | URLTest/Fallback 缓存、Selector 选择、空闲时间戳与回调 |
 
-选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，该节点仍作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到 `direct`。UDP 继续执行正常的存活性排除。
+选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，该节点仍作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到 `direct`。UDP 继续执行正常的存活性排除。Selector 的已配置选择或 `default` 因健康过滤回退到其他成员、以及全候选被过滤后的最后尝试服务，都会在真实选择路径上记录限流警告（每组每网络 60 秒）——面板仍显示已配置选择，因此这种偏离必须可见。
 
 ## 策略语义
 
 | 策略 | 运行时行为 |
 | --- | --- |
-| Selector | 运行时选择优先，其次是 `default`，最后是第一个合格成员。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 关闭该组已跟踪的连接。已配置但不健康的选择仍保有预热所有权，即使流量暂时选择另一个合格成员。 |
+| Selector | 运行时选择优先，其次是 `default`，最后是第一个合格成员。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 关闭该组已跟踪的连接。已配置但不健康的选择仍保有预热所有权，即使流量暂时选择另一个合格成员；该回退（或 `default` 被健康过滤）按每组每网络每分钟一次记录警告。 |
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
