@@ -711,6 +711,17 @@ impl<'a> ProtoDecoder<'a> {
             if shift > 63 {
                 anyhow::bail!("varint overflow");
             }
+            // The tenth byte is shifted by 63, so anything above bit 0 leaves u64 and would be
+            // silently dropped — a 2^64 length would arrive downstream as a small value.
+            if shift == 63 {
+                let next = *self
+                    .data
+                    .get(self.pos)
+                    .ok_or_else(|| anyhow::anyhow!("unexpected end of protobuf data"))?;
+                if next & 0x7f > 1 {
+                    anyhow::bail!("varint overflow");
+                }
+            }
         }
     }
 
@@ -722,12 +733,17 @@ impl<'a> ProtoDecoder<'a> {
     }
 
     fn read_len_delimited(&mut self) -> anyhow::Result<&'a [u8]> {
-        let len = self.read_varint()? as usize;
-        if self.pos + len > self.data.len() {
+        let len = usize::try_from(self.read_varint()?)
+            .map_err(|_| anyhow::anyhow!("length-delimited field length overflows usize"))?;
+        let Some(end) = self
+            .pos
+            .checked_add(len)
+            .filter(|end| *end <= self.data.len())
+        else {
             anyhow::bail!("length-delimited field exceeds data");
-        }
-        let slice = &self.data[self.pos..self.pos + len];
-        self.pos += len;
+        };
+        let slice = &self.data[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -739,11 +755,16 @@ impl<'a> ProtoDecoder<'a> {
             }
             2 => {
                 // length-delimited
-                let len = self.read_varint()? as usize;
-                if self.pos + len > self.data.len() {
+                let len = usize::try_from(self.read_varint()?)
+                    .map_err(|_| anyhow::anyhow!("skip length overflows usize"))?;
+                let Some(end) = self
+                    .pos
+                    .checked_add(len)
+                    .filter(|end| *end <= self.data.len())
+                else {
                     anyhow::bail!("skip length exceeds data");
-                }
-                self.pos += len;
+                };
+                self.pos = end;
             }
             5 => {
                 // 32-bit
@@ -1436,5 +1457,30 @@ mod scan_tests {
             ),
             crate::dns::routing::DnsResponseDecision::Reject
         );
+    }
+
+    #[test]
+    fn geo_length_guard_rejects_a_wrapping_length() {
+        // Field 1, length-delimited, with u64::MAX encoded as a ten-byte varint. It exceeds
+        // usize on a 32-bit target and would wrap `pos + len` past the guard on a 64-bit one.
+        let asset = [
+            0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        ];
+        let mut decoder = ProtoDecoder::new(&asset);
+        decoder.read_tag().expect("tag");
+        assert!(decoder.read_len_delimited().is_err());
+
+        let mut decoder = ProtoDecoder::new(&asset);
+        decoder.read_tag().expect("tag");
+        assert!(decoder.skip_field(2).is_err());
+
+        // 2^64 needs a tenth byte of 0x02, whose payload would be shifted out of u64 and leave a
+        // length of zero — an empty field where the asset declared a huge one.
+        let wider_than_u64 = [
+            0x0a, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02,
+        ];
+        let mut decoder = ProtoDecoder::new(&wider_than_u64);
+        decoder.read_tag().expect("tag");
+        assert!(decoder.read_len_delimited().is_err());
     }
 }
