@@ -500,7 +500,11 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     let result =
         honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
             .await;
-    assert!(result.is_ok(), "DNS health result: {result:?}");
+    assert!(result.dns.is_ok(), "DNS health result: {result:?}");
+    assert!(
+        result.data_path.is_some(),
+        "Score QUIC probe must run: {result:?}"
+    );
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert_eq!(
         manager
@@ -511,6 +515,74 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
             .id,
         other.id
     );
+}
+
+#[tokio::test]
+async fn quic_probe_still_runs_when_dns_probe_fails() {
+    use honk_config::node::{Group, GroupPolicy};
+    use honk_outbound::group::GroupManager;
+
+    // The DNS check target may be blocked through a healthy UDP path; the
+    // Score handshake probe must still run so its success can attest the
+    // data path (here it fails too — the mock refuses every dial).
+    let node = udp_test_node();
+    let group = Group {
+        name: "score".into(),
+        policy: GroupPolicy::Score,
+        nodes: vec![node.id],
+        ..Group::default()
+    };
+    let config = Config {
+        nodes: vec![node.clone()],
+        groups: vec![group.clone()],
+        ..Config::default()
+    };
+    let manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::new(&[group], std::slice::from_ref(&node)),
+    )));
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::CountDialError {
+            dials: Arc::clone(&dials),
+        },
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(node.protocol(), handler.clone())
+            .with_packet(handler),
+    );
+    let runtime = Arc::new(parking_lot::RwLock::new(Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+    )));
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
+        Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+    });
+    let quic_target = resolve_quic_score_target(
+        "https://quic.example.test:9443/generate_204",
+        Some(resolver),
+    )
+    .await
+    .unwrap();
+    let prober = probers::ProxyUdpProber::new(
+        Arc::new(RwLock::new(Arc::new(config))),
+        Arc::new(registry),
+        runtime,
+        Arc::new(StatsManager::new()),
+        "127.0.0.1:53".parse().unwrap(),
+        "127.0.0.1:53".parse::<SocketAddr>().unwrap().into(),
+        Some(quic_target),
+        manager.clone(),
+    );
+
+    let result =
+        honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
+            .await;
+    assert!(result.dns.is_err(), "DNS health result: {result:?}");
+    assert!(
+        matches!(result.data_path, Some(Err(_))),
+        "the Score QUIC probe must be attempted even when DNS fails: {result:?}"
+    );
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
 #[test]

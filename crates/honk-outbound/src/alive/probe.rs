@@ -425,15 +425,21 @@ impl AliveDialerSet {
 
     /// Probe a single node's UDP data path (Go: UdpCheck) through the
     /// installed [`UdpProber`]: honk-core routes a minimal DNS query through
-    /// the proxy handler's `dial_udp_transport` and awaits the answer.
+    /// the proxy handler's `dial_udp_transport` and awaits the answer, then —
+    /// for Score group members with an HTTPS check URL — independently runs a
+    /// real TLS-in-QUIC handshake against the check target.
     ///
-    /// Success marks BOTH UDP domains (DataUdp + DnsUdp, v4+v6) alive and
-    /// records the round-trip latency for URLTest ranking; failure records
-    /// one probe failure against each (probe threshold 3, exponential
-    /// backoff via `mark_unavailable_internal`). TCP state is never
-    /// touched. Without an installed prober this is a no-op returning
-    /// `false`, and no state is recorded — nodes keep the legacy
-    /// TCP-fallback selection semantics (see
+    /// DNS success marks BOTH UDP domains (DataUdp + DnsUdp, v4+v6) alive and
+    /// records the round-trip latency for URLTest ranking. When the DNS
+    /// target is unreachable but the data-path handshake succeeded, only
+    /// DnsUdp records a probe failure and DataUdp is marked alive from the
+    /// handshake — a blocked `:53` check target must not condemn a working
+    /// UDP path, because excluded nodes receive no traffic that could revive
+    /// them. Total failure records one probe failure against each domain
+    /// (probe threshold 3, exponential backoff via `mark_unavailable_internal`).
+    /// TCP state is never touched. Without an installed prober this is a
+    /// no-op returning `false`, and no state is recorded — nodes keep the
+    /// legacy TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: Uuid, timeout: Duration) -> bool {
         // Same exemption as probe_node: direct/block UDP liveness is
@@ -453,29 +459,42 @@ impl AliveDialerSet {
         };
 
         let node_name = self.node_name(node_id);
-        const UDP_DOMAINS: [ProbeDomain; 2] = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp];
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        match prober.probe_udp(&node_name, timeout).await {
-            Ok(elapsed) => {
+        let outcome = prober.probe_udp(&node_name, timeout).await;
+        match (outcome.dns, outcome.data_path) {
+            (Ok(elapsed), _) => {
                 tracing::debug!(
                     "UDP health check succeeded for node '{}' ({}ms)",
                     node_name,
                     elapsed.as_millis()
                 );
-                for domain in UDP_DOMAINS {
+                for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
                     for ipver in IPVERS {
                         self.mark_alive_for_latency(node_id, domain, ipver, elapsed);
                     }
                 }
                 true
             }
-            Err(err_msg) => {
+            (Err(dns_err), Some(Ok(data_elapsed))) => {
+                tracing::debug!(
+                    "UDP DNS check failed for node '{}' but the data-path handshake succeeded ({}ms): {}",
+                    node_name,
+                    data_elapsed.as_millis(),
+                    dns_err
+                );
+                for ipver in IPVERS {
+                    self.mark_dead_for(node_id, ProbeDomain::DnsUdp, ipver);
+                    self.mark_alive_for_latency(node_id, ProbeDomain::DataUdp, ipver, data_elapsed);
+                }
+                true
+            }
+            (Err(err_msg), _) => {
                 tracing::debug!(
                     "UDP health check failed for node '{}': {}",
                     node_name,
                     err_msg
                 );
-                for domain in UDP_DOMAINS {
+                for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
                     for ipver in IPVERS {
                         self.mark_dead_for(node_id, domain, ipver);
                     }

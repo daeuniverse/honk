@@ -129,12 +129,29 @@ pub trait HttpProber: Send + Sync {
 /// Type-erased HTTP prober stored in `AliveDialerSet`.
 pub type HttpProberRef = Arc<dyn HttpProber>;
 
+/// Outcome of one node UDP health probe: two independent signals.
+///
+/// The DNS exchange against `udp_check_dns` and the Score data-path
+/// handshake (a real TLS-in-QUIC handshake to the HTTPS check URL) can
+/// disagree when the DNS target is blocked through the node — a common
+/// anti-amplification rule on relay servers — while the UDP data path
+/// itself works. Treating that as total UDP death excluded healthy nodes
+/// from UDP selection permanently (no traffic left to revive them).
+#[derive(Debug)]
+pub struct UdpProbeOutcome {
+    /// Round-trip of the minimal DNS query through the node's UDP transport.
+    pub dns: Result<Duration, String>,
+    /// Independent data-path handshake result; `None` when not run (no HTTPS
+    /// check URL, or the node belongs to no Score group).
+    pub data_path: Option<Result<Duration, String>>,
+}
+
 /// Trait for UDP-based health check probing through proxy nodes.
 ///
 /// Implemented by `honk-core` to route a minimal DNS query through the
 /// proxy handler's UDP data path (real UDP, UoT, QUIC datagrams — whatever
-/// `dial_udp_transport` provides), matching Go's `Dialer.UdpCheck`. Returns
-/// the measured round-trip latency on success, or an error string on failure.
+/// `dial_udp_transport` provides), matching Go's `Dialer.UdpCheck`, plus the
+/// Score data-path handshake as an independent second signal.
 ///
 /// This catches nodes whose TCP path works but whose UDP path is broken
 /// (e.g. an AnyTLS server without UoT support) — a plain TCP probe can
@@ -146,7 +163,7 @@ pub trait UdpProber: Send + Sync {
         &self,
         node_name: &str,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
+    ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>>;
 }
 
 /// Type-erased UDP prober stored in `AliveDialerSet`.

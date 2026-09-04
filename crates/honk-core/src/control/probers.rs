@@ -526,7 +526,11 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         node_name: &str,
         timeout: Duration,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send + 'static>,
+        Box<
+            dyn std::future::Future<Output = honk_outbound::alive::UdpProbeOutcome>
+                + Send
+                + 'static,
+        >,
     > {
         let node = self.find_node(node_name);
         let node_name_owned = node_name.to_string();
@@ -540,20 +544,30 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let quic_score_target = self.quic_score_target.clone();
 
         Box::pin(async move {
-            let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
+            let dns_only = |error: String| honk_outbound::alive::UdpProbeOutcome {
+                dns: Err(error),
+                data_path: None,
+            };
+            let Some(node) = node else {
+                return dns_only(format!("node '{}' not found", node_name_owned));
+            };
             let protocol = node.protocol();
-            let entry = registry
-                .find(protocol)
-                .ok_or_else(|| format!("no handler for protocol {:?}", protocol))?;
-            let packet = entry
-                .packet
-                .clone()
-                .ok_or_else(|| format!("protocol {:?} has no UDP capability", protocol))?;
+            let Some(entry) = registry.find(protocol) else {
+                return dns_only(format!("no handler for protocol {:?}", protocol));
+            };
+            let Some(packet) = entry.packet.clone() else {
+                return dns_only(format!("protocol {:?} has no UDP capability", protocol));
+            };
             let connect_timeout = {
                 let config = config
                     .try_read()
-                    .map_err(|_| "config lock busy".to_string())?;
-                std::time::Duration::from_millis(config.global.connect_timeout_ms)
+                    .map_err(|_| "config lock busy".to_string());
+                match config {
+                    Ok(config) => {
+                        std::time::Duration::from_millis(config.global.connect_timeout_ms)
+                    }
+                    Err(error) => return dns_only(error),
+                }
             };
             let (runtime, ephemeral) = honk_outbound::urltest::probe_runtime(&generation, &node);
             let reporter = start_probe_feedback(
@@ -585,7 +599,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 Ok::<(), anyhow::Error>(())
             };
             let result = tokio::time::timeout(timeout, attempt).await;
-            let health_result = match result {
+            let dns = match result {
                 Ok(Ok(())) => {
                     probe_finish(&reporter, ScoreOutcome::Success);
                     Ok(start.elapsed())
@@ -599,28 +613,32 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     Err("UDP probe timeout".to_string())
                 }
             };
-            // The DNS probe failure already recorded the Score evidence; a
-            // handshake through the same dead path only adds quinn ERROR noise.
-            if health_result.is_ok()
-                && let Some(target) = quic_score_target.as_ref()
-            {
-                score_quic_probe(
-                    &packet,
-                    &generation,
-                    Arc::clone(&runtime),
-                    &node,
-                    target,
-                    &group_manager,
-                    connect_timeout,
-                    timeout,
-                )
-                .await;
-            }
+            // The DNS check target may be blocked through an otherwise
+            // healthy UDP path (relay anti-amplification rules); the Score
+            // handshake runs regardless so its success can attest the data
+            // path. It is still skipped for nodes outside Score groups
+            // (start_probe_feedback returns no reporter there).
+            let data_path = match quic_score_target.as_ref() {
+                Some(target) => {
+                    score_quic_probe(
+                        &packet,
+                        &generation,
+                        Arc::clone(&runtime),
+                        &node,
+                        target,
+                        &group_manager,
+                        connect_timeout,
+                        timeout,
+                    )
+                    .await
+                }
+                None => None,
+            };
             if ephemeral.is_none() {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
             close_ephemeral(ephemeral).await;
-            health_result
+            honk_outbound::alive::UdpProbeOutcome { dns, data_path }
         })
     }
 }
@@ -671,16 +689,15 @@ async fn score_quic_probe(
     group_manager: &SharedGroupManager,
     connect_timeout: Duration,
     timeout: Duration,
-) {
-    let Some(reporter) = start_probe_feedback(group_manager, node.id, quic_probe_context(target))
-    else {
-        return;
-    };
+) -> Option<Result<Duration, String>> {
+    // Nodes outside Score groups create no reporter and are not probed.
+    let reporter = start_probe_feedback(group_manager, node.id, quic_probe_context(target))?;
     let reporter = Some(reporter);
     let target_domain = match &target.identity {
         ScoreTarget::Domain { .. } => Some(target.host.as_str()),
         ScoreTarget::Socket(_) => None,
     };
+    let start = std::time::Instant::now();
     let attempt = async {
         let transport = generation
             .scope_dials(packet.dial_udp_transport_runtime(
@@ -700,7 +717,7 @@ async fn score_quic_probe(
         )
         .await
     };
-    match tokio::time::timeout(timeout, attempt).await {
+    Some(match tokio::time::timeout(timeout, attempt).await {
         Ok(Ok(_)) => {
             probe_first_response(&reporter);
             // The handshake probe exposes no wire counters. Record only the
@@ -708,10 +725,18 @@ async fn score_quic_probe(
             probe_tx(&reporter, 1);
             probe_rx(&reporter, 1);
             probe_finish(&reporter, ScoreOutcome::Success);
+            Ok(start.elapsed())
         }
-        Ok(Err(error)) => probe_finish(&reporter, ScoreOutcome::from_error(&error)),
-        Err(_) => probe_finish(&reporter, ScoreOutcome::Timeout),
-    }
+        Ok(Err(error)) => {
+            let message = format!("{error}");
+            probe_finish(&reporter, ScoreOutcome::from_error(&error));
+            Err(message)
+        }
+        Err(_) => {
+            probe_finish(&reporter, ScoreOutcome::Timeout);
+            Err("Score QUIC probe timeout".to_string())
+        }
+    })
 }
 
 /// Build the minimal DNS query used by the UDP health probe: a single
