@@ -2237,7 +2237,7 @@ impl super::GroupManager {
         } else {
             let candidate = match group.policy {
                 honk_config::group::GroupPolicy::Selector => {
-                    let picked = self.pick_selector(&candidates, group);
+                    let picked = self.pick_selector(&candidates, group, context.network);
                     self.commit_selector_pick_for_target(
                         group,
                         picked,
@@ -2353,7 +2353,7 @@ impl super::GroupManager {
         } else {
             Some(match group.policy {
                 honk_config::group::GroupPolicy::Selector => {
-                    let picked = self.pick_selector(&candidates, group);
+                    let picked = self.pick_selector(&candidates, group, context.network);
                     self.commit_selector_pick_for_target(
                         group, picked, context, visited, depth, effects,
                     )

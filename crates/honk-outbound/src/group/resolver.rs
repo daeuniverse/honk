@@ -93,7 +93,7 @@ impl GroupManager {
         }
         let candidate = match group.policy {
             GroupPolicy::Selector => {
-                let picked = self.pick_selector(&candidates, group);
+                let picked = self.pick_selector(&candidates, group, network);
                 self.commit_selector_pick(group, picked, domain, ipver, visited, depth, effects)
             }
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),

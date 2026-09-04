@@ -177,6 +177,30 @@ fn test_selector_runtime_choice_overrides_default() {
 }
 
 #[test]
+fn selector_choice_filtered_by_health_falls_back_without_rewriting_choice() {
+    let (a, b) = (nid("sel-a"), nid("sel-b"));
+    let nodes = vec![make_node(a, "sel-a"), make_node(b, "sel-b")];
+    let group = make_group("g", GroupPolicy::Selector, vec![a, b]);
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
+    m.set_selector_choice("g", "sel-a");
+    alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
+
+    let selected = m
+        .select_node_for_domain("g", ProbeDomain::Tcp, IpVersion::V4)
+        .unwrap();
+    assert_eq!(
+        selected.name, "sel-b",
+        "a health-filtered choice falls back to the first alive member"
+    );
+    assert_eq!(
+        m.get_selector_choice("g").as_deref(),
+        Some("sel-a"),
+        "the stored choice is preserved so recovery restores it"
+    );
+}
+
+#[test]
 fn selector_warm_node_keeps_configured_dead_leaf_and_resolves_nested_choice() {
     let (a, b) = (nid("warm-a"), nid("warm-b"));
     let nodes = vec![make_node(a, "warm-a"), make_node(b, "warm-b")];

@@ -33,7 +33,8 @@ impl GroupManager {
                 .filter_map(|id| self.nodes.get(id))
                 .find(|node| node.name == tag && selectable(node))
         };
-        if let Some(choice) = self.selector_choice.read().get(&group.name)
+        let choice = self.selector_choice.read().get(&group.name).cloned();
+        if let Some(choice) = choice.as_deref()
             && let Some(node) = find(choice)
         {
             return Some(node);
@@ -41,13 +42,30 @@ impl GroupManager {
         if let Some(default) = group.default.as_deref()
             && let Some(node) = find(default)
         {
+            if let Some(choice) = choice.as_deref() {
+                self.warn_selector_choice_filtered(
+                    group,
+                    choice,
+                    &node.name,
+                    SelectionNetwork::from_probe_domain(domain),
+                );
+            }
             return Some(node);
         }
-        group
+        let picked = group
             .nodes
             .iter()
             .filter_map(|id| self.nodes.get(id))
-            .find(selectable)
+            .find(selectable);
+        if let (Some(choice), Some(node)) = (choice.as_deref(), picked) {
+            self.warn_selector_choice_filtered(
+                group,
+                choice,
+                &node.name,
+                SelectionNetwork::from_probe_domain(domain),
+            );
+        }
+        picked
     }
 
     /// Selector policy: runtime choice, then `group.default`, then first
@@ -55,22 +73,70 @@ impl GroupManager {
     /// direct member node or a nested sub-group (sing-box nested-selector
     /// behavior: picking a sub-group defers to that group's own pick,
     /// which flattening already resolved to its leaf).
+    ///
+    /// When the configured choice is health-filtered for this network (e.g.
+    /// UDP-dead), the fallback is deliberate — but it is logged
+    /// (rate-limited) because the dashboard `now` field still displays the
+    /// configured choice while traffic silently rides another member.
     pub(super) fn pick_selector<'a>(
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
+        network: SelectionNetwork,
     ) -> Candidate<'a> {
-        if let Some(choice) = self.selector_choice.read().get(&group.name)
-            && let Some(c) = candidates.iter().find(|c| c.tag == choice.as_str())
-        {
-            return c.clone();
+        let choice = self.selector_choice.read().get(&group.name).cloned();
+        let mut choice_filtered = false;
+        if let Some(choice) = choice.as_deref() {
+            if let Some(c) = candidates.iter().find(|c| c.tag == choice) {
+                return c.clone();
+            }
+            choice_filtered = true;
         }
-        if let Some(default_name) = &group.default
-            && let Some(c) = candidates.iter().find(|c| c.tag == default_name.as_str())
-        {
-            return c.clone();
+        let picked = group
+            .default
+            .as_deref()
+            .and_then(|default| candidates.iter().find(|c| c.tag == default))
+            .unwrap_or(&candidates[0]);
+        if choice_filtered {
+            self.warn_selector_choice_filtered(
+                group,
+                choice.as_deref().expect("filtered choice"),
+                picked.tag,
+                network,
+            );
         }
-        candidates[0].clone()
+        picked.clone()
+    }
+
+    /// Rate-limited warning for a health-filtered Selector choice: the
+    /// dashboard keeps displaying the configured choice while traffic rides
+    /// another member, so the fallback must be visible without logging once
+    /// per dial.
+    fn warn_selector_choice_filtered(
+        &self,
+        group: &Group,
+        choice: &str,
+        picked: &str,
+        network: SelectionNetwork,
+    ) {
+        const LOG_COOLDOWN: Duration = Duration::from_secs(60);
+        let key = (group.name.clone(), network);
+        let now = Instant::now();
+        let mut last = self.selector_fallback_log.write();
+        if let Some(previous) = last.get(&key)
+            && now.duration_since(*previous) < LOG_COOLDOWN
+        {
+            return;
+        }
+        last.insert(key, now);
+        drop(last);
+        tracing::warn!(
+            group = %group.name,
+            network = ?network,
+            choice = %choice,
+            picked = %picked,
+            "selector choice is not alive for this network; traffic falls back to another member"
+        );
     }
     pub(super) fn pick_score<'a>(
         &self,

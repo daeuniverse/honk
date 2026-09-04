@@ -200,6 +200,10 @@ pub struct GroupManager {
     /// Per-group selector choice (set via API, persisted by caller).
     /// group_name → selected node name.
     selector_choice: RwLock<HashMap<String, String>>,
+    /// Rate limiter for the "selector choice health-filtered" warning,
+    /// keyed per (group, network) so a degraded choice logs at most once
+    /// per cooldown instead of once per dial.
+    selector_fallback_log: RwLock<HashMap<(String, SelectionNetwork), Instant>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
     persist_callback: RwLock<Option<PersistCallback>>,
     /// Wakes the generation-owned selector warm coordinator.
@@ -293,6 +297,7 @@ impl GroupManager {
             fallback_cache: RwLock::new(HashMap::new()),
             last_used: RwLock::new(HashMap::new()),
             selector_choice: RwLock::new(HashMap::new()),
+            selector_fallback_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
@@ -544,7 +549,7 @@ impl GroupManager {
         }
         match group.policy {
             GroupPolicy::Selector => {
-                let picked = self.pick_selector(&candidates, group);
+                let picked = self.pick_selector(&candidates, group, network);
                 let committed = self.commit_selector_pick(
                     group,
                     picked,
