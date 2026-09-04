@@ -218,7 +218,7 @@ For VLESS URL links, `security=reality` enables TLS and maps the REALITY query f
 
 | Query | Meaning |
 | --- | --- |
-| `security=reality` | Select REALITY and enable TLS |
+| `security=reality` | Select REALITY and enable TLS. A node that selects REALITY without `pbk` is rejected at validation rather than degraded to plain TLS |
 | `pbk` | Base64url 32-byte X25519 server public key; invalid input fails closed |
 | `sid` | Even-length hexadecimal short ID, at most 8 bytes; empty is valid |
 | `spx` | Stored spider path; defaults to `/` when REALITY is selected |

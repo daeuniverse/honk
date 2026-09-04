@@ -105,6 +105,23 @@ impl VlessConfig {
                 )));
             }
         }
+        // A REALITY node without a usable public key falls back to ordinary TLS with the
+        // configured SNI, which is the opposite of what selecting REALITY asked for.
+        let has_key = self
+            .tls
+            .reality_public_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        // Presence is the intent, not a non-empty value: an empty short id is documented as
+        // valid, and an empty key is exactly what parse_reality_config reads as "no REALITY".
+        let wants_reality = self.tls.reality_public_key.is_some()
+            || self.tls.reality_short_id.is_some()
+            || self.tls.reality_spider_x.is_some();
+        if wants_reality && !has_key {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{name}' selects REALITY without reality_public_key"
+            )));
+        }
         Ok(())
     }
 }
