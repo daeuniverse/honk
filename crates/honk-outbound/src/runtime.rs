@@ -888,6 +888,8 @@ pub struct DialPermit {
     _process: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Captured logical operation state for spawned child work. Clones share
+/// successful permits and the first-dial callback with their parent.
 #[derive(Clone)]
 pub(crate) struct CapturedDialScope(Arc<DialScope>);
 
@@ -902,10 +904,30 @@ impl CapturedDialScope {
     {
         DIAL_SCOPE.scope(self.0, future).await
     }
+}
+
+/// Reusable admission identity for autonomous dial operations. Each scoped
+/// future receives its own permit-holding operation scope.
+#[derive(Clone)]
+pub(crate) struct CapturedDialAdmission(DialAdmission);
+
+impl CapturedDialAdmission {
+    fn standalone() -> Self {
+        Self(DialAdmission::standalone())
+    }
+
+    pub(crate) async fn scope<F>(self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        DIAL_SCOPE
+            .scope(DialScope::new(self.0, None), future)
+            .await
+    }
 
     #[cfg(test)]
     pub(crate) fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
-        self.0.admission.matches_registry(registry)
+        self.0.matches_registry(registry)
     }
 }
 
@@ -915,14 +937,14 @@ pub(crate) fn capture_dial_scope() -> CapturedDialScope {
         .unwrap_or_else(|_| CapturedDialScope::standalone())
 }
 
-pub(crate) fn try_capture_dial_admission() -> Option<CapturedDialScope> {
+pub(crate) fn try_capture_dial_admission() -> Option<CapturedDialAdmission> {
     DIAL_SCOPE
-        .try_with(|scope| CapturedDialScope(DialScope::new(scope.admission.clone(), None)))
+        .try_with(|scope| CapturedDialAdmission(scope.admission.clone()))
         .ok()
 }
 
-pub(crate) fn capture_dial_admission() -> CapturedDialScope {
-    try_capture_dial_admission().unwrap_or_else(CapturedDialScope::standalone)
+pub(crate) fn capture_dial_admission() -> CapturedDialAdmission {
+    try_capture_dial_admission().unwrap_or_else(CapturedDialAdmission::standalone)
 }
 
 pub(crate) async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
@@ -1198,10 +1220,10 @@ impl OutboundRuntimeRegistry {
     /// Rebind autonomous AnyTLS replacement dials after this generation is
     /// published. Reused pools must stop consulting the predecessor's gate.
     pub fn activate_background_dial_admission(&self) {
-        let scope = CapturedDialScope(DialScope::new(DialAdmission::for_registry(self), None));
+        let admission = CapturedDialAdmission(DialAdmission::for_registry(self));
         for runtime in self.nodes.values() {
             if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
-                anytls.pool.set_dial_scope(scope.clone());
+                anytls.pool.set_dial_admission(admission.clone());
             }
         }
     }
