@@ -552,7 +552,8 @@ async fn quic_probe_still_runs_when_dns_probe_fails() {
             .with_packet(handler),
     );
     let runtime = Arc::new(parking_lot::RwLock::new(Arc::new(
-        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap(),
     )));
     let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
         Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
