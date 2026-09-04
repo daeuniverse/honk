@@ -488,12 +488,20 @@ impl AliveDialerSet {
                 }
                 true
             }
-            (Err(err_msg), _) => {
-                tracing::debug!(
-                    "UDP health check failed for node '{}': {}",
-                    node_name,
-                    err_msg
-                );
+            (Err(err_msg), data_path) => {
+                match &data_path {
+                    Some(Err(data_err)) => tracing::debug!(
+                        "UDP health check failed for node '{}': {}; data-path handshake: {}",
+                        node_name,
+                        err_msg,
+                        data_err
+                    ),
+                    _ => tracing::debug!(
+                        "UDP health check failed for node '{}': {}",
+                        node_name,
+                        err_msg
+                    ),
+                }
                 for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
                     for ipver in IPVERS {
                         self.mark_dead_for(node_id, domain, ipver);
