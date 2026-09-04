@@ -137,7 +137,7 @@ This keeps DHCP, mDNS, SSDP, LLMNR, and similar link traffic out of the proxy. T
 
 ### Outbound liveness
 
-Userspace publishes group-OR health into `OUTBOUND_CONNECTIVITY_MAP`. A new LAN flow routed to a slot explicitly marked dead is dropped with `TC_ACT_SHOT`; this is deliberately fail-closed. One narrow exception keeps the slot open for a TCP group with exactly one unique leaf and no `final`, allowing a real dial through that same proxy to prove recovery without an implicit `direct` fallback. UDP and all-dead multi-leaf groups remain fail-closed. TCP and UDP destination port `53` are exempt on LAN ingress. Generated must-direct rules for every current gateway interface address run through the same routing publication path and keep local administration reachable even when proxy outbounds are dead.
+Userspace publishes group-OR health into `OUTBOUND_CONNECTIVITY_MAP`. A new LAN flow routed to a slot explicitly marked dead is dropped with `TC_ACT_SHOT`; this is deliberately fail-closed. One narrow exception keeps the slot open for a TCP group with exactly one unique leaf and no `final`, allowing a real dial through that same proxy to prove recovery without an implicit `direct` fallback. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. TCP and UDP destination port `53` are exempt on LAN ingress. Generated must-direct rules for every current gateway interface address run through the same routing publication path and keep local administration reachable even when proxy outbounds are dead.
 
 ### Route-time direct offload
 

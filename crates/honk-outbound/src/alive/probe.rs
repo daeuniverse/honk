@@ -35,9 +35,9 @@ impl AliveDialerSet {
         // direct is measured against the bootstrap resolver (default
         // 223.5.5.5:53) with a raw connect: the proxy check URL is chosen
         // for proxied egress and is commonly unreachable over a direct
-        // connection (e.g. google-analytics from CN), so probing it flapped
-        // direct dead every cycle only for real traffic to revive it
-        // seconds later.
+        // connection (e.g. google-analytics from CN). The result is a
+        // display-only latency signal — failure marks never apply to the
+        // direct builtin (see mark_unavailable_internal).
         if node_id == honk_config::config::DIRECT_NODE_ID {
             let target = self.direct_check_addr.read().clone();
             return self
@@ -442,9 +442,9 @@ impl AliveDialerSet {
     /// legacy TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: Uuid, timeout: Duration) -> bool {
-        // Same exemption as probe_node: direct/block UDP liveness is
-        // traffic-driven, and the UDP check target (e.g. 8.8.8.8) is not a
-        // reliable direct-egress signal either.
+        // direct/block UDP liveness carries no verdict: the builtins are
+        // never marked dead, and the UDP check target (e.g. 8.8.8.8) is not
+        // a reliable direct-egress signal either.
         if matches!(
             node_id,
             honk_config::config::DIRECT_NODE_ID | honk_config::config::BLOCK_NODE_ID

@@ -116,7 +116,7 @@ Offloaded flows never create a userspace relay or `/connections` entry and canno
 
 Before redirect or native forwarding, the datapath checks `OUTBOUND_CONNECTIVITY_MAP`. A dead selected outbound returns `TC_ACT_SHOT`: honk fails closed rather than leaking the flow through `direct`. Destination port 53 is exempt for both TCP and UDP so DNS can reach the control plane and apply its own fallback policy.
 
-The group-shared slot normally contains the OR of all leaf health. A TCP group with exactly one unique leaf and no `final` keeps that slot open as a userspace last resort; the control plane still dials the same proxy, and successful traffic can revive it. UDP and all-dead multi-leaf groups remain fail-closed. Clash `Global` and `Direct` overrides still cannot bypass a `must` or `block` result. See the [datapath design](./datapath.md) for the exact redirect and drop paths.
+The group-shared slot normally contains the OR of all leaf health. A TCP group with exactly one unique leaf and no `final` keeps that slot open as a userspace last resort; the control plane still dials the same proxy, and successful traffic can revive it. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. Clash `Global` and `Direct` overrides still cannot bypass a `must` or `block` result. See the [datapath design](./datapath.md) for the exact redirect and drop paths.
 
 ## Related docs
 

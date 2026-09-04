@@ -1005,17 +1005,24 @@ fn test_block_ignores_traffic_failures() {
 fn test_direct_ignores_failure_marks() {
     let set = AliveDialerSet::new();
     set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    // Age out of the registration grace period so non-forced failures count
+    // (the incident vector was the traffic-failure threshold).
+    set.node_registered_at
+        .write()
+        .insert(DIRECT_NODE_ID, Instant::now() - GRACE_PERIOD);
     for _ in 0..20 {
         set.report_unavailable_traffic(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
         set.report_unavailable_forced(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
         set.record_dial_failure(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
-        set.mark_dead_for(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
+        set.mark_dead(DIRECT_NODE_ID);
         set.mark_dead_for(DIRECT_NODE_ID, ProbeDomain::DataUdp, IpVersion::V4);
     }
     for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
         assert!(set.is_alive_for(DIRECT_NODE_ID, domain, IpVersion::V4));
         assert!(set.is_alive_for(DIRECT_NODE_ID, domain, IpVersion::V6));
     }
+    // Dial failures must not strike-demote direct in URLTest ranking either.
+    assert!(!set.is_failure_demoted(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4));
 }
 
 /// direct is probed against the dedicated direct check target (bootstrap
