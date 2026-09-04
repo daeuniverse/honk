@@ -42,6 +42,8 @@ const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 /// bound — at the cap new mappings are refused and the datagram is dropped,
 /// which UDP tolerates by design.
 pub(crate) const MAX_ENDPOINTS: usize = 8192;
+/// Total reply sockets retained by one endpoint, including the eagerly-created primary.
+pub(in crate::control) const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
     /// The proxy-side framed UDP transport (upstream).

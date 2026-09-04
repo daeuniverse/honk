@@ -1,6 +1,6 @@
 //! Immutable process-wide descriptor partitioning for the control plane.
 
-use crate::control::udp_endpoint::MAX_ENDPOINTS;
+use crate::control::udp_endpoint::{MAX_ENDPOINTS, MAX_REPLY_SOCKETS_PER_ENDPOINT};
 use crate::pool::MAX_TOTAL_ENTRIES;
 
 pub(crate) const MAX_EFFECTIVE_NOFILE: usize = 1_048_576;
@@ -10,7 +10,8 @@ const MAX_TRANSIENT_DIALS: usize = 1_024;
 const MAX_UDP_SLOW_PATH: usize = 256;
 const MAX_DNS_SLOW_PATH: usize = 256;
 const TCP_FLOW_DESCRIPTOR_COST: usize = 6;
-const UDP_ENDPOINT_DESCRIPTOR_COST: usize = 3;
+// One retained transport carrier plus every reply socket the endpoint may open.
+const UDP_ENDPOINT_DESCRIPTOR_COST: usize = 1 + MAX_REPLY_SOCKETS_PER_ENDPOINT;
 // Keep half of the non-TCP budget available for bursty gateway DNS/UDP work.
 const ELASTIC_NON_TCP_RESERVE_DIVISOR: usize = 2;
 
@@ -141,6 +142,31 @@ mod tests {
     }
 
     #[test]
+    fn full_cone_endpoint_max_fits_descriptor_partition() {
+        assert_eq!(UDP_ENDPOINT_DESCRIPTOR_COST, 9);
+        for (nofile, expected_endpoint_ceiling) in [
+            (64, 3),
+            (1_024, 56),
+            (4_096, 240),
+            (usize::MAX, MAX_ENDPOINTS),
+        ] {
+            let budget = ResourceBudget::for_nofile(nofile);
+            let non_udp_descriptors = budget.fixed_reserve
+                + budget.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST
+                + budget.tcp_pool_entries
+                + budget.transient_dials;
+            let full_cone_endpoint_descriptors =
+                budget.udp_endpoints * (1 + MAX_REPLY_SOCKETS_PER_ENDPOINT);
+
+            assert_eq!(budget.udp_endpoints, expected_endpoint_ceiling);
+            assert!(
+                non_udp_descriptors + full_cone_endpoint_descriptors
+                    <= budget.effective_nofile
+            );
+        }
+    }
+
+    #[test]
     fn representative_limits_have_stable_partitions() {
         assert_eq!(
             ResourceBudget::for_nofile(64),
@@ -150,8 +176,8 @@ mod tests {
                 active_tcp_flows: 2,
                 tcp_pool_entries: 7,
                 transient_dials: 4,
-                udp_endpoints: 11,
-                udp_slow_path: 11,
+                udp_endpoints: 3,
+                udp_slow_path: 3,
                 dns_slow_path: 4,
             }
         );
@@ -163,8 +189,8 @@ mod tests {
                 active_tcp_flows: 37,
                 tcp_pool_entries: 112,
                 transient_dials: 56,
-                udp_endpoints: 168,
-                udp_slow_path: 168,
+                udp_endpoints: 56,
+                udp_slow_path: 56,
                 dns_slow_path: 56,
             }
         );
@@ -176,8 +202,8 @@ mod tests {
                 active_tcp_flows: 160,
                 tcp_pool_entries: 480,
                 transient_dials: 240,
-                udp_endpoints: 720,
-                udp_slow_path: 256,
+                udp_endpoints: 240,
+                udp_slow_path: 240,
                 dns_slow_path: 240,
             }
         );
@@ -216,7 +242,7 @@ mod tests {
         let cap_tcp_only_fds = cap.fixed_reserve + cap.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST;
         assert_eq!(
             cap.elastic_tcp_flows(cap.active_tcp_flows, cap_tcp_only_fds),
-            18_688
+            22_784
         );
     }
     #[test]

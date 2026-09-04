@@ -10,9 +10,6 @@ const QUEUED_PACKET_MAX_AGE: Duration = Duration::from_secs(5);
 pub(super) const TRAFFIC_ALIVE_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 pub(super) const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 pub(super) const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Includes the eagerly-created original-destination socket. Reaching the
-/// bound fails the endpoint closed rather than replying from the wrong source.
-const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 #[derive(Debug)]
 enum PacketSendFailure {
     Congestion(io::Error),
