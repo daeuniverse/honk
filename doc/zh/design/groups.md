@@ -49,6 +49,12 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 只有物理拨号、逻辑 stream、transport preparation 或 exchange 真正启动时才调用 `ScoreFeedback::start()` 并创建 `ScoreReporter`。可 clone reporter 记录 setup、首响应、发送/接收字节，并且只接受 success、timeout、`io::ErrorKind`、cancellation、shutdown 或 other 中的一个终态；第一个终态调用生效，最后一个未完成 handle 被 drop 时报告 cancellation。cancellation 与 shutdown 会撤销本次 attempt 而不增加终态证据。retry 会启动新的 reporter，未实际启动的 speculative work 没有 reporter。instrumentation 始终编译但按需运行：非 Score 计划不会创建 reporter 或评分 cell。
 
+带拨号准入作用域的 TCP 拨号，在首个物理尝试获准后，或复用 session/QUIC 连接上的逻辑 open 开始前启动 reporter；等待冷物理拨号准入时不启动。回调只执行一次；未经过这两个边界便已完成的路径保留完成时的兜底回调。
+
+普通路径和竞速后的 TCP ready/bare 补池仍记录 setup 质量，但其成功与失败都不改变真实流量的连败计数或探索退避。UDP driver 在自己的健康回调可能同步退役 endpoint 之前判定终态，避免该回调把错误改写成中性的取消或成功。主动退役在没有回包时保持中性，已有回包时计为成功；进程关闭和单包拥塞保持中性，回包空闲到期仅在从未收到回包时计为超时。
+
+对仍存活的 endpoint，已明确判定的 QUIC 通路停滞保留更高优先级：即使当前错误原本属于单包拥塞或已有回包后的空闲到期，也仍归因为超时。
+
 同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：直连 UDP、DoQ 与 DoH3 使用 UDP 分桶；TCP、DoT、DoH 与经代理的 UDP（以 TCP-DNS 承载，因此适用 TCP 健康与 TCP 分桶）使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶。每个周期 UDP 探测会为 Score 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，且无论 DNS 探测成败都会运行。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume；当 DNS exchange 失败而握手成功时，它还会把 `DataUdp` 标记为存活，使被封禁的 `:53` 检查目标不能永久判死一条正常的 UDP 数据通路。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
 
 排名以可靠性为主：Beta 先验的下置信估计先排除固定「可靠性接近」区间之外的成员，延迟与吞吐只在该区间内微调。延迟惩罚相对组内已观测最快候选归一，吞吐 bonus 相对组内最高主导方向 bytes/s 归一。有效完成证据不足或衰减到训练阈值以下的候选会重新视为冷候选。候选数不超过 4 时冷探索覆盖全部成员；更大的组探索 `ceil(sqrt(n)) + 1` 个成员，并每进行 `2n` 次选择（限制在 16–64）复检 Beta 可靠性上置信界最高的非当前成员。cadence 只按 `(group, TCP/UDP, 目标 IPv4/IPv6 地址族或 none)` 分域。连败会把叶节点按指数退避移出冷探索与周期探索——从 5 分钟起随连败翻倍，上限 6 小时，退避状态独立于证据衰减；成功立即恢复探索资格，但连败只降一级——抖动节点必须逐级挣回快速探索节奏。只有真实流量的结果会移动连败计数——探测、urltest 与预热结果对连败中立，健康检查目标的畅通洗不掉真实连败。同一连败计数也门控排名：连续三次新鲜失败时，只要还有更健康的候选，该叶节点就退出可靠性带；仅当所有候选都在连败时回退到全量排名，保证选择永不消失。现任滞回随有效完成证据线性增长，在八次完成时达到完整 `0.01` 余量；全局、目标地址族和精确目标的新鲜失败 envelope 在决定是否绕过余量前取 `max`，而不相加。探索与其余平局保持确定性，最终计划始终只包含一个权威叶节点。
@@ -126,7 +132,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 | Score QUIC 评分 | 通过新的 packet transport 为 Score 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`，无论 DNS 探测成败都会运行。成功或失败会更新精确 `DataUdp` 分数与聚合先验，不奖励未观测的 byte volume；当 DNS 探测失败而握手成功时，还会按上表所述复活 `DataUdp` 活性。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
-`has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。已建立 endpoint 的发送、接收和回包空闲错误会上报 `DataUdp` 流量失败。主动 endpoint 退役、节点死亡取消和进程关闭不影响健康状态。
+`has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。已建立 endpoint 的终止性发送/接收错误，以及从未收到回包时的回包空闲到期，会上报 `DataUdp` 流量失败。单包拥塞、已有回包后的空闲到期、主动 endpoint 退役、节点死亡取消和进程关闭不影响健康状态。
 
 alive→dead 转换会调用控制面死亡回调，清除该节点的池连接与 UDP endpoint，避免新流量取得陈旧的可复用对象。
 
