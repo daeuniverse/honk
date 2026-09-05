@@ -414,9 +414,9 @@ fn find_dat(name: &str) -> Option<std::path::PathBuf> {
             return Some(path);
         }
     }
-    let data_path = honk_config::paths::resolve_artifact_path(name);
-    if data_path.is_file() {
-        return Some(data_path);
+    let mut path = honk_config::paths::resolve_artifact_path(name);
+    if path.is_file() {
+        return Some(path);
     }
     for directory in [
         honk_config::paths::LEGACY_DATA_DIR,
@@ -427,7 +427,9 @@ fn find_dat(name: &str) -> Option<std::path::PathBuf> {
         "/usr/share/dae",
         "/etc/dae",
     ] {
-        let path = std::path::Path::new(directory).join(name);
+        path.clear();
+        path.push(directory);
+        path.push(name);
         if path.is_file() {
             return Some(path);
         }
