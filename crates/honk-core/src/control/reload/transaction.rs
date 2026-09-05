@@ -134,8 +134,11 @@ impl ControlPlane {
             .await
     }
 
-    /// Publish an explicit runtime configuration through the same transaction
-    /// used by SIGHUP and subscription refreshes.
+    /// Publish an explicit runtime configuration through the serialized transaction.
+    ///
+    /// This direct API cannot reconcile the process-owned subscription workers, so
+    /// it rejects additions, removals, or worker-spec changes. Use the engine's
+    /// SIGHUP reload path when the subscription worker set changes.
     pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
         let drain = Arc::clone(&self.drain_tracker);
         self.apply_runtime_config(new_config, &drain).await
