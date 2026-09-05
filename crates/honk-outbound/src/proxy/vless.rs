@@ -2061,7 +2061,7 @@ mod tests {
         assert!(moved.contains(&node.id));
         let replacement = Arc::new(replacement);
         generation.mark_moved_out(moved);
-        generation.drain_session_pools();
+        generation.retire_reusable_state().await;
         generation.shutdown().await;
         assert_eq!(pool.live_session_count(), 1);
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();

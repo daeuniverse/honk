@@ -343,28 +343,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_exchange_unregisters_and_quarantines_pool_id() {
+    async fn cancelled_exchange_rejects_delayed_wire_response() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let pool = UdpPool::new(address, Duration::from_secs(60))
             .await
             .unwrap();
-        let exchange_pool = Arc::clone(&pool);
-        let exchange =
-            tokio::spawn(async move { exchange_pool.exchange(&query(0x1234), None).await });
-        let mut buffer = [0_u8; 512];
-        let (length, _) = server.recv_from(&mut buffer).await.unwrap();
-        assert!(length >= 2);
-        let id = u16::from_be_bytes([buffer[0], buffer[1]]);
 
-        exchange.abort();
-        assert!(exchange.await.unwrap_err().is_cancelled());
+        let first_pool = Arc::clone(&pool);
+        let first = tokio::spawn(async move { first_pool.exchange(&query(0x1234), None).await });
+        let mut first_wire = [0_u8; 512];
+        let (first_len, first_peer) = server.recv_from(&mut first_wire).await.unwrap();
+        let first_id = first_wire[..2].to_vec();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
 
-        {
-            let state = pool.state.lock();
-            assert!(state.pending.is_empty());
-            assert!(UdpPool::is_retired(&state, id));
-        }
+        let second_pool = Arc::clone(&pool);
+        let mut second =
+            tokio::spawn(async move { second_pool.exchange(&query(0x5678), None).await });
+        let mut second_wire = [0_u8; 512];
+        let (second_len, second_peer) = server.recv_from(&mut second_wire).await.unwrap();
+        assert_ne!(&second_wire[..2], first_id.as_slice());
+
+        first_wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        server
+            .send_to(&first_wire[..first_len], first_peer)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "a delayed response for the cancelled wire ID completed its successor"
+        );
+
+        second_wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        server
+            .send_to(&second_wire[..second_len], second_peer)
+            .await
+            .unwrap();
+        let response = second.await.unwrap().unwrap();
+        assert_eq!(&response[..2], &0x5678_u16.to_be_bytes());
         pool.close().await;
     }
 

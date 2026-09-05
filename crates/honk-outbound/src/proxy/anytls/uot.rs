@@ -315,6 +315,14 @@ mod uot_transport_tests {
         target: SocketAddr,
         capacity: usize,
     ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
+        uot_test_transport_with_capacity_and_budget(target, capacity, INBOUND_PAYLOAD_BUDGET).await
+    }
+
+    async fn uot_test_transport_with_capacity_and_budget(
+        target: SocketAddr,
+        capacity: usize,
+        inbound_budget: usize,
+    ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
         let addr = "127.0.0.1:2443";
         let (client_end, mut server_end) = tokio::io::duplex(capacity);
         let (read, write) = tokio::io::split(client_end);
@@ -328,7 +336,7 @@ mod uot_transport_tests {
             TEST_AUTH,
             bytes::Bytes::from_static(TEST_SETTINGS),
             padding_state,
-            InboundPayloadBudget::new(INBOUND_PAYLOAD_BUDGET),
+            InboundPayloadBudget::new(inbound_budget),
         )
         .await
         .unwrap();
@@ -399,6 +407,31 @@ mod uot_transport_tests {
         let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong!");
         assert_eq!(src, target);
+    }
+
+    #[tokio::test]
+    async fn uot_read_releases_pool_payload_credit() {
+        const BUDGET: usize = 8;
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (transport, mut server) =
+            uot_test_transport_with_capacity_and_budget(target, 1 << 20, BUDGET).await;
+        let sid = transport.sid;
+        let mut buf = [0_u8; BUDGET];
+
+        for payload in [b"first!", b"second"] {
+            let mut frame = Vec::with_capacity(BUDGET);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.extend_from_slice(payload);
+            write_frame(&mut server, CMD_PSH, sid, &frame)
+                .await
+                .unwrap();
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(1), transport.recv_packet(&mut buf))
+                    .await
+                    .expect("UoT payload credit was not released")
+                    .unwrap();
+            assert_eq!(&buf[..len], payload);
+        }
     }
 
     #[tokio::test]

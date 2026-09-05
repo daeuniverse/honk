@@ -83,6 +83,37 @@ fn anytls_connector_is_lazy_shared_and_generation_local() {
 }
 
 #[tokio::test]
+async fn retirement_releases_cached_non_flow_state() {
+    let anytls = node("anytls-retired", NodeProtocol::AnyTLS);
+    let tuic = node("tuic-retired", NodeProtocol::Tuic);
+    let registry = OutboundRuntimeRegistry::build(&[anytls.clone(), tuic.clone()]).unwrap();
+    let anytls_runtime = registry.get(&anytls.id).unwrap();
+    anytls_runtime.anytls_tls_connector().unwrap();
+    let ProtocolRuntime::AnyTls(anytls_state) = &anytls_runtime.runtime else {
+        panic!("AnyTLS runtime expected");
+    };
+    let tuic_runtime = registry.get(&tuic.id).unwrap();
+    let ProtocolRuntime::Quic(quic) = &tuic_runtime.runtime else {
+        panic!("TUIC runtime expected");
+    };
+    let client = Arc::new(FakeQuicClient::default());
+    quic.client({
+        let client = Arc::clone(&client);
+        || async move { Ok(client) }
+    })
+    .await
+    .unwrap();
+
+    registry.retire_reusable_state().await;
+
+    assert!(anytls_state.pool.is_retired());
+    assert!(!anytls_runtime.tls_connector_loaded());
+    assert!(client.warm_released.load(Ordering::Acquire));
+    assert_eq!(quic.client_count(), Some(0));
+    assert!(!client.force_closed.load(Ordering::Acquire));
+}
+
+#[tokio::test]
 async fn warm_retention_releases_only_after_last_owner() {
     for node in [
         node("anytls-retained", NodeProtocol::AnyTLS),
@@ -473,7 +504,7 @@ async fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
         OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&unchanged), 64, Some(&first))
             .unwrap();
     first.mark_moved_out(reused);
-    first.drain_session_pools();
+    first.retire_reusable_state().await;
     first.shutdown().await;
     let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
         panic!("anytls runtime expected");
@@ -499,7 +530,7 @@ async fn vless_mux_pools_retire_and_shut_down_with_their_generation() {
         let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
             panic!("VLESS mux runtime expected");
         };
-        registry.drain_session_pools();
+        registry.retire_reusable_state().await;
         assert!(mux.is_retired());
 
         let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();

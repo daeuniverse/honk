@@ -57,7 +57,7 @@ pub struct IfaceWatcher {
 impl IfaceWatcher {
     /// `attached` seeds the names (with ifindex and directions) already
     /// hooked during startup so the first reconcile does not attach twice.
-    pub fn spawn(
+    pub(crate) fn spawn(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,

@@ -1027,17 +1027,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn dial_scope_matches(
-        &self,
-        registry: &crate::runtime::OutboundRuntimeRegistry,
-    ) -> bool {
-        self.dial_admission
-            .read()
-            .as_ref()
-            .is_some_and(|admission| admission.matches_registry(registry))
-    }
-
     /// Start the pool janitor (prune closed/expired, prewarm to the explicit
     /// or runtime-pinned floor) once; subsequent calls update the explicit
     /// floor without spawning another task. `prewarm` dials a fresh session

@@ -863,7 +863,7 @@ impl UdpEndpointPool {
 
     /// Admit a retained NFQUEUE allocation without duplicating its payload.
     /// A fresh call uses `None`; followers name the exact published generation.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn reserve_owned_or_enqueue(
         self: &Arc<Self>,
@@ -966,7 +966,7 @@ impl UdpEndpointPool {
 
     /// Reconstruct an expired terminal Proxy cell from the same-token live
     /// initializer or Ready entry and return its generation with the enqueue.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(test)]
     pub(in crate::control) fn enqueue_owned_by_token(
         &self,
         client: SocketAddr,
