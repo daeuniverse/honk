@@ -168,6 +168,52 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
 
 #[tokio::test]
 #[ignore = "requires root; run via just test-netns"]
+async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-pin-ownership-test-{}", std::process::id()));
+    std::fs::create_dir_all(&pin_root).expect("pin root");
+    let foreign = pin_root.join("FOREIGN_MAP");
+    aya::maps::Array::<_, u32>::create(1, 0)
+        .expect("create foreign map")
+        .pin(&foreign)
+        .expect("pin foreign map");
+    let foreign_id = aya::maps::MapInfo::from_pin(&foreign)
+        .expect("foreign map info")
+        .id();
+
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        0x0800_0000,
+        None,
+        "lo",
+        false,
+    )
+    .await
+    .expect("backend load");
+    backend.detach_hooks().expect("detach hooks");
+    backend.cleanup().await.expect("cleanup");
+
+    assert_eq!(
+        aya::maps::MapInfo::from_pin(&foreign)
+            .expect("cleanup removed a pin this instance did not create")
+            .id(),
+        foreign_id
+    );
+    assert!(
+        pin_root
+            .join(UDP_DECISION_SEQUENCE_MAP)
+            .try_exists()
+            .expect("allocator pin readable"),
+        "cleanup removed the persistent allocator"
+    );
+
+    let _ = std::fs::remove_dir_all(&pin_root);
+}
+
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
 async fn pinned_raw_udp_decision_sequence_survives_reload() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
