@@ -47,9 +47,9 @@ impl SubscriptionAuthorizations {
     pub(crate) fn publish(&mut self, current: &[Subscription], next: &[Subscription]) {
         let mut active = HashMap::new();
         for subscription in next.iter().filter(|subscription| subscription.enabled) {
-            let unchanged = current.iter().any(|previous| {
-                previous.enabled && same_worker_spec(previous, subscription)
-            });
+            let unchanged = current
+                .iter()
+                .any(|previous| previous.enabled && same_worker_spec(previous, subscription));
             let revision = if unchanged {
                 self.active.get(&subscription.id).copied()
             } else {
@@ -173,12 +173,8 @@ impl SupervisorState {
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let completion = fetch_once(
-                    Arc::clone(&manager),
-                    store.clone(),
-                    task_authorized.clone(),
-                )
-                .await;
+                let completion =
+                    fetch_once(Arc::clone(&manager), store.clone(), task_authorized.clone()).await;
                 deliver_fetch(completion, &command_tx).await;
                 if command_tx.is_closed() {
                     return;
@@ -453,7 +449,10 @@ impl SubscriptionSupervisor {
     }
 
     pub(crate) fn start(&mut self, merge_tx: mpsc::Sender<ControlCommand>) {
-        assert!(self.task.is_none(), "subscription supervisor already started");
+        assert!(
+            self.task.is_none(),
+            "subscription supervisor already started"
+        );
         let (command_tx, commands) = mpsc::channel(4);
         let mut state = SupervisorState {
             manager: self.manager.take().expect("subscription manager missing"),
