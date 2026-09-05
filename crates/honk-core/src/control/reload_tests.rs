@@ -672,188 +672,174 @@ async fn empty_subscription_merge_does_not_publish_runtime() {
     assert_eq!(provider.retired_count(), before_retired);
 }
 
-#[tokio::test(start_paused = true)]
-async fn subscription_supervisor_fetches_only_committed_revisions_and_joins_shutdown() {
+#[tokio::test]
+async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision() {
     use tokio::io::AsyncWriteExt as _;
 
-    fn subscription(
-        id: uuid::Uuid,
-        name: &str,
-        address: std::net::SocketAddr,
-        update_interval: u64,
-    ) -> honk_config::subscription::Subscription {
-        honk_config::subscription::Subscription {
-            id,
-            name: name.into(),
-            url: format!("http://{address}"),
-            update_interval,
-            ..Default::default()
-        }
-    }
-
-    async fn send_subscription(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
-        const BODY: &str = "c29ja3M1Oi8vMTI3LjAuMC4xOjEwODAjYg==";
+    const BODY: &str = "c29ja3M1Oi8vMTI3LjAuMC4xOjEwODAjYg==";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
             BODY.len()
         );
-        stream.write_all(response.as_bytes()).await
-    }
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
 
-    let cp = test_cp().await;
-    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
-    let (merge_tx, mut merge_rx) = tokio::sync::mpsc::channel(8);
+    let mut cp = test_cp().await;
     let mut startup = Config::default();
     let mut supervisor = crate::subscription::SubscriptionSupervisor::prepare(&mut startup, None)
         .await
         .unwrap();
-    supervisor.start(merge_tx);
+    let (command_tx, mut commands) = tokio::sync::mpsc::channel(4);
+    supervisor.start(command_tx);
     let supervisor_handle = supervisor.handle();
+    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
+    let subscription_id = uuid::Uuid::new_v4();
+    let subscription = honk_config::subscription::Subscription {
+        id: subscription_id,
+        name: "committed".into(),
+        url: format!("http://{address}"),
+        update_interval: 0,
+        ..Default::default()
+    };
+    let mut candidate = cp.config_handle().read().await.as_ref().clone();
+    candidate.subscriptions = vec![subscription];
+    let drain = DrainTracker::new();
+    let (result, applied) = tokio::sync::oneshot::channel();
 
-    let rejected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let rejected_id = uuid::Uuid::new_v4();
-    let mut rejected = cp.config_handle().read().await.as_ref().clone();
-    rejected.subscriptions = vec![subscription(
-        rejected_id,
-        "rejected",
-        rejected_listener.local_addr().unwrap(),
-        0,
-    )];
-    rejected.dns.upstream = vec![honk_config::dns::DnsUpstream {
-        name: "broken".into(),
-        address: String::new(),
-        protocol: honk_config::types::DnsProtocol::Udp,
-        tls_server_name: None,
-        outbound: None,
-    }];
     assert!(
-        !cp.apply_sighup_config(rejected, &DrainTracker::new(), &mut authorizations,)
-            .await
+        cp.dispatch_control_command(
+            ControlCommand::ReloadConfig {
+                request_id: 1,
+                config: Box::new(candidate),
+                result,
+            },
+            &drain,
+            &mut authorizations,
+        )
+        .await
     );
-    tokio::task::yield_now().await;
+    let authorized = applied.await.unwrap().expect("reload rejected");
+    let revision = authorized[0].revision;
+    assert!(authorizations.authorizes(subscription_id, revision));
+    supervisor_handle.reconcile(authorized).await.unwrap();
+
+    let merge = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(1), rejected_listener.accept())
+        cp.dispatch_control_command(merge, &drain, &mut authorizations)
             .await
-            .is_err()
     );
     assert!(
         cp.config_handle()
             .read()
             .await
-            .subscriptions
+            .nodes
             .iter()
-            .all(|subscription| subscription.id != rejected_id)
+            .any(|node| node.subscription_id == Some(subscription_id))
     );
 
-    let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let a_address = a_listener.local_addr().unwrap();
-    let (a_started_tx, a_started_rx) = tokio::sync::oneshot::channel();
-    let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel();
-    let a_server = tokio::spawn(async move {
-        let (stream, _) = a_listener.accept().await.unwrap();
-        let _ = a_started_tx.send(());
-        let _ = release_a_rx.await;
-        let _ = send_subscription(stream).await;
-    });
-    let a = subscription(uuid::Uuid::new_v4(), "a", a_address, 0);
-    let mut candidate_a = cp.config_handle().read().await.as_ref().clone();
-    candidate_a.subscriptions = vec![a.clone()];
     assert!(
-        cp.apply_sighup_config(candidate_a, &DrainTracker::new(), &mut authorizations,)
-            .await
+        cp.dispatch_control_command(
+            ControlCommand::MergeSubscription {
+                subscription_id,
+                revision: revision.wrapping_sub(1),
+                name: "stale".into(),
+                nodes: vec![Node {
+                    name: "stale".into(),
+                    subscription_id: Some(subscription_id),
+                    ..Default::default()
+                }],
+            },
+            &drain,
+            &mut authorizations,
+        )
+        .await
     );
-    let a_revision = authorizations.revision(a.id).unwrap();
-    let committed_a = cp.config_handle().read().await.subscriptions.clone();
-    supervisor_handle.reconcile(committed_a).await;
-    a_started_rx.await.unwrap();
-
-    let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let b_address = b_listener.local_addr().unwrap();
-    let (b_started_tx, mut b_started_rx) = tokio::sync::mpsc::unbounded_channel();
-    let b_server = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (stream, _) = b_listener.accept().await.unwrap();
-            let _ = b_started_tx.send(());
-            send_subscription(stream).await.unwrap();
-        }
-    });
-    let b = subscription(uuid::Uuid::new_v4(), "b", b_address, 1);
-    let mut candidate_b = cp.config_handle().read().await.as_ref().clone();
-    candidate_b.subscriptions = vec![b.clone()];
     assert!(
-        cp.apply_sighup_config(candidate_b, &DrainTracker::new(), &mut authorizations,)
+        cp.config_handle()
+            .read()
             .await
+            .nodes
+            .iter()
+            .all(|node| node.name != "stale")
     );
-    assert!(!authorizations.authorizes(a.id, a_revision));
-    let committed_b = cp.config_handle().read().await.subscriptions.clone();
-    let b_revision = authorizations.revision(b.id).unwrap();
 
-    let stale_node = Node {
-        name: "stale-a".into(),
-        subscription_id: Some(a.id),
+    server.await.unwrap();
+    assert_eq!(supervisor.shutdown().await, 0);
+}
+
+#[tokio::test]
+async fn applied_reload_with_dropped_supervisor_handoff_stops_dispatch() {
+    let mut cp = test_cp().await;
+    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
+    let subscription_id = uuid::Uuid::new_v4();
+    let mut candidate = cp.config_handle().read().await.as_ref().clone();
+    candidate.subscriptions = vec![honk_config::subscription::Subscription {
+        id: subscription_id,
+        name: "lost-handoff".into(),
+        url: "http://127.0.0.1:9".into(),
+        update_interval: 0,
+        ..Default::default()
+    }];
+    let (result, applied) = tokio::sync::oneshot::channel();
+    drop(applied);
+
+    assert!(
+        !cp.dispatch_control_command(
+            ControlCommand::ReloadConfig {
+                request_id: 2,
+                config: Box::new(candidate),
+                result,
+            },
+            &DrainTracker::new(),
+            &mut authorizations,
+        )
+        .await
+    );
+    assert!(authorizations.revision(subscription_id).is_some());
+}
+
+#[tokio::test]
+async fn runtime_reload_shortcut_rejects_subscription_worker_changes() {
+    let cp = test_cp().await;
+    let mut candidate = cp.config_handle().read().await.as_ref().clone();
+    candidate.subscriptions = vec![honk_config::subscription::Subscription {
+        id: uuid::Uuid::new_v4(),
+        name: "bypass".into(),
+        url: "http://127.0.0.1:9".into(),
+        update_interval: 0,
+        ..Default::default()
+    }];
+
+    assert!(!cp.reload_runtime_config(candidate).await);
+    assert!(cp.config_handle().read().await.subscriptions.is_empty());
+}
+
+#[test]
+fn subscription_revision_is_not_reused_after_remove_and_readd() {
+    let subscription = honk_config::subscription::Subscription {
+        id: uuid::Uuid::new_v4(),
+        name: "aba".into(),
         ..Default::default()
     };
-    assert!(
-        !cp.merge_authorized_subscription_nodes_with_drain(
-            a.id,
-            a_revision,
-            &authorizations,
-            vec![stale_node],
-            &DrainTracker::new(),
-        )
-        .await
+    let mut authorizations =
+        crate::subscription::SubscriptionAuthorizations::new(std::slice::from_ref(&subscription))
+            .unwrap();
+    let first_revision = authorizations.revision(subscription.id).unwrap();
+
+    authorizations.publish(std::slice::from_ref(&subscription), &[]);
+    authorizations.publish(&[], std::slice::from_ref(&subscription));
+
+    assert_ne!(
+        authorizations.revision(subscription.id).unwrap(),
+        first_revision
     );
-    supervisor_handle.reconcile(committed_b).await;
-
-    b_started_rx.recv().await.unwrap();
-    let first_b_nodes = match merge_rx.recv().await.unwrap() {
-        ControlCommand::MergeSubscription {
-            subscription_id,
-            revision,
-            nodes,
-            ..
-        } => {
-            assert_eq!(subscription_id, b.id);
-            assert_eq!(revision, b_revision);
-            nodes
-        }
-        command => panic!("unexpected command: {command:?}"),
-    };
-    assert!(
-        cp.merge_authorized_subscription_nodes_with_drain(
-            b.id,
-            b_revision,
-            &authorizations,
-            first_b_nodes,
-            &DrainTracker::new(),
-        )
-        .await
-    );
-
-    tokio::time::advance(Duration::from_secs(1)).await;
-    b_started_rx.recv().await.unwrap();
-    assert!(matches!(
-        merge_rx.recv().await,
-        Some(ControlCommand::MergeSubscription {
-            subscription_id,
-            revision,
-            ..
-        }) if subscription_id == b.id && revision == b_revision
-    ));
-
-    let _ = release_a_tx.send(());
-    a_server.await.unwrap();
-    b_server.await.unwrap();
-    tokio::task::yield_now().await;
-    assert!(merge_rx.try_recv().is_err());
-
-    let mut aba =
-        crate::subscription::SubscriptionAuthorizations::new(std::slice::from_ref(&a)).unwrap();
-    let first_a_revision = aba.revision(a.id).unwrap();
-    aba.publish(std::slice::from_ref(&a), &[]);
-    aba.publish(&[], std::slice::from_ref(&a));
-    assert_ne!(aba.revision(a.id).unwrap(), first_a_revision);
-    assert_eq!(supervisor.shutdown().await, 0);
 }
 
 #[tokio::test]

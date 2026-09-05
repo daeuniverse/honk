@@ -88,9 +88,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
-pub mod commands;
+mod commands;
 
-pub use commands::ControlCommand;
+pub(crate) use commands::ControlCommand;
 use connection::*;
 use probers::*;
 use reload::*;
@@ -310,7 +310,7 @@ impl ControlPlane {
         self.dns_controller.dns_service()
     }
 
-    pub fn command_sender(&self) -> mpsc::Sender<ControlCommand> {
+    pub(crate) fn command_sender(&self) -> mpsc::Sender<ControlCommand> {
         self.command_tx.clone()
     }
 

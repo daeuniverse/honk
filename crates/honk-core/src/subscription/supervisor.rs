@@ -11,7 +11,7 @@ use super::{SubscriptionManager, SubscriptionStore};
 use crate::control::ControlCommand;
 
 #[derive(Clone, Debug)]
-struct AuthorizedSubscription {
+pub(crate) struct AuthorizedSubscription {
     pub(crate) subscription: Subscription,
     pub(crate) revision: u64,
 }
@@ -25,6 +25,16 @@ fn same_worker_spec(left: &Subscription, right: &Subscription) -> bool {
         && left.user_agent == right.user_agent
         && left.headers == right.headers
         && left.enabled == right.enabled
+}
+
+pub(crate) fn same_subscription_worker_set(left: &[Subscription], right: &[Subscription]) -> bool {
+    // ponytail: subscription lists are tiny; index by UUID if config scale changes.
+    left.len() == right.len()
+        && left.iter().all(|subscription| {
+            right
+                .iter()
+                .any(|other| same_worker_spec(subscription, other))
+        })
 }
 
 #[derive(Debug)]
@@ -76,7 +86,7 @@ impl SubscriptionAuthorizations {
         self.active.get(&subscription_id).copied()
     }
 
-    fn committed(&self, subscriptions: &[Subscription]) -> Vec<AuthorizedSubscription> {
+    pub(crate) fn committed(&self, subscriptions: &[Subscription]) -> Vec<AuthorizedSubscription> {
         subscriptions
             .iter()
             .filter(|subscription| subscription.enabled)
@@ -156,8 +166,7 @@ struct SupervisorState {
     manager: Arc<SubscriptionManager>,
     store: Option<SubscriptionStore>,
     command_tx: mpsc::Sender<ControlCommand>,
-    authorizations: SubscriptionAuthorizations,
-    subscriptions: Vec<Subscription>,
+
     startup: JoinSet<FetchCompletion>,
     immediate: JoinSet<()>,
     periodic: HashMap<uuid::Uuid, PeriodicWorker>,
@@ -197,12 +206,7 @@ impl SupervisorState {
         });
     }
 
-    async fn reconcile(&mut self, subscriptions: Vec<Subscription>) {
-        self.authorizations
-            .publish(&self.subscriptions, &subscriptions);
-        let authorized_subscriptions = self.authorizations.committed(&subscriptions);
-        self.subscriptions = subscriptions;
-
+    async fn reconcile(&mut self, authorized_subscriptions: Vec<AuthorizedSubscription>) {
         self.startup.abort_all();
         while self.startup.join_next().await.is_some() {}
         self.immediate.abort_all();
@@ -268,8 +272,8 @@ impl SupervisorState {
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
-                    Some(SupervisorCommand::Reconcile { subscriptions, done }) => {
-                        self.reconcile(subscriptions).await;
+                    Some(SupervisorCommand::Reconcile { authorized, done }) => {
+                        self.reconcile(authorized).await;
                         let _ = done.send(());
                     }
                     Some(SupervisorCommand::Shutdown { done }) => {
@@ -295,7 +299,7 @@ impl SupervisorState {
 
 enum SupervisorCommand {
     Reconcile {
-        subscriptions: Vec<Subscription>,
+        authorized: Vec<AuthorizedSubscription>,
         done: oneshot::Sender<()>,
     },
     Shutdown {
@@ -309,19 +313,17 @@ pub(crate) struct SubscriptionSupervisorHandle {
 }
 
 impl SubscriptionSupervisorHandle {
-    pub(crate) async fn reconcile(&self, subscriptions: Vec<Subscription>) {
+    pub(crate) async fn reconcile(
+        &self,
+        authorized: Vec<AuthorizedSubscription>,
+    ) -> anyhow::Result<()> {
         let (done, wait) = oneshot::channel();
-        if self
-            .command_tx
-            .send(SupervisorCommand::Reconcile {
-                subscriptions,
-                done,
-            })
+        self.command_tx
+            .send(SupervisorCommand::Reconcile { authorized, done })
             .await
-            .is_ok()
-        {
-            let _ = wait.await;
-        }
+            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped before reconcile"))?;
+        wait.await
+            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped during reconcile"))
     }
 }
 
@@ -329,8 +331,6 @@ pub(crate) struct SubscriptionSupervisor {
     manager: Option<Arc<SubscriptionManager>>,
     store: Option<SubscriptionStore>,
     initial: Vec<AuthorizedSubscription>,
-    authorizations: Option<SubscriptionAuthorizations>,
-    subscriptions: Vec<Subscription>,
     startup: Option<JoinSet<FetchCompletion>>,
     command_tx: Option<mpsc::Sender<SupervisorCommand>>,
     task: Option<JoinHandle<()>>,
@@ -440,8 +440,6 @@ impl SubscriptionSupervisor {
             manager: Some(manager),
             store,
             initial,
-            authorizations: Some(authorizations),
-            subscriptions: config.subscriptions.clone(),
             startup: Some(startup),
             command_tx: None,
             task: None,
@@ -458,11 +456,6 @@ impl SubscriptionSupervisor {
             manager: self.manager.take().expect("subscription manager missing"),
             store: self.store.take(),
             command_tx: merge_tx,
-            authorizations: self
-                .authorizations
-                .take()
-                .expect("subscription authorizations missing"),
-            subscriptions: std::mem::take(&mut self.subscriptions),
             startup: self.startup.take().expect("startup tasks missing"),
             immediate: JoinSet::new(),
             periodic: HashMap::new(),

@@ -154,7 +154,7 @@ impl ControlPlane {
         &self,
         mut new_config: Config,
         drain: &DrainTracker,
-        mut authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
+        authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
     ) -> bool {
         if let Err(error) =
             crate::subscription::validate_subscription_ids(&new_config.subscriptions)
@@ -164,6 +164,15 @@ impl ControlPlane {
         }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
+        if authorizations.is_none()
+            && !crate::subscription::same_subscription_worker_set(
+                &current_config.subscriptions,
+                &new_config.subscriptions,
+            )
+        {
+            error!("reload rejected: subscription worker changes require the control command path");
+            return false;
+        }
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
         let current_dns_forwarder = self.dns_controller.forwarder();
         let current_dns_router = current_dns_forwarder.routing_snapshot();
@@ -598,7 +607,7 @@ impl ControlPlane {
                 publication.commit();
                 *router_guard = new_router;
                 *config_guard = Arc::new(new_config);
-                if let Some(authorizations) = authorizations.as_deref_mut() {
+                if let Some(authorizations) = authorizations {
                     authorizations
                         .publish(&current_config.subscriptions, &config_guard.subscriptions);
                 }

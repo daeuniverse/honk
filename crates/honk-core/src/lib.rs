@@ -75,6 +75,30 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
         .min(control::MAX_EFFECTIVE_NOFILE))
 }
 
+async fn request_runtime_reload(
+    reload_tx: &tokio::sync::mpsc::Sender<control::ControlCommand>,
+    subscription_supervisor: &subscription::SubscriptionSupervisorHandle,
+    request_id: u64,
+    config: Config,
+) -> anyhow::Result<()> {
+    let (result, applied) = tokio::sync::oneshot::channel();
+    reload_tx
+        .send(control::ControlCommand::ReloadConfig {
+            request_id,
+            config: Box::new(config),
+            result,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("command send failed: {error}"))?;
+    if let Some(authorized) = applied
+        .await
+        .map_err(|error| anyhow::anyhow!("result channel failed: {error}"))?
+    {
+        subscription_supervisor.reconcile(authorized).await?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "ebpf")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredInterfaces {
@@ -1197,33 +1221,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                     new_config.ensure_builtin_nodes();
                     new_config.ensure_local_direct_rules();
-                    let (result, applied) = tokio::sync::oneshot::channel();
-                    if let Err(error) = reload_tx
-                        .send(control::ControlCommand::ReloadConfig {
-                            request_id,
-                            config: Box::new(new_config),
-                            result,
-                        })
-                        .await
+                    if let Err(error) = request_runtime_reload(
+                        &reload_tx,
+                        &reload_subscription_supervisor,
+                        request_id,
+                        new_config,
+                    )
+                    .await
                     {
-                        warn!(
-                            "SIGHUP reload request {request_id} rejected: command send failed: {error}"
-                        );
+                        warn!("SIGHUP reload request {request_id} failed: {error}");
+                        let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
                         break;
-                    }
-                    match applied.await {
-                        Ok(Some(subscriptions)) => {
-                            reload_subscription_supervisor
-                                .reconcile(subscriptions)
-                                .await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!(
-                                "SIGHUP reload request {request_id} result channel failed: {error}"
-                            );
-                            break;
-                        }
                     }
                 }
                 Err(e) => {

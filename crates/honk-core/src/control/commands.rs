@@ -1,12 +1,14 @@
-use honk_config::{Config, node::Node, subscription::Subscription};
+use honk_config::{Config, node::Node};
+
+use crate::subscription::AuthorizedSubscription;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum ControlCommand {
+pub(crate) enum ControlCommand {
     ReloadConfig {
         request_id: u64,
         config: Box<Config>,
-        result: tokio::sync::oneshot::Sender<Option<Vec<Subscription>>>,
+        result: tokio::sync::oneshot::Sender<Option<Vec<AuthorizedSubscription>>>,
     },
     /// Merge freshly fetched subscription nodes into the running config,
     /// replacing the previous node set of that subscription. Used by

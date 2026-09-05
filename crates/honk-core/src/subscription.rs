@@ -19,7 +19,8 @@ use sha2::{Digest as _, Sha256};
 mod supervisor;
 
 pub(crate) use supervisor::{
-    SubscriptionAuthorizations, SubscriptionSupervisor, validate_subscription_ids,
+    AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
+    SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
 };
 
 /// reqwest DNS resolver backed by honk's bootstrap resolver
