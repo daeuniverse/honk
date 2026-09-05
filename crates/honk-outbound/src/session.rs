@@ -349,7 +349,7 @@ pub struct SessionPool<S: ManagedSession + 'static> {
     state: Arc<AtomicUsize>,
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
     capacity_notify: Arc<Notify>,
-    dial_admission: RwLock<crate::runtime::CapturedDialAdmission>,
+    dial_admission: RwLock<Option<crate::runtime::CapturedDialAdmission>>,
 }
 
 impl<S: ManagedSession + 'static> std::fmt::Debug for SessionPool<S> {
@@ -370,7 +370,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             state: Arc::new(AtomicUsize::new(PoolState::Running as usize)),
             shutdown_tx: Arc::new(shutdown_tx),
             capacity_notify: Arc::new(Notify::new()),
-            dial_admission: RwLock::new(crate::runtime::capture_dial_admission()),
+            dial_admission: RwLock::new(None),
         }
     }
 
@@ -992,7 +992,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 )
             };
             if current < min_idle {
-                let admission = self.dial_admission.read().clone();
+                let admission = self
+                    .dial_admission
+                    .read()
+                    .clone()
+                    .unwrap_or_else(crate::runtime::capture_dial_admission);
                 if let Ok(s) = admission
                     .scope(self.offer({
                         let prewarm = prewarm.clone();
@@ -1007,7 +1011,20 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     }
 
     pub(crate) fn set_dial_admission(&self, admission: crate::runtime::CapturedDialAdmission) {
-        *self.dial_admission.write() = admission;
+        let mut current = self.dial_admission.write();
+        if self.state() == PoolState::Running {
+            *current = Some(admission);
+        }
+    }
+
+    pub(crate) fn bind_current_dial_admission_if_unbound(&self) {
+        let Some(admission) = crate::runtime::try_capture_dial_admission() else {
+            return;
+        };
+        let mut current = self.dial_admission.write();
+        if self.state() == PoolState::Running && current.is_none() {
+            *current = Some(admission);
+        }
     }
 
     #[cfg(test)]
@@ -1015,7 +1032,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         &self,
         registry: &crate::runtime::OutboundRuntimeRegistry,
     ) -> bool {
-        self.dial_admission.read().matches_registry(registry)
+        self.dial_admission
+            .read()
+            .as_ref()
+            .is_some_and(|admission| admission.matches_registry(registry))
     }
 
     /// Start the pool janitor (prune closed/expired, prewarm to the explicit
@@ -1034,9 +1054,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         if self.state() != PoolState::Running {
             return;
         }
-        if let Some(admission) = crate::runtime::try_capture_dial_admission() {
-            self.set_dial_admission(admission);
-        }
+        self.bind_current_dial_admission_if_unbound();
         {
             let mut pool = self.pool.lock();
             if self.state() != PoolState::Running {
@@ -1070,6 +1088,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         {
             return;
         }
+        self.dial_admission.write().take();
         let _ = self.shutdown_tx.send(true);
         // Dials and janitors observe this signal. A late dial verifies the
         // terminal state under the registration lock before publication.
@@ -1154,6 +1173,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
             }
         }
+        self.dial_admission.write().take();
         let _ = self.shutdown_tx.send(true);
         // Dials and janitors observe the terminal signal; terminal
         // registration checks close late dial results safely.

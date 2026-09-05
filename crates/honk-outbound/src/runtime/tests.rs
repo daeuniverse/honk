@@ -174,8 +174,7 @@ async fn warm_resources_report_session_state_only() {
     let trojan = node("trojan", NodeProtocol::Trojan);
     let tuic = node("tuic", NodeProtocol::Tuic);
     let registry =
-        OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone(), tuic.clone()])
-            .unwrap();
+        OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone(), tuic.clone()]).unwrap();
 
     let anytls_runtime = registry.get(&anytls.id).unwrap();
     let tuic_runtime = registry.get(&tuic.id).unwrap();
@@ -253,8 +252,7 @@ async fn overlapping_generations_share_the_startup_dial_ceiling() {
     }
 
     let (second, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, Some(&first))
-            .unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, Some(&first)).unwrap();
     assert_eq!(second.dial_limit(), 4);
     held.push(second.acquire_dial_permit().await);
     assert!(
@@ -375,8 +373,7 @@ async fn overlapping_generations_bound_physical_address_attempts() {
     let (first, _) =
         OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, None).unwrap();
     let (second, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, Some(&first))
-            .unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, Some(&first)).unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let run = |generation: Arc<OutboundRuntimeRegistry>| {
@@ -454,12 +451,9 @@ fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
 async fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
     let unchanged = node("anytls", NodeProtocol::AnyTLS);
     let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
-    let (second, _) = OutboundRuntimeRegistry::build_reusing(
-        std::slice::from_ref(&unchanged),
-        64,
-        Some(&first),
-    )
-    .unwrap();
+    let (second, _) =
+        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&unchanged), 64, Some(&first))
+            .unwrap();
 
     // A build alone transfers nothing: the old generation still closes
     // the runtime if the reload aborts before the commit point.
@@ -475,12 +469,9 @@ async fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
     // Committed transfer: the old generation skips the moved runtime;
     // the new generation closes it as its full owner.
     let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
-    let (second, reused) = OutboundRuntimeRegistry::build_reusing(
-        std::slice::from_ref(&unchanged),
-        64,
-        Some(&first),
-    )
-    .unwrap();
+    let (second, reused) =
+        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&unchanged), 64, Some(&first))
+            .unwrap();
     first.mark_moved_out(reused);
     first.drain_session_pools();
     first.shutdown().await;
@@ -537,12 +528,9 @@ fn vless_mux_runtime_reuse_is_mode_exact() {
 
     let mut changed = node.clone();
     changed.vless_mut().unwrap().mode = WireMode::H2mux;
-    let (changed_registry, reused) = OutboundRuntimeRegistry::build_reusing(
-        std::slice::from_ref(&changed),
-        64,
-        Some(&first),
-    )
-    .unwrap();
+    let (changed_registry, reused) =
+        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&changed), 64, Some(&first))
+            .unwrap();
     assert!(reused.is_empty());
     assert!(!Arc::ptr_eq(
         &first.get(&node.id).unwrap(),
@@ -562,12 +550,9 @@ fn build_reusing_ignores_parse_timestamps() {
     let mut reparsed = parsed.clone();
     reparsed.created_at = chrono::Utc::now();
     reparsed.updated_at = chrono::Utc::now();
-    let (second, _) = OutboundRuntimeRegistry::build_reusing(
-        std::slice::from_ref(&reparsed),
-        64,
-        Some(&first),
-    )
-    .unwrap();
+    let (second, _) =
+        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&reparsed), 64, Some(&first))
+            .unwrap();
     assert!(Arc::ptr_eq(
         &first.get(&parsed.id).unwrap(),
         &second.get(&parsed.id).unwrap()
@@ -678,9 +663,7 @@ async fn quic_runtime_close_covers_client_and_rejects_new_builds() {
     assert!(client.force_closed.load(Ordering::Acquire));
     assert!(
         runtime
-            .client::<FakeQuicClient, _, _>(|| async {
-                Ok(Arc::new(FakeQuicClient::default()))
-            })
+            .client::<FakeQuicClient, _, _>(|| async { Ok(Arc::new(FakeQuicClient::default())) })
             .await
             .is_err(),
         "a closed QUIC runtime rejects new client builds"

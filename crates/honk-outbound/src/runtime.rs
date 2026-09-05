@@ -920,9 +920,7 @@ impl CapturedDialAdmission {
     where
         F: Future,
     {
-        DIAL_SCOPE
-            .scope(DialScope::new(self.0, None), future)
-            .await
+        DIAL_SCOPE.scope(DialScope::new(self.0, None), future).await
     }
 
     #[cfg(test)]
@@ -1168,6 +1166,19 @@ impl OutboundRuntimeRegistry {
     /// Configured admission ceiling for this immutable generation.
     pub fn dial_limit(&self) -> usize {
         self.dial_limit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dial_gate_weak_refs(
+        &self,
+    ) -> (
+        std::sync::Weak<tokio::sync::Semaphore>,
+        std::sync::Weak<tokio::sync::Semaphore>,
+    ) {
+        (
+            Arc::downgrade(&self.dial_semaphore),
+            Arc::downgrade(&self.dial_ceiling_semaphore),
+        )
     }
 
     /// Acquire generation-local admission before the shared process gate so

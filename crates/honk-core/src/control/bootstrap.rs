@@ -128,6 +128,7 @@ impl ControlPlane {
                 None,
             )
             .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
+        runtime_registry.activate_background_dial_admission();
         let runtime_registry = runtime_registry.into_shared();
         info!(
             nofile = resource_budget.effective_nofile,

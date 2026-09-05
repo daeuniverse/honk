@@ -599,10 +599,8 @@ impl ControlPlane {
                 *router_guard = new_router;
                 *config_guard = Arc::new(new_config);
                 if let Some(authorizations) = authorizations.as_deref_mut() {
-                    authorizations.publish(
-                        &current_config.subscriptions,
-                        &config_guard.subscriptions,
-                    );
+                    authorizations
+                        .publish(&current_config.subscriptions, &config_guard.subscriptions);
                 }
                 *group_guard = Arc::clone(&new_group_manager);
                 *outbound_guard = new_outbound_id_map;
