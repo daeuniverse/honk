@@ -176,6 +176,14 @@ where
     result
 }
 
+/// Start the current scoped logical dial, if it has not started already.
+///
+/// Reused sessions and QUIC connections have no new physical admission to
+/// trigger the callback before their logical open can block.
+pub(crate) fn start_scoped_dial() {
+    let _ = DIAL_SCOPE.try_with(|scope| scope.start());
+}
+
 impl OutboundRuntimeRegistry {
     /// Configured admission ceiling for this immutable generation.
     pub fn dial_limit(&self) -> usize {
@@ -208,8 +216,9 @@ impl OutboundRuntimeRegistry {
             .await
     }
 
-    /// As [`Self::scope_dials`], starting feedback at the first admitted
-    /// physical attempt. A warm logical dial starts feedback on completion.
+    /// Start at the first admitted physical attempt or at the first logical
+    /// open on reused state; completed paths without either boundary retain
+    /// the historical completion fallback.
     pub async fn scope_dials_with_start<F, C>(&self, future: F, on_start: C) -> F::Output
     where
         F: Future,

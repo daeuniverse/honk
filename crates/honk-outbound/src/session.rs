@@ -856,6 +856,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 continue;
             };
             let permit = permit.with_capacity_notify(Arc::clone(&self.capacity_notify));
+            // A shared session is already physically admitted; time the
+            // logical open before protocol negotiation can block or cancel.
+            // A cold offer has already fired this one-shot hook on admission.
+            crate::runtime::start_scoped_dial();
             match open(Arc::clone(&session), permit).await {
                 Ok(t) => return Ok(t),
                 Err(OpenError::Refused(e)) => return Err(e),

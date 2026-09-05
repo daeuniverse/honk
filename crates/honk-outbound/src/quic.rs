@@ -2359,10 +2359,17 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         if let Some((conn, ctx)) = &state.conn
             && conn.close_reason().is_none()
         {
-            if state.metrics_enabled {
-                on_publish(ctx.as_ref(), conn);
+            let conn = conn.clone();
+            let ctx = Arc::clone(ctx);
+            let metrics_enabled = state.metrics_enabled;
+            drop(state);
+            // The QUIC connection is already admitted and reusable; time the
+            // logical stream before its protocol open can block or cancel.
+            crate::runtime::start_scoped_dial();
+            if metrics_enabled {
+                on_publish(ctx.as_ref(), &conn);
             }
-            return Ok((conn.clone(), Arc::clone(ctx)));
+            return Ok((conn, ctx));
         }
         state.conn = None;
 

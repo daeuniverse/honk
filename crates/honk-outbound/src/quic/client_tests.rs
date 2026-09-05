@@ -112,6 +112,108 @@ async fn test_client(port: u16) -> QuicClient<()> {
     QuicClient::new("127.0.0.1", port, "localhost", config)
 }
 
+#[derive(Debug, Default)]
+struct TestConnState {
+    open: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl QuicConnState for TestConnState {
+    fn touch(&self) {}
+
+    fn open_counter(&self) -> &Arc<std::sync::atomic::AtomicUsize> {
+        &self.open
+    }
+
+    fn enable_telemetry(&self) {}
+}
+
+async fn test_client_state(port: u16) -> QuicClient<TestConnState> {
+    let mut node = skip_verify_node();
+    node.name = "quic-warm-start".to_string();
+    node.host = "127.0.0.1".to_string();
+    node.address = format!("127.0.0.1:{port}");
+    node.port = port;
+    let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
+        .await
+        .unwrap();
+    QuicClient::new("127.0.0.1", port, "localhost", config)
+}
+
+#[tokio::test]
+async fn warm_quic_starts_feedback_before_blocked_stream_open() {
+    let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let accepted = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move { endpoint.accept().await.unwrap().await.unwrap() }
+    });
+    let client = Arc::new(test_client_state(addr.port()).await);
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+            .unwrap()
+            .0,
+    );
+    generation
+        .scope_dials(client.connection_with(Duration::from_secs(1), |_| async {
+            Ok::<_, anyhow::Error>(TestConnState::default())
+        }))
+        .await
+        .unwrap();
+    let server = accepted.await.unwrap();
+
+    let feedback_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let open_entered = Arc::new(tokio::sync::Notify::new());
+    let release_open = Arc::new(tokio::sync::Notify::new());
+    let task = {
+        let client = Arc::clone(&client);
+        let generation = Arc::clone(&generation);
+        let feedback_started = Arc::clone(&feedback_started);
+        let open_entered = Arc::clone(&open_entered);
+        let release_open = Arc::clone(&release_open);
+        tokio::spawn(async move {
+            generation
+                .scope_dials_with_start(
+                    dial_quic_stream(
+                        &client,
+                        |timeout| {
+                            let client = Arc::clone(&client);
+                            async move {
+                                client
+                                    .connection_with(timeout, |_| async {
+                                        Ok::<_, anyhow::Error>(TestConnState::default())
+                                    })
+                                    .await
+                            }
+                        },
+                        Duration::from_secs(1),
+                        move |_conn| {
+                            let open_entered = Arc::clone(&open_entered);
+                            let release_open = Arc::clone(&release_open);
+                            async move {
+                                open_entered.notify_one();
+                                release_open.notified().await;
+                                Err(anyhow::anyhow!("released test stream open"))
+                            }
+                        },
+                        |_| false,
+                        "test",
+                    ),
+                    move || feedback_started.store(true, Ordering::Release),
+                )
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), open_entered.notified())
+        .await
+        .expect("warm QUIC stream open did not start");
+    assert!(feedback_started.load(Ordering::Acquire));
+    release_open.notify_one();
+    assert!(task.await.unwrap().is_err());
+    client.force_close().await;
+    drop(server);
+    endpoint.close(VarInt::from_u32(0), b"test complete");
+}
+
 fn spawn_accept_loop(endpoint: Endpoint) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
