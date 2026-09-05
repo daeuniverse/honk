@@ -16,7 +16,7 @@ pub struct GeositeArgs {
     #[command(subcommand)]
     action: GeositeAction,
     /// Path to geosite.dat (default: $DAE_LOCATION_ASSET, then
-    /// /var/share/honk/geosite.dat, ./geosite.dat, and dae asset locations).
+    /// /var/share/honk/geosite.dat, ./geosite.dat, honk share directories, then dae asset locations).
     #[arg(long, global = true)]
     pub file: Option<PathBuf>,
 }
@@ -43,7 +43,7 @@ pub struct GeoipArgs {
     #[command(subcommand)]
     action: GeoipAction,
     /// Path to geoip.dat (default: $DAE_LOCATION_ASSET, then
-    /// /var/share/honk/geoip.dat, ./geoip.dat, and dae asset locations).
+    /// /var/share/honk/geoip.dat, ./geoip.dat, honk share directories, then dae asset locations).
     #[arg(long, global = true)]
     pub file: Option<PathBuf>,
 }
@@ -112,6 +112,7 @@ fn resolve_dat(
     find().ok_or_else(|| {
         anyhow::anyhow!(
             "{name} not found (tried $DAE_LOCATION_ASSET, /var/share/honk/{name}, ./{name}, \
+             /usr/local/share/honk, /usr/share/honk, \
              /usr/local/share/dae, /usr/share/dae, /etc/dae) — pass --file PATH"
         )
     })

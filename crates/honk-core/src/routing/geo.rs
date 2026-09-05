@@ -98,8 +98,8 @@ pub(crate) struct GeoSourceSet {
 
 impl GeoSourceSet {
     pub(crate) fn load(requirements: &GeoRequirements) -> Self {
-        let geosite = capture_source(!requirements.geosite_codes.is_empty(), find_geosite_dat);
-        let geoip = capture_source(!requirements.geoip_codes.is_empty(), find_geoip_dat);
+        let geosite = capture_source(!requirements.geosite_codes.is_empty(), "geosite.dat");
+        let geoip = capture_source(!requirements.geoip_codes.is_empty(), "geoip.dat");
         Self::from_sources(geosite, geoip)
     }
 
@@ -143,11 +143,15 @@ impl GeoSourceSet {
     }
 }
 
-fn capture_source(required: bool, find: fn() -> Option<std::path::PathBuf>) -> GeoSource {
+fn capture_source(required: bool, name: &str) -> GeoSource {
     if !required {
         return GeoSource::Unused;
     }
-    let Some(path) = find() else {
+    let Some(path) = find_dat(name) else {
+        tracing::warn!(
+            asset = name,
+            "required geo asset not found; dependent geo matchers are unavailable"
+        );
         return GeoSource::Missing;
     };
     match std::fs::read(&path) {
@@ -398,7 +402,7 @@ fn load_geosite_index(
 
 /// Locate geosite.dat for tooling queries (`honk-tool geosite`): an explicit
 /// `--file` path wins at the call site; otherwise the runtime data directory
-/// precedes dae's legacy asset locations.
+/// precedes the working directory, honk's share directories, and dae's legacy locations.
 pub fn find_geosite_dat() -> Option<std::path::PathBuf> {
     find_dat("geosite.dat")
 }
@@ -414,7 +418,14 @@ fn find_dat(name: &str) -> Option<std::path::PathBuf> {
     if data_path.is_file() {
         return Some(data_path);
     }
-    for directory in [".", "/usr/local/share/dae", "/usr/share/dae", "/etc/dae"] {
+    for directory in [
+        ".",
+        "/usr/local/share/honk",
+        "/usr/share/honk",
+        "/usr/local/share/dae",
+        "/usr/share/dae",
+        "/etc/dae",
+    ] {
         let path = std::path::Path::new(directory).join(name);
         if path.is_file() {
             return Some(path);
@@ -1060,6 +1071,27 @@ fn split_geoip_entry(data: &[u8]) -> anyhow::Result<(Option<String>, Vec<&[u8]>)
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[test]
+    fn missing_geo_asset_warns_only_when_required() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(output.reopen().unwrap()))
+            .finish();
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-geosite.dat");
+        let name = missing.to_str().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(matches!(capture_source(false, name), GeoSource::Unused));
+            assert_eq!(output.as_file().metadata().unwrap().len(), 0);
+            assert!(matches!(capture_source(true, name), GeoSource::Missing));
+        });
+        let output = std::fs::read_to_string(output.path()).unwrap();
+        assert!(output.contains("WARN"));
+        assert!(output.contains(name));
+    }
 
     fn push_varint(mut v: u64, out: &mut Vec<u8>) {
         loop {

@@ -76,7 +76,8 @@ Direct, block, `must`, and other reserved handoffs remain final and keep the ori
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
 3. `./<name>` in the process working directory
-4. `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`
+4. `/usr/local/share/honk/<name>`, then `/usr/share/honk/<name>`
+5. `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`
 
 Other relative runtime paths preserve legacy installations as follows:
 

@@ -66,11 +66,15 @@ Appending `(must)` gives Go dae-compatible must semantics. A matching must rule 
 | 1 | `$DAE_LOCATION_ASSET/<file>` |
 | 2 | `global.data_dir/<file>` |
 | 3 | `./<file>` in the process working directory |
-| 4 | `/usr/local/share/dae/<file>` |
-| 5 | `/usr/share/dae/<file>` |
-| 6 | `/etc/dae/<file>` |
+| 4 | `/usr/local/share/honk/<file>` |
+| 5 | `/usr/share/honk/<file>` |
+| 6 | `/usr/local/share/dae/<file>` |
+| 7 | `/usr/share/dae/<file>` |
+| 8 | `/etc/dae/<file>` |
 
 See the [global reference](./global.md) for runtime asset resolution. `geoip: private` uses a built-in CIDR set and does not require `geoip.dat`.
+
+When a referenced geo asset cannot be found, the engine logs a warning naming the missing file. Unused assets do not produce missing-file warnings.
 
 A geosite code may select an attribute with `category@attr`. Attribute keys compare case-insensitively. Everything after the first `@` is the selector, including any later `@`. An unknown category or a selector matching no entries logs a warning, expands to zero matchers, and never matches.
 

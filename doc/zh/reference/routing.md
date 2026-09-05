@@ -66,11 +66,15 @@ routing {
 | 1 | `$DAE_LOCATION_ASSET/<file>` |
 | 2 | `global.data_dir/<file>` |
 | 3 | 进程工作目录中的 `./<file>` |
-| 4 | `/usr/local/share/dae/<file>` |
-| 5 | `/usr/share/dae/<file>` |
-| 6 | `/etc/dae/<file>` |
+| 4 | `/usr/local/share/honk/<file>` |
+| 5 | `/usr/share/honk/<file>` |
+| 6 | `/usr/local/share/dae/<file>` |
+| 7 | `/usr/share/dae/<file>` |
+| 8 | `/etc/dae/<file>` |
 
 运行时资源解析规则见[全局参考](./global.md)。`geoip: private` 使用内建 CIDR 集，不需要 `geoip.dat`。
+
+找不到被引用的 Geo 资源时，引擎会记录包含缺失文件名的警告。未使用的资源不会触发缺失文件警告。
 
 geosite 代码可以用 `category@attr` 选择属性。属性名按大小写不敏感方式比较。第一个 `@` 后的全部内容都是选择器，包括后续的 `@`。未知类目或没有条目命中的选择器会记录告警、展开为零个 matcher，并且永不匹配。
 

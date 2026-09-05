@@ -76,7 +76,8 @@
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
 3. 进程工作目录中的 `./<name>`
-4. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然后 `/etc/dae/<name>`
+4. `/usr/local/share/honk/<name>`，然后 `/usr/share/honk/<name>`
+5. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然后 `/etc/dae/<name>`
 
 其他相对运行时路径按下表保留旧安装：
 
