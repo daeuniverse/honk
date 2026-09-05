@@ -761,8 +761,9 @@ fn reset_corrupt(path: &Path) {
     }
 }
 
-/// Resolve a cache path. Relative paths prefer the runtime data directory,
-/// then an existing path under the legacy configuration directory.
+/// Resolve a cache path. Relative paths prefer the configured data directory,
+/// then the previous default data directory, then an existing path under the
+/// legacy configuration directory.
 fn resolve_path(path: &str, legacy_config_dir: Option<&Path>) -> PathBuf {
     let configured = if path.is_empty() { "cache.db" } else { path };
     let configured_path = Path::new(configured);
@@ -790,14 +791,6 @@ mod tests {
             store_fakeip: false,
             store_dns: false,
         }
-    }
-
-    #[test]
-    fn relative_cache_path_uses_the_data_directory() {
-        assert_eq!(
-            resolve_path("cache.db", None),
-            PathBuf::from("/var/share/honk/cache.db")
-        );
     }
 
     #[test]

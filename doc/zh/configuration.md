@@ -42,7 +42,7 @@ include {
 
 ## 运行时数据目录
 
-`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。启动时 honk 会递归创建目录，再以 create-new 方式创建并删除一个私有随机探测文件，且不跟随探测文件的符号链接。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者均不可用时启动失败并保留两项原因。相对的 `global.log_file`、`experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在实际生效的目录下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查实际生效的数据目录、工作目录与 dae 标准资源目录。
+`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/lib/honk`，必须是非空绝对路径，修改后需重启。启动时 honk 会递归创建目录，并以私有 create-new/remove 文件执行探测；候选目录不可用时，只有通过同一探测的工作目录才能作为回退。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源可继续使用，不会自动迁移；复用的可写状态仍会在原位置更新。对于相对可写资源和只读依赖，honk 依次检查已有的 `<data_dir>/<path>`、已有的 `/var/share/honk/<path>`，再检查调用方已有的旧候选路径（缓存使用原始配置目录，其他依赖使用工作目录）；都不存在时返回 `<data_dir>/<path>` 用于创建。相对日志仅用于创建，始终使用 `<data_dir>/<path>`；绝对路径保持原样。Geo 资源独立按普通文件查找：`$DAE_LOCATION_ASSET`、`<data_dir>`、`/var/share/honk`、工作目录、honk share 目录，最后是 dae share 目录。
 
 详见 [Global 参考](./reference/global.md)。
 
@@ -122,7 +122,7 @@ global {
     log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     bootstrap_resolver: '1.1.1.1:53'
     store_subscribe: true
 }
@@ -253,15 +253,15 @@ dns {
 
 ## 订阅
 
-每个来源可写作 `tag: 'url'`，在带引号的 URL 后追加 `(UA)` 可指定该订阅的 User-Agent；需要同时指定刷新周期时使用 `tag: { url, ua, interval }`。`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。请求默认使用 `honk/<version>`，可由 `ua` 覆盖；缓存 key 包含配置中的覆盖值，因此不同请求身份会使用不同的已存正文。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
+每个来源可写作 `tag: 'url'`，在带引号的 URL 后追加 `(UA)` 可指定该订阅的 User-Agent；需要同时指定刷新周期时使用 `tag: { url, ua, interval }`。`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `<data_dir>/.sub`；如果首选存储不存在，则继续使用已有的 `/var/share/honk/.sub`，再使用已有的 `./.sub`。不会自动移动或删除存储。请求默认使用 `honk/<version>`，可由 `ua` 覆盖；缓存 key 包含配置中的覆盖值，因此不同请求身份会使用不同的已存正文。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于 runtime。修改 `store_subscribe` 后需重启。
 
 详见 [订阅参考](./reference/subscription.md)。
 
 ## 启用 Clash API、缓存文件与首包保留 UDP
 
-**Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 通过 `data_dir` 解析，缺失时可在后台下载。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
+**Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
 
-**缓存文件。** 设置 `experimental.cache_file.enabled: true` 可持久化 Selector 选择与 Clash 模式；`store_dns: true` 还会持久化符合条件的 DNS 应答。相对 `path` 使用 `data_dir`，并遵循前述旧路径规则。
+**缓存文件。** 设置 `experimental.cache_file.enabled: true` 可持久化 Selector 选择与 Clash 模式；`store_dns: true` 还会持久化符合条件的 DNS 应答。相对 `path` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和原始配置目录中的已有文件；缺失数据库在 `data_dir` 下创建。
 
 **首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。若使用 mock eBPF、不带 `ebpf` 的构建，或固定队列前置检查失败，honk 会记录 warning，仅在本进程关闭 NFQUEUE，不会改写配置文件。真实实例取得锁后，启动会绑定队列 `320`，并在发布 `inet honk_nfqueue` / `udp_decision` 前回收残留的自有 nftables table；honk 运行期间，防火墙管理器不得修改这些保留对象。
 

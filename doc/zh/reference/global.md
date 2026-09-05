@@ -19,7 +19,7 @@
 | `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。 |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此向每个已解析的 WAN 接口（含运行期晚挂载的）写入 `net.ipv6.conf.<wan>.accept_ra=2`，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录；修改后需重启。 |
+| `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。修改后需重启。 |
 | `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。当前健康检查循环使用第一个值；空列表退回普通 TCP 检查。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
@@ -69,24 +69,26 @@
 
 ## 数据目录与资源路径
 
-`data_dir` 默认为 `/var/share/honk`，必须是非空绝对路径，并在进程内只设置一次。启动时 honk 会递归创建目录，并以私有随机文件执行 create-new/remove 探测。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者都不可用时，启动失败并报告两项原因。子项使用绝对路径时保持不变。
+`data_dir` 默认为 `/var/lib/honk`，必须是非空绝对路径，并在进程内只设置一次。启动时 honk 会递归创建目录，并以私有随机文件执行 create-new/remove 探测。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者都不可用时，启动失败并报告两项原因。旧根目录是 `/var/share/honk`（`LEGACY_DATA_DIR`），用于复用已有资源，不会自动迁移。复用的可写缓存和订阅存储仍会在原位置正常更新。即使使用自定义 `data_dir`，也遵循相同的回退顺序。子项使用绝对路径时保持不变。
 
-`geoip.dat` 和 `geosite.dat` 严格使用以下顺序中第一个存在的文件：
+`geoip.dat` 和 `geosite.dat` 严格使用以下顺序中第一个已存在的普通文件：
 
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
-3. 进程工作目录中的 `./<name>`
-4. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然后 `/etc/dae/<name>`
+3. `/var/share/honk/<name>`（`LEGACY_DATA_DIR`）
+4. 进程工作目录中的 `./<name>`
+5. `/usr/local/share/honk/<name>`，然后 `/usr/share/honk/<name>`
+6. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然后 `/etc/dae/<name>`
 
-其他相对运行时路径按下表保留旧安装：
+其他相对运行时路径按下表保留旧安装。除日志外，每次查找先检查实际生效数据目录中已有的副本，再检查 `/var/share/honk` 中已有的副本，最后检查各调用方的已有旧候选路径。都不存在时，返回 `data_dir` 下的路径用于创建；绝对路径保持原样。
 
 | 路径 | 解析与旧路径回退 |
 | ---- | ---------------- |
-| 节点 `ech_config_path` | 优先使用已存在的 `<data_dir>/<path>`，其次使用已存在的工作目录相对路径。两者都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
-| `global.log_file` | 相对路径解析为 `<data_dir>/<path>`，启动时创建父目录；绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。 |
-| `experimental.cache_file.path` | 优先使用已存在的 `<data_dir>/<path>`，其次使用相对于原始配置目录且已存在的路径。新数据库在 `data_dir` 下创建。 |
-| `experimental.clash_api.external_ui` | 优先使用已存在的 `<data_dir>/<path>`，其次使用已存在的工作目录相对目录。两者都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
-| 订阅存储 | 使用 `<data_dir>/.sub`；已有旧 `./.sub` 会继续使用，直至迁移。 |
+| 节点 `ech_config_path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对路径。都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
+| `global.log_file` | 相对路径始终通过仅用于创建的路径 helper 解析为 `<data_dir>/<path>`，启动时创建父目录；不会读取或迁移 `/var/share/honk` 中已有的日志。绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。 |
+| `experimental.cache_file.path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及相对于原始配置目录且已存在的路径。新数据库在 `data_dir` 下创建。 |
+| `experimental.clash_api.external_ui` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对目录。都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
+| 订阅存储 | 依次优先使用已存在的 `<data_dir>/.sub`、已存在的 `/var/share/honk/.sub`，以及已存在的 `./.sub`。都不存在时创建 `<data_dir>/.sub`；不会自动移动或删除存储。 |
 
 ## 预热与拨号预算
 
@@ -103,7 +105,7 @@ global {
     tproxy_port: 12345
     log_level: info
     log_file: 'honk.log'
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     store_subscribe: true
     nfqueue_enable: true
 

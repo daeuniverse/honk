@@ -19,7 +19,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. That setup pins `net.ipv6.conf.all.forwarding=1` and therefore also writes `net.ipv6.conf.<wan>.accept_ra=2` on every resolved WAN interface (including late-attached ones), so an SLAAC/RA-learned IPv6 default route survives the forwarding pin. Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in the WAN `.network` file. |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | Hold ambiguous LAN-forwarded UDP originals in NFQUEUE until userspace reaches a terminal decision. The setting requires the real eBPF backend; after the singleton instance handoff, an unavailable fixed queue or a pre-admission queue/rules/health failure logs a warning and disables it for the process without rewriting the config. Persistent token-generation recovery failures remain fatal. Installation reclaims the reserved nftables table. Changing it requires restart. New configurations should use this key; the deprecated `experimental.udp_nfqueue.enabled` spelling is accepted with a migration warning, but this canonical key wins when both are present. |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively; each candidate must pass a private create-new/remove probe. An unusable candidate falls back to the equally probed working directory. A change requires restart. |
+| `data_dir` | `data_dir` | `"/var/lib/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively; each candidate must pass a private create-new/remove probe. An unusable candidate falls back to the equally probed working directory. Existing artifacts under the legacy `/var/share/honk` (`LEGACY_DATA_DIR`) root remain usable through the path-specific fallback rules below; honk does not automatically relocate them; writable state remains active in place. A change requires restart. |
 | `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `data_dir/.sub` for startup and reload recovery. A change requires restart. |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The current health loop uses the first value; an empty list falls back to a plain TCP check. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method sent by the URL health check. An empty value is treated as `HEAD`. |
@@ -69,24 +69,26 @@ Direct, block, `must`, and other reserved handoffs remain final and keep the ori
 
 ## Data directory and asset paths
 
-`data_dir` defaults to `/var/share/honk`, must be an absolute non-empty path, and is installed once for the process. At startup honk recursively creates it and verifies it with a private random create-new/remove probe. An unusable candidate falls back only to a process working directory that passes the same probe; startup fails and reports both causes when neither is usable. Absolute child paths remain unchanged.
+`data_dir` defaults to `/var/lib/honk`, must be an absolute non-empty path, and is installed once for the process. At startup honk recursively creates it and verifies it with a private random create-new/remove probe. An unusable candidate falls back only to a process working directory that passes the same probe; startup fails and reports both causes when neither is usable. The legacy root is `/var/share/honk` (`LEGACY_DATA_DIR`), used to retain existing artifacts without automatic migration. Reused writable caches and subscription stores continue to be updated in place. For a custom `data_dir`, the same fallback order applies. Absolute child paths remain unchanged.
 
-`geoip.dat` and `geosite.dat` use the first existing file in this exact order:
+`geoip.dat` and `geosite.dat` use the first existing regular file in this exact order:
 
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
-3. `./<name>` in the process working directory
-4. `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`
+3. `/var/share/honk/<name>` (`LEGACY_DATA_DIR`)
+4. `./<name>` in the process working directory
+5. `/usr/local/share/honk/<name>`, then `/usr/share/honk/<name>`
+6. `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`
 
-Other relative runtime paths preserve legacy installations as follows:
+Other relative runtime paths preserve legacy installations as follows. Except for logs, each lookup checks the existing configured-data-directory copy first, then an existing `/var/share/honk` copy, then the existing per-caller legacy candidate. If none exists, the path below `data_dir` is returned for creation. Absolute paths remain explicit.
 
 | Path | Resolution and legacy fallback |
 | ---- | ------------------------------ |
-| Node `ech_config_path` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative path. If neither exists, resolve to `<data_dir>/<path>` so the read error names the intended location. |
-| `global.log_file` | Relative paths resolve to `<data_dir>/<path>`; parent directories are created at startup. Absolute paths remain explicit. On Linux, new logs are mode `0600`; symlinks and non-regular destinations are rejected, while permissions on an existing regular file are preserved. honk appends without rotation; use the platform log-rotation facility when needed. |
-| `experimental.cache_file.path` | Prefer an existing `<data_dir>/<path>`, then an existing path relative to the original configuration directory. New databases are created below `data_dir`. |
-| `experimental.clash_api.external_ui` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative directory. If neither exists, use `<data_dir>/<path>` for the dashboard download. |
-| Subscription store | Use `<data_dir>/.sub`; retain an existing legacy `./.sub` until it is moved. |
+| Node `ech_config_path` | Prefer an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then an existing working-directory-relative path. If none exists, resolve to `<data_dir>/<path>` so the read error names the intended location. |
+| `global.log_file` | Relative paths always resolve to `<data_dir>/<path>` via the creation-only path helper; parent directories are created at startup. Existing `/var/share/honk` logs are not read or migrated. Absolute paths remain explicit. On Linux, new logs are mode `0600`; symlinks and non-regular destinations are rejected, while permissions on an existing regular file are preserved. honk appends without rotation; use the platform log-rotation facility when needed. |
+| `experimental.cache_file.path` | Prefer an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then an existing path relative to the original configuration directory. New databases are created below `data_dir`. |
+| `experimental.clash_api.external_ui` | Prefer an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then an existing working-directory-relative directory. If none exists, use `<data_dir>/<path>` for the dashboard download. |
+| Subscription store | Prefer an existing `<data_dir>/.sub`, then an existing `/var/share/honk/.sub`, then an existing `./.sub`. If none exists, create `<data_dir>/.sub`; no store is moved or deleted automatically. |
 
 ## Warm-up and dial budget
 
@@ -103,7 +105,7 @@ global {
     tproxy_port: 12345
     log_level: info
     log_file: 'honk.log'
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     store_subscribe: true
     nfqueue_enable: true
 

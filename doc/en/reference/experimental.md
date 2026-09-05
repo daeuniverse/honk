@@ -30,7 +30,7 @@ With a non-empty `secret`, API requests use `Authorization: Bearer <secret>`; We
 
 ### External UI
 
-An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing working-directory-relative directory; if neither exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `external_ui_download_url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
+An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing directory below `/var/share/honk`, then an existing working-directory-relative directory; if none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `external_ui_download_url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
 
 A non-empty `external_ui_download_detour` forces the initial request and every redirect through that node or group. `direct` downloads directly, `block` aborts, and a group resolves its authoritative leaf for each exchange. When the field is empty, each URL follows the normal traffic routing decision as before. An unavailable tag, download failure, or extraction failure is logged without stopping the engine.
 
@@ -43,7 +43,7 @@ A non-empty `external_ui_download_detour` forces the initial request and every r
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Open the SQLite cache and enable runtime-state persistence. |
-| `path` | `"cache.db"` | Database path. An absolute path is literal. For a relative path, an existing file below `global.data_dir` wins, then an existing legacy path relative to the original config directory; a new file is created below `global.data_dir`. |
+| `path` | `"cache.db"` | Database path. An absolute path is literal. For a relative path, an existing file below `global.data_dir` wins, then an existing file below `/var/share/honk`, then an existing path relative to the original config directory; a new file is created below `global.data_dir`. |
 | `cache_id` | `""` | Namespace for every database key. A non-empty value prefixes keys with `<cache_id>:`. |
 | `store_fakeip` | `false` | FakeIP persistence intent only. The `fakeip:` prefix and flush API exist, but the engine does not populate or restore mappings yet. |
 | `store_dns` | `false` | Persist and restore DNS cache answers using the exact-key v2 format. |

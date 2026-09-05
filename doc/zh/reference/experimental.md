@@ -30,7 +30,7 @@
 
 ### 外部 UI
 
-绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择相对当前工作目录的已有目录；两者都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
+绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
 非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 仍按原有行为遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。
 
@@ -43,7 +43,7 @@
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `enabled` | `false` | 打开 SQLite 缓存并启用运行时状态持久化。 |
-| `path` | `"cache.db"` | 数据库路径。绝对路径按原值使用。对相对路径，优先使用 `global.data_dir` 下的已有文件，其次使用相对原配置目录的已有旧路径；新文件创建在 `global.data_dir` 下。 |
+| `path` | `"cache.db"` | 数据库路径。绝对路径按原值使用。对相对路径，依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和相对原配置目录的已有文件；新文件创建在 `global.data_dir` 下。 |
 | `cache_id` | `""` | 所有数据库 key 的 namespace。非空值给 key 加上 `<cache_id>:` 前缀。 |
 | `store_fakeip` | `false` | 仅表示 FakeIP 持久化意图。已有 `fakeip:` 前缀和 flush API，但引擎尚不写入或恢复映射。 |
 | `store_dns` | `false` | 使用 exact-key v2 格式持久化并恢复 DNS 缓存应答。 |

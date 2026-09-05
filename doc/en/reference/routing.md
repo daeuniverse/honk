@@ -59,18 +59,23 @@ Appending `(must)` gives Go dae-compatible must semantics. A matching must rule 
 
 ## Geo assets
 
-`geoip:` and `geosite:` conditions use `geoip.dat` and `geosite.dat`. Their lookup order is:
+`geoip:` and `geosite:` conditions use `geoip.dat` and `geosite.dat`. The engine selects the first existing regular file in this order:
 
 | Priority | Location |
 | --- | --- |
 | 1 | `$DAE_LOCATION_ASSET/<file>` |
 | 2 | `global.data_dir/<file>` |
-| 3 | `./<file>` in the process working directory |
-| 4 | `/usr/local/share/dae/<file>` |
-| 5 | `/usr/share/dae/<file>` |
-| 6 | `/etc/dae/<file>` |
+| 3 | `/var/share/honk/<file>` (`LEGACY_DATA_DIR`) |
+| 4 | `./<file>` in the process working directory |
+| 5 | `/usr/local/share/honk/<file>` |
+| 6 | `/usr/share/honk/<file>` |
+| 7 | `/usr/local/share/dae/<file>` |
+| 8 | `/usr/share/dae/<file>` |
+| 9 | `/etc/dae/<file>` |
 
 See the [global reference](./global.md) for runtime asset resolution. `geoip: private` uses a built-in CIDR set and does not require `geoip.dat`.
+
+When a referenced geo asset cannot be found, the engine logs a warning naming the missing file. Unused assets do not produce missing-file warnings.
 
 A geosite code may select an attribute with `category@attr`. Attribute keys compare case-insensitively. Everything after the first `@` is the selector, including any later `@`. An unknown category or a selector matching no entries logs a warning, expands to zero matchers, and never matches.
 

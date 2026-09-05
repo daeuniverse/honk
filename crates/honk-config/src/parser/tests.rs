@@ -57,9 +57,6 @@ global {
 
     #[test]
     fn test_parse_data_dir() {
-        let default = parse_dae_config("global {}").unwrap();
-        assert_eq!(default.global.data_dir, "/var/share/honk");
-
         let custom = parse_dae_config("global {\n data_dir: '/srv/honk'\n}").unwrap();
         assert_eq!(custom.global.data_dir, "/srv/honk");
         custom.validate().unwrap();
