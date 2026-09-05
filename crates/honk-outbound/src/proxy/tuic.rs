@@ -315,7 +315,7 @@ impl TuicConnState {
 
     fn alloc_session(&self) -> Option<u16> {
         self.next_session
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 (next <= u16::MAX as u32).then_some(next + 1)
             })
             .ok()
@@ -1133,13 +1133,10 @@ mod tests {
     async fn assert_udp_roundtrip(transport: &dyn PacketTransport, payload: &[u8]) {
         transport.send_packet(payload).await.unwrap();
         let mut buf = [0u8; 256];
-        let (n, _) = tokio::time::timeout(
-            Duration::from_secs(5),
-            transport.recv_packet(&mut buf),
-        )
-        .await
-        .expect("reply timed out")
-        .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+            .await
+            .expect("reply timed out")
+            .unwrap();
         assert_eq!(&buf[..n], payload);
     }
 
