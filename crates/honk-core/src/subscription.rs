@@ -53,13 +53,6 @@ fn effective_subscription_user_agent(sub: &Subscription) -> &str {
         .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT)
 }
 
-fn default_store_root() -> PathBuf {
-    honk_config::paths::resolve_artifact_path_with_legacy(
-        SUBSCRIPTION_STORE_DIR,
-        Some(Path::new(SUBSCRIPTION_STORE_DIR)),
-    )
-}
-
 /// Durable raw subscription bodies keyed by their fetch identity.
 #[derive(Clone, Debug)]
 pub struct SubscriptionStore {
@@ -70,30 +63,42 @@ impl SubscriptionStore {
     /// Open the subscription store below `global.data_dir`, retaining an
     /// existing old data-directory or `./.sub` store during upgrades.
     pub fn in_data_dir() -> anyhow::Result<Self> {
-        let root = default_store_root();
-        let preferred = honk_config::paths::resolve_artifact_path(SUBSCRIPTION_STORE_DIR);
-        if root == preferred {
-            return Self::open(root);
+        Self::open_with_legacy(
+            honk_config::paths::resolve_artifact_path(SUBSCRIPTION_STORE_DIR),
+            [
+                Path::new(honk_config::paths::LEGACY_DATA_DIR).join(SUBSCRIPTION_STORE_DIR),
+                PathBuf::from(SUBSCRIPTION_STORE_DIR),
+            ],
+        )
+    }
+
+    fn open_with_legacy(preferred: PathBuf, legacy_roots: [PathBuf; 2]) -> anyhow::Result<Self> {
+        if preferred.exists() {
+            return Self::open(preferred);
         }
-        match Self::open(root.clone()) {
-            Ok(store) => {
-                tracing::warn!(
-                    legacy = %root.display(),
-                    preferred = %preferred.display(),
-                    "using legacy subscription store; move it to the runtime data directory"
-                );
-                Ok(store)
+        for root in legacy_roots {
+            if !root.exists() {
+                continue;
             }
-            Err(error) => {
-                tracing::warn!(
-                    legacy = %root.display(),
-                    preferred = %preferred.display(),
-                    %error,
-                    "legacy subscription store is unusable; starting a data-directory store"
-                );
-                Self::open(preferred)
+            match Self::open(root.clone()) {
+                Ok(store) => {
+                    tracing::warn!(
+                        legacy = %root.display(),
+                        preferred = %preferred.display(),
+                        "using legacy subscription store; move it to the runtime data directory"
+                    );
+                    return Ok(store);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        legacy = %root.display(),
+                        %error,
+                        "legacy subscription store is unusable; trying the next location"
+                    );
+                }
             }
         }
+        Self::open(preferred)
     }
 
     fn open(root: PathBuf) -> anyhow::Result<Self> {
@@ -1648,6 +1653,39 @@ not-proxies: []
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
         assert_eq!(fs::read_dir(store.root()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_store_skips_rejected_legacy_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let preferred = temp.path().join("preferred");
+        let old = temp.path().join("old");
+        let cwd = temp.path().join("cwd");
+        let sub = Subscription {
+            url: "https://example.invalid/subscription".into(),
+            ..Subscription::default()
+        };
+        let retained = SubscriptionStore::open(cwd.clone()).unwrap();
+        retained
+            .store_content(&sub, "socks5://127.0.0.1:1080#retained".into())
+            .await
+            .unwrap();
+        fs::write(&old, "not a directory").unwrap();
+
+        for symlink in [false, true] {
+            if symlink {
+                fs::remove_file(&old).unwrap();
+                let target = temp.path().join("symlink-target");
+                fs::create_dir(&target).unwrap();
+                std::os::unix::fs::symlink(target, &old).unwrap();
+            }
+            let store =
+                SubscriptionStore::open_with_legacy(preferred.clone(), [old.clone(), cwd.clone()])
+                    .unwrap();
+            let nodes = store.load_nodes(&sub).await.unwrap().unwrap();
+            assert_eq!(nodes[0].name, "retained");
+            assert!(!preferred.exists());
+        }
     }
 
     #[test]
