@@ -47,6 +47,12 @@ async fn send_timeout_after_reply_is_not_idle_success() {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay = "127.0.0.1:53".parse().unwrap();
     let endpoint = UdpEndpoint::new(transport(socket, relay), relay, uuid::Uuid::new_v4());
+
+    let idle_timeout = Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle_timeout),
+        ScoreOutcome::Timeout
+    );
     endpoint.has_reply.store(true, Ordering::Relaxed);
 
     let send_timeout = Err(io::Error::new(
@@ -58,7 +64,13 @@ async fn send_timeout_after_reply_is_not_idle_success() {
         ScoreOutcome::Io(io::ErrorKind::TimedOut)
     );
 
-    let idle_timeout = Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
+    assert_eq!(
+        score_driver_outcome(
+            &endpoint,
+            &Err(io::Error::new(io::ErrorKind::WouldBlock, "congested")),
+        ),
+        ScoreOutcome::Cancelled
+    );
     assert_eq!(
         score_driver_outcome(&endpoint, &idle_timeout),
         ScoreOutcome::Success
@@ -146,6 +158,7 @@ async fn run_endpoint_driver(
         first_ack,
     )
     .await
+    .result
 }
 
 fn make_addr(ip: &str, port: u16) -> SocketAddr {
@@ -1969,6 +1982,146 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         removed_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+}
+
+#[tokio::test]
+async fn udp_driver_scores_transport_failure_before_synchronous_node_retirement() {
+    for failure_at in ["first", "retained", "steady"] {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = Arc::new(StatsManager::new());
+        let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 53);
+        let relay = make_addr("192.168.1.1", 1080);
+        let nodes = [
+            honk_config::node::Node {
+                id: TEST_NODE_ID,
+                name: "failed".into(),
+                ..Default::default()
+            },
+            honk_config::node::Node {
+                id: OTHER_NODE_ID,
+                name: "survivor".into(),
+                ..Default::default()
+            },
+        ];
+        let group = honk_config::group::Group {
+            name: "score".into(),
+            policy: honk_config::group::GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = honk_outbound::group::GroupManager::new(&[group], &nodes);
+        let score_context = honk_outbound::group::ScoreSelectionContext::aggregate(
+            honk_outbound::group::SelectionNetwork::Udp,
+            honk_outbound::alive::ProbeDomain::DataUdp,
+            honk_outbound::alive::IpVersion::V4,
+        );
+        assert_eq!(
+            manager
+                .selection_plan_for_target("score", &score_context)
+                .entries[0]
+                .node
+                .id,
+            TEST_NODE_ID
+        );
+        let reporter = manager
+            .feedback_for_node(TEST_NODE_ID, score_context.clone())
+            .unwrap()
+            .start();
+        let transport = Arc::new(ScriptedPacketTransport::new(
+            relay,
+            [
+                if failure_at == "first" {
+                    DriverSendAction::Error
+                } else {
+                    DriverSendAction::Ok
+                },
+                DriverSendAction::Error,
+            ],
+        ));
+        let endpoint = Arc::new(UdpEndpoint::new_scored(
+            transport,
+            relay,
+            TEST_NODE_ID,
+            honk_outbound::alive::IpVersion::V4,
+            Some(reporter),
+        ));
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(4);
+        pool.set_remove_sink(removed_tx);
+        let callback_pool = Arc::clone(&pool);
+        alive.set_death_callback(Some(Box::new(move |node_id, _name| {
+            callback_pool.remove_by_node(node_id);
+        })));
+        // DataUdp retires on the 50th traffic failure; the driver supplies the last one.
+        for _ in 0..49 {
+            alive.report_unavailable_traffic(
+                TEST_NODE_ID,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                honk_outbound::alive::IpVersion::V4,
+            );
+        }
+
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("score retirement fixture must initialize"),
+        };
+        if failure_at != "first" {
+            let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+            assert!(matches!(
+                pool.reserve_or_enqueue(client, dst, b"follower", permit, &stats),
+                EndpointReservation::Enqueued
+            ));
+        }
+        let mut queue_rx = lease.take_queue_receiver().unwrap();
+        let followers = if failure_at == "retained" {
+            vec![queue_rx.try_recv().unwrap()]
+        } else {
+            Vec::new()
+        };
+        let mut driver = pool.spawn_driver(
+            client,
+            dst,
+            lease.generation(),
+            lease.decision_token(),
+            Arc::clone(&endpoint),
+            queue_rx,
+            test_reply_socket().await,
+            Arc::clone(&alive),
+            Arc::clone(&stats),
+            "failed".to_owned(),
+        );
+        driver.wait_ready().await.unwrap();
+        assert!(lease.commit_ready(Arc::clone(&endpoint)));
+        driver
+            .start_with_followers(lease.take_first().unwrap(), followers)
+            .unwrap();
+        drop(lease);
+
+        assert_eq!(
+            driver.wait_first_ack().await.is_ok(),
+            failure_at == "steady"
+        );
+        assert_eq!(
+            recv_and_ack(&pool, &mut removed_rx).await.unwrap().client,
+            client
+        );
+        assert!(endpoint.dead.load(Ordering::Acquire));
+        assert!(pool.is_empty());
+        let selected = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let selected = manager.selection_plan_for_target("score", &score_context);
+                if selected.entries[0].node.id == OTHER_NODE_ID {
+                    break selected.entries[0].node.id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(selected, OTHER_NODE_ID);
+    }
 }
 
 #[tokio::test]
