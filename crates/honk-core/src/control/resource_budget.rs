@@ -10,8 +10,8 @@ const MAX_TRANSIENT_DIALS: usize = 1_024;
 const MAX_UDP_SLOW_PATH: usize = 256;
 const MAX_DNS_SLOW_PATH: usize = 256;
 const TCP_FLOW_DESCRIPTOR_COST: usize = 6;
-// One retained transport carrier plus every reply socket the endpoint may open.
-const UDP_ENDPOINT_DESCRIPTOR_COST: usize = 1 + MAX_REPLY_SOCKETS_PER_ENDPOINT;
+// One upstream socket, a possible SOCKS5 control connection, and every reply socket.
+const UDP_ENDPOINT_DESCRIPTOR_COST: usize = 2 + MAX_REPLY_SOCKETS_PER_ENDPOINT;
 // Keep half of the non-TCP budget available for bursty gateway DNS/UDP work.
 const ELASTIC_NON_TCP_RESERVE_DIVISOR: usize = 2;
 
@@ -142,19 +142,16 @@ mod tests {
     }
 
     #[test]
-    fn full_cone_endpoint_max_fits_descriptor_partition() {
+    fn worst_case_udp_endpoint_max_fits_descriptor_partition() {
         for nofile in [64, 1_024, 4_096, usize::MAX] {
             let budget = ResourceBudget::for_nofile(nofile);
             let non_udp_descriptors = budget.fixed_reserve
                 + budget.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST
                 + budget.tcp_pool_entries
                 + budget.transient_dials;
-            let full_cone_endpoint_descriptors =
-                budget.udp_endpoints * (1 + MAX_REPLY_SOCKETS_PER_ENDPOINT);
+            let endpoint_descriptors = budget.udp_endpoints * (2 + MAX_REPLY_SOCKETS_PER_ENDPOINT);
 
-            assert!(
-                non_udp_descriptors + full_cone_endpoint_descriptors <= budget.effective_nofile
-            );
+            assert!(non_udp_descriptors + endpoint_descriptors <= budget.effective_nofile);
         }
     }
 
