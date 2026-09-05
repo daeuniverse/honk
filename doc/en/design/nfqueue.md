@@ -14,6 +14,8 @@ global {
 
 Changing the setting requires a process restart; reload rejects the change. Startup treats NFQUEUE as best-effort: mock mode, a build without `ebpf`, a failed fixed-queue preflight, or a queue/rules/health failure before datapath admission logs a warning and disables staging for that process without rewriting the config file. Persistent token-generation recovery failures remain fatal because allocator state is ambiguous. Real mode acquires the singleton instance lock before that preflight, so a normal handoff waits for the old queue owner instead of degrading spuriously. The reserved nftables table is reclaimed during installation after queue binding. Once the service is admitted, listener, queue, watchdog, verdict, cleanup, and retirement failures remain fatal. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
 
+SIGHUP compares the requested setting with the initial user request, then retains the active startup decision. An unchanged file therefore reloads after any startup downgrade without re-enabling staging; explicitly changing the requested setting still requires restart.
+
 The hook is deliberately narrow:
 
 | Traffic or state | Behavior |
@@ -48,7 +50,8 @@ flowchart LR
 | Verdict ownership | A non-`Clone`, exactly-once `VerdictGuard`; dropping an uncommitted guard sends `NF_DROP` |
 | Ingest ownership | One actor bounded to `256` entries and `8 MiB` of queued payload; a UDP slow-path permit is attempted only when the actor dequeues an entry |
 | nftables ownership | One atomic transaction owns exact `inet honk_nfqueue` / `udp_decision`, an `inet prerouting` filter chain at priority `-250`; only UDP carrying the pending signature reaches the queue |
-| Failure policy | No queue bypass, fanout, or fail-open flag. Malformed or truncated input, `ENOBUFS`, unexpected listener exit, and verdict-socket failure are fatal |
+| Failure policy | No queue bypass, fanout, or fail-open flag. Packet-local capture truncation or malformed L3/L4 bytes receives an exact `NF_DROP` and the listener continues. `ENOBUFS` reports undelivered packets already dropped by the kernel and the listener continues. Structural netlink/NFQUEUE metadata, version, queue, or family contradictions, unexpected listener exit, and verdict-socket failure remain fatal |
+Packet-local failures are therefore isolated to the affected skb. Outer netlink datagram truncation or corruption is structural and remains fatal; a verdict-send error is also fatal because ownership of that skb is then uncertain.
 
 The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 

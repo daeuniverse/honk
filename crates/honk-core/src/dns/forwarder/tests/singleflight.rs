@@ -67,7 +67,7 @@ async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
     }
     #[async_trait]
     impl DnsUpstreamPool for CancelUpstream {
-        async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 self.first_entered.notify_one();
@@ -75,7 +75,9 @@ async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
             }
             self.successor_entered.notify_one();
             self.release_successor.notified().await;
-            Ok(self.response.clone())
+            let mut response = self.response.clone();
+            response[0..2].copy_from_slice(&raw_query[0..2]);
+            Ok(response)
         }
     }
 

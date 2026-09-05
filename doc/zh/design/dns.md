@@ -160,8 +160,8 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | 机制 | 不变量 |
 | --- | --- |
 | 容量 | 最多 16 个 LRU 分片精确划分 `max_cache_size`。每个分片同时受条目数与保留的 key/response wire 字节限制。字节目标为每个配置条目 4 KiB，每分片至少 65,535 字节，全局上限 64 MiB。 |
-| 正缓存 TTL | `fixed_domain_ttl` 优先级最高；零表示该域名不缓存。否则，非零 `optimistic_cache_ttl` 覆盖应答最小 TTL。所选 TTL 也会写入缓存的 answer record。 |
-| 负缓存 TTL | NXDOMAIN 与 SERVFAIL 使用从 SOA 得出的负 TTL，缺省为 60 秒，随后钳制到 `1..=300` 秒。 |
+| 正缓存 TTL | `fixed_domain_ttl` 优先级最高；零表示该域名不缓存。否则，非零 `optimistic_cache_ttl` 覆盖应答最小 TTL。没有覆盖时，零 TTL 或最高位为一的 wire TTL 不可缓存；最高位为一的值按 RFC 2181 归零。所选缓存 TTL 也会写入缓存的 answer record。 |
+| 负缓存 TTL | NXDOMAIN 与 SERVFAIL 使用从 SOA 得出的负 TTL，缺省为 60 秒，上限为 300 秒。零值（包括最高位为一而归零的 wire 值）禁用负缓存。 |
 | Stale 处理 | 过期正应答在一小时内仍可用于 serve-stale。上游错误或 SERVFAIL 可返回该应答，并将 wire TTL 改为 30 秒。接近过期的命中会启动去重的 stale-while-revalidate refresh。 |
 | Flush fence | publication epoch 防止 flush 前开始的前台或后台工作在 flush barrier 后重新填充内存或持久化。 |
 
@@ -190,13 +190,15 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 直连 UDP 为每个查询分配由 CSPRNG 选择的新 16-bit ID，接收时同时校验 ID 与 question，恢复调用方 ID，并将退役 ID 隔离三秒。因此延迟报文无法在 ID 复用后满足另一个问题。
 
+所有上游交换均在响应路由、缓存发布或 `TC` 回退前校验响应事务 ID。DoQ、DoH 与 DoH3 在线上发送零，要求响应同样为零，然后才恢复调用方 ID；缓存模板不绑定事务 ID。
+
 ## 路由投影
 
 `DnsController` 将解析结果转换为 desired state，而不是内联写 `DOMAIN_ROUTING_MAP`：
 
 | 结果 | 投影 observation |
 | --- | --- |
-| 已接受的 positive | 用应答的有效 TTL 替换该域名的 IP 集合与 expiry。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
+| 已接受的 positive | 用应答的有效 TTL 替换该域名的 IP 集合与 expiry；不可缓存或有效 TTL 为零时清除旧 owner。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
 | 已接受的 NODATA 或 NXDOMAIN | 清除该域名 owner。 |
 | 已接受的 SERVFAIL 或被策略拒绝 | 保留当前状态。 |
 

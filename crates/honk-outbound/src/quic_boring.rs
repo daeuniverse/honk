@@ -32,7 +32,7 @@ use quinn_proto::crypto::{
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
-use sha2::{Sha256, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 
 // TLS 1.3 cipher suite IDs (RFC 8446 §B.4).
 const TLS13_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -366,9 +366,8 @@ struct QuicCryptoState {
     /// pinSHA256 connections never resume: a resumed PSK session would
     /// bypass the pin check on a later (possibly different-pin) config.
     allow_resumption: bool,
-    /// Session-ticket cache key for `on_new_session_cb` (SNI|port — see
-    /// [`BoringQuicOptions::ticket_key`]); falls back to the server name.
-    ticket_key: Option<String>,
+    /// The exact lookup identity is reused when publishing replacement tickets.
+    ticket_key: String,
 }
 
 static EX_DATA_INDEX: LazyLock<i32> = LazyLock::new(|| unsafe {
@@ -450,11 +449,11 @@ static QUIC_METHOD: boring_sys::SSL_QUIC_METHOD = boring_sys::SSL_QUIC_METHOD {
     send_alert: Some(on_send_alert),
 };
 
-/// Process-wide client ticket cache: key → SSL_SESSION, bounded and
-/// insertion-ordered (oldest evicted past [`SESSION_TICKETS_CAP`]).
-/// TLS 1.3 resumption in BoringSSL is explicit (`SSL_set_session` before the
-/// handshake) — the internal SSL_CTX cache only serves TLS 1.2-style id
-/// lookups, so tickets are stashed here keyed by server identity.
+/// Process-wide client ticket cache: fully scoped identity → SSL_SESSION,
+/// bounded and insertion-ordered (oldest evicted past
+/// [`SESSION_TICKETS_CAP`]). TLS 1.3 resumption in BoringSSL is explicit
+/// (`SSL_set_session` before the handshake) — the internal SSL_CTX cache only
+/// serves TLS 1.2-style id lookups, so tickets are stashed here.
 #[derive(Default)]
 struct TicketCache {
     slots: std::collections::HashMap<String, usize>,
@@ -464,12 +463,6 @@ struct TicketCache {
 impl TicketCache {
     fn get(&self, key: &str) -> Option<&usize> {
         self.slots.get(key)
-    }
-
-    /// Test-facing existence check.
-    #[cfg(test)]
-    fn contains_key(&self, key: &str) -> bool {
-        self.slots.contains_key(key)
     }
 
     fn insert(&mut self, key: String, session: usize) {
@@ -508,8 +501,9 @@ static SESSION_TICKETS: LazyLock<parking_lot::Mutex<TicketCache>> =
 /// leak of `SSL_SESSION` objects on long-running subscriptions.
 const SESSION_TICKETS_CAP: usize = 64;
 
-/// `new_session_cb`: retain each ticket the server issues (one ref held by
-/// the map; replaced tickets are freed).
+/// `new_session_cb`: transfer each ticket the server issues into the cache.
+/// Returning one transfers the callback's reference to `TicketCache`, which
+/// frees it on replacement or eviction.
 unsafe extern "C" fn on_new_session_cb(
     ssl: *mut boring_sys::SSL,
     session: *mut boring_sys::SSL_SESSION,
@@ -518,25 +512,10 @@ unsafe extern "C" fn on_new_session_cb(
     if !state.allow_resumption {
         return 0;
     }
-    // SNI|port key when the config carries one (never cross-resume between
-    // different servers sharing an SNI); the bare server name otherwise.
-    let name = match state.ticket_key.clone() {
-        Some(key) => key,
-        None => {
-            let name = unsafe {
-                boring_sys::SSL_get_servername(ssl, boring_sys::TLSEXT_NAMETYPE_host_name)
-            };
-            if name.is_null() {
-                return 0;
-            }
-            unsafe { std::ffi::CStr::from_ptr(name) }
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
-    unsafe { boring_sys::SSL_SESSION_up_ref(session) };
-    SESSION_TICKETS.lock().insert(name, session as usize);
-    0
+    SESSION_TICKETS
+        .lock()
+        .insert(state.ticket_key.clone(), session as usize);
+    1
 }
 
 /// Options for [`BoringQuicClientConfig::new`].
@@ -554,9 +533,8 @@ pub struct BoringQuicOptions {
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
     pub pin_sha256: Option<[u8; 32]>,
-    /// Session-ticket cache key (defaults to the server name). Servers are
-    /// identified by SNI|port so different servers sharing an SNI (e.g. one
-    /// certificate deployed on two protocol servers) never cross-resume.
+    /// Endpoint identity (defaults to the handshake server name).
+    /// The crypto layer always adds SNI, ALPN, and verification policy.
     pub ticket_key: Option<String>,
 }
 
@@ -568,8 +546,8 @@ pub struct BoringQuicClientConfig {
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
     has_pin: bool,
-    /// Session-ticket cache key (defaults to the server name when unset).
     ticket_key: Option<String>,
+    ticket_policy: String,
 }
 
 impl BoringQuicClientConfig {
@@ -615,6 +593,18 @@ impl BoringQuicClientConfig {
             boring_sys::SSL_CTX_sess_set_new_cb(builder.as_ptr(), Some(on_new_session_cb));
         }
 
+        let mut policy = Sha256::new();
+        policy.update([u8::from(skip_cert_verify)]);
+        policy.update((alpn_wire.len() as u64).to_be_bytes());
+        policy.update(&alpn_wire);
+        if let Some(ech) = &ech_config_list {
+            policy.update(ech.as_slice());
+        }
+        let ticket_policy = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            policy.finalize(),
+        );
+
         Ok(Self {
             ctx: builder.build(),
             alpn_wire,
@@ -622,7 +612,15 @@ impl BoringQuicClientConfig {
             ech_config_list,
             has_pin: pin_sha256.is_some(),
             ticket_key,
+            ticket_policy,
         })
+    }
+
+    fn session_ticket_key(&self, server_name: &str) -> String {
+        format!(
+            "{:?}|{server_name:?}|{}",
+            self.ticket_key, self.ticket_policy
+        )
     }
 }
 
@@ -638,7 +636,9 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             return Err(ConnectError::UnsupportedVersion);
         }
 
-        let mut ssl = Ssl::new(&self.ctx).expect("SSL_new failed");
+        let mut ssl = Ssl::new(&self.ctx).map_err(|error| {
+            ConnectError::InvalidServerName(format!("{server_name}: SSL_new failed: {error}"))
+        })?;
         // Offer 0-RTT early data on resumed connections; whether any early
         // payload is actually sent is quinn's decision (into_0rtt), and
         // servers that ignore the offer are unaffected.
@@ -662,38 +662,64 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         // a session minted under a pre-reload SSL_CTX) must not poison every
         // subsequent dial until process restart.
         let mut resume_key = None;
-        let lookup_key = self
-            .ticket_key
-            .clone()
-            .unwrap_or_else(|| server_name.to_string());
-        if !self.has_pin
-            && let Some(&session) = SESSION_TICKETS.lock().get(&lookup_key)
-        {
-            unsafe {
-                boring_sys::SSL_set_session(ssl.as_ptr(), session as *mut boring_sys::SSL_SESSION)
-            };
-            // Remember the exact entry offered so a failure evicts it only
-            // if it is still the current one.
-            resume_key = Some((lookup_key, session));
-            tracing::debug!(server_name, "QUIC TLS: offering cached session ticket");
+        let lookup_key = self.session_ticket_key(server_name);
+        if !self.has_pin {
+            // Keep the cache lock through SSL_set_session: the cache owns the
+            // pointer and may free it on replacement. SSL_set_session only
+            // borrows the caller-owned reference.
+            let mut cache = SESSION_TICKETS.lock();
+            if let Some(&session) = cache.get(&lookup_key) {
+                let ok = unsafe {
+                    boring_sys::SSL_set_session(
+                        ssl.as_ptr(),
+                        session as *mut boring_sys::SSL_SESSION,
+                    )
+                };
+                if ok == 1 {
+                    // Remember the exact entry offered so a failure evicts it
+                    // only if it is still current.
+                    resume_key = Some((lookup_key.clone(), session));
+                    tracing::debug!(server_name, "QUIC TLS: offering cached session ticket");
+                } else {
+                    let reason = ErrorStack::get().to_string();
+                    cache.remove_if_current(&lookup_key, session);
+                    tracing::debug!(
+                        server_name,
+                        error = %reason,
+                        "QUIC TLS: discarded unusable cached session ticket"
+                    );
+                }
+            }
         }
-        ssl.set_alpn_protos(&self.alpn_wire)
-            .expect("invalid ALPN wire format");
+        ssl.set_alpn_protos(&self.alpn_wire).map_err(|error| {
+            ConnectError::InvalidServerName(format!("{server_name}: invalid ALPN: {error}"))
+        })?;
 
         if self.chrome {
             ssl.set_permute_extensions(true);
-            crate::tls::set_chrome_key_shares_ssl(&ssl).expect("SSL_set1_client_key_shares");
+            crate::tls::set_chrome_key_shares_ssl(&ssl).map_err(|error| {
+                ConnectError::InvalidServerName(format!(
+                    "{server_name}: Chrome key-share setup failed: {error}"
+                ))
+            })?;
         }
         match &self.ech_config_list {
-            Some(list) => ssl
-                .set_ech_config_list(list)
-                .expect("invalid ECHConfigList"),
+            Some(list) => ssl.set_ech_config_list(list).map_err(|error| {
+                ConnectError::InvalidServerName(format!(
+                    "{server_name}: invalid ECHConfigList: {error}"
+                ))
+            })?,
             None if self.chrome => ssl.set_enable_ech_grease(true),
             None => {}
         }
 
         let ok = unsafe { boring_sys::SSL_set_quic_method(ssl.as_ptr(), &QUIC_METHOD) };
-        assert_eq!(ok, 1, "SSL_set_quic_method");
+        if ok != 1 {
+            let error = ErrorStack::get();
+            return Err(ConnectError::InvalidServerName(format!(
+                "{server_name}: SSL_set_quic_method failed: {error}"
+            )));
+        }
 
         let mut transport_params = Vec::new();
         params.write(&mut transport_params);
@@ -704,11 +730,16 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
                 transport_params.len(),
             )
         };
-        assert_eq!(ok, 1, "SSL_set_quic_transport_params");
+        if ok != 1 {
+            let error = ErrorStack::get();
+            return Err(ConnectError::InvalidServerName(format!(
+                "{server_name}: SSL_set_quic_transport_params failed: {error}"
+            )));
+        }
 
         let state = Box::new(QuicCryptoState {
             allow_resumption: !self.has_pin,
-            ticket_key: self.ticket_key.clone(),
+            ticket_key: lookup_key,
             ..Default::default()
         });
         let ok = unsafe {
@@ -720,7 +751,12 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
                     .cast::<c_void>(),
             )
         };
-        assert_eq!(ok, 1, "SSL_set_ex_data");
+        if ok != 1 {
+            let error = ErrorStack::get();
+            return Err(ConnectError::InvalidServerName(format!(
+                "{server_name}: SSL_set_ex_data failed: {error}"
+            )));
+        }
 
         unsafe { boring_sys::SSL_set_connect_state(ssl.as_ptr()) };
 
@@ -929,7 +965,10 @@ impl Session for BoringQuicSession {
         } else {
             let ok = unsafe { boring_sys::SSL_process_quic_post_handshake(self.ssl.as_ptr()) };
             if ok != 1 {
-                for e in ErrorStack::get().errors() {
+                // ErrorStack::get drains BoringSSL's queue. Reuse this one
+                // snapshot for both diagnostics and the transport error.
+                let stack = ErrorStack::get();
+                for e in stack.errors() {
                     tracing::debug!(
                         file = e.file(),
                         line = e.line(),
@@ -938,7 +977,8 @@ impl Session for BoringQuicSession {
                         "QUIC TLS post-handshake error queue entry"
                     );
                 }
-                return Err(self.fatal_error(&ErrorStack::get().to_string()));
+                let reason = stack.to_string();
+                return Err(self.fatal_error(&reason));
             }
         }
 
@@ -1097,6 +1137,46 @@ mod tests {
         let addr = spawn_echo_server(&[b"h3"]);
         roundtrip_to(node, addr).await
     }
+    fn direct_boring_config(
+        alpn: &[u8],
+        skip_cert_verify: bool,
+        ticket_key: Option<String>,
+    ) -> anyhow::Result<quinn::ClientConfig> {
+        let alpn_wire = std::iter::once(alpn.len() as u8)
+            .chain(alpn.iter().copied())
+            .collect();
+        let crypto = BoringQuicClientConfig::new(BoringQuicOptions {
+            alpn_wire,
+            skip_cert_verify,
+            ticket_key,
+            ..Default::default()
+        })?;
+        Ok(quinn::ClientConfig::new(Arc::new(crypto)))
+    }
+
+    async fn connect_for_ticket(
+        config: quinn::ClientConfig,
+        addr: std::net::SocketAddr,
+        server_name: &str,
+    ) -> anyhow::Result<bool> {
+        let mut endpoint = crate::quic::client_endpoint(false)?;
+        endpoint.set_default_client_config(config);
+        let conn = endpoint.connect(addr, server_name)?.await?;
+        let data = conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
+            .ok_or_else(|| anyhow::anyhow!("missing BoringSSL handshake data"))?;
+        let resumed = data.session_reused;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(b"ping").await?;
+        send.finish()?;
+        let echoed = recv.read_to_end(16).await?;
+        anyhow::ensure!(echoed.as_slice() == b"ping", "unexpected echo response");
+        // Tickets are sent after the handshake; allow the callback to cache it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        conn.close(0u32.into(), b"done");
+        Ok(resumed)
+    }
 
     /// ChaCha20-Poly1305 interop: the server is restricted to TLS 1.3
     /// ChaCha20 so QUIC header protection takes the ChaCha20 path
@@ -1153,141 +1233,126 @@ mod tests {
         assert_eq!(echoed, b"ping");
     }
 
-    /// A ticket cached under a rebuilt client config (post-reload SSL_CTX)
-    /// or rejected by the server must be evicted on handshake failure —
-    /// never poison every later dial until process restart. Production
-    /// regression: after a SIGHUP reload pointed a node at a different
-    /// server with the same SNI, every dial failed on the stale ticket.
-    #[tokio::test]
-    async fn rejected_ticket_is_evicted() {
-        let addr = spawn_echo_server(&[b"h3"]);
-        let node = Node {
-            address: "127.0.0.1:0".to_string(),
-            ..skip_verify_node()
-        };
-        let ticket_key = format!("{}|{}|{}|h3", node.host(), node.port, node.host());
-        // Prime the cache under the first client config (SSL_CTX #1).
-        let cfg1 = crate::quic::client_config(&node, &[b"h3"], Default::default())
-            .await
-            .unwrap();
-        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
-        endpoint.set_default_client_config(cfg1);
-        let conn = endpoint.connect(addr, "evict.test").unwrap().await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        send.write_all(b"ping").await.unwrap();
-        send.finish().unwrap();
-        let _ = recv.read_to_end(16).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        conn.close(0u32.into(), b"done");
-        assert!(SESSION_TICKETS.lock().contains_key(&ticket_key));
-
-        // Rebuild the client config (SSL_CTX #2, as a reload would) and dial
-        // twice: whatever happens with the cross-context ticket on the first
-        // dial, the second must succeed — the cache can never stay poisoned.
-        let cfg2 = crate::quic::client_config(&node, &[b"h3"], Default::default())
-            .await
-            .unwrap();
-        for attempt in 0..2 {
-            let mut endpoint = crate::quic::client_endpoint(false).unwrap();
-            endpoint.set_default_client_config(cfg2.clone());
-            match endpoint.connect(addr, "evict.test").unwrap().await {
-                Ok(conn) => {
-                    conn.close(0u32.into(), b"done");
-                    if attempt == 1 {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    assert_eq!(attempt, 0, "second dial must succeed, got: {e}");
-                    assert!(
-                        !SESSION_TICKETS.lock().contains_key(&ticket_key),
-                        "rejected ticket must be evicted after the failed dial"
-                    );
-                }
-            }
-        }
-    }
-
-    /// TLS 1.3 session resumption: a second connection to the same server
-    /// over a shared client config must reuse the cached session ticket.
+    /// TLS 1.3 session resumption: a second connection to the same server,
+    /// SNI, ALPN, and policy reuses the cached session ticket.
     #[tokio::test]
     async fn session_resumption_reuses_ticket() {
         let addr = spawn_echo_server(&[b"h3"]);
-        // Unique address: the process-global ticket cache is shared by
-        // parallel tests — a collision under the same key would serve a
-        // foreign ticket and break the resumption assertion.
-        let node = Node {
-            address: "127.0.0.1:11".to_string(),
-            ..skip_verify_node()
-        };
-        let ticket_key = format!("{}|{}|{}|h3", node.host(), node.port, node.host());
-        let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
-            .await
-            .unwrap();
-        for i in 0..2 {
-            let mut endpoint = crate::quic::client_endpoint(false).unwrap();
-            endpoint.set_default_client_config(cfg.clone());
-            let conn = endpoint
-                .connect(addr, "resumption.test")
-                .unwrap()
+        let ticket_key = format!("resumption-endpoint-{}", addr.port());
+        let config = direct_boring_config(b"h3", true, Some(ticket_key)).unwrap();
+
+        assert!(
+            !connect_for_ticket(config.clone(), addr, "localhost")
                 .await
-                .unwrap();
-            let data = conn
-                .handshake_data()
-                .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
-                .expect("handshake data");
-            if i == 0 {
-                assert!(
-                    !data.session_reused,
-                    "first connection must be a full handshake"
-                );
-            }
-            // Session tickets arrive post-handshake; drive a tiny exchange
-            // (and let the peer's ticket flight land) before closing.
-            let (mut send, mut recv) = conn.open_bi().await.unwrap();
-            send.write_all(b"ping").await.unwrap();
-            send.finish().unwrap();
-            let _ = recv.read_to_end(16).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            conn.close(0u32.into(), b"done");
-            if i == 1 {
-                // The ticket flight arrives post-handshake; wait for the
-                // cache to hold it instead of racing the next connection.
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        if SESSION_TICKETS.lock().contains_key(&ticket_key) {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("session ticket was never cached");
-            }
-        }
-        // The cached ticket must be offered and accepted at least once.
-        // Resumption is opportunistic (a server may fall back to a full
-        // handshake under load), so allow one fallback attempt.
+                .unwrap(),
+            "first connection must be a full handshake"
+        );
+
+        // Resumption is opportunistic; retry once if the first offered ticket
+        // is not accepted by the peer.
         let mut resumed = false;
         for _ in 0..2 {
-            let mut endpoint = crate::quic::client_endpoint(false).unwrap();
-            endpoint.set_default_client_config(cfg.clone());
-            let Ok(conn) = endpoint.connect(addr, "resumption.test").unwrap().await else {
-                continue;
-            };
-            let data = conn
-                .handshake_data()
-                .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
-                .expect("handshake data");
-            resumed |= data.session_reused;
-            conn.close(0u32.into(), b"done");
-            if resumed {
-                break;
+            if let Ok(reused) = connect_for_ticket(config.clone(), addr, "localhost").await {
+                resumed |= reused;
+                if resumed {
+                    break;
+                }
             }
         }
         assert!(
             resumed,
-            "cached ticket must resume on at least one connection"
+            "same-identity connection must resume at least once"
+        );
+    }
+
+    /// Endpoint, SNI, and ALPN are all part of the ticket identity. The
+    /// observable contract is that a ticket from another identity is never
+    /// accepted as a resumed handshake; the rustls fixture does not expose a
+    /// ClientHello hook to prove whether a rejected PSK was put on the wire.
+    #[tokio::test]
+    async fn ticket_identity_scopes_endpoint_sni_and_alpn() {
+        let addr = spawn_echo_server(&[b"h3", b"h3-alt"]);
+        let ticket_key = format!("identity-endpoint-{}", addr.port());
+        let base = direct_boring_config(b"h3", true, Some(ticket_key.clone())).unwrap();
+
+        assert!(
+            !connect_for_ticket(base.clone(), addr, "localhost")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !connect_for_ticket(base.clone(), addr, "other-sni")
+                .await
+                .unwrap(),
+            "different SNI must not resume"
+        );
+
+        let other_alpn = direct_boring_config(b"h3-alt", true, Some(ticket_key.clone())).unwrap();
+        assert!(
+            !connect_for_ticket(other_alpn, addr, "localhost")
+                .await
+                .unwrap(),
+            "different ALPN must not resume"
+        );
+
+        let other_endpoint =
+            direct_boring_config(b"h3", true, Some(format!("other-endpoint-{}", addr.port())))
+                .unwrap();
+        assert!(
+            !connect_for_ticket(other_endpoint, addr, "localhost")
+                .await
+                .unwrap(),
+            "different endpoint identity must not resume"
+        );
+
+        assert!(
+            connect_for_ticket(base, addr, "localhost").await.unwrap(),
+            "same endpoint/SNI/ALPN/policy must resume"
+        );
+    }
+
+    /// A ticket primed with verification disabled must not let a secure
+    /// config accept the self-signed loopback certificate. `ticket_key: None`
+    /// exercises the canonical identity layer rather than a caller override.
+    #[tokio::test]
+    async fn insecure_ticket_cannot_bypass_secure_certificate_policy() {
+        let addr = spawn_echo_server(&[b"h3"]);
+        let server_name = format!("auth-policy-{}", addr.port());
+        let insecure = direct_boring_config(b"h3", true, None).unwrap();
+        assert!(
+            !connect_for_ticket(insecure, addr, &server_name)
+                .await
+                .unwrap()
+        );
+
+        let secure = direct_boring_config(b"h3", false, None).unwrap();
+        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+        endpoint.set_default_client_config(secure);
+        let result = endpoint.connect(addr, &server_name).unwrap().await;
+        assert!(
+            result.is_err(),
+            "secure config must reject self-signed certificate instead of resuming insecure ticket"
+        );
+    }
+
+    #[test]
+    fn malformed_ech_config_is_rejected_without_panic() {
+        let config = Arc::new(
+            BoringQuicClientConfig::new(BoringQuicOptions {
+                alpn_wire: b"\x02h3".to_vec(),
+                ech_config_list: Some(Arc::new(vec![0, 1, 0])),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crypto::ClientConfig::start_session(config, 1, "localhost", &params)
+        }));
+        assert!(outcome.is_ok(), "malformed ECH must not panic");
+        assert!(
+            outcome.unwrap().is_err(),
+            "malformed ECH must return an error"
         );
     }
 

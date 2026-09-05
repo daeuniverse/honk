@@ -715,6 +715,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
+    let requested_nfqueue_enable = config.global.nfqueue_enable;
     prepare_nfqueue_startup(&mut config, mock_mode);
 
     // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
@@ -1055,6 +1056,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
     )?;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
+    control_plane.set_nfqueue_startup_request(requested_nfqueue_enable);
 
     #[cfg(feature = "ebpf")]
     let iface_watcher = if !cli.mock_ebpf {

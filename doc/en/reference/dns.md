@@ -123,6 +123,7 @@ A trailing `-> tag` forces the upstream through that node or group. Without it, 
 | `ip(192.0.2.0/24, geoip: private, ...)` | Response only | Match when any answer IP belongs to a listed CIDR or GeoIP set. |
 
 For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution performed for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
+Malformed, empty, unknown, or otherwise invalid supported DNS predicates (including qtype arguments) reject configuration. The known unsupported `sub(...)`, `node(...)`, and `subnode(...)` functions are warning-only: when they appear as a conjunct, honk skips the entire rule rather than evaluating the remaining conditions as a broader match.
 
 ### Request actions
 
@@ -172,6 +173,8 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs. `0` keeps the answer TTL. |
 | `max_cache_size` | `10000` | Entry limit. It also scales the retained query/response wire-byte budget at 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. `0` is warned and clamped to one entry. |
 | `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` makes that domain uncacheable. |
+
+When answer TTLs are preserved, zero and wire TTLs with the high bit set do not enter cache or DNS routing projection; high-bit values normalize to zero per RFC 2181. An explicit nonzero fixed/configured TTL still overrides the upstream value.
 
 Request routing runs before cache lookup. Cache and background-refresh identity uses the selected upstream or exact `asis` destination, not the raw client source: clients selecting the same exchange scope share entries, while different selected upstreams or `asis` destinations remain isolated. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
 

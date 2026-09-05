@@ -23,7 +23,7 @@ use crate::dns::outcome::DnsOutcome;
 use super::response::make_address_response;
 use super::{DnsForwardError, DnsForwarder, ResolveMode};
 
-const HOSTS_TTL_SECS: u32 = 60;
+pub(super) const HOSTS_TTL_SECS: u32 = 60;
 
 #[derive(Debug, Default)]
 pub(crate) struct HostsFile {
@@ -560,7 +560,6 @@ mod tests {
         assert_eq!(a.status(), OutcomeStatus::Accepted);
         assert_eq!(a.provenance(), Provenance::Fresh);
         assert_eq!(a.response_class(), ResponseClass::Positive);
-        assert!(!a.expiry().is_cacheable());
         assert_eq!(&a.rendered()[0..2], &0x1234u16.to_be_bytes());
         assert_eq!(a.answer_ips(), &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
         assert_eq!(

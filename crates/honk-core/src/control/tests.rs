@@ -52,9 +52,6 @@ async fn health_push_re_resolves_after_reload_writer() {
     let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::new(&old_config.groups, &old_config.nodes),
     )));
-    let outbound_id_map = Arc::new(parking_lot::RwLock::new(reload::build_outbound_id_map(
-        &old_config,
-    )));
     let alive_set = Arc::new(AliveDialerSet::new());
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
@@ -63,7 +60,6 @@ async fn health_push_re_resolves_after_reload_writer() {
         Arc::clone(&ebpf),
         Arc::clone(&config),
         Arc::clone(&group_manager),
-        Arc::clone(&outbound_id_map),
         Arc::clone(&alive_set),
     ));
 
@@ -72,7 +68,6 @@ async fn health_push_re_resolves_after_reload_writer() {
     backend_writer.set_outbound_alive(2, 1, 0, false).unwrap();
     backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
     *config_writer = Arc::new(new_config.clone());
-    *outbound_id_map.write() = reload::build_outbound_id_map(&new_config);
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
     let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
@@ -87,6 +82,67 @@ async fn health_push_re_resolves_after_reload_writer() {
     let backend = ebpf.read().await;
     assert!(!backend.get_outbound_alive(2, 1, 0).unwrap());
     assert!(backend.get_outbound_alive(3, 1, 0).unwrap());
+}
+
+#[tokio::test]
+async fn health_push_updates_every_group_sharing_nested_leaf() {
+    let node = udp_test_node();
+    let config = Config {
+        nodes: vec![node.clone()],
+        groups: vec![
+            Group {
+                name: "child".into(),
+                nodes: vec![node.id],
+                ..Default::default()
+            },
+            Group {
+                name: "sibling".into(),
+                nodes: vec![node.id],
+                ..Default::default()
+            },
+            Group {
+                name: "parent".into(),
+                groups: vec!["child".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::new(&config.groups, &config.nodes),
+    )));
+    let config = Arc::new(RwLock::new(Arc::new(config)));
+    let alive_set = Arc::new(AliveDialerSet::new());
+    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+        crate::ebpf::mock::MockEbpfBackend::new(),
+    )));
+    let publisher = runtime::OutboundHealthPublisher::new(
+        Arc::clone(&ebpf),
+        Arc::clone(&config),
+        Arc::clone(&group_manager),
+        Arc::clone(&alive_set),
+    );
+
+    alive_set.report_unavailable_forced(node.id, ProbeDomain::DataUdp, IpVersion::V4);
+    Arc::new(publisher).publish(node.id, 2, 0).await;
+    let backend = ebpf.read().await;
+    for outbound in 2..=4 {
+        assert!(!backend.get_outbound_alive(outbound, 2, 0).unwrap());
+    }
+    drop(backend);
+
+    alive_set.report_available_traffic(node.id, ProbeDomain::DataUdp, IpVersion::V4);
+    let publisher = runtime::OutboundHealthPublisher::new(
+        Arc::clone(&ebpf),
+        Arc::clone(&config),
+        Arc::clone(&group_manager),
+        Arc::clone(&alive_set),
+    );
+    Arc::new(publisher).publish(node.id, 2, 0).await;
+    let backend = ebpf.read().await;
+    for outbound in 2..=4 {
+        assert!(backend.get_outbound_alive(outbound, 2, 0).unwrap());
+    }
 }
 
 #[cfg(feature = "ebpf")]
@@ -168,6 +224,27 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     assert_eq!(
         published & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY),
         0
+    );
+
+    let mut requested = control.config_handle().read().await.as_ref().clone();
+    requested.global.nfqueue_enable = true;
+    let mut authorizations =
+        crate::subscription::SubscriptionAuthorizations::new(&requested.subscriptions).unwrap();
+    assert!(
+        control
+            .apply_sighup_config(
+                requested.clone(),
+                &control.drain_tracker,
+                &mut authorizations,
+            )
+            .await
+    );
+    assert!(!control.config_handle().read().await.global.nfqueue_enable);
+    requested.global.nfqueue_enable = false;
+    assert!(
+        !control
+            .apply_sighup_config(requested, &control.drain_tracker, &mut authorizations)
+            .await
     );
 }
 
@@ -4149,15 +4226,15 @@ fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
     assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
 
     let missing = resolve_udp_score_plan(&config, &manager, "missing-final", IpVersion::V4);
-    assert_eq!(
-        missing
-            .nodes
-            .iter()
-            .map(|node| node.name.as_str())
-            .collect::<Vec<_>>(),
-        ["direct"]
+    assert!(
+        missing.nodes.is_empty(),
+        "an unresolved group.final must fail closed, never fall back to direct"
     );
-
+    assert!(
+        resolve_udp_score_plan(&config, &manager, "not-configured", IpVersion::V4)
+            .nodes
+            .is_empty()
+    );
     let cycle = resolve_udp_score_plan(&config, &manager, "cycle-a", IpVersion::V4);
     assert!(
         cycle.nodes.is_empty(),

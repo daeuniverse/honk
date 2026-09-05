@@ -452,10 +452,12 @@ that many bytes are masked or unmasked. Treating every number as four bytes
 corrupts the following payload for short packet numbers.
 
 A process-wide, bounded `SESSION_TICKETS` cache stores BoringSSL TLS 1.3
-sessions by server identity. BoringSSL requires explicit `SSL_set_session` for
-resumption. `pinSHA256` nodes never resume because a PSK handshake would bypass
-the certificate pin. Rejected cached sessions are evicted without deleting a
-newer concurrent ticket.
+sessions only under the low-level identity assembled by each Boring config:
+endpoint identity, handshake SNI, ALPN, certificate-verification policy, and
+ECH configuration. BoringSSL requires explicit `SSL_set_session` for
+resumption. `pinSHA256` nodes never resume because a PSK handshake would
+bypass the certificate pin. Rejected cached sessions are evicted without
+deleting a newer concurrent ticket.
 
 The backend can carry real ECH and the Chrome QUIC ClientHello. Proxy outbounds
 do not expose early packet keys to quinn, so they send no 0-RTT early payload;

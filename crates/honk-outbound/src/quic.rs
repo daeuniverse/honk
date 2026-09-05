@@ -1303,6 +1303,12 @@ pub struct QuicClientOptions {
     /// `max_udp_payload_size` (receive advertisement) is set separately by
     /// the protocol handler from the same node field.
     pub max_udp_payload_size: Option<u16>,
+    /// Caller-owned endpoint identity for the session-ticket cache.
+    ///
+    /// The crypto layer adds ALPN and certificate-verification policy.
+    /// This is needed by shared DNS QUIC configs, whose
+    /// `Node` is only a template and does not identify the actual upstream.
+    pub ticket_key: Option<String>,
 }
 
 impl QuicClientOptions {
@@ -1361,6 +1367,14 @@ pub async fn client_config(
             })
         })
         .transpose()?;
+    let ticket_key = options.ticket_key.clone().unwrap_or_else(|| {
+        format!(
+            "{}|{}|{}",
+            node.host(),
+            node.port,
+            tls.sni.clone().unwrap_or_else(|| node.host().to_string()),
+        )
+    });
     let crypto =
         crate::quic_boring::BoringQuicClientConfig::new(crate::quic_boring::BoringQuicOptions {
             alpn_wire,
@@ -1368,16 +1382,7 @@ pub async fn client_config(
             chrome: crate::tls::chrome_mode(),
             ech_config_list: ech,
             pin_sha256,
-            ticket_key: Some(format!(
-                "{}|{}|{}|{}",
-                node.host(),
-                node.port,
-                tls.sni.clone().unwrap_or_else(|| node.host().to_string()),
-                alpn.iter()
-                    .map(|p| String::from_utf8_lossy(p).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )),
+            ticket_key: Some(ticket_key),
         })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
     let mut transport = TransportConfig::default();

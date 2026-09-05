@@ -39,7 +39,10 @@ mod metadata {
             None if configured_ttl > 0 => {
                 EffectiveExpiry::cacheable(Duration::from_secs(u64::from(configured_ttl)))
             }
-            None => EffectiveExpiry::cacheable(Duration::from_secs(u64::from(answer_ttl.max(1)))),
+            None if answer_ttl > 0 => {
+                EffectiveExpiry::cacheable(Duration::from_secs(u64::from(answer_ttl)))
+            }
+            None => EffectiveExpiry::do_not_cache(),
         }
     }
 }

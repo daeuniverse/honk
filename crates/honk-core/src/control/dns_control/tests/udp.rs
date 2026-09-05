@@ -135,9 +135,22 @@ async fn transparent_udp_routes_by_client_source() {
 
 #[tokio::test]
 async fn truncated_upstream_response_is_not_cached_or_projected() {
+    assert_uncacheable_projection(true).await;
+}
+
+#[tokio::test]
+async fn zero_ttl_upstream_response_clears_projection_without_caching() {
+    assert_uncacheable_projection(false).await;
+}
+
+async fn assert_uncacheable_projection(truncated_response: bool) {
     let query = query_with_txid("example.com", 0x5151);
     let mut truncated = a_response(&query, [192, 0, 2, 10]);
-    truncated[2..4].copy_from_slice(&0x8380_u16.to_be_bytes());
+    if truncated_response {
+        truncated[2..4].copy_from_slice(&0x8380_u16.to_be_bytes());
+    } else {
+        truncated[query.len() + 6..query.len() + 10].copy_from_slice(&0u32.to_be_bytes());
+    }
     let upstream = Arc::new(SlowUpstream {
         calls: AtomicUsize::new(0),
         delay: Duration::ZERO,
@@ -225,8 +238,12 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
             },
         )
         .await
-        .expect("truncated outcome");
-    assert!(outcome.answer_ips().is_empty());
+        .expect("uncacheable outcome");
+    if truncated_response {
+        assert!(outcome.answer_ips().is_empty());
+    } else {
+        assert_eq!(outcome.answer_ips(), &[learned_ip]);
+    }
     assert!(!outcome.expiry().is_cacheable());
     controller.submit_projection(runtime.runtime(), &outcome);
     drop(runtime);
@@ -234,9 +251,16 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     assert!(cache.lock().await.is_empty());
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
     let projected_again = controller.project_routes(&snapshot);
-    assert_eq!(projected_again.len(), 1);
-    assert_eq!(projected_again[0].0, projected[0].0);
-    assert_eq!(projected_again[0].1.bitmap, projected[0].1.bitmap);
+    if truncated_response {
+        assert_eq!(projected_again.len(), 1);
+        assert_eq!(projected_again[0].0, projected[0].0);
+        assert_eq!(projected_again[0].1.bitmap, projected[0].1.bitmap);
+    } else {
+        assert!(
+            projected_again.is_empty(),
+            "zero TTL must revoke the old domain owner"
+        );
+    }
     persister.shutdown().await.expect("persistence shutdown");
     assert!(database.load_dns_v2().expect("persisted rows").is_empty());
     controller.shutdown(Duration::from_secs(1)).await;

@@ -122,6 +122,75 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
 }
 
 #[tokio::test]
+async fn udp_asis_wrong_id_tc_does_not_trigger_tcp_fallback() {
+    let tcp = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind fallback TCP endpoint");
+    let original_dst = tcp.local_addr().expect("fallback endpoint address");
+    let udp = tokio::net::UdpSocket::bind(original_dst)
+        .await
+        .expect("bind UDP endpoint on TCP port");
+    let udp_responder = tokio::spawn(async move {
+        let mut query = vec![0u8; 512];
+        let (received, peer) = udp.recv_from(&mut query).await.expect("receive asis UDP query");
+        query.truncate(received);
+        query[..2].copy_from_slice(&0xdeadu16.to_be_bytes());
+        query[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+        udp.send_to(&query, peer)
+            .await
+            .expect("send wrong-ID truncated UDP response");
+    });
+    let query = make_a_query();
+
+    let error = asis_test_forwarder()
+        .resolve_with_context_and_profile(
+            &query,
+            DnsRequestMeta::new(None, Some(original_dst)),
+            IngressProfile::Udp {
+                advertised_size: 1232,
+            },
+        )
+        .await
+        .expect_err("wrong transaction ID must be rejected");
+    udp_responder.await.expect("UDP responder");
+    assert!(error.to_string().contains("transaction ID"));
+    assert!(tokio::time::timeout(Duration::from_millis(100), tcp.accept())
+        .await
+        .is_err());
+}
+
+struct WrongIdUpstream {
+    response: Vec<u8>,
+    call_count: AtomicUsize,
+}
+
+#[async_trait]
+impl DnsUpstreamPool for WrongIdUpstream {
+    async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(self.response.clone())
+    }
+}
+
+#[tokio::test]
+async fn named_wrong_id_response_is_rejected_before_cache() {
+    let mut query = make_a_query();
+    query[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+    let mut response = make_a_response([192, 0, 2, 42], 60);
+    response[..2].copy_from_slice(&0xdeadu16.to_be_bytes());
+    let upstream = Arc::new(WrongIdUpstream {
+        response,
+        call_count: AtomicUsize::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+
+    for _ in 0..2 {
+        assert!(forwarder.resolve_outcome(&query).await.is_err());
+    }
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn udp_asis_cache_is_partitioned_by_original_destination() {
     let first = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -233,8 +302,11 @@ async fn udp_asis_receives_valid_datagrams_larger_than_4096_bytes() {
         .expect("large UDP responder must receive the asis query")
         .expect("large UDP responder");
 
-    assert!(response.len() > 4096);
-    assert_eq!(response, sent);
+    assert!(sent.len() > 4096);
+    assert!(response.len() <= 1232);
+    assert_eq!(&response[0..2], &query[0..2]);
+    assert_ne!(u16::from_be_bytes([response[2], response[3]]) & 0x0200, 0);
+    assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
 }
 
 #[tokio::test]

@@ -21,6 +21,8 @@ pub(crate) fn is_truncated(response: &[u8]) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResponseError {
+    #[error("DNS response transaction ID {actual:#06x} does not match expected {expected:#06x}")]
+    TransactionIdMismatch { expected: u16, actual: u16 },
     #[error("DNS response is shorter than its header")]
     HeaderTruncated,
     #[error("DNS response has QR clear")]
@@ -143,6 +145,16 @@ impl ResponseTemplate {
         write_u16(&mut response, 8, counts[1])?;
         write_u16(&mut response, 10, counts[2])?;
         Ok(response)
+    }
+}
+
+pub(crate) fn check_transaction_id(expected: u16, response: &[u8]) -> Result<(), ResponseError> {
+    let bytes = response.get(..2).ok_or(ResponseError::HeaderTruncated)?;
+    let actual = u16::from_be_bytes([bytes[0], bytes[1]]);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ResponseError::TransactionIdMismatch { expected, actual })
     }
 }
 

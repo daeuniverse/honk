@@ -134,13 +134,15 @@ async fn urltest_node_impl(
         let addr = {
             let hook = URLTEST_RESOLVER.read().clone();
             match hook {
-                Some(hook) => hook(host.clone(), port)
+                Some(hook) => tokio::time::timeout(timeout, hook(host.clone(), port))
                     .await
+                    .map_err(|_| anyhow!("urltest DNS resolution timed out"))?
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-                None => crate::bootstrap::resolve(&host)
+                None => tokio::time::timeout(timeout, crate::bootstrap::resolve(&host))
                     .await
+                    .map_err(|_| anyhow!("urltest DNS resolution timed out"))?
                     .with_context(|| format!("failed to resolve '{host}:{port}'"))?
                     .into_iter()
                     .next()
@@ -186,16 +188,20 @@ async fn urltest_node_impl(
     let addr = {
         let hook = URLTEST_RESOLVER.read().clone();
         match hook {
-            Some(hook) => hook(host.clone(), port)
+            Some(hook) => tokio::time::timeout(timeout, hook(host.clone(), port))
                 .await
+                .map_err(|_| anyhow!("urltest DNS resolution timed out"))?
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-            None => tokio::net::lookup_host(format!("{host}:{port}"))
-                .await
-                .with_context(|| format!("failed to resolve '{host}:{port}'"))?
-                .next()
-                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
+            None => {
+                tokio::time::timeout(timeout, tokio::net::lookup_host(format!("{host}:{port}")))
+                    .await
+                    .map_err(|_| anyhow!("urltest DNS resolution timed out"))?
+                    .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+                    .next()
+                    .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?
+            }
         }
     };
     let feedback = group_manager.and_then(|manager| {
@@ -788,6 +794,9 @@ mod resolver_hook_tests {
                 if host == "example.invalid" && port == 443 {
                     called2.store(true, std::sync::atomic::Ordering::Relaxed);
                     vec!["127.0.0.1:443".parse().unwrap()]
+                } else if host == "slow.invalid" && port == 443 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Vec::new()
                 } else {
                     tokio::net::lookup_host(format!("{host}:{port}"))
                         .await
@@ -808,6 +817,15 @@ mod resolver_hook_tests {
         )
         .await;
         assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        let error = urltest_node(
+            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &handler,
+            "https://slow.invalid/",
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("slow resolver must be bounded by the probe timeout");
+        assert!(error.to_string().contains("DNS resolution timed out"));
         *URLTEST_RESOLVER.write() = None;
     }
 }

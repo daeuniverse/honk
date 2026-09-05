@@ -28,6 +28,9 @@ pub(super) fn patch_txid(mut response: Vec<u8>, txid: u16) -> Vec<u8> {
     }
     response
 }
+fn normalize_ttl(ttl: u32) -> u32 {
+    if ttl & 0x8000_0000 != 0 { 0 } else { ttl }
+}
 
 /// RFC 2308 §5 negative-cache TTL: `min(SOA TTL, SOA MINIMUM)` from the
 /// authority section, falling back to `default_ttl` when no SOA record is
@@ -58,18 +61,23 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
             return default_ttl;
         }
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        let ttl = normalize_ttl(u32::from_be_bytes([
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]));
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         if i >= ancount && rtype == 6 && rdlength >= 20 && pos + 10 + rdlength <= data.len() {
             // SOA RDATA: MNAME, RNAME, SERIAL, REFRESH, RETRY, EXPIRE,
             // MINIMUM — the last u32 of RDATA.
-            let minimum = u32::from_be_bytes([
+            let minimum = normalize_ttl(u32::from_be_bytes([
                 data[pos + 10 + rdlength - 4],
                 data[pos + 10 + rdlength - 3],
                 data[pos + 10 + rdlength - 2],
                 data[pos + 10 + rdlength - 1],
-            ]);
-            return ttl.min(minimum).max(1);
+            ]));
+            return ttl.min(minimum);
         }
         pos += 10 + rdlength;
     }
@@ -157,8 +165,13 @@ pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
 
         // Record layout after NAME: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA(n)
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
-        if rtype != 41 && ttl > 0 && ttl < min_ttl {
+        let ttl = normalize_ttl(u32::from_be_bytes([
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]));
+        if rtype != 41 && ttl < min_ttl {
             min_ttl = ttl;
         }
 

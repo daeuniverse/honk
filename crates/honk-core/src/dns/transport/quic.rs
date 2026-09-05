@@ -4,7 +4,10 @@ use super::dial::{DialContext, dial_candidates};
 use crate::dns::endpoint::DnsEndpoint;
 
 /// Shared QUIC client config for DNS transports (15s keep-alive, cubic).
-pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::ClientConfig> {
+pub(super) async fn dns_quic_config(
+    endpoint: &DnsEndpoint,
+    alpn: &[&[u8]],
+) -> anyhow::Result<quinn::ClientConfig> {
     honk_outbound::quic::client_config(
         &honk_config::node::Node {
             outbound: honk_config::node::OutboundConfig::from_protocol(
@@ -15,6 +18,10 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
         alpn,
         honk_outbound::quic::QuicClientOptions {
             keep_alive: Some(Duration::from_secs(15)),
+            ticket_key: Some(format!(
+                "dns|{}|{}|{}",
+                endpoint.host, endpoint.port, endpoint.sni
+            )),
             ..honk_outbound::quic::QuicClientOptions::with_congestion(Some("cubic"))
         },
     )

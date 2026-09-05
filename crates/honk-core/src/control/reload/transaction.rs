@@ -113,6 +113,11 @@ impl ControlPlane {
     ) -> bool {
         let _reload = self.reload_lock.lock().await;
         let current = self.config.read().await.clone();
+        if new_config.global.nfqueue_enable != self.requested_nfqueue_enable {
+            error!("reload rejected: global.nfqueue_enable requires process restart");
+            return false;
+        }
+        new_config.global.nfqueue_enable = current.global.nfqueue_enable;
         rebase_subscription_nodes(&current, &mut new_config);
         new_config.ensure_local_direct_rules();
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
@@ -363,7 +368,6 @@ impl ControlPlane {
                 return false;
             }
         };
-        let new_outbound_id_map = build_outbound_id_map(&new_config);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
@@ -481,7 +485,6 @@ impl ControlPlane {
             let mut ebpf = self.ebpf.write().await;
             let projection_publication = self.dns_controller.prepare_projection_publication();
             let mut group_guard = self.group_manager.write();
-            let mut outbound_guard = self.outbound_id_map.write();
             let mut plan_guard = self.active_routing_plan.write();
             let mut runtime_guard = self.runtime_registry.write();
             'publication: {
@@ -621,7 +624,6 @@ impl ControlPlane {
                         .publish(&current_config.subscriptions, &config_guard.subscriptions);
                 }
                 *group_guard = Arc::clone(&new_group_manager);
-                *outbound_guard = new_outbound_id_map;
                 if routing_publication_needed {
                     *plan_guard = Arc::clone(&new_plan);
                 }

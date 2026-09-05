@@ -43,6 +43,7 @@ group {
 | — (not in dae) | `idle_timeout` | `null` | URLTest probe-suspension threshold after inactivity, in seconds. With `null`, the health layer uses 1800 seconds. |
 | — (not in dae) | `interrupt_connections` | `false` | Close tracked connections on an actual Selector, URLTest, or Fallback selection change. LoadBalance rotation does not trigger it. |
 | — (not in dae) | `id` | random UUID | Internal group identity generated when the field is absent. |
+A configured `final` must name an existing node, group, `direct`, or `block` when static validation has no enabled subscription that could materialize the name. If an enabled subscription may provide the name, static validation defers that check; an unresolved runtime `final` resolves to an empty plan and fails closed, never to an implicit `direct` fallback.
 
 ## Policies
 

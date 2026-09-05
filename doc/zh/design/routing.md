@@ -15,6 +15,7 @@
 `RoutingMatcherBuilder` 按优先级升序排列已编译路由，并把每条规则降低为 `honk-core` 与 `honk-ebpf` 共享的 dae `match_set` ABI。每个按类型拆分的 `MatchSet` 都携带 matcher 值、取反位、中间或最终出站、`must` 位与 mark。
 
 同一条件内的多个值形成 OR 链，不同条件形成 AND 链。中间结果 `LogicalOr` 与 `LogicalAnd` 保留这一结构，内核中无需分配规则对象。最后的 fallback 条目为未匹配流提供真实出站。
+物理 `MatchSet` bank 的硬上限为 `MAX_MATCH_SET_LEN` = 128 个 slot，其中包含最终 fallback。编译会先统计完整 plan；若将溢出，则在任何 BPF map 写入前拒绝整个 plan，绝不会截断或静默跳过规则。
 
 进入路由时，`route()` 准备全前缀的源、目的与 MAC key，并对选中的 bank 调用 `bpf_loop`。`RouteCtx` 在循环迭代之间维护 `GoodSubrule`、`BadRule`、`Must`、DNS 查询和域名已知状态。最终结果以 0–7 位编码出站、8–39 位编码 mark、40 位编码 `must`。
 

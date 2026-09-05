@@ -26,6 +26,21 @@ fn answer(request: &QueryContext, answer_count: u16) -> Vec<u8> {
 }
 
 #[test]
+fn checks_upstream_transaction_id_without_changing_template_validation() {
+    let request = query(0x1234, IngressProfile::Internal);
+    let response = answer(&request, 0);
+
+    assert!(super::check_transaction_id(0xaaaa, &response).is_ok());
+    assert!(matches!(
+        super::check_transaction_id(0x1234, &response),
+        Err(ResponseError::TransactionIdMismatch {
+            expected: 0x1234,
+            actual: 0xaaaa
+        })
+    ));
+    assert!(ResponseTemplate::validate(&request, &response).is_ok());
+}
+#[test]
 fn restores_each_callers_txid_for_full_profiles() {
     // Given
     let original = query(1, IngressProfile::Internal);

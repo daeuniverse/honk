@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -25,14 +26,21 @@ impl DnsForwarder {
         raw_query: &[u8],
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
-        match scope {
+        let response = match scope {
             RequestScope::Upstream(upstream) => {
                 self.upstream_pool.query(upstream.as_str(), raw_query).await
             }
             RequestScope::AsIs(destination) => {
                 self.query_asis(raw_query, *destination, ingress).await
             }
-        }
+        }?;
+        let expected_id = raw_query
+            .get(..2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .ok_or_else(|| anyhow::anyhow!("DNS query is shorter than its transaction ID"))?;
+        crate::dns::response::check_transaction_id(expected_id, &response)
+            .context("DNS upstream response transaction ID mismatch")?;
+        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -81,7 +89,9 @@ impl DnsForwarder {
             None,
             OutcomeStatus::Accepted,
             Provenance::Fresh,
-            EffectiveExpiry::do_not_cache(),
+            EffectiveExpiry::cacheable(Duration::from_secs(u64::from(
+                super::hosts::HOSTS_TTL_SECS,
+            ))),
             None,
             None,
             Vec::new(),
@@ -220,9 +230,15 @@ impl DnsForwarder {
         destination: SocketAddr,
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
+        let expected_id = raw_query
+            .get(..2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .ok_or_else(|| anyhow::anyhow!("DNS query is shorter than its transaction ID"))?;
         match ingress {
             IngressProfile::Udp { .. } => {
                 let response = self.query_asis_udp(raw_query, destination).await?;
+                crate::dns::response::check_transaction_id(expected_id, &response)
+                    .context("asis UDP response transaction ID mismatch")?;
                 if crate::dns::response::is_truncated(&response) {
                     debug!(
                         destination = %destination,

@@ -14,6 +14,8 @@ global {
 
 修改该设置必须重启进程；reload 会拒绝该变更。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建、固定队列前置检查失败，或数据路径准入前的队列/规则/健康检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。持久化 token generation 恢复失败仍为 fatal，因为分配器状态已无法确定。真实模式会先取得单实例锁，再执行该前置检查，因此正常交接会等待旧队列所有者，不会误降级；保留的 nftables table 会在绑定队列后由安装阶段回收。服务准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。进程级配置项见[全局配置参考](../reference/global.md)。
 
+SIGHUP 将配置中的请求值与启动时的用户请求比较，然后保留当前启动决策。因此，启动降级后仍可重载未修改的配置文件，且不会重新开启暂存；显式修改请求值仍要求重启。
+
 该 hook 的范围刻意保持狭窄：
 
 | 流量或状态 | 行为 |
@@ -48,7 +50,8 @@ flowchart LR
 | Verdict 所有权 | 不可 `Clone`、恰好一次的 `VerdictGuard`；未提交的 guard 在 drop 时发送 `NF_DROP` |
 | Ingest 所有权 | 单 actor，队列上限为 `256` 项和 `8 MiB` payload；仅当 actor dequeue 时才尝试取得 UDP slow-path permit |
 | nftables 所有权 | 单个原子事务独占精确的 `inet honk_nfqueue` / `udp_decision`，即优先级 `-250` 的 `inet prerouting` filter chain；只有携带 Pending 签名的 UDP 才进入队列 |
-| 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。输入畸形或截断、`ENOBUFS`、listener 意外退出以及 verdict socket 失败均为 fatal |
+| 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。包本地 capture 截断或 L3/L4 畸形只对该 skb 发出精确 `NF_DROP`，listener 继续运行。`ENOBUFS` 表示内核已丢弃未交付的包，listener 继续接收。netlink/NFQUEUE 外层 metadata、version、queue 或 family 矛盾、listener 意外退出以及 verdict socket 失败仍为 fatal |
+因此，包本地失败只影响对应 skb。外层 netlink datagram 截断或损坏属于结构性错误，仍为 fatal；verdict 发送失败也为 fatal，因为该 skb 的所有权此时不确定。
 
 服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
 

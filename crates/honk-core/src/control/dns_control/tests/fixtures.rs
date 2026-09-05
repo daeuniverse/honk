@@ -8,10 +8,14 @@ pub(super) struct SlowUpstream {
 
 #[async_trait::async_trait]
 impl DnsUpstreamPool for SlowUpstream {
-    async fn query(&self, _name: &str, _raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query(&self, _name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
-        Ok(self.response.clone())
+        let mut response = self.response.clone();
+        if let Some(id) = response.get_mut(..2) {
+            id.copy_from_slice(&raw[..2]);
+        }
+        Ok(response)
     }
 }
 

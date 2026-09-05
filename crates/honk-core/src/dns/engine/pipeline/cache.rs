@@ -108,7 +108,10 @@ pub(super) async fn store(
         return EffectiveExpiry::do_not_cache();
     }
     if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
-        let negative_ttl = extract_soa_negative_ttl(response, 60).clamp(1, 300);
+        let negative_ttl = extract_soa_negative_ttl(response, 60).min(300);
+        if negative_ttl == 0 {
+            return EffectiveExpiry::do_not_cache();
+        }
         if context.forwarder.cache_enabled {
             let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
             context

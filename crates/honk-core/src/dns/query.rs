@@ -12,6 +12,13 @@ const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;
 const OPT_TYPE: u16 = 41;
 const ALLOWED_QUERY_FLAGS: u16 = 0x0130;
+const MIN_UDP_ADVERTISED_SIZE: u16 = 512;
+const MAX_UDP_ADVERTISED_SIZE: u16 = 1232;
+
+#[inline]
+fn clamp_udp_advertised_size(size: u16) -> u16 {
+    size.clamp(MIN_UDP_ADVERTISED_SIZE, MAX_UDP_ADVERTISED_SIZE)
+}
 
 /// Unforgeable evidence that an ingress adapter validated the exact query.
 #[derive(Clone, Copy, Debug)]
@@ -74,10 +81,9 @@ pub(crate) fn validate_exact_dns_query(data: &[u8]) -> Option<ValidatedDnsQuery>
 
     let query = QueryContext::parse(data).ok()?;
     query.qname()?.to_domain_name()?;
-    let advertised_size = query
-        .edns()
-        .map(|edns| edns.advertised_size())
-        .unwrap_or(512);
+    let advertised_size = query.edns().map_or(MIN_UDP_ADVERTISED_SIZE, |edns| {
+        clamp_udp_advertised_size(edns.advertised_size())
+    });
     Some(ValidatedDnsQuery(IngressProfile::Udp { advertised_size }))
 }
 
@@ -91,7 +97,7 @@ pub(crate) fn udp_ingress_profile(data: &[u8]) -> IngressProfile {
     let advertised_size = QueryContext::parse(data)
         .ok()
         .and_then(|query| query.edns().map(|edns| edns.advertised_size()))
-        .unwrap_or(512);
+        .map_or(MIN_UDP_ADVERTISED_SIZE, clamp_udp_advertised_size);
     IngressProfile::Udp { advertised_size }
 }
 

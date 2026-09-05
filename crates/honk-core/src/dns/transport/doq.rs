@@ -34,7 +34,7 @@ pub struct DoqClient {
 
 impl DoqClient {
     pub async fn new(dial: DialContext) -> anyhow::Result<Arc<Self>> {
-        let quic_config = dns_quic_config(&[b"doq"]).await?;
+        let quic_config = dns_quic_config(&dial.endpoint, &[b"doq"]).await?;
         Ok(Arc::new(Self {
             dial,
             quic_config,
@@ -83,6 +83,8 @@ impl DoqClient {
             }
 
             let mut resp = read_length_prefixed(&mut recv, self.dial.query_timeout).await?;
+            crate::dns::response::check_transaction_id(0, &resp)
+                .map_err(|error| anyhow::anyhow!("DoQ response transaction ID: {error}"))?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &resp)
             {

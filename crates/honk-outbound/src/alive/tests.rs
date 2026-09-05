@@ -1272,3 +1272,67 @@ fn test_report_dial_latency_ignores_builtin_nodes() {
         ));
     }
 }
+
+#[test]
+fn removing_node_reclaims_health_state_and_blocks_stale_probe_writes() {
+    let set = AliveDialerSet::new();
+    let node = id(200);
+    set.register_node(node, "node".into(), "127.0.0.1:1080".into());
+    set.record_probe_latency(
+        node,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert!(set.collections.read().contains_key(&node));
+
+    set.remove_node(node);
+    assert!(!set.registered_nodes().contains_key(&node));
+    assert!(!set.states.read().contains_key(&node));
+    assert!(!set.collections.read().contains_key(&node));
+    assert!(
+        set.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
+
+    // Feedback from a removed node cannot recreate retained state.
+    set.record_probe_latency(
+        node,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(20),
+    );
+    assert!(!set.collections.read().contains_key(&node));
+    assert!(!set.states.read().contains_key(&node));
+    set.notify_check_tcp(node);
+    set.notify_check_dns_udp(node);
+    assert!(!set.last_emergency_tcp.lock().contains_key(&node));
+    assert!(!set.last_emergency_udp.lock().contains_key(&node));
+    set.register_node(node, "node".into(), "127.0.0.1:1080".into());
+    set.record_probe_latency(
+        node,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(30),
+    );
+    assert_eq!(
+        set.get_last_latency(node, ProbeDomain::Tcp, IpVersion::V4),
+        Some(Duration::from_millis(30))
+    );
+}
+
+#[test]
+fn custom_url_reload_prunes_removed_member_tags() {
+    let set = AliveDialerSet::new();
+    let url = "http://check.example";
+    set.set_url_member_resolver(Some(Arc::new(|group| {
+        (group == "g")
+            .then(|| vec![("live".into(), "leaf".into())])
+            .unwrap_or_default()
+    })));
+    set.sync_group_check_urls(&[("g".into(), url.into())]);
+    set.record_url_probe_failure("stale", url);
+    assert!(!set.has_url_state("stale", url));
+    set.record_url_probe_success("live", url, Duration::from_millis(5));
+    assert!(set.has_url_state("live", url));
+}

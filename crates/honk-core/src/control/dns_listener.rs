@@ -753,15 +753,17 @@ mod tests {
         assert_eq!(
             validate_exact_dns_query(&wire).unwrap().ingress(),
             crate::dns::query::IngressProfile::Udp {
-                advertised_size: u16::MAX
+                advertised_size: 1232
             }
         );
         let mut undersized = wire.clone();
         let opt_class = undersized.len() - 8;
-        undersized[opt_class..opt_class + 2].copy_from_slice(&1u16.to_be_bytes());
+        undersized[opt_class..opt_class + 2].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(
             validate_exact_dns_query(&undersized).unwrap().ingress(),
-            crate::dns::query::IngressProfile::Udp { advertised_size: 1 }
+            crate::dns::query::IngressProfile::Udp {
+                advertised_size: 512
+            }
         );
 
         let mut opcode_query = query("opcode.example", 0x5252);

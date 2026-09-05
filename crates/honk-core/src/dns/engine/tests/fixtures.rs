@@ -5,7 +5,7 @@ struct SequenceExchange {
 }
 #[async_trait]
 impl DnsUpstreamPool for SequenceExchange {
-    async fn query(&self, upstream: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query(&self, upstream: &str, query: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(cache) = &self.cache_probe {
             assert!(
@@ -18,6 +18,12 @@ impl DnsUpstreamPool for SequenceExchange {
             .expect("reply lock")
             .get_mut(upstream)
             .and_then(VecDeque::pop_front)
+            .map(|reply| {
+                reply.map(|mut response| {
+                    response[0..2].copy_from_slice(&query[0..2]);
+                    response
+                })
+            })
             .unwrap_or_else(|| anyhow::bail!("missing reply for {upstream}"))
     }
 }

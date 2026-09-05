@@ -8,7 +8,7 @@ use crate::dns::forwarder::{
     DnsForwardError, ResolveMode, SERVE_STALE_TTL_SECS, make_empty_response, traversal_strings,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
-use crate::dns::planner::{ResponseTraversal, UpstreamTag};
+use crate::dns::planner::{RequestScope, ResponseTraversal, UpstreamTag};
 use crate::dns::singleflight::FlightLeader;
 
 pub(super) async fn run_as_leader(
@@ -96,8 +96,11 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                 strict_reusable &= response_strict_reusable;
                 response = context
                     .forwarder
-                    .upstream_pool
-                    .query(upstream.as_str(), context.raw_query)
+                    .exchange(
+                        &RequestScope::Upstream(upstream.clone()),
+                        context.raw_query,
+                        context.prepared.query().ingress(),
+                    )
                     .await
                     .map_err(|source| DnsForwardError::Exchange {
                         upstream: upstream.as_str().to_owned(),

@@ -600,6 +600,7 @@ impl Hysteria2Handler {
                 conn_receive_window: hy2.init_conn_recv_window.or(Some(8 << 20)),
                 disable_mtu_discovery: hy2.disable_mtu_discovery == Some(true),
                 max_udp_payload_size: hy2.quic.mtu,
+                ticket_key: None,
             },
         )
         .await?;

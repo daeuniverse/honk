@@ -127,6 +127,8 @@ Probe and traffic failures have separate counters. Probe failures apply exponent
 
 A dead state normally needs two consecutive probe successes to recover. `notify_network_change` clears stale cooldowns after a relevant link, address, or route change, primes dead states, and triggers probes so one fresh success can verify recovery. Newly registered nodes receive a 60-second grace period during which non-forced failures are recorded but do not count toward death. Probe history retains 100 entries per node, domain, and address family.
 
+Reload reclaims health, latency, probe-history, and trigger state for removed nodes and rejects late feedback for them. This authority covers all current configured nodes, including nodes outside scheduled probe groups; traffic feedback must not depend on periodic-probe registration. Custom-URL state is retained only for current member-tag/URL pairs.
+
 | Probe path | Behavior |
 | --- | --- |
 | TCP | Sends the configured HTTP method to `tcp_check_url` through the node, or performs a raw TCP connect when no HTTP probe applies. A cold reusable node first establishes its session/client in a throwaway runtime; setup is untimed, then only a completed HTTP exchange records warm-path RTT in the matching TCP family state. Setup and target-exchange failures both update liveness/cooldown without contributing latency or ranking strikes. |

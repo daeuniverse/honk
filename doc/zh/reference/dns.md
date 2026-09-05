@@ -123,6 +123,7 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `ip(192.0.2.0/24, geoip: private, ...)` | 仅 response | 任一应答 IP 属于所列 CIDR 或 GeoIP 集时匹配。 |
 
 透明 53 端口与 `dns.bind` 入口的逻辑来源是 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 解析使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有逻辑来源。来源未知时，正向和取反的 `sip` 条件都为 false，请求路由会继续执行下一条规则或 fallback。response 路由不接受 `sip`。
+畸形、空值、未知或其他无效的受支持 DNS predicate（包括 qtype 参数）会拒绝配置。已知但不支持的 `sub(...)`、`node(...)` 与 `subnode(...)` 函数仅产生告警：它们作为 conjunct 出现时，honk 会跳过整条规则，而不会把剩余条件当作更宽的匹配继续求值。
 
 ### Request 动作
 
@@ -172,6 +173,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的 wire RR TTL。`0` 保留应答 TTL。 |
 | `max_cache_size` | `10000` | 条目上限。它还按每个配置条目 4 KiB 缩放保留 query/response wire 字节预算；每个分片至少 65,535 字节，全局上限 64 MiB。`0` 会告警并钳制为一个条目。 |
 | `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 使该域名不可缓存。 |
+
+保留上游 TTL 时，零 TTL 和最高位为一的 wire TTL 不会进入缓存或 DNS 路由投影；最高位为一的值按 RFC 2181 归零。显式非零的固定/配置 TTL 仍会覆盖上游值。
 
 Request 路由先于缓存查询执行。缓存与后台 refresh 的标识使用选中的上游或精确 `asis` 目的地址，而不是原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
 

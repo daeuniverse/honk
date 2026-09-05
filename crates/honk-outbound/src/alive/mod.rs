@@ -81,9 +81,9 @@ const MAX_PROBE_BACKOFF_FAILURES: u32 = 10;
 /// rejected) from immediately marking a dead node as alive.
 const RECOVERY_SUCCESSES_NEEDED: u32 = 2;
 
-/// Grace period for newly registered nodes. Probe failures during this
-/// window don't count toward the death threshold, preventing new nodes
-/// from being immediately marked dead before the first probe completes.
+/// Grace period for newly active nodes. Probe failures during this window
+/// don't count toward the death threshold, preventing new nodes from being
+/// immediately marked dead before the first probe completes.
 pub(crate) const GRACE_PERIOD: Duration = Duration::from_secs(60);
 
 /// Cooldown between emergency probes to protect the health check pool.
@@ -287,8 +287,9 @@ pub const DEFAULT_URLTEST_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 /// are not pushed to the kernel map.
 pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
 
-/// A node registered for health checking: the content-derived NodeId is
-/// the map key; the name is kept for logs and the prober's node lookup.
+/// A node known to the current config or scheduled for health checking: the
+/// content-derived NodeId is the map key; the name is kept for logs and the
+/// prober's node lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     pub name: String,
@@ -326,6 +327,12 @@ pub struct AliveDialerSet {
     states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
+    /// Current config-node authority for feedback and probe state. `None`
+    /// keeps standalone callers permissive until core installs a snapshot.
+    active_nodes: RwLock<Option<HashSet<Uuid>>>,
+    /// Nodes selected for scheduled periodic probes. This is intentionally
+    /// narrower than `active_nodes`: ungrouped config nodes still receive
+    /// traffic feedback without becoming periodic probe targets.
     registered: RwLock<HashMap<Uuid, RegisteredNode>>,
     ebpf_callback: RwLock<Option<EbpfAliveCallback>>,
     death_callback: RwLock<Option<DeathCallback>>,
@@ -361,7 +368,7 @@ pub struct AliveDialerSet {
     /// through the node's UDP data path after the TCP probe.
     udp_prober: RwLock<Option<UdpProberRef>>,
     score_feedback: RwLock<Option<ScoreFeedbackFactory>>,
-    /// Timestamp when each node was first registered (for grace period).
+    /// Timestamp when each node became active (for grace period).
     node_registered_at: RwLock<HashMap<Uuid, Instant>>,
     /// Per-node per-domain/IP-version probe history for API/UI.
     probe_history: RwLock<HashMap<(Uuid, usize), Vec<ProbeRecord>>>,
@@ -394,6 +401,9 @@ pub struct AliveDialerSet {
     url_collections: RwLock<HashMap<(String, String), Arc<DialerCollection>>>,
     /// check_url → cached resolved IPs (same caching as `check_url_ips`).
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
+    /// When installed, only current (member tag, URL) pairs may mutate URL
+    /// probe state. A missing resolver keeps standalone tests permissive.
+    active_url_members: RwLock<Option<HashSet<(String, String)>>>,
 }
 
 /// Default probe target for the `direct` node when no `bootstrap_resolver`
@@ -413,6 +423,7 @@ impl AliveDialerSet {
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
+            active_nodes: RwLock::new(None),
             registered: RwLock::new(HashMap::new()),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
@@ -444,6 +455,7 @@ impl AliveDialerSet {
             url_states: RwLock::new(HashMap::new()),
             url_collections: RwLock::new(HashMap::new()),
             url_check_ips: RwLock::new(HashMap::new()),
+            active_url_members: RwLock::new(None),
         }
     }
 
@@ -595,13 +607,28 @@ impl AliveDialerSet {
         self.trigger_rx.lock().take()
     }
 
-    fn with_state<F, R>(&self, node_id: Uuid, idx: usize, f: F) -> R
+    fn admit_feedback(
+        &self,
+        node_id: Uuid,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, Option<HashSet<Uuid>>>> {
+        let active_nodes = self.active_nodes.read();
+        if active_nodes
+            .as_ref()
+            .is_some_and(|nodes| !nodes.contains(&node_id))
+        {
+            return None;
+        }
+        Some(active_nodes)
+    }
+
+    fn with_state<F, R>(&self, node_id: Uuid, idx: usize, f: F) -> Option<R>
     where
         F: FnOnce(&mut PerProtocolState) -> R,
     {
+        let _registration = self.admit_feedback(node_id)?;
         let mut states = self.states.write();
         let entry = states.entry(node_id).or_insert_with(fresh_states);
-        f(&mut entry[idx])
+        Some(f(&mut entry[idx]))
     }
 
     fn read_state(&self, node_id: Uuid, idx: usize) -> PerProtocolState {
@@ -674,16 +701,19 @@ impl AliveDialerSet {
         latency: Duration,
     ) {
         let idx = alive_index(domain, ipver);
-        let was_alive = self.with_state(node_id, idx, |e| {
+        let Some(was_alive) = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             e.reset_on_success();
             was
-        });
+        }) else {
+            return;
+        };
         if !was_alive {
             self.push_ebpf(node_id, domain, ipver, true);
         }
-        if latency > Duration::ZERO {
-            let coll = self.get_or_create_collection(node_id, idx);
+        if latency > Duration::ZERO
+            && let Some(coll) = self.get_or_create_collection(node_id, idx)
+        {
             coll.mark_available(latency);
         }
         self.record_probe_history(node_id, idx, true, Some(latency));
@@ -707,6 +737,9 @@ impl AliveDialerSet {
         latency: Option<Duration>,
     ) {
         let key = (node_id, idx);
+        let Some(_registration) = self.admit_feedback(node_id) else {
+            return;
+        };
         let mut history = self.probe_history.write();
         let entry = history.entry(key).or_default();
         entry.push(ProbeRecord {
@@ -761,7 +794,7 @@ impl AliveDialerSet {
             probe_failure_threshold(domain)
         };
 
-        let (was_alive, _failures) = self.with_state(node_id, idx, |e| {
+        let Some((was_alive, _failures)) = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             e.consecutive_successes = 0;
             if force {
@@ -789,7 +822,9 @@ impl AliveDialerSet {
                 }
             }
             (was, e.consecutive_failures + e.traffic_failures)
-        });
+        }) else {
+            return;
+        };
 
         if was_alive && !force {
             let still_alive = self.read_state(node_id, idx).alive;
@@ -806,11 +841,10 @@ impl AliveDialerSet {
                 }
             }
         }
-        if !is_traffic {
-            // Probe counters own liveness and cooldown; ranking strikes are
-            // reserved for real dial failures.
-            self.get_or_create_collection(node_id, idx)
-                .mark_probe_unavailable();
+        if !is_traffic && let Some(coll) = self.get_or_create_collection(node_id, idx) {
+            // Probe counters own liveness; ranking strikes are reserved for
+            // real dial failures.
+            coll.mark_probe_unavailable();
         }
 
         self.record_probe_history(node_id, idx, false, None);
@@ -854,6 +888,9 @@ impl AliveDialerSet {
     /// the data-UDP health domain (Go: `ReportAvailableTraffic`).
     pub fn report_available_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let idx = alive_index(domain, ipver);
+        let Some(_authority) = self.admit_feedback(node_id) else {
+            return;
+        };
         // A real dial success breaks the consecutive dial-failure streak —
         // even when the state is clean and nothing else needs updating.
         if let Some(arr) = self.collections.read().get(&node_id) {
@@ -867,11 +904,14 @@ impl AliveDialerSet {
         {
             return;
         }
-        let was_alive = self.with_state(node_id, idx, |e| {
+        drop(_authority);
+        let Some(was_alive) = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             e.reset_on_success();
             was
-        });
+        }) else {
+            return;
+        };
         if !was_alive {
             self.push_ebpf(node_id, domain, ipver, true);
             tracing::info!(
@@ -886,6 +926,9 @@ impl AliveDialerSet {
     /// Trigger an emergency TCP health check on this node.
     /// Rate-limited to once per EMERGENCY_PROBE_COOLDOWN to protect the worker pool.
     pub fn notify_check_tcp(&self, node_id: Uuid) {
+        let Some(registration) = self.admit_feedback(node_id) else {
+            return;
+        };
         let now = Instant::now();
         let mut last = self.last_emergency_tcp.lock();
         if let Some(prev) = last.get(&node_id)
@@ -895,12 +938,16 @@ impl AliveDialerSet {
         }
         last.insert(node_id, now);
         drop(last);
+        drop(registration);
         self.trigger_probe(node_id);
     }
 
     /// Trigger an emergency DNS UDP health check on this node.
     /// Rate-limited to once per EMERGENCY_PROBE_COOLDOWN.
     pub fn notify_check_dns_udp(&self, node_id: Uuid) {
+        let Some(registration) = self.admit_feedback(node_id) else {
+            return;
+        };
         let now = Instant::now();
         let mut last = self.last_emergency_udp.lock();
         if let Some(prev) = last.get(&node_id)
@@ -910,6 +957,7 @@ impl AliveDialerSet {
         }
         last.insert(node_id, now);
         drop(last);
+        drop(registration);
         self.trigger_probe(node_id);
     }
 
@@ -927,7 +975,8 @@ impl AliveDialerSet {
     }
 
     /// Get (or create) the `DialerCollection` for a given node and domain index.
-    fn get_or_create_collection(&self, node_id: Uuid, idx: usize) -> Arc<DialerCollection> {
+    fn get_or_create_collection(&self, node_id: Uuid, idx: usize) -> Option<Arc<DialerCollection>> {
+        let _registration = self.admit_feedback(node_id)?;
         let mut cols = self.collections.write();
         let arr = cols.entry(node_id).or_insert_with(|| {
             [
@@ -939,7 +988,7 @@ impl AliveDialerSet {
                 Arc::new(DialerCollection::new()),
             ]
         });
-        Arc::clone(&arr[idx])
+        Some(Arc::clone(&arr[idx]))
     }
 
     /// Record a successful probe latency for a node + domain + IP version.
@@ -952,7 +1001,7 @@ impl AliveDialerSet {
         latency: Duration,
     ) {
         let idx = alive_index(domain, ipver);
-        let revived = self.with_state(node_id, idx, |e| {
+        let Some(revived) = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             if was {
                 e.reset_on_success();
@@ -979,12 +1028,15 @@ impl AliveDialerSet {
                     false
                 }
             }
-        });
+        }) else {
+            return;
+        };
         if revived {
             self.push_ebpf(node_id, domain, ipver, true);
         }
-        let coll = self.get_or_create_collection(node_id, idx);
-        if revived || self.read_state(node_id, idx).alive {
+        if let Some(coll) = self.get_or_create_collection(node_id, idx)
+            && (revived || self.read_state(node_id, idx).alive)
+        {
             coll.mark_available(latency);
         }
 
@@ -1078,8 +1130,9 @@ impl AliveDialerSet {
         if node_id == BLOCK_NODE_ID || node_id == DIRECT_NODE_ID {
             return;
         }
-        self.get_or_create_collection(node_id, alive_index(domain, ipver))
-            .record_dial_failure();
+        if let Some(coll) = self.get_or_create_collection(node_id, alive_index(domain, ipver)) {
+            coll.record_dial_failure();
+        }
     }
 
     /// Feed one REAL proxied dial's wall-clock latency (network round trip
@@ -1104,7 +1157,9 @@ impl AliveDialerSet {
         if node_id == DIRECT_NODE_ID || node_id == BLOCK_NODE_ID {
             return false;
         }
-        let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
+        let Some(coll) = self.get_or_create_collection(node_id, alive_index(domain, ipver)) else {
+            return false;
+        };
         match coll.record_traffic_latency(elapsed) {
             TrafficVerdict::Slow => {
                 if coll.bump_slow_streak() >= SLOW_DIAL_STREAK_MAX {
@@ -1121,15 +1176,15 @@ impl AliveDialerSet {
             }
         }
     }
-
     /// Seed a persisted delay sample into the node's TCP-v4 latency
     /// history (cache.db warm start). Does NOT touch alive state — probes
     /// decide liveness; this only pre-seeds ranking data so URLTest groups
     /// don't start cold after a restart.
     pub fn restore_latency(&self, node_id: Uuid, latency: Duration, at: std::time::SystemTime) {
         let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
-        let coll = self.get_or_create_collection(node_id, idx);
-        coll.restore_sample(latency, at);
+        if let Some(coll) = self.get_or_create_collection(node_id, idx) {
+            coll.restore_sample(latency, at);
+        }
     }
 
     /// Snapshot every node's last real TCP-v4 latency sample for
@@ -1147,25 +1202,89 @@ impl AliveDialerSet {
             .collect()
     }
 
-    pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
+    /// Replace the current config-node authority used by traffic and probe
+    /// feedback. Nodes absent from the snapshot lose all per-node state while
+    /// the authority write is held, so late feedback cannot recreate them.
+    pub fn sync_active_nodes(&self, nodes: HashSet<Uuid>) {
+        let mut authority = self.active_nodes.write();
+        let previous = std::mem::replace(&mut *authority, Some(nodes));
+        let current = authority
+            .as_ref()
+            .expect("active node authority was just installed");
+        let now = Instant::now();
+
+        {
+            let mut registered_at = self.node_registered_at.write();
+            for node_id in current {
+                if previous.as_ref().is_none_or(|old| !old.contains(node_id)) {
+                    registered_at.insert(*node_id, now);
+                }
+            }
+            registered_at.retain(|node_id, _| current.contains(node_id));
+        }
         self.registered
             .write()
-            .insert(node_id, RegisteredNode { name, address });
+            .retain(|node_id, _| current.contains(node_id));
+        self.states
+            .write()
+            .retain(|node_id, _| current.contains(node_id));
+        self.collections
+            .write()
+            .retain(|node_id, _| current.contains(node_id));
+        self.node_urltest_groups
+            .write()
+            .retain(|node_id, _| current.contains(node_id));
+        self.probe_history
+            .write()
+            .retain(|(node_id, _), _| current.contains(node_id));
+        self.last_emergency_tcp
+            .lock()
+            .retain(|node_id, _| current.contains(node_id));
+        self.last_emergency_udp
+            .lock()
+            .retain(|node_id, _| current.contains(node_id));
+        self.trigger_pending
+            .lock()
+            .retain(|node_id| current.contains(node_id));
+        self.urltest_group_members
+            .write()
+            .values_mut()
+            .for_each(|members| members.retain(|node_id| current.contains(node_id)));
+    }
+
+    pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
+        let node = RegisteredNode { name, address };
+        let mut authority = self.active_nodes.write();
+        if let Some(active) = authority.as_mut() {
+            active.insert(node_id);
+        } else {
+            *authority = Some(HashSet::from([node_id]));
+        }
+        self.registered.write().insert(node_id, node);
         self.node_registered_at
             .write()
             .insert(node_id, Instant::now());
-        let mut states = self.states.write();
-        states.entry(node_id).or_insert_with(fresh_states);
+        self.states
+            .write()
+            .entry(node_id)
+            .or_insert_with(fresh_states);
     }
 
-    /// Snapshot of currently registered nodes (NodeId → name/address), used
-    /// by config reload to diff and re-register only what changed.
+    /// Remove a node from scheduled periodic probes without dropping its
+    /// current-config traffic state. Core uses this when a node leaves all
+    /// groups but remains a valid configured outbound.
+    pub fn unregister_probe_node(&self, node_id: Uuid) {
+        self.registered.write().remove(&node_id);
+    }
+
+    /// Snapshot of nodes selected for scheduled periodic probes, used by
+    /// config reload to diff and re-register only what changed.
     pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {
         self.registered.read().clone()
     }
 
-    /// Registered display name for logs and prober lookups; falls back to
-    /// the ID itself for nodes driven without registration (tests).
+    /// Registered display name for logs and prober lookups; falls back to the
+    /// ID for active nodes without a scheduled probe, or standalone tests.
     pub fn node_name(&self, node_id: Uuid) -> String {
         self.registered
             .read()
@@ -1175,12 +1294,25 @@ impl AliveDialerSet {
     }
 
     pub fn remove_node(&self, node_id: Uuid) {
+        // Serialize removal with late feedback: hold the authority write while
+        // every per-node map is pruned, so retired nodes cannot reappear.
+        let mut authority = self.active_nodes.write();
+        authority.get_or_insert_with(HashSet::new).remove(&node_id);
         self.registered.write().remove(&node_id);
         self.states.write().remove(&node_id);
+        self.collections.write().remove(&node_id);
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);
-        let mut history = self.probe_history.write();
-        history.retain(|(id, _), _| *id != node_id);
+        self.last_emergency_tcp.lock().remove(&node_id);
+        self.last_emergency_udp.lock().remove(&node_id);
+        self.trigger_pending.lock().remove(&node_id);
+        self.urltest_group_members
+            .write()
+            .values_mut()
+            .for_each(|members| members.retain(|id| *id != node_id));
+        self.probe_history
+            .write()
+            .retain(|(id, _), _| *id != node_id);
     }
 
     /// A link/address/route change invalidates probe backoff that may have
@@ -1210,6 +1342,9 @@ impl AliveDialerSet {
     }
 
     pub fn trigger_probe(&self, node_id: Uuid) {
+        let Some(_registration) = self.admit_feedback(node_id) else {
+            return;
+        };
         let mut pending = self.trigger_pending.lock();
         if !pending.insert(node_id) {
             return;
@@ -1280,16 +1415,34 @@ impl AliveDialerSet {
                 map.insert(group.clone(), url.clone());
             }
         }
-        let active_urls: HashSet<String> = self.group_check_urls.read().values().cloned().collect();
+        let active_urls: HashSet<String> = groups.iter().map(|(_, url)| url.clone()).collect();
+        // Keep the authority gate while pruning state. In-flight probes from a
+        // retiring manager either finish before this swap or are refused by
+        // the same gate and cannot recreate removed (tag, URL) entries.
+        let active_members = self.url_member_resolver.read().clone().map(|resolver| {
+            groups
+                .iter()
+                .flat_map(|(group, url)| {
+                    resolver(group)
+                        .into_iter()
+                        .map(move |(tag, _)| (tag, url.clone()))
+                })
+                .collect::<HashSet<_>>()
+        });
+        let mut authority = self.active_url_members.write();
+        *authority = active_members;
+        let active_members = authority.as_ref();
         self.url_check_ips
             .write()
             .retain(|url, _| active_urls.contains(url));
-        self.url_states
-            .write()
-            .retain(|(_, url), _| active_urls.contains(url));
-        self.url_collections
-            .write()
-            .retain(|(_, url), _| active_urls.contains(url));
+        self.url_states.write().retain(|key, _| {
+            active_urls.contains(&key.1)
+                && active_members.is_none_or(|members| members.contains(key))
+        });
+        self.url_collections.write().retain(|key, _| {
+            active_urls.contains(&key.1)
+                && active_members.is_none_or(|members| members.contains(key))
+        });
     }
 
     /// Groups with a custom check URL: `(group name, url)`.
@@ -1344,12 +1497,17 @@ impl AliveDialerSet {
         if ma > Duration::ZERO { Some(ma) } else { None }
     }
 
-    /// Record a successful custom-URL probe (recovery hysteresis mirrors
-    /// the global path: a dead node needs RECOVERY_SUCCESSES_NEEDED
-    /// consecutive successes to revive).
+    /// Record a successful custom-URL probe under the active reload authority.
     pub(crate) fn record_url_probe_success(&self, node_id: &str, url: &str, latency: Duration) {
-        self.mark_url_probe_succeeded(node_id, url);
         let key = (node_id.to_string(), url.to_string());
+        let authority = self.active_url_members.read();
+        if authority
+            .as_ref()
+            .is_some_and(|members| !members.contains(&key))
+        {
+            return;
+        }
+        self.mark_url_probe_succeeded(node_id, url);
         let coll = {
             let mut cols = self.url_collections.write();
             cols.entry(key)
@@ -1367,6 +1525,13 @@ impl AliveDialerSet {
     /// resolves to a builtin, or the tag stays filtered forever.
     pub(crate) fn mark_url_probe_succeeded(&self, node_id: &str, url: &str) {
         let key = (node_id.to_string(), url.to_string());
+        let authority = self.active_url_members.read();
+        if authority
+            .as_ref()
+            .is_some_and(|members| !members.contains(&key))
+        {
+            return;
+        }
         let mut states = self.url_states.write();
         let e = states.entry(key).or_insert_with(UrlProbeState::new);
         if e.alive {
@@ -1389,6 +1554,13 @@ impl AliveDialerSet {
     /// with no permanent stop.
     pub(crate) fn record_url_probe_failure(&self, node_id: &str, url: &str) {
         let key = (node_id.to_string(), url.to_string());
+        let authority = self.active_url_members.read();
+        if authority
+            .as_ref()
+            .is_some_and(|members| !members.contains(&key))
+        {
+            return;
+        }
         let mut states = self.url_states.write();
         let e = states.entry(key).or_insert_with(UrlProbeState::new);
         e.consecutive_successes = 0;
@@ -1428,9 +1600,12 @@ impl AliveDialerSet {
             }
             None => Self::merge_check_addrs(Vec::new(), url, Self::parse_url_port(url)),
         };
-        self.url_check_ips
-            .write()
-            .insert(url.to_string(), ips.clone());
+        let groups = self.group_check_urls.read();
+        if groups.values().any(|active| active == url) {
+            self.url_check_ips
+                .write()
+                .insert(url.to_string(), ips.clone());
+        }
         ips
     }
 

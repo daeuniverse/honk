@@ -26,6 +26,15 @@ routing {
 }
 ```
 
+## MatchSet capacity
+
+Each compiled physical routing bank has at most `MAX_MATCH_SET_LEN` = 128 `MatchSet` slots, including the fallback. An overflow rejects the complete compile before any map writes, so honk never truncates the rule list or publishes a partial bank.
+
+ [doc/zh/reference/routing.md#BDAA]
+## MatchSet 容量
+
+每个编译后的物理路由 bank 最多有 `MAX_MATCH_SET_LEN` = 128 个 `MatchSet` slot，其中包括 fallback。发生溢出时，完整编译会在任何 map 写入前被拒绝，因此 honk 不会截断规则列表，也不会发布部分 bank。
+
 ## Condition functions
 
 | Function | Accepted arguments | Internal `RoutingCondition` field |

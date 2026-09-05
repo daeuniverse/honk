@@ -156,7 +156,6 @@ pub(super) struct OutboundHealthPublisher {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     alive_set: Arc<AliveDialerSet>,
 }
 
@@ -165,59 +164,41 @@ impl OutboundHealthPublisher {
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<Config>>>,
         group_manager: SharedGroupManager,
-        outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
         alive_set: Arc<AliveDialerSet>,
     ) -> Self {
         Self {
             ebpf,
             config,
             group_manager,
-            outbound_id_map,
             alive_set,
         }
     }
 
     pub(super) async fn publish(self: Arc<Self>, node_id: uuid::Uuid, domain: u32, ipver: u32) {
-        // Reload takes these locks in the same order. Keep the config generation
-        // pinned while waiting so a queued edge cannot update a recycled slot.
+        // Reload holds config → eBPF → group-manager locks in this order. Keep
+        // the same generation pinned while recomputing every group that may
+        // share this leaf; a node→one-group map cannot update shared leaves.
         let config = self.config.read().await;
         let mut backend = self.ebpf.write().await;
-        let Some(outbound_idx) = self.outbound_id_map.read().get(&node_id).copied() else {
-            return;
-        };
-        let Some(group) = outbound_idx
-            .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
-            .and_then(|idx| config.groups.get(idx as usize))
-        else {
-            warn!(outbound_idx, %node_id, "outbound health slot has no current group");
-            return;
-        };
-        let probe_domain = match domain {
-            1 => ProbeDomain::DnsUdp,
-            2 => ProbeDomain::DataUdp,
-            _ => ProbeDomain::Tcp,
-        };
-        let ip_version = if ipver == 1 {
-            IpVersion::V6
-        } else {
-            IpVersion::V4
-        };
         let group_manager = self.group_manager.read().clone();
-        let alive = reload::group_datapath_alive(
-            group,
-            &group_manager,
-            &self.alive_set,
-            probe_domain,
-            ip_version,
-        );
-        if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
-            warn!(
-                %error,
-                outbound_idx,
-                domain,
-                ipver,
-                "failed to update outbound health in eBPF"
-            );
+        let snapshot =
+            reload::group_connectivity_snapshot(&config, &group_manager, &self.alive_set);
+        for &(outbound_idx, snapshot_domain, snapshot_ipver, alive) in &snapshot {
+            if snapshot_domain != domain || snapshot_ipver != ipver {
+                continue;
+            }
+            if let Err(error) =
+                backend.set_outbound_alive(outbound_idx, snapshot_domain, snapshot_ipver, alive)
+            {
+                warn!(
+                    %error,
+                    outbound_idx,
+                    domain,
+                    ipver,
+                    %node_id,
+                    "failed to update outbound health in eBPF"
+                );
+            }
         }
     }
 }
@@ -700,7 +681,6 @@ impl ControlPlane {
                 self.ebpf.clone(),
                 self.config.clone(),
                 self.group_manager.clone(),
-                self.outbound_id_map.clone(),
                 alive_set.clone(),
             ));
             alive_set.set_ebpf_callback(Box::new(
@@ -709,9 +689,6 @@ impl ControlPlane {
                         tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
                 },
             ));
-            let period = std::time::Duration::from_secs(interval_secs);
-            let handle = alive_set.spawn_health_check_loop(period, check_timeout);
-            self.background_tasks.lock().await.push(handle);
             info!(
                 "Outbound health check loop started (interval={}s)",
                 interval_secs

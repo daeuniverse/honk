@@ -43,6 +43,7 @@ group {
 | —（dae 中不可配置） | `idle_timeout` | `null` | URLTest 在不活跃后暂停探测的阈值，单位为秒。值为 `null` 时，健康检查层使用 1800 秒。 |
 | —（dae 中不可配置） | `interrupt_connections` | `false` | Selector、URLTest 或 Fallback 的选择实际变化时关闭已跟踪连接。LoadBalance 轮转不会触发。 |
 | —（dae 中不可配置） | `id` | 随机 UUID | 字段缺失时生成的内部组标识。 |
+当没有启用订阅可以在运行时提供名称时，配置的 `final` 必须指向现有节点、组、`direct` 或 `block`，否则静态校验会拒绝。若启用订阅可能提供该名称，静态校验会推迟检查；运行时仍未解析的 `final` 会解析为空 plan 并 fail closed，绝不会隐式回退到 `direct`。
 
 ## 策略
 

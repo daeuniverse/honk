@@ -408,10 +408,11 @@ Header protection 感知 packet-number 长度。接收时先 unmask 第一字节
 再推导一到四字节的 packet-number 长度；仅 mask 或 unmask 这么多字节。
 把所有 packet number 当作四字节，会破坏短 packet number 后面的 payload。
 
-进程级、有界 `SESSION_TICKETS` cache 按服务端身份保存 BoringSSL TLS 1.3
-session。BoringSSL resumption 要求显式 `SSL_set_session`。`pinSHA256`
-节点绝不 resume，因为 PSK 握手会绕过证书 pin。被拒绝的缓存 session 会
-被淘汰，同时不会删除并发连接写入的更新 ticket。
+进程级、有界 `SESSION_TICKETS` cache 只在每个 Boring config 组装的底层
+身份之下保存 BoringSSL TLS 1.3 session：endpoint identity、握手 SNI、ALPN、
+证书校验策略与 ECH 配置。BoringSSL resumption 要求显式
+`SSL_set_session`。`pinSHA256` 节点绝不 resume，因为 PSK 握手会绕过证书
+pin。被拒绝的缓存 session 会被淘汰，同时不会删除并发连接写入的更新 ticket。
 
 该 backend 可以承载真实 ECH 与 Chrome QUIC ClientHello。代理出站不向
 quinn 暴露 early packet key，因此不会发送 0-RTT early payload；互通

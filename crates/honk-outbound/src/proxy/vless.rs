@@ -606,7 +606,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for ResponseHeaderStrip<S> {
                             }
                             std::task::Poll::Ready(Ok(())) => {
                                 if rb.filled().is_empty() {
-                                    return std::task::Poll::Ready(Ok(())); // EOF before header
+                                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "VLESS: truncated response header",
+                                    )));
                                 }
                                 *filled += rb.filled().len();
                             }
@@ -636,7 +639,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for ResponseHeaderStrip<S> {
                         std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                         std::task::Poll::Ready(Ok(())) => {
                             if rb.filled().is_empty() {
-                                return std::task::Poll::Ready(Ok(())); // EOF in addon
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "VLESS: truncated response addons",
+                                )));
                             }
                             *remaining -= rb.filled().len();
                             if *remaining == 0 {
@@ -790,6 +796,9 @@ impl<S: AsyncRead + RawTcp + Unpin> AsyncRead for VisionStream<S> {
                     VisionState::Detect => {
                         if this.inbox.len() < 21 {
                             if this.inner_eof {
+                                // Fewer than UUID + frame header is an
+                                // ambiguous optional Vision probe. Preserve
+                                // it as raw data, including a partial header.
                                 this.state = VisionState::Raw;
                                 continue;
                             }
@@ -832,7 +841,17 @@ impl<S: AsyncRead + RawTcp + Unpin> AsyncRead for VisionStream<S> {
                             if content_remaining == 0 {
                                 continue;
                             }
-                            if this.inner_eof || buf.filled().len() > initial_filled {
+                            if this.inner_eof {
+                                this.state = VisionState::Failed;
+                                if buf.filled().len() > initial_filled {
+                                    return std::task::Poll::Ready(Ok(()));
+                                }
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "vision: truncated content",
+                                )));
+                            }
+                            if buf.filled().len() > initial_filled {
                                 return std::task::Poll::Ready(Ok(()));
                             }
                             true
@@ -848,7 +867,17 @@ impl<S: AsyncRead + RawTcp + Unpin> AsyncRead for VisionStream<S> {
                             if padding_remaining == 0 {
                                 continue;
                             }
-                            if this.inner_eof || buf.filled().len() > initial_filled {
+                            if this.inner_eof {
+                                this.state = VisionState::Failed;
+                                if buf.filled().len() > initial_filled {
+                                    return std::task::Poll::Ready(Ok(()));
+                                }
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "vision: truncated padding",
+                                )));
+                            }
+                            if buf.filled().len() > initial_filled {
                                 return std::task::Poll::Ready(Ok(()));
                             }
                             true
@@ -875,7 +904,24 @@ impl<S: AsyncRead + RawTcp + Unpin> AsyncRead for VisionStream<S> {
                                             padding_remaining,
                                             command,
                                         };
-                                        if this.inner_eof || buf.filled().len() > initial_filled {
+                                        if this.inner_eof {
+                                            if this.inbox.is_empty() {
+                                                // EOF exactly at a frame boundary is clean.
+                                                this.state = VisionState::Raw;
+                                                continue;
+                                            }
+                                            this.state = VisionState::Failed;
+                                            if buf.filled().len() > initial_filled {
+                                                return std::task::Poll::Ready(Ok(()));
+                                            }
+                                            return std::task::Poll::Ready(Err(
+                                                std::io::Error::new(
+                                                    std::io::ErrorKind::UnexpectedEof,
+                                                    "vision: truncated frame header",
+                                                ),
+                                            ));
+                                        }
+                                        if buf.filled().len() > initial_filled {
                                             return std::task::Poll::Ready(Ok(()));
                                         }
                                         true
@@ -1552,19 +1598,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vision_truncated_detected_frame_ends_cleanly() {
+    async fn vision_truncated_detected_frame_is_unexpected_eof() {
         let uuid = [5_u8; 16];
         let mut truncated_content = uuid.to_vec();
         truncated_content.extend_from_slice(&[0, 0, 5, 0, 0]);
         truncated_content.extend_from_slice(b"ab");
-        assert_eq!(unpad_all(uuid, &truncated_content, 2).await, b"ab");
+        let reader = ChunkedReader {
+            data: truncated_content.into(),
+            chunk: 2,
+        };
+        let mut stream = VisionStream::new(reader, uuid);
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .await
+            .expect_err("recognized frame with short content must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, b"ab", "already-delivered content must be preserved");
 
         let mut truncated_padding = uuid.to_vec();
         truncated_padding.extend_from_slice(&[0, 0, 3, 0, 5]);
         truncated_padding.extend_from_slice(b"abc\0\0");
-        assert_eq!(unpad_all(uuid, &truncated_padding, 3).await, b"abc");
+        let reader = ChunkedReader {
+            data: truncated_padding.into(),
+            chunk: 3,
+        };
+        let mut stream = VisionStream::new(reader, uuid);
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .await
+            .expect_err("recognized frame with short padding must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            output, b"abc",
+            "already-delivered content must be preserved"
+        );
     }
-
     #[tokio::test]
     async fn vision_sub_probe_size_streams_pass_through_raw() {
         let uuid = [6_u8; 16];
@@ -1737,6 +1807,24 @@ mod tests {
         let mut out = Vec::new();
         let err = stream.read_to_end(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn response_strip_rejects_partial_header_and_addon() {
+        for data in [vec![0x00], vec![0x00, 0x02, 0xaa]] {
+            let reader = ChunkedReader {
+                data: data.into_iter().collect(),
+                chunk: 1,
+            };
+            let mut stream = ResponseHeaderStrip::new(reader);
+            let mut output = Vec::new();
+            let error = stream
+                .read_to_end(&mut output)
+                .await
+                .expect_err("truncated VLESS response metadata must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert!(output.is_empty());
+        }
     }
 
     #[tokio::test]

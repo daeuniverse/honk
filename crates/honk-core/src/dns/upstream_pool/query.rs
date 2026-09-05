@@ -138,6 +138,12 @@ impl UpstreamPool {
         let response = transport
             .exchange(raw_query, route.feedback.as_ref())
             .await?;
+        let expected_id = raw_query
+            .get(..2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .ok_or_else(|| anyhow::anyhow!("DNS query is shorter than its transaction ID"))?;
+        crate::dns::response::check_transaction_id(expected_id, &response)
+            .context("proxied UDP response transaction ID mismatch")?;
         let response = if crate::dns::response::is_truncated(&response) {
             let tcp_feedback = self.tcp_feedback_for_route(entry, route);
             debug!(
@@ -169,6 +175,12 @@ impl UpstreamPool {
         exchange: (Vec<u8>, AdmissionPermit<'_>, Option<EcsQuery>),
     ) -> anyhow::Result<Vec<u8>> {
         let (response, _admission, injected) = exchange;
+        let expected_id = raw_query
+            .get(..2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .ok_or_else(|| anyhow::anyhow!("DNS query is shorter than its transaction ID"))?;
+        crate::dns::response::check_transaction_id(expected_id, &response)
+            .context("direct UDP response transaction ID mismatch")?;
         let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
         let response = if crate::dns::response::is_truncated(&response) {
             debug!(

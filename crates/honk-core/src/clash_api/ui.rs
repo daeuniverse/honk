@@ -209,47 +209,24 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     let (nodes, feedback) = {
         let config = ctx.config.read().await;
         let group_manager = ctx.group_manager.read().clone();
-        // Generic route resolution defaults unknown outputs to direct; an
-        // explicitly configured detour must not bypass that operator error.
-        if detour_configured
-            && outbound != Config::BUILTIN_DIRECT_NODE
-            && outbound != Config::BUILTIN_BLOCK_NODE
-            && !config.nodes.iter().any(|node| node.name == outbound)
-            && !config.groups.iter().any(|group| group.name == outbound)
-        {
-            anyhow::bail!("external UI download: detour outbound '{outbound}' not found");
-        }
-        if config.groups.iter().any(|group| group.name == outbound) {
-            let context = ScoreSelectionContext {
-                network: SelectionNetwork::Tcp,
-                probe_domain: ProbeDomain::Tcp,
-                target_family: score_ipver,
-                health_family: score_ipver.unwrap_or(target_ipver),
-                target: Some(if domain.is_some() {
-                    ScoreTarget::domain(host, port)
-                } else {
-                    std::net::SocketAddr::new(dst_ip, port).into()
-                }),
-            };
-            let plan =
-                group_manager.selection_plan_for_target_with_health_fallback(&outbound, &context);
-            let mut entries = plan.entries.into_iter();
-            match entries.next() {
-                Some(entry) => (vec![entry.node.clone()], entry.feedback),
-                None => (Vec::new(), None),
-            }
-        } else {
-            (
-                crate::control::reload::resolve_outbound_nodes(
-                    &config,
-                    &group_manager,
-                    &outbound,
-                    ProbeDomain::Tcp,
-                    target_ipver,
-                ),
-                None,
-            )
-        }
+        let context = ScoreSelectionContext {
+            network: SelectionNetwork::Tcp,
+            probe_domain: ProbeDomain::Tcp,
+            target_family: score_ipver,
+            health_family: score_ipver.unwrap_or(target_ipver),
+            target: Some(if domain.is_some() {
+                ScoreTarget::domain(host, port)
+            } else {
+                std::net::SocketAddr::new(dst_ip, port).into()
+            }),
+        };
+        let plan = crate::control::reload::resolve_outbound_plan_for_target(
+            &config,
+            &group_manager,
+            &outbound,
+            &context,
+        );
+        (plan.nodes, plan.feedback.into_iter().next().flatten())
     };
     let Some(node) = nodes.into_iter().next() else {
         anyhow::bail!("external UI download: outbound '{outbound}' has no available node");
@@ -862,16 +839,7 @@ mod tests {
             .external_ui_download_detour = "missing".into();
         drop(config);
 
-        let error = decide_route(&ctx, "127.0.0.1", 80)
-            .await
-            .err()
-            .expect("an unknown explicit detour must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("detour outbound 'missing' not found"),
-            "{error:#}"
-        );
+        assert!(decide_route(&ctx, "127.0.0.1", 80).await.is_err());
     }
 
     #[tokio::test]

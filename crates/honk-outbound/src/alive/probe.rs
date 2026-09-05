@@ -51,7 +51,7 @@ impl AliveDialerSet {
 
         // Clone the Arc out of the lock before awaiting (parking_lot guard is !Send).
         let prober_opt = self.http_prober.read().clone();
-        if let Some(ref prober) = prober_opt {
+        if let Some(prober) = &prober_opt {
             return self
                 .probe_node_http(node_id, &registered, timeout, prober)
                 .await;

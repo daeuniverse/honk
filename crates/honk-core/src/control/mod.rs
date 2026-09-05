@@ -122,6 +122,8 @@ pub struct ControlPlane {
     reload_lock: tokio::sync::Mutex<()>,
     log_file_override: Option<PathBuf>,
     effective_log_file: Option<PathBuf>,
+    /// The initial request survives a startup downgrade of the active config.
+    requested_nfqueue_enable: bool,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
@@ -148,9 +150,6 @@ pub struct ControlPlane {
     /// Persistent cache (selector choices, clash mode); opened by `run()`
     /// via `init_cache_db` when `experimental.cache_file` is enabled.
     cache_db: Option<Arc<crate::cachedb::CacheDb>>,
-    /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
-    /// shared with the alive set's outbound resolver; rebuilt on reload.
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.

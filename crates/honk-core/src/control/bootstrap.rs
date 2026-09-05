@@ -65,6 +65,7 @@ impl ControlPlane {
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);
+        let requested_nfqueue_enable = config.global.nfqueue_enable;
 
         // Create alive set for node health checking and pass it into the group
         // manager so dead nodes are excluded from group selection.
@@ -92,16 +93,6 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
-        // NodeId → eBPF outbound id for OUTBOUND_CONNECTIVITY_MAP pushes,
-        // numbered exactly like push_routing_to_ebpf (group i → UserBase+i).
-        // Rebuilt on config reload.
-        let outbound_id_map = Arc::new(parking_lot::RwLock::new(build_outbound_id_map(&config)));
-        {
-            let map = outbound_id_map.clone();
-            alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {
-                map.read().get(&node_id).copied()
-            })));
-        }
         let group_manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
         // Custom-URL member resolution: a group's members are probed via
@@ -228,6 +219,7 @@ impl ControlPlane {
             reload_lock: tokio::sync::Mutex::new(()),
             log_file_override: None,
             effective_log_file,
+            requested_nfqueue_enable,
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
@@ -254,7 +246,6 @@ impl ControlPlane {
             connection_tracker: Arc::new(ConnectionTracker::new()),
             tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
-            outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.active_tcp_flows,
@@ -312,6 +303,10 @@ impl ControlPlane {
     ) {
         self.log_file_override = log_file_override;
         self.effective_log_file = effective_log_file;
+    }
+
+    pub(crate) fn set_nfqueue_startup_request(&mut self, requested: bool) {
+        self.requested_nfqueue_enable = requested;
     }
 
     /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition

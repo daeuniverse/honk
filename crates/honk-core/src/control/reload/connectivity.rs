@@ -58,21 +58,23 @@ pub(in crate::control) fn health_check_targets(
         .collect()
 }
 
-/// Synchronize alive-set health-check registrations with the config's
-/// group membership: register nodes that are new or whose name/address
-/// changed, remove nodes that left the checked set. Unchanged
-/// registrations keep their probe state and grace period. Returns
-/// `(added, removed)` counts.
+/// Synchronize the alive-set authority with every current config node, while
+/// keeping scheduled health checks limited to the configured group targets.
+/// Nodes that leave the checked set are unregistered from periodic probes but
+/// remain eligible for traffic feedback while they stay in the config.
+/// Returns `(added, removed)` scheduled-probe counts.
 pub(in crate::control) fn sync_health_check_nodes(
     alive_set: &AliveDialerSet,
     config: &Config,
 ) -> (usize, usize) {
+    let current = alive_set.registered_nodes();
+    alive_set.sync_active_nodes(config.nodes.iter().map(|node| node.id).collect());
+
     let desired: std::collections::HashMap<uuid::Uuid, (String, String)> =
         health_check_targets(config)
             .into_iter()
             .map(|(id, name, addr)| (id, (name, addr)))
             .collect();
-    let current = alive_set.registered_nodes();
     let mut added = 0usize;
     for (id, (name, addr)) in &desired {
         let unchanged = current
@@ -86,7 +88,7 @@ pub(in crate::control) fn sync_health_check_nodes(
     let mut removed = 0usize;
     for id in current.keys() {
         if !desired.contains_key(id) {
-            alive_set.remove_node(*id);
+            alive_set.unregister_probe_node(*id);
             removed += 1;
         }
     }
@@ -207,30 +209,6 @@ pub(in crate::control) fn install_selector_warm_callback(
     })));
 }
 
-/// Build the NodeId → eBPF outbound id map used for
-/// `OUTBOUND_CONNECTIVITY_MAP` pushes. Numbering matches
-/// `push_routing_to_ebpf`: direct=0, block=1, group i → `UserBase + i`;
-/// group member nodes inherit their group's id (first group wins when a
-/// node is in several groups), with nested sub-groups expanded to their
-/// leaves so a leaf dialed via a sub-group still maps to the top group's
-/// slot. Nodes outside any group have no eBPF outbound id and are absent
-/// from the map.
-pub(in crate::control) fn build_outbound_id_map(
-    config: &Config,
-) -> std::collections::HashMap<uuid::Uuid, u8> {
-    let by_name = groups_by_name(config);
-    let mut map = std::collections::HashMap::new();
-    for (i, group) in config.groups.iter().enumerate() {
-        let id = OutboundIndex::UserBase as u8 + i as u8;
-        let mut leaf_ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(group, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
-        for node_id in leaf_ids {
-            map.entry(node_id).or_insert(id);
-        }
-    }
-    map
-}
-
 type GroupConnectivity = (u8, u32, u32, bool);
 
 /// A sole TCP leaf with no configured fallback remains a userspace last resort:
@@ -304,18 +282,8 @@ pub(crate) fn open_group_connectivity(
 }
 
 impl ControlPlane {
-    /// Rebuild the [`GroupManager`] from the current config after a reload.
-    ///
-    /// A fresh manager is installed into the shared cell so every holder
-    /// (control plane, per-connection handles, clash API) picks up new or
-    /// changed groups at once. Runtime selector choices migrate by group
-    /// name (choices whose group or selected node vanished are dropped);
-    /// cache.db-backed choices survive because every change is persisted
-    /// at set time, so no cache.db restore runs here. The alive set's
-    /// health-check registrations and URLTest group table are refreshed to
-    /// match the new group membership, and the node → eBPF outbound id map
-    /// (`outbound_id_map`, already refreshed by the reload path) is built
-    /// from the same config, keeping the two consistent.
+    /// The alive set is synchronized after publication so health checks use
+    /// the same rebuilt manager and config generation as routing.
     pub async fn reload_group_manager(&self) {
         let (groups, nodes) = {
             let config = self.config.read().await;

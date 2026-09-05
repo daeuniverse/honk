@@ -130,9 +130,11 @@ impl MockUpstream {
 
 #[async_trait]
 impl DnsUpstreamPool for MockUpstream {
-    async fn query(&self, _upstream_name: &str, _raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(self.response.clone())
+        let mut response = self.response.clone();
+        response[0..2].copy_from_slice(&raw_query[0..2]);
+        Ok(response)
     }
 }
 
@@ -145,11 +147,13 @@ struct GatedUpstream {
 
 #[async_trait]
 impl DnsUpstreamPool for GatedUpstream {
-    async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         self.release.notified().await;
-        Ok(self.response.clone())
+        let mut response = self.response.clone();
+        response[0..2].copy_from_slice(&raw_query[0..2]);
+        Ok(response)
     }
 }
 

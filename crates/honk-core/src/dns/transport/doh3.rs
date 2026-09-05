@@ -60,7 +60,7 @@ impl Doh3Client {
         dial: DialContext,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
-        let quic_config = dns_quic_config(&[b"h3"]).await?;
+        let quic_config = dns_quic_config(&dial.endpoint, &[b"h3"]).await?;
         Ok(Arc::new(Self {
             dial,
             quic_config,

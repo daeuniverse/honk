@@ -3,8 +3,8 @@
 //!
 //! Mirrors the Go `routing_matcher_builder.go` (`control/routing_matcher_builder.go`)
 //! in dae-core: each rule is split into type-specific `match_set` entries, and
-//! IP/MAC prefixes are stored in LPM trie maps while domain rules are evaluated
-//! in userspace (domain is not available during eBPF TCP SYN classification).
+//! IP/MAC prefixes are stored in LPM trie maps while DNS-learned domain rules
+//! use DomainSet entries; unknown names remain a userspace decision.
 
 use crate::ebpf::{EbpfBackend, LpmKeepSet, maps};
 use crate::routing::CompiledRoute;
@@ -351,20 +351,31 @@ impl RoutingMatcherBuilder {
         let mut group_bitmaps: RoutingGroupBitmaps =
             [[0; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
 
-        for route in routes.iter().take(MAX_MATCH_SET_LEN as usize) {
+        for route in routes.iter() {
             // Skip rules whose conditions are unsupported in eBPF.
             // Domain/geosite matching is evaluated by DNS snooping: the
             // DomainSet match type is pushed, and resolved IPs are inserted
             // into DOMAIN_ROUTING_MAP so the eBPF fast path can match them.
-            if Self::has_unsupported_ebpf_conditions(route)
-                || Self::collect_conditions(route).is_empty()
-            {
+            let conditions = Self::collect_conditions(route);
+            if Self::has_unsupported_ebpf_conditions(route) || conditions.is_empty() {
                 debug!(
                     "Skipping eBPF push for rule '{}' (unsupported or empty conditions)",
                     route.name
                 );
                 continue;
             }
+
+            // Reject before map publication; skipping or splitting a chain
+            // would silently change first-match routing policy.
+            let required = Self::condition_match_set_count(&conditions);
+            let remaining = (MAX_MATCH_SET_LEN as usize).saturating_sub(1 + match_sets.len());
+            anyhow::ensure!(
+                required <= remaining,
+                "rule '{}' needs {} MatchSets but only {} remain (one reserved for fallback)",
+                route.name,
+                required,
+                remaining
+            );
             let outbound = outbound_name_to_id
                 .get(route.outbound.as_str())
                 .copied()
@@ -376,9 +387,7 @@ impl RoutingMatcherBuilder {
             // neither needs a control-plane marker for the initial route.
             let punt_to_control_plane = dial_mode == DialMode::DomainPlusPlus
                 && !route.ports.is_empty()
-                && route.domain_suffixes.is_empty()
-                && route.domain_keywords.is_empty()
-                && route.geosite_domains.is_empty()
+                && !route.has_domain_conditions()
                 && route.process_names.is_empty()
                 && route.mac_addresses.is_empty()
                 && route.dscp_values.is_empty()
@@ -422,19 +431,6 @@ impl RoutingMatcherBuilder {
             .copied()
             .unwrap_or(OutboundIndex::Direct as u8);
 
-        // Ensure the fallback fits even if the ruleset is at capacity.
-        if match_sets.len() >= MAX_MATCH_SET_LEN as usize {
-            warn!(
-                "Generated {} match sets exceed eBPF MAX_MATCH_SET_LEN ({}); truncating to make room for fallback",
-                match_sets.len(),
-                MAX_MATCH_SET_LEN
-            );
-            match_sets.truncate(MAX_MATCH_SET_LEN as usize - 1);
-            // Truncation can cut a rule chain mid-way; drop the group
-            // bitmap bits of the removed tail so no group ever skips the
-            // fallback slot that reused its index.
-            Self::clear_group_bits_from(&mut group_bitmaps, match_sets.len());
-        }
         let fallback_idx = match_sets.len();
         match_sets.push(MatchSet {
             value: MatchSetValue { raw: [0; 16] },
@@ -501,6 +497,19 @@ impl RoutingMatcherBuilder {
         Ok(plan.result())
     }
 
+    fn condition_match_set_count(conditions: &[Condition<'_>]) -> usize {
+        conditions
+            .iter()
+            .map(|condition| match &condition.kind {
+                ConditionKind::SourcePort { ranges } | ConditionKind::Port { ranges } => {
+                    ranges.len()
+                }
+                ConditionKind::Dscp { values } => values.len(),
+                ConditionKind::ProcessName { names } => names.len(),
+                _ => 1,
+            })
+            .sum()
+    }
     pub fn build_and_push(
         ebpf: &mut dyn EbpfBackend,
         routes: &[CompiledRoute],
@@ -689,11 +698,12 @@ impl RoutingMatcherBuilder {
         let mut conditions = Vec::new();
 
         macro_rules! collect_side {
-            ($not:expr, $domain_suffixes:expr, $domain_keywords:expr, $geosite_domains:expr,
-             $source_ip_nets:expr, $ip_nets:expr, $mac_addresses:expr, $source_ports:expr,
-             $ports:expr, $protocols:expr, $ip_versions:expr, $dscp_values:expr,
-             $process_names:expr) => {
-                let has_domain = !$domain_suffixes.is_empty()
+            ($not:expr, $domain_patterns:expr, $domain_suffixes:expr, $domain_keywords:expr,
+             $geosite_domains:expr, $source_ip_nets:expr, $ip_nets:expr, $mac_addresses:expr,
+             $source_ports:expr, $ports:expr, $protocols:expr, $ip_versions:expr,
+             $dscp_values:expr, $process_names:expr) => {
+                let has_domain = !$domain_patterns.is_empty()
+                    || !$domain_suffixes.is_empty()
                     || !$domain_keywords.is_empty()
                     || !$geosite_domains.is_empty();
                 if has_domain {
@@ -775,6 +785,7 @@ impl RoutingMatcherBuilder {
 
         collect_side!(
             false,
+            &route.domain_patterns,
             &route.domain_suffixes,
             &route.domain_keywords,
             &route.geosite_domains,
@@ -790,6 +801,7 @@ impl RoutingMatcherBuilder {
         );
         collect_side!(
             true,
+            &route.not_domain_patterns,
             &route.not_domain_suffixes,
             &route.not_domain_keywords,
             &route.not_geosite_domains,
@@ -1121,22 +1133,6 @@ impl RoutingMatcherBuilder {
                 let word = idx / 32;
                 if word < words.len() {
                     words[word] |= 1u32 << (idx % 32);
-                }
-            }
-        }
-    }
-
-    /// Clear the bitmap bits at indices `>= from` in every group.  Used
-    /// when ruleset truncation drops MatchSets whose bits were already
-    /// recorded.
-    fn clear_group_bits_from(bitmaps: &mut RoutingGroupBitmaps, from: usize) {
-        for words in bitmaps.iter_mut() {
-            for (w, word) in words.iter_mut().enumerate() {
-                let base = w * 32;
-                if base >= from {
-                    *word = 0;
-                } else if base + 32 > from {
-                    *word &= (1u32 << (from - base)) - 1;
                 }
             }
         }
@@ -1527,6 +1523,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_domain_patterns_become_kernel_domain_sets() {
+        let route = CompiledRoute {
+            domain_patterns: vec![regex::Regex::new(r"^full\.example$").unwrap()],
+            ..make_route("full", "direct")
+        };
+        let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
+
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
+            .unwrap();
+
+        assert!(plan.has_domain_rules);
+        assert_eq!(plan.match_sets.len(), 2); // DomainSet + fallback
+        assert_eq!(plan.domain_bitmaps.get("full").map(Vec::len), Some(1));
+    }
+
+    #[test]
     fn test_push_port_rule_to_ebpf() {
         let mut backend = MockEbpfBackend::new();
         let route = CompiledRoute {
@@ -1556,6 +1568,34 @@ mod tests {
         assert_eq!(port_rule.outbound, OutboundIndex::UserBase as u8);
         let fallback = backend.active_routing_rule(1).unwrap();
         assert_eq!(fallback.match_type, MatchType::Fallback as u8);
+    }
+
+    #[test]
+    fn oversized_rule_rejects_publication_without_changing_routes() {
+        let oversized = CompiledRoute {
+            ports: (0..128)
+                .map(|port| crate::routing::PortRange {
+                    start: port,
+                    end: port,
+                })
+                .collect(),
+            ..make_route("oversized", "proxy")
+        };
+        let outbound_map = HashMap::from([
+            ("proxy".to_string(), OutboundIndex::UserBase as u8),
+            ("direct".to_string(), OutboundIndex::Direct as u8),
+        ]);
+        let mut backend = MockEbpfBackend::new();
+        let error = RoutingMatcherBuilder::build_and_push(
+            &mut backend,
+            &[oversized],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("MatchSets"));
+        assert_eq!(backend.active_routing_rule_count(), 0);
     }
 
     #[test]
@@ -2219,19 +2259,6 @@ mod tests {
                     vec![physical_word]
                 );
             }
-        }
-    }
-
-    #[test]
-    fn test_clear_group_bits_from() {
-        let mut bitmaps: RoutingGroupBitmaps =
-            [[u32::MAX; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
-        RoutingMatcherBuilder::clear_group_bits_from(&mut bitmaps, 34);
-        for words in bitmaps.iter() {
-            assert_eq!(words[0], u32::MAX);
-            assert_eq!(words[1], 0b11);
-            assert_eq!(words[2], 0);
-            assert_eq!(words[3], 0);
         }
     }
 

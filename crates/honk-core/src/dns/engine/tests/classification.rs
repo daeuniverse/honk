@@ -47,3 +47,23 @@ fn fixed_zero_disables_cache_instead_of_clamping_to_one() {
     // Then
     assert!(!expiry.is_cacheable());
 }
+
+#[test]
+fn zero_answer_ttl_disables_cache_without_overrides() {
+    let expiry = effective_expiry(None, 0, 0);
+
+    assert!(!expiry.is_cacheable());
+    assert_eq!(expiry.ttl(), std::time::Duration::ZERO);
+}
+
+#[test]
+fn configured_and_fixed_ttls_override_zero_answer_ttl() {
+    assert_eq!(
+        effective_expiry(None, 600, 0).ttl(),
+        std::time::Duration::from_secs(600)
+    );
+    assert_eq!(
+        effective_expiry(Some(45), 600, 0).ttl(),
+        std::time::Duration::from_secs(45)
+    );
+}

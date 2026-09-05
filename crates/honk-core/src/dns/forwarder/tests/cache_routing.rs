@@ -32,6 +32,15 @@ fn test_extract_soa_negative_ttl() {
     // No authority section → default.
     let plain = make_a_response([1, 1, 1, 1], 300);
     assert_eq!(extract_soa_negative_ttl(&plain, 42), 42);
+
+    let mut zero_soa_ttl = resp.clone();
+    zero_soa_ttl[35..39].copy_from_slice(&0_u32.to_be_bytes());
+    assert_eq!(extract_soa_negative_ttl(&zero_soa_ttl, 60), 0);
+
+    let mut high_bit_minimum = resp.clone();
+    let minimum = high_bit_minimum.len() - 4;
+    high_bit_minimum[minimum..].copy_from_slice(&0x8000_0001_u32.to_be_bytes());
+    assert_eq!(extract_soa_negative_ttl(&high_bit_minimum, 60), 0);
 }
 
 #[tokio::test]
@@ -61,30 +70,33 @@ async fn test_cache_hit() {
 
 #[tokio::test]
 async fn test_cache_hit_rewrites_transaction_id() {
-    // Build a response whose ID does not match the query ID.  The forwarder
-    // must rewrite the response ID to match each query so that standard
-    // resolvers (glibc/c-ares) accept cached answers.
-    let mut response = make_a_response([93, 184, 216, 34], 300);
-    response[0] = 0xBE;
-    response[1] = 0xEF;
-
-    let mock = Arc::new(MockUpstream::new(response.clone()));
+    // The upstream response uses the exchange query ID; cache hits must render
+    // the same answer with each caller's transaction ID.
+    let response = make_a_response([93, 184, 216, 34], 300);
+    let mock = Arc::new(MockUpstream::new(response));
     let forwarder = DnsForwarder::new(
         mock.clone() as Arc<dyn DnsUpstreamPool>,
         test_cache(),
         test_router(),
     );
 
-    let mut query = make_a_query();
-    query[0] = 0xAB;
-    query[1] = 0xCD;
+    let mut first_query = make_a_query();
+    first_query[0..2].copy_from_slice(&0xabcd_u16.to_be_bytes());
+    let mut second_query = make_a_query();
+    second_query[0..2].copy_from_slice(&0x1234_u16.to_be_bytes());
 
-    let result1 = forwarder.resolve(&query).await.expect("first resolve");
-    assert_eq!(&result1[0..2], &[0xAB, 0xCD]);
+    let result1 = forwarder
+        .resolve(&first_query)
+        .await
+        .expect("first resolve");
+    assert_eq!(&result1[0..2], &[0xab, 0xcd]);
     assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
 
-    let result2 = forwarder.resolve(&query).await.expect("second resolve");
-    assert_eq!(&result2[0..2], &[0xAB, 0xCD]);
+    let result2 = forwarder
+        .resolve(&second_query)
+        .await
+        .expect("second resolve");
+    assert_eq!(&result2[0..2], &[0x12, 0x34]);
     assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
 }
 

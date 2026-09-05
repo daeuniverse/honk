@@ -15,6 +15,7 @@ The routing result is therefore a property of the flow, not of each packet. Esta
 `RoutingMatcherBuilder` sorts compiled routes by ascending priority and lowers each rule to the dae `match_set` ABI shared by `honk-core` and `honk-ebpf`. Each type-specific `MatchSet` carries a matcher value, negation bit, intermediate or final outbound, `must` bit, and mark.
 
 Multiple values inside one condition form an OR chain. Distinct conditions form an AND chain. The intermediate `LogicalOr` and `LogicalAnd` outcomes preserve this structure without allocating a rule object in the kernel. A final fallback entry gives unmatched flows a real outbound.
+The physical `MatchSet` bank has a hard limit of `MAX_MATCH_SET_LEN` = 128 slots, including the final fallback. Compilation counts the complete plan first and rejects the whole plan before any BPF map write when it would overflow; rules are never truncated or silently skipped.
 
 At route entry, `route()` prepares full-prefix source, destination, and MAC keys and calls `bpf_loop` over the selected bank. `RouteCtx` maintains `GoodSubrule`, `BadRule`, `Must`, DNS-query, and domain-known state across loop iterations. A final result encodes the outbound in bits 0–7, the mark in bits 8–39, and `must` in bit 40.
 

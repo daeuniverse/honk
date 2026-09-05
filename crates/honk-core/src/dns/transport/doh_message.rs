@@ -45,7 +45,7 @@ pub(super) fn build_doh_request(
 }
 
 /// Shared DoH/DoH3 response validation: 2xx status, minimum DNS header size,
-/// then restore the original query ID.
+/// a zero wire transaction ID, then restore the original query ID.
 pub(super) fn finish_doh_response(
     label: &str,
     status: http::StatusCode,
@@ -58,6 +58,24 @@ pub(super) fn finish_doh_response(
     if body.len() < 12 {
         anyhow::bail!("{label} response too short ({} bytes)", body.len());
     }
+    crate::dns::response::check_transaction_id(0, &body)
+        .map_err(|error| anyhow::anyhow!("{label} response transaction ID: {error}"))?;
     super::framing::restore_dns_id(&mut body, orig_id);
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_doh_response;
+
+    #[test]
+    fn finish_requires_zero_wire_id_before_restoration() {
+        let response = finish_doh_response("DoH", http::StatusCode::OK, vec![0; 12], 0x1234)
+            .expect("zero wire ID");
+        assert_eq!(&response[..2], &0x1234u16.to_be_bytes());
+
+        let mut wrong_id = vec![0; 12];
+        wrong_id[..2].copy_from_slice(&0x4321u16.to_be_bytes());
+        assert!(finish_doh_response("DoH", http::StatusCode::OK, wrong_id, 0x1234).is_err());
+    }
 }

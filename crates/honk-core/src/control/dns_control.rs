@@ -236,7 +236,9 @@ impl DnsController {
             ProjectionObservation::Retain
         } else {
             match (outcome.status(), outcome.response_class()) {
-                (OutcomeStatus::Accepted, ResponseClass::Positive) => {
+                (OutcomeStatus::Accepted, ResponseClass::Positive)
+                    if outcome.expiry().is_cacheable() =>
+                {
                     ProjectionObservation::Positive {
                         domain,
                         ips: outcome.answer_ips(),
@@ -247,6 +249,9 @@ impl DnsController {
                             ProjectionFreshness::Fresh
                         },
                     }
+                }
+                (OutcomeStatus::Accepted, ResponseClass::Positive) => {
+                    ProjectionObservation::Clear { domain }
                 }
                 (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {
                     ProjectionObservation::Clear { domain }

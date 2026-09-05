@@ -83,6 +83,13 @@ fn test_extract_min_ttl_no_answers() {
 }
 
 #[test]
+fn test_extract_min_ttl_keeps_zero_and_normalizes_high_bit() {
+    assert_eq!(extract_min_ttl(&make_a_response([8, 8, 8, 8], 0)), 0);
+
+    assert_eq!(extract_min_ttl(&make_a_response([8, 8, 8, 8], 0x8000_0001)), 0);
+}
+
+#[test]
 fn test_extract_min_ttl_short_response() {
     let short = vec![0u8; 5];
     assert_eq!(extract_min_ttl(&short), 60);

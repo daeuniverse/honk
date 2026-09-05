@@ -16,15 +16,19 @@ async fn concurrent_response_requery_is_one_logical_flight() {
     }
     #[async_trait]
     impl DnsUpstreamPool for RequeryUpstream {
-        async fn query(&self, upstream: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        async fn query(&self, upstream: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
             if upstream == "fallback" {
                 self.fallback_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(self.clean.clone());
+                let mut response = self.clean.clone();
+                response[0..2].copy_from_slice(&raw_query[0..2]);
+                return Ok(response);
             }
             self.initial_calls.fetch_add(1, Ordering::SeqCst);
             self.initial_entered.notify_one();
             self.initial_release.notified().await;
-            Ok(self.polluted.clone())
+            let mut response = self.polluted.clone();
+            response[0..2].copy_from_slice(&raw_query[0..2]);
+            Ok(response)
         }
     }
 
@@ -119,13 +123,15 @@ async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
     }
     #[async_trait]
     impl DnsUpstreamPool for RetryUpstream {
-        async fn query(&self, upstream: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        async fn query(&self, upstream: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
             if upstream == "fallback" {
                 let call = self.fallback_calls.fetch_add(1, Ordering::SeqCst);
                 if call == 0 {
                     anyhow::bail!("first fallback failed");
                 }
-                return Ok(self.clean.clone());
+                let mut response = self.clean.clone();
+                response[0..2].copy_from_slice(&raw_query[0..2]);
+                return Ok(response);
             }
             let call = self.initial_calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
@@ -135,7 +141,9 @@ async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
                 self.successor_entered.notify_one();
                 self.successor_release.notified().await;
             }
-            Ok(self.polluted.clone())
+            let mut response = self.polluted.clone();
+            response[0..2].copy_from_slice(&raw_query[0..2]);
+            Ok(response)
         }
     }
 

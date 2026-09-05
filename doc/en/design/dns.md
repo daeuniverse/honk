@@ -160,8 +160,8 @@ Configured ECS is a generation-pinned named-upstream transport policy, not ingre
 | Mechanism | Invariant |
 | --- | --- |
 | Capacity | At most 16 LRU shards divide `max_cache_size` exactly. Each shard is bounded by both entry count and retained key/response wire bytes. The byte target is 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. |
-| Positive TTL | `fixed_domain_ttl` has first priority; zero disables caching for that domain. Otherwise nonzero `optimistic_cache_ttl` overrides the answer minimum TTL. The selected TTL is also written into cached answer records. |
-| Negative TTL | NXDOMAIN and SERVFAIL use the SOA-derived negative TTL, defaulting to 60 seconds, then clamp it to `1..=300` seconds. |
+| Positive TTL | `fixed_domain_ttl` has first priority; zero disables caching for that domain. Otherwise nonzero `optimistic_cache_ttl` overrides the answer minimum TTL. Without either override, zero and wire TTLs with the high bit set are uncacheable; high-bit values normalize to zero per RFC 2181. The selected cache TTL is also written into cached answer records. |
+| Negative TTL | NXDOMAIN and SERVFAIL use the SOA-derived negative TTL, defaulting to 60 seconds and capped at 300 seconds. Zero, including a high-bit wire value normalized to zero, disables negative caching. |
 | Stale handling | Expired positive answers remain eligible for serve-stale for one hour. An upstream error or SERVFAIL may return one with wire TTL 30 seconds. Near-expiry hits start a deduplicated stale-while-revalidate refresh. |
 | Flush fence | A publication epoch prevents foreground or background work begun before a flush from repopulating memory or persistence after the flush barrier. |
 
@@ -190,13 +190,15 @@ Dial/TLS/QUIC/HTTP session setup uses the dial/handshake timeout, while request/
 
 Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both ID and question on receipt, restores the caller ID, and quarantines retired IDs for three seconds. Delayed packets therefore cannot satisfy a different question after reuse.
 
+Every upstream exchange validates its response transaction ID before response routing, cache publication, or `TC` fallback. DoQ, DoH, and DoH3 send zero on the wire and require zero back before restoring the caller ID; cache templates remain ID-neutral.
+
 ## Routing projection
 
 `DnsController` converts resolution outcomes into desired state rather than writing `DOMAIN_ROUTING_MAP` inline:
 
 | Outcome | Projection observation |
 | --- | --- |
-| Accepted positive | Replace the domain's IP set and expiry using the answer's effective TTL. Multiple domain owners of one IP contribute ORed routing bitmaps. |
+| Accepted positive | Replace the domain's IP set and expiry using the answer's effective TTL; an uncacheable/zero-expiry answer clears the old owner instead. Multiple domain owners of one IP contribute ORed routing bitmaps. |
 | Accepted NODATA or NXDOMAIN | Clear that domain owner. |
 | Accepted SERVFAIL or rejected policy result | Retain current state. |
 
