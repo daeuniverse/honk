@@ -11,9 +11,9 @@ use crate::proxy::uot::{
 
 #[cfg(test)]
 use super::{
-    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, INBOUND_PAYLOAD_BUDGET, PaddingScheme,
-    PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP, read_frame,
-    write_frame,
+    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, INBOUND_PAYLOAD_BUDGET, InboundPayloadBudget,
+    PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP,
+    read_frame, write_frame,
 };
 #[cfg(test)]
 use crate::proxy::addr;
@@ -328,7 +328,7 @@ mod uot_transport_tests {
             TEST_AUTH,
             bytes::Bytes::from_static(TEST_SETTINGS),
             padding_state,
-            Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET)),
+            InboundPayloadBudget::new(INBOUND_PAYLOAD_BUDGET),
         )
         .await
         .unwrap();

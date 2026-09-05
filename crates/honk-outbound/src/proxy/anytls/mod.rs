@@ -26,8 +26,12 @@ use super::{
 };
 use crate::session::{ManagedSession as _, SpeculativeCheckout};
 
+mod inbound;
 mod uot;
 
+use inbound::{
+    INBOUND_PAYLOAD_BUDGET, InboundPayload, InboundPayloadBudget, TcpInbound, TcpReceiveState,
+};
 pub(crate) use uot::AnyTlsUotTransport;
 use uot::{UOT_DRAIN_QUEUE_CAP, UotReceiveState};
 
@@ -211,9 +215,6 @@ impl PaddingState {
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
-/// Inbound AnyTLS payload bytes retained by every live or draining
-/// physical session belonging to one node pool.
-const INBOUND_PAYLOAD_BUDGET: usize = 12 * 1024 * 1024;
 /// Soft caps on parked overflow (data frames/payload, session-wide and
 /// per stream). Tripping one never blocks the demux: the frame parks and
 /// the stall watchdog reaps consumers that make no flush progress for
@@ -275,51 +276,6 @@ pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
 
 /// Monotonic diagnostic session id (sing `sessionCounter`).
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
-
-/// One admitted inbound payload. Its owned permit follows the bytes through
-/// the primary queue, overflow, and consumer buffer, returning capacity on
-/// exact final-byte consumption or any dropped owner.
-#[derive(Debug)]
-struct InboundPayload {
-    data: Vec<u8>,
-    credit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl InboundPayload {
-    fn new(data: Vec<u8>, credit: tokio::sync::OwnedSemaphorePermit) -> Self {
-        debug_assert_eq!(data.len(), credit.num_permits());
-        Self { data, credit }
-    }
-
-    #[cfg(test)]
-    fn for_test(data: Vec<u8>) -> Self {
-        let budget = Arc::new(tokio::sync::Semaphore::new(data.len()));
-        let credit = budget
-            .try_acquire_many_owned(data.len() as u32)
-            .expect("test payload budget");
-        Self::new(data, credit)
-    }
-
-    fn into_parts(self) -> (Vec<u8>, tokio::sync::OwnedSemaphorePermit) {
-        (self.data, self.credit)
-    }
-}
-
-impl std::ops::Deref for InboundPayload {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
-#[cfg(test)]
-impl PartialEq<Vec<u8>> for InboundPayload {
-    fn eq(&self, other: &Vec<u8>) -> bool {
-        self.data.as_slice() == other.as_slice()
-    }
-}
-
 
 /// Inbound events delivered from the session demux to a stream task.
 #[derive(Debug)]
@@ -1055,7 +1011,7 @@ async fn session_writer(
 pub(crate) struct AnyTlsPool {
     sessions: Arc<crate::session::SessionPool<AnyTlsSession>>,
     padding: Arc<PaddingState>,
-    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
+    inbound_payload_budget: Arc<InboundPayloadBudget>,
 }
 
 impl AnyTlsPool {
@@ -1063,7 +1019,7 @@ impl AnyTlsPool {
         Self {
             sessions: Arc::new(crate::session::SessionPool::new(session_pool_config())),
             padding: Arc::new(PaddingState::default()),
-            inbound_payload_budget: Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET)),
+            inbound_payload_budget: InboundPayloadBudget::new(INBOUND_PAYLOAD_BUDGET),
         }
     }
 
@@ -1071,7 +1027,7 @@ impl AnyTlsPool {
         Arc::clone(&self.padding)
     }
 
-    fn inbound_payload_budget(&self) -> Arc<tokio::sync::Semaphore> {
+    fn inbound_payload_budget(&self) -> Arc<InboundPayloadBudget> {
         Arc::clone(&self.inbound_payload_budget)
     }
 }
@@ -1107,6 +1063,8 @@ pub(crate) struct AnyTlsSession {
     writer_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Open streams: sid → demux delivery channel.
     streams: Mutex<HashMap<u32, StreamSink>>,
+    /// TCP payload ownership, including queues held by callers after a stream reset.
+    tcp_inbound: parking_lot::Mutex<HashMap<u32, Arc<TcpInbound>>>,
     /// Remote FINs suppress the local Drop notification.
     remote_fin: parking_lot::Mutex<HashSet<u32>>,
     /// Stream id allocator (sing `streamId`); first stream gets sid 1.
@@ -1147,7 +1105,9 @@ pub(crate) struct AnyTlsSession {
     stream_permits: Arc<tokio::sync::Semaphore>,
     /// Shared across every physical session retained or draining under the
     /// originating node pool.
-    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
+    inbound_payload_budget: Arc<InboundPayloadBudget>,
+    /// Odd while a locally budget-blocked frame has not completed dispatch.
+    inbound_budget_epoch: AtomicU64,
     /// Demux task handle, aborted on close.
     demux: Mutex<Option<tokio::task::AbortHandle>>,
     /// Inbound frame counter, bumped by the demux per frame; lets the SYNACK
@@ -1166,7 +1126,7 @@ impl AnyTlsSession {
         auth: &[u8],
         settings: bytes::Bytes,
         padding_state: Arc<PaddingState>,
-        inbound_payload_budget: Arc<tokio::sync::Semaphore>,
+        inbound_payload_budget: Arc<InboundPayloadBudget>,
     ) -> anyhow::Result<Arc<Self>> {
         transport_write.write_all(auth).await?;
         transport_write.flush().await?;
@@ -1179,6 +1139,7 @@ impl AnyTlsSession {
             writer_q: Arc::new(WriterQueue::new()),
             writer_task: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
+            tcp_inbound: parking_lot::Mutex::new(HashMap::new()),
             remote_fin: parking_lot::Mutex::new(HashSet::new()),
             next_sid: AtomicU32::new(0),
             peer_supports_synack: AtomicBool::new(false),
@@ -1193,9 +1154,11 @@ impl AnyTlsSession {
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             inbound_payload_budget,
+            inbound_budget_epoch: AtomicU64::new(0),
             demux: Mutex::new(None),
             rx_frame_seq: AtomicU64::new(0),
         });
+        session.inbound_payload_budget.register(&session);
 
         let demux_handle = {
             let session = Arc::clone(&session);
@@ -1253,7 +1216,9 @@ impl AnyTlsSession {
                 if !overdue {
                     return;
                 }
-                if session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker {
+                let budget_waiting = session.inbound_budget_epoch.load(Ordering::SeqCst) & 1 != 0;
+                if budget_waiting || session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker
+                {
                     // Frames kept arriving through the window: the server is
                     // alive but never acknowledged this open. Reset only this
                     // stream — failing the session would kill every healthy
@@ -1469,16 +1434,18 @@ impl AnyTlsSession {
     async fn register_and_open(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
-        queue_cap: usize,
-        sink: fn(mpsc::Sender<StreamEvent>) -> StreamSink,
+        sink: StreamSink,
+        tcp_inbound: Option<Arc<TcpInbound>>,
         permit: crate::session::SessionPermit<Self>,
-    ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>, StreamRegistration)> {
+    ) -> anyhow::Result<(u32, StreamRegistration)> {
         if self.is_closed() {
             anyhow::bail!("AnyTLS session {} is closed", self.seq);
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = mpsc::channel(queue_cap);
-        self.streams.lock().unwrap().insert(sid, sink(tx));
+        if let Some(inbound) = tcp_inbound {
+            self.tcp_inbound.lock().insert(sid, inbound);
+        }
+        self.streams.lock().unwrap().insert(sid, sink);
         let mut guard = StreamRegistration {
             session: Arc::clone(self),
             sid,
@@ -1532,7 +1499,7 @@ impl AnyTlsSession {
         drop(initial_settings);
         queued.map_err(|_| self.writer_queue_error())?;
         guard.frame_started = false;
-        Ok((sid, rx, guard))
+        Ok((sid, guard))
     }
 
     async fn open_uot_stream(
@@ -1540,8 +1507,9 @@ impl AnyTlsSession {
         target_addr: Vec<u8>,
         permit: crate::session::SessionPermit<Self>,
     ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>, StreamRegistration)> {
-        let (sid, rx, guard) = self
-            .register_and_open(target_addr, UOT_DRAIN_QUEUE_CAP, StreamSink::Uot, permit)
+        let (tx, rx) = mpsc::channel(UOT_DRAIN_QUEUE_CAP);
+        let (sid, guard) = self
+            .register_and_open(target_addr, StreamSink::Uot(tx), None, permit)
             .await?;
         debug!("AnyTLS session {} opened uot sid={}", self.seq, sid);
         Ok((sid, rx, guard))
@@ -1558,18 +1526,85 @@ impl AnyTlsSession {
         }
     }
 
+    fn tcp_sink_is_live(&self, sid: u32) -> bool {
+        matches!(
+            self.streams.lock().unwrap().get(&sid),
+            Some(StreamSink::Tcp(tx)) if !tx.is_closed()
+        )
+    }
+
+    fn oldest_inbound_stall(&self) -> Option<(Instant, u32)> {
+        self.tcp_inbound
+            .lock()
+            .iter()
+            .filter_map(|(&sid, inbound)| inbound.stalled_since().map(|since| (since, sid)))
+            .min()
+    }
+
+    fn reap_inbound_stall(&self, sid: u32, now: Instant) -> bool {
+        let inbound = {
+            let inbound = self.tcp_inbound.lock();
+            let Some(inbound) = inbound.get(&sid) else {
+                return false;
+            };
+            Arc::clone(inbound)
+        };
+        let _delivery = inbound.delivery_guard();
+        let Some((since, retained_bytes, queue_capacity)) =
+            inbound.reap_if_stalled(now, || self.kill_stream(sid))
+        else {
+            return false;
+        };
+        let stalled_for = now.saturating_duration_since(since);
+        let mut registered = self.tcp_inbound.lock();
+        if registered
+            .get(&sid)
+            .is_some_and(|current| Arc::ptr_eq(current, &inbound))
+        {
+            registered.remove(&sid);
+        }
+        drop(registered);
+        let stall_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX);
+        warn!(
+            session = self.seq,
+            victim_sid = sid,
+            retained_bytes,
+            stall_ms,
+            stream_killed = queue_capacity.is_some(),
+            "AnyTLS inbound payload budget reaped stalled retention"
+        );
+        if queue_capacity.is_some()
+            && self
+                .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
+                .is_err()
+        {
+            self.fail(anyhow::anyhow!(
+                "writer queue unavailable on inbound budget kill"
+            ));
+        }
+        true
+    }
+
     /// TCP payload must not be dropped, unlike UoT.
     async fn open_stream_direct(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
         permit: crate::session::SessionPermit<Self>,
     ) -> anyhow::Result<AnyTlsStream> {
-        let (sid, rx, guard) = self
-            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp, permit)
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        let receive = Arc::new(parking_lot::Mutex::new(TcpReceiveState::new(rx)));
+        let inbound = TcpInbound::new(&receive);
+        let (sid, guard) = self
+            .register_and_open(target_addr, StreamSink::Tcp(tx), Some(inbound), permit)
             .await?;
         let permit = guard.commit();
         debug!("AnyTLS session {} opened direct sid={}", self.seq, sid);
-        Ok(AnyTlsStream::new(Arc::clone(self), sid, rx, permit))
+        Ok(AnyTlsStream::from_receive(
+            Arc::clone(self),
+            sid,
+            receive,
+            permit,
+        ))
     }
 
     /// Unregister a UoT stream, optionally notifying the server with FIN.
@@ -1603,6 +1638,7 @@ impl AnyTlsSession {
         };
 
         self.discard_overflow(sid);
+        self.tcp_inbound.lock().remove(&sid);
         if notify_fin && was_registered && !received_fin {
             let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
@@ -1692,23 +1728,36 @@ impl AnyTlsSession {
     /// [`Self::park_overflow`]). A saturated UoT sink retires only its sid.
     #[cfg(test)]
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
-        let credit = Arc::clone(&self.inbound_payload_budget)
-            .acquire_many_owned(data.len() as u32)
+        let (credit, _wait) = self
+            .inbound_payload_budget
+            .acquire(self, sid, data.len())
             .await
             .expect("test session payload budget open");
-        self.dispatch_payload(sid, InboundPayload::new(data, credit))
-            .await;
+        let credit = credit.expect("test stream remains live");
+        let payload = match self.tcp_inbound.lock().get(&sid).cloned() {
+            Some(inbound) => InboundPayload::for_tcp(data, credit, inbound),
+            None => InboundPayload::new(data, credit),
+        };
+        self.dispatch_payload(sid, payload).await;
     }
 
     async fn dispatch_payload(self: &Arc<Self>, sid: u32, data: InboundPayload) {
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
             Some(StreamSink::Tcp(tx)) => {
+                let delivery_owner = data.delivery_owner();
+                let delivery = delivery_owner.delivery_guard();
+                if !self.tcp_sink_is_live(sid) {
+                    return;
+                }
                 if self.overflow_has(sid) {
+                    drop(delivery);
                     self.park_overflow(sid, StreamEvent::Data(data)).await;
                     return;
                 }
-                match tx.try_send(StreamEvent::Data(data)) {
+                let result = tx.try_send(StreamEvent::Data(data));
+                drop(delivery);
+                match result {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(ev)) => {
                         self.park_overflow(sid, ev).await;
@@ -1987,6 +2036,23 @@ fn server_synack_setting(data: &[u8]) -> Option<bool> {
     Some((version as u8) >= 2)
 }
 
+async fn complete_frame_body<T>(
+    budget_waited: bool,
+    body: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    if !budget_waited {
+        return body.await;
+    }
+    tokio::time::timeout(OVERFLOW_STALL_GRACE, body)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "AnyTLS frame body stalled after inbound budget wait",
+            )
+        })?
+}
+
 async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
     let mut fail_reason: Option<anyhow::Error> = None;
     loop {
@@ -2003,24 +2069,8 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             let sink = session.streams.lock().unwrap().get(&sid).cloned();
             match sink {
                 Some(StreamSink::Tcp(_)) => {
-                    let credit = match Arc::clone(&session.inbound_payload_budget)
-                        .acquire_many_owned(payload_len as u32)
-                        .await
-                    {
-                        Ok(credit) => credit,
-                        Err(e) => {
-                            fail_reason = Some(anyhow::anyhow!(
-                                "inbound payload budget closed: {e}"
-                            ));
-                            break;
-                        }
-                    };
-                    let live = matches!(
-                        session.streams.lock().unwrap().get(&sid),
-                        Some(StreamSink::Tcp(tx)) if !tx.is_closed()
-                    );
-                    if !live {
-                        drop(credit);
+                    let inbound = session.tcp_inbound.lock().get(&sid).cloned();
+                    let Some(inbound) = inbound else {
                         session.end_stream(sid, false);
                         if let Err(e) = drain_frame_body(&mut read, payload_len).await {
                             fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
@@ -2028,16 +2078,66 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                         }
                         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
                         continue;
+                    };
+                    let (credit, budget_wait) = match session
+                        .inbound_payload_budget
+                        .acquire(&session, sid, payload_len)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            fail_reason =
+                                Some(anyhow::anyhow!("inbound payload budget closed: {e}"));
+                            break;
+                        }
+                    };
+                    let Some(credit) = credit else {
+                        session.end_stream(sid, false);
+                        if let Err(e) = complete_frame_body(
+                            budget_wait.is_some(),
+                            drain_frame_body(&mut read, payload_len),
+                        )
+                        .await
+                        {
+                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            break;
+                        }
+                        session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                        drop(budget_wait);
+                        continue;
+                    };
+                    if !session.tcp_sink_is_live(sid) {
+                        drop(credit);
+                        session.end_stream(sid, false);
+                        if let Err(e) = complete_frame_body(
+                            budget_wait.is_some(),
+                            drain_frame_body(&mut read, payload_len),
+                        )
+                        .await
+                        {
+                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            break;
+                        }
+                        session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                        drop(budget_wait);
+                        continue;
                     }
-                    let data = match read_frame_body(&mut read, payload_len).await {
+                    let data = match complete_frame_body(
+                        budget_wait.is_some(),
+                        read_frame_body(&mut read, payload_len),
+                    )
+                    .await
+                    {
                         Ok(data) => data,
                         Err(e) => {
                             fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
                             break;
                         }
                     };
+                    session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+                    drop(budget_wait);
                     session
-                        .dispatch_payload(sid, InboundPayload::new(data, credit))
+                        .dispatch_payload(sid, InboundPayload::for_tcp(data, credit, inbound))
                         .await;
                 }
                 Some(StreamSink::Uot(tx)) => {
@@ -2053,9 +2153,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                             continue;
                         }
                     };
-                    let credit = match Arc::clone(&session.inbound_payload_budget)
-                        .try_acquire_many_owned(payload_len as u32)
-                    {
+                    let credit = match session.inbound_payload_budget.try_acquire(payload_len) {
                         Ok(credit) => credit,
                         Err(_) => {
                             drop(queue);
@@ -2090,6 +2188,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                             break;
                         }
                     };
+                    session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
                     queue.send(StreamEvent::Data(InboundPayload::new(data, credit)));
                 }
                 None => {
@@ -2101,9 +2200,9 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                         fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
                         break;
                     }
+                    session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
@@ -2332,7 +2431,7 @@ async fn dial_session(
     connect_timeout: Duration,
     tls_connector: Option<Arc<TlsConnector>>,
     padding_state: Arc<PaddingState>,
-    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
+    inbound_payload_budget: Arc<InboundPayloadBudget>,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
     let timeout = connect_timeout.saturating_mul(3);
     tokio::time::timeout(timeout, async {
@@ -2519,7 +2618,7 @@ impl AnyTlsHandler {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
-        let commit_dial_scope = crate::runtime::capture_dial_admission();
+        pool.sessions.bind_current_dial_admission_if_unbound();
 
         let (session, permit, detached) = match pool.checkout_speculative().await? {
             SpeculativeCheckout::Shared { session, permit } => (session, permit, None),
@@ -2552,25 +2651,21 @@ impl AnyTlsHandler {
             let commit_node = node.clone();
             let commit_pool = Arc::clone(&pool);
             let commit_runtime = runtime.clone();
-            return Ok(PreparedUdpTransport::new(transport, move || {
-                commit_dial_scope.scope(async move {
-                    reservation.commit()?;
-                    if commit_runtime.is_some() {
-                        Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
-                    }
-                    Ok(())
-                })
+            return Ok(PreparedUdpTransport::new(transport, move || async move {
+                reservation.commit()?;
+                if commit_runtime.is_some() {
+                    Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
+                }
+                Ok(())
             }));
         }
 
         let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(transport, move || {
-            commit_dial_scope.scope(async move {
-                if runtime.is_some() {
-                    Self::ensure_janitor(&commit_node, &pool, runtime);
-                }
-                Ok(())
-            })
+        Ok(PreparedUdpTransport::new(transport, move || async move {
+            if runtime.is_some() {
+                Self::ensure_janitor(&commit_node, &pool, runtime);
+            }
+            Ok(())
         }))
     }
 
@@ -2636,9 +2731,7 @@ impl AnyTlsHandler {
 pub(crate) struct AnyTlsStream {
     session: Arc<AnyTlsSession>,
     sid: u32,
-    rx: mpsc::Receiver<StreamEvent>,
-    read_buf: Option<InboundPayload>,
-    read_pos: usize,
+    receive: Arc<parking_lot::Mutex<TcpReceiveState>>,
     /// Set when the Fin/disconnect event was consumed in the same poll
     /// that also delivered data: the data goes out now, the zero-byte
     /// EOF is owed to the next poll (a consumed Fin is otherwise lost
@@ -2667,18 +2760,29 @@ pub(crate) struct AnyTlsStream {
 }
 
 impl AnyTlsStream {
+    #[cfg(test)]
     fn new(
         session: Arc<AnyTlsSession>,
         sid: u32,
         rx: mpsc::Receiver<StreamEvent>,
         permit: crate::session::SessionPermit<AnyTlsSession>,
     ) -> Self {
+        let receive = Arc::new(parking_lot::Mutex::new(TcpReceiveState::new(rx)));
+        let inbound = TcpInbound::new(&receive);
+        session.tcp_inbound.lock().insert(sid, inbound);
+        Self::from_receive(session, sid, receive, permit)
+    }
+
+    fn from_receive(
+        session: Arc<AnyTlsSession>,
+        sid: u32,
+        receive: Arc<parking_lot::Mutex<TcpReceiveState>>,
+        permit: crate::session::SessionPermit<AnyTlsSession>,
+    ) -> Self {
         Self {
             session,
             sid,
-            rx,
-            read_buf: None,
-            read_pos: 0,
+            receive,
             read_eof: false,
             read_err: None,
             out_slot: None,
@@ -2686,22 +2790,19 @@ impl AnyTlsStream {
             _permit: Some(permit),
         }
     }
-
-    fn release_permit(&mut self) {
-        self._permit.take();
-    }
 }
 
 impl std::fmt::Debug for AnyTlsStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let receive = self.receive.lock();
         f.debug_struct("AnyTlsStream")
             .field("sid", &self.sid)
             .field(
                 "pending_read",
-                &self
+                &receive
                     .read_buf
                     .as_ref()
-                    .map_or(0, |data| data.len() - self.read_pos),
+                    .map_or(0, |data| data.len() - receive.read_pos),
             )
             .finish()
     }
@@ -2728,34 +2829,35 @@ impl tokio::io::AsyncRead for AnyTlsStream {
             return std::task::Poll::Ready(Err(e));
         }
 
-        let mut got_any = this
+        let mut receive = this.receive.lock();
+        let mut got_any = receive
             .read_buf
             .as_ref()
-            .is_some_and(|data| this.read_pos < data.len());
+            .is_some_and(|data| receive.read_pos < data.len());
         loop {
-            let n = this
-                .read_buf
-                .as_ref()
-                .map_or(0, |data| (data.len() - this.read_pos).min(out.remaining()));
+            let n = receive.read_buf.as_ref().map_or(0, |data| {
+                (data.len() - receive.read_pos).min(out.remaining())
+            });
             if n > 0 {
-                let data = this.read_buf.as_ref().expect("read payload present");
-                out.put_slice(&data[this.read_pos..this.read_pos + n]);
-                this.read_pos += n;
+                let data = receive.read_buf.as_ref().expect("read payload present");
+                out.put_slice(&data[receive.read_pos..receive.read_pos + n]);
+                data.note_progress();
+                receive.read_pos += n;
             }
-            if this
+            if receive
                 .read_buf
                 .as_ref()
-                .is_some_and(|data| this.read_pos == data.len())
+                .is_some_and(|data| receive.read_pos == data.len())
             {
-                this.read_buf = None;
-                this.read_pos = 0;
+                receive.read_buf = None;
+                receive.read_pos = 0;
             }
             if out.remaining() == 0 {
                 return std::task::Poll::Ready(Ok(()));
             }
 
             let next = if got_any {
-                match this.rx.try_recv() {
+                match receive.rx.try_recv() {
                     Ok(ev) => std::task::Poll::Ready(Some(ev)),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => std::task::Poll::Pending,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -2763,7 +2865,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     }
                 }
             } else {
-                this.rx.poll_recv(cx)
+                receive.rx.poll_recv(cx)
             };
 
             if matches!(next, std::task::Poll::Ready(Some(_))) {
@@ -2771,10 +2873,11 @@ impl tokio::io::AsyncRead for AnyTlsStream {
             }
             match next {
                 std::task::Poll::Ready(Some(StreamEvent::Data(data))) => {
-                    this.read_buf = Some(data);
+                    receive.read_buf = Some(data);
                     got_any = true;
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Error(e))) => {
+                    receive.discard_payloads();
                     let killed = this.session.end_stream(this.sid, true);
                     let err = if killed {
                         std::io::Error::new(
@@ -2790,13 +2893,13 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                         return std::task::Poll::Ready(Ok(()));
                     }
                     this.read_eof = true;
-                    this.release_permit();
+                    this._permit.take();
                     return std::task::Poll::Ready(Err(err));
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
+                    receive.discard_payloads();
                     let killed = this.session.end_stream(this.sid, false);
                     if killed {
-                        // A cloned sender can outlive watchdog removal and carry this FIN.
                         let err = std::io::Error::new(
                             std::io::ErrorKind::ConnectionReset,
                             "stream killed: slow consumer (HOL)",
@@ -2806,14 +2909,15 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                             return std::task::Poll::Ready(Ok(()));
                         }
                         this.read_eof = true;
-                        this.release_permit();
+                        this._permit.take();
                         return std::task::Poll::Ready(Err(err));
                     }
                     this.read_eof = true;
-                    this.release_permit();
+                    this._permit.take();
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Ready(None) => {
+                    receive.discard_payloads();
                     let killed = this.session.end_stream(this.sid, false);
                     let pending: Option<std::io::Error> =
                         if let Some(e) = this.session.terminal_error.get() {
@@ -2821,10 +2925,10 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                                 std::io::ErrorKind::ConnectionAborted,
                                 e.to_string(),
                             ))
-                        } else if killed {
+                        } else if killed || receive.was_reset() {
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionReset,
-                                "stream killed: slow consumer (HOL)",
+                                "stream reset: inbound payload budget",
                             ))
                         } else {
                             None
@@ -2835,11 +2939,11 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                             return std::task::Poll::Ready(Ok(()));
                         }
                         this.read_eof = true;
-                        this.release_permit();
+                        this._permit.take();
                         return std::task::Poll::Ready(Err(err));
                     }
                     this.read_eof = true;
-                    this.release_permit();
+                    this._permit.take();
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Pending => {

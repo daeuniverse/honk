@@ -88,63 +88,61 @@ fn overflow_state_enforces_frame_and_byte_caps_independently() {
     }
     assert_eq!(frames.usage().bytes, SESSION_OVERFLOW_CAP);
     assert_eq!(
-        frames.limit_for(
-            2,
-            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
-        ),
+        frames.limit_for(2, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
         Some(OverflowLimit::SessionFrames)
     );
 
     let mut stream_bytes = OverflowState::default();
-    stream_bytes.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
+    stream_bytes.push_back(
+        1,
+        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+    );
     assert_eq!(
-        stream_bytes.limit_for(
-            1,
-            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
-        ),
+        stream_bytes.limit_for(1, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
         Some(OverflowLimit::StreamBytes)
     );
 
     let mut session_bytes = OverflowState::default();
     for sid in 1..=4 {
-        session_bytes.push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
+        session_bytes.push_back(
+            sid,
+            StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+        );
     }
     assert_eq!(session_bytes.usage().bytes, SESSION_OVERFLOW_BYTES_CAP);
     assert_eq!(
-        session_bytes.limit_for(
-            5,
-            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
-        ),
+        session_bytes.limit_for(5, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
         Some(OverflowLimit::SessionBytes)
     );
     assert_eq!(session_bytes.limit_for(5, &StreamEvent::Fin), None);
 
     let mut competing_limits = OverflowState::default();
-    competing_limits.push_back(9, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
+    competing_limits.push_back(
+        9,
+        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+    );
     for _ in 1..SESSION_OVERFLOW_CAP {
         competing_limits.push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![2])));
     }
     assert_eq!(
-        competing_limits.limit_for(
-            9,
-            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
-        ),
+        competing_limits.limit_for(9, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
         Some(OverflowLimit::SessionFrames)
     );
 
     let mut competing_session_limits = OverflowState::default();
     for sid in 1..=4 {
-        competing_session_limits
-            .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
+        competing_session_limits.push_back(
+            sid,
+            StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+        );
     }
     for _ in 4..SESSION_OVERFLOW_CAP {
-        competing_session_limits.push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![3])));
+        competing_session_limits
+            .push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![3])));
     }
     assert_eq!(
-        competing_session_limits.limit_for(
-            11,
-            &StreamEvent::Data(InboundPayload::for_test(vec![1])),
-        ),
+        competing_session_limits
+            .limit_for(11, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
         Some(OverflowLimit::SessionBytes)
     );
 
@@ -186,7 +184,10 @@ fn overflow_terminal_events_cap_per_stream() {
 #[test]
 fn overflow_state_accounting_tracks_every_queue_operation() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1, 2, 3])));
+    overflow.push_back(
+        1,
+        StreamEvent::Data(InboundPayload::for_test(vec![1, 2, 3])),
+    );
     overflow.push_back(1, StreamEvent::Fin);
     overflow.push_back(2, StreamEvent::Data(InboundPayload::for_test(vec![0; 5])));
     assert_eq!(
@@ -268,13 +269,13 @@ async fn overflow_flush_progress_resets_stall_age() {
 #[tokio::test(start_paused = true)]
 async fn overflow_admit_below_hard_caps_never_kills() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
+    overflow.push_back(
+        1,
+        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+    );
     tokio::time::advance(OVERFLOW_STALL_GRACE * 4).await;
     assert!(matches!(
-        overflow.admit(
-            1,
-            StreamEvent::Data(InboundPayload::for_test(vec![1])),
-        ),
+        overflow.admit(1, StreamEvent::Data(InboundPayload::for_test(vec![1])),),
         OverflowAction::Parked
     ));
     assert_eq!(
@@ -288,10 +289,7 @@ async fn overflow_admit_below_hard_caps_never_kills() {
     }
     tokio::time::advance(OVERFLOW_STALL_GRACE * 4).await;
     assert!(matches!(
-        session_soft.admit(
-            2,
-            StreamEvent::Data(InboundPayload::for_test(vec![2])),
-        ),
+        session_soft.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![2])),),
         OverflowAction::Parked
     ));
     assert_eq!(session_soft.usage().frames, SESSION_OVERFLOW_CAP + 1);
@@ -308,7 +306,9 @@ async fn overflow_admit_hard_cap_reaps_past_grace_stream() {
     }
     tokio::time::advance(OVERFLOW_STALL_GRACE).await;
 
-    let OverflowAction::Kill(victim, event) = overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9]))) else {
+    let OverflowAction::Kill(victim, event) =
+        overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9])))
+    else {
         panic!("past-grace stream at the hard cap must be reaped")
     };
     assert_eq!(victim.sid, 1);
@@ -339,14 +339,15 @@ async fn overflow_admit_hard_cap_waits_inside_the_grace() {
     assert!(overflow.has(1));
 
     tokio::time::advance(OVERFLOW_STALL_GRACE).await;
-    let OverflowAction::Kill(victim, event) = overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9]))) else {
+    let OverflowAction::Kill(victim, event) =
+        overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![9])))
+    else {
         panic!("hard cap past the grace must reap")
     };
     assert_eq!(victim.sid, 1);
     assert!(victim.stalled_for >= OVERFLOW_STALL_GRACE);
     assert!(matches!(overflow.admit(2, event), OverflowAction::Parked));
 }
-
 
 fn anytls_node(name: &str) -> Node {
     Node {
@@ -406,7 +407,7 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
             Duration::from_millis(50),
             None,
             Arc::new(PaddingState::default()),
-            Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET)),
+            InboundPayloadBudget::new(INBOUND_PAYLOAD_BUDGET),
         ),
     )
     .await;
@@ -552,8 +553,8 @@ fn test_padding() -> Arc<PaddingState> {
     })
 }
 
-fn test_inbound_payload_budget() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(INBOUND_PAYLOAD_BUDGET))
+fn test_inbound_payload_budget() -> Arc<InboundPayloadBudget> {
+    InboundPayloadBudget::new(INBOUND_PAYLOAD_BUDGET)
 }
 
 /// Establish a session over an in-memory duplex; returns the session
@@ -564,7 +565,7 @@ async fn establish_test_session(addr: &str) -> (Arc<AnyTlsSession>, tokio::io::D
 
 async fn establish_test_session_with_budget(
     addr: &str,
-    inbound_payload_budget: Arc<tokio::sync::Semaphore>,
+    inbound_payload_budget: Arc<InboundPayloadBudget>,
 ) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
     let (client_end, server_end) = tokio::io::duplex(1 << 20);
     let (read, write) = tokio::io::split(client_end);
@@ -598,7 +599,7 @@ async fn expect_handshake(server: &mut tokio::io::DuplexStream) {
 #[tokio::test]
 async fn inbound_payload_budget_is_held_until_consumed_or_dropped() {
     const BUDGET: usize = 8;
-    let budget = Arc::new(tokio::sync::Semaphore::new(BUDGET));
+    let budget = InboundPayloadBudget::new(BUDGET);
     let (draining, mut draining_server) =
         establish_test_session_with_budget("draining", Arc::clone(&budget)).await;
     let (sibling, mut sibling_server) =
@@ -614,12 +615,15 @@ async fn inbound_payload_budget_is_held_until_consumed_or_dropped() {
         .insert(101, StreamSink::Tcp(tx));
     let permit = draining.try_reserve().unwrap();
     let mut stream = AnyTlsStream::new(Arc::clone(&draining), 101, rx, permit);
-    let (sibling_tx, mut sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    let (sibling_tx, sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     sibling
         .streams
         .lock()
         .unwrap()
         .insert(202, StreamSink::Tcp(sibling_tx));
+    let sibling_permit = sibling.try_reserve().unwrap();
+    let mut sibling_stream =
+        AnyTlsStream::new(Arc::clone(&sibling), 202, sibling_rx, sibling_permit);
 
     write_frame(&mut draining_server, CMD_PSH, 101, b"abcd")
         .await
@@ -639,10 +643,14 @@ async fn inbound_payload_budget_is_held_until_consumed_or_dropped() {
     write_frame(&mut sibling_server, CMD_PSH, 202, b"ijkl")
         .await
         .unwrap();
+    let mut sibling_bytes = [0; 4];
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), sibling_rx.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            sibling_stream.read_exact(&mut sibling_bytes)
+        )
+        .await
+        .is_err(),
         "a sibling session must backpressure at the pool-wide cap"
     );
 
@@ -651,30 +659,390 @@ async fn inbound_payload_budget_is_held_until_consumed_or_dropped() {
     assert_eq!(&partial, b"abc");
     assert_eq!(budget.available_permits(), 0);
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), sibling_rx.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            sibling_stream.read_exact(&mut sibling_bytes)
+        )
+        .await
+        .is_err(),
         "a partial read must retain the whole payload credit"
     );
 
     let mut final_byte = [0; 1];
     stream.read_exact(&mut final_byte).await.unwrap();
     assert_eq!(&final_byte, b"d");
-    let sibling_payload = tokio::time::timeout(Duration::from_secs(1), sibling_rx.recv())
-        .await
-        .expect("exact final-byte consumption releases credit")
-        .expect("sibling stream remains registered");
-    match &sibling_payload {
-        StreamEvent::Data(data) => assert_eq!(&data[..], b"ijkl"),
-        StreamEvent::Fin | StreamEvent::Error(_) => panic!("sibling payload was terminated"),
-    }
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sibling_stream.read_exact(&mut sibling_bytes),
+    )
+    .await
+    .expect("exact final-byte consumption releases credit")
+    .expect("sibling stream remains registered");
+    assert_eq!(&sibling_bytes, b"ijkl");
 
     draining.close();
     sibling.close();
-    drop(sibling_payload);
-    drop(sibling_rx);
+    drop(sibling_stream);
     drop(stream);
     assert_eq!(budget.available_permits(), BUDGET);
+}
+
+#[tokio::test]
+async fn saturated_uot_budget_does_not_block_tcp_delivery() {
+    const BUDGET: usize = 8;
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (session, mut server) =
+        establish_test_session_with_budget("class-isolation", Arc::clone(&budget)).await;
+    expect_handshake(&mut server).await;
+
+    let (uot_tx, uot_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(301, StreamSink::Uot(uot_tx));
+
+    let (tcp_tx, tcp_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(302, StreamSink::Tcp(tcp_tx));
+    let tcp_permit = session.try_reserve().unwrap();
+    let mut tcp_stream = AnyTlsStream::new(Arc::clone(&session), 302, tcp_rx, tcp_permit);
+    write_frame(&mut server, CMD_PSH, 301, &[1; BUDGET])
+        .await
+        .unwrap();
+    write_frame(&mut server, CMD_PSH, 301, &[3]).await.unwrap();
+    write_frame(&mut server, CMD_PSH, 302, &[2; BUDGET])
+        .await
+        .unwrap();
+
+    let mut delivered = [0; BUDGET];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tcp_stream.read_exact(&mut delivered),
+    )
+    .await
+    .expect("UoT saturation must not block TCP")
+    .unwrap();
+    assert_eq!(delivered, [2; BUDGET]);
+    assert!(!session.streams.lock().unwrap().contains_key(&301));
+    drop(uot_rx);
+    let (replacement_tx, mut replacement_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(303, StreamSink::Uot(replacement_tx));
+    write_frame(&mut server, CMD_PSH, 303, &[4; BUDGET])
+        .await
+        .unwrap();
+    let replacement = tokio::time::timeout(Duration::from_secs(1), replacement_rx.recv())
+        .await
+        .expect("retired UoT transport retained its payload budget")
+        .expect("replacement UoT stream closed");
+    match replacement {
+        StreamEvent::Data(data) => assert_eq!(data, vec![4; BUDGET]),
+        StreamEvent::Fin | StreamEvent::Error(_) => panic!("replacement UoT stream terminated"),
+    }
+    assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn retired_tcp_frame_does_not_fail_its_session() {
+    let budget = InboundPayloadBudget::new(8);
+    let (session, mut server) = establish_test_session_with_budget("retired-frame", budget).await;
+    expect_handshake(&mut server).await;
+
+    let (retired_tx, _retired_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(351, StreamSink::Tcp(retired_tx));
+    let (sibling_tx, sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(352, StreamSink::Tcp(sibling_tx));
+    let sibling_permit = session.try_reserve().unwrap();
+    let mut sibling_stream =
+        AnyTlsStream::new(Arc::clone(&session), 352, sibling_rx, sibling_permit);
+
+    write_frame(&mut server, CMD_PSH, 351, &[1; 4])
+        .await
+        .unwrap();
+    write_frame(&mut server, CMD_PSH, 352, &[2; 4])
+        .await
+        .unwrap();
+    let mut delivered = [0; 4];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sibling_stream.read_exact(&mut delivered),
+    )
+    .await
+    .expect("retired TCP frame failed the physical session")
+    .unwrap();
+    assert_eq!(delivered, [2; 4]);
+    assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn terminal_event_releases_later_payload_credit() {
+    const BUDGET: usize = 8;
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (session, mut server) =
+        establish_test_session_with_budget("terminal-credit", Arc::clone(&budget)).await;
+    expect_handshake(&mut server).await;
+
+    let (failed_tx, failed_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(401, StreamSink::Tcp(failed_tx.clone()));
+    let failed_permit = session.try_reserve().unwrap();
+    let mut failed_stream = AnyTlsStream::new(Arc::clone(&session), 401, failed_rx, failed_permit);
+    let inbound = session.tcp_inbound.lock().get(&401).unwrap().clone();
+    let (credit, _wait) = budget.acquire(&session, 401, BUDGET).await.unwrap();
+    let credit = credit.unwrap();
+    failed_tx
+        .send(StreamEvent::Error(Arc::from("target refused")))
+        .await
+        .unwrap();
+    failed_tx
+        .send(StreamEvent::Data(InboundPayload::for_tcp(
+            vec![1; BUDGET],
+            credit,
+            inbound,
+        )))
+        .await
+        .unwrap();
+
+    let mut byte = [0; 1];
+    let error = failed_stream.read_exact(&mut byte).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+
+    let (sibling_tx, sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(402, StreamSink::Tcp(sibling_tx));
+    let sibling_permit = session.try_reserve().unwrap();
+    let mut sibling_stream =
+        AnyTlsStream::new(Arc::clone(&session), 402, sibling_rx, sibling_permit);
+    write_frame(&mut server, CMD_PSH, 402, &[2; BUDGET])
+        .await
+        .unwrap();
+    let mut delivered = [0; BUDGET];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sibling_stream.read_exact(&mut delivered),
+    )
+    .await
+    .expect("terminal stream retained sibling payload budget")
+    .unwrap();
+    assert_eq!(delivered, [2; BUDGET]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn canceled_budget_waiter_does_not_stall_or_desync_demux() {
+    const BUDGET: usize = 8;
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (blocker, mut blocker_server) =
+        establish_test_session_with_budget("wait-blocker", Arc::clone(&budget)).await;
+    let (waiting, mut waiting_server) =
+        establish_test_session_with_budget("wait-cancel", Arc::clone(&budget)).await;
+    expect_handshake(&mut blocker_server).await;
+    expect_handshake(&mut waiting_server).await;
+
+    let (blocker_tx, blocker_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    blocker
+        .streams
+        .lock()
+        .unwrap()
+        .insert(601, StreamSink::Tcp(blocker_tx));
+    let blocker_permit = blocker.try_reserve().unwrap();
+    let mut blocker_stream =
+        AnyTlsStream::new(Arc::clone(&blocker), 601, blocker_rx, blocker_permit);
+    let (canceled_tx, canceled_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    waiting
+        .streams
+        .lock()
+        .unwrap()
+        .insert(602, StreamSink::Tcp(canceled_tx));
+    let canceled_permit = waiting.try_reserve().unwrap();
+    let canceled_stream =
+        AnyTlsStream::new(Arc::clone(&waiting), 602, canceled_rx, canceled_permit);
+    let (survivor_tx, survivor_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    waiting
+        .streams
+        .lock()
+        .unwrap()
+        .insert(603, StreamSink::Tcp(survivor_tx));
+    let survivor_permit = waiting.try_reserve().unwrap();
+    let mut survivor_stream =
+        AnyTlsStream::new(Arc::clone(&waiting), 603, survivor_rx, survivor_permit);
+
+    write_frame(&mut blocker_server, CMD_PSH, 601, &[1; BUDGET])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if budget.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), 0);
+    write_frame(&mut waiting_server, CMD_PSH, 602, &[2; 4])
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    write_frame(&mut waiting_server, CMD_PSH, 603, &[3; 4])
+        .await
+        .unwrap();
+    drop(canceled_stream);
+    tokio::time::advance(OVERFLOW_EMERGENCY_WAIT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let mut blocker_payload = [0; BUDGET];
+    blocker_stream
+        .read_exact(&mut blocker_payload)
+        .await
+        .unwrap();
+    let mut survivor_payload = [0; 4];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        survivor_stream.read_exact(&mut survivor_payload),
+    )
+    .await
+    .expect("canceled frame left the session demux stalled or misaligned")
+    .unwrap();
+    assert_eq!(survivor_payload, [3; 4]);
+    assert!(!waiting.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_primary_queue_releases_pool_budget_for_sibling_session() {
+    const BUDGET: usize = 8;
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (slow, mut slow_server) =
+        establish_test_session_with_budget("slow", Arc::clone(&budget)).await;
+    let (sibling, mut sibling_server) =
+        establish_test_session_with_budget("sibling", Arc::clone(&budget)).await;
+    expect_handshake(&mut slow_server).await;
+    expect_handshake(&mut sibling_server).await;
+
+    let (slow_tx, slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    slow.streams
+        .lock()
+        .unwrap()
+        .insert(301, StreamSink::Tcp(slow_tx));
+    let slow_permit = slow.try_reserve().unwrap();
+    let mut slow_stream = AnyTlsStream::new(Arc::clone(&slow), 301, slow_rx, slow_permit);
+    let (sibling_tx, sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    sibling
+        .streams
+        .lock()
+        .unwrap()
+        .insert(302, StreamSink::Tcp(sibling_tx));
+    let sibling_permit = sibling.try_reserve().unwrap();
+    let mut sibling_stream =
+        AnyTlsStream::new(Arc::clone(&sibling), 302, sibling_rx, sibling_permit);
+
+    write_frame(&mut slow_server, CMD_PSH, 301, &[1; BUDGET])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if budget.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), 0);
+    write_frame(&mut sibling_server, CMD_PSH, 302, &[2; 4])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(OVERFLOW_STALL_GRACE - OVERFLOW_EMERGENCY_WAIT).await;
+    let mut progress = [0; 1];
+    slow_stream.read_exact(&mut progress).await.unwrap();
+    assert_eq!(progress, [1]);
+    tokio::time::advance(OVERFLOW_EMERGENCY_WAIT + OVERFLOW_EMERGENCY_WAIT).await;
+    tokio::task::yield_now().await;
+    assert!(slow.streams.lock().unwrap().contains_key(&301));
+    assert_eq!(budget.available_permits(), 0);
+    tokio::time::advance(OVERFLOW_STALL_GRACE).await;
+
+    let mut delivered = [0; 4];
+    sibling_stream.read_exact(&mut delivered).await.unwrap();
+    assert_eq!(delivered, [2; 4]);
+    let mut byte = [0; 1];
+    let error = slow_stream.read_exact(&mut byte).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!slow.is_closed());
+    assert!(!sibling.is_closed());
+    assert_eq!(budget.available_permits(), BUDGET);
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_session_budget_reap_reports_reset() {
+    const BUDGET: usize = 8;
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (slow, mut slow_server) =
+        establish_test_session_with_budget("closed-slow", Arc::clone(&budget)).await;
+    let (sibling, mut sibling_server) =
+        establish_test_session_with_budget("closed-sibling", Arc::clone(&budget)).await;
+    expect_handshake(&mut slow_server).await;
+    expect_handshake(&mut sibling_server).await;
+
+    let (slow_tx, slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    slow.streams
+        .lock()
+        .unwrap()
+        .insert(501, StreamSink::Tcp(slow_tx));
+    let slow_permit = slow.try_reserve().unwrap();
+    let mut slow_stream = AnyTlsStream::new(Arc::clone(&slow), 501, slow_rx, slow_permit);
+    let (sibling_tx, sibling_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    sibling
+        .streams
+        .lock()
+        .unwrap()
+        .insert(502, StreamSink::Tcp(sibling_tx));
+    let sibling_permit = sibling.try_reserve().unwrap();
+    let mut sibling_stream =
+        AnyTlsStream::new(Arc::clone(&sibling), 502, sibling_rx, sibling_permit);
+
+    write_frame(&mut slow_server, CMD_PSH, 501, &[1; BUDGET])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if budget.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), 0);
+    slow.close();
+    write_frame(&mut sibling_server, CMD_PSH, 502, &[2; 4])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(OVERFLOW_STALL_GRACE + OVERFLOW_EMERGENCY_WAIT + OVERFLOW_EMERGENCY_WAIT)
+        .await;
+
+    let mut delivered = [0; 4];
+    sibling_stream.read_exact(&mut delivered).await.unwrap();
+    assert_eq!(delivered, [2; 4]);
+    let mut byte = [0; 1];
+    let error = slow_stream.read_exact(&mut byte).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!sibling.is_closed());
 }
 
 #[tokio::test]
@@ -1816,27 +2184,120 @@ async fn dropped_unanswered_stream_cancels_its_synack_deadline() {
     );
 }
 
-/// The activity marker is sampled before the batch write, so frames that
-/// arrive while a blocked flush is still in flight count as window activity.
+/// A locally blocked frame stays observable across permit acquisition and
+/// body dispatch. Once admitted without that wait, a partial body is still
+/// peer silence and lets the SYNACK watchdog retire the physical session.
 #[tokio::test(start_paused = true)]
-async fn synack_activity_marker_is_a_pre_write_snapshot() {
-    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+async fn budget_wait_to_body_handoff_is_atomic_for_synack_liveness() {
+    const BUDGET: usize = 8;
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (blocker, mut blocker_server) =
+        establish_test_session_with_budget("synack-blocker", Arc::clone(&budget)).await;
+    let (session, mut server) =
+        establish_test_session_with_budget("synack-active", Arc::clone(&budget)).await;
+    expect_handshake(&mut blocker_server).await;
     expect_handshake(&mut server).await;
     write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
         .await
         .unwrap();
     tokio::task::yield_now().await;
 
-    session.register_synack(2);
+    let (blocker_tx, blocker_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    blocker
+        .streams
+        .lock()
+        .unwrap()
+        .insert(7, StreamSink::Tcp(blocker_tx));
+    let blocker_permit = blocker.try_reserve().unwrap();
+    let blocker_stream = AnyTlsStream::new(Arc::clone(&blocker), 7, blocker_rx, blocker_permit);
+    write_frame(&mut blocker_server, CMD_PSH, 7, &[1; BUDGET])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if budget.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), 0);
+
+    let (active_tx, active_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(9, StreamSink::Tcp(active_tx));
+    let active_permit = session.try_reserve().unwrap();
+    let mut active_stream = AnyTlsStream::new(Arc::clone(&session), 9, active_rx, active_permit);
+    session.register_synack(9);
     let marker = session.rx_frame_seq.load(Ordering::Relaxed);
-    session.start_synack_deadline(2, marker);
-    session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
+    session.start_synack_deadline(9, marker);
+    let mut delayed = Vec::new();
+    write_frame(&mut delayed, CMD_PSH, 9, b"xy").await.unwrap();
+    server
+        .write_all(&delayed[..FRAME_HEADER_LEN + 1])
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(SYNACK_TIMEOUT - Duration::from_millis(1)).await;
+    drop(blocker_stream);
+    for _ in 0..100 {
+        if budget.available_permits() == BUDGET - 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), BUDGET - 2);
+    assert_eq!(session.inbound_budget_epoch.load(Ordering::SeqCst) & 1, 1);
+
+    tokio::time::advance(Duration::from_millis(2)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "permit acquisition must not create a false-silence window"
+    );
+    server
+        .write_all(&delayed[FRAME_HEADER_LEN + 1..])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if session.rx_frame_seq.load(Ordering::Relaxed) > marker {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(session.rx_frame_seq.load(Ordering::Relaxed) > marker);
+    let error = active_stream.read(&mut [0; 1]).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert_eq!(budget.available_permits(), BUDGET);
+
+    let (stalled_tx, stalled_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(10, StreamSink::Tcp(stalled_tx));
+    let stalled_permit = session.try_reserve().unwrap();
+    let _stalled_stream = AnyTlsStream::new(Arc::clone(&session), 10, stalled_rx, stalled_permit);
+    session.register_synack(10);
+    let marker = session.rx_frame_seq.load(Ordering::Relaxed);
+    session.start_synack_deadline(10, marker);
+    let mut partial = Vec::new();
+    write_frame(&mut partial, CMD_PSH, 10, b"yz").await.unwrap();
+    server
+        .write_all(&partial[..FRAME_HEADER_LEN + 1])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
 
     tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
     assert!(
-        !session.is_closed(),
-        "post-marker frames must count as window activity"
+        session.is_closed(),
+        "a peer-stalled frame body must not count as completed activity"
     );
 }
 
@@ -1913,21 +2374,6 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
     drop(registration);
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 
-    let (closed_tx, closed_rx) = mpsc::channel(STREAM_QUEUE_CAP);
-    session
-        .streams
-        .lock()
-        .unwrap()
-        .insert(33, StreamSink::Tcp(closed_tx));
-    session
-        .overflow
-        .lock()
-        .push_back(33, StreamEvent::Data(InboundPayload::for_test(vec![3; 23])));
-    drop(closed_rx);
-    session.dispatch_data(33, vec![4]).await;
-    assert!(!session.streams.lock().unwrap().contains_key(&33));
-    assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
-
     let (close_tx, _close_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     session
         .streams
@@ -1951,19 +2397,22 @@ async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
     let sid = 41;
     let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
+        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
+            .unwrap();
     }
     session
         .streams
         .lock()
         .unwrap()
         .insert(sid, StreamSink::Tcp(tx));
-    session
-        .overflow
-        .lock()
-        .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])));
+    session.overflow.lock().push_back(
+        sid,
+        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+    );
 
-    session.park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1]))).await;
+    session
+        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])))
+        .await;
     tokio::time::advance(OVERFLOW_STALL_GRACE - OVERFLOW_WATCHDOG_TICK).await;
     tokio::task::yield_now().await;
     assert!(session.streams.lock().unwrap().contains_key(&sid));
@@ -2064,7 +2513,10 @@ async fn session_hard_cap_kills_stream_that_outwaits_the_stall_grace() {
     tokio::time::advance(OVERFLOW_STALL_GRACE).await;
 
     session
-        .park_overflow(53, StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])))
+        .park_overflow(
+            53,
+            StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])),
+        )
         .await;
 
     assert!(session.killed_streams.lock().unwrap().contains(&51));
@@ -2103,7 +2555,9 @@ async fn session_hard_cap_waits_for_progress_and_spares_everyone() {
     let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     let (waiting_tx, mut waiting_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        waiting_tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![7]))).unwrap();
+        waiting_tx
+            .try_send(StreamEvent::Data(InboundPayload::for_test(vec![7])))
+            .unwrap();
     }
     {
         let mut streams = session.streams.lock().unwrap();
@@ -2113,7 +2567,10 @@ async fn session_hard_cap_waits_for_progress_and_spares_everyone() {
     {
         let mut overflow = session.overflow.lock();
         for _ in 0..SESSION_OVERFLOW_HARD_CAP {
-            overflow.push_back(slow_sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
+            overflow.push_back(
+                slow_sid,
+                StreamEvent::Data(InboundPayload::for_test(vec![1; 8])),
+            );
         }
     }
 
@@ -2121,7 +2578,10 @@ async fn session_hard_cap_waits_for_progress_and_spares_everyone() {
         let session = Arc::clone(&session);
         async move {
             session
-                .park_overflow(waiting_sid, StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])))
+                .park_overflow(
+                    waiting_sid,
+                    StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])),
+                )
                 .await;
         }
     });
@@ -2179,7 +2639,9 @@ async fn session_hard_cap_kills_only_after_full_grace_of_waits() {
         }
     }
 
-    session.park_overflow(72, StreamEvent::Data(InboundPayload::for_test(vec![9]))).await;
+    session
+        .park_overflow(72, StreamEvent::Data(InboundPayload::for_test(vec![9])))
+        .await;
 
     assert!(session.killed_streams.lock().unwrap().contains(&71));
     assert!(!session.streams.lock().unwrap().contains_key(&71));
@@ -2199,10 +2661,12 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
     let fast_sid = 62;
     let waiting_sid = 63;
     let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
-    let (fast_tx, mut fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    let (fast_tx, fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     let (waiting_tx, mut waiting_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        waiting_tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![7]))).unwrap();
+        waiting_tx
+            .try_send(StreamEvent::Data(InboundPayload::for_test(vec![7])))
+            .unwrap();
     }
     {
         let mut streams = session.streams.lock().unwrap();
@@ -2210,15 +2674,23 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
         streams.insert(fast_sid, StreamSink::Tcp(fast_tx));
         streams.insert(waiting_sid, StreamSink::Tcp(waiting_tx));
     }
+    let fast_permit = session.try_reserve().unwrap();
+    let mut fast_stream = AnyTlsStream::new(Arc::clone(&session), fast_sid, fast_rx, fast_permit);
     {
         let mut overflow = session.overflow.lock();
         for _ in 0..SESSION_OVERFLOW_CAP {
-            overflow.push_back(slow_sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])));
+            overflow.push_back(
+                slow_sid,
+                StreamEvent::Data(InboundPayload::for_test(vec![1; 8])),
+            );
         }
     }
 
     session
-        .park_overflow(waiting_sid, StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])))
+        .park_overflow(
+            waiting_sid,
+            StreamEvent::Data(InboundPayload::for_test(vec![9, 8, 7])),
+        )
         .await;
     assert!(
         !session
@@ -2230,10 +2702,9 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
     assert_eq!(session.overflow.lock().stream_usage(waiting_sid).frames, 1);
 
     session.dispatch_data(fast_sid, vec![7]).await;
-    match fast_rx.recv().await.unwrap() {
-        StreamEvent::Data(data) => assert_eq!(data, vec![7]),
-        StreamEvent::Fin | StreamEvent::Error(_) => panic!("fast sibling was terminated"),
-    }
+    let mut fast_byte = [0; 1];
+    fast_stream.read_exact(&mut fast_byte).await.unwrap();
+    assert_eq!(fast_byte, [7]);
 
     match waiting_rx.recv().await.unwrap() {
         StreamEvent::Data(data) => assert_eq!(data, vec![7]),
@@ -2269,7 +2740,10 @@ async fn overflow_transition_self_kicks_an_emptied_queue() {
         .insert(sid, StreamSink::Tcp(tx));
 
     session
-        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![7, 8, 9])))
+        .park_overflow(
+            sid,
+            StreamEvent::Data(InboundPayload::for_test(vec![7, 8, 9])),
+        )
         .await;
 
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
@@ -2294,7 +2768,9 @@ async fn concurrent_overflow_flush_preserves_stream_order() {
     for index in 0..EVENTS {
         session.overflow.lock().push_back(
             sid,
-            StreamEvent::Data(InboundPayload::for_test(u16::try_from(index).unwrap().to_be_bytes().to_vec())),
+            StreamEvent::Data(InboundPayload::for_test(
+                u16::try_from(index).unwrap().to_be_bytes().to_vec(),
+            )),
         );
     }
 
@@ -2375,7 +2851,8 @@ async fn stale_remote_fin_after_overflow_kill_is_reset() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
     let sid = 82;
     let (tx, rx) = mpsc::channel(1);
-    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![1]))).unwrap();
+    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![1])))
+        .unwrap();
     session
         .streams
         .lock()
@@ -2567,7 +3044,7 @@ async fn test_hol_stall_does_not_block_other_streams() {
 
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
     let (slow_tx, slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
-    let (fast_tx, mut fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    let (fast_tx, fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     session
         .streams
         .lock()
@@ -2578,6 +3055,8 @@ async fn test_hol_stall_does_not_block_other_streams() {
         .lock()
         .unwrap()
         .insert(2, StreamSink::Tcp(fast_tx));
+    let fast_permit = session.try_reserve().unwrap();
+    let mut fast_stream = AnyTlsStream::new(Arc::clone(&session), 2, fast_rx, fast_permit);
     let permit = session.try_reserve().unwrap();
     let mut slow_stream = AnyTlsStream::new(Arc::clone(&session), 1, slow_rx, permit);
 
@@ -2588,14 +3067,15 @@ async fn test_hol_stall_does_not_block_other_streams() {
 
     for i in 0..10u8 {
         session.dispatch_data(2, vec![i; 4]).await;
-        let ev = tokio::time::timeout(Duration::from_secs(2), fast_rx.recv())
-            .await
-            .expect("stream 2 must not be blocked by stream 1")
-            .expect("stream 2 channel open");
-        match ev {
-            StreamEvent::Data(d) => assert_eq!(d, vec![i; 4]),
-            _ => panic!("stream 2 got non-data event"),
-        }
+        let mut delivered = [0; 4];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fast_stream.read_exact(&mut delivered),
+        )
+        .await
+        .expect("stream 2 must not be blocked by stream 1")
+        .unwrap();
+        assert_eq!(delivered, [i; 4]);
     }
 
     let total = STREAM_QUEUE_CAP + parked;
@@ -2620,13 +3100,17 @@ async fn demux_overflow_cap_never_blocks_sibling_streams() {
     expect_handshake(&mut server).await;
     let slow_sid = 91;
     let fast_sid = 92;
-    let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
-    let (fast_tx, mut fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    let (slow_tx, slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    let (fast_tx, fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
     {
         let mut streams = session.streams.lock().unwrap();
         streams.insert(slow_sid, StreamSink::Tcp(slow_tx));
         streams.insert(fast_sid, StreamSink::Tcp(fast_tx));
     }
+    let slow_permit = session.try_reserve().unwrap();
+    let _slow_stream = AnyTlsStream::new(Arc::clone(&session), slow_sid, slow_rx, slow_permit);
+    let fast_permit = session.try_reserve().unwrap();
+    let mut fast_stream = AnyTlsStream::new(Arc::clone(&session), fast_sid, fast_rx, fast_permit);
 
     for _ in 0..STREAM_QUEUE_CAP + SESSION_OVERFLOW_CAP {
         write_frame(&mut server, CMD_PSH, slow_sid, &[1u8; 8])
@@ -2647,14 +3131,15 @@ async fn demux_overflow_cap_never_blocks_sibling_streams() {
     write_frame(&mut server, CMD_PSH, fast_sid, &[7u8; 4])
         .await
         .unwrap();
-    let event = tokio::time::timeout(Duration::from_millis(100), fast_rx.recv())
-        .await
-        .expect("fast sibling must not wait behind the overflow cap")
-        .expect("fast sibling channel open");
-    match event {
-        StreamEvent::Data(data) => assert_eq!(data, vec![7u8; 4]),
-        StreamEvent::Fin | StreamEvent::Error(_) => panic!("fast sibling was terminated"),
-    }
+    let mut data = [0; 4];
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        fast_stream.read_exact(&mut data),
+    )
+    .await
+    .expect("fast sibling must not wait behind the overflow cap")
+    .expect("fast sibling remains open");
+    assert_eq!(data, [7u8; 4]);
     assert!(session.streams.lock().unwrap().contains_key(&slow_sid));
     assert!(!session.killed_streams.lock().unwrap().contains(&slow_sid));
     session.close();
@@ -2668,7 +3153,8 @@ async fn overflow_watchdog_spares_streams_with_flush_progress() {
     let sid = 44;
     let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
+        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
+            .unwrap();
     }
     session
         .streams
@@ -2710,7 +3196,8 @@ async fn overflow_watchdog_retires_when_the_overflow_drains() {
     let sid = 45;
     let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
+        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
+            .unwrap();
     }
     session
         .streams
@@ -2739,7 +3226,8 @@ async fn uot_sink_saturation_retires_only_stream() {
     let (session, mut server) = establish_test_session("127.0.0.1:443").await;
     expect_handshake(&mut server).await;
     let (tx, _rx) = mpsc::channel(1);
-    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0]))).unwrap();
+    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
+        .unwrap();
     session
         .streams
         .lock()
@@ -3179,7 +3667,7 @@ async fn speculative_detached_winner_commits_into_captured_pool_once() {
 }
 
 #[tokio::test]
-async fn speculative_commit_binds_initial_generation_admission() {
+async fn speculative_prepare_binds_initial_generation_admission() {
     let mut node = zero_idle_anytls_node("speculative-initial-admission");
     node.address = "127.0.0.1:443".into();
     let generation = Arc::new(
@@ -3209,11 +3697,103 @@ async fn speculative_commit_binds_initial_generation_admission() {
         ))
         .await
         .unwrap();
-    assert!(!pool.dial_scope_matches(&generation));
+    assert!(pool.dial_scope_matches(&generation));
 
     let transport = prepared.commit().await.unwrap();
 
     assert!(pool.dial_scope_matches(&generation));
+    drop(transport);
+    pool.shutdown();
+}
+
+#[tokio::test]
+async fn prepared_transport_does_not_retain_retired_generation_gates() {
+    let node = zero_idle_anytls_node("retired-prepared-admission");
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&node),
+            1,
+            None,
+        )
+        .unwrap()
+        .0,
+    );
+    generation.activate_background_dial_admission();
+    let runtime = generation.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    let (session, _server) = establish_test_session("retired-prepared-admission").await;
+    let prepared = generation
+        .scope_dials(AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+            &node,
+            Arc::clone(&pool),
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+            Some(runtime),
+            {
+                let session = Arc::clone(&session);
+                move || async move { Ok(session) }
+            },
+        ))
+        .await
+        .unwrap();
+    let (generation_gate, process_gate) = generation.dial_gate_weak_refs();
+
+    generation.drain_session_pools();
+    drop(generation);
+
+    assert!(generation_gate.upgrade().is_none());
+    assert!(process_gate.upgrade().is_none());
+    drop(prepared);
+}
+
+#[tokio::test]
+async fn late_predecessor_commit_keeps_successor_dial_admission() {
+    let node = zero_idle_anytls_node("late-predecessor-admission");
+    let first = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&node),
+            1,
+            None,
+        )
+        .unwrap()
+        .0,
+    );
+    first.activate_background_dial_admission();
+    let runtime = first.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    let (session, _server) = establish_test_session("late-predecessor-admission").await;
+    let prepared = first
+        .scope_dials(AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+            &node,
+            Arc::clone(&pool),
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+            Some(runtime),
+            {
+                let session = Arc::clone(&session);
+                move || async move { Ok(session) }
+            },
+        ))
+        .await
+        .unwrap();
+    let (first_gate, _) = first.dial_gate_weak_refs();
+    let (successor, reused) = crate::runtime::OutboundRuntimeRegistry::build_reusing(
+        std::slice::from_ref(&node),
+        2,
+        Some(&first),
+    )
+    .unwrap();
+    let successor = Arc::new(successor);
+    successor.activate_background_dial_admission();
+    first.mark_moved_out(reused);
+    first.drain_session_pools();
+    drop(first);
+    assert!(first_gate.upgrade().is_none());
+    assert!(pool.dial_scope_matches(&successor));
+
+    let transport = prepared.commit().await.unwrap();
+
+    assert!(pool.dial_scope_matches(&successor));
     drop(transport);
     pool.shutdown();
 }
