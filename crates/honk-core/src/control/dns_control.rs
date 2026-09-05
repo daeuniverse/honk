@@ -12,8 +12,8 @@ use crate::ebpf::EbpfBackend;
 use crate::routing::Router;
 #[cfg(test)]
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, warn};
 
@@ -208,11 +208,16 @@ impl DnsController {
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
                 build_dns_refused(data)
             }
-            Err(_) => {
-                debug!(
-                    error_kind = "resolve_failed",
-                    "DNS controller forward failed; sending SERVFAIL"
-                );
+            Err(error) => {
+                // A wedged upstream layer must be visible at the default
+                // level without one line per query. Monotonic clock: a
+                // wall-clock step must not mute the alarm.
+                static LAST_SERVFAIL_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+                let mut last = LAST_SERVFAIL_LOG.lock().unwrap();
+                if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+                    *last = Some(Instant::now());
+                    warn!(error = %error, "DNS controller forward failed; sending SERVFAIL");
+                }
                 build_dns_servfail(data)
             }
         }

@@ -43,6 +43,8 @@ routing {
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
 
+A `mac(...)` bypass does not exempt a client from DNS interception: on LAN interfaces the port-`53` fast path runs before the routing engine, so no routing rule can exempt DNS. Only a specifically bound non-honk local `:53` listener takes precedence over the fast path (see the DNS design doc).
+
 ## Outbound targets and `must`
 
 | Target | Meaning |
