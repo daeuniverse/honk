@@ -218,7 +218,7 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 
 | Query | 含义 |
 | --- | --- |
-| `security=reality` | 选择 REALITY 并开启 TLS |
+| `security=reality` | 选择 REALITY 并开启 TLS。选择了 REALITY 却没有 `pbk` 的节点会在校验时被拒绝，而不是降级成普通 TLS |
 | `pbk` | Base64url 编码的 32 字节 X25519 服务端公钥；无效输入 fail-closed |
 | `sid` | 偶数长度十六进制 short ID，最多 8 字节；允许为空 |
 | `spx` | 存储 spider path；选择 REALITY 时默认为 `/` |

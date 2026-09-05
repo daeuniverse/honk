@@ -24,7 +24,7 @@
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。当前健康检查循环使用第一个值；空列表退回普通 TCP 检查。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔；省略端口时默认为 `53`。 |
-| `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。UDP 预热 coordinator 也使用该值，但实际下限为 10 秒。 |
+| `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。必须为正；解析失败的值会变成零并在校验时被拒绝。UDP 预热 coordinator 也使用该值，但实际下限为 10 秒。 |
 | `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。 |
 | `dial_mode` | `dial_mode` | `"domain"` | 目的域名发现和路由模式：`ip`、`domain`、`domain+` 或 `domain++`。参见[拨号模式](#拨号模式)。 |
 | `allow_insecure` | `allow_insecure` | `false` | 全局 TLS 校验回退兼容字段。当前 TLS connector 不读取该字段；跳过证书校验需在节点分享链接中按节点配置。 |

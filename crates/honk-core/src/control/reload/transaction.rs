@@ -134,12 +134,18 @@ impl ControlPlane {
             .await
     }
 
-    /// Publish an explicit runtime configuration through the serialized transaction.
+    /// Validate and publish an explicit runtime configuration through the serialized
+    /// transaction used by SIGHUP and subscription refreshes.
     ///
-    /// This direct API cannot reconcile the process-owned subscription workers, so
-    /// it rejects additions, removals, or worker-spec changes. Use the engine's
-    /// SIGHUP reload path when the subscription worker set changes.
+    /// Validation stays on this public entry because subscription merges legitimately
+    /// publish nodes a whole-config check would reject. Unlike SIGHUP, direct callers
+    /// cannot reconcile the process-owned subscription workers, so additions, removals,
+    /// or worker-spec changes are rejected; use SIGHUP for those changes.
     pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
+        if let Err(error) = new_config.validate() {
+            error!(%error, "runtime reload rejected: invalid configuration");
+            return false;
+        }
         let drain = Arc::clone(&self.drain_tracker);
         self.apply_runtime_config(new_config, &drain).await
     }

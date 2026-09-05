@@ -967,6 +967,48 @@ fn test_validate_rejects_vless_encryption_with_flow() {
 }
 
 #[test]
+fn test_reality_without_public_key_is_rejected_on_every_load_path() {
+    // Share links are validated as they are parsed.
+    for link in [
+        "vless://uuid@example.com:443?security=reality#no-pbk",
+        "vless://uuid@example.com:443?security=reality&pbk=#empty-pbk",
+    ] {
+        let error = Node::from_share_link(link).unwrap_err();
+        assert!(
+            error.to_string().contains("without reality_public_key"),
+            "{link} must be rejected rather than degraded to plain TLS: {error}"
+        );
+    }
+
+    // A structured node reaches the same invariant through Config::validate.
+    let node =
+        Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=AAA#ok").unwrap();
+    let mut config = Config::default();
+    config.nodes.push(node.clone());
+    config.validate().unwrap();
+
+    // Either an auxiliary REALITY field or the key itself signals the intent; an empty key is
+    // still the intent, and only a node with none of the three is an ordinary TLS node.
+    for (key, short_id) in [
+        (None, Some("0123456789abcdef".to_string())),
+        // An empty short id is documented as valid, so it still signals REALITY.
+        (None, Some(String::new())),
+        (Some(String::new()), None),
+        (Some("  ".to_string()), None),
+    ] {
+        let mut node = node.clone();
+        let tls = node.tls_mut().unwrap();
+        tls.reality_public_key = key;
+        tls.reality_short_id = short_id;
+        tls.reality_spider_x = None;
+        let mut config = Config::default();
+        config.nodes.push(node);
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("without reality_public_key"));
+    }
+}
+
+#[test]
 fn test_vless_derive_id_differs_by_reality_public_key() {
     let a =
         Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=AAA#a").unwrap();
