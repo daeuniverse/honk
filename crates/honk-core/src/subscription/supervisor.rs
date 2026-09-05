@@ -505,3 +505,137 @@ impl SubscriptionSupervisor {
         remaining
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    struct DropCount(Arc<AtomicUsize>);
+
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn tracked_pending<T>(started: Arc<Notify>, drops: Arc<AtomicUsize>) -> T {
+        let _drop = DropCount(drops);
+        started.notify_one();
+        pending().await
+    }
+
+    fn authorized(id: uuid::Uuid, revision: u64) -> AuthorizedSubscription {
+        AuthorizedSubscription {
+            subscription: Subscription {
+                id,
+                name: format!("subscription-{revision}"),
+                url: "http://127.0.0.1:9".into(),
+                update_interval: 3_600,
+                ..Default::default()
+            },
+            revision,
+        }
+    }
+
+    fn state(
+        startup: JoinSet<FetchCompletion>,
+        immediate: JoinSet<()>,
+        periodic: HashMap<uuid::Uuid, PeriodicWorker>,
+    ) -> SupervisorState {
+        let (command_tx, _commands) = mpsc::channel(4);
+        SupervisorState {
+            manager: Arc::new(SubscriptionManager::new().unwrap()),
+            store: None,
+            command_tx,
+            startup,
+            immediate,
+            periodic,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_joins_startup_and_replaces_periodic_worker() {
+        let id = uuid::Uuid::new_v4();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let startup_started = Arc::new(Notify::new());
+        let periodic_started = Arc::new(Notify::new());
+        let mut startup = JoinSet::new();
+        let startup_abort = startup.spawn(tracked_pending::<FetchCompletion>(
+            Arc::clone(&startup_started),
+            Arc::clone(&drops),
+        ));
+        let periodic_task = tokio::spawn(tracked_pending::<()>(
+            Arc::clone(&periodic_started),
+            Arc::clone(&drops),
+        ));
+        let periodic_abort = periodic_task.abort_handle();
+        let mut periodic = HashMap::new();
+        periodic.insert(
+            id,
+            PeriodicWorker {
+                authorized: authorized(id, 1),
+                task: periodic_task,
+            },
+        );
+        let mut state = state(startup, JoinSet::new(), periodic);
+        startup_started.notified().await;
+        periodic_started.notified().await;
+
+        state.reconcile(vec![authorized(id, 2)]).await;
+
+        assert!(state.startup.is_empty());
+        assert_eq!(state.periodic[&id].authorized.revision, 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(startup_abort.is_finished());
+        assert!(periodic_abort.is_finished());
+        state.shutdown().await;
+        assert_eq!(state.owned_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_every_active_worker() {
+        let id = uuid::Uuid::new_v4();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let startup_started = Arc::new(Notify::new());
+        let immediate_started = Arc::new(Notify::new());
+        let periodic_started = Arc::new(Notify::new());
+        let mut startup = JoinSet::new();
+        let startup_abort = startup.spawn(tracked_pending::<FetchCompletion>(
+            Arc::clone(&startup_started),
+            Arc::clone(&drops),
+        ));
+        let mut immediate = JoinSet::new();
+        let immediate_abort = immediate.spawn(tracked_pending::<()>(
+            Arc::clone(&immediate_started),
+            Arc::clone(&drops),
+        ));
+        let periodic_task = tokio::spawn(tracked_pending::<()>(
+            Arc::clone(&periodic_started),
+            Arc::clone(&drops),
+        ));
+        let periodic_abort = periodic_task.abort_handle();
+        let mut periodic = HashMap::new();
+        periodic.insert(
+            id,
+            PeriodicWorker {
+                authorized: authorized(id, 1),
+                task: periodic_task,
+            },
+        );
+        let mut state = state(startup, immediate, periodic);
+        startup_started.notified().await;
+        immediate_started.notified().await;
+        periodic_started.notified().await;
+
+        state.shutdown().await;
+
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert!(startup_abort.is_finished());
+        assert!(immediate_abort.is_finished());
+        assert!(periodic_abort.is_finished());
+        assert_eq!(state.owned_task_count(), 0);
+    }
+}

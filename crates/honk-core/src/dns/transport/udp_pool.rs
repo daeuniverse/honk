@@ -354,16 +354,24 @@ mod tests {
         let first = tokio::spawn(async move { first_pool.exchange(&query(0x1234), None).await });
         let mut first_wire = [0_u8; 512];
         let (first_len, first_peer) = server.recv_from(&mut first_wire).await.unwrap();
-        let first_id = first_wire[..2].to_vec();
+        let first_id = u16::from_be_bytes(first_wire[..2].try_into().unwrap());
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
+        {
+            let state = pool.state.lock();
+            assert!(!state.pending.contains_key(&first_id));
+            assert!(UdpPool::is_retired(&state, first_id));
+        }
 
         let second_pool = Arc::clone(&pool);
         let mut second =
             tokio::spawn(async move { second_pool.exchange(&query(0x5678), None).await });
         let mut second_wire = [0_u8; 512];
         let (second_len, second_peer) = server.recv_from(&mut second_wire).await.unwrap();
-        assert_ne!(&second_wire[..2], first_id.as_slice());
+        assert_ne!(
+            u16::from_be_bytes(second_wire[..2].try_into().unwrap()),
+            first_id
+        );
 
         first_wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         server
