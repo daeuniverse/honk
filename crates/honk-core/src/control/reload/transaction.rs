@@ -128,8 +128,16 @@ impl ControlPlane {
     }
 
     /// Publish an explicit runtime configuration through the same transaction
-    /// used by SIGHUP and subscription refreshes.
+    /// used by SIGHUP and subscription refreshes. This entry point has no caller that has
+    /// already validated, so it validates here, the way the SIGHUP handler does. The check
+    /// stays on this public entry rather than inside the shared transaction: subscription
+    /// merges reach that transaction directly and legitimately publish nodes a whole-config
+    /// check would reject.
     pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
+        if let Err(error) = new_config.validate() {
+            error!(%error, "runtime reload rejected: invalid configuration");
+            return false;
+        }
         let drain = Arc::clone(&self.drain_tracker);
         self.apply_runtime_config(new_config, &drain).await
     }

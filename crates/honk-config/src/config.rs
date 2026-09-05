@@ -598,6 +598,14 @@ impl Config {
             .client_subnet_mode()
             .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
 
+        // A duration that fails to parse becomes zero, and a zero period makes
+        // tokio::time::interval panic, taking the health-check loop down at startup.
+        if self.global.check_interval_secs == 0 {
+            return Err(crate::ConfigError::Validation(
+                "global.check_interval must be a positive duration, such as 30s".into(),
+            ));
+        }
+
         // The eBPF datapath has the mark compiled in; userspace cannot inject
         // a different value, so a custom mark would silently break the proxy.
         if self.global.tproxy_mark != default_tproxy_mark() {
@@ -864,6 +872,17 @@ mod builtin_nodes_tests {
                 "name={name:?} url={url:?} must fail validation"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_check_interval() {
+        let mut config = Config::default();
+        config.global.check_interval_secs = 0;
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("global.check_interval"),
+            "validation error must identify global.check_interval: {error}"
+        );
     }
 
     #[test]
