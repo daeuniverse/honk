@@ -180,6 +180,11 @@ impl UdpDriverCleanupGuard {
     }
 }
 
+pub(super) struct UdpDriverResult {
+    pub(super) result: io::Result<()>,
+    pub(super) outcome: ScoreOutcome,
+}
+
 pub(super) struct UdpDriverContext {
     pub(super) endpoint: Arc<UdpEndpoint>,
     pub(super) queue_rx: mpsc::Receiver<QueuedDatagram>,
@@ -338,7 +343,7 @@ impl UdpEndpointPool {
                 Ok(initial) => initial,
                 Err(_) => return,
             };
-            let result = run_endpoint_driver(
+            let driver_result = run_endpoint_driver(
                 UdpDriverContext {
                     endpoint: Arc::clone(&endpoint),
                     queue_rx,
@@ -355,7 +360,8 @@ impl UdpEndpointPool {
                 first_ack_tx,
             )
             .await;
-            _cleanup.set_outcome(score_driver_outcome(&endpoint, &result));
+            let UdpDriverResult { result, outcome } = driver_result;
+            _cleanup.set_outcome(outcome);
             if let Err(error) = result {
                 debug!(
                     "UDP endpoint driver {} -> {} stopped: {}",
@@ -375,12 +381,11 @@ impl UdpEndpointPool {
         }
     }
 }
-
 pub(super) async fn run_endpoint_driver(
     context: UdpDriverContext,
     initial: UdpDriverStart,
     first_ack: oneshot::Sender<io::Result<()>>,
-) -> io::Result<()> {
+) -> UdpDriverResult {
     let UdpDriverContext {
         endpoint,
         queue_rx,
@@ -410,7 +415,9 @@ pub(super) async fn run_endpoint_driver(
     .await
     {
         let congested = matches!(&failure, PacketSendFailure::Congestion(_));
-        let error = failure.into_io_error();
+        let result = Err(failure.into_io_error());
+        // Health reporting can synchronously retire and mark this endpoint dead.
+        let outcome = score_driver_outcome(&endpoint, &result);
         if !congested && !endpoint.dead.load(Ordering::Acquire) {
             alive_set.report_unavailable_traffic(
                 endpoint.node_id,
@@ -418,8 +425,13 @@ pub(super) async fn run_endpoint_driver(
                 health_family,
             );
         }
-        let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
-        return Err(error);
+        let _ = first_ack.send(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| io::Error::new(error.kind(), error.to_string())),
+        );
+        return UdpDriverResult { result, outcome };
     }
 
     for follower in followers {
@@ -441,6 +453,8 @@ pub(super) async fn run_endpoint_driver(
                 );
             }
             Err(PacketSendFailure::Transport(error)) => {
+                let result = Err(error);
+                let outcome = score_driver_outcome(&endpoint, &result);
                 if !endpoint.dead.load(Ordering::Acquire) {
                     alive_set.report_unavailable_traffic(
                         endpoint.node_id,
@@ -448,8 +462,13 @@ pub(super) async fn run_endpoint_driver(
                         health_family,
                     );
                 }
-                let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
-                return Err(error);
+                let _ = first_ack.send(
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| io::Error::new(error.kind(), error.to_string())),
+                );
+                return UdpDriverResult { result, outcome };
             }
         }
     }
@@ -478,6 +497,8 @@ pub(super) async fn run_endpoint_driver(
         result = &mut sender => result,
         result = &mut receiver => result,
     };
+    // Capture the score before the error-triggered death callback can retire it.
+    let outcome = score_driver_outcome(&endpoint, &result);
     if let Err(error) = &result
         && !endpoint.dead.load(Ordering::Acquire)
         && !matches!(
@@ -492,7 +513,7 @@ pub(super) async fn run_endpoint_driver(
             health_family,
         );
     }
-    result
+    UdpDriverResult { result, outcome }
 }
 
 async fn send_followers(

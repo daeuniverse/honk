@@ -26,6 +26,61 @@ async fn offer_dials_once_and_reuses() {
     assert_eq!(dials.load(Ordering::Relaxed), 1);
 }
 
+#[tokio::test]
+async fn warm_session_starts_feedback_before_blocked_open() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let session = ReservedTestSession::new(1);
+    pool.insert(&session);
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+            .unwrap()
+            .0,
+    );
+    let feedback_started = Arc::new(AtomicBool::new(false));
+    let open_entered = Arc::new(tokio::sync::Notify::new());
+    let release_open = Arc::new(tokio::sync::Notify::new());
+    let task = {
+        let pool = Arc::clone(&pool);
+        let generation = Arc::clone(&generation);
+        let feedback_started = Arc::clone(&feedback_started);
+        let open_entered = Arc::clone(&open_entered);
+        let release_open = Arc::clone(&release_open);
+        let feedback_started_for_open = Arc::clone(&feedback_started);
+        tokio::spawn(async move {
+            generation
+                .scope_dials_with_start(
+                    pool.open_with(
+                        || async { anyhow::bail!("warm session must not dial") },
+                        move |_session, permit| {
+                            let feedback_started = Arc::clone(&feedback_started_for_open);
+                            let open_entered = Arc::clone(&open_entered);
+                            let release_open = Arc::clone(&release_open);
+                            async move {
+                                assert!(feedback_started.load(Ordering::Acquire));
+                                open_entered.notify_one();
+                                release_open.notified().await;
+                                drop(permit);
+                                Ok::<_, OpenError>(())
+                            }
+                        },
+                    ),
+                    move || feedback_started.store(true, Ordering::Release),
+                )
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), open_entered.notified())
+        .await
+        .expect("warm logical open did not start");
+    assert!(feedback_started.load(Ordering::Acquire));
+    release_open.notify_one();
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn spread_sessions_fills_idle_capacity_before_multiplexing() {
     let pool = pool(SessionPoolConfig {

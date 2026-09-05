@@ -411,6 +411,8 @@ fn exploration_backoff_grows_with_failures_and_shrinks_with_success() {
     fail(now);
     // Probe/urltest/warm outcomes never move the streak or the backoff.
     neutral(ScoreOutcome::Success, now);
+    assert_eq!(streak(now), 1);
+    assert!(backed_off(now + Duration::from_secs(1)));
     neutral(ScoreOutcome::Timeout, now);
     assert_eq!(streak(now), 1);
     assert!(backed_off(now + Duration::from_secs(1)));

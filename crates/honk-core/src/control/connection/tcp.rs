@@ -546,7 +546,9 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     let generation = Arc::clone(&runtime_generation);
-                    let pool_feedback = score_reporter.as_ref().map(|reporter| reporter.feedback());
+                    let pool_feedback = score_reporter
+                        .as_ref()
+                        .map(|reporter| reporter.feedback().streak_neutral());
                     let pool_health_family = health_ipver;
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
@@ -912,7 +914,10 @@ impl ControlPlaneHandle {
                 let registry = ctx.proxy_registry.clone();
                 let target_domain = target_domain.clone();
                 let generation = Arc::clone(&runtime_generation);
-                let pool_feedback = feedback.get(&node.id).cloned();
+                let pool_feedback = feedback
+                    .get(&node.id)
+                    .cloned()
+                    .map(|feedback| feedback.streak_neutral());
                 let pool_health_family = ipver;
                 deposit_count += 1;
                 tokio::spawn(async move {
