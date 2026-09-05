@@ -158,6 +158,11 @@ pool 不会在调用方 abort 后残留。Single XUDP 没有 generation runtime�
 replacement 可以立即采用新的 generation 局部限额，而旧的进行中工作
 继续占用共享进程 gate。已经热 session 上的逻辑 stream 不再执行物理拨号。
 
+Session pool 的自主 replacement dial 只绑定已发布 owner 的 admission。reload
+发布时原子地重新绑定迁移的 pool；迟到的 speculative commit 不能恢复前任
+generation 的 gate。退役会立即清除已存 admission，尚未 commit 的 prepared
+transport 既不保留 gate，也不保留成功拨号的 permit。
+
 ## 共享 stream、socket 与 bootstrap 层
 
 ### Stream transport
@@ -529,10 +534,22 @@ Emergency hard limit 为每 session 768 个 frame 或 12 MiB。如果某 stream
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
 在 reader progress 后重新判断。
 
+同一节点 pool 中所有 current 与 draining session 对 TCP 与 UoT retained
+payload 分别使用 12 MiB 的 pool-wide byte budget，aggregate ceiling 为
+24 MiB。将 drop-on-full UoT class 分开，可防止 stalled datagram consumer
+阻塞 TCP recovery。TCP budget 覆盖主 delivery queue 与 overflow；达到上限后
+同样按 100 ms 轮次等待。当最旧的 TCP retained payload 已完整 3 秒没有
+application-read progress 时，只 reset 该 stream 并丢弃其 retained payload。
+reader 持续推进会重新开始 grace。
+
+这样，一个被放弃的主队列不会占死 pool 中所有 sibling session。
+
 FIN 与 error event 绕过 data-frame quota，使 termination 不会被满队列
-隐藏，但每个 SID 最多停放两个 terminal event。已经 admitted 的 data 会
-在随后 reset 前排空。session failure 变成 `ConnectionAborted`；逐 stream
-拒绝或 slow-consumer reap 变成 `ConnectionReset`。
+隐藏，但每个 SID 最多停放两个 terminal event。普通 overflow reap 会在 reset
+前排空已经 admitted 的 data；pool-budget recovery 是 fail-safe 例外，只丢弃
+stalled stream 自己 retained 的 payload。session failure 变成
+`ConnectionAborted`；逐 stream 拒绝或 slow-consumer reap 变成
+`ConnectionReset`。
 
 UoT delivery 使用非阻塞 `try_send`。UoT sink 满时会移除该 sink 并退役
 对应 SID，而不是阻塞 session demux，或丢弃任意 chunk 后继续使用已经

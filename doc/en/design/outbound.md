@@ -174,6 +174,12 @@ limit immediately, while old in-flight work continues to occupy the shared
 process gate. Logical streams on already warm sessions do not perform another
 physical dial.
 
+Session pools bind autonomous replacement dials only to the published owner's
+admission. Reload publication atomically rebinds transferred pools; a late
+speculative commit cannot restore its predecessor's gate. Retirement clears
+the stored admission immediately, and an uncommitted prepared transport retains
+neither gate nor successful dial permit.
+
 ## Shared stream, socket, and bootstrap layers
 
 ### Stream transport
@@ -582,11 +588,24 @@ Otherwise the demultiplexer waits in bounded 100 ms
 `OVERFLOW_EMERGENCY_WAIT` rounds, shortened to the nearest grace expiry, and
 re-evaluates after reader progress.
 
+All current and draining sessions in one node pool use separate 12 MiB
+pool-wide byte budgets for TCP and UoT retained payloads, for a 24 MiB
+aggregate ceiling. Keeping the drop-on-full UoT class separate prevents a
+stalled datagram consumer from starving TCP recovery. The TCP budget covers
+primary delivery queues and overflow. Saturation waits in the same 100 ms
+rounds. Once the oldest retained TCP payload has seen no application-read
+progress for the full 3-second grace, only that stream is reset and its
+retained payloads are discarded. A progressing reader renews the grace.
+
+This prevents one abandoned primary queue from pinning every sibling session
+in the pool.
+
 FIN and error events bypass the data-frame quota so termination cannot be
 hidden behind a full queue, but at most two terminal events park per SID.
-Admitted data drains before the resulting reset. A session failure becomes
-`ConnectionAborted`; a per-stream refusal or slow-consumer reap becomes
-`ConnectionReset`.
+Ordinary overflow reaps drain admitted data before reset; pool-budget recovery
+is the fail-safe exception and discards only the stalled stream's retained
+payloads. A session failure becomes `ConnectionAborted`; a per-stream refusal
+or slow-consumer reap becomes `ConnectionReset`.
 
 UoT delivery uses nonblocking `try_send`. A full UoT sink is removed and that
 SID is retired rather than blocking the session demux or dropping an arbitrary

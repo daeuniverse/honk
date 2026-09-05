@@ -11,8 +11,9 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use honk_ebpf_common::DAE_BYPASS_MARK;
+use parking_lot::Mutex;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex as TokioMutex, oneshot};
 
 use super::owned_task::OwnedTask;
 
@@ -21,6 +22,7 @@ const ID_QUARANTINE: Duration = Duration::from_secs(3);
 const ID_BITMAP_WORDS: usize = (u16::MAX as usize + 1) / u64::BITS as usize;
 
 struct Pending {
+    nonce: u64,
     question: Vec<u8>,
     original_id: [u8; 2],
     reply: oneshot::Sender<Vec<u8>>,
@@ -28,6 +30,7 @@ struct Pending {
 
 struct State {
     closed: bool,
+    next_nonce: u64,
     pending: HashMap<u16, Pending>,
     retired: VecDeque<(Instant, u16)>,
     retired_ids: [u64; ID_BITMAP_WORDS],
@@ -37,8 +40,28 @@ struct State {
 pub struct UdpPool {
     socket: Arc<UdpSocket>,
     state: Mutex<State>,
-    receive_task: Mutex<Option<OwnedTask>>,
+    receive_task: TokioMutex<Option<OwnedTask>>,
     timeout: Duration,
+}
+
+struct PendingGuard<'a> {
+    pool: &'a UdpPool,
+    id: u16,
+    nonce: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.pool.state.lock();
+        if state
+            .pending
+            .get(&self.id)
+            .is_some_and(|pending| pending.nonce == self.nonce)
+        {
+            state.pending.remove(&self.id);
+            UdpPool::retire_id(&mut state, self.id);
+        }
+    }
 }
 
 impl UdpPool {
@@ -72,11 +95,12 @@ impl UdpPool {
             socket: Arc::clone(&socket),
             state: Mutex::new(State {
                 closed: false,
+                next_nonce: 0,
                 pending: HashMap::new(),
                 retired: VecDeque::new(),
                 retired_ids: [0; ID_BITMAP_WORDS],
             }),
-            receive_task: Mutex::new(None),
+            receive_task: TokioMutex::new(None),
             timeout,
         });
         let receive_task = OwnedTask::spawn(
@@ -89,7 +113,7 @@ impl UdpPool {
 
     pub(crate) async fn close(&self) {
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.lock();
             state.closed = true;
             state.pending.clear();
         }
@@ -110,8 +134,8 @@ impl UdpPool {
         let original_id = [query[0], query[1]];
         let question = query[12..Self::question_end(query)?].to_vec();
         let (reply, receiver) = oneshot::channel();
-        let id = {
-            let mut state = self.state.lock().await;
+        let (id, nonce) = {
+            let mut state = self.state.lock();
             if state.closed {
                 anyhow::bail!("UDP DNS exchange pool is closed");
             }
@@ -121,22 +145,30 @@ impl UdpPool {
             }
             let id = Self::allocate_id(&state)
                 .ok_or_else(|| anyhow::anyhow!("UDP DNS IDs exhausted"))?;
+            let nonce = state
+                .next_nonce
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("UDP DNS registration nonce exhausted"))?;
+            state.next_nonce = nonce;
             state.pending.insert(
                 id,
                 Pending {
+                    nonce,
                     question,
                     original_id,
                     reply,
                 },
             );
-            id
+            (id, nonce)
+        };
+        let _pending = PendingGuard {
+            pool: self,
+            id,
+            nonce,
         };
         let mut wire = query.to_vec();
         wire[..2].copy_from_slice(&id.to_be_bytes());
-        if let Err(error) = self.socket.send(&wire).await {
-            self.unregister(id).await;
-            return Err(error.into());
-        }
+        self.socket.send(&wire).await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
             reporter.tx(query.len() as u64);
@@ -144,10 +176,7 @@ impl UdpPool {
         match tokio::time::timeout(self.timeout, receiver).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => anyhow::bail!("UDP DNS receive loop stopped"),
-            Err(_) => {
-                self.unregister(id).await;
-                anyhow::bail!("UDP DNS query timed out after {:?}", self.timeout)
-            }
+            Err(_) => anyhow::bail!("UDP DNS query timed out after {:?}", self.timeout),
         }
     }
 
@@ -170,7 +199,7 @@ impl UdpPool {
             };
             let id = u16::from_be_bytes([buffer[0], buffer[1]]);
             let pending = {
-                let mut state = pool.state.lock().await;
+                let mut state = pool.state.lock();
                 let matches = Self::question_end(&buffer[..length]).is_ok_and(|end| {
                     state
                         .pending
@@ -192,13 +221,6 @@ impl UdpPool {
                 response[..2].copy_from_slice(&pending.original_id);
                 let _ = pending.reply.send(response);
             }
-        }
-    }
-
-    async fn unregister(&self, id: u16) {
-        let mut state = self.state.lock().await;
-        if state.pending.remove(&id).is_some() {
-            Self::retire_id(&mut state, id);
         }
     }
 
@@ -310,7 +332,7 @@ mod tests {
         pool.exchange(&query(0x1234), None).await.unwrap();
         let first_id = first_id_rx.await.unwrap();
         {
-            let state = pool.state.lock().await;
+            let state = pool.state.lock();
             assert!(UdpPool::is_retired(&state, first_id));
             assert_ne!(UdpPool::allocate_id_from(&state, first_id), Some(first_id));
         }
@@ -318,6 +340,59 @@ mod tests {
 
         pool.close().await;
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_exchange_rejects_delayed_wire_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let pool = UdpPool::new(address, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let first_pool = Arc::clone(&pool);
+        let first = tokio::spawn(async move { first_pool.exchange(&query(0x1234), None).await });
+        let mut first_wire = [0_u8; 512];
+        let (first_len, first_peer) = server.recv_from(&mut first_wire).await.unwrap();
+        let first_id = u16::from_be_bytes(first_wire[..2].try_into().unwrap());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        {
+            let state = pool.state.lock();
+            assert!(!state.pending.contains_key(&first_id));
+            assert!(UdpPool::is_retired(&state, first_id));
+        }
+
+        let second_pool = Arc::clone(&pool);
+        let mut second =
+            tokio::spawn(async move { second_pool.exchange(&query(0x5678), None).await });
+        let mut second_wire = [0_u8; 512];
+        let (second_len, second_peer) = server.recv_from(&mut second_wire).await.unwrap();
+        assert_ne!(
+            u16::from_be_bytes(second_wire[..2].try_into().unwrap()),
+            first_id
+        );
+
+        first_wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        server
+            .send_to(&first_wire[..first_len], first_peer)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "a delayed response for the cancelled wire ID completed its successor"
+        );
+
+        second_wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        server
+            .send_to(&second_wire[..second_len], second_peer)
+            .await
+            .unwrap();
+        let response = second.await.unwrap().unwrap();
+        assert_eq!(&response[..2], &0x5678_u16.to_be_bytes());
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -363,6 +438,7 @@ mod tests {
     fn retired_id_bitmap_tracks_expiry_without_history_scans() {
         let mut state = State {
             closed: false,
+            next_nonce: 0,
             pending: HashMap::new(),
             retired: VecDeque::new(),
             retired_ids: [0; ID_BITMAP_WORDS],

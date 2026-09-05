@@ -11,8 +11,9 @@ use crate::proxy::uot::{
 
 #[cfg(test)]
 use super::{
-    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED,
-    WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP, read_frame, write_frame,
+    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, INBOUND_PAYLOAD_BUDGET, InboundPayloadBudget,
+    PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP,
+    read_frame, write_frame,
 };
 #[cfg(test)]
 use crate::proxy::addr;
@@ -57,6 +58,7 @@ pub(super) struct UotReceiveState {
     rx: mpsc::Receiver<StreamEvent>,
     mode: Option<UotMode>,
     buffered: bytes::BytesMut,
+    credit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl UotReceiveState {
@@ -65,6 +67,7 @@ impl UotReceiveState {
             rx,
             mode: None,
             buffered: bytes::BytesMut::new(),
+            credit: None,
         }
     }
 }
@@ -217,7 +220,23 @@ impl PacketTransport for AnyTlsUotTransport {
         let mut receive = self.receive.lock().await;
         loop {
             if let Some(frame) = self.next_uot_frame(&mut receive)? {
+                let consumed = frame.frame_end;
                 let payload_len = crate::proxy::uot::copy_frame(&mut receive.buffered, frame, buf)?;
+                let empty = {
+                    let credit = receive
+                        .credit
+                        .as_mut()
+                        .expect("buffered UoT bytes own payload credit");
+                    drop(
+                        credit
+                            .split(consumed)
+                            .expect("UoT credit covers consumed frame"),
+                    );
+                    credit.num_permits() == 0
+                };
+                if empty {
+                    receive.credit = None;
+                }
                 return Ok((payload_len, self.target));
             }
 
@@ -232,7 +251,13 @@ impl PacketTransport for AnyTlsUotTransport {
                             "UoT stream frame exceeds buffer limit",
                         ));
                     }
+                    let (data, credit) = data.into_parts();
                     receive.buffered.extend_from_slice(&data);
+                    if let Some(held) = receive.credit.as_mut() {
+                        held.merge(credit);
+                    } else {
+                        receive.credit = Some(credit);
+                    }
                 }
                 StreamEvent::Fin => {
                     return Err(std::io::Error::new(
@@ -290,6 +315,14 @@ mod uot_transport_tests {
         target: SocketAddr,
         capacity: usize,
     ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
+        uot_test_transport_with_capacity_and_budget(target, capacity, INBOUND_PAYLOAD_BUDGET).await
+    }
+
+    async fn uot_test_transport_with_capacity_and_budget(
+        target: SocketAddr,
+        capacity: usize,
+        inbound_budget: usize,
+    ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
         let addr = "127.0.0.1:2443";
         let (client_end, mut server_end) = tokio::io::duplex(capacity);
         let (read, write) = tokio::io::split(client_end);
@@ -303,6 +336,7 @@ mod uot_transport_tests {
             TEST_AUTH,
             bytes::Bytes::from_static(TEST_SETTINGS),
             padding_state,
+            InboundPayloadBudget::new(inbound_budget),
         )
         .await
         .unwrap();
@@ -373,6 +407,31 @@ mod uot_transport_tests {
         let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong!");
         assert_eq!(src, target);
+    }
+
+    #[tokio::test]
+    async fn uot_read_releases_pool_payload_credit() {
+        const BUDGET: usize = 8;
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (transport, mut server) =
+            uot_test_transport_with_capacity_and_budget(target, 1 << 20, BUDGET).await;
+        let sid = transport.sid;
+        let mut buf = [0_u8; BUDGET];
+
+        for payload in [b"first!", b"second"] {
+            let mut frame = Vec::with_capacity(BUDGET);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.extend_from_slice(payload);
+            write_frame(&mut server, CMD_PSH, sid, &frame)
+                .await
+                .unwrap();
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(1), transport.recv_packet(&mut buf))
+                    .await
+                    .expect("UoT payload credit was not released")
+                    .unwrap();
+            assert_eq!(&buf[..len], payload);
+        }
     }
 
     #[tokio::test]

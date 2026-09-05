@@ -16,6 +16,13 @@ use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
 use sha2::{Digest as _, Sha256};
 
+mod supervisor;
+
+pub(crate) use supervisor::{
+    AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
+    SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
+};
+
 /// reqwest DNS resolver backed by honk's bootstrap resolver
 /// (bypass-marked UDP/TCP), so subscription fetches do not depend on the
 /// system resolver — which on a polluted network can hand back poisoned

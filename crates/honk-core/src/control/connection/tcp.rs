@@ -1,7 +1,6 @@
 use super::routing::{build_connection_info, connection_chains};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
-use honk_config::types::NodeProtocol;
 
 use std::collections::{HashMap, HashSet};
 
@@ -146,7 +145,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let (dial_mode, connect_timeout, dns_resolve_timeout, overall_dial_timeout) = {
+        let (dial_mode, connect_timeout, overall_dial_timeout) = {
             let config = self.config.read().await;
             let connect_timeout_ms = config.global.connect_timeout_ms;
             (
@@ -156,7 +155,6 @@ impl ControlPlaneHandle {
                     .parse::<DialMode>()
                     .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?,
                 Duration::from_millis(connect_timeout_ms),
-                Duration::from_millis(config.global.dns_resolve_timeout_ms),
                 Duration::from_millis((connect_timeout_ms.max(1000) * 4).max(10000)),
             )
         };
@@ -283,13 +281,7 @@ impl ControlPlaneHandle {
         let generation_group_manager = self.group_manager.read().clone();
         let runtime_generation = self.runtime_registry.read().clone();
         drop(generation_config_guard);
-        let (
-            mut candidates,
-            mut selection_mode,
-            mut score_feedback,
-            mut selection_chains,
-            health_ipver,
-        ) = {
+        let (mut candidates, selection_mode, score_feedback, mut selection_chains, health_ipver) = {
             let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
             let plan = crate::control::reload::resolve_outbound_plan_for_target(
                 &generation_config,
@@ -326,122 +318,21 @@ impl ControlPlaneHandle {
 
         // Domain targets are meaningful only for non-reserved proxy
         // outbounds. Direct and block always use the original IP.
-        let domain_target_allowed = !matches!(
+        let target_domain = if matches!(
             outbound_name.as_str(),
             "direct" | "block" | "must_rules" | "control_plane_routing"
-        );
-        let all_domain_capable = candidates.iter().all(|node| {
-            matches!(
-                node.protocol(),
-                NodeProtocol::Direct
-                    | NodeProtocol::Block
-                    | NodeProtocol::Socks5
-                    | NodeProtocol::Trojan
-                    | NodeProtocol::SS
-                    | NodeProtocol::AnyTLS
-            )
-        });
-
-        // Resolve the target IP for dialing. Domain-capable proxies receive
-        // the sniffed name; other proxy paths resolve it locally.
-        let (resolved_target, target_domain) = if domain_target_allowed {
-            if let Some(ref domain) = domain {
-                if all_domain_capable {
-                    debug!(
-                        "Skipping DNS for {} (domain-capable proxy, {} candidates)",
-                        domain,
-                        candidates.len()
-                    );
-                    (original_dst, Some(domain.clone()))
-                } else {
-                    let is_v6 = original_dst.is_ipv6();
-                    match tokio::time::timeout(
-                        dns_resolve_timeout,
-                        self.dns_resolver
-                            .resolve_for_source(domain, client_addr.ip()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resolved)) => {
-                            let preferred_ip = if is_v6 {
-                                resolved
-                                    .ipv6
-                                    .first()
-                                    .or_else(|| resolved.ipv4.first())
-                                    .copied()
-                            } else {
-                                resolved
-                                    .ipv4
-                                    .first()
-                                    .or_else(|| resolved.ipv6.first())
-                                    .copied()
-                            };
-                            match preferred_ip {
-                                Some(ip) => {
-                                    let resolved_addr = SocketAddr::new(ip, original_dst.port());
-                                    debug!(
-                                        "DNS resolved {} -> {} ({})",
-                                        domain,
-                                        resolved_addr,
-                                        if is_v6 { "v6-prefer" } else { "v4-prefer" }
-                                    );
-                                    (resolved_addr, Some(domain.clone()))
-                                }
-                                None => {
-                                    debug!(
-                                        "DNS returned no IPs for {}, using original dst",
-                                        domain
-                                    );
-                                    (original_dst, Some(domain.clone()))
-                                }
-                            }
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            debug!("DNS timed out or failed for {}, using original dst", domain);
-                            (original_dst, Some(domain.clone()))
-                        }
-                    }
-                }
-            } else {
-                (original_dst, None)
-            }
+        ) {
+            None
         } else {
-            (original_dst, None)
+            domain.clone()
         };
-        if (resolved_target.is_ipv6() && ipver == IpVersion::V4)
-            || (resolved_target.is_ipv4() && ipver == IpVersion::V6)
-        {
-            // Local DNS fell back across address families. The preliminary
-            // plan was needed to decide whether local resolution was required,
-            // but no dial (and therefore no reporter) has started yet. Replace
-            // it with a plan keyed by the address that will actually be dialed
-            // while retaining the proxy-health family already selected.
-            let context =
-                tcp_score_context(resolved_target, target_domain.as_deref(), health_ipver);
-            let plan = crate::control::reload::resolve_outbound_plan_for_target(
-                &generation_config,
-                &generation_group_manager,
-                &outbound_name,
-                &context,
-            );
-            let (nodes, mode, feedback, chains, _) = unpack_tcp_score_plan(plan);
-            candidates = nodes;
-            selection_mode = mode;
-            score_feedback = feedback;
-            selection_chains = chains;
-            if selection_mode == SelectionPlanMode::ColdUrlTest {
-                candidates.truncate(3);
-            } else {
-                candidates.truncate(1);
-            }
-        }
 
         let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
         let candidate_refs: Vec<&Node> = candidates.iter().collect();
         let raced = self
             .race_candidates(
                 &candidate_refs,
-                resolved_target,
+                original_dst,
                 target_domain.clone(),
                 &outbound_name,
                 connect_timeout,
@@ -466,11 +357,8 @@ impl ControlPlaneHandle {
                 if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
                     {
                         let group_manager = Arc::clone(&generation_group_manager);
-                        let context = tcp_score_context(
-                            resolved_target,
-                            target_domain.as_deref(),
-                            health_ipver,
-                        );
+                        let context =
+                            tcp_score_context(original_dst, target_domain.as_deref(), health_ipver);
                         let mut plan =
                             crate::control::reload::resolve_urltest_retry_plan_for_target(
                                 &group_manager,
@@ -501,7 +389,7 @@ impl ControlPlaneHandle {
                             let retry = self
                                 .race_candidates(
                                     &nodes,
-                                    resolved_target,
+                                    original_dst,
                                     target_domain.clone(),
                                     &outbound_name,
                                     connect_timeout,
@@ -540,7 +428,7 @@ impl ControlPlaneHandle {
             crate::connection_tracker::ConnectionEntry {
                 id,
                 source: client_addr.to_string(),
-                destination: resolved_target.to_string(),
+                destination: original_dst.to_string(),
                 proxy: node.name.clone(),
                 rule,
                 rule_payload,
@@ -565,10 +453,10 @@ impl ControlPlaneHandle {
             outbound = %outbound_name,
             dialer = %node.name,
             sniffed = target_domain.as_deref().unwrap_or(""),
-            ip = %resolved_target,
+            ip = %original_dst,
             dscp = dscp_val,
             src = %client_addr,
-            "TCP connection: {} <-> {}", client_addr, resolved_target,
+            "TCP connection: {} <-> {}", client_addr, original_dst,
         );
 
         if !sniff_result.buffered.is_empty() {
@@ -608,7 +496,7 @@ impl ControlPlaneHandle {
                     flow.stream_mut(),
                     upstream,
                     client_addr,
-                    resolved_target,
+                    original_dst,
                     Some(conn_progress.clone()),
                 )
                 .await
@@ -618,7 +506,7 @@ impl ControlPlaneHandle {
                     flow.stream_mut(),
                     proxy_stream.stream,
                     client_addr,
-                    resolved_target,
+                    original_dst,
                     Some(conn_progress),
                 )
                 .await
@@ -673,7 +561,7 @@ impl ControlPlaneHandle {
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
                                 &node_addr,
-                                resolved_target,
+                                original_dst,
                                 target_domain.as_deref(),
                             );
                             // Only hot targets earn a speculative ready
@@ -687,7 +575,7 @@ impl ControlPlaneHandle {
                                 .dial_runtime(
                                     Arc::clone(&generation),
                                     node.id,
-                                    resolved_target,
+                                    original_dst,
                                     target_domain.as_deref(),
                                     connect_timeout,
                                 )
@@ -713,7 +601,7 @@ impl ControlPlaneHandle {
                                     }
                                     debug!(
                                         "Pool deposit: ready dial to {} via {} failed: {}",
-                                        resolved_target, node_addr, e
+                                        original_dst, node_addr, e
                                     );
                                 }
                             }
@@ -791,19 +679,13 @@ impl ControlPlaneHandle {
                     if relay::is_ignorable_connection_error(io_err) {
                         debug!(
                             "TCP relay closed for {} -> {}: {}",
-                            client_addr, resolved_target, io_err
+                            client_addr, original_dst, io_err
                         );
                     } else {
-                        warn!(
-                            "Relay error for {} -> {}: {}",
-                            client_addr, resolved_target, e
-                        );
+                        warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                     }
                 } else {
-                    warn!(
-                        "Relay error for {} -> {}: {}",
-                        client_addr, resolved_target, e
-                    );
+                    warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                 }
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
@@ -842,7 +724,7 @@ impl ControlPlaneHandle {
     async fn race_candidates(
         &self,
         candidates: &[&Node],
-        resolved_target: SocketAddr,
+        target: SocketAddr,
         target_domain: Option<String>,
         outbound_name: &str,
         connect_timeout: Duration,
@@ -858,7 +740,6 @@ impl ControlPlaneHandle {
     )> {
         let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
         let ctx = self.clone();
-        let target = resolved_target;
         let outbound = outbound_name.to_string();
         let feedback = feedback.clone();
 
@@ -1159,13 +1040,13 @@ impl ControlPlaneHandle {
                     if outbound_name == "direct" || outbound_name == "block" {
                         debug!(
                             "Direct/block dial to {} failed ({}): {}",
-                            resolved_target, last_name, last_msg
+                            target, last_name, last_msg
                         );
                     } else {
                         warn!(
                             "All {} candidate(s) failed to dial {} ({} timed out; first error from '{}': {}; last error from '{}': {})",
                             candidates.len(),
-                            resolved_target,
+                            target,
                             timeout_count,
                             first_name,
                             first_msg,
@@ -1293,9 +1174,9 @@ mod score_tests {
     use super::*;
 
     #[test]
-    fn tcp_score_context_uses_resolved_target_family_not_health_family() {
-        let resolved: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let context = tcp_score_context(resolved, Some("example.com"), IpVersion::V6);
+    fn tcp_score_context_uses_target_family_not_health_family() {
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let context = tcp_score_context(target, Some("example.com"), IpVersion::V6);
 
         assert_eq!(context.target_family, Some(IpVersion::V4));
         assert_eq!(context.health_family, IpVersion::V6);

@@ -269,8 +269,105 @@ impl ControlPlane {
         }
     }
 
+    pub(in crate::control) async fn dispatch_control_command(
+        &mut self,
+        command: ControlCommand,
+        drain: &DrainTracker,
+        subscription_authorizations: &mut crate::subscription::SubscriptionAuthorizations,
+    ) -> bool {
+        match command {
+            ControlCommand::ReloadConfig {
+                request_id,
+                config,
+                result,
+            } => {
+                info!("SIGHUP reload request {request_id} started");
+                let applied = self
+                    .apply_sighup_config(*config, drain, subscription_authorizations)
+                    .await;
+                let committed = if applied {
+                    info!("SIGHUP reload request {request_id} applied");
+                    let config = self.config.read().await;
+                    Some(subscription_authorizations.committed(&config.subscriptions))
+                } else {
+                    warn!("SIGHUP reload request {request_id} rejected");
+                    None
+                };
+                if result.send(committed).is_err() && applied {
+                    error!("SIGHUP reload request {request_id} lost its supervisor handoff");
+                    return false;
+                }
+            }
+            ControlCommand::MergeSubscription {
+                subscription_id,
+                revision,
+                name,
+                nodes,
+            } => {
+                info!(
+                    "Merging {} node(s) from subscription '{}'",
+                    nodes.len(),
+                    name
+                );
+                let _ = self
+                    .merge_authorized_subscription_nodes_with_drain(
+                        subscription_id,
+                        revision,
+                        subscription_authorizations,
+                        nodes,
+                        drain,
+                    )
+                    .await;
+            }
+            ControlCommand::NetworkChanged => {
+                let _reload = self.reload_lock.lock().await;
+                let current = self.config.read().await.clone();
+                let mut next = current.as_ref().clone();
+                let routing_changed = next.ensure_local_direct_rules();
+                let client_subnet_auto = matches!(
+                    current.dns.client_subnet_mode(),
+                    Ok(Some(honk_config::dns::DnsClientSubnet::Auto { .. }))
+                );
+                if client_subnet_auto {
+                    crate::dns::ecs::resolve_client_subnet(&mut next.dns).await;
+                }
+                let client_subnet_changed =
+                    next.dns.resolved_client_subnet != current.dns.resolved_client_subnet;
+                let new_config = (routing_changed || client_subnet_changed).then_some(next);
+                let applied = match new_config {
+                    Some(new_config) => {
+                        info!(
+                            routing_changed,
+                            client_subnet_changed, "refreshing runtime after network change"
+                        );
+                        self.apply_resolved_runtime_config_locked(new_config, drain)
+                            .await
+                    }
+                    None => true,
+                };
+                drop(_reload);
+                if !applied {
+                    warn!("network-triggered runtime refresh rejected");
+                    if self
+                        .network_refresh_retry
+                        .as_ref()
+                        .is_none_or(|retry| retry.is_finished())
+                    {
+                        self.network_refresh_retry =
+                            Some(spawn_network_refresh_retry(self.command_sender()));
+                    }
+                }
+                self.alive_set.notify_network_change();
+            }
+            ControlCommand::Shutdown => return false,
+        }
+        true
+    }
+
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
+        let mut subscription_authorizations =
+            crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions)?;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
         #[cfg(feature = "ebpf")]
@@ -812,82 +909,18 @@ impl ControlPlane {
                 }
 
                 cmd = rx.recv() => {
-                    match cmd {
-                        Some(ControlCommand::ReloadConfig { request_id, config }) => {
-                            info!("SIGHUP reload request {request_id} started");
-                            if self.apply_sighup_config(*config, &drain).await {
-                                info!("SIGHUP reload request {request_id} applied");
-                            } else {
-                                warn!("SIGHUP reload request {request_id} rejected");
-                            }
-                        }
-                        Some(ControlCommand::MergeSubscription {
-                            subscription_id,
-                            name,
-                            nodes,
-                        }) => {
-                            info!(
-                                "Merging {} node(s) from subscription '{}'",
-                                nodes.len(),
-                                name
-                            );
-                            if nodes.is_empty() {
-                                warn!(
-                                    subscription = %name,
-                                    "subscription returned no nodes; keeping active nodes"
-                                );
-                                continue;
-                            }
-                            let _ = self
-                                .merge_subscription_nodes_with_drain(
-                                    subscription_id,
-                                    nodes,
-                                    &drain,
-                                )
-                                .await;
-                        }
-                        Some(ControlCommand::NetworkChanged) => {
-                            let _reload = self.reload_lock.lock().await;
-                            let current = self.config.read().await.clone();
-                            let mut next = current.as_ref().clone();
-                            let routing_changed = next.ensure_local_direct_rules();
-                            let client_subnet_auto = matches!(
-                                current.dns.client_subnet_mode(),
-                                Ok(Some(honk_config::dns::DnsClientSubnet::Auto { .. }))
-                            );
-                            if client_subnet_auto {
-                                crate::dns::ecs::resolve_client_subnet(&mut next.dns).await;
-                            }
-                            let client_subnet_changed =
-                                next.dns.resolved_client_subnet != current.dns.resolved_client_subnet;
-                            let new_config = (routing_changed || client_subnet_changed).then_some(next);
-                            let applied = match new_config {
-                                Some(new_config) => {
-                                    info!(
-                                        routing_changed,
-                                        client_subnet_changed,
-                                        "refreshing runtime after network change"
-                                    );
-                                    self.apply_resolved_runtime_config_locked(new_config, &drain)
-                                        .await
-                                }
-                                None => true,
-                            };
-                            drop(_reload);
-                            if !applied {
-                                warn!("network-triggered runtime refresh rejected");
-                                if self
-                                    .network_refresh_retry
-                                    .as_ref()
-                                    .is_none_or(|retry| retry.is_finished())
-                                {
-                                    self.network_refresh_retry =
-                                        Some(spawn_network_refresh_retry(self.command_sender()));
-                                }
-                            }
-                            self.alive_set.notify_network_change();
-                        }
-                        Some(ControlCommand::Shutdown) | None => break,
+                    let Some(command) = cmd else {
+                        break;
+                    };
+                    if !self
+                        .dispatch_control_command(
+                            command,
+                            &drain,
+                            &mut subscription_authorizations,
+                        )
+                        .await
+                    {
+                        break;
                     }
                 }
             }

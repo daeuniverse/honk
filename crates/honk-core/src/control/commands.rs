@@ -1,11 +1,14 @@
 use honk_config::{Config, node::Node};
 
+use crate::subscription::AuthorizedSubscription;
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum ControlCommand {
+pub(crate) enum ControlCommand {
     ReloadConfig {
         request_id: u64,
         config: Box<Config>,
+        result: tokio::sync::oneshot::Sender<Option<Vec<AuthorizedSubscription>>>,
     },
     /// Merge freshly fetched subscription nodes into the running config,
     /// replacing the previous node set of that subscription. Used by
@@ -13,6 +16,7 @@ pub enum ControlCommand {
     /// live in memory only and are never written back to the config file.
     MergeSubscription {
         subscription_id: uuid::Uuid,
+        revision: u64,
         name: String,
         nodes: Vec<Node>,
     },

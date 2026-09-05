@@ -66,7 +66,7 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true
 
 # Encoding
 base64.workspace = true
-percent-encoding.workspace = true
+percent-encoding = { workspace = true, optional = true }
 aho-corasick.workspace = true
 
 # DNS transports (DoH H2 / DoQ / DoH3)
@@ -100,14 +100,14 @@ axum = { workspace = true, optional = true, features = ["ws"] }
 tower-http = { workspace = true, optional = true }
 
 # External UI auto-download (clash-api)
-zip.workspace = true
+zip = { workspace = true, optional = true }
 
 [features]
 default = ["clash-api", "mimalloc", "rprx"]
 # Enable real eBPF support (requires Linux kernel 5.8+)
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
-clash-api = ["dep:axum", "dep:tower-http"]
+clash-api = ["dep:axum", "dep:tower-http", "dep:percent-encoding", "dep:zip"]
 # Route the shipped binary's allocations through mimalloc (see main.rs)
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)

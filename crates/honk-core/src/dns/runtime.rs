@@ -187,7 +187,7 @@ impl DnsRuntime {
         self.parts.forwarder.shutdown_prefetch().await;
         self.parts.transport.close().await;
         if let Some(runtime) = &self.parts.outbound_runtime {
-            runtime.drain_session_pools();
+            runtime.retire_reusable_state().await;
         }
         self.state
             .store(RuntimeState::Closed as u8, Ordering::Release);
