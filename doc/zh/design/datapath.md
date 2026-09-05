@@ -55,6 +55,9 @@ flowchart LR
 `auto` 解析为当前默认路由接口。没有默认路由时，该项保持未挂载，而不会回退到 loopback。`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组；每 60 秒一次的协调 tick 作为事件交付的后备。协调过程重新解析 `auto`，通过 ifindex 识别接口重建，重新计算单网卡或双网卡角色，并安装或忘记进程持有的挂钩。
 
 链路、地址、路由或接口角色变化时，系统还会为已配置 LAN/WAN 接口上的每个地址重新发布生成的 `direct(must)` 规则。它清除健康检查 cooldown 并触发新探测。在新探测成功前，失效 UDP 和多叶节点出站仍保持 fail-closed；未配置 `final` 的单叶节点 TCP 组仍可作为用户态最后尝试。
+### 分片与 VLAN 边界
+
+LAN ingress 在路由或 conntrack 前丢弃非原子 IPv4 分片及带非原子 Fragment header 的 IPv6 包。WAN egress 只对本机发起且非控制面的非原子分片执行丢弃；转发流量与 honk 控制面流量保留原生或 bypass 路径。VLAN trunk 解析尚未实现。若要处理 VLAN 逻辑接口上的流量，应把 hook 挂到该接口；这不等于支持任意 802.1Q trunk 解析，也不新增 VLAN 支持。
 
 ## 程序清单
 
@@ -115,7 +118,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 `SKB_MARK_RESERVED_MASK` 为 `0xc0000000`，即 `CLASSIFIED_MARK` 与 `NFQUEUE_PENDING_MARK` 的并集。配置校验拒绝与这些 bit 重叠的 `global.so_mark_from_dae` 和路由规则 mark。NFQUEUE direct 完成路径在接受规则 mark 前重复相同检查。
 
-本地套接字探测必须区分 honk 自身的透明监听器和普通本地服务。`bpf_sock_is_dae_socket` 把完整套接字 mark 与 `PARAM.dae_socket_mark` 比较，后者由用户空间设为 `DAE_BYPASS_MARK`。相等表示“honk 监听器”，探测继续透明路径；普通未标记监听器可以取得该目的地址。主机网络命名空间中的 `dns.bind` 套接字有意保持为普通未标记监听器。
+TC 侧本地套接字探测在当前 ingress 网络命名空间运行（这些挂钩对应宿主命名空间），使用 `BPF_F_CURRENT_NETNS`，而不是相对的 peer 命名空间 ID。当存在匹配套接字时，探测必须区分 honk 自身的透明监听器与普通本地服务。`bpf_sock_is_dae_socket` 将完整套接字 mark 与 `PARAM.dae_socket_mark` 比较，后者由用户空间设为 `DAE_BYPASS_MARK`；相等表示“honk 监听器”，探测继续透明路径，普通未标记监听器则可以取得该目的地址。宿主网络命名空间中的 `dns.bind` 套接字有意保持为普通未标记监听器。
 
 ## 数据包行为与不变量
 

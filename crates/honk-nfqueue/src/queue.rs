@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::netlink;
 use crate::packet;
-use crate::verdict::{GuardTracker, VerdictGuard};
+use crate::verdict::{GuardTracker, NF_DROP, VerdictGuard};
 use crate::{
     COPY_RANGE, FatalError, FatalNotifier, MAX_DATAGRAM_SIZE, PacketCallback, QUEUE_MAXLEN,
     QUEUE_NUM, SO_RCVBUF_SIZE,
@@ -227,17 +227,21 @@ pub(crate) fn listen(
         }
 
         let mut received_any = false;
+        let mut recovered_loss = false;
         loop {
             match receive_exact(socket.fd.as_raw_fd()) {
-                Ok(Some(datagram)) => {
+                Ok(ReceiveOutcome::Datagram(datagram)) => {
                     received_any = true;
                     dispatch_datagram(datagram, Instant::now(), &socket, &callback, &tracker)?;
                 }
-                Ok(None) => break,
+                Ok(ReceiveOutcome::Empty) => break,
+                Ok(ReceiveOutcome::Dropped) => recovered_loss = true,
                 Err(error) => return Err(error),
             }
         }
-        if !received_any && poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        if !received_any
+            && !recovered_loss
+            && poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
         {
             return Err(FatalError::ListenerExited);
         }
@@ -273,11 +277,25 @@ fn dispatch_datagram(
         if queue != QUEUE_NUM {
             return Err(FatalError::UnexpectedQueue { queue });
         }
-        let parsed = packet::parse_packet_message(message.body, received_at).map_err(|error| {
-            FatalError::MalformedMessage {
-                error: error.to_string(),
+        let parsed = match packet::parse_packet_message(message.body, received_at) {
+            Ok(parsed) => parsed,
+            Err(packet::PacketMessageError::Packet { packet_id, .. }) => {
+                // The NFQA envelope and packet id are valid; malformed or unsupported
+                // L3/L4 bytes are packet-local input. Drop only this skb and keep the
+                // listener alive. Envelope corruption remains fatal below.
+                socket
+                    .send_verdict(packet_id, NF_DROP, None)
+                    .map_err(|error| FatalError::VerdictSocket {
+                        error: error.to_string(),
+                    })?;
+                continue;
             }
-        })?;
+            Err(error) => {
+                return Err(FatalError::MalformedMessage {
+                    error: error.to_string(),
+                });
+            }
+        };
         let guard = VerdictGuard::new(Arc::clone(socket), parsed.packet_id, Arc::clone(tracker));
         if catch_unwind(AssertUnwindSafe(|| (callback)(parsed.packet, guard))).is_err() {
             return Err(FatalError::CallbackPanicked);
@@ -291,7 +309,13 @@ fn dispatch_datagram(
     Ok(())
 }
 
-fn receive_exact(fd: RawFd) -> Result<Option<Bytes>, FatalError> {
+enum ReceiveOutcome {
+    Datagram(Bytes),
+    Empty,
+    Dropped,
+}
+
+fn receive_exact(fd: RawFd) -> Result<ReceiveOutcome, FatalError> {
     let mut probe = [0u8; 1];
     let (expected, _) = match recvmsg(
         fd,
@@ -299,9 +323,14 @@ fn receive_exact(fd: RawFd) -> Result<Option<Bytes>, FatalError> {
         libc::MSG_PEEK | libc::MSG_TRUNC | libc::MSG_DONTWAIT,
     ) {
         Ok(received) => received,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Ok(ReceiveOutcome::Empty);
+        }
         Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
-            return Err(FatalError::Enobufs);
+            // nfnetlink_unicast removes the queue entry and, without FAIL_OPEN,
+            // drops its skb before reporting ENOBUFS. Continue receiving the
+            // remaining datagrams; no userspace verdict ownership was lost.
+            return Ok(ReceiveOutcome::Dropped);
         }
         Err(error) => return Err(listener_io("peek recvmsg", error)),
     };
@@ -319,7 +348,9 @@ fn receive_exact(fd: RawFd) -> Result<Option<Bytes>, FatalError> {
     let (actual, flags) = match recvmsg(fd, &mut buffer, libc::MSG_DONTWAIT) {
         Ok(received) => received,
         Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
-            return Err(FatalError::Enobufs);
+            // See the peek path above: the kernel drops the undelivered skb,
+            // so ENOBUFS is recoverable receive loss, not held ownership.
+            return Ok(ReceiveOutcome::Dropped);
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             return Err(FatalError::DatagramLengthChanged {
@@ -335,7 +366,7 @@ fn receive_exact(fd: RawFd) -> Result<Option<Bytes>, FatalError> {
     if actual != expected {
         return Err(FatalError::DatagramLengthChanged { expected, actual });
     }
-    Ok(Some(buffer.freeze()))
+    Ok(ReceiveOutcome::Datagram(buffer.freeze()))
 }
 
 fn recvmsg(fd: RawFd, buffer: &mut [u8], flags: libc::c_int) -> io::Result<(usize, libc::c_int)> {
@@ -478,6 +509,7 @@ mod tests {
             libc::AF_INET as u16
         );
         assert_eq!(decoded[1].0, 0);
+
         assert_eq!(decoded[1].1, NFQA_CFG_CMD);
         assert_eq!(decoded[1].2[0], NFQNL_CFG_CMD_PF_BIND);
         assert_eq!(
@@ -502,6 +534,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncated_copy_is_dropped_without_listener_fatal() {
+        let (socket, peer, mut fatal) = QueueSocket::for_test();
+        let tracker = GuardTracker::new();
+        let callback: PacketCallback = Arc::new(|_, _| panic!("truncated copy was dispatched"));
+
+        let layer_three = [
+            0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2, 203, 0, 113, 7, 0xcf, 0x08,
+            0x01, 0xbb, 0, 8, 0, 0,
+        ];
+        let mut datagram = Vec::new();
+        let start = netlink::put_message_header(
+            &mut datagram,
+            (netlink::NFNL_SUBSYS_QUEUE << 8) | NFQA_MSG_PACKET,
+            0,
+            1,
+            libc::AF_INET as u8,
+            QUEUE_NUM,
+        );
+        netlink::put_attribute(&mut datagram, 1, &[0, 0, 0, 9, 0x08, 0x00, 0x00]);
+        netlink::put_attribute_be32(&mut datagram, 3, 0xc000_0001);
+        netlink::put_attribute_be32(&mut datagram, 13, layer_three.len() as u32 + 1);
+        netlink::put_attribute(&mut datagram, 10, &layer_three);
+        netlink::seal_message(&mut datagram, start);
+
+        dispatch_datagram(
+            Bytes::from(datagram),
+            Instant::now(),
+            &socket,
+            &callback,
+            &tracker,
+        )
+        .expect("truncated copy must be dropped and skipped");
+
+        let verdict = netlink::recv_datagram(peer.as_raw_fd(), 128).expect("drop verdict");
+        let message = netlink::messages(verdict)
+            .next()
+            .expect("one verdict message")
+            .expect("valid verdict message");
+        let attributes = netlink::attributes(message.body.slice(netlink::NFGENMSG_LEN..))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid verdict attributes");
+        assert_eq!(&attributes[0].payload[..4], &NF_DROP.to_be_bytes());
+        assert_eq!(&attributes[0].payload[4..], &9u32.to_be_bytes());
+        assert!(matches!(
+            fatal.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
     #[test]
     fn malformed_netlink_length_is_listener_fatal() {
         let (socket, _peer, _fatal) = QueueSocket::for_test();

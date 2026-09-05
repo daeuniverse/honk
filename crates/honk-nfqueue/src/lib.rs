@@ -77,8 +77,6 @@ fn parse_kernel_queue_stats(contents: &str) -> Option<(u64, u64, u64)> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FatalError {
-    #[error("NFQUEUE receive lost packets with ENOBUFS")]
-    Enobufs,
     #[error("NFQUEUE listener {operation} failed: {error}")]
     ListenerIo {
         operation: &'static str,

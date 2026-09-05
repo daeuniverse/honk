@@ -55,6 +55,9 @@ Ethernet interfaces use the `_l2` programs; interfaces without an Ethernet heade
 `auto` resolves to the current default-route interface. If no default route exists, the entry stays unattached rather than falling back to loopback. `IfaceWatcher` subscribes to rtnetlink link, IPv4/IPv6 address, and IPv4/IPv6 route groups; a 60-second reconciliation tick backs up event delivery. Reconciliation re-resolves `auto`, detects interface recreation by ifindex, recalculates single- versus dual-homed roles, and attaches or forgets process-owned hooks.
 
 A changed link/address/route/interface role also republishes generated `direct(must)` rules for every address on configured LAN/WAN interfaces. It clears health-check cooldowns and triggers fresh probes. Dead UDP and multi-leaf outbounds remain fail-closed until a fresh probe succeeds; a sole TCP leaf with no `final` remains a userspace last resort.
+### Fragment and VLAN boundaries
+
+LAN ingress drops non-atomic IPv4 fragments and IPv6 packets carrying a non-atomic Fragment header before routing or conntrack. WAN egress drops non-atomic fragments only for locally originated, non-control-plane traffic; forwarded traffic and honk control-plane packets retain their native or bypass path. VLAN trunk parsing is not implemented. To handle traffic on a VLAN logical interface, attach the hooks to that interface; this does not add arbitrary 802.1Q trunk parsing or new VLAN support.
 
 ## Program inventory
 
@@ -115,7 +118,7 @@ Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in sha
 
 `SKB_MARK_RESERVED_MASK` is `0xc0000000`, the union of `CLASSIFIED_MARK` and `NFQUEUE_PENDING_MARK`. Configuration validation rejects `global.so_mark_from_dae` and routing-rule marks that overlap those bits. NFQUEUE direct completion repeats the same check before accepting a rule mark.
 
-Local-socket probing must distinguish honk's own transparent listeners from ordinary local services. `bpf_sock_is_dae_socket` compares the full socket mark with `PARAM.dae_socket_mark`, which userspace sets to `DAE_BYPASS_MARK`. Equality means “honk listener,” so the probe continues the transparent path; an ordinary unmarked listener may claim the destination. Host-namespace `dns.bind` sockets are deliberately unmarked ordinary listeners.
+TC-side local-socket probes run in the current ingress network namespace (the host namespace for these hooks), using `BPF_F_CURRENT_NETNS` rather than a relative peer-namespace ID. They must distinguish honk's own transparent listeners from ordinary local services when a matching socket is present. `bpf_sock_is_dae_socket` compares the full socket mark with `PARAM.dae_socket_mark`, which userspace sets to `DAE_BYPASS_MARK`; equality means “honk listener,” so the probe continues the transparent path, while an ordinary unmarked listener may claim the destination. Host-namespace `dns.bind` sockets are deliberately unmarked ordinary listeners.
 
 ## Packet behavior and invariants
 

@@ -38,8 +38,8 @@ use crate::{
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     transport::{
-        ETH_HLEN, ETH_P_IP, IPPROTO_ICMPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet,
-        tcp_listener_l4proto,
+        ETH_HLEN, ETH_P_IP, IPPROTO_ICMPV6, IPPROTO_TCP, IPPROTO_UDP, packet_is_honk_internal,
+        parse_packet, tcp_listener_l4proto,
     },
 };
 
@@ -305,8 +305,8 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_OK);
     }
 
-    // Broadcast/multicast (DHCPOFFER, mDNS, NetBIOS) is never conn-tracked.
-    if crate::transport::dst_is_special(pkt, link_h_len) {
+    // Broadcast/multicast and the private dae0 link are never conn-tracked.
+    if crate::transport::dst_is_special(pkt, link_h_len) || packet_is_honk_internal(pkt) {
         return Err(TC_ACT_OK);
     }
 
@@ -865,13 +865,23 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // Parse before reading __sk_buff fields: ctx.load() proves to the verifier
     // that ctx.skb.skb is a valid non-null pointer.
     let ret = parse_packet(ctx, link_h_len, pkt);
+    if ret == crate::transport::PARSE_FRAGMENT as c_long {
+        if skb_ingress_ifindex(ctx) != NOWHERE_IFINDEX {
+            return Err(TC_ACT_UNSPEC);
+        }
+        return Err(if is_control_plane(ctx) {
+            TC_ACT_OK
+        } else {
+            TC_ACT_SHOT
+        });
+    }
     if ret != 0 {
         // Unsupported or malformed traffic is left untouched.
         return Err(TC_ACT_OK);
     }
 
-    // Broadcast/multicast is never re-routed into daens.
-    if crate::transport::dst_is_special(pkt, link_h_len) {
+    // Broadcast/multicast and the private dae0 link are never re-routed.
+    if crate::transport::dst_is_special(pkt, link_h_len) || packet_is_honk_internal(pkt) {
         return Err(TC_ACT_OK);
     }
 

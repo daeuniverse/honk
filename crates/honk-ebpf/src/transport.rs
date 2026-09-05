@@ -87,7 +87,7 @@ pub const ERR_MALFORMED: c_long = -14;
 /// Fast path could not pull enough data; fall back to slow path.
 pub const ERR_FALLBACK: c_long = -1;
 
-/// Non-initial IP fragment that lacks L4 header; pass through for kernel reassembly.
+/// Fragmented datagrams lack a complete transport tuple.
 pub const ERR_FRAGMENT: c_long = -2;
 
 /// Unsupported L4 protocol; pass through to kernel stack.
@@ -116,6 +116,40 @@ pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
         // ff00::/8
         (unsafe { dst.u6_addr8[0] }) == 0xFF
     }
+}
+
+/// True when either endpoint is in honk's private link subnets.  These
+/// addresses belong to the dae0/dae0peer pair and must never re-enter the
+/// proxy datapath.  IPv4 tuples are represented as `::ffff:a.b.c.d`.
+#[inline(always)]
+pub fn packet_is_honk_internal(pkt: &ParsedPacket) -> bool {
+    is_honk_internal_addr(pkt.tuples.five.src_ip.as_bytes())
+        || is_honk_internal_addr(pkt.tuples.five.dst_ip.as_bytes())
+}
+
+#[inline(always)]
+fn is_honk_internal_addr(addr: &[u8; 16]) -> bool {
+    let v4_mapped = addr[0] == 0
+        && addr[1] == 0
+        && addr[2] == 0
+        && addr[3] == 0
+        && addr[4] == 0
+        && addr[5] == 0
+        && addr[6] == 0
+        && addr[7] == 0
+        && addr[8] == 0
+        && addr[9] == 0
+        && addr[10] == 0xff
+        && addr[11] == 0xff;
+    (v4_mapped && addr[12] == 169 && addr[13] == 254)
+        || (addr[0] == 0xfd
+            && addr[1] == 0
+            && addr[2] == 0x68
+            && addr[3] == 0x6f
+            && addr[4] == 0x6e
+            && addr[5] == 0x6b
+            && addr[6] == 0
+            && addr[7] == 0)
 }
 
 /// Proxy preliminaries need a userspace domain decision only for QUIC long headers.
@@ -295,8 +329,8 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ihl = self.iph.ihl();
             self.l4proto = self.iph.proto;
 
-            let frag_off = u16::from_be(self.iph.frag_offset()) & 0x1FFF;
-            if frag_off != 0 {
+            // Classifiers must give the first and later fragments the same verdict.
+            if self.iph.frag_flags() & 1 != 0 || self.iph.frag_offset() != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -373,7 +407,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    if (u16::from_be(fragh.frag_off) & 0xFFF8) != 0 {
+                    // The M bit or a non-zero offset identifies a fragmented
+                    // datagram.  Keep the whole datagram on the native path.
+                    if u16::from_be(fragh.frag_off) & 0xFFF9 != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
                     continue;
@@ -511,9 +547,8 @@ impl ParseTransportExt for ParseTransportCtx {
             self.iph = unsafe { ptr::read(iph_ptr) };
             self.ihl = iph.ihl();
             self.l4proto = iph.proto;
-
-            let frag_off = u16::from_be(iph.frag_offset()) & 0x1FFF;
-            if frag_off != 0 {
+            let fragmented = iph.frag_flags() & 1 != 0 || iph.frag_offset() != 0;
+            if fragmented {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -570,7 +605,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    if (u16::from_be(fragh.frag_off) & 0xFFF8) != 0 {
+                    // Pass all non-atomic fragmented datagrams through; the
+                    // first fragment must not be routed without its followers.
+                    if u16::from_be(fragh.frag_off) & 0xFFF9 != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
                     continue;

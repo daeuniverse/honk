@@ -68,6 +68,7 @@ fn nfqueue_service_isolated_netns_kernel_contract() {
             );
             configure_loopback();
             exercise_kernel_contract();
+            exercise_receive_overrun();
         })
         .expect("spawn isolated netns test")
         .join()
@@ -190,6 +191,16 @@ fn exercise_kernel_contract() {
         b"accept-ipv6",
         CallbackDecision::Accept,
     );
+    exercise_oversized_datagram(&ipv4_client, &ipv4_receiver, &mut fatal);
+    exercise_datagram(
+        &ipv4_client,
+        &ipv4_receiver,
+        &events,
+        &mut fatal,
+        b"accept-after-oversized",
+        CallbackDecision::Accept,
+    );
+
     exercise_datagram(
         &ipv4_client,
         &ipv4_receiver,
@@ -242,6 +253,71 @@ fn exercise_kernel_contract() {
     );
 }
 
+fn exercise_receive_overrun() {
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = parking_lot::Mutex::new(release_rx);
+    let callback: PacketCallback = Arc::new(move |packet, mut guard| {
+        if packet.payload.as_ref() == b"pause" {
+            blocked_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+        if packet.payload.as_ref() == b"accept-after-overrun" {
+            guard.accept(FINAL_MARK).unwrap();
+        }
+    });
+    let (service, mut fatal) = NfqueueService::start(callback).unwrap();
+    let receiver = marked_receiver("127.0.0.1:0".parse().unwrap());
+    let client = marked_client("127.0.0.1:0".parse().unwrap());
+    client.connect(receiver.local_addr().unwrap()).unwrap();
+    client.send(b"pause").unwrap();
+    blocked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let payload = vec![0xa5; 60_000];
+    for _ in 0..1024 {
+        client.send(&payload).unwrap();
+    }
+    let read_stats = || {
+        crate::parse_kernel_queue_stats(
+            &std::fs::read_to_string("/proc/thread-self/net/netfilter/nfnetlink_queue").unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(
+        read_stats().2 > 0,
+        "burst must overflow netlink delivery, not merely queue maxlen"
+    );
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while read_stats().0 != 0 {
+        assert!(matches!(
+            fatal.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            Instant::now() < deadline,
+            "listener did not recover after ENOBUFS"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    client.send(b"accept-after-overrun").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut received = [0u8; 64];
+    let length = receiver
+        .recv(&mut received)
+        .expect("listener must survive receive overrun");
+    assert_eq!(&received[..length], b"accept-after-overrun");
+    assert!(matches!(
+        fatal.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    service.shutdown().unwrap();
+}
+
 fn exercise_datagram(
     client: &UdpSocket,
     receiver: &UdpSocket,
@@ -280,6 +356,25 @@ fn exercise_datagram(
     } else {
         assert_no_delivery(receiver, Duration::from_millis(250));
     }
+}
+fn exercise_oversized_datagram(
+    client: &UdpSocket,
+    receiver: &UdpSocket,
+    fatal: &mut FatalReceiver,
+) {
+    // A maximum-size IPv4 UDP datagram exceeds the kernel's effective
+    // NFQUEUE copy range (65531 bytes), so it must be dropped by packet_id
+    // without taking down the listener. The following ordinary datagram
+    // proves the listener remains live.
+    let payload = vec![0xa5; 65_507];
+    client
+        .send(&payload)
+        .expect("send maximum-size UDP datagram");
+    assert_no_delivery(receiver, Duration::from_millis(250));
+    assert!(matches!(
+        fatal.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
 }
 
 fn receive_event_or_fatal(

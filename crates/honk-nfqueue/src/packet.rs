@@ -81,17 +81,28 @@ pub(crate) struct ParsedPacket {
     pub(crate) packet_id: u32,
     pub(crate) packet: QueuedPacket,
 }
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PacketMessageError {
+    #[error("{0}")]
+    Message(#[from] PacketError),
+    #[error("packet {packet_id}: {error}")]
+    Packet {
+        packet_id: u32,
+        #[source]
+        error: PacketError,
+    },
+}
 
 pub(crate) fn parse_packet_message(
     body: Bytes,
     received_at: Instant,
-) -> Result<ParsedPacket, PacketError> {
+) -> Result<ParsedPacket, PacketMessageError> {
     if body.len() < netlink::NFGENMSG_LEN {
-        return Err(PacketError::TruncatedNfgenmsg);
+        return Err(PacketError::TruncatedNfgenmsg.into());
     }
     let family = body[0];
     if family != libc::AF_INET as u8 && family != libc::AF_INET6 as u8 {
-        return Err(PacketError::UnexpectedFamily(family));
+        return Err(PacketError::UnexpectedFamily(family).into());
     }
 
     let mut packet_id = None;
@@ -108,7 +119,8 @@ pub(crate) fn parse_packet_message(
                     return Err(PacketError::InvalidAttributeLength {
                         kind: attribute.kind,
                         length: attribute.payload.len(),
-                    });
+                    }
+                    .into());
                 }
                 packet_id = Some(u32::from_be_bytes(
                     attribute.payload[..4].try_into().expect("four bytes"),
@@ -136,10 +148,14 @@ pub(crate) fn parse_packet_message(
     if let Some(captured) = capture_length
         && captured != layer_three.len()
     {
-        return Err(PacketError::CaptureLengthMismatch {
+        let error = PacketError::CaptureLengthMismatch {
             captured,
             payload: layer_three.len(),
-        });
+        };
+        if captured > layer_three.len() {
+            return Err(PacketMessageError::Packet { packet_id, error });
+        }
+        return Err(error.into());
     }
 
     let family_from_packet = layer_three
@@ -149,13 +165,14 @@ pub(crate) fn parse_packet_message(
     if (family == libc::AF_INET as u8 && family_from_packet != 4)
         || (family == libc::AF_INET6 as u8 && family_from_packet != 6)
     {
-        return Err(PacketError::UnexpectedFamily(family));
+        return Err(PacketError::UnexpectedFamily(family).into());
     }
     let (tuple, payload_range) = match family_from_packet {
-        4 => parse_ipv4_udp(&layer_three)?,
-        6 => parse_ipv6_udp(&layer_three)?,
-        _ => return Err(PacketError::NotIpDatagram),
-    };
+        4 => parse_ipv4_udp(&layer_three),
+        6 => parse_ipv6_udp(&layer_three),
+        _ => return Err(PacketError::NotIpDatagram.into()),
+    }
+    .map_err(|error| PacketMessageError::Packet { packet_id, error })?;
 
     Ok(ParsedPacket {
         packet_id,
@@ -411,7 +428,6 @@ mod tests {
         assert_eq!(parsed.packet.tuple.destination.port(), 8443);
         assert_eq!(parsed.packet.payload.as_ref(), b"quic");
     }
-
     #[test]
     fn rejects_cap_len_mismatch_and_fragments() {
         let layer_three = ipv4_udp(b"payload");
@@ -426,7 +442,10 @@ mod tests {
         );
         assert!(matches!(
             mismatch,
-            Err(PacketError::CaptureLengthMismatch { .. })
+            Err(PacketMessageError::Packet {
+                packet_id: 9,
+                error: PacketError::CaptureLengthMismatch { .. },
+            })
         ));
 
         let mut fragmented = layer_three.to_vec();
@@ -438,10 +457,13 @@ mod tests {
                 Instant::now()
             )
             .unwrap_err(),
-            PacketError::NotUdpIpv4 {
-                protocol: IPPROTO_UDP,
-                fragment: 0x2000,
-                header_length: 20,
+            PacketMessageError::Packet {
+                packet_id: 9,
+                error: PacketError::NotUdpIpv4 {
+                    protocol: IPPROTO_UDP,
+                    fragment: 0x2000,
+                    header_length: 20,
+                },
             }
         );
     }

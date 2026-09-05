@@ -52,8 +52,8 @@ use crate::{
     },
     sk,
     transport::{
-        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet,
-        udp_has_quic_long_header,
+        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, packet_is_honk_internal,
+        parse_packet, udp_has_quic_long_header,
     },
 };
 const IPV6_BYTE_LENGTH: usize = 16;
@@ -485,21 +485,6 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
     result == BPF_FIB_LKUP_RET_NOT_FWDED as c_long
 }
 
-/// Existing flows probe for a local owner as before. Pure SYNs normally skip
-/// this lookup, except TCP DNS: a real host-netns port-53 LISTEN socket must
-/// get first refusal before the unconditional DNS redirect.
-#[inline(always)]
-const fn tcp_socket_probe_required(pure_syn: bool, destination_port: u16) -> bool {
-    !pure_syn || destination_port == 53
-}
-
-// Host-build-free structural coverage for the no_std eBPF crate.
-const _: [(); 1] = [(); tcp_socket_probe_required(true, 53) as usize];
-const _: [(); 0] = [(); tcp_socket_probe_required(true, 443) as usize];
-const _: [(); 1] = [(); tcp_socket_probe_required(false, 443) as usize];
-
-/// Check if a destination IP is likely a local address where a socket lookup
-/// could find a matching listening socket (RFC 1918, loopback, ULA, link-local).
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
@@ -520,13 +505,16 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     };
 
     let ret = parse_packet(ctx, link_h_len, pkt);
+    if ret == crate::transport::PARSE_FRAGMENT as c_long {
+        return Err(TC_ACT_SHOT);
+    }
     if ret != 0 {
         return pass_through_classified(ctx);
     }
 
-    // Broadcast/multicast destinations (DHCP, mDNS, SSDP, LLMNR) must never
-    // be routed, marked, or conntracked — pass through immediately.
-    if crate::transport::dst_is_special(pkt, link_h_len) {
+    // Broadcast/multicast and the private dae0 link are never routed,
+    // marked, or conntracked.
+    if crate::transport::dst_is_special(pkt, link_h_len) || packet_is_honk_internal(pkt) {
         return pass_through_classified(ctx);
     }
 
@@ -689,30 +677,19 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         };
 
         if pkt.l4proto == IPPROTO_TCP {
-            // Preserve the general pure-SYN lookup skip. TCP DNS is the sole
-            // exception so LAN clients can reach an ordinary host listener
-            // before the unconditional port-53 fast path below.
-            let pure_syn = pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0;
-            if tcp_socket_probe_required(pure_syn, pkt.tuples.five.dst_port) {
-                let param = PARAM.load();
-                if let Some(probe) =
-                    sk::probe_tcp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            if let Some(probe) = sk::probe_tcp_socket(ctx, &mut tuple, tuple_size) {
+                // A local (non-dae) LISTEN socket owns this destination:
+                // NAT loopback — leave it to the kernel.
+                // BPF_TCP_LISTEN = 10
+                if !probe.is_dae_socket
+                    && probe.state == 10
+                    && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
                 {
-                    // A local (non-dae) LISTEN socket owns this destination:
-                    // NAT loopback — leave it to the kernel.
-                    // BPF_TCP_LISTEN = 10
-                    if !probe.is_dae_socket
-                        && probe.state == 10
-                        && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-                    {
-                        return pass_through_classified(ctx);
-                    }
+                    return pass_through_classified(ctx);
                 }
             }
         } else {
-            let param = PARAM.load();
-            if let Some(probe) =
-                sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            if let Some(probe) = sk::probe_udp_socket(ctx, &mut tuple, tuple_size)
                 && !probe.is_dae_socket
                 && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
             {

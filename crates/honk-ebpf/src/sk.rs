@@ -7,7 +7,7 @@ use core::ffi::{c_long, c_void};
 
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
-    bindings::{bpf_sock, bpf_sock_tuple},
+    bindings::{BPF_F_CURRENT_NETNS, bpf_sock, bpf_sock_tuple},
     helpers::{
         bpf_map_lookup_elem, bpf_sk_assign, bpf_sk_lookup_tcp, bpf_sk_lookup_udp, bpf_sk_release,
     },
@@ -65,16 +65,23 @@ pub(crate) struct SkProbe {
     pub is_wildcard: bool,
 }
 
-/// Probe the TCP socket matching `tuple` in `netns_id`, releasing the
-/// reference before returning. `None` when nothing matched.
+/// Probe the current (ingress/host) namespace, not a relative peer netns ID.
+/// Always release the lookup reference before returning.
 #[inline(always)]
 pub(crate) fn probe_tcp_socket(
     ctx: &TcContext,
     tuple: &mut bpf_sock_tuple,
     tuple_size: u32,
-    netns_id: u64,
 ) -> Option<SkProbe> {
-    let sk = unsafe { bpf_sk_lookup_tcp(ctx.skb.skb as *mut _, tuple, tuple_size, netns_id, 0) };
+    let sk = unsafe {
+        bpf_sk_lookup_tcp(
+            ctx.skb.skb as *mut _,
+            tuple,
+            tuple_size,
+            BPF_F_CURRENT_NETNS as u64,
+            0,
+        )
+    };
     probe_result(sk)
 }
 
@@ -84,9 +91,16 @@ pub(crate) fn probe_udp_socket(
     ctx: &TcContext,
     tuple: &mut bpf_sock_tuple,
     tuple_size: u32,
-    netns_id: u64,
 ) -> Option<SkProbe> {
-    let sk = unsafe { bpf_sk_lookup_udp(ctx.skb.skb as *mut _, tuple, tuple_size, netns_id, 0) };
+    let sk = unsafe {
+        bpf_sk_lookup_udp(
+            ctx.skb.skb as *mut _,
+            tuple,
+            tuple_size,
+            BPF_F_CURRENT_NETNS as u64,
+            0,
+        )
+    };
     probe_result(sk)
 }
 
