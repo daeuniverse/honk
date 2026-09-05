@@ -24,7 +24,7 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
-当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
+当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
@@ -162,11 +162,11 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 
 `SIGHUP` 会按 fetch 身份（URL + 配置的 User-Agent + headers）稳定订阅 ID，并把活动订阅节点带入候选配置。只有启用订阅且当前没有活动节点时才恢复缓存，随后安排立即网络刷新。网络、解析或没有可用节点的失败会保留活动节点，不替换上一次有效正文。持久化失败不是致命错误：校验成功的节点仍可合并，旧正文仍可恢复。定期刷新与立即刷新使用同一串行的 runtime 发布路径，订阅节点不会写回配置文件。
 
-当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
+当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
 ## Clash API 与 cache DB
 
-可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当 API 成功绑定，或任一配置组使用 `interrupt_connections` 时，才启用连接元数据，因此即使没有 API 也能在选择变化时中断连接。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash mode，并可选持久化 DNS 答案。相对路径优先位于 `global.data_dir`，同时在切换期继续使用已有的配置目录相对旧数据库。配置与持久化语义见[实验性配置参考](../reference/experimental.md)。
+可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当 API 成功绑定，或任一配置组使用 `interrupt_connections` 时，才启用连接元数据，因此即使没有 API 也能在选择变化时中断连接。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash 模式和可选 DNS 应答。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和原始配置目录中的已有数据库；缺失数据库在 `global.data_dir` 下创建。配置和持久化语义见 [Experimental 参考](../reference/experimental.md)。
 
 ## 相关文档
 

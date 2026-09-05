@@ -162,7 +162,7 @@ Start with a direct-only configuration to prove that the datapath works, then ad
 global {
     wan_interface: auto
     lan_interface: br-lan
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     log_level: info
     dial_mode: domain
     auto_config_kernel_parameter: true
@@ -176,9 +176,11 @@ routing {
 Install the configuration:
 
 ```shell
-sudo install -d -m 0700 /etc/honk /var/share/honk
+sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
+
+The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback; honk does not automatically relocate them; writable state remains active in place. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path; relative logs are created only below the configured directory.
 
 Start honk in the foreground:
 
@@ -218,11 +220,13 @@ See the [configuration guide](configuration.md) for the complete configuration f
 Download these files only when the configuration references `geoip:` or `geosite:`:
 
 ```shell
-sudo curl -fL --retry 3 -o /var/share/honk/geosite.dat \
+sudo curl -fL --retry 3 -o /var/lib/honk/geosite.dat \
   https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-sudo curl -fL --retry 3 -o /var/share/honk/geoip.dat \
+sudo curl -fL --retry 3 -o /var/lib/honk/geoip.dat \
   https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
 ```
+
+The engine selects the first existing regular file in this order: `$DAE_LOCATION_ASSET/<name>`, `<data_dir>/<name>`, `/var/share/honk/<name>`, `./<name>`, `/usr/local/share/honk/<name>`, `/usr/share/honk/<name>`, `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`.
 
 ## Run with systemd
 
@@ -237,7 +241,7 @@ After=network-online.target
 [Service]
 Type=notify
 User=root
-WorkingDirectory=/var/share/honk
+WorkingDirectory=/var/lib/honk
 ExecStart=/usr/local/bin/honk-core --config /etc/honk/config.dae
 ExecReload=/usr/local/bin/honk-core reload
 Restart=on-failure
@@ -348,7 +352,7 @@ cargo +stable run --release -p honk-core -- \
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
 | LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
-| A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or remove unused Geo rules. |
+| A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |
 | A GNU binary does not execute on VyOS or a minimal system | Use the musl release for the same architecture. |
 
 ## Further reading

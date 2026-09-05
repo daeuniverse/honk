@@ -68,7 +68,7 @@ pub struct SubscriptionStore {
 
 impl SubscriptionStore {
     /// Open the subscription store below `global.data_dir`, retaining an
-    /// existing legacy `./.sub` store during the data-directory cutover.
+    /// existing old data-directory or `./.sub` store during upgrades.
     pub fn in_data_dir() -> anyhow::Result<Self> {
         let root = default_store_root();
         let preferred = honk_config::paths::resolve_artifact_path(SUBSCRIPTION_STORE_DIR);

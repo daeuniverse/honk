@@ -402,7 +402,7 @@ fn load_geosite_index(
 
 /// Locate geosite.dat for tooling queries (`honk-tool geosite`): an explicit
 /// `--file` path wins at the call site; otherwise the runtime data directory
-/// precedes the working directory, honk's share directories, and dae's legacy locations.
+/// precedes the old data directory, working directory, honk shares, and dae's legacy locations.
 pub fn find_geosite_dat() -> Option<std::path::PathBuf> {
     find_dat("geosite.dat")
 }
@@ -419,6 +419,7 @@ fn find_dat(name: &str) -> Option<std::path::PathBuf> {
         return Some(data_path);
     }
     for directory in [
+        honk_config::paths::LEGACY_DATA_DIR,
         ".",
         "/usr/local/share/honk",
         "/usr/share/honk",

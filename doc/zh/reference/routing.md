@@ -59,18 +59,19 @@ routing {
 
 ## Geo 资源
 
-`geoip:` 和 `geosite:` 条件使用 `geoip.dat` 与 `geosite.dat`。查找顺序如下：
+`geoip:` 和 `geosite:` 条件使用 `geoip.dat` 与 `geosite.dat`。引擎按以下顺序选择第一个已存在的普通文件：
 
 | 优先级 | 位置 |
 | --- | --- |
 | 1 | `$DAE_LOCATION_ASSET/<file>` |
 | 2 | `global.data_dir/<file>` |
-| 3 | 进程工作目录中的 `./<file>` |
-| 4 | `/usr/local/share/honk/<file>` |
-| 5 | `/usr/share/honk/<file>` |
-| 6 | `/usr/local/share/dae/<file>` |
-| 7 | `/usr/share/dae/<file>` |
-| 8 | `/etc/dae/<file>` |
+| 3 | `/var/share/honk/<file>`（`LEGACY_DATA_DIR`） |
+| 4 | 进程工作目录中的 `./<file>` |
+| 5 | `/usr/local/share/honk/<file>` |
+| 6 | `/usr/share/honk/<file>` |
+| 7 | `/usr/local/share/dae/<file>` |
+| 8 | `/usr/share/dae/<file>` |
+| 9 | `/etc/dae/<file>` |
 
 运行时资源解析规则见[全局参考](./global.md)。`geoip: private` 使用内建 CIDR 集，不需要 `geoip.dat`。
 

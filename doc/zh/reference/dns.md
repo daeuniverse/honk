@@ -46,7 +46,7 @@ dns {
 }
 ```
 
-绝对路径保持原样。相对路径解析到 `global.data_dir` 下，但仍兼容已经存在于旧工作目录中的文件。查询路径只使用生成的不可变快照，不执行文件 I/O。
+绝对路径保持原样。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和工作目录中的已有副本；缺失路径仍定位到 `global.data_dir` 下。查询路径只使用生成的不可变快照，不执行文件 I/O。
 
 自定义 matcher 支持 `full:example.com`（或无前缀的精确名称）、`domain:example.com`（该名称及标签边界内的所有子域）、`keyword:text` 和 `regexp:pattern`。匹配优先级依次为精确、最长 domain 后缀、首个匹配的 regexp、首个匹配的 keyword；重复定义同一 matcher 时，后者替换其地址。Full、domain 和 keyword 名称按 ASCII 大小写不敏感方式处理，并归一化末尾点。Regexp 保持大小写敏感，匹配不带末尾点的小写名称；需要忽略大小写时使用 `(?i)`。重复地址会去除。
 

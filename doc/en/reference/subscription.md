@@ -55,8 +55,8 @@ The internal body-selector behavior is:
 
 | Property | Current behavior |
 | --- | --- |
-| Preferred location | `<data_dir>/.sub`; the default `data_dir` is `/var/share/honk`. |
-| Legacy location | If the preferred directory does not exist but `./.sub` does, the legacy directory remains active until it is moved. The preferred directory wins when both exist. |
+| Preferred location | `<data_dir>/.sub`; the default `data_dir` is `/var/lib/honk`. |
+| Legacy locations | Prefer an existing `/var/share/honk/.sub` (`LEGACY_DATA_DIR`), then an existing `./.sub` when the configured store is absent. A custom `data_dir` follows the same order. No store is moved or deleted automatically; migrate it explicitly when ready. |
 | Permissions | Directory mode `0700`; file mode `0600`. Symlink store directories are rejected. |
 | Filename | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their cache across upgrades. The request identity is not exposed in plaintext. |
 | Write boundary | The raw response body is written only after HTTP success and successful parsing. A temporary file is synced, renamed atomically, and followed by a directory sync. |

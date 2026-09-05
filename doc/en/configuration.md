@@ -42,7 +42,7 @@ The entry file's own sections merge first regardless of where its `include` bloc
 
 ## Runtime data directory
 
-`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/share/honk`, must be a non-empty absolute path, and is restart-required. At startup honk recursively creates the directory, then verifies it by creating and removing a private random probe file without following a probe symlink. An unusable candidate falls back only to a working directory that passes the same probe; startup fails with both causes if neither works. Relative `global.log_file`, `experimental.cache_file.path`, `experimental.clash_api.external_ui`, the `.sub` subscription store, `geoip.dat`, `geosite.dat`, and node `ech_config_path` resolve under the effective directory; absolute child paths stay literal. If the preferred data-directory copy is absent, honk retains an existing legacy cache beside the entry config, an existing `./.sub` store, or an existing working-directory UI/ECH path until it is moved. Geo lookup checks an existing `$DAE_LOCATION_ASSET/<file>` first, followed by the effective data directory, working directory, and standard dae asset directories.
+`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/lib/honk`, must be a non-empty absolute path, and is restart-required. At startup honk recursively creates the directory and probes it with a private create-new/remove file; an unusable candidate falls back only to a working directory that passes the same probe. Existing artifacts under `/var/share/honk` (`LEGACY_DATA_DIR`) remain usable without automatic migration; reused writable state continues to be updated in place. For relative writable artifacts and read-only dependencies, honk checks an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then the existing per-caller legacy candidate (the original config directory for cache, or the working directory for other dependencies), and otherwise returns `<data_dir>/<path>` for creation. Relative logs are creation-only and always use `<data_dir>/<path>`; absolute paths stay literal. Geo assets use an independent regular-file search order: `$DAE_LOCATION_ASSET`, `<data_dir>`, `/var/share/honk`, the working directory, honk share directories, then dae share directories.
 
 See the [global reference](./reference/global.md).
 
@@ -122,7 +122,7 @@ global {
     log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     bootstrap_resolver: '1.1.1.1:53'
     store_subscribe: true
 }
@@ -253,15 +253,15 @@ See the [DNS reference](./reference/dns.md).
 
 ## Subscriptions
 
-Declare each source as `tag: 'url'`, append `(UA)` after the quoted URL for a per-subscription User-Agent, or use `tag: { url, ua, interval }` when a custom refresh interval is also needed; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `.sub`. Requests use `honk/<version>` unless `ua` overrides it; the cache key includes the configured override, so distinct request identities keep distinct stored bodies. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. An empty refresh never clears the previous generation. Subscription nodes exist only at runtime. Changing `store_subscribe` requires restart.
+Declare each source as `tag: 'url'`, append `(UA)` after the quoted URL for a per-subscription User-Agent, or use `tag: { url, ua, interval }` when a custom refresh interval is also needed; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `<data_dir>/.sub`; if that store is absent, an existing `/var/share/honk/.sub` and then an existing `./.sub` remain usable. No store is moved or deleted automatically. Requests use `honk/<version>` unless `ua` overrides it; the cache key includes the configured override, so distinct request identities keep distinct stored bodies. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. Subscription nodes remain runtime-only. `store_subscribe` changes require restart.
 
 See the [subscription reference](./reference/subscription.md).
 
 ## Enabling the Clash API, cache file, and held-first-packet UDP
 
-**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` resolves through `data_dir` and may be downloaded in the background when missing. `external_ui_download_url` selects the ZIP source, while `external_ui_download_detour` forces the download through one node or group; empty values retain the built-in URL and normal traffic routing.
+**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` prefers an existing directory below `data_dir`, then `/var/share/honk`, then the working directory; if none exists, the dashboard is downloaded under `data_dir`. `external_ui_download_url` selects the ZIP source, while `external_ui_download_detour` forces the download through one node or group; empty values retain the built-in URL and normal traffic routing.
 
-**Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` uses `data_dir`, subject to the legacy-path rule above.
+**Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` prefers an existing file below `data_dir`, then `/var/share/honk`, then the original configuration directory; a missing database is created below `data_dir`.
 
 **Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. If startup uses mock eBPF, lacks the `ebpf` feature, or fails the fixed-queue preflight, honk logs a warning and disables NFQUEUE for that process without rewriting the config file. After the real-instance lock is acquired, startup binds queue `320` and reclaims the stale owned nftables table before publishing `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate those reserved objects while honk runs.
 

@@ -70,7 +70,7 @@ UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启�
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
 | Bypass mark | 编译期常量 | `DAE_BYPASS_MARK = 0x100`；控制面拨号、探测与 DNS 上游 socket 使用该值以避免再次拦截。 |
 | TPROXY mark | 编译期常量与配置校验 | `TPROXY_MARK = 0x08000000`；`global.tproxy_mark` 必须等于该值。 |
-| Geo 资源 | 运行时路径搜索 | 依次检查 `DAE_LOCATION_ASSET`、`global.data_dir`、工作目录、`/usr/local/share/honk`、`/usr/share/honk`、`/usr/local/share/dae`、`/usr/share/dae`、`/etc/dae`。见[全局配置参考](./global.md)。 |
+| Geo 资源 | 运行时路径搜索 | 依次检查 `DAE_LOCATION_ASSET`、`global.data_dir`、旧根目录 `/var/share/honk`、工作目录、`/usr/local/share/honk`、`/usr/share/honk`、`/usr/local/share/dae`、`/usr/share/dae`、`/etc/dae`；每个候选都必须是普通文件。见[全局配置参考](./global.md)。 |
 
 ## `honk-tool`
 
@@ -200,7 +200,7 @@ honk-tool geoip [--file PATH] lookup <ip>
 | `geoip lookup <ip>` | 返回最长匹配前缀上并列的全部 code/CIDR。 |
 | `--file PATH` | 对应 `.dat` 文件的命令族全局覆盖路径。 |
 
-未给 `--file` 时，工具依次搜索 `$DAE_LOCATION_ASSET/<name>.dat`、`/var/share/honk/<name>.dat`、`./<name>.dat`、`/usr/local/share/honk/<name>.dat`、`/usr/share/honk/<name>.dat`、`/usr/local/share/dae/<name>.dat`、`/usr/share/dae/<name>.dat`、`/etc/dae/<name>.dat`。与 `honk-core` 不同，该工具不加载配置，因而无法获知自定义 `global.data_dir`。输出每行一条记录；下游管道关闭时不会 panic。
+未给 `--file` 时，工具按以下顺序搜索第一个已存在的普通文件：`$DAE_LOCATION_ASSET/<name>.dat`、`/var/lib/honk/<name>.dat`、旧根目录 `/var/share/honk/<name>.dat`、`./<name>.dat`、`/usr/local/share/honk/<name>.dat`、`/usr/share/honk/<name>.dat`、`/usr/local/share/dae/<name>.dat`、`/usr/share/dae/<name>.dat`，最后是 `/etc/dae/<name>.dat`。与 `honk-core` 不同，该工具不加载配置，因而无法获知自定义 `global.data_dir`。输出每行一条记录；下游管道关闭时不会 panic。
 
 ## 相关文档
 

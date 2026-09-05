@@ -161,7 +161,7 @@ sudo install -m 0755 target/release/honk-core /usr/local/bin/honk-core
 global {
     wan_interface: auto
     lan_interface: br-lan
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     log_level: info
     dial_mode: domain
     auto_config_kernel_parameter: true
@@ -175,9 +175,11 @@ routing {
 安装配置：
 
 ```shell
-sudo install -d -m 0700 /etc/honk /var/share/honk
+sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
+
+默认运行时根目录是 `/var/lib/honk`。旧根目录 `/var/share/honk` 中的已有资源会按各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。自定义 `data_dir` 也遵循相同的回退顺序。相对缓存、订阅存储、ECH/UI 与其他只读依赖依次检查配置目录、`/var/share/honk`，再检查调用方的旧候选路径；相对日志只会在配置目录下创建。
 
 前台启动：
 
@@ -217,11 +219,13 @@ bootstrap_resolver: '1.1.1.1:53'
 只有配置引用 `geoip:` 或 `geosite:` 时才需要下载：
 
 ```shell
-sudo curl -fL --retry 3 -o /var/share/honk/geosite.dat \
+sudo curl -fL --retry 3 -o /var/lib/honk/geosite.dat \
   https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-sudo curl -fL --retry 3 -o /var/share/honk/geoip.dat \
+sudo curl -fL --retry 3 -o /var/lib/honk/geoip.dat \
   https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
 ```
+
+引擎按以下顺序选择第一个已存在的普通文件：`$DAE_LOCATION_ASSET/<name>`、`<data_dir>/<name>`、`/var/share/honk/<name>`、`./<name>`、`/usr/local/share/honk/<name>`、`/usr/share/honk/<name>`、`/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，最后是 `/etc/dae/<name>`。
 
 ## 使用 systemd 运行
 
@@ -236,7 +240,7 @@ After=network-online.target
 [Service]
 Type=notify
 User=root
-WorkingDirectory=/var/share/honk
+WorkingDirectory=/var/lib/honk
 ExecStart=/usr/local/bin/honk-core --config /etc/honk/config.dae
 ExecReload=/usr/local/bin/honk-core reload
 Restart=on-failure
@@ -347,7 +351,7 @@ cargo +stable run --release -p honk-core -- \
 | NFQUEUE disabled 或 queue busy | 检查 nftables/NFQUEUE 内核支持、queue 320 占用者和残留 honk 实例；确实不需要时设置 `nfqueue_enable: false`。 |
 | LAN 流量未被代理 | `lan_interface` 为空或接口名错误；它不会自动使用 `lo`。 |
 | VLESS/VMess 报 `No handler for protocol` | 构建缺少 `rprx`；使用默认 features，或显式加入 `rprx`。 |
-| Geo rule 加载失败 | 将 `geoip.dat`/`geosite.dat` 放入配置的 `data_dir`，或删除未使用的 Geo rule。 |
+| Geo rule 加载失败 | 将 `geoip.dat`/`geosite.dat` 放入配置的 `data_dir`，或检查文档所列的旧目录/共享目录搜索位置；不需要时删除未使用的 Geo rule。 |
 | GNU binary 在 VyOS/精简系统无法执行 | 改用同架构的 musl release。 |
 
 ## 继续阅读

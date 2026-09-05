@@ -70,7 +70,7 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 | Pin root | `--bpf-pin-root PATH` | Defaults to `/sys/fs/bpf` and is passed to the real backend for pinned maps. |
 | Bypass mark | Compiled constant | `DAE_BYPASS_MARK = 0x100`; control-plane dials, probes, and DNS upstream sockets use it to avoid re-interception. |
 | TPROXY mark | Compiled constant plus validated config | `TPROXY_MARK = 0x08000000`; `global.tproxy_mark` must equal this value. |
-| Geo assets | Runtime path search | `DAE_LOCATION_ASSET` first, then `global.data_dir`, the working directory, `/usr/local/share/honk`, `/usr/share/honk`, `/usr/local/share/dae`, `/usr/share/dae`, and `/etc/dae`. See the [global configuration reference](./global.md). |
+| Geo assets | Runtime path search | `DAE_LOCATION_ASSET` first, then `global.data_dir`, legacy `/var/share/honk`, the working directory, `/usr/local/share/honk`, `/usr/share/honk`, `/usr/local/share/dae`, `/usr/share/dae`, and `/etc/dae`; each candidate must be a regular file. See the [global configuration reference](./global.md). |
 
 ## `honk-tool`
 
@@ -200,7 +200,7 @@ honk-tool geoip [--file PATH] lookup <ip>
 | `geoip lookup <ip>` | Return every code/CIDR tie at the longest matching prefix. |
 | `--file PATH` | Global per-family override for the corresponding `.dat` file. |
 
-Without `--file`, the tool searches `$DAE_LOCATION_ASSET/<name>.dat`, `/var/share/honk/<name>.dat`, `./<name>.dat`, `/usr/local/share/honk/<name>.dat`, `/usr/share/honk/<name>.dat`, `/usr/local/share/dae/<name>.dat`, `/usr/share/dae/<name>.dat`, then `/etc/dae/<name>.dat`. Unlike `honk-core`, the tool does not load a config to discover a custom `global.data_dir`. Output is one record per line and handles a closed downstream pipe without a panic.
+Without `--file`, the tool searches the first existing regular file in this order: `$DAE_LOCATION_ASSET/<name>.dat`, `/var/lib/honk/<name>.dat`, legacy `/var/share/honk/<name>.dat`, `./<name>.dat`, `/usr/local/share/honk/<name>.dat`, `/usr/share/honk/<name>.dat`, `/usr/local/share/dae/<name>.dat`, `/usr/share/dae/<name>.dat`, then `/etc/dae/<name>.dat`. Unlike `honk-core`, the tool does not load a config to discover a custom `global.data_dir`. Output is one record per line and handles a closed downstream pipe without a panic.
 
 ## Related docs
 

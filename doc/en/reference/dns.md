@@ -46,7 +46,7 @@ dns {
 }
 ```
 
-Absolute paths remain explicit. Relative paths resolve below `global.data_dir`, while an existing legacy working-directory path remains usable. The query path uses the resulting immutable snapshot and performs no file I/O.
+Absolute paths remain explicit. Relative paths prefer an existing copy below `global.data_dir`, then an existing `/var/share/honk` copy, then an existing working-directory path. A missing path remains below `global.data_dir`; the query path uses the resulting immutable snapshot and performs no file I/O.
 
 Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its addresses. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
 
