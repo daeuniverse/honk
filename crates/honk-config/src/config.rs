@@ -668,6 +668,21 @@ impl Config {
                     node.name
                 )));
             }
+            if let Some(shadowsocks) = node.shadowsocks()
+                && (shadowsocks
+                    .plugin
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || shadowsocks
+                        .plugin_opts
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty()))
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Node '{}' configures an unsupported static Shadowsocks plugin",
+                    node.name
+                )));
+            }
             // Reject unknown transports at load time instead of silently
             // degrading to raw TCP at dial time.
             if let Some(transport) = node.transport()
@@ -740,12 +755,41 @@ impl Config {
         // direct/block. A bare node name has no eBPF outbound id, so accepting
         // it would silently misroute; subscription nodes arrive at runtime and
         // are deliberately out of scope here. group.final and DNS upstream
-        // detours legitimately accept node names and stay unchecked.
+        // detours may resolve nodes, groups, or built-ins.
         let is_config_node = |name: &str| {
             self.nodes.iter().any(|node| {
                 node.id != DIRECT_NODE_ID && node.id != BLOCK_NODE_ID && node.name == name
             })
         };
+        let is_known_final = |name: &str| {
+            matches!(name, Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE)
+                || is_config_node(name)
+                || self.groups.iter().any(|group| group.name == name)
+        };
+        let has_enabled_subscriptions = self
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.enabled);
+        for group in &self.groups {
+            let Some(final_name) = group.final_outbound.as_deref() else {
+                continue;
+            };
+            if final_name.is_empty() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "group '{}' has an empty final target",
+                    group.name
+                )));
+            }
+            // Enabled subscriptions can materialize a node name after this
+            // pre-fetch validation. Leave those names unresolved here; the
+            // runtime resolver must fail closed until a matching node exists.
+            if !has_enabled_subscriptions && !is_known_final(final_name) {
+                return Err(crate::ConfigError::Validation(format!(
+                    "unknown final '{}' for group '{}' (expected a node, group, 'direct', or 'block')",
+                    final_name, group.name
+                )));
+            }
+        }
         let check_outbound = |outbound: &str, fallback: bool| -> Result<(), crate::ConfigError> {
             let kind = if fallback { "fallback" } else { "outbound" };
             if matches!(
@@ -875,6 +919,40 @@ mod builtin_nodes_tests {
     }
 
     #[test]
+    fn test_validate_rejects_unknown_static_group_final() {
+        let mut config = Config::default();
+        config.groups.push(Group {
+            name: "proxy".into(),
+            final_outbound: Some("typo".into()),
+            ..Default::default()
+        });
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("unknown final 'typo'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_defers_subscription_group_final_resolution() {
+        let mut config = Config::default();
+        config.groups.push(Group {
+            name: "proxy".into(),
+            final_outbound: Some("node-from-subscription".into()),
+            ..Default::default()
+        });
+        config.subscriptions.push(Subscription {
+            name: "sub".into(),
+            url: "https://example.test/feed".into(),
+            enabled: true,
+            ..Default::default()
+        });
+
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn test_validate_rejects_zero_check_interval() {
         let mut config = Config::default();
         config.global.check_interval_secs = 0;
@@ -996,6 +1074,23 @@ mod builtin_nodes_tests {
             config.nodes[0].transport_mut().unwrap().transport = ok.into();
             assert!(config.validate().is_ok(), "transport '{ok}' must pass");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_structured_static_shadowsocks_plugin() {
+        let mut config = Config::default();
+        let mut node =
+            Node::from_share_link("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#ss-node").unwrap();
+        node.shadowsocks_mut().unwrap().plugin = Some("obfs-local".into());
+        config.nodes.push(node);
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported static Shadowsocks plugin"),
+            "{error}"
+        );
     }
 
     #[test]

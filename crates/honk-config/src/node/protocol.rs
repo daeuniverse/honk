@@ -370,6 +370,13 @@ impl OutboundConfig {
             fingerprint.push('|');
             fingerprint.push_str(config.mode.as_str());
         }
+        // Keep legacy TLS identities stable, but do not reuse a TLS runtime
+        // for a VLESS link explicitly configured with security=none.
+        if let Self::Vless(config) = self
+            && !config.tls.enabled
+        {
+            fingerprint.push_str("|tls=none");
+        }
         fingerprint
     }
 }

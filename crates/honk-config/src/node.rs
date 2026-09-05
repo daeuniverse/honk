@@ -136,11 +136,23 @@ impl Node {
 
     /// Get the effective host (use host field or parse from address).
     pub fn host(&self) -> &str {
-        if self.host.is_empty() {
-            self.address.split(':').next().unwrap_or(&self.address)
-        } else {
-            &self.host
+        if !self.host.is_empty() {
+            return &self.host;
         }
+        if let Some(address) = self.address.strip_prefix('[') {
+            if let Some((host, _)) = address.split_once(']') {
+                return host;
+            }
+        }
+        if self.address.parse::<std::net::Ipv6Addr>().is_ok() {
+            return &self.address;
+        }
+        if let Some((host, port)) = self.address.rsplit_once(':') {
+            if port.parse::<u16>().ok() == Some(self.port) {
+                return host;
+            }
+        }
+        &self.address
     }
 
     pub fn shadowsocks(&self) -> Option<&ShadowsocksConfig> {
@@ -580,6 +592,7 @@ mod tests {
             .id
         });
         assert!(ids.iter().all(|id| *id != legacy.id));
+
         assert_eq!(
             ids.iter()
                 .copied()
@@ -587,6 +600,32 @@ mod tests {
                 .len(),
             ids.len()
         );
+    }
+
+    #[test]
+    fn test_host_parsing_preserves_structured_ipv6() {
+        for (address, expected) in [
+            ("[2001:db8::1]:443", "2001:db8::1"),
+            ("2001:db8::443", "2001:db8::443"),
+            ("proxy.example:443", "proxy.example"),
+        ] {
+            let node = Node {
+                address: address.into(),
+                port: 443,
+                ..Default::default()
+            };
+            assert_eq!(node.host(), expected);
+            let mut explicit = node.clone();
+            explicit.host = expected.into();
+            assert_eq!(node.derive_id(), explicit.derive_id());
+        }
+    }
+    #[test]
+    fn test_vless_tls_policy_changes_identity() {
+        let tls = Node::from_share_link("vless://uuid@example.com:443#tls").unwrap();
+        let no_tls =
+            Node::from_share_link("vless://uuid@example.com:443?security=none#no-tls").unwrap();
+        assert_ne!(tls.derive_id(), no_tls.derive_id());
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use super::{
-    Section, extract_fn_args, extract_nested_all, has_routing_fallback, normalize_geosite_code,
-    parse_bool, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections,
-    strip_tag_arg,
+    Section, extract_nested_all, has_routing_fallback, normalize_geosite_code, parse_bool,
+    parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections, strip_tag_arg,
 };
-use crate::dns::DnsConfig;
+use crate::{
+    dns::DnsConfig,
+    parser::{split_filter_arguments, unquote_filter_argument},
+};
 
 pub(super) fn parse_section(section: &Section) -> Result<DnsConfig, crate::ConfigError> {
     let dns_subs =
@@ -58,7 +60,7 @@ pub(super) fn parse_section(section: &Section) -> Result<DnsConfig, crate::Confi
             "routing" => {
                 for req_body in extract_nested_all(&sub.body, "request") {
                     let has_fallback = has_routing_fallback(&req_body);
-                    let request = parse_dns_request_routing(&req_body);
+                    let request = parse_dns_request_routing(&req_body)?;
                     cfg.routing.request.rules.extend(request.rules);
                     if !has_fallback {
                         continue;
@@ -73,7 +75,7 @@ pub(super) fn parse_section(section: &Section) -> Result<DnsConfig, crate::Confi
                 }
                 for resp_body in extract_nested_all(&sub.body, "response") {
                     let has_fallback = has_routing_fallback(&resp_body);
-                    let response = parse_dns_response_routing(&resp_body);
+                    let response = parse_dns_response_routing(&resp_body)?;
                     cfg.routing.response.rules.extend(response.rules);
                     if has_fallback {
                         cfg.routing.response.fallback = response.fallback;
@@ -240,7 +242,9 @@ fn parse_fixed_domain_ttl(body: &str) -> std::collections::HashMap<String, u32> 
 }
 
 /// Parse `routing.request { ... }` block.
-fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
+fn parse_dns_request_routing(
+    body: &str,
+) -> Result<crate::dns::DnsRequestRouting, crate::ConfigError> {
     let mut routing = crate::dns::DnsRequestRouting::default();
 
     for line in body.lines() {
@@ -267,8 +271,7 @@ fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
             let action = crate::dns::DnsRequestAction::parse(right);
-            let conditions = parse_dns_conditions(left, false);
-            // Skip rules whose conditions were all ignored (e.g. sub()/node()).
+            let conditions = parse_dns_conditions(left, false)?;
             if !conditions.is_empty() {
                 routing
                     .rules
@@ -277,11 +280,13 @@ fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
         }
     }
 
-    routing
+    Ok(routing)
 }
 
 /// Parse `routing.response { ... }` block.
-fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
+fn parse_dns_response_routing(
+    body: &str,
+) -> Result<crate::dns::DnsResponseRouting, crate::ConfigError> {
     let mut routing = crate::dns::DnsResponseRouting::default();
 
     for line in body.lines() {
@@ -308,8 +313,7 @@ fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
             let action = crate::dns::DnsResponseAction::parse(right);
-            let conditions = parse_dns_conditions(left, true);
-            // Skip rules whose conditions were all ignored (e.g. sub()/node()).
+            let conditions = parse_dns_conditions(left, true)?;
             if !conditions.is_empty() {
                 routing
                     .rules
@@ -318,112 +322,223 @@ fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
         }
     }
 
-    routing
+    Ok(routing)
+}
+
+/// Parse a known DNS predicate's arguments, rejecting malformed delimiters and
+/// empty arguments instead of allowing a negated empty predicate to match all.
+fn dns_fn_args(inner: &str, fn_name: &str) -> Result<Option<Vec<String>>, crate::ConfigError> {
+    let Some(rest) = inner.strip_prefix(fn_name) else {
+        return Ok(None);
+    };
+    if !rest.starts_with('(') {
+        return Ok(None);
+    }
+    let Some(raw) = rest
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Err(crate::ConfigError::Parse(format!(
+            "malformed DNS predicate '{inner}'"
+        )));
+    };
+    let args = split_filter_arguments(raw).ok_or_else(|| {
+        crate::ConfigError::Parse(format!("unclosed quote in DNS predicate '{fn_name}'"))
+    })?;
+    let args: Vec<String> = args
+        .into_iter()
+        .map(unquote_filter_argument)
+        .map(str::to_owned)
+        .collect();
+    if args.iter().any(String::is_empty) {
+        return Err(crate::ConfigError::Parse(format!(
+            "DNS predicate '{fn_name}' has an empty argument"
+        )));
+    }
+    Ok(Some(args))
 }
 
 /// Parse a chain of `&&`-separated conditions.
-fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCond> {
+fn parse_dns_conditions(
+    expr: &str,
+    is_response: bool,
+) -> Result<Vec<crate::dns::DnsCond>, crate::ConfigError> {
     let mut conds = Vec::new();
     let parts: Vec<&str> = expr.split("&&").map(|s| s.trim()).collect();
 
     for part in parts {
         let part = part.trim();
         if part.is_empty() {
-            continue;
+            return Err(crate::ConfigError::Parse(
+                "DNS routing rule contains an empty condition".into(),
+            ));
         }
         let (not, inner) = if let Some(rest) = part.strip_prefix('!') {
             (true, rest.trim())
         } else {
             (false, part)
         };
+        if inner.is_empty() {
+            return Err(crate::ConfigError::Parse(
+                "DNS routing rule contains an empty negated condition".into(),
+            ));
+        }
 
-        if let Some(args) = extract_fn_args(inner, "qname") {
-            let matchers = parse_dns_qname_args(&args);
+        if let Some(args) = dns_fn_args(inner, "qname")? {
+            let matchers = parse_dns_qname_args(&args)?;
             conds.push(crate::dns::DnsCond::Qname { not, matchers });
             continue;
         }
 
-        if let Some(args) = extract_fn_args(inner, "qtype") {
-            let types: Vec<u16> = args
-                .iter()
-                .filter_map(|a| crate::dns::parse_qtype_token(a))
-                .collect();
+        if let Some(args) = dns_fn_args(inner, "qtype")? {
+            let mut types = Vec::with_capacity(args.len());
+            for arg in args {
+                let value = crate::dns::parse_qtype_token(&arg).ok_or_else(|| {
+                    crate::ConfigError::Parse(format!("invalid DNS qtype '{arg}'"))
+                })?;
+                types.push(value);
+            }
             conds.push(crate::dns::DnsCond::Qtype { not, types });
             continue;
         }
 
-        if let Some(cidrs) = extract_fn_args(inner, "sip") {
+        if let Some(args) = dns_fn_args(inner, "sip")? {
+            let (cidrs, geoip) = parse_dns_ip_args(&args)?;
+            if !geoip.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS sip() supports IP addresses and CIDRs only".into(),
+                ));
+            }
             conds.push(crate::dns::DnsCond::Sip { not, cidrs });
             continue;
         }
 
         if is_response {
-            if let Some(args) = extract_fn_args(inner, "upstream") {
+            if let Some(args) = dns_fn_args(inner, "upstream")? {
                 conds.push(crate::dns::DnsCond::Upstream { not, names: args });
                 continue;
             }
-            if let Some(args) = extract_fn_args(inner, "ip") {
-                let (cidrs, geoip) = parse_dns_ip_args(&args);
+            if let Some(args) = dns_fn_args(inner, "ip")? {
+                let (cidrs, geoip) = parse_dns_ip_args(&args)?;
                 conds.push(crate::dns::DnsCond::Ip { not, cidrs, geoip });
                 continue;
             }
         }
 
-        // sub() / node() / subnode() — not supported for client DNS, warn
-        if inner.starts_with("sub(") || inner.starts_with("node(") || inner.starts_with("subnode(")
-        {
-            eprintln!(
-                "dns routing: ignoring unsupported function {} (out of scope for client DNS)",
-                inner
-            );
-            continue;
+        // An unsupported conjunct must skip the whole rule, not broaden it.
+        for fn_name in ["sub", "node", "subnode"] {
+            if dns_fn_args(inner, fn_name)?.is_some() {
+                eprintln!(
+                    "dns routing: skipping rule with unsupported function {}",
+                    inner
+                );
+                return Ok(Vec::new());
+            }
         }
 
-        // unknown condition function — silently ignored
+        return Err(crate::ConfigError::Parse(format!(
+            "unknown or unsupported DNS predicate '{inner}'"
+        )));
     }
 
-    conds
+    Ok(conds)
 }
 
 /// Parse qname(args) into a list of domain matchers.
-fn parse_dns_qname_args(args: &[String]) -> Vec<crate::dns::DnsDomainMatcher> {
+fn parse_dns_qname_args(
+    args: &[String],
+) -> Result<Vec<crate::dns::DnsDomainMatcher>, crate::ConfigError> {
     let mut matchers = Vec::new();
     for a in args {
         let a = a.trim();
         if a.is_empty() {
-            continue;
+            return Err(crate::ConfigError::Parse(
+                "DNS qname() requires at least one non-empty argument".into(),
+            ));
         }
         if let Some(v) = strip_tag_arg(a, "geosite:") {
-            matchers.push(crate::dns::DnsDomainMatcher::Geosite(
-                normalize_geosite_code(&v),
-            ));
+            let v = normalize_geosite_code(&v);
+            if v.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS qname(geosite:) requires a category".into(),
+                ));
+            }
+            matchers.push(crate::dns::DnsDomainMatcher::Geosite(v));
         } else if let Some(v) = strip_tag_arg(a, "keyword:") {
+            if v.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS qname(keyword:) requires a value".into(),
+                ));
+            }
             matchers.push(crate::dns::DnsDomainMatcher::Keyword(v));
         } else if let Some(v) = strip_tag_arg(a, "full:") {
+            if v.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS qname(full:) requires a domain".into(),
+                ));
+            }
             matchers.push(crate::dns::DnsDomainMatcher::Full(v));
         } else if let Some(v) = strip_tag_arg(a, "regex:") {
+            if v.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS qname(regex:) requires a pattern".into(),
+                ));
+            }
+            regex::Regex::new(&v).map_err(|error| {
+                crate::ConfigError::Parse(format!("invalid DNS qname regex '{v}': {error}"))
+            })?;
             matchers.push(crate::dns::DnsDomainMatcher::Regex(v));
         } else if let Some(v) = strip_tag_arg(a, "suffix:") {
+            if v.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS qname(suffix:) requires a domain".into(),
+                ));
+            }
             matchers.push(crate::dns::DnsDomainMatcher::Suffix(v));
         } else {
             // Bare argument → suffix (dae compatible)
             matchers.push(crate::dns::DnsDomainMatcher::Suffix(a.to_string()));
         }
     }
-    matchers
+    if matchers.is_empty() {
+        return Err(crate::ConfigError::Parse(
+            "DNS qname() requires at least one matcher".into(),
+        ));
+    }
+    Ok(matchers)
 }
 
 /// Parse ip(...) args into (cidrs, geoip_codes).
-fn parse_dns_ip_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+fn parse_dns_ip_args(args: &[String]) -> Result<(Vec<String>, Vec<String>), crate::ConfigError> {
     let mut cidrs = Vec::new();
     let mut geoip = Vec::new();
     for a in args {
         let a = a.trim();
         if let Some(v) = strip_tag_arg(a, "geoip:") {
+            if v.is_empty() {
+                return Err(crate::ConfigError::Parse(
+                    "DNS ip(geoip:) requires a category".into(),
+                ));
+            }
             geoip.push(v.to_lowercase());
         } else {
+            let valid = if a.contains('/') {
+                a.parse::<ipnet::IpNet>().is_ok()
+            } else {
+                a.parse::<std::net::IpAddr>().is_ok()
+            };
+            if !valid {
+                return Err(crate::ConfigError::Parse(format!(
+                    "invalid DNS IP or CIDR '{a}'"
+                )));
+            }
             cidrs.push(a.to_string());
         }
     }
-    (cidrs, geoip)
+    if cidrs.is_empty() && geoip.is_empty() {
+        return Err(crate::ConfigError::Parse(
+            "DNS ip() requires at least one IP, CIDR, or geoip category".into(),
+        ));
+    }
+    Ok((cidrs, geoip))
 }

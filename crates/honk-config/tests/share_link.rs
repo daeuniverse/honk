@@ -162,17 +162,12 @@ fn test_ss_base64_userinfo() {
 }
 
 #[test]
-fn test_ss_base64_userinfo_with_padding_and_plugin_suffix() {
-    // Same but padded base64 and the `/?plugin=...` suffix form.
-    let node = Node::from_share_link(
+fn test_ss_rejects_static_plugin_suffix() {
+    let error = Node::from_share_link(
         "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388/?plugin=v2ray-plugin%3Btls#ss-pad",
     )
-    .unwrap();
-    let ss = node.shadowsocks().unwrap();
-    assert_eq!(ss.encryption.as_deref(), Some("aes-256-gcm"));
-    assert_eq!(ss.password.as_deref(), Some("pass"));
-    assert_eq!(ss.plugin.as_deref(), Some("v2ray-plugin"));
-    assert_eq!(ss.plugin_opts.as_deref(), Some("tls"));
+    .unwrap_err();
+    assert!(error.to_string().contains("static Shadowsocks plugins"));
 }
 
 #[test]
@@ -206,19 +201,12 @@ fn test_ss_plain_userinfo_base64_method() {
 }
 
 #[test]
-fn test_ss_with_plugin() {
-    let node = Node::from_share_link(
+fn test_ss_rejects_static_plugin_options() {
+    let error = Node::from_share_link(
         "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com#ss-plugin",
     )
-    .unwrap();
-    assert_eq!(node.protocol(), NodeProtocol::SS);
-    let ss = node.shadowsocks().unwrap();
-    assert_eq!(ss.encryption.as_deref(), Some("aes-256-gcm"));
-    assert_eq!(ss.plugin.as_deref(), Some("obfs-local"));
-    assert_eq!(
-        ss.plugin_opts.as_deref(),
-        Some("obfs=http;obfs-host=example.com")
-    );
+    .unwrap_err();
+    assert!(error.to_string().contains("static Shadowsocks plugins"));
 }
 
 #[test]
@@ -391,24 +379,18 @@ fn sample_config() -> Config {
     config.experimental.cache_file.cache_id = "router1".to_string();
     config.experimental.cache_file.store_fakeip = true;
 
-    config.nodes.push(
-        Node::from_share_link(
-            "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp#ss-node",
-        )
-        .unwrap(),
-    );
+    config
+        .nodes
+        .push(Node::from_share_link("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#ss-node").unwrap());
     config.nodes.push(
         Node::from_share_link(
             "trojan://pw@example.com:443?type=ws&path=%2Fws&host=cdn.example.com&sni=sni.example.com#trojan-node",
         )
         .unwrap(),
     );
-    config.nodes.push(
-        Node::from_share_link(
-            "anytls://uuid-pw@any.example.com:443?insecure=1&idle_session_timeout=1m&min_idle_session=4#anytls-node",
-        )
-        .unwrap(),
-    );
+    config.nodes.push(Node::from_share_link(
+        "anytls://uuid-pw@any.example.com:443?insecure=1&idle_session_timeout=1m&min_idle_session=4#anytls-node",
+    ).unwrap());
     config
 }
 

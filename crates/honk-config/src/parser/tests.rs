@@ -1163,6 +1163,19 @@ dns {
 }
 
 #[test]
+fn test_parse_dns_rejects_malformed_predicates() {
+    for predicate in ["!qtype()", "qtype(not-a-type)", "qname()", "unknown(foo)"] {
+        let input =
+            format!("dns {{\n routing {{\n  request {{\n   {predicate} -> reject\n  }}\n }}\n}}");
+        let error = parse_dae_config(&input).unwrap_err();
+        assert!(
+            error.to_string().contains("DNS") || error.to_string().contains("dns"),
+            "malformed predicate {predicate:?} must identify DNS parsing: {error}"
+        );
+    }
+}
+
+#[test]
 fn test_parse_dns_request_routing_qname_and_qtype() {
     let input = r#"
 dns {
