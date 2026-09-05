@@ -48,6 +48,9 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
 pub struct RealEbpfBackend {
     bpf: Option<Ebpf>,
     pin_root: PathBuf,
+    /// Map names this instance claimed at attach, so cleanup unlinks what it owns instead of
+    /// everything under a pin root that is shared with every other BPF consumer.
+    pinned_maps: Vec<String>,
     tproxy_port: u16,
     tproxy_mark: u32,
     /// Every TC link attached to a configured interface, including the four
@@ -501,24 +504,15 @@ impl RealEbpfBackend {
         })
     }
 
+    /// The pin root defaults to `/sys/fs/bpf`, which every other BPF consumer on the host also
+    /// pins into, so cleanup unlinks the names this instance claimed rather than sweeping the
+    /// directory. `UDP_DECISION_SEQUENCE` is never in that list — attach pins it through
+    /// `map_pin_path` and skips the loop — so the persistent allocator survives by construction.
+    /// A name the current object no longer contains is no longer swept; the sweep used to remove
+    /// it, and nothing else does now.
     fn remove_nonpersistent_pins(&self) -> std::io::Result<()> {
-        let entries = match std::fs::read_dir(&self.pin_root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_name() == std::ffi::OsStr::new(UDP_DECISION_SEQUENCE_MAP) {
-                continue;
-            }
-            let path = entry.path();
-            let result = if entry.file_type()?.is_dir() {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            };
-            if let Err(error) = result
+        for name in &self.pinned_maps {
+            if let Err(error) = std::fs::remove_file(self.pin_root.join(name))
                 && error.kind() != std::io::ErrorKind::NotFound
             {
                 return Err(error);

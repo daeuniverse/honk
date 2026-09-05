@@ -123,6 +123,7 @@ impl RealEbpfBackend {
         }
         let mut bpf = loader.load(obj)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
+        let mut pinned_maps = Vec::new();
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
             // These cannot be pinned to bpffs; skip them to avoid noisy warnings.
@@ -134,6 +135,9 @@ impl RealEbpfBackend {
                 continue;
             }
             let pin_path = pin_root.join(name);
+            // Recorded before the attempt, not after it: a stale pin whose unlink and re-pin both
+            // fail still belongs to us, and cleanup is the next chance to remove it.
+            pinned_maps.push(name.to_owned());
             if let Err(error) = std::fs::remove_file(&pin_path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -581,6 +585,7 @@ impl RealEbpfBackend {
         Ok(Self {
             bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
+            pinned_maps,
             tproxy_port,
             tproxy_mark,
             interface_links,
