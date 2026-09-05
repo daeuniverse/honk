@@ -1,6 +1,7 @@
 use super::{
     Section, extract_fn_args, extract_nested_all, has_routing_fallback, normalize_geosite_code,
-    parse_bool, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections, strip_tag_arg,
+    parse_bool, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections,
+    strip_tag_arg,
 };
 use crate::dns::DnsConfig;
 

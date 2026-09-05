@@ -1937,10 +1937,7 @@ fn source_routed_dns_resolver(
         .with_cache_enabled(false)
         .with_policy_from_config(&config)?,
     );
-    Ok((
-        DnsResolver::with_forwarder(&config, forwarder)?,
-        queries,
-    ))
+    Ok((DnsResolver::with_forwarder(&config, forwarder)?, queries))
 }
 
 fn tls_client_hello(sni: &str) -> Vec<u8> {
@@ -2147,9 +2144,7 @@ async fn tcp_proxy_protocols_pass_domain_without_local_resolution() -> anyhow::R
             mode: UdpTestMode::TcpCaptureTarget(Arc::clone(&dial_target)),
         });
         let mut registry = ProxyRegistry::new();
-        registry.register(honk_outbound::proxy::ProtocolEntry::new(
-            protocol, handler,
-        ));
+        registry.register(honk_outbound::proxy::ProtocolEntry::new(protocol, handler));
         let (dns_resolver, dns_queries) = source_routed_dns_resolver(
             "127.0.0.42/32",
             "127.0.0.2".parse()?,

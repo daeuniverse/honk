@@ -160,8 +160,7 @@ mod tests {
 
             assert_eq!(budget.udp_endpoints, expected_endpoint_ceiling);
             assert!(
-                non_udp_descriptors + full_cone_endpoint_descriptors
-                    <= budget.effective_nofile
+                non_udp_descriptors + full_cone_endpoint_descriptors <= budget.effective_nofile
             );
         }
     }

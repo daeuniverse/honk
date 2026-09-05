@@ -1709,4 +1709,3 @@ mod merge_check_addrs_tests {
         assert_eq!(merged.len(), 2);
     }
 }
-

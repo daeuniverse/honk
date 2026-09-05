@@ -281,13 +281,7 @@ impl ControlPlaneHandle {
         let generation_group_manager = self.group_manager.read().clone();
         let runtime_generation = self.runtime_registry.read().clone();
         drop(generation_config_guard);
-        let (
-            mut candidates,
-            selection_mode,
-            score_feedback,
-            mut selection_chains,
-            health_ipver,
-        ) = {
+        let (mut candidates, selection_mode, score_feedback, mut selection_chains, health_ipver) = {
             let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
             let plan = crate::control::reload::resolve_outbound_plan_for_target(
                 &generation_config,
@@ -363,11 +357,8 @@ impl ControlPlaneHandle {
                 if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
                     {
                         let group_manager = Arc::clone(&generation_group_manager);
-                        let context = tcp_score_context(
-                            original_dst,
-                            target_domain.as_deref(),
-                            health_ipver,
-                        );
+                        let context =
+                            tcp_score_context(original_dst, target_domain.as_deref(), health_ipver);
                         let mut plan =
                             crate::control::reload::resolve_urltest_retry_plan_for_target(
                                 &group_manager,
@@ -691,16 +682,10 @@ impl ControlPlaneHandle {
                             client_addr, original_dst, io_err
                         );
                     } else {
-                        warn!(
-                            "Relay error for {} -> {}: {}",
-                            client_addr, original_dst, e
-                        );
+                        warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                     }
                 } else {
-                    warn!(
-                        "Relay error for {} -> {}: {}",
-                        client_addr, original_dst, e
-                    );
+                    warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                 }
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
