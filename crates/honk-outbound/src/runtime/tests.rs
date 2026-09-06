@@ -338,12 +338,18 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
         .expect("released DNS capacity must admit the successor");
     drop(successor_permit);
 
+    let dns_runtime = dns.get(&node.id).unwrap();
+    let connector = dns_runtime.anytls_tls_connector().unwrap();
+    let connector_lifetime = Arc::downgrade(&connector);
+    drop(connector);
     main.shutdown().await;
     assert!(!dns.is_shutdown());
-    let dns_pool = dns.get(&node.id).unwrap().anytls_pool().unwrap();
+    assert!(connector_lifetime.upgrade().is_some());
+    let dns_pool = dns_runtime.anytls_pool().unwrap();
     assert!(!dns_pool.is_retired());
     dns.shutdown().await;
     assert!(dns_pool.is_retired());
+    assert!(connector_lifetime.upgrade().is_none());
 }
 
 #[tokio::test]

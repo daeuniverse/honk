@@ -20,12 +20,19 @@ mod resources {
     #[async_trait]
     pub(crate) trait RuntimeTransport: Send + Sync {
         async fn close(&self);
+        fn reap_tls_connectors(&self, _now: std::time::Instant) -> usize {
+            0
+        }
     }
 
     #[async_trait]
     impl RuntimeTransport for UpstreamPool {
         async fn close(&self) {
             UpstreamPool::close(self).await;
+        }
+
+        fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
+            UpstreamPool::reap_tls_connectors(self, now)
         }
     }
 }
@@ -123,17 +130,12 @@ impl DnsRuntime {
         self.leases.load(Ordering::Acquire)
     }
 
-    pub(crate) fn try_acquire_query(
-        &self,
-        udp: bool,
-    ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), TryAcquireError> {
-        let udp_permit = if udp {
-            Some(Arc::clone(&self.udp_query_limit).try_acquire_owned()?)
-        } else {
-            None
-        };
-        let query_permit = Arc::clone(&self.query_limit).try_acquire_owned()?;
-        Ok((query_permit, udp_permit))
+    pub(crate) fn try_acquire_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.query_limit).try_acquire_owned()
+    }
+
+    pub(crate) fn try_acquire_udp_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.udp_query_limit).try_acquire_owned()
     }
 
     pub(crate) fn forwarder(&self) -> &Arc<DnsForwarder> {
@@ -142,6 +144,10 @@ impl DnsRuntime {
 
     pub(crate) fn routing_projection(&self) -> &Arc<RoutingProjectionSnapshot> {
         &self.parts.routing_projection
+    }
+
+    pub(crate) fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
+        self.parts.transport.reap_tls_connectors(now)
     }
 
     pub(crate) fn cache(&self) -> Arc<tokio::sync::Mutex<super::cache::DnsCache>> {
@@ -276,6 +282,17 @@ impl RuntimeLease {
             biased;
             error = self.cancelled() => Err(error),
             result = operation => Ok(result),
+        }
+    }
+
+    pub(crate) async fn run_reply<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, RuntimeCancelled> {
+        tokio::select! {
+            biased;
+            result = operation => Ok(result),
+            error = self.cancelled() => Err(error),
         }
     }
 }

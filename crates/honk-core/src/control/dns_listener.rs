@@ -387,9 +387,15 @@ async fn run_udp_supervisor(
                         stats.record_udp_slow_permit_accepted();
                         admission
                     }
-                    Err(_) => {
-                        stats.record_udp_slow_permit_rejected();
-                        send_udp_refused(socket.as_ref(), query, response_source, client_addr).await;
+                    Err(error) => {
+                        if error.udp_reply.is_some() {
+                            stats.record_udp_slow_permit_accepted();
+                        } else {
+                            stats.record_udp_slow_permit_rejected();
+                        }
+                        let _ = error
+                            .run_reply(send_udp_refused(socket.as_ref(), query, response_source, client_addr))
+                            .await;
                         continue;
                     }
                 };
@@ -839,13 +845,13 @@ mod tests {
 
         stop_listener(&mut listener, &drain).await;
 
-        let (saturated_controller, _) =
+        let (saturated_controller, saturated_calls) =
             controller_with_config([192, 0, 2, 10], &honk_config::dns::DnsConfig::default(), 0);
         let (mut saturated, saturated_address, saturated_drain) =
             start_listener("udp://127.0.0.1:0", saturated_controller);
         let refused = udp_exchange(saturated_address, &query("busy.example", 0x3030)).await;
         assert_eq!(refused[3] & 0x0f, 5);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(saturated_calls.load(Ordering::SeqCst), 0);
         stop_listener(&mut saturated, &saturated_drain).await;
     }
     #[tokio::test]

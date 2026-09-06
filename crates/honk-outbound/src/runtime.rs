@@ -581,7 +581,10 @@ impl NodeRuntime {
     /// (connection + endpoint driver). Terminal for the runtime; idempotent.
     pub async fn close(&self) {
         match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.pool.shutdown(),
+            ProtocolRuntime::AnyTls(runtime) => {
+                runtime.pool.shutdown();
+                runtime.tls.evict();
+            }
             ProtocolRuntime::VlessMux(runtime) => runtime.shutdown(),
             ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
             ProtocolRuntime::None => {}

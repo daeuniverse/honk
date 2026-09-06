@@ -208,6 +208,8 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、路由与组快照、transport manager、路由投影、捕获的 bootstrap resolver，以及代内 query/UDP 准入。新构建的 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于同一代。DNS 代理 transport 使用全新的 outbound runtime registry，不复用普通流量或旧 DNS 代的 session。该 DNS registry 与来源配置代共享 dial semaphore，并保留进程级 physical-dial 上限，但不共享退役标志或协议连接池。
 
+现有 TLS 维护任务也会回收当前 DNS registry 的空闲 connector。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
+
 发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程 join 后台 worker、关闭 DNS transport 及其私有代理 session，再退役捕获的普通流量 registry 中未转移的可复用状态。30 秒排空期限只是安全兜底，并非新代服务的前置条件；到期会取消所有基于 runtime 的 `DnsService` 查询路径。最多保留四个已退役 runtime；超过上限与 provider 关闭会触发相同的强制取消。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。

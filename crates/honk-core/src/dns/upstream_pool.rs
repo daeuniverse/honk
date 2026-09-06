@@ -361,6 +361,12 @@ impl UpstreamPool {
             .map_err(|_| anyhow::anyhow!("DNS upstream runtime generation is already set"))
     }
 
+    pub(crate) fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
+        self.runtime_generation
+            .get()
+            .map_or(0, |generation| generation.reap_tls_connectors(now))
+    }
+
     pub fn with_runtime_generation(
         self,
         generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,

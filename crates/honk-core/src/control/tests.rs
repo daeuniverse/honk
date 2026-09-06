@@ -3780,6 +3780,45 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
     })
     .await
     .expect("DNS task must release its ConnectionGuard after completion");
+
+    let _held_queries: Vec<_> = (0..2048)
+        .map(|_| state.dns_controller.try_admit_query(false).unwrap())
+        .collect();
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let original_dst = addr("127.0.0.1:53");
+    let can_reply = super::sockets::new_udp_reply_socket(original_dst).is_ok();
+    for _ in 0..256 {
+        super::dispatch_udp_slow_path(&state, client_addr, original_dst, &query, validated);
+    }
+    assert_eq!(drain.active_count(), 256, "refusals retain UDP admission");
+    super::dispatch_udp_slow_path(&state, client_addr, original_dst, &query, validated);
+    assert_eq!(
+        drain.active_count(),
+        256,
+        "UDP saturation cannot spawn a refusal"
+    );
+
+    if can_reply {
+        let mut response = [0u8; 512];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response))
+                .await
+                .expect("query saturation must return REFUSED, not silently drop")
+                .unwrap();
+        assert_eq!(&response[..2], &query[..2]);
+        assert!(len >= 12);
+        assert_eq!(response[3] & 0x0f, 5);
+    } else {
+        eprintln!("skipping wire reply: transparent UDP socket needs privileges");
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while drain.active_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refusals release their UDP admission and drain guards");
 }
 
 /// Production-branch DNS path with an existing Ready endpoint: the shared
@@ -3943,7 +3982,7 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         super::UdpSlowPathWork::Initialize(_) => {
             panic!("Initializing follower must enqueue, not create a second lease")
         }
-        super::UdpSlowPathWork::Dns { .. } => {
+        super::UdpSlowPathWork::Dns { .. } | super::UdpSlowPathWork::DnsRefused { .. } => {
             panic!("non-DNS follower must not take the DNS branch")
         }
     }

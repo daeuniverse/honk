@@ -85,6 +85,51 @@ async fn dns_proxy_query_survives_traffic_registry_retirement() {
 }
 
 #[tokio::test]
+async fn dns_private_tls_connectors_follow_runtime_maintenance() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut node = test_node("dns-anytls");
+    node.address = address.ip().to_string();
+    node.port = address.port();
+    node.outbound =
+        honk_config::node::OutboundConfig::from_protocol(honk_config::types::NodeProtocol::AnyTLS);
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    let traffic = Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap(),
+    );
+    let upstream = DnsUpstream {
+        outbound: Some(node.name.clone()),
+        ..make_upstream("proxy", "1.1.1.1:53", DnsProtocol::Tcp)
+    };
+    let pool = UpstreamPool::new_with_proxy(
+        &[upstream],
+        make_router(),
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+        )),
+        vec![node],
+        vec![],
+    )
+    .unwrap()
+    .with_runtime_generation(Arc::clone(&traffic));
+    let transport: &dyn crate::dns::runtime::RuntimeTransport = &pool;
+
+    assert!(pool.query("proxy", &mock_dns_query(123)).await.is_err());
+    let expired = std::time::Instant::now() + honk_outbound::runtime::TLS_IDLE_RETENTION;
+    assert_eq!(traffic.reap_tls_connectors(expired), 0);
+    assert_eq!(transport.reap_tls_connectors(expired), 1);
+
+    pool.close().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn resolve_dial_leaf_forced_arrow_bypasses_traffic_router() {
     let forced = test_node("forced-node");
     let routed = test_node("routed-node");

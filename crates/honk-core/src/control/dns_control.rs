@@ -51,16 +51,35 @@ pub(crate) struct AdmittedDnsQuery {
     _udp_permit: Option<OwnedSemaphorePermit>,
 }
 
+pub(crate) struct DnsAdmissionError {
+    error: TryAcquireError,
+    pub(super) udp_reply: Option<(crate::dns::runtime::RuntimeLease, OwnedSemaphorePermit)>,
+}
+
+impl std::fmt::Debug for DnsAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.error, f)
+    }
+}
+
+impl DnsAdmissionError {
+    pub(crate) async fn run_reply<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, crate::dns::runtime::RuntimeCancelled> {
+        match &self.udp_reply {
+            Some((runtime, _)) => runtime.run_reply(operation).await,
+            None => Ok(operation.await),
+        }
+    }
+}
+
 impl AdmittedDnsQuery {
     pub(crate) async fn run_reply<T>(
         &self,
         operation: impl Future<Output = T>,
     ) -> Result<T, crate::dns::runtime::RuntimeCancelled> {
-        tokio::select! {
-            biased;
-            result = operation => Ok(result),
-            cancelled = self.runtime.cancelled() => Err(cancelled),
-        }
+        self.runtime.run_reply(operation).await
     }
 }
 
@@ -192,9 +211,28 @@ impl DnsController {
 
     /// Acquire a generation-pinned query admission. The runtime lease and
     /// permits remain owned by the caller through response I/O.
-    pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, TryAcquireError> {
+    pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
         let runtime = self.runtime_provider().acquire();
-        let (query_permit, udp_permit) = runtime.runtime().try_acquire_query(udp)?;
+        let udp_permit =
+            if udp {
+                Some(runtime.runtime().try_acquire_udp_query().map_err(|error| {
+                    DnsAdmissionError {
+                        error,
+                        udp_reply: None,
+                    }
+                })?)
+            } else {
+                None
+            };
+        let query_permit = match runtime.runtime().try_acquire_query() {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Err(DnsAdmissionError {
+                    error,
+                    udp_reply: udp_permit.map(|permit| (runtime, permit)),
+                });
+            }
+        };
         Ok(AdmittedDnsQuery {
             runtime,
             _query_permit: query_permit,

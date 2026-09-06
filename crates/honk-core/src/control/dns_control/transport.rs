@@ -28,15 +28,16 @@ impl DnsController {
         };
         let admission = match self.try_admit_query(true) {
             Ok(admission) => admission,
-            Err(_) => {
+            Err(error) => {
                 debug!("DNS runtime admission reached; sending REFUSED");
                 let response = build_dns_refused(data);
-                let _ = super::super::send_udp_reply_from_orig_dst(
-                    &response,
-                    client_addr,
-                    original_dst,
-                )
-                .await;
+                let _ = error
+                    .run_reply(super::super::send_udp_reply_from_orig_dst(
+                        &response,
+                        client_addr,
+                        original_dst,
+                    ))
+                    .await;
                 return Ok(true);
             }
         };

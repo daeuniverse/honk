@@ -733,13 +733,16 @@ impl ControlPlane {
 
         {
             let runtime_registry = self.runtime_registry.clone();
+            let dns_runtime = self.dns_controller.runtime_provider();
             let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
                 interval.tick().await;
                 loop {
                     interval.tick().await;
                     let generation = runtime_registry.read().clone();
-                    let evicted = generation.reap_tls_connectors(std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    let evicted = generation.reap_tls_connectors(now)
+                        + dns_runtime.acquire().runtime().reap_tls_connectors(now);
                     if evicted > 0 {
                         debug!(evicted, "released idle outbound TLS connectors");
                     }
@@ -1025,6 +1028,11 @@ pub(super) enum UdpSlowPathWork {
         data: Bytes,
         validated: ValidatedDnsQuery,
     },
+    DnsRefused {
+        runtime: crate::dns::runtime::RuntimeLease,
+        udp_permit: tokio::sync::OwnedSemaphorePermit,
+        response: Vec<u8>,
+    },
     /// Fully handled in the receive loop (enqueued / rejected / dropped).
     Done,
 }
@@ -1079,7 +1087,15 @@ pub(super) fn begin_udp_slow_path_at(
                 stats.record_udp_slow_permit_accepted();
                 admission
             }
-            Err(_) => {
+            Err(error) => {
+                if let Some((runtime, udp_permit)) = error.udp_reply {
+                    stats.record_udp_slow_permit_accepted();
+                    return UdpSlowPathWork::DnsRefused {
+                        runtime,
+                        udp_permit,
+                        response: crate::dns::response::build_dns_refused(data),
+                    };
+                }
                 stats.record_udp_slow_permit_rejected();
                 return UdpSlowPathWork::Done;
             }
@@ -1250,6 +1266,24 @@ fn dispatch_udp_slow_path_at(
                     .await;
             });
         }
+        UdpSlowPathWork::DnsRefused {
+            runtime,
+            udp_permit,
+            response,
+        } => {
+            let guard = ConnectionGuard::new(Arc::clone(&state.drain));
+            state.udp_pool.spawn_slow_path(async move {
+                let _guard = guard;
+                let _permit = udp_permit;
+                let _ = runtime
+                    .run_reply(super::send_udp_reply_from_orig_dst(
+                        &response,
+                        src_addr,
+                        original_dst,
+                    ))
+                    .await;
+            });
+        }
     }
 }
 
@@ -1274,7 +1308,9 @@ pub(super) fn reserve_udp_slow_path(
         data,
     ) {
         UdpSlowPathWork::Initialize(lease) => Some(lease),
-        UdpSlowPathWork::Dns { .. } | UdpSlowPathWork::Done => None,
+        UdpSlowPathWork::Dns { .. }
+        | UdpSlowPathWork::DnsRefused { .. }
+        | UdpSlowPathWork::Done => None,
     }
 }
 
