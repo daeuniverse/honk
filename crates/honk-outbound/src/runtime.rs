@@ -221,11 +221,13 @@ struct TlsConnectorSlot {
 struct TlsConnectorSlotState {
     cached: Option<(Arc<crate::tls::TlsConnector>, Instant)>,
     revision: u64,
+    closed: bool,
 }
 
 impl TlsConnectorSlot {
     fn get_or_build(&self, node: &Node) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let mut state = self.state.lock();
+        anyhow::ensure!(!state.closed, "TLS runtime is closed");
         state.revision = state.revision.wrapping_add(1);
         if let Some((connector, used_at)) = state.cached.as_mut() {
             *used_at = Instant::now();
@@ -264,6 +266,13 @@ impl TlsConnectorSlot {
         if state.cached.take().is_some() {
             state.revision = state.revision.wrapping_add(1);
         }
+    }
+
+    // Pool shutdown signals detached factories; it does not join them.
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.cached = None;
     }
 
     #[cfg(test)]
@@ -583,7 +592,7 @@ impl NodeRuntime {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => {
                 runtime.pool.shutdown();
-                runtime.tls.evict();
+                runtime.tls.close();
             }
             ProtocolRuntime::VlessMux(runtime) => runtime.shutdown(),
             ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
@@ -1050,7 +1059,7 @@ impl OutboundRuntimeRegistry {
             match &runtime.runtime {
                 ProtocolRuntime::AnyTls(anytls) => {
                     anytls.pool.retire();
-                    anytls.tls.evict();
+                    anytls.tls.close();
                 }
                 ProtocolRuntime::VlessMux(vless) => vless.retire(),
                 ProtocolRuntime::Quic(quic) => quic.release_warm().await,

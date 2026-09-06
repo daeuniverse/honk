@@ -108,6 +108,7 @@ async fn retirement_releases_cached_non_flow_state() {
 
     assert!(anytls_state.pool.is_retired());
     assert!(!anytls_runtime.tls_connector_loaded());
+    assert!(anytls_runtime.anytls_tls_connector().is_err());
     assert!(client.warm_released.load(Ordering::Acquire));
     assert_eq!(quic.client_count(), Some(0));
     assert!(!client.force_closed.load(Ordering::Acquire));
@@ -350,6 +351,10 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
     dns.shutdown().await;
     assert!(dns_pool.is_retired());
     assert!(connector_lifetime.upgrade().is_none());
+    assert!(
+        dns_runtime.anytls_tls_connector().is_err(),
+        "a delayed dial cannot rebuild TLS state after terminal shutdown"
+    );
 }
 
 #[tokio::test]
