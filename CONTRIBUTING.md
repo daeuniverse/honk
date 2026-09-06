@@ -10,16 +10,17 @@ This policy exists so that contributors know the rules before they write code, a
 
 > LLMs may **fill**; humans must **own the invariants**.
 
-It is fine to use LLMs to answer questions, analyze, distill, refine, check, suggest, review, and to generate code in the areas listed in §3. It is not acceptable for an LLM to originate changes in the soundness-critical areas listed in §2 unless the human author is already a domain expert who fully understands and stands behind every line.
+It is fine to use LLMs to answer questions, analyze, distill, refine, check, suggest, review, and to generate code in the areas listed in §3. LLM-originated changes in the soundness-critical areas listed in §2 are prohibited by default; the domain-expert exception in §11 is the only exception.
 
 The project cares more about authors **understanding** what the code does, **planning** how it will change, and **deciding** what it should look like, than about the code itself. A polished PR is not evidence of any of these.
 
-## 2. Soundness-critical areas (human-authored only)
+## 2. Soundness-critical areas (human-originated by default)
 
-The following carry honk's core invariants — generation ownership, lock ordering, eBPF two-phase commit semantics, failure-direction guarantees. Changes here must be originated by a human who can defend the design line by line. LLMs may analyze, review, and suggest, but must not create the change:
+The following carry honk's core invariants — generation ownership, lock ordering, eBPF two-phase commit semantics, failure-direction guarantees. Changes here must be originated by a human who can defend the design line by line, unless the domain-expert exception in §11 applies. Outside that exception, LLMs may analyze, review, and suggest, but must not create the change:
 
+- `crates/honk-ebpf/` (kernel programs, datapath state transitions, token semantics)
 - `crates/honk-core/src/ebpf/` (real backend, map lifecycle, routing push plans)
-- `crates/honk-ebpf-common/` (ABI， aya Pods)
+- `crates/honk-ebpf-common/` (shared kernel/userspace ABI, aya `Pod` implementations)
 - `crates/honk-core/src/control/reload/` (transaction, fingerprints, retention decisions)
 - `crates/honk-core/src/control/routing_matcher.rs` and the eBPF publication pipeline
 - Lock acquisition order across `config`, `router`, `ebpf`, `group_manager`, `outbound_id_map`, `active_routing_plan`, `runtime_registry`, `reload_lock`
@@ -49,7 +50,7 @@ LLM-generated code is welcome in:
 ## 4. Review rules
 
 1. **Human review is the merge gate.** LLM reviews (including external adversarial reviews) are advisory layers; at least one maintainer must approve with human judgment.
-2. **No mechanical relay.** Do not respond to review comments by pasting them into an LLM and pasting the answer back. If we wanted an LLM's opinion we would ask it ourselves. We want *your* reasoning.
+2. **No mechanical relay.** Do not respond to review comments by pasting them into an LLM and pasting the answer back. If we wanted an LLM's opinion we would ask it ourselves. We want _your_ reasoning.
 3. **Fast review owns the shallow, slow review owns the deep.** Maintainers' quick review of LLM filler code is expected to catch contract violations visible in the diff. Defect classes structurally invisible to fast review — negative-space omissions, cross-file invariant conflicts, concurrency/timing — are the explicit responsibility of the deep-review layer (see §6) and must not be assumed covered.
 4. **Tests must attack, not mirror.** Reviewers of LLM-written tests should sample whether assertions are independently derived semantic claims (e.g. "old-generation entries survive one transition") or restatements of the implementation. Mirror tests are rejected regardless of coverage numbers.
 5. **Reviewers may close non-compliant PRs** with a pointer to this document, no questions asked.
@@ -85,15 +86,15 @@ An unbroken streak of "no findings" from any single reviewer — human or LLM �
 
 ## 8. What LLMs are not for here
 
-- Originating changes in §2 areas
+- Originating changes in §2 areas unless the domain-expert exception in §11 applies
 - Substituting for the author's mental model of merged code
 - Producing PR descriptions, issue text, or review replies posted without disclosure
-- Lowering any existing bar: clippy clean, full test pass, and `AGENTS.md` synchronization are required of LLM-assisted PRs exactly as of human ones — LLM PRs are held to a *higher* bar (unconditional tests, disclosure), never a lower one
+- Lowering any existing bar: clippy clean, passing the applicable CI and documented validation gates, and `AGENTS.md` synchronization are required of LLM-assisted PRs exactly as of human ones. Use the gates in [CI](.github/workflows/ci.yml), the [Justfile](Justfile), and `AGENTS.md`, including only their explicitly documented temporary test exclusions. Disclosure and human review remain mandatory; LLM assistance is never a reason to skip required validation.
 
 ## 9. Enforcement and scope notes
 
 - Maintainers are not responsible for detecting LLM authorship; that responsibility lies with the author. Style is not evidence; do not accuse contributors of LLM use. Suspected undisclosed use is reported privately to maintainers.
-- Harassment over LLM use — allowed or not — is a Code of Conduct violation.
+- Harassment over LLM use — allowed or not — is prohibited under this policy. Report it privately to maintainers.
 - Some provisions are unenforceable. That is accepted: the goal is a bright line judged on actions (disclosure given or not), with intent considered only when deciding how to respond.
 - This policy is easier to change than it was to adopt. Propose amendments by PR against this file.
 
@@ -101,4 +102,10 @@ An unbroken streak of "no findings" from any single reviewer — human or LLM �
 
 Merged code becomes the maintainer's burden. If you cannot explain, unprompted, what your PR does and why it is correct — including the parts an LLM wrote — the PR is not ready, regardless of how polished it is. We are building a community of deep experts in this codebase, not just artifacts that mechanically do the right thing.
 
-*No programmer tapes.*
+## 11. Domain-expert exception
+
+A human author who is already a domain expert in the affected area may use an LLM to originate a §2 change, provided that the author fully understands and stands behind every line before submitting it. This is the same exception referenced in §§1, 2, and 8, not a separate permission granted by each section.
+
+The exception concerns only who originates the code. All conditions in §3, disclosure under §5, human maintainer approval under §4, and adversarial deep review under §6 still apply. The author retains responsibility for the design and its invariants; passing tests, LLM review, or relying on a maintainer to supply the missing understanding does not satisfy the exception.
+
+_No programmer tapes._
