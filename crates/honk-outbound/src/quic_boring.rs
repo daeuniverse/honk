@@ -1172,10 +1172,21 @@ mod tests {
         send.finish()?;
         let echoed = recv.read_to_end(16).await?;
         anyhow::ensure!(echoed.as_slice() == b"ping", "unexpected echo response");
-        // Tickets are sent after the handshake; allow the callback to cache it.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         conn.close(0u32.into(), b"done");
         Ok(resumed)
+    }
+
+    async fn wait_for_same_policy_resumption(
+        config: quinn::ClientConfig,
+        addr: std::net::SocketAddr,
+        server_name: &str,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !connect_for_ticket(config.clone(), addr, server_name).await? {}
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("same-policy connection never resumed before deadline"))?
     }
 
     /// ChaCha20-Poly1305 interop: the server is restricted to TLS 1.3
@@ -1248,21 +1259,9 @@ mod tests {
             "first connection must be a full handshake"
         );
 
-        // Resumption is opportunistic; retry once if the first offered ticket
-        // is not accepted by the peer.
-        let mut resumed = false;
-        for _ in 0..2 {
-            if let Ok(reused) = connect_for_ticket(config.clone(), addr, "localhost").await {
-                resumed |= reused;
-                if resumed {
-                    break;
-                }
-            }
-        }
-        assert!(
-            resumed,
-            "same-identity connection must resume at least once"
-        );
+        wait_for_same_policy_resumption(config, addr, "localhost")
+            .await
+            .expect("same-identity connection must resume before test completes");
     }
 
     /// Endpoint, SNI, and ALPN are all part of the ticket identity. The
@@ -1280,6 +1279,9 @@ mod tests {
                 .await
                 .unwrap()
         );
+        wait_for_same_policy_resumption(base.clone(), addr, "localhost")
+            .await
+            .expect("same-policy control must resume before judging isolation");
         assert!(
             !connect_for_ticket(base.clone(), addr, "other-sni")
                 .await
@@ -1319,11 +1321,15 @@ mod tests {
         let addr = spawn_echo_server(&[b"h3"]);
         let server_name = format!("auth-policy-{}", addr.port());
         let insecure = direct_boring_config(b"h3", true, None).unwrap();
+
         assert!(
-            !connect_for_ticket(insecure, addr, &server_name)
+            !connect_for_ticket(insecure.clone(), addr, &server_name)
                 .await
                 .unwrap()
         );
+        wait_for_same_policy_resumption(insecure, addr, &server_name)
+            .await
+            .expect("same-policy control must resume before judging policy isolation");
 
         let secure = direct_boring_config(b"h3", false, None).unwrap();
         let mut endpoint = crate::quic::client_endpoint(false).unwrap();
@@ -1362,24 +1368,23 @@ mod tests {
     #[tokio::test]
     async fn pin_config_never_resumes_cached_ticket() {
         let addr = spawn_echo_server(&[b"h3"]);
-        // Prime the cache via a non-pin connection (unique address so
-        // parallel tests never share its ticket key).
         let node = Node {
-            address: "127.0.0.1:12".to_string(),
+            address: format!("127.0.0.1:{}", addr.port()),
+            host: "127.0.0.1".into(),
+            port: addr.port(),
             ..skip_verify_node()
         };
         let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
             .await
             .unwrap();
-        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
-        endpoint.set_default_client_config(cfg);
-        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        send.write_all(b"ping").await.unwrap();
-        send.finish().unwrap();
-        let _ = recv.read_to_end(16).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        conn.close(0u32.into(), b"done");
+        assert!(
+            !connect_for_ticket(cfg.clone(), addr, "localhost")
+                .await
+                .unwrap()
+        );
+        wait_for_same_policy_resumption(cfg.clone(), addr, "localhost")
+            .await
+            .expect("same-policy control must resume before judging pin isolation");
 
         // Same host with the correct pin set: the handshake must succeed,
         // but it must be a full handshake — never a resumed one.
