@@ -1,7 +1,5 @@
 use super::DnsController;
-use crate::dns::query::{
-    DnsRequestMeta, IngressProfile, ValidatedDnsQuery, is_exact_dns_query, validate_exact_dns_query,
-};
+use crate::dns::query::{DnsRequestMeta, IngressProfile, ValidatedDnsQuery, is_exact_dns_query};
 use crate::dns::response::build_dns_refused;
 use crate::dns::transport::{read_length_prefixed_into, write_length_prefixed};
 use std::net::SocketAddr;
@@ -12,40 +10,6 @@ use tracing::debug;
 pub(super) const TCP_DNS_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DnsController {
-    /// Handle a UDP DNS query from TPROXY.
-    pub(crate) async fn handle_udp_dns(
-        &self,
-        data: &[u8],
-        client_addr: SocketAddr,
-        original_dst: SocketAddr,
-        validated: Option<ValidatedDnsQuery>,
-    ) -> anyhow::Result<bool> {
-        if original_dst.port() != 53 {
-            return Ok(false);
-        }
-        let Some(validated) = validated.or_else(|| validate_exact_dns_query(data)) else {
-            return Ok(false);
-        };
-        let admission = match self.try_admit_query(true) {
-            Ok(admission) => admission,
-            Err(error) => {
-                debug!("DNS runtime admission reached; sending REFUSED");
-                let response = build_dns_refused(data);
-                let _ = error
-                    .run_reply(super::super::send_udp_reply_from_orig_dst(
-                        &response,
-                        client_addr,
-                        original_dst,
-                    ))
-                    .await;
-                return Ok(true);
-            }
-        };
-        self.handle_udp_dns_admitted(&admission, data, client_addr, original_dst, validated)
-            .await;
-        Ok(true)
-    }
-
     pub(crate) async fn handle_udp_dns_admitted(
         &self,
         admission: &super::AdmittedDnsQuery,

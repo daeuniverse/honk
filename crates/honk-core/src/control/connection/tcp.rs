@@ -137,10 +137,10 @@ impl ControlPlaneHandle {
         );
         let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
 
-        if let Ok(true) = self
+        if self
             .dns_controller
             .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
-            .await
+            .await?
         {
             return Ok(());
         }

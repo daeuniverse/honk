@@ -1232,29 +1232,42 @@ fn strict_dns_query_requires_forwarder_parseable_question() {
 }
 
 #[tokio::test]
-async fn udp_dns_controller_declines_root_and_binary_questions() {
+async fn udp_slow_path_forwards_root_and_binary_questions() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let controller = production_dns_controller(calls.clone(), dns_response_payload());
-    let client = addr("127.0.0.1:34567");
     let dst = addr("203.0.113.53:53");
 
-    let root = dns_query_with_qname(&[0x00]);
-    assert!(
-        !controller
-            .handle_udp_dns(&root, client, dst, None)
-            .await
-            .unwrap(),
-        "root qname must fall back to ordinary UDP"
-    );
-
-    let binary = dns_query_with_qname(&[0x01, 0xff, 0x00]);
-    assert!(
-        !controller
-            .handle_udp_dns(&binary, client, dst, None)
-            .await
-            .unwrap(),
-        "binary qname must fall back to ordinary UDP"
-    );
+    for (client, data) in [
+        (addr("127.0.0.1:34567"), dns_query_with_qname(&[0x00])),
+        (
+            addr("127.0.0.1:34568"),
+            dns_query_with_qname(&[0x01, 0xff, 0x00]),
+        ),
+    ] {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = Arc::new(StatsManager::new());
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let work = begin_udp_slow_path(
+            &pool,
+            &stats,
+            &limit,
+            validate_exact_dns_query(&data).map(|validated| (controller.as_ref(), validated)),
+            client,
+            dst,
+            &data,
+        );
+        let lease = match work {
+            UdpSlowPathWork::Initialize(lease) => lease,
+            _ => panic!("non-strict port-53 payload must take ordinary UDP forwarding"),
+        };
+        assert_eq!(lease.client_addr(), client);
+        assert_eq!(lease.original_dst(), dst);
+        assert_eq!(lease.first_payload().as_ref(), data.as_slice());
+        assert_eq!(stats.udp_snapshot().slow_permit_accepted, 1);
+        assert_eq!(limit.available_permits(), 0);
+        drop(lease);
+        assert_eq!(limit.available_permits(), 1);
+    }
 
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
@@ -1594,8 +1607,7 @@ async fn udp_fast_path_dns_shaped_non53_forwards() {
 
 #[tokio::test]
 async fn udp_fast_path_non_dns_port53_forwards() {
-    // Garbage to port 53 is not a DNS query: the endpoint driver forwards it,
-    // exactly like the slow path does after handle_udp_dns declines.
+    // Garbage to port 53 is not strict DNS, so the endpoint driver forwards it.
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -2642,6 +2654,107 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             .redirect_track_lookup(&redirect_key)?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_dns_write_error_is_returned_without_tcp_fallthrough() -> anyhow::Result<()> {
+    use honk_ebpf_common::RoutingHandoffEntry;
+    use std::net::Ipv4Addr;
+    use tokio::io::AsyncWriteExt;
+
+    struct BlockingUpstream {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::forwarder::DnsUpstreamPool for BlockingUpstream {
+        async fn query(&self, _name: &str, _raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(dns_response_payload())
+        }
+    }
+
+    // Keep the required DNS port separate from the usual loopback resolver bind.
+    let listener = match TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 53)).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping: loopback TCP :53 bind needs privileges");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let original_dst = listener.local_addr()?;
+    let mut client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let raw_tuples: [u8; 40] = bytes_of(&tuples).try_into().expect("40-byte tuple key");
+    backend.routing_handoffs.lock().insert(
+        raw_tuples,
+        RoutingHandoffEntry {
+            result: RoutingResult {
+                outbound: OutboundIndex::Direct as u8,
+                mark: DAE_BYPASS_MARK,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "direct".into();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let mut plane = ControlPlane::new(
+        config,
+        Box::new(backend),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    plane.dns_controller = production_dns_controller_with_upstream(Arc::new(BlockingUpstream {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    }));
+    let handle = plane.spawn_handle();
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let peer = async move {
+        let query = dns_query_payload();
+        client
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await?;
+        client.write_all(&query).await?;
+        entered.notified().await;
+        socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO))?;
+        drop(client);
+        release.notify_one();
+        Ok::<_, anyhow::Error>(())
+    };
+    let (result, peer_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(handle.serve_connection(accepted, client_addr), peer)
+    })
+    .await?;
+    peer_result?;
+    assert!(
+        result.is_err(),
+        "terminal DNS response I/O error must not fall through to TCP routing"
+    );
+    assert!(handle.stats.snapshot().is_empty());
+    assert!(handle.tcp_flow_pins.snapshot().is_empty());
     Ok(())
 }
 

@@ -305,8 +305,6 @@ pub(in crate::control) struct UdpInitLease {
     initializer: Arc<InitializingEndpoint>,
     _initializer_guard: UdpInitializerGuard,
     connection_guard: Option<ActiveConnectionGuard>,
-    /// NFQUEUE admission already excluded DNS interception.
-    dns_checked: bool,
     committed: bool,
 }
 
@@ -348,10 +346,6 @@ impl UdpInitLease {
     pub(in crate::control) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
         debug_assert!(self.connection_guard.is_none());
         self.connection_guard = Some(guard);
-    }
-
-    pub(in crate::control) fn dns_checked(&self) -> bool {
-        self.dns_checked
     }
 
     /// Associate a tracker created after route selection with this exact
@@ -764,7 +758,6 @@ impl UdpEndpointPool {
             initializer,
             _initializer_guard: initializer_guard,
             connection_guard: None,
-            dns_checked: decision_token != 0,
             committed: false,
         })
     }

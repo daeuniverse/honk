@@ -92,9 +92,7 @@ impl ControlPlaneHandle {
                 .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?
         };
 
-        // These checks remain after reservation because DNS and sniffing
-        // share this initializer. A staged early exit must retire its held
-        // originals immediately.
+        // A staged early exit must retire its held originals immediately.
         if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
             trace!(
                 "Skipping honk-internal UDP {} -> {}",
@@ -116,31 +114,6 @@ impl ControlPlaneHandle {
                 verdicts.cancel(*identity).await?;
             }
             return Ok(());
-        }
-
-        if !lease.dns_checked() {
-            match self
-                .dns_controller
-                .handle_udp_dns(&data, client_addr, original_dst, None)
-                .await
-            {
-                Ok(true) => {
-                    #[cfg(feature = "ebpf")]
-                    if let Some((verdicts, identity)) = &pending {
-                        verdicts.cancel(*identity).await?;
-                    }
-                    return Ok(());
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    // Keep ordinary UDP forwarding available when DNS control
-                    // declines with an error.
-                    warn!(
-                        "DNS controller error for UDP {} -> {}; continuing UDP: {}",
-                        client_addr, original_dst, error
-                    );
-                }
-            }
         }
 
         let tuples = build_tuples_key(

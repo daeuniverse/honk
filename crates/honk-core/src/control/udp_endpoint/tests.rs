@@ -534,7 +534,6 @@ fn udp_owned_admission_transfers_allocations_and_preserves_identity() {
         };
     assert_eq!(lease.first_payload().as_ptr(), payload_ptr);
     assert_eq!(lease.decision_token(), 41);
-    assert!(lease.dns_checked());
     assert_eq!(slow_slots.available_permits(), 0);
     assert_eq!(
         pool.global_payload_bytes.available_permits(),
