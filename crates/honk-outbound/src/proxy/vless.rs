@@ -604,13 +604,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for ResponseHeaderStrip<S> {
                             std::task::Poll::Ready(Err(e)) => {
                                 return std::task::Poll::Ready(Err(e));
                             }
+                            std::task::Poll::Ready(Ok(()))
+                                if rb.filled().is_empty() && *filled == 0 =>
+                            {
+                                // A peer may half-close before sending any lazy response metadata.
+                                // This is a clean response EOF; the upload half may still drain.
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            std::task::Poll::Ready(Ok(())) if rb.filled().is_empty() => {
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "VLESS: truncated response header",
+                                )));
+                            }
                             std::task::Poll::Ready(Ok(())) => {
-                                if rb.filled().is_empty() {
-                                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                                        std::io::ErrorKind::UnexpectedEof,
-                                        "VLESS: truncated response header",
-                                    )));
-                                }
                                 *filled += rb.filled().len();
                             }
                         }
@@ -1828,6 +1835,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_strip_accepts_clean_eof_before_header() {
+        let reader = ChunkedReader {
+            data: std::collections::VecDeque::new(),
+            chunk: 1,
+        };
+        let mut stream = ResponseHeaderStrip::new(reader);
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).await.unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
     async fn response_strip_header_and_addon() {
         let mut data = vec![0x00, 0x03, 0xaa, 0xbb, 0xcc];
         data.extend_from_slice(b"payload-bytes");
@@ -1904,6 +1923,64 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    #[tokio::test]
+    async fn response_half_close_before_header_preserves_upload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (upload_tx, upload_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 19];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[18], CMD_TCP);
+            let mut addr = [0u8; 7];
+            stream.read_exact(&mut addr).await.unwrap();
+
+            stream.shutdown().await.unwrap();
+            let mut upload = [0u8; 4];
+            stream.read_exact(&mut upload).await.unwrap();
+            upload_tx.send(upload).unwrap();
+        });
+
+        let uuid_str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
+        let node = Node {
+            name: "vless-half-close".into(),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            ..vless_node(uuid_str, WireMode::Legacy)
+        };
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let mut ps = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            VLessHandler::new().dial(&node, target, None, std::time::Duration::from_secs(3)),
+        )
+        .await
+        .expect("dial must not wait for response metadata")
+        .unwrap();
+
+        let mut downstream = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                ps.stream.read(&mut downstream),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0
+        );
+        ps.stream.write_all(b"ping").await.unwrap();
+        ps.stream.flush().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), upload_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            *b"ping"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
