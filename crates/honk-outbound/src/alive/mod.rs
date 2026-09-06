@@ -261,7 +261,7 @@ fn fresh_states() -> [PerProtocolState; ALIVE_STATES_PER_NODE] {
     ]
 }
 
-type EbpfAliveCallback = Box<dyn Fn(Uuid, u32, u32, bool) + Send + Sync>;
+type EbpfAliveCallback = Box<dyn Fn(Uuid, ProbeDomain, IpVersion, bool) + Send + Sync>;
 
 /// Callback fired when a node's (domain, ip-version) state flips
 /// alive→dead on the probe path (same trigger as the eBPF connectivity
@@ -572,7 +572,7 @@ impl AliveDialerSet {
 
     fn push_ebpf(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion, alive: bool) {
         if let Some(ref cb) = *self.ebpf_callback.read() {
-            cb(node_id, domain as u32, ipver as u32, alive);
+            cb(node_id, domain, ipver, alive);
         }
     }
 

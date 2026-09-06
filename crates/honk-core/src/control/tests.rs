@@ -70,7 +70,11 @@ async fn health_push_re_resolves_after_reload_writer() {
     *config_writer = Arc::new(new_config.clone());
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
-    let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
+    let update = tokio::spawn(Arc::clone(&health_publisher).publish(
+        node.id,
+        ProbeDomain::DnsUdp,
+        IpVersion::V4,
+    ));
     tokio::task::yield_now().await;
     assert!(!update.is_finished());
     drop(config_writer);
@@ -124,7 +128,9 @@ async fn health_push_updates_every_group_sharing_nested_leaf() {
     );
 
     alive_set.report_unavailable_forced(node.id, ProbeDomain::DataUdp, IpVersion::V4);
-    Arc::new(publisher).publish(node.id, 2, 0).await;
+    Arc::new(publisher)
+        .publish(node.id, ProbeDomain::DataUdp, IpVersion::V4)
+        .await;
     let backend = ebpf.read().await;
     for outbound in 2..=4 {
         assert!(!backend.get_outbound_alive(outbound, 2, 0).unwrap());
@@ -138,7 +144,9 @@ async fn health_push_updates_every_group_sharing_nested_leaf() {
         Arc::clone(&group_manager),
         Arc::clone(&alive_set),
     );
-    Arc::new(publisher).publish(node.id, 2, 0).await;
+    Arc::new(publisher)
+        .publish(node.id, ProbeDomain::DataUdp, IpVersion::V4)
+        .await;
     let backend = ebpf.read().await;
     for outbound in 2..=4 {
         assert!(backend.get_outbound_alive(outbound, 2, 0).unwrap());

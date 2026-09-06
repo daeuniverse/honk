@@ -22,9 +22,9 @@ pub(in crate::control) use warm::{
 pub(in crate::control) use subscription::config_with_subscription_nodes;
 
 pub(in crate::control) use connectivity::{
-    group_check_url_registrations, group_connectivity_snapshot, install_interrupt_callback,
-    install_selector_warm_callback, open_group_connectivity, publish_group_connectivity,
-    sync_health_check_nodes, urltest_group_registrations,
+    group_check_url_registrations, group_connectivity_snapshot, group_datapath_alive,
+    install_interrupt_callback, install_selector_warm_callback, open_group_connectivity,
+    publish_group_connectivity, sync_health_check_nodes, urltest_group_registrations,
 };
 
 #[derive(Debug, Clone)]

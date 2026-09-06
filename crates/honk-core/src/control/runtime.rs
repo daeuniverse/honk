@@ -174,27 +174,30 @@ impl OutboundHealthPublisher {
         }
     }
 
-    pub(super) async fn publish(self: Arc<Self>, node_id: uuid::Uuid, domain: u32, ipver: u32) {
+    pub(super) async fn publish(
+        self: Arc<Self>,
+        node_id: uuid::Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) {
         // Reload holds config → eBPF → group-manager locks in this order. Keep
         // the same generation pinned while recomputing every group that may
         // share this leaf; a node→one-group map cannot update shared leaves.
         let config = self.config.read().await;
         let mut backend = self.ebpf.write().await;
         let group_manager = self.group_manager.read().clone();
-        let snapshot =
-            reload::group_connectivity_snapshot(&config, &group_manager, &self.alive_set);
-        for &(outbound_idx, snapshot_domain, snapshot_ipver, alive) in &snapshot {
-            if snapshot_domain != domain || snapshot_ipver != ipver {
-                continue;
-            }
+        for (index, group) in config.groups.iter().enumerate() {
+            let outbound_idx = OutboundIndex::UserBase as u8 + index as u8;
+            let alive =
+                reload::group_datapath_alive(group, &group_manager, &self.alive_set, domain, ipver);
             if let Err(error) =
-                backend.set_outbound_alive(outbound_idx, snapshot_domain, snapshot_ipver, alive)
+                backend.set_outbound_alive(outbound_idx, domain as u32, ipver as u32, alive)
             {
                 warn!(
                     %error,
                     outbound_idx,
-                    domain,
-                    ipver,
+                    ?domain,
+                    ?ipver,
                     %node_id,
                     "failed to update outbound health in eBPF"
                 );
