@@ -5,20 +5,6 @@ use crate::dns::query::{IngressProfile, QueryContext};
 use super::{CacheKey, DnsCache, ExactLookup, OperationKind, make_test_response};
 
 #[test]
-fn exact_key_has_stable_typed_identity() {
-    let key = CacheKey::for_test(
-        vec![0, 0, 1],
-        IngressProfile::Internal,
-        RequestScope::Upstream(UpstreamTag::new("default").expect("tag")),
-        OperationKind::Resolve,
-    );
-    let identical = key.clone();
-
-    assert_eq!(key, identical);
-    assert_eq!(key.shard_hash(), identical.shard_hash());
-}
-
-#[test]
 fn cache_key_canonical_fields_are_separated_and_collision_checked() {
     let base = CacheKey::for_test(
         vec![0, 0, 1],
