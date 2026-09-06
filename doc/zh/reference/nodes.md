@@ -17,7 +17,7 @@ node {
 
 当前解析器同时接受带 tag 和不带 tag 的条目。非空 dae tag 会替换链接的 `#fragment` 名称。不带 tag 的链接保留解码后的 fragment；没有 fragment 时使用不含凭据的 `{scheme}-{host}` 回退名称。
 
-格式错误但 scheme 已识别的链接会被丢弃，并向 stderr 输出 `node section: skipping unparseable entry: ...`。未知 scheme 是配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS wire 行为必须写在各链接的 `vless_mode=` query 中。
+已识别链接中的普通语法或解码错误会被丢弃，并向 stderr 输出 `node section: skipping unparseable entry: ...`。语义校验错误（包括不支持的 Shadowsocks plugin）和未知 scheme 是配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS wire 行为必须写在各链接的 `vless_mode=` query 中。
 
 ## 节点身份
 
@@ -27,7 +27,7 @@ node {
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow` 以及每种非 `legacy` VLESS mode。调优参数与显示元数据不参与。
+凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow`、每种非 `legacy` VLESS mode，以及 VLESS 禁用 TLS 的标记。已有启用 TLS 的 VLESS 身份保持不变。调优参数与显示元数据不参与。
 
 因此，只要可拨号端点不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
 

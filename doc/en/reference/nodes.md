@@ -17,7 +17,7 @@ node {
 
 The current parser accepts both tagged and untagged entries. A non-empty dae tag replaces the link's `#fragment` name. An untagged link keeps its decoded fragment; without one, it receives the credential-free fallback `{scheme}-{host}`.
 
-A malformed recognized link is dropped with `node section: skipping unparseable entry: ...` on stderr. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
+Ordinary syntax or decoding failures in recognized links are dropped with `node section: skipping unparseable entry: ...` on stderr. Semantic validation failures, including unsupported Shadowsocks plugins, and unknown schemes are hard configuration errors. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
 
 ## Node identity
 
@@ -27,7 +27,7 @@ A malformed recognized link is dropped with `node section: skipping unparseable 
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and every non-`legacy` VLESS mode. Tuning and display metadata do not participate.
+The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, every non-`legacy` VLESS mode, and a marker for TLS-disabled VLESS. Existing TLS-enabled VLESS identities remain unchanged. Tuning and display metadata do not participate.
 
 Identity is therefore stable across rename, reload, and subscription refresh when the dialable endpoint is unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
 
