@@ -68,8 +68,9 @@ async fn dns_proxy_query_survives_traffic_registry_retirement() {
         vec![node],
         vec![],
     )
-    .unwrap()
-    .with_runtime_generation(Arc::clone(&generation));
+    .unwrap();
+    pool.set_runtime_generation(Arc::clone(&generation))
+        .unwrap();
 
     generation.begin_retirement();
     let response = tokio::time::timeout(
@@ -115,8 +116,8 @@ async fn dns_private_tls_connectors_follow_runtime_maintenance() {
         vec![node],
         vec![],
     )
-    .unwrap()
-    .with_runtime_generation(Arc::clone(&traffic));
+    .unwrap();
+    pool.set_runtime_generation(Arc::clone(&traffic)).unwrap();
     let transport: &dyn crate::dns::runtime::RuntimeTransport = &pool;
 
     assert!(pool.query("proxy", &mock_dns_query(123)).await.is_err());

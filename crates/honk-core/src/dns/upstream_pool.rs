@@ -367,15 +367,6 @@ impl UpstreamPool {
             .map_or(0, |generation| generation.reap_tls_connectors(now))
     }
 
-    pub fn with_runtime_generation(
-        self,
-        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    ) -> Self {
-        self.set_runtime_generation(generation)
-            .expect("new DNS upstream pool has no runtime generation");
-        self
-    }
-
     pub fn set_group_manager(&self, group_manager: Option<SharedGroupManager>) {
         *self.group_manager.write() = group_manager;
     }
