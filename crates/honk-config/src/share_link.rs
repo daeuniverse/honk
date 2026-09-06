@@ -154,16 +154,6 @@ impl Node {
                 "vless_mode/packetEncoding are valid only for VLESS share links".into(),
             ));
         }
-        if protocol == NodeProtocol::SS
-            && query
-                .keys()
-                .any(|key| matches!(key.as_str(), "plugin" | "plugin-opts" | "plugin_opts"))
-        {
-            return Err(ConfigError::Validation(
-                "static Shadowsocks plugins are unsupported; remove plugin/plugin-opts or use a subscription that filters them"
-                    .into(),
-            ));
-        }
         if let Some(tls) = node.tls_mut() {
             tls.enabled = match protocol {
                 NodeProtocol::Trojan | NodeProtocol::AnyTLS => true,

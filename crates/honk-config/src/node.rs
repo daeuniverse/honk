@@ -296,6 +296,21 @@ impl Node {
     }
 
     pub fn validate_protocol(&self) -> Result<(), crate::ConfigError> {
+        if let Some(shadowsocks) = self.shadowsocks()
+            && (shadowsocks
+                .plugin
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || shadowsocks
+                    .plugin_opts
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()))
+        {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{}' configures an unsupported static Shadowsocks plugin",
+                self.name
+            )));
+        }
         if let Some(config) = self.vless() {
             config.validate(&self.name)?;
         }

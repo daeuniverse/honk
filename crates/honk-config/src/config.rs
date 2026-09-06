@@ -699,21 +699,6 @@ impl Config {
                     node.name
                 )));
             }
-            if let Some(shadowsocks) = node.shadowsocks()
-                && (shadowsocks
-                    .plugin
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-                    || shadowsocks
-                        .plugin_opts
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty()))
-            {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Node '{}' configures an unsupported static Shadowsocks plugin",
-                    node.name
-                )));
-            }
             // Reject unknown transports at load time instead of silently
             // degrading to raw TCP at dial time.
             if let Some(transport) = node.transport()

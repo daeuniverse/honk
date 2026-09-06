@@ -304,22 +304,6 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     let nodes = nodes
         .into_iter()
         .filter(|node| {
-            if node.shadowsocks().is_some_and(|config| {
-                config
-                    .plugin
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-                    || config
-                        .plugin_opts
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty())
-            }) {
-                tracing::warn!(
-                    node = %node.name,
-                    "skipping subscription node with unsupported proxy plugin"
-                );
-                return false;
-            }
             if seen.insert(node.id) {
                 true
             } else {
@@ -840,7 +824,7 @@ fn parse_clash_subscription(
             tls.enabled = true;
         }
         if let Err(error) = node.validate_protocol() {
-            tracing::warn!(node = %node.name, reason = %error, "skipping unsupported VLESS node");
+            tracing::warn!(node = %node.name, reason = %error, "skipping unsupported proxy node");
             continue;
         }
 

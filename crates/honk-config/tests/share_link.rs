@@ -162,15 +162,6 @@ fn test_ss_base64_userinfo() {
 }
 
 #[test]
-fn test_ss_rejects_static_plugin_suffix() {
-    let error = Node::from_share_link(
-        "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388/?plugin=v2ray-plugin%3Btls#ss-pad",
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("static Shadowsocks plugins"));
-}
-
-#[test]
 fn test_ss_plain_userinfo() {
     let node = Node::from_share_link("ss://aes-256-gcm:mypassword@2.3.4.5:8389#ss-plain").unwrap();
     assert_eq!(node.protocol(), NodeProtocol::SS);
@@ -201,12 +192,27 @@ fn test_ss_plain_userinfo_base64_method() {
 }
 
 #[test]
-fn test_ss_rejects_static_plugin_options() {
-    let error = Node::from_share_link(
-        "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com#ss-plugin",
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("static Shadowsocks plugins"));
+fn ss_plugin_validation_preserves_empty_metadata() {
+    let plain = Node::from_share_link("ss://aes-256-gcm:password@127.0.0.1:8388").unwrap();
+    let empty =
+        Node::from_share_link("ss://aes-256-gcm:password@127.0.0.1:8388?plugin=&plugin_opts=%20")
+            .unwrap();
+    assert_eq!(empty.id, plain.id);
+    let mut config = Config::default();
+    config.nodes.push(empty);
+    config.validate().unwrap();
+
+    assert!(matches!(
+        Node::from_share_link("ss://aes-256-gcm:password@127.0.0.1:8388?plugin=v2ray-plugin%3Btls"),
+        Err(honk_config::ConfigError::Validation(_))
+    ));
+    let mut unsupported = plain;
+    unsupported.shadowsocks_mut().unwrap().plugin_opts = Some("obfs=http".into());
+    config.nodes = vec![unsupported];
+    assert!(matches!(
+        config.validate(),
+        Err(honk_config::ConfigError::Validation(_))
+    ));
 }
 
 #[test]
