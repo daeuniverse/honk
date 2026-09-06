@@ -1540,7 +1540,7 @@ impl EbpfBackend for RealEbpfBackend {
     fn replace_local_addresses(&mut self, addresses: &[LocalAddressKey]) -> anyhow::Result<()> {
         // Raw batch scans require the override object's exact key/value ABI.
         let _ = self.hash_map::<LocalAddressKey, u8>("LOCAL_ADDRESS_MAP")?;
-        let desired: HashSet<LocalAddressKey> = addresses.iter().copied().collect();
+        let mut desired: HashSet<LocalAddressKey> = addresses.iter().copied().collect();
         anyhow::ensure!(
             desired.len() <= MAX_LOCAL_ADDRESSES as usize,
             "LOCAL_ADDRESS_MAP capacity exceeded: {} > {}",
@@ -1553,7 +1553,7 @@ impl EbpfBackend for RealEbpfBackend {
         // Remove first: replacing a full map must not fail merely because old
         // entries temporarily occupy slots needed by the new generation.
         for (key, _) in &current {
-            if !desired.contains(key) {
+            if !desired.remove(key) {
                 self.hash_remove::<LocalAddressKey, u8>("LOCAL_ADDRESS_MAP", key)?;
             }
         }

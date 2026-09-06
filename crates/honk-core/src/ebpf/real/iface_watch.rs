@@ -118,14 +118,8 @@ pub(crate) fn host_local_address_keys() -> anyhow::Result<Vec<LocalAddressKey>> 
         .map_err(|error| anyhow::anyhow!("getifaddrs: {error}"))?
     {
         let link_local = match address {
-            std::net::IpAddr::V4(address) => {
-                let octets = address.octets();
-                octets[0] == 169 && octets[1] == 254
-            }
-            std::net::IpAddr::V6(address) => {
-                let octets = address.octets();
-                octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
-            }
+            std::net::IpAddr::V4(address) => address.is_link_local(),
+            std::net::IpAddr::V6(address) => address.is_unicast_link_local(),
         };
         let ifindex = if link_local {
             let Some(ifindex) = iface_address_ifindex(&ifname) else {
@@ -157,19 +151,18 @@ async fn run(
     let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
-    let mut network_state = read_network_state();
+    let mut network_state = None;
 
     // Startup rule generation may have run before this interface became
     // ready; the control-plane refresh is content-deduplicated.
-    if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, true).await {
+    if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut network_state).await {
         return;
     }
     loop {
         tokio::select! {
             _ = stop.changed() => break,
             _ = ticker.tick() => {
-                let changed = update_network_state(&mut network_state);
-                if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await {
+                if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut network_state).await {
                     break;
                 }
             }
@@ -204,8 +197,7 @@ async fn run(
                 match drained {
                     Ok(Ok(())) => {
                         guard.clear_ready();
-                        let changed = update_network_state(&mut network_state);
-                        if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await {
+                        if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut network_state).await {
                             break;
                         }
                     }
@@ -225,17 +217,14 @@ async fn run(
 fn read_network_state() -> NetworkState {
     NetworkState {
         default_interface: crate::detect_default_interface(),
-        local_addresses: host_local_address_keys().unwrap_or_default(),
+        local_addresses: host_local_address_keys().unwrap_or_else(|error| {
+            warn!(
+                "failed to enumerate local addresses: {}; revoking authority",
+                error
+            );
+            Vec::new()
+        }),
     }
-}
-
-fn update_network_state(current: &mut NetworkState) -> bool {
-    let next = read_network_state();
-    if *current == next {
-        return false;
-    }
-    *current = next;
-    true
 }
 
 async fn reconcile_and_notify(
@@ -243,19 +232,14 @@ async fn reconcile_and_notify(
     config: &Arc<RwLock<Arc<honk_config::Config>>>,
     commands: &tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     attached: &mut AttachedMap,
-    network_state_changed: bool,
+    network_state: &mut Option<NetworkState>,
 ) -> bool {
-    let local_addresses = match host_local_address_keys() {
-        Ok(addresses) => addresses,
-        Err(error) => {
-            warn!(
-                "failed to enumerate local addresses: {}; revoking authority",
-                error
-            );
-            Vec::new()
-        }
-    };
-    let publication = ebpf.write().await.replace_local_addresses(&local_addresses);
+    let next = read_network_state();
+    let network_state_changed = network_state.as_ref() != Some(&next);
+    let publication = ebpf
+        .write()
+        .await
+        .replace_local_addresses(&next.local_addresses);
     if let Err(error) = publication {
         warn!(
             "failed to publish local address evidence: {}; revoking authority",
@@ -278,6 +262,7 @@ async fn reconcile_and_notify(
             return false;
         }
     }
+    *network_state = Some(next);
     if (reconcile(ebpf, config, attached).await || network_state_changed)
         && commands
             .send(crate::control::ControlCommand::NetworkChanged)
@@ -537,19 +522,22 @@ mod tests {
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, false).await;
+        let mut network_state = None;
+        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, &mut network_state).await;
         assert!(matches!(
             rx.try_recv(),
             Ok(crate::control::ControlCommand::NetworkChanged)
         ));
 
-        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, false).await;
+        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, &mut network_state).await;
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
-        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, true).await;
+        network_state.as_mut().unwrap().default_interface =
+            Some("not-an-interface-name".to_string());
+        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, &mut network_state).await;
         assert!(matches!(
             rx.try_recv(),
             Ok(crate::control::ControlCommand::NetworkChanged)
