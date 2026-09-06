@@ -339,45 +339,6 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
 }
 
 #[test]
-fn test_push_ebpf_uses_outbound_resolver() {
-    let set = AliveDialerSet::new();
-    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let calls2 = calls.clone();
-    set.set_ebpf_callback(Box::new(move |_node_id, o, d, ip, alive| {
-        calls2.lock().unwrap().push((o, d, ip, alive));
-    }));
-
-    // No resolver installed → legacy outbound 0. TCP dies at 3 failures.
-    for _ in 0..3 {
-        set.mark_dead(id(1)); // Tcp×V4+V6
-    }
-    assert_eq!(
-        calls.lock().unwrap().as_slice(),
-        &[(0u8, 0u32, 0u32, false), (0u8, 0u32, 1u32, false)]
-    );
-
-    // Resolver maps n2 → outbound 5; unknown nodes are skipped.
-    set.set_outbound_resolver(Some(Arc::new(
-        |node: Uuid| {
-            if node == id(2) { Some(5u8) } else { None }
-        },
-    )));
-    for _ in 0..3 {
-        set.mark_dead(id(2));
-        set.mark_dead(id(3));
-    }
-    assert_eq!(
-        calls.lock().unwrap().as_slice(),
-        &[
-            (0u8, 0u32, 0u32, false),
-            (0u8, 0u32, 1u32, false),
-            (5u8, 0u32, 0u32, false),
-            (5u8, 0u32, 1u32, false),
-        ]
-    );
-}
-
-#[test]
 fn test_sync_urltest_groups_full_refresh() {
     let set = AliveDialerSet::new();
     for (i, n) in ["n1", "n2", "n3"].into_iter().enumerate() {

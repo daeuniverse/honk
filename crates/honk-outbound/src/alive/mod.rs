@@ -261,7 +261,7 @@ fn fresh_states() -> [PerProtocolState; ALIVE_STATES_PER_NODE] {
     ]
 }
 
-type EbpfAliveCallback = Box<dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync>;
+type EbpfAliveCallback = Box<dyn Fn(Uuid, u32, u32, bool) + Send + Sync>;
 
 /// Callback fired when a node's (domain, ip-version) state flips
 /// alive→dead on the probe path (same trigger as the eBPF connectivity
@@ -279,13 +279,6 @@ pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<(String, String)> + Send + 
 /// (sing-box default: 30 minutes). Periodic probing of a URLTest group's
 /// members pauses while the group is idle and resumes on the next selection.
 pub const DEFAULT_URLTEST_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
-
-/// Resolves a NodeId to its eBPF outbound index for
-/// `OUTBOUND_CONNECTIVITY_MAP` writes (direct=0, block=1, group i → 2+i,
-/// matching the control plane's routing push). Returns `None` for nodes
-/// without an eBPF outbound id (not in any group) — those state changes
-/// are not pushed to the kernel map.
-pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
 
 /// A node known to the current config or scheduled for health checking: the
 /// content-derived NodeId is the map key; the name is kept for logs and the
@@ -372,8 +365,6 @@ pub struct AliveDialerSet {
     node_registered_at: RwLock<HashMap<Uuid, Instant>>,
     /// Per-node per-domain/IP-version probe history for API/UI.
     probe_history: RwLock<HashMap<(Uuid, usize), Vec<ProbeRecord>>>,
-    /// NodeId → eBPF outbound index resolver for connectivity pushes.
-    outbound_resolver: RwLock<Option<OutboundIdResolver>>,
     /// DNS resolver for check targets (system lookup when unset).
     resolver: RwLock<Option<ResolveHook>>,
     /// Last activity timestamp per URLTest group (lazy start: absent = idle).
@@ -445,7 +436,6 @@ impl AliveDialerSet {
             score_feedback: RwLock::new(None),
             node_registered_at: RwLock::new(HashMap::new()),
             probe_history: RwLock::new(HashMap::new()),
-            outbound_resolver: RwLock::new(None),
             group_last_active: RwLock::new(HashMap::new()),
             node_urltest_groups: RwLock::new(HashMap::new()),
             urltest_group_members: RwLock::new(HashMap::new()),
@@ -580,26 +570,9 @@ impl AliveDialerSet {
         *self.death_callback.write() = cb;
     }
 
-    /// Install the node name → eBPF outbound index resolver used by
-    /// `push_ebpf`. Re-callable: honk-core re-installs (or refreshes the
-    /// captured map) on config reload. Pass `None` to restore the legacy
-    /// fallback (outbound 0).
-    pub fn set_outbound_resolver(&self, resolver: Option<OutboundIdResolver>) {
-        *self.outbound_resolver.write() = resolver;
-    }
-
     fn push_ebpf(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion, alive: bool) {
-        let outbound = match *self.outbound_resolver.read() {
-            Some(ref resolve) => match resolve(node_id) {
-                Some(id) => id,
-                // Node has no eBPF outbound id (not in any group) — skip.
-                None => return,
-            },
-            // Legacy fallback when no resolver is installed (tests).
-            None => 0,
-        };
         if let Some(ref cb) = *self.ebpf_callback.read() {
-            cb(node_id, outbound, domain as u32, ipver as u32, alive);
+            cb(node_id, domain as u32, ipver as u32, alive);
         }
     }
 

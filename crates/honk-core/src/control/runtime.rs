@@ -682,12 +682,10 @@ impl ControlPlane {
                 self.group_manager.clone(),
                 alive_set.clone(),
             ));
-            alive_set.set_ebpf_callback(Box::new(
-                move |node_id, _outbound_idx, domain, ipver, _alive| {
-                    let _handle =
-                        tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
-                },
-            ));
+            alive_set.set_ebpf_callback(Box::new(move |node_id, domain, ipver, _alive| {
+                let _handle =
+                    tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
+            }));
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);
             self.background_tasks.lock().await.push(handle);
