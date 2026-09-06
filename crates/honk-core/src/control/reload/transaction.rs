@@ -517,8 +517,6 @@ impl ControlPlane {
                         .load(std::sync::atomic::Ordering::Acquire)
                     || !old_plan.semantically_eq(&new_plan)
                     || !domain_routes_eq(&old_domain_routes, &new_domain_routes);
-                let bitmap_generation_fence_needed =
-                    routing_publication_needed || !reuse_routing_state;
                 let provider = self.dns_controller.runtime_provider();
                 let publication = provider.prepare_publication(new_runtime);
 
@@ -586,9 +584,6 @@ impl ControlPlane {
                         }
                         break 'publication Err(());
                     }
-                }
-                if bitmap_generation_fence_needed {
-                    routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
                 }
                 if routing_publication_needed {
                     self.routing_publication_dirty

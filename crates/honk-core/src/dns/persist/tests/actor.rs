@@ -276,3 +276,30 @@ async fn shutdown_performs_final_write_without_periodic_wait() {
     persister.shutdown().await.expect("shutdown");
     assert_eq!(db.load_dns_v2().expect("rows").len(), 1);
 }
+#[tokio::test]
+async fn exact_removal_dominates_queued_upsert_and_durable_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = test_db(&dir, "");
+    let (key, response, _) = fixture(IngressProfile::Internal, None, upstream("default"));
+
+    let initial = DnsCachePersister::spawn(Arc::clone(&db));
+    initial.save(key.clone(), response.clone().into(), unix_now() + 300);
+    initial.shutdown().await.expect("initial shutdown");
+    assert_eq!(db.load_dns_v2().expect("durable row").len(), 1);
+
+    let persister = DnsCachePersister::spawn(Arc::clone(&db));
+    persister.save(key.clone(), response.into(), unix_now() + 300);
+    persister.remove(key);
+    persister.shutdown().await.expect("removal shutdown");
+    assert!(db.load_dns_v2().expect("rows").is_empty());
+    let restored = DnsCache::new(8);
+    let restart = DnsCachePersister::spawn(db);
+    assert_eq!(
+        restart
+            .restore(restored.service(), None)
+            .await
+            .expect("restore"),
+        0
+    );
+    restart.shutdown().await.expect("restart shutdown");
+}

@@ -135,22 +135,49 @@ pub(in crate::control) fn urltest_group_registrations(
         .collect()
 }
 
-/// Build `(group name, check_url)` for every group with a custom
-/// `check_url` (sing-box urltest `url` option) — the input to
-/// [`AliveDialerSet::sync_group_check_urls`]. Selector groups are
-/// excluded (their check_url is ignored, sing-box parity). Members are
-/// resolved dynamically each probe cycle through the group manager (the
-/// url member resolver installed in `ControlPlane`), so sub-group picks
-/// never go stale here.
-pub(in crate::control) fn group_check_url_registrations(config: &Config) -> Vec<(String, String)> {
+/// Build `(group name, check_url, configured member tags)` for every group
+/// with a custom `check_url` (sing-box urltest `url` option) — the input to
+/// [`AliveDialerSet::sync_group_check_urls`]. Selector groups are excluded
+/// (their check_url is ignored, sing-box parity). Member tags are taken from
+/// the current config topology: direct node UUIDs become their configured
+/// names and immediate subgroup names remain stable tags. The probe resolver
+/// separately maps those tags to current, leaf-deduplicated picks.
+pub(in crate::control) fn group_check_url_registrations(
+    config: &Config,
+) -> Vec<(String, String, Vec<String>)> {
+    let node_names: std::collections::HashMap<uuid::Uuid, &str> = config
+        .nodes
+        .iter()
+        .map(|node| (node.id, node.name.as_str()))
+        .collect();
+    let group_names: std::collections::HashSet<&str> = config
+        .groups
+        .iter()
+        .map(|group| group.name.as_str())
+        .collect();
     config
         .groups
         .iter()
-        .filter(|g| g.policy != GroupPolicy::Selector && g.check_url.is_some())
+        .filter(|group| group.policy != GroupPolicy::Selector && group.check_url.is_some())
         .map(|group| {
+            let mut tags = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for id in &group.nodes {
+                if let Some(name) = node_names.get(id)
+                    && seen.insert(*name)
+                {
+                    tags.push((*name).to_string());
+                }
+            }
+            for name in &group.groups {
+                if group_names.contains(name.as_str()) && seen.insert(name.as_str()) {
+                    tags.push(name.clone());
+                }
+            }
             (
                 group.name.clone(),
                 group.check_url.clone().unwrap_or_default(),
+                tags,
             )
         })
         .collect()

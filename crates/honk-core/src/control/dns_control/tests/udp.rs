@@ -199,7 +199,11 @@ async fn assert_uncacheable_projection(truncated_response: bool) {
     let snapshot = Arc::new(crate::dns::projection::RoutingProjectionSnapshot::new(
         1,
         Arc::new(Router::new(&[route], "direct").expect("routing matcher")),
-        std::collections::HashMap::from([("dns".into(), vec![bitmap])]),
+        vec![crate::dns::projection::DomainRuleBitmap {
+            route_index: 0,
+            negated: false,
+            bitmap,
+        }],
     ));
     let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
         generation: crate::dns::runtime::RuntimeGeneration::new(1),

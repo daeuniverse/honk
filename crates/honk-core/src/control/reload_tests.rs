@@ -288,7 +288,6 @@ async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
         &initial_plan,
     )
     .unwrap();
-    routing_matcher::RoutingMatcherBuilder::activate_projection(&initial_plan);
     control_plane
         .routing_publication_dirty
         .store(false, std::sync::atomic::Ordering::Release);
@@ -1219,23 +1218,28 @@ async fn router_only_semantic_reload_fences_sniffed_bitmap_writers() {
         cp.apply_runtime_config(first.clone(), &DrainTracker::new())
             .await
     );
+    let provider = cp.dns_controller.runtime_provider();
+    let stale = Arc::clone(provider.acquire().runtime().routing_projection());
     let ebpf_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
-    let bitmap_generation =
-        routing_matcher::DOMAIN_BITMAPS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-
     first.routing.rules[0].condition.domain = vec!["second.example".into()];
     assert!(cp.apply_runtime_config(first, &DrainTracker::new()).await);
 
+    let handle = cp.spawn_handle();
+    let ip = "203.0.113.7".parse().unwrap();
+    handle
+        .push_sniffed_domain_bitmap_in_snapshot("first.example", ip, &provider, &stale)
+        .await;
+    assert!(cp.ebpf.read().await.projection_map_snapshot().is_empty());
     assert_eq!(
         cp.ebpf.read().await.active_routing_generation().unwrap(),
-        ebpf_generation,
-        "equal eBPF plan bytes should not flip the map bank"
+        ebpf_generation
     );
-    assert!(
-        routing_matcher::DOMAIN_BITMAPS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-            > bitmap_generation,
-        "replacing the userspace Router must fence stale bitmap writers"
-    );
+    handle
+        .push_sniffed_domain_bitmap("second.example", ip)
+        .await;
+    let current = cp.ebpf.read().await.projection_map_snapshot();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].1.bitmap, [1, 0, 0, 0, 0, 0, 0, 0]);
 }
 #[tokio::test]
 async fn identical_subscription_merge_skips_runtime_generation() {

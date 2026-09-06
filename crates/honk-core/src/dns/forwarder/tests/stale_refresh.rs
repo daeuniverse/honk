@@ -48,6 +48,58 @@ async fn test_serve_stale_on_upstream_failure() {
     assert!(stale.windows(4).any(|w| w == [93, 184, 216, 34]));
     assert_eq!(extract_min_ttl(&stale), SERVE_STALE_TTL_SECS);
 }
+#[tokio::test]
+async fn zero_ttl_replacement_revokes_fresh_and_stale_exact_entry() {
+    struct ReplacementUpstream {
+        responses: std::sync::Mutex<std::collections::VecDeque<Result<Vec<u8>, String>>>,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for ReplacementUpstream {
+        async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            match self
+                .responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .expect("scripted response")
+            {
+                Ok(mut response) => {
+                    response[0..2].copy_from_slice(&raw_query[0..2]);
+                    Ok(response)
+                }
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        }
+    }
+
+    let upstream = Arc::new(ReplacementUpstream {
+        responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+            Ok(make_a_response([192, 0, 2, 1], 300)),
+            Ok(make_a_response([192, 0, 2, 2], 0)),
+            Err("upstream down".into()),
+        ])),
+    });
+    let forwarder = DnsForwarder::new(upstream, test_cache(), test_router());
+    let query = make_a_query();
+
+    forwarder.resolve(&query).await.expect("initial positive");
+    let replacement = forwarder
+        .resolve_inner(
+            &query,
+            DnsRequestMeta::EMPTY,
+            IngressProfile::Internal,
+            true,
+            crate::dns::forwarder::ResolveMode::Compatibility,
+        )
+        .await
+        .expect("zero-TTL replacement");
+    assert!(!replacement.expiry().is_cacheable());
+    assert!(
+        forwarder.resolve(&query).await.is_err(),
+        "superseded exact response must not be served stale after a zero-TTL replacement"
+    );
+}
 
 /// A SERVFAIL answer must not shadow a recently-expired positive entry.
 #[tokio::test]

@@ -26,6 +26,10 @@ routing {
 }
 ```
 
+## MatchSet 容量
+
+每个编译后的物理路由 bank 最多有 `MAX_MATCH_SET_LEN` = 128 个 `MatchSet` slot，其中包括 fallback。发生溢出时，完整编译会在任何 map 写入前被拒绝，因此 honk 不会截断规则列表，也不会发布部分 bank。
+
 ## 条件函数
 
 | 函数 | 接受的参数 | 内部 `RoutingCondition` 字段 |

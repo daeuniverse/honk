@@ -1207,7 +1207,7 @@ impl AliveDialerSet {
     /// the authority write is held, so late feedback cannot recreate them.
     pub fn sync_active_nodes(&self, nodes: HashSet<Uuid>) {
         let mut authority = self.active_nodes.write();
-        let previous = std::mem::replace(&mut *authority, Some(nodes));
+        let previous = authority.replace(nodes);
         let current = authority
             .as_ref()
             .expect("active node authority was just installed");
@@ -1401,36 +1401,29 @@ impl AliveDialerSet {
         }
     }
 
-    /// Replace the whole custom check-URL table (config reload), same
-    /// shape as [`AliveDialerSet::sync_urltest_groups`]: `groups` is
-    /// `(group name, check_url)` for every group that has a custom
-    /// `check_url`. Entries for groups absent from `groups` are dropped;
-    /// per-(tag, url) probe state and latency data survive as long as the
-    /// URL itself is still in use by some group.
-    pub fn sync_group_check_urls(&self, groups: &[(String, String)]) {
+    /// Replace the whole custom check-URL table (config reload): `groups` is
+    /// `(group name, check_url, configured member tags)` for every group that
+    /// has a custom `check_url`. Entries for groups absent from `groups` are
+    /// dropped; per-(tag, url) probe state and latency data survive as long
+    /// as the URL and configured member tag remain in use.
+    pub fn sync_group_check_urls(&self, groups: &[(String, String, Vec<String>)]) {
         {
             let mut map = self.group_check_urls.write();
             map.clear();
-            for (group, url) in groups {
+            for (group, url, _) in groups {
                 map.insert(group.clone(), url.clone());
             }
         }
-        let active_urls: HashSet<String> = groups.iter().map(|(_, url)| url.clone()).collect();
+        let active_urls: HashSet<String> = groups.iter().map(|(_, url, _)| url.clone()).collect();
         // Keep the authority gate while pruning state. In-flight probes from a
         // retiring manager either finish before this swap or are refused by
         // the same gate and cannot recreate removed (tag, URL) entries.
-        let active_members = self.url_member_resolver.read().clone().map(|resolver| {
-            groups
-                .iter()
-                .flat_map(|(group, url)| {
-                    resolver(group)
-                        .into_iter()
-                        .map(move |(tag, _)| (tag, url.clone()))
-                })
-                .collect::<HashSet<_>>()
-        });
+        let active_members: HashSet<(String, String)> = groups
+            .iter()
+            .flat_map(|(_, url, tags)| tags.iter().cloned().map(move |tag| (tag, url.clone())))
+            .collect();
         let mut authority = self.active_url_members.write();
-        *authority = active_members;
+        *authority = Some(active_members);
         let active_members = authority.as_ref();
         self.url_check_ips
             .write()
@@ -1450,19 +1443,21 @@ impl AliveDialerSet {
         self.group_check_urls
             .read()
             .iter()
-            .map(|(g, u)| (g.clone(), u.clone()))
+            .map(|(group, url)| (group.clone(), url.clone()))
             .collect()
     }
 
-    /// Install the member-tag → leaf resolver used by custom-URL probing
-    /// (see the `group_check_urls` field docs).
+    /// Install the member-tag → current leaf resolver used by custom-URL
+    /// probing. Reload authority is supplied explicitly to
+    /// [`sync_group_check_urls`], so this resolver remains a transient probe
+    /// work-list and may deduplicate tags by their selected leaf.
     pub fn set_url_member_resolver(&self, resolver: Option<UrlMemberResolver>) {
         *self.url_member_resolver.write() = resolver;
     }
 
-    /// Resolve a custom-URL group's members to `(tag, leaf)` pairs through
-    /// the installed resolver. Empty when no resolver is installed (tests
-    /// drive the per-url state directly).
+    /// Resolve a custom check-URL group's current probe work list through the
+    /// installed resolver. Empty when no resolver is installed (tests drive
+    /// the per-url state directly).
     pub fn url_members_for(&self, group: &str) -> Vec<(String, String)> {
         self.url_member_resolver
             .read()
@@ -1507,7 +1502,10 @@ impl AliveDialerSet {
         {
             return;
         }
-        self.mark_url_probe_succeeded(node_id, url);
+        // Keep the single authority guard across both the liveness state and
+        // latency collection updates. Re-entering this fair RwLock here can
+        // deadlock when a reload writer queues between two reads.
+        self.mark_url_probe_succeeded_authorized(key.clone());
         let coll = {
             let mut cols = self.url_collections.write();
             cols.entry(key)
@@ -1516,6 +1514,26 @@ impl AliveDialerSet {
         };
         if self.is_alive_for_url(node_id, url) {
             coll.mark_available(latency);
+        }
+    }
+
+    /// Advance the URL liveness state after the caller has already admitted
+    /// the `(tag, url)` under `active_url_members`.
+    fn mark_url_probe_succeeded_authorized(&self, key: (String, String)) {
+        let mut states = self.url_states.write();
+        let e = states.entry(key).or_insert_with(UrlProbeState::new);
+        if e.alive {
+            e.consecutive_failures = 0;
+            e.consecutive_successes = 0;
+            e.cooldown_until = Instant::now();
+        } else {
+            e.consecutive_successes += 1;
+            e.consecutive_failures = 0;
+            if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
+                e.alive = true;
+                e.consecutive_successes = 0;
+                e.cooldown_until = Instant::now();
+            }
         }
     }
 
@@ -1532,21 +1550,7 @@ impl AliveDialerSet {
         {
             return;
         }
-        let mut states = self.url_states.write();
-        let e = states.entry(key).or_insert_with(UrlProbeState::new);
-        if e.alive {
-            e.consecutive_failures = 0;
-            e.consecutive_successes = 0;
-            e.cooldown_until = Instant::now();
-        } else {
-            e.consecutive_successes += 1;
-            e.consecutive_failures = 0;
-            if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
-                e.alive = true;
-                e.consecutive_successes = 0;
-                e.cooldown_until = Instant::now();
-            }
-        }
+        self.mark_url_probe_succeeded_authorized(key);
     }
 
     /// Record a failed custom-URL probe: TCP-probe parity — three

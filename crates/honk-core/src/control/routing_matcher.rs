@@ -6,23 +6,13 @@
 //! IP/MAC prefixes are stored in LPM trie maps while DNS-learned domain rules
 //! use DomainSet entries; unknown names remain a userspace decision.
 
+use crate::dns::projection::DomainRuleBitmap;
 use crate::ebpf::{EbpfBackend, LpmKeepSet, maps};
 use crate::routing::CompiledRoute;
 use honk_config::types::DialMode;
 use honk_ebpf_common::*;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use tracing::{debug, info, warn};
-
-/// Global cache of domain routing bitmaps from the last eBPF push.
-/// Keyed by rule name. DNS snooping reads this to push resolved IPs.
-pub static DOMAIN_BITMAPS: LazyLock<parking_lot::RwLock<HashMap<String, Vec<DomainRouting>>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
-
-/// Generation counter incremented on each eBPF routing push.
-/// Domain route caches use this to detect stale entries after rule reload.
-pub static DOMAIN_BITMAPS_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// A single condition present in a compiled route.
 #[derive(Debug)]
@@ -72,11 +62,9 @@ enum ConditionKind<'a> {
 pub struct RoutingPushResult {
     /// Number of MatchSet entries produced.
     pub match_set_count: usize,
-    /// Domain routing bitmaps keyed by outbound name.
-    /// DNS snooping uses these to push resolved IPs into DOMAIN_ROUTING_MAP.
-    pub domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
+    /// Domain-condition bits bound to the pinned router's rule indices.
+    pub domain_bitmaps: Vec<DomainRuleBitmap>,
 }
-
 /// LPM update plan for one ruleset generation.
 ///
 /// Entries are merged by their raw 20-byte key so that several rules
@@ -100,7 +88,7 @@ struct LpmPushPlan {
 #[derive(Debug, Clone)]
 pub struct RoutingPushPlan {
     match_sets: Vec<MatchSet>,
-    domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
+    domain_bitmaps: Vec<DomainRuleBitmap>,
     lpm: LpmPushPlan,
     group_bitmaps: RoutingGroupBitmaps,
     /// Any route references a domain-class matcher (negated or not). Modes
@@ -164,19 +152,12 @@ fn match_value_eq(left: &MatchSet, right: &MatchSet) -> bool {
     }
 }
 
-fn domain_bitmaps_eq(
-    left: &HashMap<String, Vec<DomainRouting>>,
-    right: &HashMap<String, Vec<DomainRouting>>,
-) -> bool {
+fn domain_bitmaps_eq(left: &[DomainRuleBitmap], right: &[DomainRuleBitmap]) -> bool {
     left.len() == right.len()
-        && left.iter().all(|(name, left)| {
-            right.get(name).is_some_and(|right| {
-                left.len() == right.len()
-                    && left
-                        .iter()
-                        .zip(right)
-                        .all(|(left, right)| left.bitmap == right.bitmap)
-            })
+        && left.iter().zip(right).all(|(left, right)| {
+            left.route_index == right.route_index
+                && left.negated == right.negated
+                && left.bitmap.bitmap == right.bitmap.bitmap
         })
 }
 
@@ -339,11 +320,11 @@ impl RoutingMatcherBuilder {
         // uncapped) ruleset: even a rule that never reaches the kernel bank
         // can still re-route a sniffed flow in userspace.
         let has_domain_rules = routes.iter().any(|r| r.has_domain_conditions());
-        let mut routes: Vec<&CompiledRoute> = routes.iter().collect();
-        routes.sort_by_key(|r| r.priority);
+        let mut routes: Vec<_> = routes.iter().enumerate().collect();
+        routes.sort_by_key(|(_, route)| route.priority);
 
         let mut match_sets: Vec<MatchSet> = Vec::with_capacity(routes.len() * 2);
-        let mut domain_bitmaps: HashMap<String, Vec<DomainRouting>> = HashMap::new();
+        let mut domain_bitmaps = Vec::new();
         let mut lpm_plan = LpmPushPlan::default();
         // (l4proto × ipversion) group bitmaps over logical rule indices:
         // bit N of group g is set when the MatchSet at index N within its
@@ -351,7 +332,7 @@ impl RoutingMatcherBuilder {
         let mut group_bitmaps: RoutingGroupBitmaps =
             [[0; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
 
-        for route in routes.iter() {
+        for (route_index, route) in routes {
             // Skip rules whose conditions are unsupported in eBPF.
             // Domain/geosite matching is evaluated by DNS snooping: the
             // DomainSet match type is pushed, and resolved IPs are inserted
@@ -406,10 +387,9 @@ impl RoutingMatcherBuilder {
 
             let rule_start = match_sets.len();
             Self::append_rule(
+                route_index,
                 route,
                 effective_outbound,
-                route.must,
-                route.mark,
                 &mut match_sets,
                 &mut domain_bitmaps,
                 &mut lpm_plan,
@@ -518,28 +498,21 @@ impl RoutingMatcherBuilder {
         dial_mode: DialMode,
     ) -> anyhow::Result<RoutingPushResult> {
         let plan = Self::compile(routes, outbound_name_to_id, fallback_outbound, dial_mode)?;
-        let result = Self::push_plan(ebpf, &plan)?;
-        Self::activate_projection(&plan);
-        Ok(result)
-    }
-
-    pub fn activate_projection(plan: &RoutingPushPlan) {
-        let mut domain_bitmaps = DOMAIN_BITMAPS.write();
-        *domain_bitmaps = plan.domain_bitmaps.clone();
-        DOMAIN_BITMAPS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Self::push_plan(ebpf, &plan)
     }
 
     /// Split one `CompiledRoute` into type-specific MatchSets and record the
     /// corresponding LPM updates into the push plan (no BPF map writes here).
     fn append_rule(
+        route_index: usize,
         route: &CompiledRoute,
         outbound: u8,
-        must: bool,
-        mark: u32,
         match_sets: &mut Vec<MatchSet>,
-        domain_bitmaps: &mut HashMap<String, Vec<DomainRouting>>,
+        domain_bitmaps: &mut Vec<DomainRuleBitmap>,
         lpm_plan: &mut LpmPushPlan,
     ) -> anyhow::Result<()> {
+        let must = route.must;
+        let mark = route.mark;
         let conditions = Self::collect_conditions(route);
         let n = conditions.len();
 
@@ -664,20 +637,11 @@ impl RoutingMatcherBuilder {
                 // DOMAIN_ROUTING_MAP with the bitmap pointing to this match_set.
                 ConditionKind::Domain => {
                     let idx = match_sets.len() as u32;
-                    // A negated DomainSet must NOT receive DNS-snooped bitmap
-                    // pushes: they record IPs whose domain matched the rule in
-                    // userspace, which is exactly the complement the kernel
-                    // would then veto. Leaving the bit unset makes the kernel
-                    // treat every flow as "not x", mirroring the userspace
-                    // unknown-domain semantics; the domain veto itself stays
-                    // on the userspace routing path.
-                    if not == 0 {
-                        let bitmap = Self::bitmap_for_rule(idx);
-                        domain_bitmaps
-                            .entry(route.name.clone())
-                            .or_default()
-                            .push(bitmap);
-                    }
+                    domain_bitmaps.push(DomainRuleBitmap {
+                        route_index,
+                        negated: cond.not,
+                        bitmap: Self::bitmap_for_rule(idx),
+                    });
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
                         not,
@@ -1535,7 +1499,7 @@ mod tests {
 
         assert!(plan.has_domain_rules);
         assert_eq!(plan.match_sets.len(), 2); // DomainSet + fallback
-        assert_eq!(plan.domain_bitmaps.get("full").map(Vec::len), Some(1));
+        assert_eq!(plan.domain_bitmaps[0].bitmap.bitmap[0], 1);
     }
 
     #[test]
@@ -1734,7 +1698,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.match_set_count, 2);
-        assert!(result.domain_bitmaps.contains_key("google"));
+        assert_eq!(result.domain_bitmaps[0].bitmap.bitmap[0], 1);
         assert_eq!(
             backend.active_routing_rule(0).unwrap().match_type,
             MatchType::DomainSet as u8
@@ -2367,41 +2331,49 @@ mod tests {
     }
 
     #[test]
-    fn test_negated_domain_pushes_not_domainset_without_bitmap() {
-        let route = CompiledRoute {
-            not_domain_suffixes: vec!["x.com".into()],
-            ..make_route("not-x", "proxy")
-        };
-        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
-        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-            .unwrap();
-
-        assert_eq!(plan.match_sets[0].match_type, MatchType::DomainSet as u8);
-        assert_eq!(plan.match_sets[0].not, 1);
-        assert!(
-            !plan.domain_bitmaps.contains_key("not-x"),
-            "a negated DomainSet must not receive DNS-snooped bitmap pushes"
+    fn domain_projection_tracks_conditions_instead_of_route_winners() {
+        let mut config = honk_config::parser::parse_dae_config(
+            r"routing {
+                domain(full: alpha.example) && dport(443) -> block
+                !domain(full: alpha.example) -> block
+                !domain(regex: ^beta\.example$) -> block
+                !domain(suffix: safe.example) -> block
+                domain(full: alpha.example) && dport(8443) -> block
+                fallback: direct
+            }",
+        )
+        .unwrap();
+        for rule in &mut config.routing.rules {
+            rule.name = "shared-name".into();
+        }
+        let router = std::sync::Arc::new(
+            crate::routing::Router::new(&config.routing.rules, "direct").unwrap(),
         );
-    }
-
-    #[test]
-    fn test_mixed_domain_rule_registers_only_positive_bitmap() {
-        let route = CompiledRoute {
-            domain_suffixes: vec!["google.com".into()],
-            not_domain_suffixes: vec!["mail.google.com".into()],
-            ..make_route("mixed", "proxy")
-        };
-        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
-        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-            .unwrap();
-
-        assert_eq!(plan.match_sets[0].match_type, MatchType::DomainSet as u8);
-        assert_eq!(plan.match_sets[0].not, 0);
-        assert_eq!(plan.match_sets[1].match_type, MatchType::DomainSet as u8);
-        assert_eq!(plan.match_sets[1].not, 1);
-        let bitmaps = plan.domain_bitmaps.get("mixed").unwrap();
-        assert_eq!(bitmaps.len(), 1, "only the positive DomainSet registers");
-        assert_eq!(bitmaps[0].bitmap[0], 1, "bitmap points at match_set 0");
+        let plan = RoutingMatcherBuilder::compile(
+            router.compiled_routes(),
+            &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+        let snapshot = crate::dns::runtime::RoutingProjectionSnapshot::new(
+            1,
+            router,
+            plan.result().domain_bitmaps,
+        );
+        assert_eq!(
+            snapshot.bitmap_for("alpha.example").unwrap().bitmap,
+            [1 | 4 | 32, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            snapshot.bitmap_for("beta.example").unwrap().bitmap,
+            [8, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            snapshot.bitmap_for("www.safe.example").unwrap().bitmap,
+            [16, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(snapshot.bitmap_for("unrelated.example").is_none());
     }
 
     #[test]

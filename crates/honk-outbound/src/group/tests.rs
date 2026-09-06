@@ -1826,7 +1826,7 @@ fn test_urltest_group_custom_check_url_selection() {
     let mut group = make_group("g", GroupPolicy::URLTest, vec![n1, n2]);
     group.check_url = Some(url.to_string());
     let alive = Arc::new(AliveDialerSet::new());
-    alive.sync_group_check_urls(&[("g".into(), url.into())]);
+    alive.sync_group_check_urls(&[("g".into(), url.into(), vec!["a".into(), "b".into()])]);
     let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
 
     // Global: a is faster. Per-URL: b is faster → b wins.

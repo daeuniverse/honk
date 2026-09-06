@@ -95,11 +95,10 @@ impl ControlPlane {
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
         let group_manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
-        // Custom-URL member resolution: a group's members are probed via
-        // their current picks (delay_test_members = tag → representative
-        // leaf), so sub-group members are measured through whatever leaf
-        // they currently select, and the tag keeps the result. The cell
-        // keeps working across reloads (the manager inside is swapped).
+        // Custom-URL member resolution is a transient probe work list:
+        // delay_test_members maps each configured tag to its current leaf and
+        // deduplicates shared leaves. Stable authority tags are supplied by
+        // group_check_url_registrations from the config topology above.
         let group_manager = group_manager.into_shared();
         {
             let group_manager = group_manager.clone();

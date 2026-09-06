@@ -77,7 +77,11 @@ impl ProjectionBenchmark {
         let snapshot = Arc::new(RoutingProjectionSnapshot::new(
             1,
             matcher,
-            HashMap::from([("projection-bench".to_owned(), vec![bitmap])]),
+            vec![super::projection::DomainRuleBitmap {
+                route_index: 0,
+                negated: false,
+                bitmap,
+            }],
         ));
         Self {
             replacement: ProjectionReplacementBenchmark::new(

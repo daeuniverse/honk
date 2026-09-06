@@ -187,6 +187,19 @@ impl DnsCacheService {
         self.put_exact(key, response, min_ttl);
     }
 
+    pub(crate) fn remove_exact_if_current(&self, epoch: PublicationEpoch, key: CacheKey) {
+        let registry = lock(&self.refresh_tasks);
+        if !registry.accepting_publications || registry.publication_epoch != epoch.0 {
+            return;
+        }
+        let slot = CacheSlot::Exact(key.clone());
+        let index = self.shard_index(&slot);
+        lock(&self.shards[index]).remove_positive(&slot);
+        if let Some(persister) = lock(&self.persister).clone() {
+            persister.remove(key);
+        }
+    }
+
     pub(crate) fn put_restored_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
         self.put_slot(CacheSlot::Exact(key), response.into(), min_ttl, false);
     }

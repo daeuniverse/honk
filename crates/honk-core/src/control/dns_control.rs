@@ -67,7 +67,7 @@ impl DnsController {
             routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                 0,
                 runtime_router,
-                std::collections::HashMap::new(),
+                Vec::new(),
             )),
             outbound_runtime: None,
             transport: Arc::new(NoopRuntimeTransport),

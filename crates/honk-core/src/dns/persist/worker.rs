@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::codec;
-use super::{COMMAND_CAPACITY, Command, CounterSet, PersistControlError, Put};
+use super::{COMMAND_CAPACITY, Command, CounterSet, PersistControlError, Put, Remove};
 use crate::cachedb::CacheDb;
 
 mod restore {
@@ -115,6 +115,18 @@ async fn run_loop(
                         &mut pending,
                         &counters,
                     ),
+                    Command::Remove(value) => {
+                        if let Err(error) = receive_remove(
+                            value,
+                            active_epoch,
+                            &mut pending,
+                            &counters,
+                            &db,
+                        ) {
+                            counters.db_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(%error, "DNS persistence exact removal failed");
+                        }
+                    }
                     Command::Flush { epoch, ack } => {
                         let result = flush(
                             &db,
@@ -176,6 +188,30 @@ fn receive_put(
         },
     );
     counters.pending.store(pending.len(), Ordering::Relaxed);
+}
+
+fn receive_remove(
+    value: Remove,
+    active_epoch: u64,
+    pending: &mut HashMap<String, Pending>,
+    counters: &CounterSet,
+    db: &CacheDb,
+) -> Result<(), crate::cachedb::CacheDbError> {
+    if value.epoch < active_epoch {
+        counters.old_epoch_discarded.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    let suffix = codec::key_suffix(&value.key);
+    if pending
+        .get(&suffix)
+        .is_some_and(|existing| existing.epoch > value.epoch)
+    {
+        counters.old_epoch_discarded.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    pending.remove(&suffix);
+    counters.pending.store(pending.len(), Ordering::Relaxed);
+    db.remove_dns_v2(&suffix)
 }
 
 fn write_active(

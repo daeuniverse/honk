@@ -234,7 +234,7 @@ impl ControlPlaneHandle {
         if let Some(domain) = &domain
             && Self::should_write_sniffed_domain_bitmap(handoff.as_ref(), reroute_by_sniffed_domain)
         {
-            self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+            self.push_sniffed_domain_bitmap(domain, original_dst.ip())
                 .await;
         }
 

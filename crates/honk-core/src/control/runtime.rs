@@ -239,7 +239,6 @@ impl ControlPlane {
         let plan = self.active_routing_plan.read().clone();
         match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
             Ok(_) => {
-                routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
                 self.routing_publication_dirty
                     .store(false, std::sync::atomic::Ordering::Release);
                 info!("routing publication retry succeeded");
@@ -689,6 +688,9 @@ impl ControlPlane {
                         tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
                 },
             ));
+            let period = std::time::Duration::from_secs(interval_secs);
+            let handle = alive_set.spawn_health_check_loop(period, check_timeout);
+            self.background_tasks.lock().await.push(handle);
             info!(
                 "Outbound health check loop started (interval={}s)",
                 interval_secs

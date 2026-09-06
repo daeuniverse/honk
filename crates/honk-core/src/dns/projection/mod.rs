@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -85,23 +84,31 @@ use state::DesiredState;
 
 const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
 
+/// A domain condition's kernel bits, independent of route names and winners.
+#[derive(Debug, Clone)]
+pub struct DomainRuleBitmap {
+    pub route_index: usize,
+    pub negated: bool,
+    pub bitmap: DomainRouting,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingProjectionSnapshot {
     generation: u64,
     matcher: Arc<Router>,
-    bitmaps: Arc<HashMap<String, Vec<DomainRouting>>>,
+    bitmaps: Arc<[DomainRuleBitmap]>,
 }
 
 impl RoutingProjectionSnapshot {
     pub(crate) fn new(
         generation: u64,
         matcher: Arc<Router>,
-        bitmaps: HashMap<String, Vec<DomainRouting>>,
+        bitmaps: Vec<DomainRuleBitmap>,
     ) -> Self {
         Self {
             generation,
             matcher,
-            bitmaps: Arc::new(bitmaps),
+            bitmaps: bitmaps.into(),
         }
     }
 
@@ -110,11 +117,12 @@ impl RoutingProjectionSnapshot {
     }
 
     pub(crate) fn bitmap_for(&self, domain: &str) -> Option<DomainRouting> {
-        let rule_name = self.matcher.route_domain(domain)?.rule_name;
         let mut aggregate = DomainRouting::default();
-        let bitmaps = self.bitmaps.get(rule_name)?;
-        for bitmap in bitmaps {
-            or_bitmap(&mut aggregate, bitmap);
+        for binding in self.bitmaps.iter() {
+            let route = &self.matcher.compiled_routes()[binding.route_index];
+            if route.domain_condition_matches(domain, binding.negated) {
+                or_bitmap(&mut aggregate, &binding.bitmap);
+            }
         }
         aggregate
             .bitmap

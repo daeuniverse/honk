@@ -145,6 +145,159 @@ async fn health_push_updates_every_group_sharing_nested_leaf() {
     }
 }
 
+#[test]
+fn production_health_sync_preserves_ungrouped_configured_feedback() {
+    let mut moving = udp_test_node();
+    moving.name = "moving".into();
+    moving.id = moving.derive_id();
+    let mut survivor = udp_test_node();
+    survivor.name = "survivor".into();
+    survivor.port += 1;
+    survivor.id = survivor.derive_id();
+    let mut removed = udp_test_node();
+    removed.name = "removed".into();
+    removed.port += 2;
+    removed.id = removed.derive_id();
+
+    let initial = udp_test_config(
+        "initial",
+        vec![moving.clone(), survivor.clone(), removed.clone()],
+        vec![Group {
+            name: "initial".into(),
+            nodes: vec![moving.id, removed.id],
+            ..Default::default()
+        }],
+    );
+    let alive = AliveDialerSet::new();
+    let (added, removed_count) = reload::sync_health_check_nodes(&alive, &initial);
+    assert_eq!((added, removed_count), (2, 0));
+    alive.record_probe_latency(
+        moving.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        survivor.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(20),
+    );
+    alive.record_probe_latency(
+        removed.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(30),
+    );
+
+    // The next config keeps moving in the configured node set but removes it
+    // from every group, while removed leaves the config entirely.
+    let next = udp_test_config(
+        "survivor-group",
+        vec![moving.clone(), survivor.clone()],
+        vec![Group {
+            name: "survivor-group".into(),
+            nodes: vec![survivor.id],
+            ..Default::default()
+        }],
+    );
+    let (added, removed_count) = reload::sync_health_check_nodes(&alive, &next);
+    assert_eq!((added, removed_count), (1, 2));
+    assert!(!alive.registered_nodes().contains_key(&moving.id));
+    assert!(alive.registered_nodes().contains_key(&survivor.id));
+    assert!(!alive.registered_nodes().contains_key(&removed.id));
+
+    // Ungrouped but configured nodes retain traffic/probe state and accept
+    // current feedback; a removed node cannot recreate state through a late
+    // write.
+    assert_eq!(
+        alive.get_last_latency(moving.id, ProbeDomain::Tcp, IpVersion::V4),
+        Some(Duration::from_millis(10))
+    );
+    alive.record_probe_latency(
+        moving.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(11),
+    );
+    assert_eq!(
+        alive.get_last_latency(moving.id, ProbeDomain::Tcp, IpVersion::V4),
+        Some(Duration::from_millis(11))
+    );
+    alive.record_probe_latency(
+        removed.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(31),
+    );
+    assert_eq!(
+        alive.get_last_latency(removed.id, ProbeDomain::Tcp, IpVersion::V4),
+        None
+    );
+}
+
+#[tokio::test]
+async fn custom_url_authority_survives_shared_subgroup_selection_changes() {
+    let mut first = udp_test_node();
+    first.name = "first".into();
+    let mut builtins = Config::default();
+    builtins.ensure_builtin_nodes();
+    let second = builtins
+        .nodes
+        .into_iter()
+        .find(|node| node.name == "direct")
+        .unwrap();
+    let url = "http://check.example";
+    let config = udp_test_config(
+        "parent",
+        vec![first.clone(), second.clone()],
+        vec![
+            Group {
+                name: "left".into(),
+                nodes: vec![first.id, second.id],
+                ..Default::default()
+            },
+            Group {
+                name: "right".into(),
+                nodes: vec![first.id, second.id],
+                ..Default::default()
+            },
+            Group {
+                name: "parent".into(),
+                policy: honk_config::node::GroupPolicy::URLTest,
+                groups: vec!["left".into(), "right".into()],
+                check_url: Some(url.into()),
+                ..Default::default()
+            },
+        ],
+    );
+    let manager = Arc::new(GroupManager::new(&config.groups, &config.nodes));
+    let alive = AliveDialerSet::new();
+    let resolver = Arc::clone(&manager);
+    alive.set_url_member_resolver(Some(Arc::new(move |group| {
+        resolver
+            .delay_test_members(group)
+            .into_iter()
+            .map(|(tag, node)| (tag, node.name))
+            .collect()
+    })));
+    alive.sync_group_check_urls(&reload::group_check_url_registrations(&config));
+    assert_eq!(manager.delay_test_members("parent").len(), 1);
+
+    manager.set_selector_choice("right", &second.name);
+    assert!(
+        manager
+            .delay_test_members("parent")
+            .iter()
+            .any(|(tag, node)| tag == "right" && node.id == second.id)
+    );
+    assert!(
+        alive
+            .probe_node_with_url("right", &second.name, url, Duration::from_secs(1))
+            .await
+    );
+    assert!(alive.has_url_state("right", url));
+}
 #[cfg(feature = "ebpf")]
 #[test]
 fn nfqueue_actor_queue_bounds_small_and_max_payloads() {

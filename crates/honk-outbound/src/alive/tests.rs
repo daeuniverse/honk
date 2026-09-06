@@ -937,7 +937,7 @@ fn test_url_probe_state_independence() {
 fn test_sync_group_check_urls_prunes_unused_urls() {
     let set = AliveDialerSet::new();
     let url_a = "http://a.example";
-    set.sync_group_check_urls(&[("g1".into(), url_a.into())]);
+    set.sync_group_check_urls(&[("g1".into(), url_a.into(), vec!["n1".into()])]);
     set.record_url_probe_failure("n1", url_a);
     assert!(set.has_url_state("n1", url_a));
 
@@ -1330,7 +1330,7 @@ fn custom_url_reload_prunes_removed_member_tags() {
             .then(|| vec![("live".into(), "leaf".into())])
             .unwrap_or_default()
     })));
-    set.sync_group_check_urls(&[("g".into(), url.into())]);
+    set.sync_group_check_urls(&[("g".into(), url.into(), vec!["live".into()])]);
     set.record_url_probe_failure("stale", url);
     assert!(!set.has_url_state("stale", url));
     set.record_url_probe_success("live", url, Duration::from_millis(5));

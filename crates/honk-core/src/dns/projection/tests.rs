@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +8,8 @@ use honk_ebpf_common::DomainRouting;
 use super::state::DesiredState;
 use super::worker;
 use super::{
-    ProjectionFreshness, ProjectionObservation, RoutingProjection, RoutingProjectionSnapshot,
+    DomainRuleBitmap, ProjectionFreshness, ProjectionObservation, RoutingProjection,
+    RoutingProjectionSnapshot,
 };
 use crate::ebpf::maps;
 use crate::ebpf::mock::MockEbpfBackend;
@@ -57,10 +57,18 @@ fn snapshot(generation: u64, a: u32, b: u32) -> Arc<RoutingProjectionSnapshot> {
     Arc::new(RoutingProjectionSnapshot::new(
         generation,
         Arc::new(Router::new(&routes, "direct").expect("test router")),
-        HashMap::from([
-            ("a".to_owned(), vec![bitmap(a)]),
-            ("b".to_owned(), vec![bitmap(b)]),
-        ]),
+        vec![
+            DomainRuleBitmap {
+                route_index: 0,
+                negated: false,
+                bitmap: bitmap(a),
+            },
+            DomainRuleBitmap {
+                route_index: 1,
+                negated: false,
+                bitmap: bitmap(b),
+            },
+        ],
     ))
 }
 

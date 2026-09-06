@@ -114,7 +114,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
 
     let exact_cache_key = context.cache_key.clone();
     let expiry = if strict_reusable {
-        cache::store(context, &exact_cache_key, &mut response, class).await
+        cache::store(context, &exact_cache_key, &mut response, class, status).await
     } else {
         EffectiveExpiry::do_not_cache()
     };

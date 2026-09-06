@@ -141,6 +141,9 @@ pub(super) fn encode(key: &CacheKey, response: &[u8], expire_at_unix: u64) -> En
     put_bytes(&mut bytes, response);
     EncodedEntry { suffix, bytes }
 }
+pub(super) fn key_suffix(key: &CacheKey) -> String {
+    digest_hex(&encode_key(key))
+}
 
 pub(super) fn decode(
     suffix: &str,

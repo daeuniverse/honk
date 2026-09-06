@@ -100,6 +100,31 @@ impl CompiledRoute {
             || !self.not_geosite_domains.is_empty()
             || !self.not_domain_patterns.is_empty()
     }
+
+    /// Match domain evidence before kernel negation, independently of the
+    /// connection's IP, port, process, or an earlier rule's outcome.
+    pub(crate) fn domain_condition_matches(&self, domain: &str, negated: bool) -> bool {
+        if negated {
+            return self
+                .not_domain_patterns
+                .iter()
+                .any(|re| re.is_match(domain))
+                || self.not_domain_suffixes.iter().any(|s| domain.ends_with(s))
+                || self.not_domain_keywords.iter().any(|k| domain.contains(k))
+                || (!self.not_geosite_domains.is_empty()
+                    && self.not_geosite_matcher.matches(domain));
+        }
+        let has_plain = !self.domain_patterns.is_empty()
+            || !self.domain_suffixes.is_empty()
+            || !self.domain_keywords.is_empty();
+        let has_geosite = !self.geosite_domains.is_empty();
+        (has_plain || has_geosite)
+            && (!has_plain
+                || self.domain_patterns.iter().any(|re| re.is_match(domain))
+                || self.domain_suffixes.iter().any(|s| domain.ends_with(s))
+                || self.domain_keywords.iter().any(|k| domain.contains(k)))
+            && (!has_geosite || self.geosite_matcher.matches(domain))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -599,21 +624,13 @@ impl Router {
             return false;
         }
 
-        if !route.domain_patterns.is_empty()
-            || !route.domain_suffixes.is_empty()
-            || !route.domain_keywords.is_empty()
+        if route_has_domain_condition(route)
+            && !conn
+                .domain
+                .as_deref()
+                .is_some_and(|domain| route.domain_condition_matches(domain, false))
         {
-            match conn.domain {
-                Some(ref domain) => {
-                    let dm = route.domain_patterns.iter().any(|re| re.is_match(domain))
-                        || route.domain_suffixes.iter().any(|s| domain.ends_with(s))
-                        || route.domain_keywords.iter().any(|k| domain.contains(k));
-                    if !dm {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
+            return false;
         }
 
         // IP matching (uses pre-built LPM trie for O(key_bits) lookup)
@@ -666,17 +683,6 @@ impl Router {
             }
         }
 
-        if !route.geosite_domains.is_empty() {
-            match conn.domain {
-                Some(ref domain) => {
-                    if !route.geosite_matcher.matches(domain) {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
         if !route.ip_versions.is_empty() {
             let version = if conn.dst_ip.is_ipv4() { 4 } else { 6 };
             if !route.ip_versions.contains(&version) {
@@ -718,17 +724,10 @@ impl Router {
     /// An absent domain cannot prove a negated domain/geosite matcher, so it
     /// never vetoes — "cannot prove it is x" counts as "is not x" (dae).
     fn negated_hit(route: &CompiledRoute, conn: &ConnectionInfo) -> bool {
-        if let Some(ref domain) = conn.domain
-            && (route
-                .not_domain_patterns
-                .iter()
-                .any(|re| re.is_match(domain))
-                || route
-                    .not_domain_suffixes
-                    .iter()
-                    .any(|s| domain.ends_with(s))
-                || route.not_domain_keywords.iter().any(|k| domain.contains(k))
-                || route.not_geosite_matcher.matches(domain))
+        if conn
+            .domain
+            .as_deref()
+            .is_some_and(|domain| route.domain_condition_matches(domain, true))
         {
             return true;
         }

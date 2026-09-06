@@ -256,60 +256,45 @@ impl ControlPlaneHandle {
         }
     }
 
-    /// Publish the matched sniffed-domain bitmap so later route-time
-    /// decisions can use the learned destination IP. Best-effort: a write
-    /// failure never fails the flow.
-    pub(super) async fn push_sniffed_domain_bitmap(
+    /// Publish sniffed domain evidence through the same pinned matcher as DNS.
+    /// Reload publishes the replacement snapshot under the backend lock, so
+    /// a writer waiting on that lock must recheck its snapshot before mutation.
+    pub(in crate::control) async fn push_sniffed_domain_bitmap(
         &self,
-        conn_info: &ConnectionInfo,
         domain: &str,
         dst_ip: std::net::IpAddr,
     ) {
-        let (rule_name, bitmaps, bitmap_generation) = {
-            let router = self.router.read().await;
-            match router.route_full(conn_info) {
-                Some(matched) => {
-                    let rule_name = matched.rule_name.to_string();
-                    let (bitmaps, generation) = {
-                        let db = DOMAIN_BITMAPS.read();
-                        let generation = crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        (db.get(&rule_name).cloned().unwrap_or_default(), generation)
-                    };
-                    (rule_name, bitmaps, generation)
-                }
-                None => return,
-            }
+        let provider = self.dns_controller.runtime_provider();
+        let snapshot = {
+            let lease = provider.acquire();
+            Arc::clone(lease.runtime().routing_projection())
         };
-        if bitmaps.is_empty() {
-            return;
-        }
-        let mut merged = DomainRouting::default();
-        for bm in &bitmaps {
-            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                *word |= value;
-            }
-        }
-        let prefix_len = if dst_ip.is_ipv4() { 32 } else { 128 };
-        let prefix = format!("{dst_ip}/{prefix_len}");
-        let Ok(lpm_key) = cidr_to_lpm_key(&prefix) else {
+        self.push_sniffed_domain_bitmap_in_snapshot(domain, dst_ip, &provider, &snapshot)
+            .await;
+    }
+
+    pub(in crate::control) async fn push_sniffed_domain_bitmap_in_snapshot(
+        &self,
+        domain: &str,
+        dst_ip: std::net::IpAddr,
+        provider: &crate::dns::runtime::DnsServiceProvider,
+        snapshot: &Arc<crate::dns::runtime::RoutingProjectionSnapshot>,
+    ) {
+        let Some(bitmap) = snapshot.bitmap_for(domain) else {
             return;
         };
         let mut ebpf = self.ebpf.write().await;
-        if crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
-            .load(std::sync::atomic::Ordering::Acquire)
-            != bitmap_generation
-        {
+        if !Arc::ptr_eq(snapshot, provider.acquire().runtime().routing_projection()) {
             return;
         }
-        match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
-            Ok(()) => debug!(
-                "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
-                dst_ip, domain, rule_name
-            ),
+        let key = crate::ebpf::maps::ip_addr_to_lpm_key(dst_ip);
+        match ebpf.add_domain_ip_bitmap(&key, &bitmap) {
+            Ok(()) => debug!(%dst_ip, domain, "DOMAIN_ROUTING_MAP updated from sniffed domain"),
             Err(error) => warn!(
-                "Failed to update DOMAIN_ROUTING_MAP for {} ({}): {}",
-                dst_ip, domain, error
+                %dst_ip,
+                domain,
+                %error,
+                "Failed to update DOMAIN_ROUTING_MAP"
             ),
         }
     }

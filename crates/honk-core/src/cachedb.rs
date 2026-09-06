@@ -124,8 +124,25 @@ fn run_writer(mut conn: Connection, receiver: mpsc::Receiver<Write>) {
                 .map_err(CacheDbError::from);
                 let _ = ack.send(result);
             }
+            Write::RemoveDnsV2(key, ack) => {
+                let result = flush(&mut conn, &mut latest)
+                    .and_then(|_| {
+                        conn.execute("DELETE FROM kv WHERE key = ?1", params![key])
+                            .map(|_| ())
+                    })
+                    .map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
             Write::FlushDns(legacy, v2, ack) => {
-                let result = flush(&mut conn, &mut latest).and_then(|_| conn.execute("DELETE FROM kv WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'", params![format!("{legacy}%"), format!("{v2}%")]).map(|_| ())).map_err(CacheDbError::from);
+                let result = flush(&mut conn, &mut latest)
+                    .and_then(|_| {
+                        conn.execute(
+                            "DELETE FROM kv WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'",
+                            params![format!("{legacy}%"), format!("{v2}%")],
+                        )
+                        .map(|_| ())
+                    })
+                    .map_err(CacheDbError::from);
                 let _ = ack.send(result);
             }
             #[cfg(test)]
@@ -150,6 +167,7 @@ fn run_writer(mut conn: Connection, receiver: mpsc::Receiver<Write>) {
 enum Write {
     Set(String, String),
     Remove(String),
+    RemoveDnsV2(String, mpsc::Sender<Result<(), CacheDbError>>),
     FlushPrefix(String, mpsc::Sender<Result<(), CacheDbError>>),
     Barrier(mpsc::Sender<Result<(), CacheDbError>>),
     DnsV2(
@@ -414,6 +432,17 @@ impl CacheDb {
                     .iter()
                     .map(|(suffix, value)| (self.wrap(&format!("dns:v2:{suffix}")), value.clone()))
                     .collect(),
+                ack,
+            ))
+            .map_err(|_| CacheDbError::LockPoisoned)?;
+        result.recv().map_err(|_| CacheDbError::LockPoisoned)?
+    }
+
+    pub(crate) fn remove_dns_v2(&self, suffix: &str) -> Result<(), CacheDbError> {
+        let (ack, result) = mpsc::channel();
+        self.writer
+            .send(Write::RemoveDnsV2(
+                self.wrap(&format!("dns:v2:{suffix}")),
                 ack,
             ))
             .map_err(|_| CacheDbError::LockPoisoned)?;

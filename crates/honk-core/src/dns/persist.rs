@@ -89,8 +89,14 @@ struct Put {
     expire_at_unix: u64,
 }
 
+struct Remove {
+    epoch: u64,
+    key: CacheKey,
+}
+
 enum Command {
     Put(Put),
+    Remove(Remove),
     Flush {
         epoch: u64,
         ack: oneshot::Sender<Result<(), PersistControlError>>,
@@ -186,6 +192,32 @@ impl DnsCachePersister {
                 self.counters.dropped_closed.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::PersistenceDrop);
                 tracing::debug!(reason = "worker_closed", "DNS persistence write dropped");
+            }
+        }
+    }
+
+    pub(crate) fn remove(&self, key: CacheKey) {
+        let command = Command::Remove(Remove {
+            epoch: self.epoch.load(Ordering::SeqCst),
+            key,
+        });
+        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                self.counters.dropped_full.fetch_add(1, Ordering::Relaxed);
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::PersistenceDrop);
+                tracing::debug!(
+                    reason = "command_queue_full",
+                    "DNS persistence removal dropped"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                self.counters.dropped_closed.fetch_add(1, Ordering::Relaxed);
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::PersistenceDrop);
+                tracing::debug!(reason = "worker_closed", "DNS persistence removal dropped");
             }
         }
     }
