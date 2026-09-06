@@ -21,17 +21,15 @@ use crate::{
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::{
-        __sk_buff, BPF_FIB_LKUP_RET_NOT_FWDED, bpf_fib_lookup as BpfFibLookup, bpf_sock_tuple,
-        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
+        __sk_buff, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
+        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
-    helpers::{
-        bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_store_bytes,
-    },
+    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_store_bytes},
 };
 use honk_ebpf_common::{
     CLASSIFIED_MARK, DATAPATH_FLAG_NFQ_ENABLED, DATAPATH_FLAG_NFQ_READY, IpVersionType,
-    NFQUEUE_PENDING_MARK, NFQUEUE_SIGNATURE_MARK, RedirectEntry, RedirectTuple, RoutingMeta,
-    TPROXY_MARK,
+    LocalAddressKey, NFQUEUE_PENDING_MARK, NFQUEUE_SIGNATURE_MARK, RedirectEntry, RedirectTuple,
+    RoutingMeta, TPROXY_MARK,
     conn::{BpfStatsKey, ConnState, UdpDecisionState},
     pack_nfqueue_mark,
     redirect_need::{RoutingHandoffEntry, TuplesKey},
@@ -44,8 +42,8 @@ use network_types::{
 
 use crate::{
     maps::{
-        OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
-        ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP, increment_bpf_stat,
+        LOCAL_ADDRESS_MAP, OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK,
+        ROUTE_CTX_SCRATCH_MAP, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP, increment_bpf_stat,
     },
     route::{
         OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT, RouteCtx, RouteStateFlags,
@@ -57,8 +55,6 @@ use crate::{
     },
 };
 const IPV6_BYTE_LENGTH: usize = 16;
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
 
 /// Handoff write modes for [`redirect_lan_packet_to_control_plane`].
 ///
@@ -445,44 +441,32 @@ fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16)
     }
 }
 
-/// Confirm that a wildcard socket match names a host-local route. Socket
-/// lookup also matches forwarded destinations; only `NOT_FWDED` is eligible
-/// after the earlier broadcast/multicast rejection. Every forwarded or
-/// ambiguous FIB result stays on the transparent routing path.
+/// Confirm that a wildcard socket match names a published host-local address.
+/// Globally-scoped addresses use an interface-independent key. Link-local
+/// addresses must additionally match the ingress interface, because the same
+/// bytes may be assigned independently on multiple interfaces.
 #[inline(always)]
 fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> bool {
-    let mut fib: BpfFibLookup = unsafe { mem::zeroed() };
-    fib.family = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-        AF_INET
+    let address = unsafe { pkt.tuples.five.dst_ip.u6_addr32 };
+    let bytes = pkt.tuples.five.dst_ip.as_bytes();
+    let is_link_local = if pkt.tuples.five.dst_ip.is_v4_mapped() {
+        bytes[12] == 169 && bytes[13] == 254
     } else {
-        AF_INET6
+        bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80
     };
-    fib.l4_protocol = pkt.l4proto;
-    fib.sport = pkt.tuples.five.src_port.to_be();
-    fib.dport = pkt.tuples.five.dst_port.to_be();
-    fib.ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    unsafe {
-        fib.__bindgen_anon_1.tot_len = (*ctx.skb.skb).len as u16;
-        if fib.family == AF_INET {
-            fib.__bindgen_anon_2.tos = pkt.tuples.dscp << 2;
-        }
-        if fib.family == AF_INET {
-            fib.__bindgen_anon_3.ipv4_src = pkt.tuples.five.src_ip.u6_addr32[3];
-            fib.__bindgen_anon_4.ipv4_dst = pkt.tuples.five.dst_ip.u6_addr32[3];
-        } else {
-            fib.__bindgen_anon_3.ipv6_src = pkt.tuples.five.src_ip.u6_addr32;
-            fib.__bindgen_anon_4.ipv6_dst = pkt.tuples.five.dst_ip.u6_addr32;
-        }
+    let ifindex = if is_link_local {
+        unsafe { (*ctx.skb.skb).ifindex }
+    } else {
+        0
+    };
+    if is_link_local && ifindex == 0 {
+        return false;
     }
-    let result = unsafe {
-        bpf_fib_lookup(
-            ctx.skb.skb as *mut c_void,
-            &mut fib,
-            mem::size_of::<BpfFibLookup>() as i32,
-            0,
-        )
+    let key = LocalAddressKey {
+        ifindex,
+        addr: address,
     };
-    result == BPF_FIB_LKUP_RET_NOT_FWDED as c_long
+    unsafe { LOCAL_ADDRESS_MAP.get(&key) }.is_some()
 }
 
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain

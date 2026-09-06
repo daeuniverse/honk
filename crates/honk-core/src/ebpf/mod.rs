@@ -400,6 +400,11 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
+    /// Replace the bounded set of exact host-local addresses used to validate
+    /// wildcard socket ownership in the TC ingress path. Keys use the shared
+    /// scoped `LocalAddressKey` ABI.
+    fn replace_local_addresses(&mut self, addresses: &[LocalAddressKey]) -> anyhow::Result<()>;
+
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 
     /// Attach TC programs to a configured interface that appeared after

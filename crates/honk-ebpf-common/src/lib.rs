@@ -101,6 +101,30 @@ pub const MAX_LPM_NUM: u32 = MAX_MATCH_SET_LEN + 8;
 pub const MAX_DST_MAPPING_NUM: u32 = 65536 * 2;
 pub const MAX_COOKIE_PID_NUM: u32 = 65536;
 pub const MAX_DOMAIN_ROUTING_NUM: u32 = 65536;
+/// Maximum host-local addresses published to the TC locality decision map.
+pub const MAX_LOCAL_ADDRESSES: u32 = 1024;
+
+/// Key for the exact host-local address map consumed by TC wildcard probes.
+/// A zero `ifindex` means the address is globally scoped; link-local
+/// addresses carry their owning interface index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct LocalAddressKey {
+    pub ifindex: u32,
+    /// Network-byte-order address bytes stored as four native `u32` words.
+    pub addr: [u32; 4],
+}
+
+const _LOCAL_ADDRESS_KEY_SIZE: () = assert!(core::mem::size_of::<LocalAddressKey>() == 20);
+const _LOCAL_ADDRESS_KEY_ALIGN: () =
+    assert!(core::mem::align_of::<LocalAddressKey>() == core::mem::align_of::<u32>());
+const _LOCAL_ADDRESS_KEY_IFINDEX_OFFSET: () =
+    assert!(core::mem::offset_of!(LocalAddressKey, ifindex) == 0);
+const _LOCAL_ADDRESS_KEY_ADDR_OFFSET: () =
+    assert!(core::mem::offset_of!(LocalAddressKey, addr) == 4);
+
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for LocalAddressKey {}
 
 // Rust struct with a memory layout identical to the C struct.
 #[repr(C)]

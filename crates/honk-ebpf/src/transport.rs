@@ -407,8 +407,8 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    // The M bit or a non-zero offset identifies a fragmented
-                    // datagram.  Keep the whole datagram on the native path.
+                    // Return the explicit fragment sentinel; callers own the
+                    // drop/pass policy for the complete datagram.
                     if u16::from_be(fragh.frag_off) & 0xFFF9 != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
@@ -605,8 +605,8 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    // Pass all non-atomic fragmented datagrams through; the
-                    // first fragment must not be routed without its followers.
+                    // Return the explicit fragment sentinel; callers own the
+                    // drop/pass policy for the complete datagram.
                     if u16::from_be(fragh.frag_off) & 0xFFF9 != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }

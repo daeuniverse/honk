@@ -796,6 +796,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 single_homed,
             )
             .await?;
+            ebpf::EbpfBackend::replace_local_addresses(
+                &mut backend,
+                &ebpf::real::host_local_address_keys()?,
+            )?;
 
             let ifindex_of = |name: &str| -> Option<u32> {
                 std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))

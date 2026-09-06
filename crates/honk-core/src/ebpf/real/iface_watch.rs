@@ -14,6 +14,7 @@ use tokio::sync::{RwLock, watch};
 use tracing::{debug, info, warn};
 
 use crate::ebpf::{DynamicHooks, EbpfBackend, IfaceRole};
+use honk_ebpf_common::LocalAddressKey;
 
 // A captive-portal login may add only a default route to an already-up link.
 const RTMGRP_LINK_MASK: u32 = 1;
@@ -46,7 +47,7 @@ pub type AttachedMap = HashMap<String, AttachedInterface>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkState {
     default_interface: Option<String>,
-    local_cidrs: Vec<String>,
+    local_addresses: Vec<LocalAddressKey>,
 }
 
 pub struct IfaceWatcher {
@@ -104,6 +105,43 @@ fn subscribe_network_events() -> std::io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Enumerate current host addresses through the shared getifaddrs authority.
+/// Global addresses use an interface-independent key; link-local addresses
+/// retain their owning interface index to preserve scope semantics.
+pub(crate) fn host_local_address_keys() -> anyhow::Result<Vec<LocalAddressKey>> {
+    let mut keys = Vec::new();
+    for (ifname, address) in honk_config::config::host_interface_addresses()
+        .map_err(|error| anyhow::anyhow!("getifaddrs: {error}"))?
+    {
+        let link_local = match address {
+            std::net::IpAddr::V4(address) => {
+                let octets = address.octets();
+                octets[0] == 169 && octets[1] == 254
+            }
+            std::net::IpAddr::V6(address) => {
+                let octets = address.octets();
+                octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
+            }
+        };
+        let ifindex = if link_local {
+            let Some(ifindex) = iface_address_ifindex(&ifname) else {
+                continue;
+            };
+            ifindex
+        } else {
+            0
+        };
+        let key = crate::ebpf::maps::ip_addr_to_lpm_key(address);
+        keys.push(LocalAddressKey {
+            ifindex,
+            addr: key.data,
+        });
+    }
+    keys.sort_unstable_by_key(|key| (key.ifindex, key.addr));
+    keys.dedup();
+    Ok(keys)
+}
+
 async fn run(
     fd: OwnedFd,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
@@ -123,17 +161,21 @@ async fn run(
     let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
-    let mut network_state = read_network_state(&config).await;
+    let mut network_state = read_network_state();
 
     // Startup rule generation may have run before this interface became
     // ready; the control-plane refresh is content-deduplicated.
-    reconcile_and_notify(&ebpf, &config, &commands, &mut attached, true).await;
+    if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, true).await {
+        return;
+    }
     loop {
         tokio::select! {
             _ = stop.changed() => break,
             _ = ticker.tick() => {
-                let changed = update_network_state(&config, &mut network_state).await;
-                reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await;
+                let changed = update_network_state(&mut network_state);
+                if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await {
+                    break;
+                }
             }
             guard = async_fd.readable() => {
                 // A transient read failure (ENOBUFS after a burst) must not
@@ -166,8 +208,10 @@ async fn run(
                 match drained {
                     Ok(Ok(())) => {
                         guard.clear_ready();
-                        let changed = update_network_state(&config, &mut network_state).await;
-                        reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await;
+                        let changed = update_network_state(&mut network_state);
+                        if !reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await {
+                            break;
+                        }
                     }
                     Ok(Err(e)) => {
                         warn!("interface watcher: netlink recv failed: {}", e);
@@ -182,19 +226,15 @@ async fn run(
     debug!("interface watcher stopped");
 }
 
-async fn read_network_state(config: &Arc<RwLock<Arc<honk_config::Config>>>) -> NetworkState {
-    let config = config.read().await;
+fn read_network_state() -> NetworkState {
     NetworkState {
         default_interface: crate::detect_default_interface(),
-        local_cidrs: config.local_direct_cidrs(),
+        local_addresses: host_local_address_keys().unwrap_or_default(),
     }
 }
 
-async fn update_network_state(
-    config: &Arc<RwLock<Arc<honk_config::Config>>>,
-    current: &mut NetworkState,
-) -> bool {
-    let next = read_network_state(config).await;
+fn update_network_state(current: &mut NetworkState) -> bool {
+    let next = read_network_state();
     if *current == next {
         return false;
     }
@@ -208,7 +248,40 @@ async fn reconcile_and_notify(
     commands: &tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     attached: &mut AttachedMap,
     network_state_changed: bool,
-) {
+) -> bool {
+    let local_addresses = match host_local_address_keys() {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            warn!(
+                "failed to enumerate local addresses: {}; revoking authority",
+                error
+            );
+            Vec::new()
+        }
+    };
+    let publication = ebpf.write().await.replace_local_addresses(&local_addresses);
+    if let Err(error) = publication {
+        warn!(
+            "failed to publish local address evidence: {}; revoking authority",
+            error
+        );
+        let revocation = ebpf.write().await.replace_local_addresses(&[]);
+        if let Err(revoke_error) = revocation {
+            warn!(
+                "failed to revoke local address evidence: {}; disabling datapath",
+                revoke_error
+            );
+            let _ = ebpf.write().await.set_datapath_ready(false);
+            if commands
+                .send(crate::control::ControlCommand::Shutdown)
+                .await
+                .is_err()
+            {
+                warn!("control plane stopped before locality-failure shutdown");
+            }
+            return false;
+        }
+    }
     if (reconcile(ebpf, config, attached).await || network_state_changed)
         && commands
             .send(crate::control::ControlCommand::NetworkChanged)
@@ -217,6 +290,7 @@ async fn reconcile_and_notify(
     {
         debug!("control plane stopped before network-change refresh");
     }
+    true
 }
 
 async fn reconcile(
@@ -355,6 +429,12 @@ fn iface_is_up(name: &str) -> bool {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .is_some_and(|flags| flags & IFF_UP != 0)
+}
+
+fn iface_address_ifindex(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (ifindex != 0).then_some(ifindex)
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use super::{
 };
 use async_trait::async_trait;
 use honk_ebpf_common::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockRoutingSnapshot {
@@ -158,6 +158,9 @@ pub struct MockEbpfBackend {
     pub source_lpm_bitmap: HashMap<[u8; 20], DomainRouting>,
     /// MAC LPM routing bitmap: LpmKey → DomainRouting
     pub mac_lpm_bitmap: HashMap<[u8; 20], DomainRouting>,
+
+    /// Exact host-local addresses published by the interface watcher.
+    pub local_addresses: HashMap<LocalAddressKey, u8>,
     /// TCP connection states (TuplesKey → ConnState)
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
@@ -640,6 +643,21 @@ impl EbpfBackend for MockEbpfBackend {
         _udp6_fds: &[std::os::fd::RawFd],
     ) -> anyhow::Result<()> {
         self.listener_sockets_published = true;
+        Ok(())
+    }
+
+    fn replace_local_addresses(&mut self, addresses: &[LocalAddressKey]) -> anyhow::Result<()> {
+        let desired: HashSet<LocalAddressKey> = addresses.iter().copied().collect();
+        anyhow::ensure!(
+            desired.len() <= MAX_LOCAL_ADDRESSES as usize,
+            "LOCAL_ADDRESS_MAP capacity exceeded: {} > {}",
+            desired.len(),
+            MAX_LOCAL_ADDRESSES
+        );
+        self.local_addresses.retain(|key, _| desired.contains(key));
+        for key in desired {
+            self.local_addresses.insert(key, 1);
+        }
         Ok(())
     }
 
@@ -1648,6 +1666,24 @@ mod tests {
             Some(12345)
         );
         assert_eq!(backend.get_param(ParamKey::ControlPlanePid).unwrap(), None);
+    }
+
+    #[test]
+    fn local_address_publication_replaces_stale_and_scopes_link_local() {
+        let mut backend = MockEbpfBackend::new();
+        let global = LocalAddressKey {
+            ifindex: 0,
+            addr: [0, 0, 0xffff0000, 0x0100007f],
+        };
+        let scoped = LocalAddressKey {
+            ifindex: 7,
+            addr: [0, 0, 0xffff0000, 0x0100fea9],
+        };
+        backend.replace_local_addresses(&[global, scoped]).unwrap();
+        assert_eq!(backend.local_addresses.len(), 2);
+        backend.replace_local_addresses(&[global]).unwrap();
+        assert_eq!(backend.local_addresses.get(&global), Some(&1));
+        assert!(!backend.local_addresses.contains_key(&scoped));
     }
 
     #[test]

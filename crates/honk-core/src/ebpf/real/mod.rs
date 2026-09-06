@@ -5,6 +5,7 @@ use aya::maps::{
     MapError, PerCpuArray as AyaPerCpuArray, PerCpuValues, SockMap as AyaSockMap,
 };
 use aya::{Ebpf, EbpfLoader, Pod};
+use std::collections::HashSet;
 
 use honk_ebpf_common::*;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
@@ -117,8 +118,8 @@ mod events;
 mod iface_watch;
 mod process_name;
 mod syscall;
-
 pub use events::*;
+pub(crate) use iface_watch::host_local_address_keys;
 pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
 use syscall::{
     LookupAndDelete, bpf_delete_batch, bpf_delete_shared, bpf_lookup_and_delete,
@@ -1533,6 +1534,42 @@ impl EbpfBackend for RealEbpfBackend {
             }
         }
         self.listeners_published = true;
+        Ok(())
+    }
+
+    fn replace_local_addresses(&mut self, addresses: &[LocalAddressKey]) -> anyhow::Result<()> {
+        // Raw batch scans require the override object's exact key/value ABI.
+        let _ = self.hash_map::<LocalAddressKey, u8>("LOCAL_ADDRESS_MAP")?;
+        let desired: HashSet<LocalAddressKey> = addresses.iter().copied().collect();
+        anyhow::ensure!(
+            desired.len() <= MAX_LOCAL_ADDRESSES as usize,
+            "LOCAL_ADDRESS_MAP capacity exceeded: {} > {}",
+            desired.len(),
+            MAX_LOCAL_ADDRESSES
+        );
+
+        let mut current = Vec::new();
+        self.map_snapshot::<LocalAddressKey, u8>("LOCAL_ADDRESS_MAP", &mut current)?;
+        // Remove first: replacing a full map must not fail merely because old
+        // entries temporarily occupy slots needed by the new generation.
+        for (key, _) in &current {
+            if !desired.contains(key) {
+                self.hash_remove::<LocalAddressKey, u8>("LOCAL_ADDRESS_MAP", key)?;
+            }
+        }
+        for key in &desired {
+            if let Err(error) = self.hash_insert("LOCAL_ADDRESS_MAP", key, &1u8) {
+                let revoke = self.replace_local_addresses(&[]);
+                return match revoke {
+                    Ok(()) => Err(anyhow::anyhow!(
+                        "LOCAL_ADDRESS_MAP update failed; authority revoked: {error}"
+                    )),
+                    Err(revoke_error) => Err(anyhow::anyhow!(
+                        "LOCAL_ADDRESS_MAP update failed ({error}); revocation failed ({revoke_error})"
+                    )),
+                };
+            }
+        }
         Ok(())
     }
 

@@ -43,7 +43,7 @@ The standalone listener has these lifecycle and admission invariants:
 - A semantic `dns.bind` change on SIGHUP is restart-required. An unchanged listener continues through the newly published DNS generation.
 - Standalone requests pass `original_dst=None`; selecting `asis` therefore produces a DNS failure (`SERVFAIL`) rather than dialing the listener recursively.
 
-A bound local `:53` listener takes precedence over transparent interception independently for TCP and UDP. A specific-address bind wins for that transport. A wildcard bind wins only when the full FIB lookup reports `NOT_FWDED`, preventing remote resolver traffic from bypassing transparent DNS. Leaving `dns.bind` empty preserves transparent TCP and UDP interception.
+A bound local `:53` listener takes precedence over transparent interception independently for TCP and UDP. A specific-address bind wins for that transport. A wildcard bind additionally requires the destination in the current host-interface address map, preventing remote and no-route destinations from bypassing transparent DNS. Leaving `dns.bind` empty preserves transparent TCP and UDP interception.
 
 ## DNS ownership state machine
 
@@ -73,7 +73,7 @@ gateway:53 packet
   -> otherwise ordinary kernel routing / no DNS service
 ```
 
-The local-listener check is per TCP/UDP transport. A specifically addressed local `:53` socket wins. A wildcard socket wins only when the complete FIB lookup says `NOT_FWDED`; a forwarded or ambiguous destination remains on the transparent path. Therefore, stopping dnsmasq does not make Honk `:54` automatically own `:53`: the observed takeover is transparent interception. To make Honk the ordinary gateway `:53` service, stop or move dnsmasq and configure `bind` for `tcp+udp://:53`.
+The local-listener check is per TCP/UDP transport. A specifically addressed local `:53` socket wins. A wildcard socket also requires a known host-interface destination address; remote, unknown, and no-route destinations remain on the transparent path. Therefore, stopping dnsmasq does not make Honk `:54` automatically own `:53`: the observed takeover is transparent interception. To make Honk the ordinary gateway `:53` service, stop or move dnsmasq and configure `bind` for `tcp+udp://:53`.
 
 The common OpenWrt forwarding state is:
 

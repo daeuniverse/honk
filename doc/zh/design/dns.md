@@ -43,7 +43,7 @@ flowchart LR
 - SIGHUP 中 `dns.bind` 的语义变化要求重启。未变化的监听器继续使用新发布的 DNS generation。
 - 独立请求传入 `original_dst=None`；选择 `asis` 因而产生 DNS 失败（`SERVFAIL`），不会递归拨回监听器。
 
-已绑定的本地 `:53` 监听器按 TCP、UDP transport 分别优先于透明拦截。具体地址的 bind 对相应 transport 优先。通配 bind 仅在完整 FIB 查询报告 `NOT_FWDED` 时优先，避免远程 resolver 流量绕过透明 DNS。将 `dns.bind` 留空会保留透明 TCP 与 UDP 拦截。
+已绑定的本地 `:53` 监听器按 TCP、UDP transport 分别优先于透明拦截。具体地址的 bind 对相应 transport 优先。通配 bind 还要求目的地址存在于当前宿主接口地址表，避免远程及无路由的目的地址绕过透明 DNS。将 `dns.bind` 留空会保留透明 TCP 与 UDP 拦截。
 
 ## DNS 所有权状态机
 
@@ -73,7 +73,7 @@ gateway:53 数据包
   -> 否则普通内核路由 / 没有 DNS 服务
 ```
 
-本地 listener 检查按 TCP、UDP transport 分开执行。具体地址的本地 `:53` socket 优先；通配 socket 只有在完整 FIB 查询报告 `NOT_FWDED` 时优先，转发或结果不明确的目的地址仍走透明路径。因此，停止 dnsmasq 不会让 Honk `:54` 自动占用 `:53`；实际观察到的接管来自透明拦截。若要让 Honk 成为普通网关 `:53` 服务，应停止或迁移 dnsmasq，并将 `bind` 配置为 `tcp+udp://:53`。
+本地 listener 检查按 TCP、UDP transport 分开执行。具体地址的本地 `:53` socket 优先；通配 socket 还要求目的地址是已知宿主接口地址，远程、未知及无路由的目的地址仍走透明路径。因此，停止 dnsmasq 不会让 Honk `:54` 自动占用 `:53`；实际观察到的接管来自透明拦截。若要让 Honk 成为普通网关 `:53` 服务，应停止或迁移 dnsmasq，并将 `bind` 配置为 `tcp+udp://:53`。
 
 OpenWrt 最常见的转发状态是：
 

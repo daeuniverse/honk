@@ -126,7 +126,7 @@ TC-side local-socket probes run in the current ingress network namespace (the ho
 
 LAN TCP and UDP with destination port `53` bypass the routing loop and go directly to the control plane. Port `53` is also exempt from LAN outbound-health drops so userspace DNS can apply its own fallback.
 
-The local-socket probe runs before this fast path and is transport-specific. A specifically bound UDP socket, or a TCP socket in `LISTEN` state, wins for its transport. A wildcard match wins only when a full FIB lookup returns `NOT_FWDED`; socket lookup alone also matches forwarded destinations. The listener-mark check excludes honk's own transparent listener from this precedence rule. Thus a local `dns.bind` listener can own host-local `:53` while remote resolver traffic still follows transparent DNS.
+The local-socket probe runs before this fast path and is transport-specific. A specifically bound UDP socket, or a TCP socket in `LISTEN` state, wins for its transport. A wildcard match additionally requires the destination in `LOCAL_ADDRESS_MAP`, populated from host interface addresses before admission and refreshed on network changes; link-local entries are scoped to the ingress interface. A missing route is not proof of locality. The listener-mark check excludes honk's own transparent listener from this precedence rule. Thus a local `dns.bind` listener can own host-local `:53` while remote resolver traffic still follows transparent DNS.
 
 ### Special and internal traffic
 

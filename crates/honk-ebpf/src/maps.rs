@@ -13,7 +13,9 @@ use honk_ebpf_common::redirect_need::{
 use honk_ebpf_common::route::{
     MatchSet, ROUTING_GROUP_META_MAP_LEN, ROUTING_META_MAP_LEN, RoutingGroupMeta,
 };
-use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
+use honk_ebpf_common::{
+    DaeParam, LocalAddressKey, MAX_LOCAL_ADDRESSES, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple,
+};
 
 use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
@@ -66,6 +68,13 @@ pub static OUTBOUND_CONNECTIVITY_MAP: Array<u64, 1536, 0> = Array::new();
 
 #[btf_map]
 pub static LISTEN_SOCKET_MAP: SockMap<16> = SockMap::new();
+
+/// Exact host-local addresses published by userspace from the interface
+/// address watcher. Wildcard listener probes must not infer locality from
+/// the ambiguous FIB `NOT_FWDED` result.
+#[btf_map]
+pub static LOCAL_ADDRESS_MAP: HashMap<LocalAddressKey, u8, { MAX_LOCAL_ADDRESSES as usize }, 1> =
+    HashMap::new();
 
 #[btf_map]
 pub static DATAPATH_STATE_MAP: Array<u32, 1, 0> = Array::new();
