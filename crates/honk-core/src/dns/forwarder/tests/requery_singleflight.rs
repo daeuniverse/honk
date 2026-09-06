@@ -58,8 +58,8 @@ async fn concurrent_response_requery_is_one_logical_flight() {
         .expect("router"),
     );
     let cache = test_cache();
-    let flights = cache.lock().await.singleflight();
     let forwarder = Arc::new(DnsForwarder::new(upstream.clone(), cache, router));
+    let flights = forwarder.singleflight();
     let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
     let mut tasks = tokio::task::JoinSet::new();
     for txid in 1..=CALLERS {
@@ -164,7 +164,7 @@ async fn response_requery_failure_is_shared_then_a_new_query_can_retry() {
         .expect("router"),
     );
     let forwarder = Arc::new(DnsForwarder::new(upstream.clone(), test_cache(), router));
-    let service = forwarder.cache_service().await;
+    let flights = forwarder.singleflight();
     let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..CALLERS {
@@ -178,7 +178,7 @@ async fn response_requery_failure_is_shared_then_a_new_query_can_retry() {
     start.wait().await;
     tokio::time::timeout(Duration::from_secs(1), async {
         upstream.initial_entered.notified().await;
-        while service.flight_counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+        while flights.counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
             tokio::task::yield_now().await;
         }
     })
@@ -202,5 +202,5 @@ async fn response_requery_failure_is_shared_then_a_new_query_can_retry() {
     assert_eq!(&response[response.len() - 4..], &[8, 8, 4, 4]);
     assert_eq!(upstream.initial_calls.load(Ordering::SeqCst), 2);
     assert_eq!(upstream.fallback_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(service.active_flights(), 0);
+    assert_eq!(flights.active_len(), 0);
 }

@@ -116,26 +116,23 @@ impl DnsService {
 
     pub(crate) async fn resolve_outcome_with_runtime(
         &self,
+        runtime: &RuntimeLease,
         raw_query: &[u8],
         metadata: DnsRequestMeta,
         ingress: IngressProfile,
-    ) -> anyhow::Result<(DnsOutcome, RuntimeLease)> {
+    ) -> anyhow::Result<DnsOutcome> {
         let mut operation = self.operation();
-        let DnsServiceBackend::Runtime(provider) = self.backend.as_ref() else {
-            anyhow::bail!("runtime DNS service required");
-        };
-        let lease = provider.acquire();
-        let outcome = operation
+        operation
             .run(
-                lease.run(
-                    lease
+                runtime.run(
+                    runtime
                         .runtime()
                         .forwarder()
                         .resolve_outcome_with_context_and_profile(raw_query, metadata, ingress),
                 ),
             )
-            .await???;
-        Ok((outcome, lease))
+            .await??
+            .map_err(Into::into)
     }
 
     pub async fn flush_cache(&self) -> anyhow::Result<bool> {

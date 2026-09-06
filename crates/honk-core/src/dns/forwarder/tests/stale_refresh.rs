@@ -128,7 +128,7 @@ async fn background_refresh_rejects_a_mismatched_question_before_cache_write() {
 
     forwarder.resolve(&query).await.expect("near-expiry hit");
     for _ in 0..20 {
-        if service.refresh_task_count() == 0 && upstream.calls.load(Ordering::SeqCst) >= 2 {
+        if forwarder.refresh_task_count() == 0 && upstream.calls.load(Ordering::SeqCst) >= 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -170,7 +170,7 @@ async fn hot_near_expiry_hits_own_one_refresh_task_and_close_cleans_it() {
         test_cache(),
         test_router(),
     ));
-    let service = forwarder.cache_service().await;
+    let flights = forwarder.singleflight();
     forwarder.resolve(&make_a_query()).await.expect("prime");
 
     let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
@@ -190,11 +190,11 @@ async fn hot_near_expiry_hits_own_one_refresh_task_and_close_cleans_it() {
     upstream.refresh_entered.notified().await;
 
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(service.refresh_task_count(), 1);
-    assert_eq!(service.active_flights(), 1);
-    service.close_refresh_tasks().await;
-    assert_eq!(service.refresh_task_count(), 0);
-    assert_eq!(service.active_flights(), 0);
+    assert_eq!(forwarder.refresh_task_count(), 1);
+    assert_eq!(flights.active_len(), 1);
+    forwarder.shutdown_background_tasks().await;
+    assert_eq!(forwarder.refresh_task_count(), 0);
+    assert_eq!(flights.active_len(), 0);
 }
 
 #[tokio::test]
@@ -276,7 +276,7 @@ async fn source_selected_near_expiry_hits_share_one_refresh() {
         .expect("router"),
     );
     let forwarder = Arc::new(DnsForwarder::new(upstream.clone(), test_cache(), router));
-    let service = forwarder.cache_service().await;
+    let flights = forwarder.singleflight();
     let query = make_a_query();
     forwarder
         .resolve_outcome_with_context(
@@ -309,18 +309,18 @@ async fn source_selected_near_expiry_hits_share_one_refresh() {
     }
     upstream.refresh_entered.notified().await;
 
-    assert_eq!(service.refresh_task_count(), 1);
-    assert_eq!(service.active_flights(), 1);
+    assert_eq!(forwarder.refresh_task_count(), 1);
+    assert_eq!(flights.active_len(), 1);
     assert_eq!(upstream.calls.lock().expect("calls").as_slice(), ["red", "red"]);
     upstream.refresh_release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(1), async {
-        while service.refresh_task_count() != 0 {
+        while forwarder.refresh_task_count() != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("refresh completion");
-    assert_eq!(service.active_flights(), 0);
+    assert_eq!(flights.active_len(), 0);
 }
 
 #[tokio::test]

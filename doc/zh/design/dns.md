@@ -90,7 +90,7 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 
 | 阶段 | 不变量 |
 | --- | --- |
-| 1. 准入与 generation | `DnsController` 取得 owned semaphore permit 与 runtime lease。2,048 查询的 permit 一直保留到应答完成；饱和时降级为 `REFUSED`。lease 为该请求固定一个完整 generation。 |
+| 1. 准入与 generation | `DnsController` 固定一个 runtime，取得该代的 owned query permit；UDP 入口同时取得该代的 UDP permit。每代 2,048 查询的 permit 一直保留到应答完成；饱和时降级为 `REFUSED`。 |
 | 2. 解析与校验 | adapter 要求一条完整请求。`DnsEngine` 解析 wire，拒绝没有可用问题或有多个问题的请求，将 qname 规范化为小写，并记录入口 profile。 |
 | 3. 地址族 gate 与 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒绝另一地址族。除此之外，不可变 hosts 快照先于请求路由、缓存与上游交换执行。 |
 | 4. 请求规划 | 按源码顺序的请求规则依据规范 qname、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
@@ -100,7 +100,7 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-系统有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。已完成的失败会连同原始原因共享给所有已加入的 follower，但不进入缓存；follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
+每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 入口另用该代按启动预算确定的 slow-path 配额（最多 256），与普通 UDP 初始化隔离。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。已完成的失败会连同原始原因共享给所有已加入的 follower，但不进入缓存；follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
 
 ### Hosts 快照
 
@@ -206,9 +206,9 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 ## Generation 与 reload
 
-一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、路由与组快照、transport manager、路由投影、捕获的 bootstrap resolver 以及固定的 outbound runtime。`DnsServiceProvider` 将该对象作为一个整体发布。查询 lease 使所有组件保持在同一 generation，包括延迟初始化的 transport 与出站 session 状态。
+一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、路由与组快照、transport manager、路由投影、捕获的 bootstrap resolver，以及代内 query/UDP 准入。新构建的 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于同一代。DNS 代理 transport 使用全新的 outbound runtime registry，不复用普通流量或旧 DNS 代的 session。该 DNS registry 与来源配置代共享 dial semaphore，并保留进程级 physical-dial 上限，但不共享退役标志或协议连接池。
 
-发布会让替换项立即可供新 lease 使用，并将旧 runtime 转为 draining。旧 runtime 等待 lease，关闭 prefetch 与 DNS transport，随后 drain 其固定的 outbound session pool。30 秒 lease 排空期限到达后，先取消基于 runtime 的 service 查询，再关闭 transport；覆盖原始查询、controller outcome 以及两条应用域名解析路径。最多保留四个已退役 runtime；超过上限和 provider 关闭使用相同的查询取消机制。入口 adapter 对被取消的解析返回 `SERVFAIL`，在应答 I/O 结束后释放进程级准入名额，避免旧代卡住的查询无限期占用共享 UDP slow-path 预算（最多 256）。Provider 持有退役 supervisor，回收已完成项，并在关闭时 join。
+发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程 join 后台 worker、关闭 DNS transport 及其私有代理 session，再退役捕获的普通流量 registry 中未转移的可复用状态。30 秒排空期限只是安全兜底，并非新代服务的前置条件；到期会取消所有基于 runtime 的 `DnsService` 查询路径。最多保留四个已退役 runtime；超过上限与 provider 关闭会触发相同的强制取消。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
 

@@ -28,11 +28,10 @@ mod reload_tests;
 mod resource_budget;
 mod runtime;
 mod shutdown;
-use runtime::try_admit_udp_slow_path;
 #[cfg(test)]
 use runtime::{
-    UdpDnsSlowPathContext, UdpLoopState, UdpSlowPathWork, begin_udp_slow_path,
-    complete_udp_dns_slow_path, dispatch_udp_slow_path, reserve_udp_slow_path,
+    UdpLoopState, UdpSlowPathWork, begin_udp_slow_path, dispatch_udp_slow_path,
+    reserve_udp_slow_path, try_admit_udp_slow_path,
 };
 pub mod routing_matcher;
 mod sockets;
@@ -128,7 +127,7 @@ pub struct ControlPlane {
     dns_resolver: Arc<DnsResolver>,
     dns_controller: Arc<crate::control::dns_control::DnsController>,
     group_manager: SharedGroupManager,
-    /// Single owner of every outbound session runtime, keyed by Node.id.
+    /// Traffic runtimes; DNS generations own separate session registries.
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
     drain_tracker: Arc<DrainTracker>,
@@ -155,8 +154,6 @@ pub struct ControlPlane {
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
-    /// Port-53 ingress budget, isolated from both TCP and generic UDP floods.
-    dns_concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Background task handles (health check, janitor) for clean shutdown.
     background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// The generation-owned UDP warm coordinator. It is deliberately kept

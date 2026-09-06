@@ -7,6 +7,7 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
         release_first: Notify::new(),
     });
     let controller = controller_with_limit(upstream.clone(), 1);
+    let _held = hold_query_slots(&controller);
     let first_client = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind first client");
@@ -194,6 +195,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         routing_projection: Arc::clone(&snapshot),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
+        udp_query_limit: 256,
     });
     let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>> = Arc::new(
         tokio::sync::RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new())),
@@ -215,9 +217,11 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     let projected = controller.project_routes(&snapshot);
     assert_eq!(projected.len(), 1);
 
-    let (outcome, runtime) = controller
+    let runtime = controller.runtime_provider().acquire();
+    let outcome = controller
         .dns_service()
         .resolve_outcome_with_runtime(
+            &runtime,
             &query,
             DnsRequestMeta::EMPTY,
             IngressProfile::Udp {

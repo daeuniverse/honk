@@ -305,8 +305,7 @@ pub(in crate::control) struct UdpInitLease {
     initializer: Arc<InitializingEndpoint>,
     _initializer_guard: UdpInitializerGuard,
     connection_guard: Option<ActiveConnectionGuard>,
-    /// The DNS controller already examined this first datagram before the
-    /// lease was created. A continuation must not invoke it a second time.
+    /// NFQUEUE admission already excluded DNS interception.
     dns_checked: bool,
     committed: bool,
 }
@@ -349,10 +348,6 @@ impl UdpInitLease {
     pub(in crate::control) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
         debug_assert!(self.connection_guard.is_none());
         self.connection_guard = Some(guard);
-    }
-
-    pub(in crate::control) fn mark_dns_checked(&mut self) {
-        self.dns_checked = true;
     }
 
     pub(in crate::control) fn dns_checked(&self) -> bool {

@@ -4,7 +4,7 @@
 //! carry proxy marks and never enter `daens`; only the transparent port-53
 //! listeners use that machinery.
 
-use super::{ConnectionGuard, try_admit_udp_slow_path};
+use super::ConnectionGuard;
 use crate::control::dns_control::DnsController;
 use crate::control::drain::DrainTracker;
 use crate::dns::query::{DnsRequestMeta, validate_exact_dns_query};
@@ -119,7 +119,6 @@ impl BoundDnsListener {
     pub(super) fn spawn(
         self,
         controller: Arc<DnsController>,
-        dns_slow_limit: Arc<Semaphore>,
         connection_limit: Arc<Semaphore>,
         stats: Arc<StatsManager>,
         drain: Arc<DrainTracker>,
@@ -141,7 +140,6 @@ impl BoundDnsListener {
             supervisors.spawn(run_udp_supervisor(
                 socket,
                 Arc::clone(&controller),
-                dns_slow_limit,
                 stats,
                 Arc::clone(&drain),
                 phase_rx.clone(),
@@ -337,7 +335,6 @@ fn bind_selected(
 async fn run_udp_supervisor(
     socket: Arc<UdpSocket>,
     controller: Arc<DnsController>,
-    dns_slow_limit: Arc<Semaphore>,
     stats: Arc<StatsManager>,
     drain: Arc<DrainTracker>,
     mut phase: watch::Receiver<ListenerPhase>,
@@ -385,30 +382,32 @@ async fn run_udp_supervisor(
                     continue;
                 }
 
-
-                let slow_permit = match try_admit_udp_slow_path(&stats, &dns_slow_limit) {
-                    Some(permit) => permit,
-                    None => {
-                        send_udp_refused(socket.as_ref(), query, response_source, client_addr).await;
-                        continue;
+                let admission = match controller.try_admit_query(true) {
+                    Ok(admission) => {
+                        stats.record_udp_slow_permit_accepted();
+                        admission
                     }
-                };
-                let query_permit = match controller.try_acquire_query() {
-                    Ok(permit) => permit,
                     Err(_) => {
+                        stats.record_udp_slow_permit_rejected();
                         send_udp_refused(socket.as_ref(), query, response_source, client_addr).await;
-                        drop(slow_permit);
                         continue;
                     }
                 };
                 let Some(validated) = validate_exact_dns_query(query) else {
                     let response = minimal_dns_error_response(query, 1);
-                    if let Err(error) = send_bound_udp_response(socket.as_ref(), &response, response_source, client_addr).await {
+                    if let Ok(Err(error)) = admission
+                        .run_reply(send_bound_udp_response(
+                            socket.as_ref(),
+                            &response,
+                            response_source,
+                            client_addr,
+                        ))
+                        .await
+                    {
                         debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS FORMERR send failed");
                     }
                     continue;
                 };
-
                 // All bounded admission is owned before the datagram copy and
                 // child allocation. Register the drain guard before spawn so a
                 // simultaneous shutdown cannot observe an untracked query.
@@ -418,13 +417,27 @@ async fn run_udp_supervisor(
                 let child_socket = Arc::clone(&socket);
                 let child_controller = Arc::clone(&controller);
                 children.spawn(async move {
-                    let _slow_permit = slow_permit;
-                    let _query_permit = query_permit;
                     let _guard = guard;
                     let metadata = DnsRequestMeta::new(Some(client_addr.ip()), None);
-                    let response = child_controller.answer_query(&query, metadata, ingress).await;
-                    if let Err(error) = send_bound_udp_response(child_socket.as_ref(), &response, response_source, client_addr).await {
-                        debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS response send failed");
+                    let response = child_controller
+                        .answer_query(&admission, &query, metadata, ingress)
+                        .await;
+                    match admission
+                        .run_reply(send_bound_udp_response(
+                            child_socket.as_ref(),
+                            &response,
+                            response_source,
+                            client_addr,
+                        ))
+                        .await
+                    {
+                        Ok(Err(error)) => {
+                            debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS response send failed");
+                        }
+                        Err(_) => {
+                            debug!(%client_addr, "standalone UDP DNS response cancelled with runtime retirement");
+                        }
+                        Ok(Ok(_)) => {}
                     }
                 });
             }
@@ -618,6 +631,7 @@ mod tests {
     fn controller_with_config(
         address: [u8; 4],
         config: &honk_config::dns::DnsConfig,
+        udp_query_limit: usize,
     ) -> (Arc<DnsController>, Arc<AtomicUsize>) {
         let (forwarder, calls) = forwarder_with_config(address, config);
         let controller = Arc::new(DnsController::new(
@@ -628,26 +642,24 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(
                 Router::new(&[], "direct").expect("test traffic router"),
             )),
+            udp_query_limit,
         ));
         (controller, calls)
     }
 
     fn controller(address: [u8; 4]) -> (Arc<DnsController>, Arc<AtomicUsize>) {
-        controller_with_config(address, &honk_config::dns::DnsConfig::default())
+        controller_with_config(address, &honk_config::dns::DnsConfig::default(), 256)
     }
-
     fn start_listener(
         bind: &str,
         controller: Arc<DnsController>,
-        dns_slow_permits: usize,
     ) -> (DnsListener, SocketAddr, Arc<DrainTracker>) {
-        start_listener_with_connection_limit(bind, controller, dns_slow_permits, 16)
+        start_listener_with_connection_limit(bind, controller, 16)
     }
 
     fn start_listener_with_connection_limit(
         bind: &str,
         controller: Arc<DnsController>,
-        dns_slow_permits: usize,
         connection_permits: usize,
     ) -> (DnsListener, SocketAddr, Arc<DrainTracker>) {
         let endpoint = DnsBindEndpoint::parse(bind).expect("dns.bind endpoint");
@@ -657,7 +669,6 @@ mod tests {
         let listener = bound
             .spawn(
                 controller,
-                Arc::new(Semaphore::new(dns_slow_permits)),
                 Arc::new(Semaphore::new(connection_permits)),
                 Arc::new(StatsManager::new()),
                 Arc::clone(&drain),
@@ -807,7 +818,7 @@ mod tests {
     async fn udp_listener_routes_query_and_reports_malformed_and_admission_errors() {
         let (controller, calls) = controller([192, 0, 2, 10]);
         let (mut listener, address, drain) =
-            start_listener("udp://127.0.0.1:0", Arc::clone(&controller), 8);
+            start_listener("udp://127.0.0.1:0", Arc::clone(&controller));
 
         let valid = query("udp.example", 0x1010);
         let response = udp_exchange(address, &valid).await;
@@ -828,8 +839,10 @@ mod tests {
 
         stop_listener(&mut listener, &drain).await;
 
+        let (saturated_controller, _) =
+            controller_with_config([192, 0, 2, 10], &honk_config::dns::DnsConfig::default(), 0);
         let (mut saturated, saturated_address, saturated_drain) =
-            start_listener("udp://127.0.0.1:0", Arc::clone(&controller), 0);
+            start_listener("udp://127.0.0.1:0", saturated_controller);
         let refused = udp_exchange(saturated_address, &query("busy.example", 0x3030)).await;
         assert_eq!(refused[3] & 0x0f, 5);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -846,8 +859,8 @@ mod tests {
             action: honk_config::dns::DnsRequestAction::Upstream("default".into()),
         }];
         config.routing.request.fallback = honk_config::dns::DnsRequestAction::Reject;
-        let (controller, calls) = controller_with_config([192, 0, 2, 30], &config);
-        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller, 8);
+        let (controller, calls) = controller_with_config([192, 0, 2, 30], &config, 256);
+        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
 
         let udp_client = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 42), 0))
             .await
@@ -914,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn wildcard_udp_reply_uses_the_queried_local_address() {
         let (controller, _) = controller([192, 0, 2, 20]);
-        let (mut listener, address, drain) = start_listener("udp://0.0.0.0:0", controller, 8);
+        let (mut listener, address, drain) = start_listener("udp://0.0.0.0:0", controller);
         let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind UDP client");
@@ -938,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_listener_serves_persistent_frames_and_closes_malformed_connections() {
         let (controller, calls) = controller([198, 51, 100, 11]);
-        let (mut listener, address, drain) = start_listener("tcp://127.0.0.1:0", controller, 8);
+        let (mut listener, address, drain) = start_listener("tcp://127.0.0.1:0", controller);
         let mut client = TcpStream::connect(address).await.expect("connect TCP DNS");
 
         for (domain, txid) in [("first.example", 0x1111), ("second.example", 0x2222)] {
@@ -988,7 +1001,7 @@ mod tests {
     async fn tcp_listener_preserves_global_connection_capacity() {
         let (controller, _) = controller([203, 0, 113, 20]);
         let (mut listener, address, drain) =
-            start_listener_with_connection_limit("tcp://127.0.0.1:0", controller, 8, 4);
+            start_listener_with_connection_limit("tcp://127.0.0.1:0", controller, 4);
         let first = TcpStream::connect(address)
             .await
             .expect("connect first idle TCP DNS client");
@@ -1018,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_releases_listener_address_for_rebind() {
         let (controller, _) = controller([203, 0, 113, 12]);
-        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller, 8);
+        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
         let mut closed_client = TcpStream::connect(address)
             .await
             .expect("connect malformed TCP DNS client");
@@ -1058,7 +1071,7 @@ mod tests {
     async fn listener_queries_acquire_the_newly_published_runtime() {
         let (controller, first_calls) = controller([192, 0, 2, 1]);
         let (mut listener, address, drain) =
-            start_listener("udp://127.0.0.1:0", Arc::clone(&controller), 8);
+            start_listener("udp://127.0.0.1:0", Arc::clone(&controller));
 
         let first = udp_exchange(address, &query("before.example", 0x4141)).await;
         assert!(first.windows(4).any(|window| window == [192, 0, 2, 1]));
@@ -1080,6 +1093,7 @@ mod tests {
                 routing_projection: projection,
                 outbound_runtime: None,
                 transport: Arc::new(TestRuntimeTransport),
+                udp_query_limit: 256,
             },
         ));
 

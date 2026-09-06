@@ -261,6 +261,7 @@ pub struct UpstreamPool {
     entries: HashMap<String, UpstreamEntry>,
     proxy_registry: Option<Arc<ProxyRegistry>>,
     client_subnet: Option<ipnet::Ipv4Net>,
+    /// DNS-only session runtime fork; never the ordinary control-plane registry.
     runtime_generation: std::sync::OnceLock<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     nodes: Vec<Node>,
     groups: Vec<Group>,
@@ -354,8 +355,9 @@ impl UpstreamPool {
         &self,
         generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     ) -> anyhow::Result<()> {
+        let dns_generation = Arc::new(generation.fork_for_dns()?);
         self.runtime_generation
-            .set(generation)
+            .set(dns_generation)
             .map_err(|_| anyhow::anyhow!("DNS upstream runtime generation is already set"))
     }
 

@@ -1259,8 +1259,8 @@ async fn udp_dns_controller_declines_root_and_binary_questions() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
-#[test]
-fn udp_slow_path_only_forces_strict_dns_to_port_53() {
+#[tokio::test]
+async fn udp_slow_path_only_forces_strict_dns_to_port_53() {
     let client = addr("10.0.0.1:12345");
     let data = dns_query_payload();
     let validated = validate_exact_dns_query(&data).unwrap();
@@ -1268,19 +1268,20 @@ fn udp_slow_path_only_forces_strict_dns_to_port_53() {
     let dns_pool = Arc::new(UdpEndpointPool::new());
     let dns_stats = Arc::new(StatsManager::new());
     let dns_limit = Arc::new(tokio::sync::Semaphore::new(1));
+    let dns = production_dns_controller(
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        dns_response_payload(),
+    );
     let dns_work = begin_udp_slow_path(
         &dns_pool,
         &dns_stats,
         &dns_limit,
+        Some((dns.as_ref(), validated)),
         client,
         addr("203.0.113.53:53"),
         &data,
-        Some(validated),
     );
-    assert!(matches!(
-        dns_work,
-        UdpSlowPathWork::DnsThenMaybeInitialize { .. }
-    ));
+    assert!(matches!(dns_work, UdpSlowPathWork::Dns { .. }));
 
     let ordinary_pool = Arc::new(UdpEndpointPool::new());
     let ordinary_stats = Arc::new(StatsManager::new());
@@ -1289,10 +1290,10 @@ fn udp_slow_path_only_forces_strict_dns_to_port_53() {
         &ordinary_pool,
         &ordinary_stats,
         &ordinary_limit,
+        Some((dns.as_ref(), validated)),
         client,
         addr("203.0.113.53:5353"),
         &data,
-        Some(validated),
     );
     assert!(matches!(ordinary_work, UdpSlowPathWork::Initialize(_)));
 }
@@ -3657,6 +3658,7 @@ fn production_dns_controller(
         Arc::new(tokio::sync::RwLock::new(
             Router::new(&[], "direct").unwrap(),
         )),
+        256,
     ))
 }
 
@@ -3695,6 +3697,7 @@ fn production_dns_controller_with_upstream(
         Arc::new(tokio::sync::RwLock::new(
             Router::new(&[], "direct").unwrap(),
         )),
+        256,
     ))
 }
 
@@ -3750,7 +3753,6 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
         udp_pool: Arc::clone(&plane.udp_pool),
         stats: Arc::clone(&plane.stats),
         udp_concurrency_limit: Arc::clone(&plane.udp_concurrency_limit),
-        dns_concurrency_limit: Arc::clone(&plane.dns_concurrency_limit),
         dns_controller: Arc::clone(&plane.dns_controller),
         drain: Arc::clone(&drain),
         handle: plane.spawn_handle(),
@@ -3821,41 +3823,21 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
         &pool,
         &stats,
         &slow,
+        Some((dns.as_ref(), validated)),
         client,
         dst,
         &query,
-        Some(validated),
         received_at,
     ) {
-        super::UdpSlowPathWork::DnsThenMaybeInitialize {
-            permit,
+        super::UdpSlowPathWork::Dns {
+            admission,
             data,
             validated,
-            enqueued_at,
         } => {
-            assert_eq!(enqueued_at, received_at);
-            let lease = super::complete_udp_dns_slow_path(
-                super::UdpDnsSlowPathContext {
-                    pool: &pool,
-                    stats: &stats,
-                    dns_controller: dns.as_ref(),
-                    src_addr: client,
-                    original_dst: dst,
-                },
-                permit,
-                &data,
-                enqueued_at,
-                validated,
-            )
-            .await;
-            assert!(
-                lease.is_none(),
-                "DNS controller must handle the packet without reserve/enqueue"
-            );
+            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
+                .await;
         }
-        _other => panic!(
-            "DNS-shaped Ready traffic must take DnsThenMaybeInitialize, got unexpected variant"
-        ),
+        _ => panic!("strict DNS must not enter the Ready endpoint queue"),
     }
 
     assert_eq!(
@@ -3894,32 +3876,25 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     let slow = Arc::new(tokio::sync::Semaphore::new(1));
     let query = dns_query_payload();
     let validated = validate_exact_dns_query(&query).unwrap();
-
     assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
-    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query, Some(validated)) {
-        super::UdpSlowPathWork::DnsThenMaybeInitialize {
-            permit,
+    match super::begin_udp_slow_path(
+        &pool,
+        &stats,
+        &slow,
+        Some((dns.as_ref(), validated)),
+        client,
+        dst,
+        &query,
+    ) {
+        super::UdpSlowPathWork::Dns {
+            admission,
             data,
             validated,
-            enqueued_at,
         } => {
-            let maybe_lease = super::complete_udp_dns_slow_path(
-                super::UdpDnsSlowPathContext {
-                    pool: &pool,
-                    stats: &stats,
-                    dns_controller: dns.as_ref(),
-                    src_addr: client,
-                    original_dst: dst,
-                },
-                permit,
-                &data,
-                enqueued_at,
-                validated,
-            )
-            .await;
-            assert!(maybe_lease.is_none());
+            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
+                .await;
         }
-        _ => panic!("DNS-shaped Initializing traffic must take DnsThenMaybeInitialize"),
+        _ => panic!("strict DNS must not enter the Initializing endpoint queue"),
     }
 
     assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -3949,13 +3924,12 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         _ => panic!("follower fixture must initialize"),
     };
 
-    // Fast path must miss for Initializing — no direct enqueue, no copy.
     assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst, None).await);
     assert_eq!(stats.udp_snapshot().endpoint_misses, 1);
     assert_eq!(stats.udp_snapshot().queue_accepted, 0);
 
     let zero = Arc::new(tokio::sync::Semaphore::new(0));
-    match super::begin_udp_slow_path(&pool, &stats, &zero, client, dst, b"follower", None) {
+    match super::begin_udp_slow_path(&pool, &stats, &zero, None, client, dst, b"follower") {
         super::UdpSlowPathWork::Done => {}
         _ => panic!("zero slow permit must not reserve or enqueue"),
     }
@@ -3964,21 +3938,18 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     assert_eq!(udp.queue_accepted, 0);
 
     let open = Arc::new(tokio::sync::Semaphore::new(1));
-    match super::begin_udp_slow_path(&pool, &stats, &open, client, dst, b"follower", None) {
+    match super::begin_udp_slow_path(&pool, &stats, &open, None, client, dst, b"follower") {
         super::UdpSlowPathWork::Done => {}
         super::UdpSlowPathWork::Initialize(_) => {
             panic!("Initializing follower must enqueue, not create a second lease")
         }
-        super::UdpSlowPathWork::DnsThenMaybeInitialize { .. } => {
+        super::UdpSlowPathWork::Dns { .. } => {
             panic!("non-DNS follower must not take the DNS branch")
         }
     }
     let udp = stats.udp_snapshot();
     assert_eq!(udp.slow_permit_accepted, 1);
-    assert_eq!(
-        udp.queue_accepted, 1,
-        "with a slow permit the follower enqueues exactly once"
-    );
+    assert_eq!(udp.queue_accepted, 1);
     drop(lease);
 }
 

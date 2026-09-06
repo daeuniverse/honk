@@ -103,6 +103,7 @@ fn runtime_with_outbound(
     );
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
+        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
@@ -135,6 +136,7 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
     );
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
+        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
@@ -144,35 +146,6 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
         outbound_runtime: None,
         transport: pool,
     })
-}
-
-#[tokio::test]
-async fn old_dns_request_keeps_generation_snapshots_after_publication() {
-    // Given: a request has leased the old runtime generation.
-    let (old, old_transport) = runtime(1, 11);
-    let provider = DnsServiceProvider::new(Arc::clone(&old));
-    let old_lease = provider.acquire();
-    let old_forwarder = Arc::clone(old_lease.runtime().forwarder());
-    let old_cache = old_lease.runtime().cache();
-    let (new, _) = runtime(2, 22);
-
-    // When: the new coherent runtime is published.
-    provider.publish(new);
-    let new_lease = provider.acquire();
-
-    // Then: each lease sees only its own generation's snapshot.
-    assert_eq!(old_lease.runtime().generation(), RuntimeGeneration::new(1));
-    assert_eq!(old_lease.runtime().routing_projection().generation(), 1);
-    assert!(Arc::ptr_eq(old_lease.runtime().forwarder(), &old_forwarder));
-    assert!(Arc::ptr_eq(&old_lease.runtime().cache(), &old_cache));
-    assert_eq!(new_lease.runtime().generation(), RuntimeGeneration::new(2));
-    assert_eq!(new_lease.runtime().routing_projection().generation(), 2);
-    assert!(!Arc::ptr_eq(
-        new_lease.runtime().forwarder(),
-        &old_forwarder
-    ));
-    assert!(!Arc::ptr_eq(&new_lease.runtime().cache(), &old_cache));
-    assert_eq!(old_transport.closes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

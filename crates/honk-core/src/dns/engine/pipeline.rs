@@ -239,7 +239,7 @@ pub(crate) async fn resolve_with_owner(
             metadata,
         )
     };
-    let flights = forwarder.cache_service().await.singleflight();
+    let flights = forwarder.singleflight();
     loop {
         match flights.acquire(flight_key.clone()) {
             FlightRole::Rejected => return Err(DnsForwardError::Overloaded),

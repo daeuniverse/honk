@@ -120,11 +120,12 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
     });
     let cache = test_cache();
     cache.lock().await.set_persister(Some(persister.clone()));
-    let service = crate::dns::DnsService::with_forwarder(Arc::new(DnsForwarder::new(
+    let forwarder = Arc::new(DnsForwarder::new(
         upstream.clone(),
         cache.clone(),
         test_router(),
-    )));
+    ));
+    let service = crate::dns::DnsService::with_forwarder(Arc::clone(&forwarder));
     let query = make_a_query();
 
     let primed = service
@@ -147,9 +148,8 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
         .expect("flush");
     assert!(persisted);
     upstream.refresh_release.add_permits(1);
-    let cache_service = cache.lock().await.service();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while cache_service.refresh_task_count() != 0 {
+        while forwarder.refresh_task_count() != 0 {
             tokio::task::yield_now().await;
         }
     })

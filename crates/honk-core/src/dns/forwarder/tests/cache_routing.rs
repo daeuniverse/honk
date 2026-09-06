@@ -248,7 +248,7 @@ async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
             cache.clone(),
             Arc::clone(&router),
         ));
-        let flights = cache.lock().await.singleflight();
+        let flights = forwarder.singleflight();
         let sources = ["192.0.2.10", "198.51.100.20", "203.0.113.30"];
         let mut tasks = tokio::task::JoinSet::new();
         for source in sources {

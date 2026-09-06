@@ -19,6 +19,7 @@ use super::engine::{DnsEngine, EngineError};
 use super::policy::PolicyId;
 use super::response::ResponseError;
 use super::routing::DnsRouter;
+use super::singleflight::Singleflight;
 use honk_config::dns::{DnsConfig, DnsStrategy};
 
 /// Abstraction over a pool of DNS upstream servers.
@@ -117,6 +118,8 @@ pub struct DnsForwarder {
     pub(crate) policy_id: Option<PolicyId>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
+    flights: Singleflight,
+    refresh_tasks: Arc<refresh::RefreshTasks>,
     prefetch_tasks: Arc<prefetch::PrefetchTasks>,
 }
 
@@ -142,6 +145,8 @@ impl DnsForwarder {
             policy_id: None,
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
+            flights: Singleflight::default(),
+            refresh_tasks: refresh::RefreshTasks::new(),
             prefetch_tasks: prefetch::PrefetchTasks::new(),
         }
     }
@@ -233,6 +238,22 @@ impl DnsForwarder {
                 .await,
         )
     }
+    pub(crate) fn singleflight(&self) -> &Singleflight {
+        &self.flights
+    }
+
+    pub fn flight_counters(&self) -> super::singleflight::FlightCounters {
+        self.flights.counters()
+    }
+
+    pub fn active_flights(&self) -> usize {
+        self.flights.active_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_task_count(&self) -> usize {
+        self.refresh_tasks.active()
+    }
 
     pub(crate) async fn engine(&self) -> Result<&DnsEngine, EngineError> {
         self.engine
@@ -257,17 +278,21 @@ impl DnsForwarder {
             policy_id: self.policy_id.clone(),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
+            flights: self.flights.clone(),
+            refresh_tasks: Arc::clone(&self.refresh_tasks),
             prefetch_tasks: prefetch::PrefetchTasks::closed(),
         }
     }
 
-    pub(crate) async fn shutdown_prefetch(&self) {
+    pub(crate) async fn shutdown_background_tasks(&self) {
         self.prefetch_tasks.shutdown().await;
+        self.refresh_tasks.shutdown().await;
     }
 }
 
 mod exchange;
 mod hosts;
+mod refresh;
 pub(crate) use hosts::{HostsSnapshot, HostsSourceSet};
 mod message {
     use crate::dns::query::{NameParseState, parse_name};

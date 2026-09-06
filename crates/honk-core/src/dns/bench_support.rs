@@ -106,7 +106,8 @@ pub struct RuntimeBenchmark {
 }
 
 struct RuntimeShared {
-    forwarder: Arc<DnsForwarder>,
+    cache: Arc<Mutex<DnsCache>>,
+    dns_router: Arc<DnsRouter>,
     router: Arc<Router>,
 }
 
@@ -117,11 +118,8 @@ impl RuntimeBenchmark {
         let dns_router =
             Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("benchmark DNS router"));
         let shared = RuntimeShared {
-            forwarder: Arc::new(DnsForwarder::new(
-                Arc::new(UnusedPool),
-                Arc::clone(&cache),
-                dns_router,
-            )),
+            cache,
+            dns_router,
             router: Arc::new(
                 Router::new(&config.routing.rules, &config.routing.default_outbound)
                     .expect("benchmark router"),
@@ -183,7 +181,12 @@ pub fn observability_snapshot_checksum() -> u64 {
 fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        forwarder: Arc::clone(&shared.forwarder),
+        udp_query_limit: 256,
+        forwarder: Arc::new(DnsForwarder::new(
+            Arc::new(UnusedPool),
+            Arc::clone(&shared.cache),
+            Arc::clone(&shared.dns_router),
+        )),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
             Arc::clone(&shared.router),

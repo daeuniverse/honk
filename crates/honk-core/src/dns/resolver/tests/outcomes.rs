@@ -280,17 +280,17 @@ async fn parent_cancellation_drops_both_flights_and_waiters() {
     let both_entered = pool.entered.notified();
     tokio::pin!(both_entered);
     let service = service(DnsStrategy::Both, pool.clone());
-    let cache = service.cache();
+    let flights = service.forwarder().singleflight().clone();
     let lookup_service = service.clone();
     let lookup = tokio::spawn(async move { lookup_service.resolve_name("example.com").await });
     tokio::time::timeout(Duration::from_secs(1), &mut both_entered)
         .await
         .expect("both branches entered");
-    assert_eq!(cache.lock().await.active_flights(), 2);
+    assert_eq!(flights.active_len(), 2);
     lookup.abort();
     let _ = lookup.await;
     tokio::task::yield_now().await;
-    assert_eq!(cache.lock().await.active_flights(), 0);
+    assert_eq!(flights.active_len(), 0);
 }
 
 #[tokio::test]

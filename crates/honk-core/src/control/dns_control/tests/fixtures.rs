@@ -30,27 +30,36 @@ pub(super) fn test_controller(
 
 pub(super) fn controller_with_limit(
     upstream: Arc<dyn DnsUpstreamPool>,
-    max_concurrent_queries: usize,
+    udp_query_limit: usize,
 ) -> Arc<DnsController> {
-    let mut controller = controller_for_upstream(upstream);
-    controller.concurrency_limit = Arc::new(Semaphore::new(max_concurrent_queries));
-    Arc::new(controller)
+    Arc::new(controller_for_upstream_and_config(
+        upstream,
+        &honk_config::dns::DnsConfig::default(),
+        udp_query_limit,
+    ))
+}
+
+pub(super) fn hold_query_slots(controller: &DnsController) -> Vec<super::super::AdmittedDnsQuery> {
+    (0..2047)
+        .map(|_| controller.try_admit_query(false).expect("test query slot"))
+        .collect()
 }
 
 pub(super) fn controller_with_dns_config(
     upstream: Arc<dyn DnsUpstreamPool>,
     config: &honk_config::dns::DnsConfig,
 ) -> Arc<DnsController> {
-    Arc::new(controller_for_upstream_and_config(upstream, config))
+    Arc::new(controller_for_upstream_and_config(upstream, config, 256))
 }
 
 fn controller_for_upstream(upstream: Arc<dyn DnsUpstreamPool>) -> DnsController {
-    controller_for_upstream_and_config(upstream, &honk_config::dns::DnsConfig::default())
+    controller_for_upstream_and_config(upstream, &honk_config::dns::DnsConfig::default(), 256)
 }
 
 fn controller_for_upstream_and_config(
     upstream: Arc<dyn DnsUpstreamPool>,
     config: &honk_config::dns::DnsConfig,
+    udp_query_limit: usize,
 ) -> DnsController {
     let forwarder = Arc::new(DnsForwarder::new(
         upstream,
@@ -67,6 +76,7 @@ fn controller_for_upstream_and_config(
         Arc::new(RwLock::new(
             Router::new(&[], "direct").expect("test router"),
         )),
+        udp_query_limit,
     )
 }
 
@@ -142,6 +152,7 @@ pub(super) fn snapshot_controller(forwarder: Arc<DnsForwarder>) -> Arc<DnsContro
         Arc::new(RwLock::new(
             Router::new(&[], "direct").expect("test router"),
         )),
+        1,
     ))
 }
 
@@ -159,6 +170,7 @@ pub(super) async fn publish_snapshot_forwarder(
         routing_projection: Arc::clone(current.runtime().routing_projection()),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
+        udp_query_limit: 256,
     });
     drop(current);
     provider.publish(runtime);

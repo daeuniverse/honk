@@ -6,6 +6,7 @@ use honk_outbound::group::GroupManager;
 use tokio::sync::RwLock;
 
 use super::*;
+use crate::dns::forwarder::DnsUpstreamPool;
 use crate::routing::Router;
 
 fn route(ip: &str, outbound: &str) -> RoutingRule {
@@ -22,35 +23,65 @@ fn route(ip: &str, outbound: &str) -> RoutingRule {
     }
 }
 
-#[test]
-fn dial_context_pins_its_outbound_runtime_generation() {
-    let node = test_node("dns-proxy");
+#[tokio::test]
+async fn dns_proxy_query_survives_traffic_registry_retirement() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut node = test_node("dns-proxy");
+    let address = listener.local_addr().unwrap();
+    node.address = address.ip().to_string();
+    node.port = address.port();
+    node.outbound =
+        honk_config::node::OutboundConfig::from_protocol(honk_config::types::NodeProtocol::Socks5);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.read_exact(&mut [0; 3]).await.unwrap();
+        stream.write_all(&[5, 0]).await.unwrap();
+        stream.read_exact(&mut [0; 10]).await.unwrap();
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 53])
+            .await
+            .unwrap();
+        let length = stream.read_u16().await.unwrap();
+        let mut query = vec![0; length as usize];
+        stream.read_exact(&mut query).await.unwrap();
+        let response = mock_dns_response(u16::from_be_bytes([query[0], query[1]]));
+        stream.write_u16(response.len() as u16).await.unwrap();
+        stream.write_all(&response).await.unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
             .unwrap(),
     );
-    let upstream = make_upstream("proxy", "1.1.1.1:53", DnsProtocol::Tcp);
+    let upstream = DnsUpstream {
+        outbound: Some(node.name.clone()),
+        ..make_upstream("proxy", "1.1.1.1:53", DnsProtocol::Tcp)
+    };
     let pool = UpstreamPool::new_with_proxy(
         &[upstream],
         make_router(),
         Some(Arc::new(
             crate::proxy::ProxyRegistry::default_resolver().unwrap(),
         )),
-        vec![node.clone()],
+        vec![node],
         vec![],
     )
     .unwrap()
     .with_runtime_generation(Arc::clone(&generation));
 
-    let entry = pool.entries.get("proxy").unwrap();
-    let context = pool
-        .dial_context(entry, Some(&node), "1.1.1.1:53".parse().unwrap())
-        .expect("proxy registry");
-    let captured = context
-        .proxy
-        .and_then(|proxy| proxy.generation)
-        .expect("proxy dial must capture the owning DNS generation");
-    assert!(Arc::ptr_eq(&captured, &generation));
+    generation.begin_retirement();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        pool.query("proxy", &mock_dns_query(123)),
+    )
+    .await
+    .expect("retired traffic registry must not block the DNS-owned dial")
+    .unwrap();
+    assert_eq!(response, mock_dns_response(123));
+    pool.close().await;
+    server.await.unwrap();
 }
 
 #[tokio::test]

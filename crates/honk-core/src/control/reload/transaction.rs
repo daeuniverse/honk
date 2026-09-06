@@ -399,6 +399,7 @@ impl ControlPlane {
         let new_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
+                udp_query_limit: self.resource_budget.dns_slow_path,
                 forwarder: Arc::clone(&new_dns_forwarder),
                 routing_projection: Arc::clone(&projection_snapshot),
                 outbound_runtime: Some(Arc::clone(&new_runtime_registry)),

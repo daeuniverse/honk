@@ -169,6 +169,7 @@ impl ControlPlane {
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),
+                udp_query_limit: resource_budget.dns_slow_path,
                 forwarder: dns_forwarder.clone(),
                 routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                     0,
@@ -261,9 +262,6 @@ impl ControlPlane {
             )),
             udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.udp_slow_path,
-            )),
-            dns_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
-                resource_budget.dns_slow_path,
             )),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),

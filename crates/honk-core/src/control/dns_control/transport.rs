@@ -26,12 +26,10 @@ impl DnsController {
         let Some(validated) = validated.or_else(|| validate_exact_dns_query(data)) else {
             return Ok(false);
         };
-        // Keep the permit through the reply write so the limit bounds the
-        // complete request lifecycle rather than only upstream resolution.
-        let _permit = match self.try_acquire_query() {
-            Ok(permit) => permit,
+        let admission = match self.try_admit_query(true) {
+            Ok(admission) => admission,
             Err(_) => {
-                debug!("DNS concurrency limit reached; sending REFUSED");
+                debug!("DNS runtime admission reached; sending REFUSED");
                 let response = build_dns_refused(data);
                 let _ = super::super::send_udp_reply_from_orig_dst(
                     &response,
@@ -42,18 +40,35 @@ impl DnsController {
                 return Ok(true);
             }
         };
+        self.handle_udp_dns_admitted(&admission, data, client_addr, original_dst, validated)
+            .await;
+        Ok(true)
+    }
 
+    pub(crate) async fn handle_udp_dns_admitted(
+        &self,
+        admission: &super::AdmittedDnsQuery,
+        data: &[u8],
+        client_addr: SocketAddr,
+        original_dst: SocketAddr,
+        validated: ValidatedDnsQuery,
+    ) {
         debug!(%client_addr, "DNS controller (UDP): forwarding query");
         let response = self
             .answer_query(
+                admission,
                 data,
                 DnsRequestMeta::new(Some(client_addr.ip()), Some(original_dst)),
                 validated.ingress(),
             )
             .await;
-        let _ =
-            super::super::send_udp_reply_from_orig_dst(&response, client_addr, original_dst).await;
-        Ok(true)
+        let _ = admission
+            .run_reply(super::super::send_udp_reply_from_orig_dst(
+                &response,
+                client_addr,
+                original_dst,
+            ))
+            .await;
     }
 
     /// Handle a TCP DNS-over-TCP connection from TPROXY.
@@ -113,19 +128,30 @@ impl DnsController {
         query: &[u8],
         metadata: DnsRequestMeta,
     ) -> anyhow::Result<()> {
-        // Keep the permit through the framed response write, including every
-        // frame on a persistent TCP connection.
-        match self.try_acquire_query() {
-            Ok(_permit) => {
-                let response = self
-                    .answer_query(query, metadata, IngressProfile::Tcp)
-                    .await;
-                write_tcp_dns_response(stream, &response, TCP_DNS_IO_TIMEOUT).await
-            }
+        // Each persistent frame gets the current generation independently.
+        let admission = match self.try_admit_query(false) {
+            Ok(admission) => admission,
             Err(_) => {
-                write_tcp_dns_response(stream, &build_dns_refused(query), TCP_DNS_IO_TIMEOUT).await
+                return write_tcp_dns_response(
+                    stream,
+                    &build_dns_refused(query),
+                    TCP_DNS_IO_TIMEOUT,
+                )
+                .await;
             }
-        }
+        };
+        let response = self
+            .answer_query(&admission, query, metadata, IngressProfile::Tcp)
+            .await;
+        admission
+            .run_reply(write_tcp_dns_response(
+                stream,
+                &response,
+                TCP_DNS_IO_TIMEOUT,
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("DNS runtime retired during TCP response write"))??;
+        Ok(())
     }
 }
 

@@ -185,6 +185,9 @@ impl UpstreamPool {
             })
             .await;
         }
+        if let Some(generation) = self.runtime_generation.get() {
+            generation.shutdown().await;
+        }
         close.complete();
     }
 }

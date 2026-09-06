@@ -482,7 +482,6 @@ impl ControlPlane {
                 let listener = bound
                     .spawn(
                         Arc::clone(&self.dns_controller),
-                        Arc::clone(&self.dns_concurrency_limit),
                         Arc::clone(&self.concurrency_limit),
                         Arc::clone(&self.stats),
                         Arc::clone(&self.drain_tracker),
@@ -507,7 +506,6 @@ impl ControlPlane {
                 udp_pool: Arc::clone(&self.udp_pool),
                 stats: Arc::clone(&self.stats),
                 udp_concurrency_limit: Arc::clone(&self.udp_concurrency_limit),
-                dns_concurrency_limit: Arc::clone(&self.dns_concurrency_limit),
                 dns_controller: Arc::clone(&self.dns_controller),
                 drain: self.drain_tracker.clone(),
                 handle: self.spawn_handle(),
@@ -1017,47 +1015,44 @@ impl ControlPlane {
 }
 /// Work produced by the shared IPv4/IPv6 UDP slow-path dispatcher after a
 /// fast-path miss. The accept loop never awaits PacketTransport I/O; DNS
-/// resolution (when required) runs inside a slow-permit-bounded task.
+/// resolution (when required) runs inside an admitted task.
 pub(super) enum UdpSlowPathWork {
     /// Fresh reservation: caller spawns `serve_udp_connection`.
     Initialize(UdpInitLease),
-    /// DNS-shaped traffic: slow permit is already held and the payload has
-    /// been copied. Run the production DNS controller first; only if it
-    /// declines, continue through the same reserve/initializer path.
-    DnsThenMaybeInitialize {
-        permit: tokio::sync::OwnedSemaphorePermit,
+    /// Strict port-53 DNS owns generation-local admission through its reply.
+    Dns {
+        admission: crate::control::dns_control::AdmittedDnsQuery,
         data: Bytes,
         validated: ValidatedDnsQuery,
-        enqueued_at: u32,
     },
     /// Fully handled in the receive loop (enqueued / rejected / dropped).
     Done,
 }
 
 /// Shared production admission helper used by both listener families and by
-/// focused tests. Order is always:
-/// `slow permit → (optional heap copy for DNS task) → reserve_or_enqueue`.
-/// Only strict DNS queries whose authoritative destination is port 53 return
-/// [`UdpSlowPathWork::DnsThenMaybeInitialize`]; DNS-shaped non-53 UDP stays
-/// on ordinary forwarding.
+/// focused tests. Strict port-53 DNS acquires generation-local query and UDP
+/// admission before its heap copy. Other datagrams retain generic UDP admission.
 #[cfg(test)]
 pub(super) fn begin_udp_slow_path(
     pool: &Arc<UdpEndpointPool>,
     stats: &StatsManager,
     concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    dns: Option<(
+        &crate::control::dns_control::DnsController,
+        ValidatedDnsQuery,
+    )>,
     src_addr: SocketAddr,
     original_dst: SocketAddr,
     data: &[u8],
-    validated_dns: Option<ValidatedDnsQuery>,
 ) -> UdpSlowPathWork {
     begin_udp_slow_path_at(
         pool,
         stats,
         concurrency_limit,
+        dns,
         src_addr,
         original_dst,
         data,
-        validated_dns,
         udp_endpoint::queue_now(),
     )
 }
@@ -1067,27 +1062,37 @@ pub(super) fn begin_udp_slow_path_at(
     pool: &Arc<UdpEndpointPool>,
     stats: &StatsManager,
     concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    dns: Option<(
+        &crate::control::dns_control::DnsController,
+        ValidatedDnsQuery,
+    )>,
     src_addr: SocketAddr,
     original_dst: SocketAddr,
     data: &[u8],
-    validated_dns: Option<ValidatedDnsQuery>,
     enqueued_at: u32,
 ) -> UdpSlowPathWork {
+    if original_dst.port() == 53
+        && let Some((dns_controller, validated)) = dns
+    {
+        let admission = match dns_controller.try_admit_query(true) {
+            Ok(admission) => {
+                stats.record_udp_slow_permit_accepted();
+                admission
+            }
+            Err(_) => {
+                stats.record_udp_slow_permit_rejected();
+                return UdpSlowPathWork::Done;
+            }
+        };
+        return UdpSlowPathWork::Dns {
+            admission,
+            data: Bytes::copy_from_slice(data),
+            validated,
+        };
+    }
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
         return UdpSlowPathWork::Done;
     };
-    if original_dst.port() == 53
-        && let Some(validated) = validated_dns
-    {
-        // Permit is acquired before the heap copy required to leave the
-        // receive buffer for a permit-bounded DNS task.
-        return UdpSlowPathWork::DnsThenMaybeInitialize {
-            permit,
-            data: Bytes::copy_from_slice(data),
-            validated,
-            enqueued_at,
-        };
-    }
     match pool.reserve_or_enqueue_at(src_addr, original_dst, data, permit, enqueued_at, stats) {
         EndpointReservation::Initializing(lease) => UdpSlowPathWork::Initialize(lease),
         EndpointReservation::Enqueued
@@ -1098,75 +1103,11 @@ pub(super) fn begin_udp_slow_path_at(
     }
 }
 
-pub(super) struct UdpDnsSlowPathContext<'a> {
-    pub(super) pool: &'a Arc<UdpEndpointPool>,
-    pub(super) stats: &'a StatsManager,
-    pub(super) dns_controller: &'a crate::control::dns_control::DnsController,
-    pub(super) src_addr: SocketAddr,
-    pub(super) original_dst: SocketAddr,
-}
-
-/// Finish a DNS-forced slow path after the slow permit was acquired: run the
-/// production DNS controller first. If it handles the packet, do not
-/// reserve/enqueue. If it declines, continue through the same
-/// `reserve_or_enqueue` path used by ordinary slow traffic.
-pub(super) async fn complete_udp_dns_slow_path(
-    context: UdpDnsSlowPathContext<'_>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    data: &[u8],
-    enqueued_at: u32,
-    validated: ValidatedDnsQuery,
-) -> Option<UdpInitLease> {
-    let UdpDnsSlowPathContext {
-        pool,
-        stats,
-        dns_controller,
-        src_addr,
-        original_dst,
-    } = context;
-    match dns_controller
-        .handle_udp_dns(data, src_addr, original_dst, Some(validated))
-        .await
-    {
-        Ok(true) => return None,
-        Ok(false) => {}
-        Err(error) => {
-            // Preserve the historical UDP fallback: a controller failure is
-            // not a reason to drop the original datagram before ordinary
-            // endpoint admission has had a chance to forward it.
-            warn!(
-                "DNS controller error for UDP {} -> {}; continuing UDP: {}",
-                src_addr, original_dst, error
-            );
-        }
-    }
-    match pool.reserve_or_enqueue_at(src_addr, original_dst, data, permit, enqueued_at, stats) {
-        EndpointReservation::Initializing(mut lease) => {
-            // The controller was invoked exactly once for this packet. Carry
-            // that fact into initialize_udp_connection so an Ok(false) or
-            // Err continuation cannot call it again.
-            lease.mark_dns_checked();
-            Some(lease)
-        }
-        EndpointReservation::Enqueued
-        | EndpointReservation::CapacityRejected
-        | EndpointReservation::QueueFull
-        | EndpointReservation::IdentityMismatch
-        | EndpointReservation::QueueClosed => None,
-    }
-}
-
-/// Shared IPv4/IPv6 receive-loop dispatcher after a fast-path miss. Acquires
-/// the slow permit before any copy/spawn, prefers the DNS controller for
-/// DNS-shaped traffic, and only then reserves or enqueues.
-/// Everything a UDP listener loop needs, cloned from the control plane once
-/// so each socket's loop runs as an independent task (parallel drain).
 #[derive(Clone)]
 pub(super) struct UdpLoopState {
     pub(super) udp_pool: Arc<UdpEndpointPool>,
     pub(super) stats: Arc<StatsManager>,
     pub(super) udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
-    pub(super) dns_concurrency_limit: Arc<tokio::sync::Semaphore>,
     pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
     pub(super) drain: Arc<DrainTracker>,
     pub(super) handle: ControlPlaneHandle,
@@ -1271,19 +1212,14 @@ fn dispatch_udp_slow_path_at(
     validated_dns: Option<ValidatedDnsQuery>,
     enqueued_at: u32,
 ) {
-    let concurrency_limit = if original_dst.port() == 53 && validated_dns.is_some() {
-        &state.dns_concurrency_limit
-    } else {
-        &state.udp_concurrency_limit
-    };
     match begin_udp_slow_path_at(
         &state.udp_pool,
         &state.stats,
-        concurrency_limit,
+        &state.udp_concurrency_limit,
+        validated_dns.map(|validated| (state.dns_controller.as_ref(), validated)),
         src_addr,
         original_dst,
         data,
-        validated_dns,
         enqueued_at,
     ) {
         UdpSlowPathWork::Done => {}
@@ -1300,45 +1236,18 @@ fn dispatch_udp_slow_path_at(
                 }
             });
         }
-        UdpSlowPathWork::DnsThenMaybeInitialize {
-            permit,
+        UdpSlowPathWork::Dns {
+            admission,
             data,
             validated,
-            enqueued_at,
         } => {
-            let handle = state.handle.clone();
             let guard = ConnectionGuard::new(Arc::clone(&state.drain));
-            let pool = Arc::clone(&state.udp_pool);
-            let stats = Arc::clone(&state.stats);
             let dns_controller = Arc::clone(&state.dns_controller);
             state.udp_pool.spawn_slow_path(async move {
-                // DNS handling is already accepted work. Register it before
-                // spawning so reload/shutdown drain cannot miss work before
-                // its first poll; keep the guard alive for the task lifetime.
                 let _guard = guard;
-                let Some(lease) = complete_udp_dns_slow_path(
-                    UdpDnsSlowPathContext {
-                        pool: &pool,
-                        stats: &stats,
-                        dns_controller: dns_controller.as_ref(),
-                        src_addr,
-                        original_dst,
-                    },
-                    permit,
-                    &data,
-                    enqueued_at,
-                    validated,
-                )
-                .await
-                else {
-                    return;
-                };
-                if let Err(e) = handle.serve_udp_connection(lease).await {
-                    warn!(
-                        "Error handling UDP from {} (orig {}): {}",
-                        src_addr, original_dst, e
-                    );
-                }
+                dns_controller
+                    .handle_udp_dns_admitted(&admission, &data, src_addr, original_dst, validated)
+                    .await;
             });
         }
     }
@@ -1359,38 +1268,18 @@ pub(super) fn reserve_udp_slow_path(
         pool,
         stats,
         concurrency_limit,
+        None,
         src_addr,
         original_dst,
         data,
-        None,
     ) {
         UdpSlowPathWork::Initialize(lease) => Some(lease),
-        UdpSlowPathWork::DnsThenMaybeInitialize {
-            permit,
-            data,
-            enqueued_at,
-            ..
-        } => {
-            match pool.reserve_or_enqueue_at(
-                src_addr,
-                original_dst,
-                &data,
-                permit,
-                enqueued_at,
-                stats,
-            ) {
-                EndpointReservation::Initializing(lease) => Some(lease),
-                _ => None,
-            }
-        }
-        UdpSlowPathWork::Done => None,
+        UdpSlowPathWork::Dns { .. } | UdpSlowPathWork::Done => None,
     }
 }
 
-/// Admit one datagram onto the current UDP slow path after a fast-path miss.
-///
-/// This is the sole production owner of `udp.slowPermit` accepted/rejected
-/// counters. Queue metrics are recorded by `reserve_or_enqueue` / the driver.
+/// Admit a non-DNS datagram after a fast-path miss. DNS records the same
+/// slow-permit counters at its generation-owned admission boundary.
 pub(super) fn try_admit_udp_slow_path(
     stats: &StatsManager,
     concurrency_limit: &Arc<tokio::sync::Semaphore>,

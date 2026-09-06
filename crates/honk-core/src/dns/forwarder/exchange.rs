@@ -5,7 +5,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use tracing::{debug, trace};
 
-use crate::dns::cache::{CacheKey, DnsCacheService, PublicationEpoch};
+use crate::dns::cache::{CacheKey, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, ParsedQuery, PreparedQuery};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use crate::dns::planner::RequestScope;
@@ -175,22 +175,21 @@ impl DnsForwarder {
     /// fresh answer back.
     pub(crate) fn maybe_spawn_refresh(
         &self,
-        cache: Arc<DnsCacheService>,
         raw_query: &[u8],
         metadata: DnsRequestMeta,
         mode: ResolveMode,
-        flight_key: crate::dns::cache::CacheKey,
+        flight_key: CacheKey,
         publication_epoch: PublicationEpoch,
     ) {
         let ingress = flight_key.ingress();
         let crate::dns::singleflight::FlightRole::Leader(owner) =
-            cache.singleflight().acquire(FlightKey::Refresh(flight_key))
+            self.singleflight().acquire(FlightKey::Refresh(flight_key))
         else {
             return;
         };
         let this = self.clone();
         let query = raw_query.to_vec();
-        let spawned = cache.spawn_refresh(async move {
+        let spawned = self.refresh_tasks.spawn(async move {
             let result = crate::dns::engine::pipeline::resolve_with_owner(
                 &this,
                 &query,

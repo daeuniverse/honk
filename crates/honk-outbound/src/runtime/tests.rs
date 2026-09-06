@@ -299,6 +299,54 @@ async fn overlapping_generations_share_the_startup_dial_ceiling() {
 }
 
 #[tokio::test]
+async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
+    let node = node("dns", NodeProtocol::AnyTLS);
+    let (main, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        2,
+        None,
+    )
+    .unwrap();
+    let main = Arc::new(main);
+    let dns = Arc::new(main.fork_for_dns().unwrap());
+
+    main.begin_retirement();
+    assert!(!dns.is_shutdown());
+
+    let held = main.acquire_dial_permit().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), dns.acquire_dial_permit())
+            .await
+            .is_err()
+    );
+    drop(held);
+    let dns_permit = tokio::time::timeout(Duration::from_millis(100), dns.acquire_dial_permit())
+        .await
+        .expect("released generation capacity must admit DNS");
+    let (successor, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, Some(&main)).unwrap();
+    let successor_permit = successor.acquire_dial_permit().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), successor.acquire_dial_permit())
+            .await
+            .is_err()
+    );
+    drop(dns_permit);
+    tokio::time::timeout(Duration::from_millis(100), successor.acquire_dial_permit())
+        .await
+        .expect("released DNS capacity must admit the successor");
+    drop(successor_permit);
+
+    main.shutdown().await;
+    assert!(!dns.is_shutdown());
+    let dns_pool = dns.get(&node.id).unwrap().anytls_pool().unwrap();
+    assert!(!dns_pool.is_retired());
+    dns.shutdown().await;
+    assert!(dns_pool.is_retired());
+}
+
+#[tokio::test]
 async fn one_dial_permit_serializes_real_tcp_fallbacks() {
     struct Active(Arc<AtomicUsize>);
     impl Drop for Active {

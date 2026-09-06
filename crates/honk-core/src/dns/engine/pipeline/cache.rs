@@ -60,7 +60,6 @@ pub(super) async fn lookup(
     if allow_refresh && remaining <= refresh_after {
         let refresh_key = context.cache_key.with_operation(OperationKind::Refresh);
         context.forwarder.maybe_spawn_refresh(
-            cache.clone(),
             context.raw_query,
             context.metadata,
             context.mode,

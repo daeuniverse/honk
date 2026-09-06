@@ -7,6 +7,7 @@ async fn first_tcp_frame_holds_permit_until_response_is_written() {
         release_first: Notify::new(),
     });
     let controller = controller_with_limit(upstream.clone(), 1);
+    let _held = hold_query_slots(&controller);
     let original_dst: SocketAddr = "127.0.0.1:53".parse().expect("original destination");
 
     let (mut first_client, mut first_server) = tcp_pair().await;
@@ -62,6 +63,7 @@ async fn cancelled_first_tcp_frame_releases_permit() {
         release_first: Notify::new(),
     });
     let controller = controller_with_limit(upstream.clone(), 1);
+    let _held = hold_query_slots(&controller);
     let original_dst: SocketAddr = "127.0.0.1:53".parse().expect("original destination");
 
     let (mut first_client, mut first_server) = tcp_pair().await;

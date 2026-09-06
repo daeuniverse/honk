@@ -30,12 +30,12 @@ async fn singleflight_dedups_and_restores_txid() {
     let second = query_with_txid("example.com", 0xbbbb);
 
     let (first_response, second_response) = tokio::join!(
-        controller.answer_query(
+        controller.answer_query_for_test(
             &first,
             crate::dns::query::DnsRequestMeta::EMPTY,
             crate::dns::query::IngressProfile::Internal,
         ),
-        controller.answer_query(
+        controller.answer_query_for_test(
             &second,
             crate::dns::query::DnsRequestMeta::EMPTY,
             crate::dns::query::IngressProfile::Internal,
@@ -64,12 +64,12 @@ async fn ineligible_queries_bypass_singleflight() {
     let second = query_with_edns_option(0xbbbb);
 
     let _ = tokio::join!(
-        controller.answer_query(
+        controller.answer_query_for_test(
             &first,
             crate::dns::query::DnsRequestMeta::EMPTY,
             crate::dns::query::IngressProfile::Internal,
         ),
-        controller.answer_query(
+        controller.answer_query_for_test(
             &second,
             crate::dns::query::DnsRequestMeta::EMPTY,
             crate::dns::query::IngressProfile::Internal,

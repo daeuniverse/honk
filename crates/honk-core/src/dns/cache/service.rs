@@ -1,12 +1,11 @@
-use super::CacheKey;
-
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::CacheKey;
 use super::counters::CacheCounterSet;
-use super::{CacheValue, DnsCache, Singleflight, lock};
+use super::{CacheValue, DnsCache, lock};
 
 static ZERO_CAPACITY_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -19,11 +18,14 @@ const MAX_TOTAL_WIRE_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct DnsCacheService {
     pub(super) shards: Vec<Mutex<CacheShard>>,
-    pub(super) flights: Singleflight,
     pub(super) counters: CacheCounterSet,
     pub(super) persister: Mutex<Option<crate::dns::persist::DnsCachePersister>>,
-    pub(super) refresh_tasks: Mutex<RefreshTasks>,
-    pub(super) active_refresh_tasks: Arc<AtomicUsize>,
+    pub(super) publication: Mutex<PublicationState>,
+}
+
+pub(super) struct PublicationState {
+    pub(super) epoch: u64,
+    pub(super) accepting: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -133,13 +135,6 @@ impl std::ops::DerefMut for CacheShard {
     }
 }
 
-pub(super) struct RefreshTasks {
-    pub(super) tasks: tokio::task::JoinSet<()>,
-    pub(super) closed: bool,
-    pub(super) publication_epoch: u64,
-    pub(super) accepting_publications: bool,
-}
-
 impl DnsCache {
     /// Create a new DNS cache with the given maximum number of entries.
     ///
@@ -181,16 +176,12 @@ impl DnsCache {
         Self {
             service: Arc::new(DnsCacheService {
                 shards,
-                flights: Singleflight::default(),
                 counters: CacheCounterSet::default(),
                 persister: Mutex::new(None),
-                refresh_tasks: Mutex::new(RefreshTasks {
-                    tasks: tokio::task::JoinSet::new(),
-                    closed: false,
-                    publication_epoch: 0,
-                    accepting_publications: true,
+                publication: Mutex::new(PublicationState {
+                    epoch: 0,
+                    accepting: true,
                 }),
-                active_refresh_tasks: Arc::new(AtomicUsize::new(0)),
             }),
         }
     }
@@ -215,13 +206,13 @@ impl Drop for PublicationFlushGuard {
 
 impl DnsCacheService {
     pub(crate) fn publication_epoch(&self) -> PublicationEpoch {
-        PublicationEpoch(lock(&self.refresh_tasks).publication_epoch)
+        PublicationEpoch(lock(&self.publication).epoch)
     }
 
     pub(crate) fn begin_flush(self: &Arc<Self>) -> PublicationFlushGuard {
-        let mut registry = lock(&self.refresh_tasks);
-        registry.publication_epoch = registry.publication_epoch.saturating_add(1);
-        registry.accepting_publications = false;
+        let mut publication = lock(&self.publication);
+        publication.epoch = publication.epoch.saturating_add(1);
+        publication.accepting = false;
         self.clear();
         PublicationFlushGuard {
             service: Arc::clone(self),
@@ -230,64 +221,12 @@ impl DnsCacheService {
     }
 
     fn finish_flush(&self) {
-        let mut registry = lock(&self.refresh_tasks);
-        registry.publication_epoch = registry.publication_epoch.saturating_add(1);
-        registry.accepting_publications = true;
-    }
-
-    pub(crate) fn singleflight(&self) -> super::Singleflight {
-        self.flights.clone()
-    }
-
-    pub fn flight_counters(&self) -> crate::dns::singleflight::FlightCounters {
-        self.flights.counters()
-    }
-
-    pub fn active_flights(&self) -> usize {
-        self.flights.active_len()
-    }
-
-    pub(crate) fn spawn_refresh<F>(&self, future: F) -> bool
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let mut registry = lock(&self.refresh_tasks);
-        while registry.tasks.try_join_next().is_some() {}
-        if registry.closed {
-            return false;
-        }
-        self.active_refresh_tasks.fetch_add(1, Ordering::Relaxed);
-        let active = Arc::clone(&self.active_refresh_tasks);
-        registry.tasks.spawn(async move {
-            let _guard = ActiveGuard(active);
-            future.await;
-        });
-        true
-    }
-
-    pub fn refresh_task_count(&self) -> usize {
-        self.active_refresh_tasks.load(Ordering::Relaxed)
-    }
-
-    pub async fn close_refresh_tasks(&self) {
-        let mut tasks = {
-            let mut registry = lock(&self.refresh_tasks);
-            registry.closed = true;
-            std::mem::replace(&mut registry.tasks, tokio::task::JoinSet::new())
-        };
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        let mut publication = lock(&self.publication);
+        publication.epoch = publication.epoch.saturating_add(1);
+        publication.accepting = true;
     }
 
     pub(crate) fn persistence(&self) -> Option<crate::dns::persist::DnsCachePersister> {
         lock(&self.persister).clone()
-    }
-}
-
-struct ActiveGuard(Arc<AtomicUsize>);
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }

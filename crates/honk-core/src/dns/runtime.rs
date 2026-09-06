@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::forwarder::DnsForwarder;
 
 pub(crate) const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
+const MAX_CONCURRENT_QUERIES: usize = 2048;
 
 mod provider;
 pub(crate) use provider::DnsServiceProvider;
@@ -73,17 +74,20 @@ pub(crate) use super::projection::RoutingProjectionSnapshot;
 
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
+    pub(crate) udp_query_limit: usize,
     pub(crate) forwarder: Arc<DnsForwarder>,
     pub(crate) routing_projection: Arc<RoutingProjectionSnapshot>,
-    /// Outbound session generation captured with this DNS snapshot. It stays
-    /// available to existing leases after publication and begins graceful
-    /// pool drain only when the runtime itself retires.
+    /// Defers reusable-state retirement of the traffic registry until this
+    /// generation drains. DNS transports own a separate registry so admitted
+    /// DNS dials can outlive traffic admission.
     pub(crate) outbound_runtime: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     pub(crate) transport: Arc<dyn RuntimeTransport>,
 }
 
 pub(crate) struct DnsRuntime {
     parts: DnsRuntimeParts,
+    query_limit: Arc<Semaphore>,
+    udp_query_limit: Arc<Semaphore>,
     state: AtomicU8,
     leases: AtomicUsize,
     lease_released: Notify,
@@ -95,6 +99,8 @@ pub(crate) struct DnsRuntime {
 impl DnsRuntime {
     pub(crate) fn new(parts: DnsRuntimeParts) -> Arc<Self> {
         Arc::new(Self {
+            query_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+            udp_query_limit: Arc::new(Semaphore::new(parts.udp_query_limit)),
             parts,
             state: AtomicU8::new(RuntimeState::Active as u8),
             leases: AtomicUsize::new(0),
@@ -115,6 +121,19 @@ impl DnsRuntime {
 
     pub(crate) fn lease_count(&self) -> usize {
         self.leases.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_acquire_query(
+        &self,
+        udp: bool,
+    ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), TryAcquireError> {
+        let udp_permit = if udp {
+            Some(Arc::clone(&self.udp_query_limit).try_acquire_owned()?)
+        } else {
+            None
+        };
+        let query_permit = Arc::clone(&self.query_limit).try_acquire_owned()?;
+        Ok((query_permit, udp_permit))
     }
 
     pub(crate) fn forwarder(&self) -> &Arc<DnsForwarder> {
@@ -190,7 +209,7 @@ impl DnsRuntime {
             return;
         }
         self.request_cancellation();
-        self.parts.forwarder.shutdown_prefetch().await;
+        self.parts.forwarder.shutdown_background_tasks().await;
         self.parts.transport.close().await;
         if let Some(runtime) = &self.parts.outbound_runtime {
             runtime.retire_reusable_state().await;
@@ -242,15 +261,20 @@ impl RuntimeLease {
         &self.runtime
     }
 
+    pub(crate) async fn cancelled(&self) -> RuntimeCancelled {
+        self.runtime.cancelled().await;
+        RuntimeCancelled {
+            generation: self.runtime.generation().get(),
+        }
+    }
+
     pub(crate) async fn run<T>(
         &self,
         operation: impl Future<Output = T>,
     ) -> Result<T, RuntimeCancelled> {
         tokio::select! {
             biased;
-            () = self.runtime.cancelled() => Err(RuntimeCancelled {
-                generation: self.runtime.generation().get(),
-            }),
+            error = self.cancelled() => Err(error),
             result = operation => Ok(result),
         }
     }

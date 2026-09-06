@@ -10,11 +10,13 @@ use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 #[cfg(test)]
 use crate::routing::Router;
+use parking_lot::Mutex;
+use std::future::Future;
 #[cfg(test)]
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, TryAcquireError};
 use tracing::{debug, warn};
 
 mod transport;
@@ -34,19 +36,32 @@ impl crate::dns::runtime::RuntimeTransport for NoopRuntimeTransport {
     async fn close(&self) {}
 }
 
-/// Max concurrent in-flight DNS queries. Sized like dae's (16384 @ ~4KB
-/// each) but conservative: 2048 ≈ 8MB of in-flight state, comfortably
-/// covering thousands of QPS before degradation. Over the limit the answer
-/// is REFUSED, not SERVFAIL — SERVFAIL invites client retry storms, REFUSED
-/// says "busy, back off".
-const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 2048;
-
 /// DNS Controller — resolves admitted queries and publishes domain routes.
 /// Transport adapters own socket admission and replies.
 pub struct DnsController {
     dns_service: crate::dns::DnsService,
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
-    concurrency_limit: Arc<Semaphore>,
+}
+
+/// Admission for one DNS request. The runtime lease and both runtime-owned
+/// permits are held by the transport owner through response I/O.
+pub(crate) struct AdmittedDnsQuery {
+    runtime: crate::dns::runtime::RuntimeLease,
+    _query_permit: OwnedSemaphorePermit,
+    _udp_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl AdmittedDnsQuery {
+    pub(crate) async fn run_reply<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, crate::dns::runtime::RuntimeCancelled> {
+        tokio::select! {
+            biased;
+            result = operation => Ok(result),
+            cancelled = self.runtime.cancelled() => Err(cancelled),
+        }
+    }
 }
 
 impl DnsController {
@@ -55,6 +70,7 @@ impl DnsController {
         forwarder: Arc<DnsForwarder>,
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         _router: Arc<RwLock<Router>>,
+        udp_query_limit: usize,
     ) -> Self {
         let config = honk_config::Config::default();
         let runtime_router = Arc::new(
@@ -71,6 +87,7 @@ impl DnsController {
             )),
             outbound_runtime: None,
             transport: Arc::new(NoopRuntimeTransport),
+            udp_query_limit,
         });
         Self::new_with_runtime(
             Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
@@ -105,7 +122,6 @@ impl DnsController {
         Self {
             dns_service,
             routing_projection,
-            concurrency_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_QUERIES)),
         }
     }
 
@@ -174,28 +190,33 @@ impl DnsController {
         self.dns_service.cache()
     }
 
-    /// Acquire admission for one complete query lifecycle. The owned permit
-    /// can move into an adapter task and remain held through its reply write.
-    pub(crate) fn try_acquire_query(
-        &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
-        Arc::clone(&self.concurrency_limit).try_acquire_owned()
+    /// Acquire a generation-pinned query admission. The runtime lease and
+    /// permits remain owned by the caller through response I/O.
+    pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, TryAcquireError> {
+        let runtime = self.runtime_provider().acquire();
+        let (query_permit, udp_permit) = runtime.runtime().try_acquire_query(udp)?;
+        Ok(AdmittedDnsQuery {
+            runtime,
+            _query_permit: query_permit,
+            _udp_permit: udp_permit,
+        })
     }
 
     /// Resolve and project one generation-pinned DNS query.
     pub(crate) async fn answer_query(
         &self,
+        admission: &AdmittedDnsQuery,
         data: &[u8],
         metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> Vec<u8> {
         match self
             .dns_service
-            .resolve_outcome_with_runtime(data, metadata, ingress)
+            .resolve_outcome_with_runtime(&admission.runtime, data, metadata, ingress)
             .await
         {
-            Ok((outcome, runtime)) => {
-                self.submit_projection(runtime.runtime(), &outcome);
+            Ok(outcome) => {
+                self.submit_projection(admission.runtime.runtime(), &outcome);
                 outcome.into_rendered()
             }
             Err(error)
@@ -216,7 +237,7 @@ impl DnsController {
                 // level without one line per query. Monotonic clock: a
                 // wall-clock step must not mute the alarm.
                 static LAST_SERVFAIL_LOG: Mutex<Option<Instant>> = Mutex::new(None);
-                let mut last = LAST_SERVFAIL_LOG.lock().unwrap();
+                let mut last = LAST_SERVFAIL_LOG.lock();
                 if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
                     *last = Some(Instant::now());
                     warn!(error = %error, "DNS controller forward failed; sending SERVFAIL");
@@ -224,6 +245,19 @@ impl DnsController {
                 build_dns_servfail(data)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn answer_query_for_test(
+        &self,
+        data: &[u8],
+        metadata: DnsRequestMeta,
+        ingress: IngressProfile,
+    ) -> Vec<u8> {
+        let admission = self
+            .try_admit_query(false)
+            .expect("test DNS query admission");
+        self.answer_query(&admission, data, metadata, ingress).await
     }
 
     fn submit_projection(

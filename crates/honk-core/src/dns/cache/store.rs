@@ -180,8 +180,8 @@ impl DnsCacheService {
         response: Vec<u8>,
         min_ttl: u32,
     ) {
-        let registry = lock(&self.refresh_tasks);
-        if !registry.accepting_publications || registry.publication_epoch != epoch.0 {
+        let publication = lock(&self.publication);
+        if !publication.accepting || publication.epoch != epoch.0 {
             return;
         }
         self.put_exact(key, response, min_ttl);
@@ -323,8 +323,8 @@ impl DnsCacheService {
         ttl: u32,
         rcode: u8,
     ) {
-        let registry = lock(&self.refresh_tasks);
-        if !registry.accepting_publications || registry.publication_epoch != epoch.0 {
+        let publication = lock(&self.publication);
+        if !publication.accepting || publication.epoch != epoch.0 {
             return;
         }
         self.put_negative_exact(key, ttl, rcode);

@@ -7,8 +7,6 @@
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
-use super::singleflight::Singleflight;
-
 mod compatibility {
     use super::{CachedEntry, DnsCache, NegativeCacheHit};
 
@@ -387,7 +385,6 @@ impl DnsCache {
     pub(crate) fn service(&self) -> Arc<DnsCacheService> {
         Arc::clone(&self.service)
     }
-
     /// Install (or remove) the cache.db persistence sink. Wired by the
     /// control plane when `experimental.cache_file.store_dns` is enabled.
     pub fn set_persister(&mut self, persister: Option<super::persist::DnsCachePersister>) {
@@ -398,21 +395,8 @@ impl DnsCache {
         self.service.persistence()
     }
 
-    #[cfg(test)]
-    pub(crate) fn singleflight(&self) -> Singleflight {
-        self.service.singleflight()
-    }
-
     pub fn counters(&self) -> CacheCounters {
         self.service.counters()
-    }
-
-    pub fn flight_counters(&self) -> super::singleflight::FlightCounters {
-        self.service.flight_counters()
-    }
-
-    pub fn active_flights(&self) -> usize {
-        self.service.active_flights()
     }
 }
 

@@ -64,6 +64,7 @@ fn runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
     ));
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(1),
+        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             1,
@@ -121,6 +122,7 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
                         .map(|_| ()),
                     1 => service
                         .resolve_outcome_with_runtime(
+                            &service.provider().unwrap().acquire(),
                             &query,
                             DnsRequestMeta::EMPTY,
                             IngressProfile::Udp {
