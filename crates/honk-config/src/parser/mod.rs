@@ -954,9 +954,11 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
                 }
                 nodes.push(node);
             }
-            // A recognized-but-removed protocol in the config file is a hard
-            // error (subscriptions skip such entries with a warning instead).
-            Err(e @ crate::ConfigError::UnknownProtocol(_)) => return Err(e),
+            // Semantically invalid static nodes are hard errors. Other
+            // malformed links retain the established warning-and-skip
+            // behavior; subscriptions apply their own filtering policy.
+            Err(e @ crate::ConfigError::UnknownProtocol(_))
+            | Err(e @ crate::ConfigError::Validation(_)) => return Err(e),
             Err(e) => eprintln!("{}", node_parse_diagnostic(&e)),
         }
     }

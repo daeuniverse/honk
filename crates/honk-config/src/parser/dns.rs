@@ -334,14 +334,53 @@ fn dns_fn_args(inner: &str, fn_name: &str) -> Result<Option<Vec<String>>, crate:
     if !rest.starts_with('(') {
         return Ok(None);
     }
-    let Some(raw) = rest
-        .strip_prefix('(')
-        .and_then(|value| value.strip_suffix(')'))
-    else {
+
+    // Find the outer closing parenthesis instead of blindly stripping the
+    // final byte. Parentheses inside quoted arguments are data; unquoted
+    // nested parentheses are valid syntax and must balance.
+    let bytes = rest.as_bytes();
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut close = None;
+    for (offset, byte) in bytes[1..].iter().copied().enumerate() {
+        let index = offset + 1;
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => depth += 1,
+            b')' if depth == 1 => {
+                close = Some(index);
+                break;
+            }
+            b')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
         return Err(crate::ConfigError::Parse(format!(
             "malformed DNS predicate '{inner}'"
         )));
     };
+    if !bytes[close + 1..]
+        .iter()
+        .all(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(crate::ConfigError::Parse(format!(
+            "malformed DNS predicate '{inner}'"
+        )));
+    }
+
+    let raw = &rest[1..close];
     let args = split_filter_arguments(raw).ok_or_else(|| {
         crate::ConfigError::Parse(format!("unclosed quote in DNS predicate '{fn_name}'"))
     })?;

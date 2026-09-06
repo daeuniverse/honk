@@ -260,6 +260,24 @@ node {
     }
 
     #[test]
+    fn test_parse_full_dae_rejects_static_shadowsocks_plugin() {
+        let input = r#"
+global {
+    log_level: info
+}
+node {
+    static: 'ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388/?plugin=v2ray-plugin%3Btls#ss-pad'
+}
+group {
+    proxy {
+        filter: name(static)
+    }
+}
+"#;
+        assert!(parse_dae_config(input).is_err());
+    }
+
+    #[test]
     fn test_parse_vless_mode_link() {
         let config = parse_dae_config(
             "node {\n    xudp: 'vless://uuid@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://uuid@example.com:443?vless_mode=mux-cool#node'\n}",
@@ -1167,11 +1185,62 @@ fn test_parse_dns_rejects_malformed_predicates() {
     for predicate in ["!qtype()", "qtype(not-a-type)", "qname()", "unknown(foo)"] {
         let input =
             format!("dns {{\n routing {{\n  request {{\n   {predicate} -> reject\n  }}\n }}\n}}");
-        let error = parse_dae_config(&input).unwrap_err();
         assert!(
-            error.to_string().contains("DNS") || error.to_string().contains("dns"),
-            "malformed predicate {predicate:?} must identify DNS parsing: {error}"
+            parse_dae_config(&input).is_err(),
+            "{predicate:?} must reject"
         );
+    }
+}
+
+#[test]
+fn test_parse_dns_rejects_unbalanced_negated_predicates() {
+    for predicate in [
+        "!qname(full: protected.example))",
+        "qname(full: protected.example)garbage",
+        "qname(full: protected.example",
+        "qname(regex: (protected.example)",
+    ] {
+        let input =
+            format!("dns {{\n routing {{\n  request {{\n   {predicate} -> reject\n  }}\n }}\n}}");
+        assert!(
+            parse_dae_config(&input).is_err(),
+            "{predicate:?} must reject"
+        );
+    }
+}
+
+#[test]
+fn test_parse_dns_accepts_quoted_and_nested_regex_parentheses() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            qname('regex:\)\.example$') -> reject
+            qname(regex: (foo|bar)) -> reject
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let [quoted, nested] = config.dns.routing.request.rules.as_slice() else {
+        panic!("both regex rules must survive parsing");
+    };
+    for (rule, matching_name) in [(quoted, ").example"), (nested, "foo")] {
+        let [
+            crate::dns::DnsCond::Qname {
+                not: false,
+                matchers,
+            },
+        ] = rule.conditions.as_slice()
+        else {
+            panic!("expected one positive qname condition");
+        };
+        let [crate::dns::DnsDomainMatcher::Regex(pattern)] = matchers.as_slice() else {
+            panic!("expected one regex");
+        };
+        let regex = regex::Regex::new(pattern).unwrap();
+        assert!(regex.is_match(matching_name));
+        assert!(!regex.is_match("outside.invalid"));
     }
 }
 

@@ -139,18 +139,14 @@ impl Node {
         if !self.host.is_empty() {
             return &self.host;
         }
-        if let Some(address) = self.address.strip_prefix('[') {
-            if let Some((host, _)) = address.split_once(']') {
-                return host;
-            }
+        if let Some(address) = self.address.strip_prefix('[') && let Some((host, _)) = address.split_once(']') {
+            return host;
         }
         if self.address.parse::<std::net::Ipv6Addr>().is_ok() {
             return &self.address;
         }
-        if let Some((host, port)) = self.address.rsplit_once(':') {
-            if port.parse::<u16>().ok() == Some(self.port) {
-                return host;
-            }
+        if let Some((host, port)) = self.address.rsplit_once(':') && port.parse::<u16>().ok() == Some(self.port) {
+            return host;
         }
         &self.address
     }

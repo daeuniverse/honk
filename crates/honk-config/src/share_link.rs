@@ -159,7 +159,7 @@ impl Node {
                 .keys()
                 .any(|key| matches!(key.as_str(), "plugin" | "plugin-opts" | "plugin_opts"))
         {
-            return Err(ConfigError::Parse(
+            return Err(ConfigError::Validation(
                 "static Shadowsocks plugins are unsupported; remove plugin/plugin-opts or use a subscription that filters them"
                     .into(),
             ));

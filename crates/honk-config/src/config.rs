@@ -145,6 +145,51 @@ fn default_tproxy_port() -> u16 {
     12345
 }
 
+/// Current addresses assigned to every host interface, including link-local
+/// addresses. The interface name is retained so callers can scope addresses
+/// whose meaning depends on the ingress interface.
+pub fn host_interface_addresses() -> std::io::Result<Vec<(String, std::net::IpAddr)>> {
+    let mut addresses = Vec::new();
+    // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs; all
+    // pointers are checked before dereference.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
+                let family = (*ifa.ifa_addr).sa_family as i32;
+                let address = if family == libc::AF_INET {
+                    let bytes = (*(ifa.ifa_addr as *const libc::sockaddr_in))
+                        .sin_addr
+                        .s_addr
+                        .to_ne_bytes();
+                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(bytes)))
+                } else if family == libc::AF_INET6 {
+                    let bytes = (*(ifa.ifa_addr as *const libc::sockaddr_in6))
+                        .sin6_addr
+                        .s6_addr;
+                    Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)))
+                } else {
+                    None
+                };
+                if let Some(address) = address {
+                    addresses.push((name, address));
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    Ok(addresses)
+}
+
 /// Host CIDRs (`addr/32`, `addr/128`) for every global-scoped address on
 /// `iface`. The literal `auto` resolves through the lowest-metric IPv4
 /// default route. Missing or unresolved interfaces yield an empty list.
@@ -160,47 +205,32 @@ fn interface_host_cidrs(iface: &str) -> Vec<String> {
     } else {
         iface
     };
-    // getifaddrs(3) — no `ip` subprocess needed. Link-local addresses
-    // (v4 169.254/16, v6 fe80::/10) are excluded, matching the old
-    // "not scope link" filter.
-    let mut cidrs = Vec::new();
-    // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs;
-    // all pointers are checked before dereference.
-    unsafe {
-        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 {
-            return cidrs;
-        }
-        let mut cur = head;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-            if name == iface && !ifa.ifa_addr.is_null() {
-                let family = (*ifa.ifa_addr).sa_family as i32;
-                if family == libc::AF_INET {
-                    // s_addr is network byte order in memory — read it in
-                    // native order to get the wire bytes as-is.
-                    let a = (*(ifa.ifa_addr as *const libc::sockaddr_in))
-                        .sin_addr
-                        .s_addr
-                        .to_ne_bytes();
-                    if !(a[0] == 169 && a[1] == 254) {
-                        cidrs.push(format!("{}.{}.{}.{}/32", a[0], a[1], a[2], a[3]));
-                    }
-                } else if family == libc::AF_INET6 {
-                    let a = (*(ifa.ifa_addr as *const libc::sockaddr_in6))
-                        .sin6_addr
-                        .s6_addr;
-                    if !(a[0] == 0xfe && (a[1] & 0xc0) == 0x80) {
-                        cidrs.push(format!("{}/128", std::net::Ipv6Addr::from(a)));
-                    }
-                }
+    let addresses = match host_interface_addresses() {
+        Ok(addresses) => addresses,
+        Err(_) => return Vec::new(),
+    };
+    addresses
+        .into_iter()
+        .filter_map(|(name, address)| {
+            if name != iface {
+                return None;
             }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(head);
-    }
-    cidrs
+            let link_local = match address {
+                std::net::IpAddr::V4(a) => {
+                    let octets = a.octets();
+                    octets[0] == 169 && octets[1] == 254
+                }
+                std::net::IpAddr::V6(a) => {
+                    let octets = a.octets();
+                    octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
+                }
+            };
+            (!link_local).then(|| {
+                let prefix = if address.is_ipv4() { 32 } else { 128 };
+                format!("{address}/{prefix}")
+            })
+        })
+        .collect()
 }
 
 /// Interface owning the lowest-metric IPv4 default route.
@@ -514,7 +544,8 @@ impl Config {
                 // These errors identify recognized dae syntax; structured
                 // fallbacks would hide their actionable cause.
                 Err(err @ crate::ConfigError::Include(_))
-                | Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
+                | Err(err @ crate::ConfigError::UnsupportedPolicy(_))
+                | Err(err @ crate::ConfigError::Validation(_)) => Err(err),
                 Err(_) => parse_toml(&content)
                     .or_else(|_| parse_yaml(&content))
                     .or_else(|_| Self::from_json_str(&content)),
@@ -999,6 +1030,24 @@ mod builtin_nodes_tests {
         let error = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
         assert!(error.to_string().contains("renamed to 'score'"));
+    }
+
+    #[test]
+    fn test_from_file_rejects_static_shadowsocks_plugin() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"global {
+    log_level: info
+}
+node {
+    static: 'ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388/?plugin=v2ray-plugin%3Btls#ss-pad'
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(Config::from_file(file.path().to_str().unwrap()).is_err());
     }
 
     #[test]
