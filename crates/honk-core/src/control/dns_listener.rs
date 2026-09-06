@@ -1020,7 +1020,24 @@ mod tests {
     #[tokio::test]
     async fn shutdown_releases_listener_address_for_rebind() {
         let (controller, _) = controller([203, 0, 113, 12]);
-        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller, 8);
+        let endpoint = DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap();
+        let bound = BoundDnsListener::bind(&endpoint).unwrap();
+        let address = bound.local_addr();
+        // Other tests may reuse the ephemeral port while shutdown drains children.
+        let port_reservation = (
+            bound.tcp.as_ref().unwrap().try_clone().unwrap(),
+            bound.udp.as_ref().unwrap().try_clone().unwrap(),
+        );
+        let drain = Arc::new(DrainTracker::new().with_drain_timeout(Duration::from_millis(20)));
+        let mut listener = bound
+            .spawn(
+                controller,
+                Arc::new(Semaphore::new(8)),
+                Arc::new(Semaphore::new(16)),
+                Arc::new(StatsManager::new()),
+                Arc::clone(&drain),
+            )
+            .unwrap();
         let mut closed_client = TcpStream::connect(address)
             .await
             .expect("connect malformed TCP DNS client");
@@ -1048,6 +1065,7 @@ mod tests {
         .await
         .expect("listener must track the idle TCP connection");
         stop_listener(&mut listener, &drain).await;
+        drop(port_reservation);
 
         let endpoint = DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap();
         let rebound = BoundDnsListener::bind(&endpoint)
