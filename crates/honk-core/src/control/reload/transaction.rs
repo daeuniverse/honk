@@ -822,7 +822,6 @@ impl ControlPlane {
                 config.dns.strategy,
             )?
             .with_client_subnet(config.dns.effective_client_subnet()?)
-            .with_runtime_generation(runtime_generation)
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
                 std::time::Duration::from_millis(config.global.connect_timeout_ms),
@@ -832,6 +831,7 @@ impl ControlPlane {
             .with_group_manager_snapshot(group_manager)
             .with_traffic_router_snapshot(router),
         );
+        dns_upstream_pool.set_runtime_generation(runtime_generation)?;
         let forwarder = Arc::new(
             crate::dns::forwarder::DnsForwarder::new(
                 Arc::clone(&dns_upstream_pool) as Arc<dyn crate::dns::forwarder::DnsUpstreamPool>,
@@ -853,98 +853,4 @@ impl ControlPlane {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn subscription(
-        id: u128,
-        name: &str,
-        ua: Option<&str>,
-    ) -> honk_config::subscription::Subscription {
-        honk_config::subscription::Subscription {
-            id: uuid::Uuid::from_u128(id),
-            name: name.into(),
-            url: "http://same-url".into(),
-            user_agent: ua.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
-    fn with_header(
-        mut sub: honk_config::subscription::Subscription,
-        value: &str,
-    ) -> honk_config::subscription::Subscription {
-        sub.headers = vec![honk_config::subscription::SubscriptionHeader {
-            key: "X-Token".into(),
-            value: value.into(),
-        }];
-        sub
-    }
-
-    fn subscription_node(name: &str, subscription_id: u128) -> honk_config::node::Node {
-        honk_config::node::Node {
-            name: name.into(),
-            subscription_id: Some(uuid::Uuid::from_u128(subscription_id)),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn rebase_matches_subscription_identity_beyond_url() {
-        let current = Config {
-            subscriptions: vec![
-                subscription(1, "a", Some("ua-a")),
-                subscription(2, "b", Some("ua-b")),
-            ],
-            nodes: vec![
-                subscription_node("node-a", 1),
-                subscription_node("node-b", 2),
-            ],
-            ..Default::default()
-        };
-
-        // Same file with the subscription order swapped; a fresh parse assigns
-        // fresh IDs.
-        let mut candidate = Config {
-            subscriptions: vec![
-                subscription(3, "b", Some("ua-b")),
-                subscription(4, "a", Some("ua-a")),
-            ],
-            ..Default::default()
-        };
-
-        rebase_subscription_nodes(&current, &mut candidate);
-
-        assert_eq!(candidate.subscriptions[0].id, uuid::Uuid::from_u128(2));
-        assert_eq!(candidate.subscriptions[1].id, uuid::Uuid::from_u128(1));
-        let mut node_names: Vec<&str> = candidate
-            .nodes
-            .iter()
-            .map(|node| node.name.as_str())
-            .collect();
-        node_names.sort_unstable();
-        assert_eq!(node_names, ["node-a", "node-b"]);
-        for node in &candidate.nodes {
-            let expected = if node.name == "node-a" { 1 } else { 2 };
-            assert_eq!(node.subscription_id, Some(uuid::Uuid::from_u128(expected)));
-        }
-    }
-
-    #[test]
-    fn rebase_treats_changed_headers_as_a_new_subscription() {
-        let current = Config {
-            subscriptions: vec![with_header(subscription(1, "a", None), "old")],
-            nodes: vec![subscription_node("node-a", 1)],
-            ..Default::default()
-        };
-        let mut candidate = Config {
-            subscriptions: vec![with_header(subscription(2, "a", None), "new")],
-            ..Default::default()
-        };
-
-        rebase_subscription_nodes(&current, &mut candidate);
-
-        assert_eq!(candidate.subscriptions[0].id, uuid::Uuid::from_u128(2));
-        assert!(candidate.nodes.is_empty());
-    }
-}
+mod tests;
