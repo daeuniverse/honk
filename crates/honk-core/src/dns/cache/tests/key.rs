@@ -157,7 +157,7 @@ fn exact_negative_identity_isolated_and_flush_fenced() {
     );
 }
 #[test]
-fn exact_positive_removal_isolated_and_flush_fenced() {
+fn exact_removal_isolated_and_flush_fenced() {
     let wire = crate::dns::forwarder::build_dns_query("remove.example", 1);
     let query = QueryContext::parse(&wire).expect("query");
     let key = CacheKey::new(
@@ -173,14 +173,18 @@ fn exact_positive_removal_isolated_and_flush_fenced() {
         OperationKind::Resolve,
     );
     let response = make_test_response([192, 0, 2, 10], 300);
-    let cache = DnsCache::new(4);
+    let cache = DnsCache::new(64);
     let service = cache.service();
     let old_epoch = service.publication_epoch();
     service.put_exact(key.clone(), response.clone(), 300);
     service.put_exact(other.clone(), response, 300);
+    assert!(service.get_exact(&key).is_some());
+    service.put_negative_if_current(old_epoch, key.clone(), 60, 3);
+    assert!(service.negative_hit_exact(&key).is_some());
 
     service.remove_exact_if_current(old_epoch, key.clone());
     assert!(service.get_exact(&key).is_none());
+    assert!(service.negative_hit_exact(&key).is_none());
     assert!(service.get_exact(&other).is_some());
 
     let flush = service.begin_flush();

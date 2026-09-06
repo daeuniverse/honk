@@ -194,7 +194,7 @@ impl DnsCacheService {
         }
         let slot = CacheSlot::Exact(key.clone());
         let index = self.shard_index(&slot);
-        lock(&self.shards[index]).remove_positive(&slot);
+        lock(&self.shards[index]).pop(&slot);
         if let Some(persister) = lock(&self.persister).clone() {
             persister.remove(key);
         }
