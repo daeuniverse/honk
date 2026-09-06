@@ -100,7 +100,7 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 入口另用该代按启动预算确定的 slow-path 配额（最多 256），与普通 UDP 初始化隔离。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。已完成的失败会连同原始原因共享给所有已加入的 follower，但不进入缓存；follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
+每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 入口另用该代按启动预算确定的 slow-path 配额（最多 256），与普通 UDP 初始化隔离。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
 
 ### Hosts 快照
 
@@ -210,7 +210,11 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 现有 TLS 维护任务也会回收当前 DNS registry 的空闲 connector。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
 
-发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程 join 后台 worker、关闭 DNS transport 及其私有代理 session，再退役捕获的普通流量 registry 中未转移的可复用状态。30 秒排空期限只是安全兜底，并非新代服务的前置条件；到期会取消所有基于 runtime 的 `DnsService` 查询路径。最多保留四个已退役 runtime；超过上限与 provider 关闭会触发相同的强制取消。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
+发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程 join 后台 worker、关闭 DNS transport 及其私有代理 session，再退役捕获的普通流量 registry 中未转移的可复用状态。
+
+30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全兜底，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。Forwarding 返回后的 bootstrap fallback 不在该取消范围内。最多保留四个已退役 runtime；超过上限与 provider 关闭会触发相同的强制取消。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。
+
+Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
 
