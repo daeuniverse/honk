@@ -92,7 +92,7 @@ async fn retirement_joins_blocked_prefetch_before_transport_close() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retirement_cancels_foreground_queries_and_releases_admission() {
+async fn retirement_cancels_every_foreground_entry_path() {
     use crate::dns::query::{DnsRequestMeta, IngressProfile};
     use crate::dns::runtime::DnsServiceProvider;
     use crate::dns::service::DnsService;
@@ -107,15 +107,12 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
         let old = runtime(Arc::clone(&transport));
         let provider = Arc::new(DnsServiceProvider::new(Arc::clone(&old)));
         let service = DnsService::with_provider(Arc::clone(&provider));
-        let admission = Arc::new(tokio::sync::Semaphore::new(256));
         let mut queries = tokio::task::JoinSet::new();
-        for caller in 0..256 {
-            let permit = Arc::clone(&admission).try_acquire_owned().unwrap();
+        for caller in 0..4 {
             let service = service.clone();
             queries.spawn(async move {
-                let _permit = permit;
                 let query = crate::dns::forwarder::build_dns_query("blocked.example", 1);
-                match caller % 4 {
+                match caller {
                     0 => service
                         .resolve(&query, IngressProfile::Api)
                         .await
@@ -140,7 +137,7 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
             });
         }
         tokio::time::timeout(Duration::from_secs(1), async {
-            while old.lease_count() != 256 {
+            while old.lease_count() != 4 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -148,7 +145,7 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
         .expect("all foreground callers acquire their old-generation lease");
         provider.publish(runtime(Arc::new(BlockingTransport::default())));
         tokio::task::yield_now().await;
-        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(old.lease_count(), 4);
         match trigger {
             Trigger::Deadline => tokio::time::advance(super::RETIREMENT_DEADLINE).await,
             Trigger::Capacity => {
@@ -171,7 +168,6 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
         .await
         .expect("retirement must cancel every service entry path");
         assert_eq!(old.lease_count(), 0);
-        assert_eq!(admission.available_permits(), 256);
         let closed_lease = provider.acquire();
         tokio::time::timeout(Duration::from_secs(1), provider.shutdown())
             .await

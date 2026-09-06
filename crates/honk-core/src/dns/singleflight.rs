@@ -77,26 +77,15 @@ struct CounterSet {
 
 pub(crate) type FlightResult = Result<Arc<ResponseTemplate>, Arc<DnsForwardError>>;
 
-struct FlightEntry {
-    sender: broadcast::Sender<FlightResult>,
-    state: FlightState,
-}
-
-enum FlightState {
-    Running,
-    Published(FlightResult),
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct Singleflight {
-    entries: Arc<Mutex<HashMap<FlightKey, FlightEntry>>>,
+    entries: Arc<Mutex<HashMap<FlightKey, broadcast::Sender<FlightResult>>>>,
     counters: Arc<CounterSet>,
 }
 
 pub(crate) enum FlightRole {
     Leader(FlightLeader),
     Waiter(FlightWaiter),
-    Ready(FlightResult),
     Rejected,
 }
 
@@ -107,19 +96,15 @@ pub(crate) struct FlightWaiter {
 
 pub(crate) struct FlightLeader {
     key: Option<FlightKey>,
-    entries: Arc<Mutex<HashMap<FlightKey, FlightEntry>>>,
+    entries: Arc<Mutex<HashMap<FlightKey, broadcast::Sender<FlightResult>>>>,
     counters: Arc<CounterSet>,
 }
 
 impl Singleflight {
     pub(crate) fn acquire(&self, key: FlightKey) -> FlightRole {
         let mut entries = lock(&self.entries);
-        if let Some(entry) = entries.get(&key) {
-            if let FlightState::Published(result) = &entry.state {
-                self.counters.waiters.fetch_add(1, Ordering::Relaxed);
-                return FlightRole::Ready(result.clone());
-            }
-            if entry.sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
+        if let Some(sender) = entries.get(&key) {
+            if sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
                 tracing::warn!(
@@ -137,7 +122,7 @@ impl Singleflight {
                 crate::stats::DnsStatEvent::SingleflightAmplificationAvoided,
             );
             return FlightRole::Waiter(FlightWaiter {
-                receiver: entry.sender.subscribe(),
+                receiver: sender.subscribe(),
                 counters: Arc::clone(&self.counters),
             });
         }
@@ -152,13 +137,7 @@ impl Singleflight {
             return FlightRole::Rejected;
         }
         let (sender, _) = broadcast::channel(1);
-        entries.insert(
-            key.clone(),
-            FlightEntry {
-                sender,
-                state: FlightState::Running,
-            },
-        );
+        entries.insert(key.clone(), sender);
         self.counters.leaders.fetch_add(1, Ordering::Relaxed);
         if matches!(key.operation(), OperationKind::Refresh) {
             self.counters.refreshes.fetch_add(1, Ordering::Relaxed);
@@ -202,20 +181,22 @@ impl FlightWaiter {
 }
 
 impl FlightLeader {
-    pub(crate) fn publish(&mut self, result: FlightResult) {
-        let Some(key) = self.key.as_ref() else {
+    pub(crate) fn publish(mut self, result: FlightResult) {
+        let Some(key) = self.key.take() else {
             return;
         };
-        if let Some(entry) = lock(&self.entries).get_mut(key) {
-            entry.state = FlightState::Published(result.clone());
-            let _ = entry.sender.send(result);
-        }
+        let mut entries = lock(&self.entries);
+        let Some(sender) = entries.remove(&key) else {
+            return;
+        };
+        // Sending while `entries` is locked is completion's linearization point:
+        // attached waiters are notified before a successor can be acquired.
+        let _ = sender.send(result);
     }
 
-    pub(crate) fn fail(mut self, error: DnsForwardError) -> DnsForwardError {
+    pub(crate) fn fail(self, error: DnsForwardError) -> DnsForwardError {
         let error = Arc::new(error);
         self.publish(Err(Arc::clone(&error)));
-        drop(self);
         Arc::try_unwrap(error).unwrap_or_else(DnsForwardError::Shared)
     }
 }
@@ -225,9 +206,7 @@ impl Drop for FlightLeader {
         let Some(key) = self.key.take() else {
             return;
         };
-        let aborted = lock(&self.entries)
-            .remove(&key)
-            .is_some_and(|entry| matches!(entry.state, FlightState::Running));
+        let aborted = lock(&self.entries).remove(&key).is_some();
         if aborted {
             self.counters.aborts.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightCancel);
