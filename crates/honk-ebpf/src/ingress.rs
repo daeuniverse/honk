@@ -466,7 +466,7 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
         ifindex,
         addr: address,
     };
-    unsafe { LOCAL_ADDRESS_MAP.get(&key) }.is_some()
+    unsafe { LOCAL_ADDRESS_MAP.get(key) }.is_some()
 }
 
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
