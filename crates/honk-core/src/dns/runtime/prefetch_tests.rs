@@ -137,9 +137,13 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
                 }
             });
         }
-        while old.lease_count() != 256 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.lease_count() != 256 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("all foreground callers acquire their old-generation lease");
         provider.publish(runtime(Arc::new(BlockingTransport::default())));
         tokio::task::yield_now().await;
         assert_eq!(admission.available_permits(), 0);
@@ -150,7 +154,11 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
                     provider.publish(runtime(Arc::new(BlockingTransport::default())));
                 }
             }
-            Trigger::Shutdown => provider.shutdown().await,
+            Trigger::Shutdown => {
+                tokio::time::timeout(Duration::from_secs(1), provider.shutdown())
+                    .await
+                    .expect("shutdown cancels pending queries");
+            }
         }
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -162,9 +170,11 @@ async fn retirement_cancels_foreground_queries_and_releases_admission() {
         .expect("retirement must cancel every service entry path");
         assert_eq!(old.lease_count(), 0);
         assert_eq!(admission.available_permits(), 256);
-        provider.shutdown().await;
-        assert!(transport.query_drop_order.load(Ordering::Acquire) > 0);
         let closed_lease = provider.acquire();
+        tokio::time::timeout(Duration::from_secs(1), provider.shutdown())
+            .await
+            .expect("final shutdown joins every runtime");
+        assert!(transport.query_drop_order.load(Ordering::Acquire) > 0);
         assert!(
             closed_lease
                 .run(async { panic!("closed runtime must not poll a query") })

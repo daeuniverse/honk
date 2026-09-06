@@ -58,7 +58,6 @@ async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() 
 #[tokio::test]
 async fn failed_exchange_is_shared_without_serial_waiter_retries() {
     struct FailingUpstream {
-        entered: tokio::sync::Notify,
         release: tokio::sync::Semaphore,
         calls: AtomicUsize,
     }
@@ -66,13 +65,11 @@ async fn failed_exchange_is_shared_without_serial_waiter_retries() {
     impl DnsUpstreamPool for FailingUpstream {
         async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.entered.notify_one();
             self.release.acquire().await?.forget();
             Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
         }
     }
     let upstream = Arc::new(FailingUpstream {
-        entered: tokio::sync::Notify::new(),
         release: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
     });
@@ -87,9 +84,13 @@ async fn failed_exchange_is_shared_without_serial_waiter_retries() {
         let forwarder = Arc::clone(&forwarder);
         queries.spawn(async move { forwarder.resolve(&make_a_query()).await });
     }
-    while flights.counters().waiters != 256 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while flights.counters().waiters != 256 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all followers join the failed exchange");
     upstream.release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(query) = queries.join_next().await {

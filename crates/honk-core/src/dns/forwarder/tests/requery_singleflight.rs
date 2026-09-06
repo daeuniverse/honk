@@ -176,10 +176,14 @@ async fn response_requery_failure_is_shared_then_a_new_query_can_retry() {
         });
     }
     start.wait().await;
-    upstream.initial_entered.notified().await;
-    while service.flight_counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        upstream.initial_entered.notified().await;
+        while service.flight_counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all requery followers join");
     upstream.initial_release.notify_one();
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(joined) = tasks.join_next().await {
