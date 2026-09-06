@@ -50,6 +50,17 @@ pub enum DnsForwardError {
     RejectedPlanEscaped,
     #[error("DNS singleflight admission is saturated")]
     Overloaded,
+    #[error("{0}")]
+    Shared(#[source] Arc<DnsForwardError>),
+}
+
+impl DnsForwardError {
+    pub(crate) fn unshared(&self) -> &Self {
+        match self {
+            Self::Shared(error) => error.unshared(),
+            error => error,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

@@ -89,3 +89,87 @@ async fn retirement_joins_blocked_prefetch_before_transport_close() {
     assert_eq!(transport.query_drop_order.load(Ordering::Acquire), 1);
     assert_eq!(transport.close_order.load(Ordering::Acquire), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn retirement_cancels_foreground_queries_and_releases_admission() {
+    use crate::dns::query::{DnsRequestMeta, IngressProfile};
+    use crate::dns::runtime::DnsServiceProvider;
+    use crate::dns::service::DnsService;
+
+    enum Trigger {
+        Deadline,
+        Capacity,
+        Shutdown,
+    }
+    for trigger in [Trigger::Deadline, Trigger::Capacity, Trigger::Shutdown] {
+        let transport = Arc::new(BlockingTransport::default());
+        let old = runtime(Arc::clone(&transport));
+        let provider = Arc::new(DnsServiceProvider::new(Arc::clone(&old)));
+        let service = DnsService::with_provider(Arc::clone(&provider));
+        let admission = Arc::new(tokio::sync::Semaphore::new(256));
+        let mut queries = tokio::task::JoinSet::new();
+        for caller in 0..256 {
+            let permit = Arc::clone(&admission).try_acquire_owned().unwrap();
+            let service = service.clone();
+            queries.spawn(async move {
+                let _permit = permit;
+                let query = crate::dns::forwarder::build_dns_query("blocked.example", 1);
+                match caller % 4 {
+                    0 => service
+                        .resolve(&query, IngressProfile::Api)
+                        .await
+                        .map(|_| ()),
+                    1 => service
+                        .resolve_outcome_with_runtime(
+                            &query,
+                            DnsRequestMeta::EMPTY,
+                            IngressProfile::Udp {
+                                advertised_size: 1232,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    2 => service.resolve_name("blocked.example").await.map(|_| ()),
+                    _ => service
+                        .resolve_name_for_source("blocked.example", "192.0.2.1".parse().unwrap())
+                        .await
+                        .map(|_| ()),
+                }
+            });
+        }
+        while old.lease_count() != 256 {
+            tokio::task::yield_now().await;
+        }
+        provider.publish(runtime(Arc::new(BlockingTransport::default())));
+        tokio::task::yield_now().await;
+        assert_eq!(admission.available_permits(), 0);
+        match trigger {
+            Trigger::Deadline => tokio::time::advance(super::RETIREMENT_DEADLINE).await,
+            Trigger::Capacity => {
+                for _ in 0..super::MAX_RETIRED_RUNTIMES {
+                    provider.publish(runtime(Arc::new(BlockingTransport::default())));
+                }
+            }
+            Trigger::Shutdown => provider.shutdown().await,
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(query) = queries.join_next().await {
+                assert!(query.unwrap().is_err(), "retired query must fail closed");
+            }
+        })
+        .await
+        .expect("retirement must cancel every service entry path");
+        assert_eq!(old.lease_count(), 0);
+        assert_eq!(admission.available_permits(), 256);
+        provider.shutdown().await;
+        assert!(transport.query_drop_order.load(Ordering::Acquire) > 0);
+        let closed_lease = provider.acquire();
+        assert!(
+            closed_lease
+                .run(async { panic!("closed runtime must not poll a query") })
+                .await
+                .is_err()
+        );
+    }
+}

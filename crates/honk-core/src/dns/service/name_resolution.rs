@@ -78,13 +78,14 @@ impl DnsService {
         let responses = match self.backend.as_ref() {
             DnsServiceBackend::Runtime(provider) => {
                 let lease = provider.acquire();
-                resolve_with_forwarder(
-                    &mut operation,
-                    lease.runtime().forwarder(),
-                    &domain,
-                    metadata,
-                )
-                .await?
+                lease
+                    .run(resolve_with_forwarder(
+                        &mut operation,
+                        lease.runtime().forwarder(),
+                        &domain,
+                        metadata,
+                    ))
+                    .await??
             }
             DnsServiceBackend::Standalone(forwarder) => {
                 resolve_with_forwarder(&mut operation, forwarder, &domain, metadata).await?
@@ -122,8 +123,14 @@ impl DnsService {
         let responses = match self.backend.as_ref() {
             DnsServiceBackend::Runtime(provider) => {
                 let lease = provider.acquire();
-                resolve_with_forwarder(&mut operation, lease.runtime().forwarder(), &domain, None)
-                    .await?
+                lease
+                    .run(resolve_with_forwarder(
+                        &mut operation,
+                        lease.runtime().forwarder(),
+                        &domain,
+                        None,
+                    ))
+                    .await??
             }
             DnsServiceBackend::Standalone(forwarder) => {
                 resolve_with_forwarder(&mut operation, forwarder, &domain, None).await?

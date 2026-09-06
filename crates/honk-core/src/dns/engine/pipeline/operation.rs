@@ -15,8 +15,10 @@ pub(super) async fn run_as_leader(
     leader: FlightLeader,
     context: &ExecutionContext<'_>,
 ) -> Result<DnsOutcome, DnsForwardError> {
-    let outcome = run(context).await?;
-    Ok(super::flight::publish_outcome(leader, outcome))
+    match run(context).await {
+        Ok(outcome) => Ok(super::flight::publish_outcome(leader, outcome)),
+        Err(error) => Err(leader.fail(error)),
+    }
 }
 
 pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, DnsForwardError> {

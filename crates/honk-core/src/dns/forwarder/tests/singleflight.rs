@@ -55,6 +55,61 @@ async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() 
     assert_eq!(flights.active_len(), 0);
 }
 
+#[tokio::test]
+async fn failed_exchange_is_shared_without_serial_waiter_retries() {
+    struct FailingUpstream {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl DnsUpstreamPool for FailingUpstream {
+        async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.acquire().await?.forget();
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+        }
+    }
+    let upstream = Arc::new(FailingUpstream {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let forwarder = Arc::new(DnsForwarder::new(
+        upstream.clone(),
+        test_cache(),
+        test_router(),
+    ));
+    let flights = forwarder.cache_service().await.singleflight();
+    let mut queries = tokio::task::JoinSet::new();
+    for _ in 0..257 {
+        let forwarder = Arc::clone(&forwarder);
+        queries.spawn(async move { forwarder.resolve(&make_a_query()).await });
+    }
+    while flights.counters().waiters != 256 {
+        tokio::task::yield_now().await;
+    }
+    upstream.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(query) = queries.join_next().await {
+            let error = query.unwrap().expect_err("upstream timeout");
+            assert!(error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)));
+        }
+    })
+    .await
+    .expect("one failed exchange must settle every waiter");
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(flights.active_len(), 0);
+    assert!(forwarder.cache().lock().await.is_empty());
+
+    upstream.release.add_permits(1);
+    assert!(forwarder.resolve(&make_a_query()).await.is_err());
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2, "failures are not cached");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
     const CALLERS: usize = 128;

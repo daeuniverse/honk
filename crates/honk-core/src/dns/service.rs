@@ -92,12 +92,16 @@ impl DnsService {
                 let lease = provider.acquire();
                 operation
                     .run(
-                        lease
-                            .runtime()
-                            .forwarder()
-                            .resolve_strict_with_context_and_profile(raw_query, metadata, ingress),
+                        lease.run(
+                            lease
+                                .runtime()
+                                .forwarder()
+                                .resolve_strict_with_context_and_profile(
+                                    raw_query, metadata, ingress,
+                                ),
+                        ),
                     )
-                    .await?
+                    .await??
             }
             DnsServiceBackend::Standalone(forwarder) => {
                 operation
@@ -123,12 +127,14 @@ impl DnsService {
         let lease = provider.acquire();
         let outcome = operation
             .run(
-                lease
-                    .runtime()
-                    .forwarder()
-                    .resolve_outcome_with_context_and_profile(raw_query, metadata, ingress),
+                lease.run(
+                    lease
+                        .runtime()
+                        .forwarder()
+                        .resolve_outcome_with_context_and_profile(raw_query, metadata, ingress),
+                ),
             )
-            .await??;
+            .await???;
         Ok((outcome, lease))
     }
 

@@ -202,7 +202,10 @@ impl DnsController {
                 if error
                     .downcast_ref::<crate::dns::forwarder::DnsForwardError>()
                     .is_some_and(|error| {
-                        matches!(error, crate::dns::forwarder::DnsForwardError::Overloaded)
+                        matches!(
+                            error.unshared(),
+                            crate::dns::forwarder::DnsForwardError::Overloaded
+                        )
                     }) =>
             {
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);

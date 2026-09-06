@@ -47,11 +47,15 @@ async fn waiter_receives_leader_template_when_completed() {
     };
 
     // When
-    leader.publish(template());
+    let expected = template();
+    leader.publish(Ok(Arc::clone(&expected)));
     let received = waiter.receive().await;
 
     // Then
-    assert!(received.is_some());
+    let received = received
+        .expect("published result")
+        .expect("successful response");
+    assert_eq!(received.wire(), expected.wire());
     assert_eq!(flights.active_len(), 1);
     assert_eq!(flights.counters().leaders, 1);
     assert_eq!(flights.counters().waiters, 1);

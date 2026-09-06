@@ -100,7 +100,7 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-系统有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。丢弃 leader 会删除 flight、唤醒 follower 重新竞争所有权，并记录取消。
+系统有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。已完成的失败会连同原始原因共享给所有已加入的 follower，但不进入缓存；follower 不会各自重复失败的交换。只有在完成前取消 leader，才会删除 flight 并唤醒 follower 重新竞争所有权。
 
 ### Hosts 快照
 
@@ -208,7 +208,7 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、路由与组快照、transport manager、路由投影、捕获的 bootstrap resolver 以及固定的 outbound runtime。`DnsServiceProvider` 将该对象作为一个整体发布。查询 lease 使所有组件保持在同一 generation，包括延迟初始化的 transport 与出站 session 状态。
 
-发布会让替换项立即可供新 lease 使用，并将旧 runtime 转为 draining。旧 runtime 等待 lease，关闭 prefetch 与 DNS transport，随后 drain 其固定的 outbound session pool。lease 排空最多等待 30 秒，随后开始关闭。最多保留四个已退役 runtime；超过上限会取消并强制关闭最旧 generation。Provider 持有的退役 supervisor 数量有界，会被回收并在关闭时 join，因此不会分离 transport 或 forced-close task。
+发布会让替换项立即可供新 lease 使用，并将旧 runtime 转为 draining。旧 runtime 等待 lease，关闭 prefetch 与 DNS transport，随后 drain 其固定的 outbound session pool。30 秒 lease 排空期限到达后，先取消基于 runtime 的 service 查询，再关闭 transport；覆盖原始查询、controller outcome 以及两条应用域名解析路径。最多保留四个已退役 runtime；超过上限和 provider 关闭使用相同的查询取消机制。入口 adapter 对被取消的解析返回 `SERVFAIL`，在应答 I/O 结束后释放进程级准入名额，避免旧代卡住的查询无限期占用共享 UDP slow-path 预算（最多 256）。Provider 持有退役 supervisor，回收已完成项，并在关闭时 join。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
 

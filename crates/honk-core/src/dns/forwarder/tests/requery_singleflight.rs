@@ -100,7 +100,7 @@ async fn concurrent_response_requery_is_one_logical_flight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
+async fn response_requery_failure_is_shared_then_a_new_query_can_retry() {
     use honk_config::dns::{
         DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRouting,
         DnsResponseRule,
@@ -112,8 +112,6 @@ async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
         fallback_calls: AtomicUsize,
         initial_entered: tokio::sync::Notify,
         initial_release: tokio::sync::Notify,
-        successor_entered: tokio::sync::Notify,
-        successor_release: tokio::sync::Notify,
         polluted: Vec<u8>,
         clean: Vec<u8>,
     }
@@ -131,9 +129,6 @@ async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
             if call == 0 {
                 self.initial_entered.notify_one();
                 self.initial_release.notified().await;
-            } else if call == 1 {
-                self.successor_entered.notify_one();
-                self.successor_release.notified().await;
             }
             Ok(self.polluted.clone())
         }
@@ -144,8 +139,6 @@ async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
         fallback_calls: AtomicUsize::new(0),
         initial_entered: tokio::sync::Notify::new(),
         initial_release: tokio::sync::Notify::new(),
-        successor_entered: tokio::sync::Notify::new(),
-        successor_release: tokio::sync::Notify::new(),
         polluted: make_a_response([10, 0, 0, 1], 60),
         clean: make_a_response([8, 8, 4, 4], 60),
     });
@@ -188,31 +181,22 @@ async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
         tokio::task::yield_now().await;
     }
     upstream.initial_release.notify_one();
-    upstream.successor_entered.notified().await;
-    while service.flight_counters().waiters
-        < u64::try_from((CALLERS - 1) + (CALLERS - 2)).expect("count")
-    {
-        tokio::task::yield_now().await;
-    }
-    upstream.successor_release.notify_one();
-
-    let mut successes = 0;
-    let mut failures = 0;
-    while let Some(joined) = tasks.join_next().await {
-        match joined.expect("task") {
-            Ok(response) => {
-                assert_eq!(&response[response.len() - 4..], &[8, 8, 4, 4]);
-                successes += 1;
-            }
-            Err(_) => failures += 1,
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(joined) = tasks.join_next().await {
+            let error = joined.expect("task").expect_err("shared fallback failure");
+            assert!(matches!(
+                error.downcast_ref::<DnsForwardError>().unwrap().unshared(),
+                DnsForwardError::Exchange { upstream, .. } if upstream == "fallback"
+            ));
         }
-    }
-    let counters = service.flight_counters();
-    assert_eq!((successes, failures), (CALLERS - 1, 1));
+    })
+    .await
+    .expect("requery failure settles all followers");
+    assert_eq!(upstream.initial_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(upstream.fallback_calls.load(Ordering::SeqCst), 1);
+    let response = forwarder.resolve(&make_a_query()).await.expect("fresh retry");
+    assert_eq!(&response[response.len() - 4..], &[8, 8, 4, 4]);
     assert_eq!(upstream.initial_calls.load(Ordering::SeqCst), 2);
     assert_eq!(upstream.fallback_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(counters.leaders, 2);
-    assert_eq!(counters.aborts, 1);
-    assert_eq!(counters.retries, u64::try_from(CALLERS - 1).expect("count"));
     assert_eq!(service.active_flights(), 0);
 }

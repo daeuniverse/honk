@@ -142,13 +142,14 @@ impl DnsForwarder {
             }
             Err(error) => {
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeError);
-                let error_kind = match error {
+                let error_kind = match error.unshared() {
                     DnsForwardError::Engine(_) => "engine",
                     DnsForwardError::Exchange { .. } => "exchange",
                     DnsForwardError::Response(_) => "response",
                     DnsForwardError::Internal(_) => "internal",
                     DnsForwardError::RejectedPlanEscaped => "rejected_plan",
                     DnsForwardError::Overloaded => "overloaded",
+                    DnsForwardError::Shared(_) => unreachable!("unwrapped shared failure"),
                 };
                 tracing::debug!(error_kind, "DNS resolution failed");
             }

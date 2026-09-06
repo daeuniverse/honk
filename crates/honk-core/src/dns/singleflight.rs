@@ -7,7 +7,7 @@ use honk_config::dns::DnsStrategy;
 use tokio::sync::broadcast;
 
 use super::cache::{CacheKey, OperationKind};
-use super::forwarder::ResolveMode;
+use super::forwarder::{DnsForwardError, ResolveMode};
 use super::query::DnsRequestMeta;
 use super::response::ResponseTemplate;
 
@@ -75,14 +75,16 @@ struct CounterSet {
     refreshes: AtomicU64,
 }
 
+pub(crate) type FlightResult = Result<Arc<ResponseTemplate>, Arc<DnsForwardError>>;
+
 struct FlightEntry {
-    sender: broadcast::Sender<Arc<ResponseTemplate>>,
+    sender: broadcast::Sender<FlightResult>,
     state: FlightState,
 }
 
 enum FlightState {
     Running,
-    Published(Arc<ResponseTemplate>),
+    Published(FlightResult),
 }
 
 #[derive(Clone, Default)]
@@ -94,12 +96,12 @@ pub(crate) struct Singleflight {
 pub(crate) enum FlightRole {
     Leader(FlightLeader),
     Waiter(FlightWaiter),
-    Ready(Arc<ResponseTemplate>),
+    Ready(FlightResult),
     Rejected,
 }
 
 pub(crate) struct FlightWaiter {
-    receiver: broadcast::Receiver<Arc<ResponseTemplate>>,
+    receiver: broadcast::Receiver<FlightResult>,
     counters: Arc<CounterSet>,
 }
 
@@ -113,9 +115,9 @@ impl Singleflight {
     pub(crate) fn acquire(&self, key: FlightKey) -> FlightRole {
         let mut entries = lock(&self.entries);
         if let Some(entry) = entries.get(&key) {
-            if let FlightState::Published(template) = &entry.state {
+            if let FlightState::Published(result) = &entry.state {
                 self.counters.waiters.fetch_add(1, Ordering::Relaxed);
-                return FlightRole::Ready(Arc::clone(template));
+                return FlightRole::Ready(result.clone());
             }
             if entry.sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
@@ -186,7 +188,7 @@ impl Singleflight {
 }
 
 impl FlightWaiter {
-    pub(crate) async fn receive(mut self) -> Option<Arc<ResponseTemplate>> {
+    pub(crate) async fn receive(mut self) -> Option<FlightResult> {
         match self.receiver.recv().await {
             Ok(template) => Some(template),
             Err(_) => {
@@ -200,14 +202,21 @@ impl FlightWaiter {
 }
 
 impl FlightLeader {
-    pub(crate) fn publish(&mut self, template: Arc<ResponseTemplate>) {
+    pub(crate) fn publish(&mut self, result: FlightResult) {
         let Some(key) = self.key.as_ref() else {
             return;
         };
         if let Some(entry) = lock(&self.entries).get_mut(key) {
-            entry.state = FlightState::Published(Arc::clone(&template));
-            let _ = entry.sender.send(template);
+            entry.state = FlightState::Published(result.clone());
+            let _ = entry.sender.send(result);
         }
+    }
+
+    pub(crate) fn fail(mut self, error: DnsForwardError) -> DnsForwardError {
+        let error = Arc::new(error);
+        self.publish(Err(Arc::clone(&error)));
+        drop(self);
+        Arc::try_unwrap(error).unwrap_or_else(DnsForwardError::Shared)
     }
 }
 

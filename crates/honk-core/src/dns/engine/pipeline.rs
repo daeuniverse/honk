@@ -20,7 +20,7 @@ mod flight {
 
     pub(super) fn publish_outcome(mut leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
         if let Some(template) = outcome.template() {
-            leader.publish(Arc::new(template.clone()));
+            leader.publish(Ok(Arc::new(template.clone())));
         }
         outcome
     }
@@ -243,12 +243,17 @@ pub(crate) async fn resolve_with_owner(
     loop {
         match flights.acquire(flight_key.clone()) {
             FlightRole::Rejected => return Err(DnsForwardError::Overloaded),
-            FlightRole::Ready(template) => {
-                return flight::waiter_outcome(&context, template).await;
+            FlightRole::Ready(result) => {
+                return flight::waiter_outcome(&context, result.map_err(DnsForwardError::Shared)?)
+                    .await;
             }
             FlightRole::Waiter(waiter) => match waiter.receive().await {
-                Some(template) => {
-                    return flight::waiter_outcome(&context, template).await;
+                Some(result) => {
+                    return flight::waiter_outcome(
+                        &context,
+                        result.map_err(DnsForwardError::Shared)?,
+                    )
+                    .await;
                 }
                 None => continue,
             },

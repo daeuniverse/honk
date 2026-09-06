@@ -150,15 +150,20 @@ impl DnsRuntime {
         self.cancellation.notify_waiters();
     }
 
+    async fn cancelled(&self) {
+        let cancelled = self.cancellation.notified();
+        if !self.cancellation_requested.load(Ordering::Acquire) {
+            cancelled.await;
+        }
+    }
+
     async fn retire(self: Arc<Self>, deadline: Duration) {
         self.start_draining();
-        let cancellation = self.cancellation.notified();
-        tokio::pin!(cancellation);
         if self.lease_count() != 0 && !self.cancellation_requested.load(Ordering::Acquire) {
             let timed_out = tokio::select! {
                 () = Self::wait_for_zero_leases(&self) => false,
                 () = tokio::time::sleep(deadline) => true,
-                () = &mut cancellation => false,
+                () = self.cancelled() => false,
             };
             if timed_out {
                 crate::stats::record_dns_event(
@@ -184,6 +189,7 @@ impl DnsRuntime {
             self.wait_closed().await;
             return;
         }
+        self.request_cancellation();
         self.parts.forwarder.shutdown_prefetch().await;
         self.parts.transport.close().await;
         if let Some(runtime) = &self.parts.outbound_runtime {
@@ -225,9 +231,28 @@ pub(crate) struct RuntimeLease {
     runtime: Arc<DnsRuntime>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("DNS runtime generation {generation} retired")]
+pub(crate) struct RuntimeCancelled {
+    generation: u64,
+}
+
 impl RuntimeLease {
     pub(crate) fn runtime(&self) -> &DnsRuntime {
         &self.runtime
+    }
+
+    pub(crate) async fn run<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, RuntimeCancelled> {
+        tokio::select! {
+            biased;
+            () = self.runtime.cancelled() => Err(RuntimeCancelled {
+                generation: self.runtime.generation().get(),
+            }),
+            result = operation => Ok(result),
+        }
     }
 }
 
