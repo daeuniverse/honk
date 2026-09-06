@@ -216,14 +216,6 @@ impl PaddingState {
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
-/// Soft caps on parked overflow (data frames/payload, session-wide and
-/// per stream). Tripping one never blocks the demux: the frame parks and
-/// the stall watchdog reaps consumers that make no flush progress for
-/// [`OVERFLOW_STALL_GRACE`]. Soft because a fast peer can burst past
-/// them in the milliseconds before the reader task is first scheduled.
-const SESSION_OVERFLOW_CAP: usize = 512;
-const STREAM_OVERFLOW_BYTES_CAP: usize = 2 * 1024 * 1024;
-const SESSION_OVERFLOW_BYTES_CAP: usize = 8 * 1024 * 1024;
 /// Emergency session-wide frame cap. Tripping it reaps the most-stalled
 /// parked stream on the spot when it is past the grace; while every
 /// stalled stream is inside the grace the demux waits bounded
@@ -286,14 +278,6 @@ enum StreamEvent {
     Error(Arc<str>),
 }
 
-impl StreamEvent {
-    fn payload_len(&self) -> usize {
-        match self {
-            Self::Data(data) => data.len(),
-            Self::Fin | Self::Error(_) => 0,
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct OverflowUsage {
     frames: usize,
@@ -322,8 +306,6 @@ struct OverflowState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverflowLimit {
     SessionFrames,
-    StreamBytes,
-    SessionBytes,
     /// Watchdog reap: no flush progress for a full stall grace.
     StallGrace,
 }
@@ -332,8 +314,6 @@ impl OverflowLimit {
     fn as_str(self) -> &'static str {
         match self {
             Self::SessionFrames => "session_frames",
-            Self::StreamBytes => "stream_bytes",
-            Self::SessionBytes => "session_bytes",
             Self::StallGrace => "stall_grace",
         }
     }
@@ -385,26 +365,6 @@ impl OverflowState {
                 bytes: stream.bytes,
             })
             .unwrap_or_default()
-    }
-
-    /// Soft bounds, checked for data frames only (terminal events bypass
-    /// the quota). Session-wide bounds first: a stream past its soft cap
-    /// keeps parking until the watchdog's grace expires, so only this
-    /// order keeps session memory capped while stall age accrues.
-    fn limit_for(&self, sid: u32, event: &StreamEvent) -> Option<OverflowLimit> {
-        let bytes = event.payload_len();
-        if bytes != 0 && self.bytes.saturating_add(bytes) > SESSION_OVERFLOW_BYTES_CAP {
-            return Some(OverflowLimit::SessionBytes);
-        }
-        if self.frames >= SESSION_OVERFLOW_CAP {
-            return Some(OverflowLimit::SessionFrames);
-        }
-        if bytes != 0
-            && self.stream_usage(sid).bytes.saturating_add(bytes) > STREAM_OVERFLOW_BYTES_CAP
-        {
-            return Some(OverflowLimit::StreamBytes);
-        }
-        None
     }
 
     /// Time since the reader last made flush progress on this stream (or
@@ -606,10 +566,6 @@ impl OverflowState {
             if terminals >= MAX_OVERFLOW_TERMINAL_EVENTS {
                 return OverflowAction::Dropped;
             }
-            self.push_back(sid, event);
-            return OverflowAction::Parked;
-        }
-        if self.limit_for(sid, &event).is_none() {
             self.push_back(sid, event);
             return OverflowAction::Parked;
         }

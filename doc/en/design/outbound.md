@@ -575,16 +575,11 @@ Each TCP child has a bounded delivery queue. When it fills, the demultiplexer
 parks frames in a per-SID ordered overflow instead of waiting, preserving
 sibling progress and exact frame/byte accounting.
 
-Soft limits are:
+The first parked frame starts a watchdog ticking every 250 ms. Only a stream
+with no successful overflow flush for a full 3 seconds is reset; queued bytes
+alone are not evidence of a stall.
 
-- 512 parked frames and 8 MiB per session; and
-- 2 MiB per stream.
-
-Crossing a soft limit does not kill the stream. The first parked frame starts a
-watchdog ticking every 250 ms. Only a stream with no successful overflow flush
-for a full 3 seconds is reset; queued bytes alone are not evidence of a stall.
-
-Emergency hard limits are 768 frames or 12 MiB per session. If a stream is
+The emergency hard limit is 768 parked data frames per session. If a stream is
 already past the 3-second grace, admission reaps that stream immediately.
 Otherwise the demultiplexer waits in bounded 100 ms
 `OVERFLOW_EMERGENCY_WAIT` rounds, shortened to the nearest grace expiry, and

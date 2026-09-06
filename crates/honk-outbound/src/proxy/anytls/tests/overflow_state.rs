@@ -1,81 +1,8 @@
 use super::*;
 #[test]
-fn overflow_state_enforces_frame_and_byte_caps_independently() {
-    let mut frames = OverflowState::default();
-    for _ in 0..SESSION_OVERFLOW_CAP {
-        frames.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
-    }
-    assert_eq!(frames.usage().bytes, SESSION_OVERFLOW_CAP);
-    assert_eq!(
-        frames.limit_for(2, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
-        Some(OverflowLimit::SessionFrames)
-    );
-
-    let mut stream_bytes = OverflowState::default();
-    stream_bytes.push_back(
-        1,
-        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
-    );
-    assert_eq!(
-        stream_bytes.limit_for(1, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
-        Some(OverflowLimit::StreamBytes)
-    );
-
-    let mut session_bytes = OverflowState::default();
-    for sid in 1..=4 {
-        session_bytes.push_back(
-            sid,
-            StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
-        );
-    }
-    assert_eq!(session_bytes.usage().bytes, SESSION_OVERFLOW_BYTES_CAP);
-    assert_eq!(
-        session_bytes.limit_for(5, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
-        Some(OverflowLimit::SessionBytes)
-    );
-    assert_eq!(session_bytes.limit_for(5, &StreamEvent::Fin), None);
-
-    let mut competing_limits = OverflowState::default();
-    competing_limits.push_back(
-        9,
-        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
-    );
-    for _ in 1..SESSION_OVERFLOW_CAP {
-        competing_limits.push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![2])));
-    }
-    assert_eq!(
-        competing_limits.limit_for(9, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
-        Some(OverflowLimit::SessionFrames)
-    );
-
-    let mut competing_session_limits = OverflowState::default();
-    for sid in 1..=4 {
-        competing_session_limits.push_back(
-            sid,
-            StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
-        );
-    }
-    for _ in 4..SESSION_OVERFLOW_CAP {
-        competing_session_limits
-            .push_back(10, StreamEvent::Data(InboundPayload::for_test(vec![3])));
-    }
-    assert_eq!(
-        competing_session_limits
-            .limit_for(11, &StreamEvent::Data(InboundPayload::for_test(vec![1])),),
-        Some(OverflowLimit::SessionBytes)
-    );
-
-    let mut errors = OverflowState::default();
-    errors.push_back(1, StreamEvent::Error(Arc::from("remote error")));
-    errors.push_back(1, StreamEvent::Fin);
-    assert_eq!(errors.usage(), OverflowUsage::default());
-    assert_eq!(errors.stream_usage(1).frames, 0);
-}
-
-#[test]
 fn overflow_terminal_events_cap_per_stream() {
     let mut overflow = OverflowState::default();
-    for _ in 0..SESSION_OVERFLOW_CAP {
+    for _ in 0..SESSION_OVERFLOW_HARD_CAP {
         overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     }
 
@@ -96,8 +23,8 @@ fn overflow_terminal_events_cap_per_stream() {
         overflow.admit(2, StreamEvent::Fin),
         OverflowAction::Parked
     ));
-    assert_eq!(overflow.usage().frames, SESSION_OVERFLOW_CAP);
-    assert_eq!(overflow.stream_usage(1).frames, SESSION_OVERFLOW_CAP);
+    assert_eq!(overflow.usage().frames, SESSION_OVERFLOW_HARD_CAP);
+    assert_eq!(overflow.stream_usage(1).frames, SESSION_OVERFLOW_HARD_CAP);
 }
 
 #[test]
@@ -183,35 +110,18 @@ async fn overflow_flush_progress_resets_stall_age() {
     assert_eq!(overflow.stalled_for(1), Duration::from_secs(2));
 }
 
-/// Soft caps never kill, no matter how stale the stream: only the
-/// watchdog reaps on stall age, only the hard caps reap in admit.
 #[tokio::test(start_paused = true)]
 async fn overflow_admit_below_hard_caps_never_kills() {
     let mut overflow = OverflowState::default();
-    overflow.push_back(
-        1,
-        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
-    );
-    tokio::time::advance(OVERFLOW_STALL_GRACE * 4).await;
-    assert!(matches!(
-        overflow.admit(1, StreamEvent::Data(InboundPayload::for_test(vec![1])),),
-        OverflowAction::Parked
-    ));
-    assert_eq!(
-        overflow.stream_usage(1).bytes,
-        STREAM_OVERFLOW_BYTES_CAP + 1
-    );
-
-    let mut session_soft = OverflowState::default();
-    for _ in 0..SESSION_OVERFLOW_CAP {
-        session_soft.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
+    for _ in 0..SESSION_OVERFLOW_HARD_CAP - 1 {
+        overflow.push_back(1, StreamEvent::Data(InboundPayload::for_test(vec![1])));
     }
     tokio::time::advance(OVERFLOW_STALL_GRACE * 4).await;
     assert!(matches!(
-        session_soft.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![2])),),
+        overflow.admit(2, StreamEvent::Data(InboundPayload::for_test(vec![2]))),
         OverflowAction::Parked
     ));
-    assert_eq!(session_soft.usage().frames, SESSION_OVERFLOW_CAP + 1);
+    assert_eq!(overflow.usage().frames, SESSION_OVERFLOW_HARD_CAP);
 }
 
 /// Hard cap with a past-grace stream: the admit reaps the

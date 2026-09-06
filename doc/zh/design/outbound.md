@@ -521,16 +521,11 @@ pending chunk，也不会重复入队。
 frame 按 SID 有序停放到 overflow，而不是等待，从而保持 sibling 进度与
 精确 frame/byte 计数。
 
-Soft limit 为：
+第一个 parked frame 启动每 250 ms tick 一次的 watchdog。只有整整 3 秒
+没有成功 overflow flush 的 stream 才被 reset；仅存在 queued byte
+不是 stall 证据。
 
-- 每 session 512 个 parked frame 与 8 MiB；以及
-- 每 stream 2 MiB。
-
-越过 soft limit 不会杀死 stream。第一个 parked frame 启动每 250 ms tick
-一次的 watchdog。只有整整 3 秒没有成功 overflow flush 的 stream 才被
-reset；仅存在 queued byte 不是 stall 证据。
-
-Emergency hard limit 为每 session 768 个 frame 或 12 MiB。如果某 stream
+Emergency hard limit 为每 session 768 个 parked data frame。如果某 stream
 已经超过 3 秒 grace，admission 立即 reap 它。否则 demultiplexer 以有界
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
 在 reader progress 后重新判断。
