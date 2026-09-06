@@ -100,7 +100,7 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-系统有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。已完成的失败会连同原始原因共享给所有已加入的 follower，但不进入缓存；follower 不会各自重复失败的交换。只有在完成前取消 leader，才会删除 flight 并唤醒 follower 重新竞争所有权。
+系统有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。已完成的失败会连同原始原因共享给所有已加入的 follower，但不进入缓存；follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
 
 ### Hosts 快照
 

@@ -100,7 +100,7 @@ The production path is ordered as follows:
 | 8. Publication and rendering | Only a strictly validated final wire response can enter the cache or be published to singleflight waiters. Prefer-family suppression is applied to caller rendering after the validated reusable answer is stored. |
 | 9. Outcome and projection | The forwarder returns a typed outcome. `DnsController` submits that outcome with the pinned generation's projection snapshot, then the ingress adapter writes the reply. |
 
-There are two independent 2,048 limits: controller query lifecycles and active singleflight keys. One flight accepts at most 256 followers. Saturated flights reject rather than opening unbounded upstream exchanges; the controller renders that overload as `REFUSED`. A completed failure is shared with all attached followers, preserving its cause without caching it; followers do not each repeat the failed exchange. Cancelling a leader before completion removes the flight and wakes followers to retry ownership.
+There are two independent 2,048 limits: controller query lifecycles and active singleflight keys. One flight accepts at most 256 followers. Saturated flights reject rather than opening unbounded upstream exchanges; the controller renders that overload as `REFUSED`. A completed failure is shared with all attached followers, preserving its cause without caching it; followers do not each repeat the failed exchange. Dropping a leader without a published result removes the flight and wakes followers to retry ownership; this includes cancellation and compatibility-only successes without a validated response template.
 
 ### Hosts snapshot
 
