@@ -1070,6 +1070,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.command_sender(),
             attached_ifaces,
         )
+        .await?
     } else {
         None
     };

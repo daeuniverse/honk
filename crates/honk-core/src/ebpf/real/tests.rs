@@ -419,3 +419,78 @@ fn test_event_ip() {
         std::net::IpAddr::V6("::1".parse::<std::net::Ipv6Addr>().unwrap())
     );
 }
+
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn watcher_startup_failure_revokes_local_addresses() {
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-watcher-failure-test-{}", std::process::id()));
+    std::fs::create_dir_all(&pin_root).expect("pin root");
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        0x0800_0000,
+        None,
+        "",
+        true,
+    )
+    .await
+    .expect("backend load");
+    backend.detach_hooks().expect("detach hooks");
+    let key = LocalAddressKey {
+        ifindex: 0,
+        addr: maps::ip_addr_to_lpm_key("192.0.2.99".parse().unwrap()).data,
+    };
+    backend.replace_local_addresses(&[key]).unwrap();
+    let Some(aya::maps::Map::HashMap(data)) = backend.bpf().unwrap().map("LOCAL_ADDRESS_MAP")
+    else {
+        panic!("local address map");
+    };
+    let observed = AyaHashMap::<_, LocalAddressKey, u8>::try_from(aya::maps::Map::HashMap(
+        AyaMapData::from_fd(data.fd().as_fd().try_clone_to_owned().unwrap()).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(observed.get(&key, 0).unwrap(), 1);
+    let backend: std::sync::Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
+    let config = std::sync::Arc::new(tokio::sync::RwLock::new(std::sync::Arc::new(
+        honk_config::Config::default(),
+    )));
+    let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+
+    struct RestoreFileLimit(libc::rlimit);
+    impl Drop for RestoreFileLimit {
+        fn drop(&mut self) {
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) } != 0 {
+                std::process::abort();
+            }
+        }
+    }
+    // This ignored test runs serially; restore the process-wide limit even on panic.
+    let mut previous = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut previous) },
+        0
+    );
+    let restore = RestoreFileLimit(previous);
+    let exhausted = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: previous.rlim_max,
+    };
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+        0
+    );
+    let watcher = IfaceWatcher::spawn(backend.clone(), config, commands, AttachedMap::new()).await;
+    drop(restore);
+    let remaining = observed.get(&key, 0);
+    backend.write().await.cleanup().await.expect("cleanup");
+    std::fs::remove_dir_all(&pin_root).expect("remove private pins");
+
+    assert!(watcher.expect("watcher failure cleanup").is_none());
+    assert!(matches!(remaining, Err(MapError::KeyNotFound)));
+}

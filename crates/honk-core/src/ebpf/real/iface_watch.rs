@@ -58,25 +58,29 @@ pub struct IfaceWatcher {
 impl IfaceWatcher {
     /// `attached` seeds the names (with ifindex and directions) already
     /// hooked during startup so the first reconcile does not attach twice.
-    pub(crate) fn spawn(
+    pub(crate) async fn spawn(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
         attached: AttachedMap,
-    ) -> Option<Self> {
-        let fd = match subscribe_network_events() {
+    ) -> anyhow::Result<Option<Self>> {
+        let fd = match subscribe_network_events().and_then(|fd| {
+            tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
+        }) {
             Ok(fd) => fd,
             Err(e) => {
                 warn!(
-                    "interface watcher disabled; subscribe network events failed: {}",
+                    "interface watcher disabled; network subscription setup failed: {}",
                     e
                 );
-                return None;
+                // An unmaintained snapshot must not escape startup admission.
+                ebpf.write().await.replace_local_addresses(&[])?;
+                return Ok(None);
             }
         };
         let (stop, rx) = watch::channel(false);
         let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx));
-        Some(Self { handle, stop })
+        Ok(Some(Self { handle, stop }))
     }
 
     pub async fn shutdown(self, timeout: Duration) {
@@ -143,21 +147,13 @@ pub(crate) fn host_local_address_keys() -> anyhow::Result<Vec<LocalAddressKey>> 
 }
 
 async fn run(
-    fd: OwnedFd,
+    fd: tokio::io::unix::AsyncFd<OwnedFd>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
 ) {
-    let async_fd = match tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("interface watcher disabled: AsyncFd setup failed: {}", e);
-            return;
-        }
-    };
     let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
@@ -177,7 +173,7 @@ async fn run(
                     break;
                 }
             }
-            guard = async_fd.readable() => {
+            guard = fd.readable() => {
                 // A transient read failure (ENOBUFS after a burst) must not
                 // kill the watcher: the ticker keeps reconciling regardless.
                 let mut guard = match guard {
