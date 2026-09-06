@@ -1325,12 +1325,12 @@ fn removing_node_reclaims_health_state_and_blocks_stale_probe_writes() {
 fn custom_url_reload_prunes_removed_member_tags() {
     let set = AliveDialerSet::new();
     let url = "http://check.example";
-    set.set_url_member_resolver(Some(Arc::new(|group| {
-        (group == "g")
-            .then(|| vec![("live".into(), "leaf".into())])
-            .unwrap_or_default()
-    })));
+    set.sync_group_check_urls(&[("g".into(), url.into(), vec!["live".into(), "stale".into()])]);
+    set.record_url_probe_success("stale", url, Duration::from_millis(5));
+    assert!(set.has_url_state("stale", url));
     set.sync_group_check_urls(&[("g".into(), url.into(), vec!["live".into()])]);
+    assert!(!set.has_url_state("stale", url));
+    assert!(set.get_avg_latency_for_url("stale", url).is_none());
     set.record_url_probe_failure("stale", url);
     assert!(!set.has_url_state("stale", url));
     set.record_url_probe_success("live", url, Duration::from_millis(5));
