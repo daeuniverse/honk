@@ -1367,31 +1367,10 @@ mod tests {
     /// would silently bypass the pin.
     #[tokio::test]
     async fn pin_config_never_resumes_cached_ticket() {
-        let addr = spawn_echo_server(&[b"h3"]);
-        let node = Node {
-            address: format!("127.0.0.1:{}", addr.port()),
-            host: "127.0.0.1".into(),
-            port: addr.port(),
-            ..skip_verify_node()
-        };
-        let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
-            .await
-            .unwrap();
-        assert!(
-            !connect_for_ticket(cfg.clone(), addr, "localhost")
-                .await
-                .unwrap()
-        );
-        wait_for_same_policy_resumption(cfg.clone(), addr, "localhost")
-            .await
-            .expect("same-policy control must resume before judging pin isolation");
-
-        // Same host with the correct pin set: the handshake must succeed,
-        // but it must be a full handshake — never a resumed one.
         let (config, cert_der) =
             crate::quic::testutil::server_config_with_cert(&[b"h3"], true).unwrap();
         let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr2 = endpoint.local_addr().unwrap();
+        let addr = endpoint.local_addr().unwrap();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 tokio::spawn(async move {
@@ -1412,30 +1391,36 @@ mod tests {
                 });
             }
         });
+        let node = Node {
+            address: format!("127.0.0.1:{}", addr.port()),
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            ..skip_verify_node()
+        };
+        let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        assert!(
+            !connect_for_ticket(cfg.clone(), addr, "localhost")
+                .await
+                .unwrap()
+        );
+        wait_for_same_policy_resumption(cfg, addr, "localhost")
+            .await
+            .expect("same-policy control must resume before judging pin isolation");
+
         let pin_bytes =
             boring::hash::hash(boring::hash::MessageDigest::sha256(), &cert_der).unwrap();
         let pin: String = pin_bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let mut pinned = skip_verify_node();
+        let mut pinned = node;
         pinned.tls_mut().unwrap().pin_sha256 = Some(pin);
         let cfg = crate::quic::client_config(&pinned, &[b"h3"], Default::default())
             .await
             .unwrap();
-        let mut endpoint2 = crate::quic::client_endpoint(false).unwrap();
-        endpoint2.set_default_client_config(cfg);
-        let conn = endpoint2
-            .connect(addr2, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        let data = conn
-            .handshake_data()
-            .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
-            .expect("handshake data");
         assert!(
-            !data.session_reused,
+            !connect_for_ticket(cfg, addr, "localhost").await.unwrap(),
             "pin configs must never resume (PSK would bypass the pin)"
         );
-        conn.close(0u32.into(), b"done");
     }
 
     /// RFC 9001 §5.4.4 ChaCha20 HP mask against a vector captured from a live
