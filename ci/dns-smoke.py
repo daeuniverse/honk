@@ -373,6 +373,7 @@ def _write_config(path: Path, dns_port: int, tproxy_port: int, upstream_port: in
     log_level: info
     disable_waiting_network: true
     auto_config_kernel_parameter: false
+    nfqueue_enable: false
     store_subscribe: false
     tcp_check_url: 'http://127.0.0.1:{upstream_port}'
     udp_check_dns: '127.0.0.1:{upstream_port}'
