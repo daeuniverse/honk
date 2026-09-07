@@ -904,9 +904,12 @@ async fn test_salamander_obfs_tcp_udp_echo() {
         .await
         .expect("dial through salamander obfs should succeed");
     stream.stream.write_all(b"obfs hello").await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.stream.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"obfs hello");
+    let mut buf = [0u8; b"obfs hello".len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.stream.read_exact(&mut buf))
+        .await
+        .expect("TCP echo timed out")
+        .unwrap();
+    assert_eq!(&buf, b"obfs hello");
 
     let udp_target: SocketAddr = "8.8.8.8:53".parse().unwrap();
     let transport = handler
