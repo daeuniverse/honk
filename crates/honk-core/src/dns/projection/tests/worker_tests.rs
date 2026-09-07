@@ -64,7 +64,7 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
     let mut backend = MockEbpfBackend::new();
-    let key = maps::cidr_to_lpm_key("203.0.113.31/32").expect("test IP");
+    let key = maps::ip_addr_to_lpm_key(ip);
     state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
     let initial = state.batch(now);
     backend
@@ -190,7 +190,7 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
     worker::flush_for_test(&projection, &ebpf).await;
     let map = ebpf.read().await.projection_map_snapshot();
     assert_eq!(map.len(), 1);
-    let expected = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("203.0.113.4/32").expect("test IP"));
+    let expected = maps::lpm_key_bytes(&maps::ip_addr_to_lpm_key(new_ip));
     assert_eq!(map[0].0, expected);
 }
 

@@ -290,11 +290,7 @@ impl ControlPlaneHandle {
                 *word |= value;
             }
         }
-        let prefix_len = if dst_ip.is_ipv4() { 32 } else { 128 };
-        let prefix = format!("{dst_ip}/{prefix_len}");
-        let Ok(lpm_key) = cidr_to_lpm_key(&prefix) else {
-            return;
-        };
+        let lpm_key = crate::ebpf::maps::ip_addr_to_lpm_key(dst_ip);
         let mut ebpf = self.ebpf.write().await;
         if crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
             .load(std::sync::atomic::Ordering::Acquire)

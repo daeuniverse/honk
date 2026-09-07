@@ -256,7 +256,9 @@ async fn reconcile(
         .map(|(name, state)| (name.clone(), state.ifindex, state.role))
         .collect();
     for (name, ifindex, role) in tracked {
-        if desired.get(&name) != Some(&role) || iface_ifindex(&name) != Some(ifindex) {
+        if desired.get(&name) != Some(&role)
+            || crate::netlink::ifindex_of(&name).ok() != Some(ifindex)
+        {
             backend.forget_dynamic_interface(ifindex);
             attached.remove(&name);
             changed = true;
@@ -271,7 +273,7 @@ async fn reconcile(
         if have == want {
             continue;
         }
-        if iface_ifindex(&name).is_none() || !iface_is_up(&name) {
+        if crate::netlink::ifindex_of(&name).is_err() || !iface_is_up(&name) {
             continue;
         }
         match backend.attach_dynamic_interface(&name, role, single_homed) {
@@ -279,7 +281,7 @@ async fn reconcile(
                 attached.insert(
                     name.clone(),
                     AttachedInterface {
-                        ifindex: iface_ifindex(&name).unwrap_or(0),
+                        ifindex: crate::netlink::ifindex_of(&name).unwrap_or(0),
                         role,
                         hooks,
                     },
@@ -340,14 +342,6 @@ fn desired_interfaces(config: &honk_config::Config) -> (HashMap<String, IfaceRol
         }
     }
     (desired, single_homed)
-}
-
-fn iface_ifindex(name: &str) -> Option<u32> {
-    std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
 }
 
 fn iface_is_up(name: &str) -> bool {

@@ -697,21 +697,6 @@ impl ControlPlaneHandle {
             }
         }
 
-        if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
-            && (ho.outbound >= OutboundIndex::UserBase as u8
-                || ho.outbound == OutboundIndex::Direct as u8)
-        {
-            let mut ebpf = self.ebpf.write().await;
-            let ob = if ho.outbound == OutboundIndex::Direct as u8 {
-                OutboundIndex::Direct
-            } else {
-                OutboundIndex::from_user(ho.outbound as u32)
-            };
-            if let Err(e) = ebpf.add_domain_route(domain, ob) {
-                debug!("Failed to add domain route for {}: {}", domain, e);
-            }
-        }
-
         Ok(())
     }
 

@@ -134,7 +134,6 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
             domain: "example.com",
             ips: &[learned_ip],
             advertised_ttl: Duration::from_secs(30),
-            freshness: crate::dns::projection::ProjectionFreshness::Fresh,
         },
     );
     let projected = controller.project_routes(&snapshot);

@@ -42,10 +42,3 @@ const _DAE_EVENT_SIP_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, sip) =
 const _DAE_EVENT_DIP_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, dip) == 52);
 const _DAE_EVENT_SPORT_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, sport) == 68);
 const _DAE_EVENT_DPORT_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, dport) == 70);
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub enum TcpState {
-    TcpStateActive = 0,
-    TcpStateClosing = 1,
-}

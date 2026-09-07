@@ -303,8 +303,8 @@ impl DnsController {
         runtime: &crate::dns::runtime::DnsRuntime,
         outcome: &crate::dns::outcome::DnsOutcome,
     ) {
-        use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
-        use crate::dns::projection::{ProjectionFreshness, ProjectionObservation};
+        use crate::dns::outcome::{OutcomeStatus, ResponseClass};
+        use crate::dns::projection::ProjectionObservation;
 
         let domain = outcome.domain();
         let observation = if crate::dns::response::is_truncated(outcome.reusable()) {
@@ -316,11 +316,6 @@ impl DnsController {
                         domain,
                         ips: outcome.answer_ips(),
                         advertised_ttl: outcome.expiry().ttl(),
-                        freshness: if outcome.provenance() == Provenance::Stale {
-                            ProjectionFreshness::Stale
-                        } else {
-                            ProjectionFreshness::Fresh
-                        },
                     }
                 }
                 (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {

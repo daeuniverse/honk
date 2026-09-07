@@ -121,6 +121,7 @@ reload-bench-counters = ["reload-bench"]
 anyhow.workspace = true
 
 [dev-dependencies]
+aya-ebpf-bindings.workspace = true
 # Test utilities
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

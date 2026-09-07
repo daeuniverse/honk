@@ -11,7 +11,7 @@ pub mod route;
 // Re-export types moved to sub-modules (for honk-core compatibility)
 pub use crate::conn::{ConnState, UdpDecisionSequence, UdpDecisionState};
 pub use crate::redirect_need::{
-    DomainRouting, IPPort, IPPortProto, PIDName, ROUTING_BITMAP_GENERATIONS, ROUTING_BITMAP_WORDS,
+    DomainRouting, PIDName, ROUTING_BITMAP_GENERATIONS, ROUTING_BITMAP_WORDS,
     ROUTING_BITMAP_WORDS_PER_GENERATION, RoutingHandoffEntry, RoutingResult, Tuples, TuplesKey,
 };
 pub use crate::route::{
@@ -87,20 +87,9 @@ pub const fn extract_nfqueue_token(mark: u32) -> Option<u32> {
 /// Socket mark bit used by the control plane to tell the eBPF datapath to
 /// pass its own traffic through without re-routing it.
 pub const DAE_BYPASS_MARK: u32 = 0x100;
-pub const RECOGNIZE_MAGIC: u16 = 0x2017;
-pub const LOOPBACK_IFINDEX: u32 = 1;
 pub const MAX_OUTBOUNDS: u32 = 256;
-pub const MAX_DOMAIN_LEN: usize = 256;
-pub const MAX_ROUTING_RULES: u32 = 512;
-pub const MAX_CONN_TRACK: u32 = 65536;
-pub const LINK_HDR_LEN_ETHERNET: u32 = 14;
-pub const LINK_HDR_LEN_NONE: u32 = 0;
 pub const MAX_MATCH_SET_LEN: u32 = 128;
 pub const MAX_LPM_SIZE: u32 = 2048000;
-pub const MAX_LPM_NUM: u32 = MAX_MATCH_SET_LEN + 8;
-pub const MAX_DST_MAPPING_NUM: u32 = 65536 * 2;
-pub const MAX_COOKIE_PID_NUM: u32 = 65536;
-pub const MAX_DOMAIN_ROUTING_NUM: u32 = 65536;
 
 // Rust struct with a memory layout identical to the C struct.
 #[repr(C)]
@@ -128,24 +117,6 @@ pub struct DaeParam {
 // The BPF side (honk-ebpf) uses aya-ebpf which doesn't have a Pod trait.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for DaeParam {}
-
-// Userspace copy of PARAM (BPF side uses maps.rs's Global<DaeParam>).
-#[cfg(not(target_arch = "bpf"))]
-#[unsafe(no_mangle)]
-static PARAM: DaeParam = DaeParam {
-    tproxy_port: 0,
-    control_plane_pid: 0,
-    dae0_ifindex: 0,
-    dae_netns_id: 0,
-    wan_ifindex: 0,
-    dae0peer_mac: [0; 6],
-    padding_after_mac: [0; 2],
-    use_redirect_peer: 0,
-    has_bpf_get_current_task: 0,
-    padding2: 0,
-    dae_socket_mark: 0,
-    local_ip: 0,
-};
 
 /// Outbound indices written into eBPF `match_set.outbound`.
 ///
@@ -193,14 +164,6 @@ impl OutboundIndex {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum L4ChecksumPolicy {
-    Enable = 0,
-    Restore = 1,
-    SetZero = 2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum L4ProtoType {
     Tcp = 1,
@@ -236,17 +199,6 @@ impl IpVersionType {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct ConnTuple {
-    pub src_ip: [u8; 16],
-    pub dst_ip: [u8; 16],
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub protocol: u8,
-    pub _pad: [u8; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -448,28 +400,6 @@ pub const DATAPATH_FLAG_NFQ_ENABLED: u32 = 1 << 3;
 /// The queue and its owned nftables rule are ready to hold staged packets.
 pub const DATAPATH_FLAG_NFQ_READY: u32 = 1 << 4;
 
-/// Parameter keys for the `params` BPF array map.
-/// Used by honk-core to configure eBPF program behaviour at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ParamKey {
-    Zero = 0,
-    BigEndianTproxyPort = 1,
-    DisableL4TxChecksum = 2,
-    DisableL4RxChecksum = 3,
-    ControlPlanePid = 4,
-    ControlPlaneNatDirect = 5,
-    ControlPlaneDnsRouting = 6,
-    SoMarkFromDae = 7,
-    Dae0Ifindex = 8,
-    Dae0peerMacHi = 9,
-    Dae0peerMacLo = 10,
-    UseRedirectPeer = 11,
-    Dae0peerIfindex = 12,
-    LoIfindex = 13,
-    TproxyMark = 14,
-}
-
 /// LPM trie key for IP/CIDR routing.
 /// Matches the kernel's `struct bpf_lpm_trie_key` layout:
 /// prefixlen (u32) + data (4 × u32 = IPv6 / IPv4-mapped).
@@ -542,12 +472,9 @@ const _OUTBOUND_STATS_RX_PACKETS_OFFSET: () =
 const _OUTBOUND_STATS_RX_BYTES_OFFSET: () =
     assert!(core::mem::offset_of!(OutboundStatsCounters, rx_bytes) == 24);
 
-/// Per-outbound statistics as returned by
-/// `EbpfBackend::get_outbound_stats`.  `tx`/`rx` packets and bytes are
-/// aggregated from the eBPF `OUTBOUND_STATS` per-CPU array (tx counted at
-/// `lan_ingress` when the routing decision lands, rx counted at
-/// `dae0_ingress` on the reply path); the connection/error fields are only
-/// populated by userspace accounting (see `honk-core`'s `StatsManager`).
+/// Aggregate statistics layout retained for userspace consumers.
+/// Kernel packet/byte counters use `OutboundStatsCounters` instead;
+/// the control plane accounts traffic independently in `StatsManager`.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct OutboundStats {

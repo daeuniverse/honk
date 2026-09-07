@@ -120,6 +120,19 @@ jobs:
               -p honk-core --features ebpf --lib ebpf::real::tests -- \
               --ignored --test-threads=1
 
+      - name: Verify TC packet contracts and isolated L3 TUN
+        run: |
+          sudo env \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_HOME="$HOME/.rustup" \
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            RUST_BACKTRACE=1 \
+            "$HOME/.cargo/bin/cargo" +stable test \
+              -p honk-core --features ebpf --test ebpf_datapath_test -- \
+              --ignored --test-threads=1
+
       - name: Run real-kernel NFQUEUE contract
         run: |
           sudo env \

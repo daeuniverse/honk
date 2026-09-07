@@ -245,18 +245,8 @@ impl RouteCtx {
     ///
     /// Returns `Ok(())` when the match logic executed normally, and
     /// `Err(MATCH_ERR)` for internal errors (map failure or invalid type).
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    pub fn eval_match(
-        &mut self,
-        match_set: &MatchSet,
-        index: u32,
-        l4proto_type: u8,
-        ipversion_type: u8,
-        pname: &[u32; 4],
-        is_wan: u8,
-        dscp: u8,
-    ) -> Result<(), c_long> {
+    pub fn eval_match(&mut self, match_set: &MatchSet, index: u32) -> Result<(), c_long> {
         let match_type: MatchType = match MatchType::from_u8(match_set.match_type) {
             Some(mt) => mt,
             None => {
@@ -291,9 +281,9 @@ impl RouteCtx {
 
             MatchType::L4Proto | MatchType::IpVersion => {
                 let value = if match_type == MatchType::L4Proto {
-                    l4proto_type
+                    self.l4proto_type
                 } else {
-                    ipversion_type
+                    self.ipversion_type
                 };
                 let mask = if match_type == MatchType::L4Proto {
                     unsafe { match_set.value.l4proto_type as u8 }
@@ -310,9 +300,9 @@ impl RouteCtx {
             }
 
             MatchType::ProcessName => {
-                if is_wan != 0 {
+                if self.is_wan != 0 {
                     let match_pname = unsafe { match_set.value.pname };
-                    if match_pname == *pname {
+                    if match_pname == self.pname_cache {
                         self.route_state |= RouteStateFlags::GoodSubrule as u8;
                     }
                 }
@@ -320,7 +310,7 @@ impl RouteCtx {
 
             MatchType::Dscp => {
                 let match_dscp = unsafe { match_set.value.dscp };
-                if dscp == match_dscp {
+                if self.dscp_cache == match_dscp {
                     self.route_state |= RouteStateFlags::GoodSubrule as u8;
                 }
             }
@@ -411,11 +401,6 @@ impl RouteCtx {
 
     #[inline(always)]
     pub fn route_loop_iteration(&mut self, index: u32) -> i32 {
-        let l4proto_type = self.l4proto_type;
-        let ipversion_type = self.ipversion_type;
-        let is_wan = self.is_wan;
-        let dscp = self.dscp_cache;
-
         if index >= MAX_MATCH_SET_LEN as u32 {
             self.result = -EFAULT as i64;
             return LOOP_BREAK;
@@ -454,19 +439,7 @@ impl RouteCtx {
 
         if has_bad_rule || has_good_subrule {
         } else {
-            let pname = self.pname_cache;
-            if self
-                .eval_match(
-                    match_set,
-                    index,
-                    l4proto_type,
-                    ipversion_type,
-                    &pname,
-                    is_wan,
-                    dscp,
-                )
-                .is_err()
-            {
+            if self.eval_match(match_set, index).is_err() {
                 // eval_match has already set self.result to the error code.
                 return LOOP_BREAK;
             }

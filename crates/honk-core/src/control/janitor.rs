@@ -188,7 +188,6 @@ struct PressureState {
 pub struct BpfJanitor {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tcp_flow_pins: Arc<TcpFlowPins>,
-    stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl BpfJanitor {
@@ -197,30 +196,10 @@ impl BpfJanitor {
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         tcp_flow_pins: Arc<TcpFlowPins>,
     ) -> Self {
-        let (stop_tx, _) = tokio::sync::watch::channel(false);
         Self {
             ebpf,
             tcp_flow_pins,
-            stop_tx,
         }
-    }
-
-    /// Return a receiver that fires when `stop()` is called.
-    pub fn stop_handle(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.stop_tx.subscribe()
-    }
-
-    /// Signal the janitor to stop.
-    pub fn stop(&self) {
-        let _ = self.stop_tx.send(true);
-    }
-
-    /// Spawn the janitor on a tokio task.
-    ///
-    /// Returns a `JoinHandle` that completes when the janitor exits.
-    /// The janitor runs until `stop()` is called or the stop receiver is dropped.
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        self.spawn_inner(None)
     }
 
     /// Spawn with a guard that reports task death to the control plane.
@@ -228,15 +207,6 @@ impl BpfJanitor {
         self,
         exit_guard: super::runtime::CriticalTaskExit,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_inner(Some(exit_guard))
-    }
-
-    fn spawn_inner(
-        self,
-        exit_guard: Option<super::runtime::CriticalTaskExit>,
-    ) -> tokio::task::JoinHandle<()> {
-        let mut stop_rx = self.stop_tx.subscribe();
-
         tokio::spawn(async move {
             let _exit_guard = exit_guard;
             let tick_duration = Duration::from_secs(JANITOR_TICK_INTERVAL_SECS);
@@ -270,18 +240,7 @@ impl BpfJanitor {
             );
 
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = stop_rx.changed() => {
-                        info!("BPF janitor: received stop signal, exiting");
-                        return;
-                    }
-                }
-
-                if *stop_rx.borrow() {
-                    info!("BPF janitor: stopping");
-                    return;
-                }
+                interval.tick().await;
 
                 let now = tokio::time::Instant::now();
 

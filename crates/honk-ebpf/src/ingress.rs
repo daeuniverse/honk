@@ -44,8 +44,8 @@ use network_types::{
 
 use crate::{
     maps::{
-        OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
-        ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP, increment_bpf_stat,
+        PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP, ROUTING_HANDOFF_MAP,
+        UDP_DECISION_SCRATCH_MAP, increment_bpf_stat,
     },
     route::{
         OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT, RouteCtx, RouteStateFlags,
@@ -383,20 +383,10 @@ fn cached_udp_decision_inner(
         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
         return Err(TC_ACT_OK);
     }
-    if outbound == OUTBOUND_DIRECT || outbound == OUTBOUND_BLOCK {
-        if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
-            return Err(TC_ACT_SHOT);
-        }
-        return redirect_lan_packet_to_control_plane(
-            ctx,
-            link_h_len,
-            pkt,
-            meta_raw,
-            HANDOFF_WRITE_REFRESH,
-            state.decision_token,
-        );
-    }
-    if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
+
+    // Direct/block cached UDP flows still require the outbound health gate;
+    // unlike cached TCP, neither has a control-plane exemption here.
+    if !lan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
         return Err(TC_ACT_SHOT);
     }
     redirect_lan_packet_to_control_plane(
@@ -421,28 +411,9 @@ fn pass_through_classified(ctx: &TcContext) -> Verdict {
 }
 
 #[inline(always)]
-fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    // DNS must always reach the control plane regardless of outbound health
-    // (Go dae tproxy.c:2606 — userspace DNS handles its own fallback);
-    // applies to both TCP and UDP port 53.
-    if dport == 53 {
-        return true;
-    }
-
-    let protocol = ctx.skb.protocol() as u16;
-    let domain_idx = match (l4proto, dport) {
-        (IPPROTO_UDP, 53) => 1,
-        (IPPROTO_UDP, _) => 2,
-        _ => 0,
-    };
-
-    let ip_idx: u64 = if protocol == ETH_P_IP.to_be() { 0 } else { 1 };
-    let key: u32 = (outbound as u32) * 6 + (domain_idx as u32) * 2 + (ip_idx as u32);
-
-    match OUTBOUND_CONNECTIVITY_MAP.get(key) {
-        Some(alive_val) => *alive_val != 0,
-        None => true,
-    }
+fn lan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
+    // LAN sends both TCP and UDP DNS to userspace; WAN egress exempts only UDP DNS.
+    dport == 53 || crate::egress::wan_outbound_is_alive(ctx, outbound, l4proto, dport)
 }
 
 /// Confirm that a wildcard socket match names a host-local route. Socket
@@ -567,28 +538,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
-        if outbound == OUTBOUND_DIRECT {
-            return redirect_lan_packet_to_control_plane(
-                ctx,
-                link_h_len,
-                pkt,
-                unsafe { tcp_state.meta.raw },
-                HANDOFF_WRITE_SKIP,
-                0,
-            );
-        }
-        if outbound == OUTBOUND_BLOCK {
-            // Redirect BLOCK to control plane so userspace can drop/log it.
-            return redirect_lan_packet_to_control_plane(
-                ctx,
-                link_h_len,
-                pkt,
-                unsafe { tcp_state.meta.raw },
-                HANDOFF_WRITE_SKIP,
-                0,
-            );
-        }
-        if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
+        // TCP direct and block cached decisions bypass the WAN health gate;
+        // all other outbounds must be alive before redirecting.
+        if outbound != OUTBOUND_DIRECT
+            && outbound != OUTBOUND_BLOCK
+            && !lan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port)
+        {
             return Err(TC_ACT_SHOT);
         }
         return redirect_lan_packet_to_control_plane(
@@ -1002,41 +957,21 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if PARAM.load().padding2 & 1 != 0 {
             info!(ctx, target: "honk", "direct(no must, no offload) → control plane");
         }
-        return redirect_lan_packet_to_control_plane(
-            ctx,
-            link_h_len,
-            pkt,
-            unsafe {
-                crate::contrack::build_routing_meta(outbound, mark, must, pkt.tuples.dscp).raw
-            },
-            handoff_mode,
-            0,
-        );
     }
-    if outbound == OUTBOUND_BLOCK {
-        // Redirect BLOCK to control plane.
-        if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
-            return Err(TC_ACT_SHOT);
-        }
-        return redirect_lan_packet_to_control_plane(
-            ctx,
-            link_h_len,
-            pkt,
-            unsafe { crate::contrack::build_routing_meta(outbound, mark, 0, pkt.tuples.dscp).raw },
-            handoff_mode,
-            0,
-        );
-    }
-
-    if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
+    // Direct bypasses the health gate; block and proxy outbounds do not.
+    if outbound != OUTBOUND_DIRECT
+        && !lan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port)
+    {
         return Err(TC_ACT_SHOT);
     }
-
+    let redirect_must = if outbound == OUTBOUND_BLOCK { 0 } else { must };
     redirect_lan_packet_to_control_plane(
         ctx,
         link_h_len,
         pkt,
-        unsafe { crate::contrack::build_routing_meta(outbound, mark, must, pkt.tuples.dscp).raw },
+        unsafe {
+            crate::contrack::build_routing_meta(outbound, mark, redirect_must, pkt.tuples.dscp).raw
+        },
         handoff_mode,
         0,
     )
@@ -1231,9 +1166,8 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
         entry.last_seen_ns = now;
     }
 
-    // Account this reply (outbound → LAN) against the outbound recorded
-    // when the flow was redirected to the control plane.  The full packet
-    // tuple was reversed above, so a successful lookup is a proxy reply.
+    crate::stats::count_rx(ctx, entry.outbound);
+
     // Restore the original LAN framing and redirect to its interface.
     //
     // Host-originated flows (from_wan != 0, e.g. gateway's own traffic out a

@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
-use super::{ProjectionFreshness, ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
+use super::{ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
 type OwnerKey = Arc<str>;
 
 #[derive(Debug)]
@@ -13,7 +13,6 @@ pub(super) struct DomainOwner {
     pub(super) ips: BTreeSet<IpAddr>,
     pub(super) expires_at: Instant,
     pub(super) sequence: u64,
-    pub(super) _freshness: ProjectionFreshness,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,8 +106,7 @@ impl DesiredState {
                 domain,
                 ips,
                 advertised_ttl,
-                freshness,
-            } => self.replace(domain, ips, now + advertised_ttl, freshness),
+            } => self.replace(domain, ips, now + advertised_ttl),
             ProjectionObservation::Clear { domain } => {
                 self.remove_owner(domain);
                 0
@@ -117,13 +115,7 @@ impl DesiredState {
         }
     }
 
-    fn replace(
-        &mut self,
-        domain: &str,
-        ips: &[IpAddr],
-        expires_at: Instant,
-        freshness: ProjectionFreshness,
-    ) -> u64 {
+    fn replace(&mut self, domain: &str, ips: &[IpAddr], expires_at: Instant) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
         let ips = ips.iter().copied().collect::<BTreeSet<_>>();
@@ -163,7 +155,6 @@ impl DesiredState {
             owner.ips = ips;
             owner.expires_at = expires_at;
             owner.sequence = sequence;
-            owner._freshness = freshness;
         } else {
             affected.reserve(ips.len());
             for ip in &ips {
@@ -179,7 +170,6 @@ impl DesiredState {
                     ips,
                     expires_at,
                     sequence,
-                    _freshness: freshness,
                 },
             );
         }

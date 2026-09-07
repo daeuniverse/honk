@@ -5,7 +5,6 @@ impl RealEbpfBackend {
         obj: &[u8],
         pin_root: &Path,
         tproxy_port: u16,
-        tproxy_mark: u32,
         lan_ifname: Option<&str>,
         wan_ifname: &str,
         single_homed: bool,
@@ -14,14 +13,8 @@ impl RealEbpfBackend {
         let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
-        let dae0_ifindex = std::fs::read_to_string("/sys/class/net/dae0/ifindex")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let dae0peer_ifindex = std::fs::read_to_string("/sys/class/net/dae0peer/ifindex")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+        let dae0_ifindex = crate::netlink::ifindex_of("dae0").unwrap_or(0);
+        let dae0peer_ifindex = crate::netlink::ifindex_of("dae0peer").unwrap_or(0);
         let dae0peer_mac = std::fs::read_to_string("/sys/class/net/dae0peer/address")
             .ok()
             .map(|s| {
@@ -43,7 +36,7 @@ impl RealEbpfBackend {
         } else {
             Self::bridge_interface(wan_ifname).unwrap_or_else(|| wan_ifname.to_string())
         };
-        let wan_ifindex = Self::iface_ifindex(&ebpf_wan_ifname);
+        let wan_ifindex = crate::netlink::ifindex_of(&ebpf_wan_ifname).unwrap_or(0);
         let local_ifname = if ebpf_lan_ifname.is_empty() {
             &ebpf_wan_ifname
         } else {
@@ -332,11 +325,7 @@ impl RealEbpfBackend {
                 }
             }
 
-            let wan_egress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
-                "wan_egress_l2"
-            } else {
-                "wan_egress_l3"
-            };
+            let wan_egress_prog = Self::wan_program_pair(&ebpf_wan_ifname).1;
             interface_links.push(
                 Self::attach_tc_owned(
                     &mut bpf,
@@ -363,11 +352,7 @@ impl RealEbpfBackend {
         if single_homed {
             info!("Single-homed interface detected; skipping wan_ingress attach");
         } else if !ebpf_wan_ifname.is_empty() {
-            let wan_ingress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
-                "wan_ingress_l2"
-            } else {
-                "wan_ingress_l3"
-            };
+            let wan_ingress_prog = Self::wan_program_pair(&ebpf_wan_ifname).0;
             interface_links.push(
                 Self::attach_tc_owned(
                     &mut bpf,
@@ -403,11 +388,7 @@ impl RealEbpfBackend {
                         );
                     }
                 }
-                let slave_prog = if Self::iface_is_ethernet(slave) {
-                    "lan_ingress_l2"
-                } else {
-                    "lan_ingress_l3"
-                };
+                let slave_prog = Self::lan_program_pair(slave).0;
                 // A slave we cannot attach silently leaves that traffic
                 // outside the proxy — abort rather than run half-covered.
                 interface_links.push(
@@ -458,11 +439,7 @@ impl RealEbpfBackend {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
                     warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
-                let slave_prog = if Self::iface_is_ethernet(slave) {
-                    "lan_ingress_l2"
-                } else {
-                    "lan_ingress_l3"
-                };
+                let slave_prog = Self::lan_program_pair(slave).0;
                 interface_links.push(
                     Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
                         anyhow::anyhow!("attach lan_ingress to bond slave {}: {}", slave, e)
@@ -586,8 +563,6 @@ impl RealEbpfBackend {
             bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
             pinned_maps,
-            tproxy_port,
-            tproxy_mark,
             interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,
@@ -599,7 +574,6 @@ impl RealEbpfBackend {
             event_flush_handle,
             cap_lookup_and_delete: BatchCapability::new(),
             cap_lookup_batch: BatchCapability::new(),
-            cap_delete_batch: BatchCapability::new(),
             cap_update_batch: BatchCapability::new(),
         })
     }
@@ -640,7 +614,7 @@ impl RealEbpfBackend {
         iface: &str,
         dir: aya::programs::TcAttachType,
     ) -> anyhow::Result<(u32, bool, aya::programs::tc::SchedClassifierLink)> {
-        let ifindex = Self::iface_ifindex(iface);
+        let ifindex = crate::netlink::ifindex_of(iface).unwrap_or(0);
         let id = Self::attach_tc_at(bpf, prog, iface, dir)?;
         let p: &mut aya::programs::SchedClassifier = bpf
             .program_mut(prog)
@@ -681,9 +655,7 @@ impl RealEbpfBackend {
             .unwrap_or(false)
     }
 
-    /// Pick the ingress/egress program pair for a LAN interface.
-    /// Bridge masters use L3; physical/veth Ethernet interfaces use L2;
-    /// everything else falls back to L3.
+    /// Ethernet interfaces, including bridge masters, use L2; others use L3.
     fn lan_program_pair(iface: &str) -> (&'static str, &'static str) {
         // NOTE: bridge masters are attached with L2 programs because the TC
         // ingress qdisc on a Linux bridge sees the full Ethernet frame.
@@ -691,6 +663,16 @@ impl RealEbpfBackend {
             ("lan_ingress_l2", "lan_egress_l2")
         } else {
             ("lan_ingress_l3", "lan_egress_l3")
+        }
+    }
+
+    /// Pick the ingress/egress program pair for a WAN interface using the
+    /// same Ethernet detection as the LAN selector.
+    fn wan_program_pair(iface: &str) -> (&'static str, &'static str) {
+        if Self::iface_is_ethernet(iface) {
+            ("wan_ingress_l2", "wan_egress_l2")
+        } else {
+            ("wan_ingress_l3", "wan_egress_l3")
         }
     }
 
@@ -705,14 +687,6 @@ impl RealEbpfBackend {
                 .as_sockaddr_in()
                 .map(|sock| u32::from_ne_bytes(sock.ip().octets()))
         })
-    }
-
-    /// Read the kernel ifindex for an interface, or 0 if it cannot be read.
-    fn iface_ifindex(iface: &str) -> u32 {
-        std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", iface))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
     }
 
     /// Return the bridge master of `iface` if it is a bridge slave.
@@ -781,7 +755,7 @@ impl RealEbpfBackend {
         let ifname = Self::bridge_interface(ifname).unwrap_or_else(|| ifname.to_string());
         info!("Attaching LAN programs to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(&ifname);
-        let ifindex = Self::iface_ifindex(&ifname);
+        let ifindex = crate::netlink::ifindex_of(&ifname).unwrap_or(0);
         let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
         let mut hooks = crate::ebpf::DynamicHooks {
             ingress: self.interface_hooked(ifindex, false),
@@ -802,14 +776,10 @@ impl RealEbpfBackend {
     pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
         info!("Attaching WAN egress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        if self.interface_hooked(Self::iface_ifindex(ifname), true) {
+        if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), true) {
             return Ok(());
         }
-        let prog = if Self::iface_is_ethernet(ifname) {
-            "wan_egress_l2"
-        } else {
-            "wan_egress_l3"
-        };
+        let prog = Self::wan_program_pair(ifname).1;
         self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Egress)
     }
 
@@ -819,14 +789,10 @@ impl RealEbpfBackend {
     pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
         info!("Attaching WAN ingress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        if self.interface_hooked(Self::iface_ifindex(ifname), false) {
+        if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), false) {
             return Ok(());
         }
-        let prog = if Self::iface_is_ethernet(ifname) {
-            "wan_ingress_l2"
-        } else {
-            "wan_ingress_l3"
-        };
+        let prog = Self::wan_program_pair(ifname).0;
         self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Ingress)
     }
 
@@ -844,16 +810,12 @@ impl RealEbpfBackend {
             ifname
         );
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        let ifindex = Self::iface_ifindex(ifname);
+        let ifindex = crate::netlink::ifindex_of(ifname).unwrap_or(0);
         let mut hooks = crate::ebpf::DynamicHooks {
             ingress: self.interface_hooked(ifindex, false),
             egress: self.interface_hooked(ifindex, true),
         };
-        let ingress_prog = if Self::iface_is_ethernet(ifname) {
-            "lan_ingress_l2"
-        } else {
-            "lan_ingress_l3"
-        };
+        let ingress_prog = Self::lan_program_pair(ifname).0;
         if !hooks.ingress {
             self.attach_tc_tracked(ingress_prog, ifname, aya::programs::TcAttachType::Ingress)?;
             hooks.ingress = true;

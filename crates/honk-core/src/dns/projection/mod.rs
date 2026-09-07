@@ -124,19 +124,12 @@ impl RoutingProjectionSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectionFreshness {
-    Fresh,
-    Stale,
-}
-
 #[derive(Debug)]
 pub(crate) enum ProjectionObservation<'a> {
     Positive {
         domain: &'a str,
         ips: &'a [IpAddr],
         advertised_ttl: Duration,
-        freshness: ProjectionFreshness,
     },
     Clear {
         domain: &'a str,
@@ -362,7 +355,6 @@ impl ProjectionReplacementBenchmark {
                 domain: &domain,
                 ips: std::slice::from_ref(&ip),
                 advertised_ttl: Duration::from_secs(300),
-                freshness: ProjectionFreshness::Fresh,
             },
             now,
         );
@@ -381,7 +373,6 @@ impl ProjectionReplacementBenchmark {
                 domain: &self.domain,
                 ips: std::slice::from_ref(&self.ip),
                 advertised_ttl: Duration::from_secs(300),
-                freshness: ProjectionFreshness::Fresh,
             },
             self.now,
         );

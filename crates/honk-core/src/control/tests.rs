@@ -5355,7 +5355,6 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 crate::DEFAULT_BPF_OBJECT,
                 &pin_root,
                 12345,
-                TPROXY_MARK,
                 Some("honk-lan0"),
                 "honk-wan0",
                 false,

@@ -35,7 +35,6 @@ pub const VERSION: &str = env!("HONK_VERSION");
 
 use clap::Parser;
 use honk_config::Config;
-use honk_ebpf_common::ParamKey;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -770,7 +769,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "ebpf")]
     let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
-    let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
+    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
     } else {
@@ -797,20 +796,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
-                config.global.tproxy_mark,
                 primary_lan,
                 primary_wan,
                 single_homed,
             )
             .await?;
 
-            let ifindex_of = |name: &str| -> Option<u32> {
-                std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-            };
             if let Some(primary_lan) = primary_lan
-                && let Some(i) = ifindex_of(primary_lan)
+                && let Ok(i) = netlink::ifindex_of(primary_lan)
             {
                 attached_ifaces.insert(
                     primary_lan.to_string(),
@@ -830,7 +823,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !single_homed
                 && !primary_wan.is_empty()
-                && let Some(i) = ifindex_of(primary_wan)
+                && let Ok(i) = netlink::ifindex_of(primary_wan)
             {
                 attached_ifaces.insert(
                     primary_wan.to_string(),
@@ -847,7 +840,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             for extra_lan in lan_ifnames.iter().skip(1) {
                 match backend.attach_lan(extra_lan, single_homed) {
                     Ok(hooks) => {
-                        if let Some(i) = ifindex_of(extra_lan) {
+                        if let Ok(i) = netlink::ifindex_of(extra_lan) {
                             attached_ifaces.insert(
                                 extra_lan.clone(),
                                 ebpf::real::AttachedInterface {
@@ -879,7 +872,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     egress: egress.is_ok(),
                 };
                 if (hooks.ingress || hooks.egress)
-                    && let Some(i) = ifindex_of(extra_wan)
+                    && let Ok(i) = netlink::ifindex_of(extra_wan)
                 {
                     attached_ifaces.insert(
                         extra_wan.clone(),
@@ -900,24 +893,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             Box::new(ebpf::mock::MockEbpfBackend::new())
         }
     };
-
-    let bpf_params = ebpf::BpfLoadParams {
-        tproxy_port: config.global.tproxy_port,
-        tproxy_mark: config.global.tproxy_mark,
-        so_mark: 0,
-        control_plane_pid: std::process::id(),
-        ..Default::default()
-    };
-    ebpf_backend.inject(&bpf_params)?;
-    info!(
-        "eBPF backend initialized with tproxy_port={}",
-        config.global.tproxy_port
-    );
-
-    // BigEndianTproxyPort is already configured by ebpf_backend.inject() above.
-    ebpf_backend.set_param(ParamKey::SoMarkFromDae, 0)?;
-    ebpf_backend.set_param(ParamKey::ControlPlanePid, std::process::id())?;
-    info!("eBPF parameters set");
+    #[cfg(feature = "ebpf")]
+    let mut ebpf_backend = ebpf_backend;
 
     if !mock_mode {
         #[cfg(feature = "ebpf")]

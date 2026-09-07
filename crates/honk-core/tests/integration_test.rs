@@ -326,67 +326,6 @@ protocol = "udp"
         );
     }
 
-    #[test]
-    fn test_mock_ebpf_full_workflow() {
-        use honk_core::ebpf::EbpfBackend;
-
-        let mut backend = MockEbpfBackend::new();
-
-        backend
-            .set_param(ParamKey::BigEndianTproxyPort, 12345)
-            .unwrap();
-        backend.set_param(ParamKey::ControlPlanePid, 42).unwrap();
-
-        assert_eq!(
-            backend.get_param(ParamKey::BigEndianTproxyPort).unwrap(),
-            Some(12345)
-        );
-        assert_eq!(
-            backend.get_param(ParamKey::ControlPlanePid).unwrap(),
-            Some(42)
-        );
-        assert_eq!(
-            backend.get_param(ParamKey::ControlPlaneNatDirect).unwrap(),
-            None
-        );
-
-        backend
-            .add_domain_route("google.com", OutboundIndex::UserBase)
-            .unwrap();
-        backend
-            .add_domain_route("youtube.com", OutboundIndex::from_user(1))
-            .unwrap();
-
-        backend
-            .add_ip_route("10.0.0.0/8", OutboundIndex::Direct)
-            .unwrap();
-        backend
-            .add_ip_route("172.16.0.0/12", OutboundIndex::Direct)
-            .unwrap();
-
-        let tuple = ConnTuple {
-            src_ip: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 1],
-            dst_ip: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8],
-            src_port: 50000,
-            dst_port: 443,
-            protocol: 6,
-            _pad: [0; 3],
-        };
-
-        backend
-            .conn_track_store(&tuple, OutboundIndex::UserBase as u32)
-            .unwrap();
-        assert_eq!(
-            backend.conn_track_lookup(&tuple).unwrap(),
-            Some(OutboundIndex::UserBase as u32)
-        );
-        backend.conn_track_remove(&tuple).unwrap();
-        assert_eq!(backend.conn_track_lookup(&tuple).unwrap(), None);
-
-        let stats = backend.get_outbound_stats(OutboundIndex::UserBase).unwrap();
-        assert_eq!(stats.total_conns, 0);
-    }
-
     #[tokio::test]
     async fn test_socks5_full_handshake() {
         use honk_config::node::Node;
@@ -873,20 +812,6 @@ protocol = "udp"
     }
 
     #[test]
-    fn test_l4_checksum_policy_values() {
-        assert_eq!(L4ChecksumPolicy::Enable as u32, 0);
-        assert_eq!(L4ChecksumPolicy::Restore as u32, 1);
-        assert_eq!(L4ChecksumPolicy::SetZero as u32, 2);
-    }
-
-    #[test]
-    fn test_param_key_values() {
-        assert_eq!(ParamKey::BigEndianTproxyPort as u32, 1);
-        assert_eq!(ParamKey::ControlPlanePid as u32, 4);
-        assert_eq!(ParamKey::ControlPlaneDnsRouting as u32, 6);
-    }
-
-    #[test]
     fn test_node_protocol_parsing() {
         use honk_config::types::NodeProtocol;
 
@@ -1096,7 +1021,6 @@ protocol = "udp"
         use honk_config::types::NodeProtocol;
         use honk_core::control::ControlPlane;
         use honk_core::dns::DnsResolver;
-        use honk_core::ebpf::EbpfBackend;
         use honk_core::ebpf::mock::MockEbpfBackend;
         use honk_core::proxy::ProxyRegistry;
         use honk_core::routing::Router;
@@ -1107,20 +1031,7 @@ protocol = "udp"
         println!("║     Full Pipeline Test: Mock eBPF + SOCKS5 + Routing        ║");
         println!("╠══════════════════════════════════════════════════════════════╣");
 
-        let mut backend = MockEbpfBackend::new();
-
-        backend
-            .set_param(ParamKey::BigEndianTproxyPort, 12345)
-            .unwrap();
-        backend
-            .set_param(ParamKey::ControlPlanePid, std::process::id())
-            .unwrap();
-
-        assert_eq!(
-            backend.get_param(ParamKey::BigEndianTproxyPort).unwrap(),
-            Some(12345)
-        );
-        println!("║  ✓ eBPF parameters configured                              ║");
+        let backend = MockEbpfBackend::new();
 
         let rules = vec![
             RoutingRule {
@@ -1239,65 +1150,6 @@ protocol = "udp"
         println!();
     }
 
-    #[test]
-    fn test_ebpf_map_summary() {
-        use honk_core::ebpf::EbpfBackend;
-        use honk_core::ebpf::mock::MockEbpfBackend;
-
-        println!();
-        println!("╔══════════════════════════════════════════════════════════════╗");
-        println!("║              eBPF Map Layout (20+ maps)                      ║");
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!("║                                                              ║");
-        println!("║  Global Maps:                                                ║");
-        println!("║    PARAM_MAP              → Parameters (tproxy_port, etc.)   ║");
-        println!("║    OUTBOUND_CONNECTIVITY  → Per-outbound alive status        ║");
-        println!("║    LISTEN_SOCKET_MAP      → SockMap for TPROXY listener      ║");
-        println!("║                                                              ║");
-        println!("║  Routing Maps:                                               ║");
-        println!("║    ROUTING_MAP            → MatchSet rules array             ║");
-        println!("║    ROUTING_META_MAP       → Active rule count                ║");
-        println!("║    DOMAIN_ROUTING_MAP     → Domain→bitmap cache (LPM)        ║");
-        println!("║                                                              ║");
-        println!("║  Connection Tracking:                                        ║");
-        println!("║    TCP_CONN_STATE_MAP     → TCP connection state + routing   ║");
-        println!("║    UDP_CONN_STATE_MAP     → UDP connection state + routing   ║");
-        println!("║    REDIRECT_TRACK         → MAC/ifindex for reply redirect   ║");
-        println!("║    ROUTING_HANDOFF_MAP    → First-packet handoff to CP       ║");
-        println!("║                                                              ║");
-        println!("║  Process Tracking:                                           ║");
-        println!("║    COOKIE_PID_MAP         → Socket cookie→PID+pname mapping  ║");
-        println!("║                                                              ║");
-        println!("║  Statistics:                                                 ║");
-        println!("║    BPF_STATS_MAP          → Overflow counters                ║");
-        println!("║                                                              ║");
-        println!("║  Per-CPU Scratch Maps:                                       ║");
-        println!("║    PARSE_CTX_SCRATCH      → Packet parsing context           ║");
-        println!("║    LAN_INGRESS_SCRATCH    → LAN ingress parsed packet        ║");
-        println!("║    WAN_EGRESS_SCRATCH     → WAN egress parsed packet         ║");
-        println!("║    ROUTE_CTX_SCRATCH      → Route decision context           ║");
-        println!("║    WAN_EGRESS_ROUTE       → WAN egress route scratch         ║");
-        println!("║    CONNTRACK_ARGS_MAP     → Conntrack arguments              ║");
-        println!("║                                                              ║");
-        println!("╚══════════════════════════════════════════════════════════════╝");
-        println!();
-
-        let mut backend = MockEbpfBackend::new();
-        backend
-            .set_param(ParamKey::BigEndianTproxyPort, 12345)
-            .unwrap();
-        backend.set_param(ParamKey::ControlPlanePid, 42).unwrap();
-        backend.set_param(ParamKey::SoMarkFromDae, 0).unwrap();
-
-        assert_eq!(
-            backend.get_param(ParamKey::BigEndianTproxyPort).unwrap(),
-            Some(12345)
-        );
-        assert_eq!(
-            backend.get_param(ParamKey::ControlPlanePid).unwrap(),
-            Some(42)
-        );
-    }
     #[test]
     fn test_mode_command_rejects_dae_without_rewriting() {
         let directory = tempfile::tempdir().expect("create temporary directory");

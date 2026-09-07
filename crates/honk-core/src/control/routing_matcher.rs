@@ -333,7 +333,7 @@ impl RoutingMatcherBuilder {
         outbound_name_to_id: &HashMap<String, u8>,
         fallback_outbound: &str,
         dial_mode: DialMode,
-    ) -> anyhow::Result<RoutingPushPlan> {
+    ) -> RoutingPushPlan {
         // Phase 1: compile the ruleset without touching any BPF map.
         // Domain-class rules are scanned over the full (unsorted,
         // uncapped) ruleset: even a rule that never reaches the kernel bank
@@ -352,15 +352,13 @@ impl RoutingMatcherBuilder {
             [[0; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
 
         for route in routes.iter().take(MAX_MATCH_SET_LEN as usize) {
-            // Skip rules whose conditions are unsupported in eBPF.
             // Domain/geosite matching is evaluated by DNS snooping: the
             // DomainSet match type is pushed, and resolved IPs are inserted
             // into DOMAIN_ROUTING_MAP so the eBPF fast path can match them.
-            if Self::has_unsupported_ebpf_conditions(route)
-                || Self::collect_conditions(route).is_empty()
-            {
+            let conditions = Self::collect_conditions(route);
+            if conditions.is_empty() {
                 debug!(
-                    "Skipping eBPF push for rule '{}' (unsupported or empty conditions)",
+                    "Skipping eBPF push for rule '{}' (empty conditions)",
                     route.name
                 );
                 continue;
@@ -398,13 +396,12 @@ impl RoutingMatcherBuilder {
             let rule_start = match_sets.len();
             Self::append_rule(
                 route,
+                &conditions,
                 effective_outbound,
-                route.must,
-                route.mark,
                 &mut match_sets,
                 &mut domain_bitmaps,
                 &mut lpm_plan,
-            )?;
+            );
             // Every MatchSet of this rule's chain shares the same group
             // membership, derived from the chain's L4Proto/IpVersion
             // entries, so the eBPF group pre-filter never splits a chain.
@@ -452,13 +449,13 @@ impl RoutingMatcherBuilder {
             Self::ALL_GROUPS,
         );
 
-        Ok(RoutingPushPlan {
+        RoutingPushPlan {
             match_sets,
             domain_bitmaps,
             lpm: lpm_plan,
             group_bitmaps,
             has_domain_rules,
-        })
+        }
     }
 
     pub fn push_plan(
@@ -508,7 +505,7 @@ impl RoutingMatcherBuilder {
         fallback_outbound: &str,
         dial_mode: DialMode,
     ) -> anyhow::Result<RoutingPushResult> {
-        let plan = Self::compile(routes, outbound_name_to_id, fallback_outbound, dial_mode)?;
+        let plan = Self::compile(routes, outbound_name_to_id, fallback_outbound, dial_mode);
         let result = Self::push_plan(ebpf, &plan)?;
         Self::activate_projection(&plan);
         Ok(result)
@@ -524,14 +521,14 @@ impl RoutingMatcherBuilder {
     /// corresponding LPM updates into the push plan (no BPF map writes here).
     fn append_rule(
         route: &CompiledRoute,
+        conditions: &[Condition<'_>],
         outbound: u8,
-        must: bool,
-        mark: u32,
         match_sets: &mut Vec<MatchSet>,
         domain_bitmaps: &mut HashMap<String, Vec<DomainRouting>>,
         lpm_plan: &mut LpmPushPlan,
-    ) -> anyhow::Result<()> {
-        let conditions = Self::collect_conditions(route);
+    ) {
+        let must = route.must;
+        let mark = route.mark;
         let n = conditions.len();
 
         for (i, cond) in conditions.iter().enumerate() {
@@ -548,9 +545,7 @@ impl RoutingMatcherBuilder {
                     let idx = match_sets.len() as u32;
                     // Negated LPM matchers still install their entries; the
                     // kernel inverts the lookup result via the not flag.
-                    if let Err(e) = Self::plan_source_lpm_routes(lpm_plan, nets, idx) {
-                        warn!("SourceIp LPM planning failed (non-fatal): {}", e);
-                    }
+                    Self::plan_source_lpm_routes(lpm_plan, nets, idx);
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
                         not,
@@ -562,9 +557,7 @@ impl RoutingMatcherBuilder {
                 }
                 ConditionKind::Ip { nets } => {
                     let idx = match_sets.len() as u32;
-                    if let Err(e) = Self::plan_dest_lpm_routes(lpm_plan, nets, idx) {
-                        warn!("DestIp LPM planning failed (non-fatal): {}", e);
-                    }
+                    Self::plan_dest_lpm_routes(lpm_plan, nets, idx);
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
                         not,
@@ -576,9 +569,7 @@ impl RoutingMatcherBuilder {
                 }
                 ConditionKind::Mac { macs } => {
                     let idx = match_sets.len() as u32;
-                    if let Err(e) = Self::plan_mac_lpm_routes(lpm_plan, macs, idx) {
-                        warn!("Mac LPM planning failed (non-fatal): {}", e);
-                    }
+                    Self::plan_mac_lpm_routes(lpm_plan, macs, idx);
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
                         not,
@@ -680,8 +671,6 @@ impl RoutingMatcherBuilder {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Return the list of conditions present in a route, in evaluation order.
@@ -807,30 +796,12 @@ impl RoutingMatcherBuilder {
         conditions
     }
 
-    /// Returns true if the route contains any condition that cannot be
-    /// evaluated by the eBPF datapath and must be left to userspace.
-    ///
-    /// All conditions we currently generate have an eBPF representation:
-    /// domain/geosite via `DomainSet` + DNS snooping, IP/MAC via LPM tries,
-    /// ports/protocol/ipversion/dscp directly, and process names via pname.
-    fn has_unsupported_ebpf_conditions(_route: &CompiledRoute) -> bool {
-        false
-    }
-
     /// Record destination IP prefixes for DEST_LPM_ROUTING_MAP into the plan.
-    fn plan_dest_lpm_routes(
-        plan: &mut LpmPushPlan,
-        nets: &[ipnet::IpNet],
-        rule_index: u32,
-    ) -> anyhow::Result<()> {
-        if nets.is_empty() {
-            return Ok(());
-        }
-
+    fn plan_dest_lpm_routes(plan: &mut LpmPushPlan, nets: &[ipnet::IpNet], rule_index: u32) {
         let bitmap = Self::bitmap_for_rule(rule_index);
 
         for (i, net) in nets.iter().enumerate() {
-            let lpm_key = maps::cidr_to_lpm_key(&net.to_string())?;
+            let lpm_key = maps::ipnet_to_lpm_key(net);
             if lpm_key.prefix_len == 0 {
                 warn!("dest LPM: zero prefix for {}", net);
             }
@@ -848,23 +819,14 @@ impl RoutingMatcherBuilder {
             nets.len(),
             rule_index
         );
-        Ok(())
     }
 
     /// Record source IP prefixes for SOURCE_LPM_ROUTING_MAP into the plan.
-    fn plan_source_lpm_routes(
-        plan: &mut LpmPushPlan,
-        nets: &[ipnet::IpNet],
-        rule_index: u32,
-    ) -> anyhow::Result<()> {
-        if nets.is_empty() {
-            return Ok(());
-        }
-
+    fn plan_source_lpm_routes(plan: &mut LpmPushPlan, nets: &[ipnet::IpNet], rule_index: u32) {
         let bitmap = Self::bitmap_for_rule(rule_index);
 
         for net in nets {
-            let lpm_key = maps::cidr_to_lpm_key(&net.to_string())?;
+            let lpm_key = maps::ipnet_to_lpm_key(net);
             plan.add_source(lpm_key, bitmap);
         }
 
@@ -873,7 +835,6 @@ impl RoutingMatcherBuilder {
             nets.len(),
             rule_index
         );
-        Ok(())
     }
 
     /// Record MAC addresses for MAC_LPM_ROUTING_MAP into the plan.
@@ -881,15 +842,7 @@ impl RoutingMatcherBuilder {
     /// Each MAC is encoded as an IPv6-like 16-byte prefix with the MAC in
     /// bytes 10–15 and prefix_len=128 (exact match), matching Go dae-core's
     /// approach of storing MAC entries in LPM tries.
-    fn plan_mac_lpm_routes(
-        plan: &mut LpmPushPlan,
-        macs: &[String],
-        rule_index: u32,
-    ) -> anyhow::Result<()> {
-        if macs.is_empty() {
-            return Ok(());
-        }
-
+    fn plan_mac_lpm_routes(plan: &mut LpmPushPlan, macs: &[String], rule_index: u32) {
         let bitmap = Self::bitmap_for_rule(rule_index);
 
         for mac_str in macs {
@@ -921,7 +874,6 @@ impl RoutingMatcherBuilder {
         }
 
         info!("Planned {} MAC routes for rule {}", macs.len(), rule_index);
-        Ok(())
     }
 
     /// Append one MatchSet per port range, ORing multiple ranges with LogicalOr.
@@ -1273,8 +1225,7 @@ mod tests {
         };
         let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
         let old_plan =
-            RoutingMatcherBuilder::compile(&[old_route], &outbound_map, "direct", DialMode::Ip)
-                .unwrap();
+            RoutingMatcherBuilder::compile(&[old_route], &outbound_map, "direct", DialMode::Ip);
         let new_dest: Vec<ipnet::IpNet> = vec!["172.16.0.0/12".parse().unwrap()];
         let new_source: Vec<ipnet::IpNet> = vec!["100.64.0.0/10".parse().unwrap()];
         let new_route = CompiledRoute {
@@ -1286,8 +1237,7 @@ mod tests {
             ..make_route("new", "direct")
         };
         let new_plan =
-            RoutingMatcherBuilder::compile(&[new_route], &outbound_map, "direct", DialMode::Ip)
-                .unwrap();
+            RoutingMatcherBuilder::compile(&[new_route], &outbound_map, "direct", DialMode::Ip);
 
         for phase in [
             RoutingPushPhase::Rules,
@@ -1505,15 +1455,13 @@ mod tests {
             &outbound_map,
             "direct",
             DialMode::Ip,
-        )
-        .unwrap();
+        );
         assert!(!plan.has_domain_rules);
 
         let mut suffix_route = make_route("suffix", "direct");
         suffix_route.domain_suffixes = vec!["example.com".into()];
         let plan =
-            RoutingMatcherBuilder::compile(&[suffix_route], &outbound_map, "direct", DialMode::Ip)
-                .unwrap();
+            RoutingMatcherBuilder::compile(&[suffix_route], &outbound_map, "direct", DialMode::Ip);
         assert!(plan.has_domain_rules);
 
         // Negated domain matchers also set the metadata bit: in modes that
@@ -1521,8 +1469,7 @@ mod tests {
         let mut negated_route = make_route("negated", "direct");
         negated_route.not_domain_keywords = vec!["ads".into()];
         let plan =
-            RoutingMatcherBuilder::compile(&[negated_route], &outbound_map, "direct", DialMode::Ip)
-                .unwrap();
+            RoutingMatcherBuilder::compile(&[negated_route], &outbound_map, "direct", DialMode::Ip);
         assert!(plan.has_domain_rules);
     }
 
@@ -1788,8 +1735,7 @@ mod tests {
             &outbound_map,
             "direct",
             DialMode::Ip,
-        )
-        .unwrap();
+        );
         RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
 
         let new_nets: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
@@ -1802,12 +1748,11 @@ mod tests {
             &outbound_map,
             "direct",
             DialMode::Ip,
-        )
-        .unwrap();
+        );
         RoutingMatcherBuilder::push_transition(&mut backend, Some(&old_plan), &new_plan).unwrap();
 
-        let old_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("10.0.0.0/8").unwrap());
-        let new_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("192.168.0.0/16").unwrap());
+        let old_key = maps::lpm_key_bytes(&maps::ipnet_to_lpm_key(&old_nets[0]));
+        let new_key = maps::lpm_key_bytes(&maps::ipnet_to_lpm_key(&new_nets[0]));
         assert_eq!(backend.dest_lpm_bitmap.len(), 2);
         assert_eq!(
             backend.dest_lpm_bitmap[&old_key].bitmap[ROUTING_BITMAP_WORDS_PER_GENERATION],
@@ -1838,7 +1783,6 @@ mod tests {
                 "direct",
                 DialMode::Ip,
             )
-            .unwrap()
         };
         let first = compile("first", "10.0.0.0/8");
         let second = compile("second", "192.168.0.0/16");
@@ -1847,8 +1791,10 @@ mod tests {
         RoutingMatcherBuilder::push_plan(&mut backend, &first).unwrap();
         RoutingMatcherBuilder::push_transition(&mut backend, Some(&first), &second).unwrap();
         let accepted = backend.routing_snapshot();
-        let first_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("10.0.0.0/8").unwrap());
-        let second_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("192.168.0.0/16").unwrap());
+        let first_key =
+            maps::lpm_key_bytes(&maps::ipnet_to_lpm_key(&"10.0.0.0/8".parse().unwrap()));
+        let second_key =
+            maps::lpm_key_bytes(&maps::ipnet_to_lpm_key(&"192.168.0.0/16".parse().unwrap()));
 
         backend.fail_next_routing_phase(RoutingPushPhase::DestinationLpm);
         assert!(
@@ -1899,43 +1845,6 @@ mod tests {
             snapshot.dest_lpm[0].1[0], 0b11,
             "shared CIDR must carry both rule indices (0 and 1)"
         );
-    }
-
-    #[test]
-    fn test_push_does_not_clear_routes_first() {
-        // Regression guard for the two-phase commit: build_and_push must not
-        // reset the rule count to 0 at any point (the eBPF datapath SHOTs
-        // new flows while the count is 0).  With the mock, the observable
-        // invariant is that a reload leaves a valid count and no stale maps.
-        let mut backend = MockEbpfBackend::new();
-        let mut outbound_map = HashMap::new();
-        outbound_map.insert("direct".to_string(), OutboundIndex::Direct as u8);
-
-        let route = CompiledRoute {
-            ports: vec![crate::routing::PortRange { start: 80, end: 80 }],
-            ..make_route("http", "direct")
-        };
-        RoutingMatcherBuilder::build_and_push(
-            &mut backend,
-            std::slice::from_ref(&route),
-            &outbound_map,
-            "direct",
-            DialMode::Ip,
-        )
-        .unwrap();
-        // Reload with the identical ruleset: everything must stay consistent.
-        RoutingMatcherBuilder::build_and_push(
-            &mut backend,
-            &[route],
-            &outbound_map,
-            "direct",
-            DialMode::Ip,
-        )
-        .unwrap();
-
-        assert_eq!(backend.active_routing_rule_count(), 2);
-        assert!(backend.domain_routes.is_empty());
-        assert!(backend.ip_routes.is_empty());
     }
 
     fn mock_group_word(backend: &MockEbpfBackend, g: u32, w: u32) -> u32 {
@@ -2023,8 +1932,7 @@ mod tests {
                 ..make_route("ip-version", "proxy")
             };
             let plan =
-                RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-                    .unwrap();
+                RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip);
             let stored_value = unsafe { plan.match_sets[0].value.ip_version };
             assert_eq!(stored_value, expected_value);
             for (group, bitmap) in plan.group_bitmaps.iter().enumerate() {
@@ -2160,8 +2068,7 @@ mod tests {
             &outbound_map,
             "direct",
             DialMode::Ip,
-        )
-        .unwrap();
+        );
         RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
 
         let key = crate::ebpf::maps::ip_addr_to_lpm_key("203.0.113.7".parse().unwrap());
@@ -2180,7 +2087,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let next_plan =
-            RoutingMatcherBuilder::compile(&routes, &outbound_map, "direct", DialMode::Ip).unwrap();
+            RoutingMatcherBuilder::compile(&routes, &outbound_map, "direct", DialMode::Ip);
         let next_generation = backend.active_routing_generation().unwrap() ^ 1;
         let next_bitmap = RoutingMatcherBuilder::bitmap_for_rule(64);
         backend
@@ -2327,8 +2234,7 @@ mod tests {
             ..make_route("not-v6", "proxy")
         };
         let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
-        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-            .unwrap();
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip);
         let rule_index = 0usize;
         for words in plan.group_bitmaps.iter() {
             assert_ne!(
@@ -2346,8 +2252,7 @@ mod tests {
             ..make_route("not-x", "proxy")
         };
         let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
-        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-            .unwrap();
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip);
 
         assert_eq!(plan.match_sets[0].match_type, MatchType::DomainSet as u8);
         assert_eq!(plan.match_sets[0].not, 1);
@@ -2365,8 +2270,7 @@ mod tests {
             ..make_route("mixed", "proxy")
         };
         let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
-        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-            .unwrap();
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip);
 
         assert_eq!(plan.match_sets[0].match_type, MatchType::DomainSet as u8);
         assert_eq!(plan.match_sets[0].not, 0);
@@ -2386,8 +2290,7 @@ mod tests {
             ..make_route("host24", "direct")
         };
         let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
-        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
-            .unwrap();
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip);
 
         assert_eq!(plan.match_sets[0].match_type, MatchType::IpSet as u8);
         assert_eq!(plan.match_sets[0].not, 0);

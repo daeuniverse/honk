@@ -199,33 +199,6 @@ impl ConntrackArgs {
     }
 
     #[inline(always)]
-    pub fn set_routing(&mut self, val: bool) {
-        if val {
-            self.flags |= CT_ARGS_HAS_ROUTING;
-        } else {
-            self.flags &= !CT_ARGS_HAS_ROUTING;
-        }
-    }
-
-    #[inline(always)]
-    pub fn set_mac(&mut self, val: bool) {
-        if val {
-            self.flags |= CT_ARGS_HAS_MAC;
-        } else {
-            self.flags &= !CT_ARGS_HAS_MAC;
-        }
-    }
-
-    #[inline(always)]
-    pub fn set_pname(&mut self, val: bool) {
-        if val {
-            self.flags |= CT_ARGS_HAS_PNAME;
-        } else {
-            self.flags &= !CT_ARGS_HAS_PNAME;
-        }
-    }
-
-    #[inline(always)]
     pub fn set(
         &mut self,
         dscp: u8,
@@ -239,19 +212,19 @@ impl ConntrackArgs {
         self.pid = pid;
 
         if let Some((outbound, mark, must)) = routing {
-            self.set_routing(true);
+            self.flags |= CT_ARGS_HAS_ROUTING;
             self.outbound = *outbound;
             self.mark = *mark;
             self.must = *must;
         }
 
         if let Some(mac_addr) = mac {
-            self.set_mac(true);
+            self.flags |= CT_ARGS_HAS_MAC;
             self.mac.copy_from_slice(mac_addr);
         }
 
         if let Some(pname_bytes) = pname {
-            self.set_pname(true);
+            self.flags |= CT_ARGS_HAS_PNAME;
             self.pname.copy_from_slice(pname_bytes);
         }
     }

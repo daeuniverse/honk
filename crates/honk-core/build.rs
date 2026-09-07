@@ -188,14 +188,6 @@ fn embed_ebpf_object() {
         "cargo:rerun-if-changed={}",
         ebpf_crate.join("src").display()
     );
-    // Track all individual eBPF source files for rebuild
-    let ebpf_src = ebpf_crate.join("src");
-    if ebpf_src.is_dir() {
-        for entry in std::fs::read_dir(&ebpf_src).unwrap() {
-            let entry = entry.unwrap();
-            println!("cargo:rerun-if-changed={}", entry.path().display());
-        }
-    }
     println!(
         "cargo:rerun-if-changed={}",
         ebpf_common_crate.join("src").display()

@@ -96,6 +96,9 @@ pub const ERR_UNKNOWN_PROTO: c_long = -3;
 /// Unsupported packet type (not IP); pass through.
 pub const PASS_UNSUPPORTED: c_long = 1;
 
+/// Parsed ICMPv6 Redirect; only locally originated LAN egress suppresses it.
+pub const PASS_NDP_REDIRECT: c_long = 3;
+
 /// Destinations that must never enter routing/conntrack: L2
 /// broadcast/multicast, IPv4 limited broadcast + multicast + 0.0.0.0, IPv6
 /// multicast. DHCP, mDNS, SSDP and LLMNR ride these — routing them through
@@ -685,7 +688,11 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
     }
 
     if tctx.l4proto == IPPROTO_ICMPV6 {
-        return PASS_UNSUPPORTED;
+        return if tctx.icmp6h.type_ == 137 {
+            PASS_NDP_REDIRECT
+        } else {
+            PASS_UNSUPPORTED
+        };
     }
 
     *out = unsafe { mem::zeroed() };

@@ -408,43 +408,6 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     }
 }
 
-/// Delete keys with `BPF_MAP_DELETE_BATCH` (Linux 5.6+).
-pub fn bpf_delete_batch<K: Pod>(
-    bpf: &Ebpf,
-    cap: &BatchCapability,
-    map: &str,
-    keys: &[K],
-) -> anyhow::Result<bool> {
-    if cap.is_unsupported() {
-        return Ok(false);
-    }
-    if keys.is_empty() {
-        return Ok(true);
-    }
-    let fd = map_fd(bpf, map)?;
-    for chunk in keys.chunks(BPF_BATCH_CHUNK) {
-        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-        attr.batch.map_fd = fd as u32;
-        attr.batch.keys = chunk.as_ptr() as u64;
-        attr.batch.count = chunk.len() as u32;
-        let result = unsafe { bpf_syscall(BPF_MAP_DELETE_BATCH as c_long, &mut attr) };
-        if !cap.observe(result) {
-            debug!(
-                "bpf delete_batch({}) unsupported, using Aya map deletes",
-                map
-            );
-            return Ok(false);
-        }
-        match result {
-            Ok(()) | Err(ENOENT) => {}
-            Err(error) => {
-                return Err(anyhow::anyhow!("bpf delete_batch({map}) errno={error}"));
-            }
-        }
-    }
-    Ok(true)
-}
-
 /// Write one bounded chunk with `BPF_MAP_UPDATE_BATCH` (Linux 5.6+).
 pub fn bpf_update_batch<K: Pod, V: Pod>(
     bpf: &Ebpf,

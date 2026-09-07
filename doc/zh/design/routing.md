@@ -46,7 +46,7 @@ TCP SYN 时内核看不到主机名。域名与 geosite 条件编译为 `DomainS
 
 ## 原子路由发布
 
-路由推送是选择器最后写入的双阶段提交。它绝不调用 `clear_routes`；清空活动 map 会在重载发布期间暴露空 generation 并丢弃新流量。
+路由推送是选择器最后写入的双阶段提交。它绝不清空活动 map，否则会在重载发布期间暴露空 generation 并丢弃新流量。
 
 1. 编译不可变的 `RoutingPushPlan`——`MatchSet`、LPM bitmap、流分组 bitmap 与域名投影元数据——且不写任何 BPF map。
 2. 读取活动 generation，并填充另一个 `ROUTING_MAP` bank。

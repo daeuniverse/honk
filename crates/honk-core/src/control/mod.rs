@@ -48,7 +48,6 @@ use crate::control::udp_endpoint::{EndpointReservation, UdpEndpointPool, UdpInit
 use crate::dns::DnsResolver;
 use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::maps::cidr_to_lpm_key;
 use crate::group::{GroupManager, SharedGroupManager};
 use crate::pool::{ConnectionPool, is_tcp_stream_alive};
 use crate::proxy::ProxyRegistry;
@@ -361,12 +360,12 @@ impl ControlPlane {
             .parse::<DialMode>()
             .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
         let fallback_outbound = config.routing.default_outbound.as_str();
-        routing_matcher::RoutingMatcherBuilder::compile(
+        Ok(routing_matcher::RoutingMatcherBuilder::compile(
             router.compiled_routes(),
             &outbound_name_to_id,
             fallback_outbound,
             dial_mode,
-        )
+        ))
     }
 }
 

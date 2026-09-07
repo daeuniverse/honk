@@ -46,7 +46,7 @@ In `domain++` mode, a generic proxy rule with a destination-port condition is ch
 
 ## Atomic routing publication
 
-A routing push is a selector-last, two-phase commit. It never calls `clear_routes`; clearing the active maps would expose an empty generation and drop new traffic while reload is in progress.
+A routing push is a selector-last, two-phase commit. It never clears the active maps: doing so would expose an empty generation and drop new traffic while reload is in progress.
 
 1. Compile an immutable `RoutingPushPlan`—`MatchSet`s, LPM bitmaps, flow-group bitmaps, and domain projection metadata—without writing any BPF map.
 2. Read the active generation and fill the other `ROUTING_MAP` bank.

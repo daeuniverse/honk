@@ -12,7 +12,7 @@ use aya_ebpf_bindings::{
     bindings::__sk_buff,
     helpers::{
         bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head,
-        bpf_skb_load_bytes, bpf_skb_store_bytes,
+        bpf_skb_store_bytes,
     },
 };
 use aya_ebpf_cty::c_void;
@@ -38,7 +38,7 @@ use crate::{
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     transport::{
-        ETH_HLEN, ETH_P_IP, IPPROTO_ICMPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet,
+        ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PASS_NDP_REDIRECT, parse_packet,
         tcp_listener_l4proto,
     },
 };
@@ -47,8 +47,6 @@ use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict,
 
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
-/// ICMPv6 Neighbor Discovery Redirect type.
-const NDP_REDIRECT: u8 = 137;
 const TOKEN_IDENTITY_MISMATCH: i32 = -2;
 
 #[inline(always)]
@@ -298,8 +296,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
-        // Negative: error → drop; Positive: unsupported protocol → pass through.
-        if ret < 0 {
+        if ret < 0 || (ret == PASS_NDP_REDIRECT && skb_ingress_ifindex(ctx) == NOWHERE_IFINDEX) {
             return Err(TC_ACT_SHOT);
         }
         return Err(TC_ACT_OK);
@@ -308,28 +305,6 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // Broadcast/multicast (DHCPOFFER, mDNS, NetBIOS) is never conn-tracked.
     if crate::transport::dst_is_special(pkt, link_h_len) {
         return Err(TC_ACT_OK);
-    }
-
-    // Drop NDP REDIRECT packets from localhost to prevent ND proxy interference.
-    if skb_ingress_ifindex(ctx) == NOWHERE_IFINDEX && pkt.l4proto == IPPROTO_ICMPV6 {
-        // ICMPv6 type is at offset: link_h_len + ipv6hdr(40) + 0(icmp6_type).
-        let icmp6_offset = if link_h_len == ETH_HLEN {
-            (link_h_len + 40) as usize
-        } else {
-            40usize
-        };
-        let mut icmp6_type: u8 = 0;
-        unsafe {
-            let _ = bpf_skb_load_bytes(
-                ctx.skb.skb as *mut _,
-                icmp6_offset as u32,
-                &mut icmp6_type as *mut u8 as *mut _,
-                1,
-            );
-        }
-        if icmp6_type == NDP_REDIRECT {
-            return Err(TC_ACT_SHOT);
-        }
     }
 
     match pkt.l4proto {

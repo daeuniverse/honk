@@ -1,5 +1,3 @@
-use aya_ebpf_bindings::bindings::{__be16, __u16};
-
 use crate::{TASK_COMM_LEN, dae_ip::In6Addr};
 
 pub const MAX_MATCH_SET_LEN: usize = 128;
@@ -7,13 +5,6 @@ pub const ROUTING_BITMAP_WORDS_PER_GENERATION: usize = MAX_MATCH_SET_LEN / 32;
 pub const ROUTING_BITMAP_GENERATIONS: usize = 2;
 pub const ROUTING_BITMAP_WORDS: usize =
     ROUTING_BITMAP_WORDS_PER_GENERATION * ROUTING_BITMAP_GENERATIONS;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IPPort {
-    pub ip: In6Addr,
-    pub port: __be16,
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -79,13 +70,6 @@ const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
-pub struct PortRange {
-    pub port_start: __u16,
-    pub port_end: __u16,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
 pub struct DomainRouting {
     pub bitmap: [u32; ROUTING_BITMAP_WORDS],
 }
@@ -100,14 +84,6 @@ impl DomainRouting {
         }
         shifted
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct IPPortProto {
-    pub ip: In6Addr,
-    pub port: __be16,
-    pub proto: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

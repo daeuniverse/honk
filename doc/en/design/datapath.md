@@ -169,6 +169,10 @@ Conn-state sweeps normally run every 60 seconds. At 70% occupancy the interval f
 
 Per-outbound traffic counters are per CPU. TX packets and bytes are counted at `lan_ingress` when the route lands, for both redirect and direct-offload outcomes. RX packets and bytes are counted at `dae0_ingress` after `REDIRECT_TRACK` identifies the returning outbound. Unclassified pass-through traffic and drops have no outbound counter.
 
+The backend API uses `TuplesKey`/`ConnState`, bounded map scans, and conditional retirement. Legacy `ConnTuple` CRUD, string IP/domain routes, cached parameter setters, and backend statistics adapters are removed. Load-time `DaeParam` globals, generation-fenced IP/rule-bit projections, `StatsManager`, and pinned `OUTBOUND_STATS` remain the authoritative paths.
+
+`just test-netns` includes production TC packet regressions: exact reverse-tuple RX accounting, cached-route health/readiness, and locally generated ICMPv6 Redirect suppression. L2 cases use `BPF_PROG_TEST_RUN`; L3 uses actual TUN interfaces in an isolated network namespace, including forwarded and hook-detached controls.
+
 ## Related docs
 
 - [Routing design](./routing.md)

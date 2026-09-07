@@ -22,35 +22,6 @@ pub const UDP_DECISION_RETIRE_FENCE_MAP: &str = "UDP_DECISION_RETIRE_FENCE";
 /// overestimates live occupancy between sweep calibrations.
 pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone)]
-pub struct BpfLoadParams {
-    pub tproxy_port: u16,
-    pub tproxy_mark: u32,
-    pub so_mark: u32,
-    pub control_plane_pid: u32,
-    pub dae0_ifindex: u32,
-    pub lo_ifindex: u32,
-    pub dae_netns_id: u32,
-    pub dae0peer_mac: [u8; 6],
-    pub local_ip: u32,
-}
-
-impl Default for BpfLoadParams {
-    fn default() -> Self {
-        Self {
-            tproxy_port: 12345,
-            tproxy_mark: 0x0800_0000,
-            so_mark: 0,
-            control_plane_pid: 0,
-            dae0_ifindex: 0,
-            lo_ifindex: 0,
-            dae_netns_id: 0,
-            dae0peer_mac: [0u8; 6],
-            local_ip: 0,
-        }
-    }
-}
-
 /// Raw key sets identifying the LPM entries that belong to the current
 /// ruleset generation, consumed by [`EbpfBackend::prune_lpm_entries`].
 /// Keys are the 20-byte raw `LpmKey` encoding produced by
@@ -314,10 +285,6 @@ pub trait EbpfBackend: Send + Sync {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
-    fn eject(&mut self) {}
-    fn inject(&mut self, _params: &BpfLoadParams) -> anyhow::Result<()> {
-        Ok(())
-    }
     fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -419,9 +386,6 @@ pub trait EbpfBackend: Send + Sync {
     /// was recreated, so its hooks died with it).
     fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
 
-    fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()>;
-    fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>>;
-
     /// Fill the inactive physical routing-rule bank. The bank is not visible
     /// to the datapath until `publish_routing_generation` flips its selector.
     fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()>;
@@ -439,21 +403,6 @@ pub trait EbpfBackend: Send + Sync {
         count: u32,
         group_bitmaps: &RoutingGroupBitmaps,
     ) -> anyhow::Result<()>;
-    fn add_domain_route(&mut self, domain: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
-    fn add_domain_routing_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()>;
-    fn add_source_routing_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
     fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
         let _ = key;
         let _ = bitmap;
@@ -533,13 +482,6 @@ pub trait EbpfBackend: Send + Sync {
         generation: u32,
         entries: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()>;
-    fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
-    /// Fully reset all routing-related maps (MatchSets, routing metadata,
-    /// domain routing, and LPM tries). NOT used by the routing push path:
-    /// clearing the active bank and metadata makes the eBPF datapath fail
-    /// closed until a complete generation is published. Kept for tests and
-    /// full-reset scenarios only.
-    fn clear_routes(&mut self) -> anyhow::Result<()>;
     /// Delete dest/source/MAC LPM entries whose raw key is not in `keep`.
     ///
     /// Post-commit cleanup for the two-phase routing push.  This replaces
@@ -556,14 +498,6 @@ pub trait EbpfBackend: Send + Sync {
     fn udp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     fn udp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
     fn udp_conn_state_remove(&mut self, key: &TuplesKey) -> anyhow::Result<()>;
-    /// Remove a bounded batch of UDP conntrack entries. Backends may override
-    /// this to amortize map access; the default preserves single-delete errors.
-    fn udp_conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<usize> {
-        for key in keys {
-            self.udp_conn_state_remove(key)?;
-        }
-        Ok(keys.len())
-    }
 
     /// Publish one token-bound UDP decision transition. The caller holds the
     /// backend write lock; implementations validate the state incarnation and
@@ -635,7 +569,6 @@ pub trait EbpfBackend: Send + Sync {
 
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
     fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;
-    fn cookie_pid_remove(&mut self, cookie: &u64) -> anyhow::Result<()>;
 
     fn set_outbound_alive(
         &mut self,
@@ -646,8 +579,6 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<()>;
     fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool>;
 
-    fn get_outbound_stats(&self, outbound: OutboundIndex) -> anyhow::Result<OutboundStats>;
-    fn clear_outbound_stats(&mut self, outbound: OutboundIndex) -> anyhow::Result<()>;
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>>;
 
     // CONN_STATE_MAP is a plain hash: the datapath expires entries lazily on
@@ -655,12 +586,9 @@ pub trait EbpfBackend: Send + Sync {
     // (mirroring the datapath's own expiry rules).  The kernel never evicts
     // on its own — silent LRU eviction could re-route or break live flows.
 
-    /// Snapshot all (key, entry) pairs from CONN_STATE_MAP.
-    /// Same consistency notes as [`Self::redirect_track_snapshot`].
+    /// Snapshot all (key, entry) pairs from CONN_STATE_MAP for janitor scans.
+    /// Implementations may use bounded batch reads internally.
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()>;
-
-    /// Remove multiple CONN_STATE_MAP entries (batched when supported).
-    fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
 
     /// Visit CONN_STATE_MAP entries in bounded chunks without accumulating
     /// the whole map (524K entries would otherwise spike memory on every
@@ -691,65 +619,25 @@ pub trait EbpfBackend: Send + Sync {
         Ok((0, 0))
     }
 
-    fn redirect_track_snapshot(
-        &self,
-        out: &mut Vec<(RedirectTuple, RedirectEntry)>,
-    ) -> anyhow::Result<()>;
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()>;
-    fn routing_handoff_snapshot(
-        &self,
-        out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
-    ) -> anyhow::Result<()>;
-    fn redirect_track_remove_batch(&mut self, keys: &[RedirectTuple]) -> anyhow::Result<()>;
-    fn cookie_pid_remove_batch(&mut self, cookies: &[u64]) -> anyhow::Result<()>;
-    fn routing_handoff_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
-
     /// Stream REDIRECT_TRACK in bounded chunks. The callback can stop at a
     /// chunk boundary so callers can retain a wall-clock budget.
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut RedirectTrackChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.redirect_track_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     fn cookie_pid_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut CookiePidChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.cookie_pid_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut RoutingHandoffChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.routing_handoff_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     /// Re-check candidates before deleting them. A key reused or transitioned
     /// after the scan is retained unless its current timestamp and TCP state
@@ -775,8 +663,4 @@ pub trait EbpfBackend: Send + Sync {
         entries: &[(TuplesKey, RoutingHandoffEntry)],
         expired_before_ns: u64,
     ) -> anyhow::Result<u64>;
-
-    fn conn_track_lookup(&self, tuple: &ConnTuple) -> anyhow::Result<Option<u32>>;
-    fn conn_track_store(&mut self, tuple: &ConnTuple, outbound_idx: u32) -> anyhow::Result<()>;
-    fn conn_track_remove(&mut self, tuple: &ConnTuple) -> anyhow::Result<()>;
 }

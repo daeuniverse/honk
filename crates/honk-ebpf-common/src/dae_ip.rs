@@ -11,10 +11,6 @@ pub union In6Addr {
     pub u6_addr64: [u64; 2],
 }
 
-/// IPv4-mapped IPv6 prefix ::ffff/96.
-#[allow(unused)]
-const V4_MAPPED_PREFIX: [__u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
-
 impl In6Addr {
     /// The all-zeros address `::`.
     pub const fn zero() -> Self {
@@ -53,31 +49,6 @@ impl In6Addr {
                 && self.u6_addr16[4] == 0
                 && self.u6_addr16[5] == u16::to_be(0xffff)
         }
-    }
-
-    /// Returns `true` if this is an IPv4-compatible address (`::/96`, deprecated but
-    /// may still be seen in the kernel).
-    pub fn is_v4_compat(&self) -> bool {
-        unsafe {
-            self.u6_addr32[0] == 0
-                && self.u6_addr32[1] == 0
-                && self.u6_addr32[2] == 0
-                && self.u6_addr32[3] != 0
-        }
-    }
-
-    /// Modify only the low 32 bits (IPv4 part), keeping the prefix unchanged.
-    /// The current address must already be v4-mapped or v4-compat.
-    pub fn set_ipv4(&mut self, ipv4_be: __be32) {
-        unsafe {
-            // Store the IPv4 bytes in network byte order.
-            self.u6_addr32[3] = ipv4_be.to_be();
-        }
-    }
-
-    /// Clear the address and set it to a new IPv4-mapped address.
-    pub fn remap_ipv4(&mut self, ipv4_be: __be32) {
-        *self = Self::from_ipv4_mapped(ipv4_be);
     }
 
     /// Get a reference to the 16-byte array without requiring `unsafe` on the caller's side.
@@ -134,25 +105,6 @@ impl core::ops::Index<core::ops::Range<usize>> for In6Addr {
 impl core::ops::IndexMut<core::ops::Range<usize>> for In6Addr {
     fn index_mut(&mut self, r: core::ops::Range<usize>) -> &mut [u8] {
         unsafe { &mut self.u6_addr8[r] }
-    }
-}
-
-impl AsRef<[u8; 16]> for In6Addr {
-    fn as_ref(&self) -> &[u8; 16] {
-        unsafe { &self.u6_addr8 }
-    }
-}
-
-impl core::ops::Deref for In6Addr {
-    type Target = [u8; 16];
-    fn deref(&self) -> &[u8; 16] {
-        unsafe { &self.u6_addr8 }
-    }
-}
-
-impl AsRef<[u8]> for In6Addr {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { &self.u6_addr8 }
     }
 }
 

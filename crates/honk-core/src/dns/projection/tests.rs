@@ -8,9 +8,7 @@ use honk_ebpf_common::DomainRouting;
 
 use super::state::DesiredState;
 use super::worker;
-use super::{
-    ProjectionFreshness, ProjectionObservation, RoutingProjection, RoutingProjectionSnapshot,
-};
+use super::{ProjectionObservation, RoutingProjection, RoutingProjectionSnapshot};
 use crate::ebpf::maps;
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::ebpf::{EbpfBackend, ProjectionMapOperation};
@@ -69,7 +67,6 @@ fn positive<'a>(domain: &'a str, ips: &'a [IpAddr], ttl: Duration) -> Projection
         domain,
         ips,
         advertised_ttl: ttl,
-        freshness: ProjectionFreshness::Fresh,
     }
 }
 
@@ -95,7 +92,7 @@ async fn shared_ip_clear_and_expiry_recompute_owner_or() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stale_uses_only_advertised_ttl_and_retain_keeps_owner() {
+async fn positive_refresh_uses_advertised_ttl_and_retain_keeps_owner() {
     let now = tokio::time::Instant::now();
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
@@ -106,7 +103,6 @@ async fn stale_uses_only_advertised_ttl_and_retain_keeps_owner() {
             domain: "a.test",
             ips: &[ip],
             advertised_ttl: Duration::from_secs(2),
-            freshness: ProjectionFreshness::Stale,
         },
         now + Duration::from_secs(1),
     );
