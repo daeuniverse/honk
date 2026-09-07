@@ -30,6 +30,9 @@ pub use honk_outbound::alive as outbound;
 pub use honk_outbound::group;
 pub use honk_outbound::proxy;
 
+/// Build-time release tag or Git description; package version without Git metadata.
+pub const VERSION: &str = env!("HONK_VERSION");
+
 use clap::Parser;
 use honk_config::Config;
 use honk_ebpf_common::ParamKey;
@@ -192,7 +195,12 @@ pub enum ClashCommand {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None, disable_version_flag = true)]
+#[command(arg(clap::Arg::new("version")
+    .short('v')
+    .long("version")
+    .action(clap::ArgAction::Version)
+    .help("Print version")))]
 pub struct Cli {
     /// Subcommand (reload, mode, proxy, delay)
     #[command(subcommand)]
@@ -596,7 +604,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let registry = registry.with(clash_log_layer);
     registry.init();
 
-    info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
+    info!("honk-core {} starting", VERSION);
     info!("Config: {}", cli.config.display());
     if let Some(error) = data_dir_creation_error {
         warn!(

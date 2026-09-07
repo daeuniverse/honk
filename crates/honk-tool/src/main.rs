@@ -12,7 +12,12 @@ mod sub;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "honk-tool", version, about = "honk CLI toolbox")]
+#[command(name = "honk-tool", version = honk_core::VERSION, about = "honk CLI toolbox", disable_version_flag = true)]
+#[command(arg(clap::Arg::new("version")
+    .short('v')
+    .long("version")
+    .action(clap::ArgAction::Version)
+    .help("Print version")))]
 struct Cli {
     #[command(subcommand)]
     command: Command,

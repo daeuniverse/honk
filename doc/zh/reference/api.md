@@ -23,7 +23,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/` | 返回 Clash hello 文档；启用外部 UI hosting 时，将非 JSON 客户端重定向到 `/ui/`。 |
-| GET | `/version` | 返回 honk 版本及 Clash premium/meta capability flag。 |
+| GET | `/version` | 返回 `honk <build-version>`（包含发布 tag，与 CLI 共用构建版本）及 Clash premium/meta capability flag。 |
 | GET | `/configs` | 返回当前模式及已实现的 Clash 兼容配置快照。 |
 | PUT | `/configs` | 兼容性 no-op；接受请求并返回 `204 No Content`。 |
 | PATCH | `/configs` | 将 `mode` 设为 `Rule`、`Global` 或 `Direct`；匹配不区分大小写。 |

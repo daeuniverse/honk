@@ -1,13 +1,55 @@
 //! Build script for honk-core.
 //!
+//! Embeds the release tag or Git description for the CLI and Clash API.
+//!
 //! When the `ebpf` feature is enabled, this script ensures the eBPF object
 //! file is available and copies it into `OUT_DIR` so `lib.rs` can embed it
 //! via `include_bytes!`.  If the object does not exist yet, it is built
 //! automatically using the nightly toolchain.
 
 fn main() {
+    emit_version();
+
     #[cfg(feature = "ebpf")]
     embed_ebpf_object();
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    output.status.success().then_some(())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn emit_version() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF");
+    if let Some(paths) = git_output(&[
+        "rev-parse",
+        "--git-path",
+        "HEAD",
+        "--git-path",
+        "refs",
+        "--git-path",
+        "packed-refs",
+    ]) {
+        // Tracking a missing packed-refs file would force every build to rerun.
+        for path in paths
+            .lines()
+            .filter(|path| std::path::Path::new(path).exists())
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    // A release ref disambiguates multiple tags pointing at the same commit.
+    let version = std::env::var("GITHUB_REF")
+        .ok()
+        .and_then(|reference| reference.strip_prefix("refs/tags/").map(str::to_string))
+        .filter(|tag| !tag.is_empty())
+        .or_else(|| git_output(&["describe", "--tags", "--always", "--match", "v*"]))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    println!("cargo:rustc-env=HONK_VERSION={version}");
 }
 
 #[cfg(feature = "ebpf")]

@@ -320,7 +320,7 @@ async fn hello(State(s): State<Arc<ClashState>>, headers: HeaderMap) -> Response
 /// GET /version — version info enabling premium/meta features in dashboards.
 async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": concat!("honk ", env!("CARGO_PKG_VERSION")),
+        "version": concat!("honk ", env!("HONK_VERSION")),
         "premium": true,
         "meta": true,
     }))

@@ -23,7 +23,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/` | Return the Clash hello document, or redirect a non-JSON client to `/ui/` when external UI hosting is enabled. |
-| GET | `/version` | Return honk version and Clash premium/meta capability flags. |
+| GET | `/version` | Return `honk <build-version>` (including the release tag, using the same build identity as the CLI) and Clash premium/meta capability flags. |
 | GET | `/configs` | Return the current mode and the implemented Clash-compatible configuration snapshot. |
 | PUT | `/configs` | Compatibility no-op; accepts the request and returns `204 No Content`. |
 | PATCH | `/configs` | Set `mode` to `Rule`, `Global`, or `Direct`; matching is case-insensitive. |
