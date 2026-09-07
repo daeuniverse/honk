@@ -87,7 +87,11 @@ fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
         .host_str()
         .ok_or_else(|| ConfigError::Parse("missing host in share link".into()))?
         .to_string();
-    let port = url.port().unwrap_or(443);
+    let port = match url.port() {
+        Some(0) => return Err(ConfigError::Parse("invalid share link port".into())),
+        Some(port) => port,
+        None => 443,
+    };
     let mut node = Node {
         address: format!("{host}:{port}"),
         host,
