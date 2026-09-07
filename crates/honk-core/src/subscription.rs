@@ -1,8 +1,8 @@
 //! Subscription manager for fetching and parsing proxy subscription URLs.
 //!
-//! Supports base64-encoded node lists (Simple format) and Clash-compatible
-//! YAML subscriptions. Individual share links are parsed with the unified
-//! [`Node::from_share_link`] parser from honk-config.
+//! Downloaded bodies, persisted bodies and local tool inputs share format
+//! detection. Foreign JSON and client records normalize through the Clash node
+//! builder; URI lists use [`Node::from_share_link`] from honk-config.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -16,6 +16,8 @@ use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
 use sha2::{Digest as _, Sha256};
 
+mod json;
+mod records;
 mod supervisor;
 
 pub(crate) use supervisor::{
@@ -371,18 +373,18 @@ impl SubscriptionManager {
     }
 }
 
-fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Result<Vec<Node>> {
+/// Parse a fetched or locally supplied subscription body using its shape.
+pub fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Result<Vec<Node>> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let nodes = match sub.sub_type {
-        SubscriptionType::Simple | SubscriptionType::Sip008 => {
-            parse_base64_subscription(content, Some(sub.id), &sub.name)
-        }
+        SubscriptionType::Sip008 => parse_sip008_subscription(content, Some(sub.id)),
         SubscriptionType::Clash => parse_clash_subscription(content, Some(sub.id)),
-        SubscriptionType::Custom => parse_base64_subscription(content, Some(sub.id), &sub.name)
-            .or_else(|_| parse_clash_subscription(content, Some(sub.id))),
+        SubscriptionType::Simple | SubscriptionType::Custom => {
+            parse_auto_subscription(content, Some(sub.id), &sub.name)
+        }
     }?;
 
     let mut seen = std::collections::HashSet::new();
-    let mut had_duplicate = false;
     let nodes = nodes
         .into_iter()
         .filter(|node| {
@@ -405,7 +407,6 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
             if seen.insert(node.id) {
                 true
             } else {
-                had_duplicate = true;
                 tracing::warn!(
                     node = %node.name,
                     "skipping subscription node with a duplicate endpoint identity"
@@ -417,10 +418,178 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     if nodes.is_empty() {
         anyhow::bail!("no usable nodes found in subscription");
     }
-    if had_duplicate && nodes.len() == 1 {
-        anyhow::bail!("subscription contains only duplicate endpoint identities");
-    }
     Ok(nodes)
+}
+
+fn parse_structured_value(content: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
+    let content = content.trim_start().trim_start_matches('\u{feff}');
+    // YAML's quoted-scalar decoder does not accept JSON UTF-16 surrogate pairs.
+    serde_json::from_str(content).or_else(|_| serde_yaml::from_str(content))
+}
+
+fn structured_subscription(value: serde_yaml::Value) -> anyhow::Result<Option<serde_yaml::Value>> {
+    let recognized = match &value {
+        serde_yaml::Value::Mapping(mapping) => ["proxies", "outbounds", "servers"]
+            .into_iter()
+            .any(|key| yaml_value(mapping, key).is_some()),
+        serde_yaml::Value::Sequence(items) => items.iter().any(|item| {
+            item.as_mapping().is_some_and(|mapping| {
+                yaml_value(mapping, "server").is_some()
+                    && (yaml_value(mapping, "server_port").is_some()
+                        || yaml_value(mapping, "port").is_some())
+            })
+        }),
+        _ => false,
+    };
+    if recognized {
+        Ok(Some(value))
+    } else if matches!(
+        value,
+        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)
+    ) {
+        anyhow::bail!("unsupported structured subscription format")
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_sip008_subscription(
+    content: &str,
+    subscription_id: Option<uuid::Uuid>,
+) -> anyhow::Result<Vec<Node>> {
+    let value = parse_structured_value(content)?;
+    match &value {
+        serde_yaml::Value::Sequence(_) => json::parse_json_subscription(value, subscription_id),
+        serde_yaml::Value::Mapping(root)
+            if yaml_value(root, "servers").is_some()
+                && yaml_value(root, "outbounds").is_none()
+                && yaml_value(root, "proxies").is_none() =>
+        {
+            json::parse_json_subscription(value, subscription_id)
+        }
+        _ => anyhow::bail!("invalid SIP008 subscription shape"),
+    }
+}
+
+fn parse_auto_subscription(
+    content: &str,
+    subscription_id: Option<uuid::Uuid>,
+    subscription_tag: &str,
+) -> anyhow::Result<Vec<Node>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty subscription body");
+    }
+    let parse_structured = |text: &str| -> anyhow::Result<Option<Vec<Node>>> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let Ok(value) = parse_structured_value(text) else {
+            let first = text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with(';'))
+                .unwrap_or_default();
+            let ini_header = first
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+                .is_some_and(|name| {
+                    !name.is_empty()
+                        && name.chars().all(|ch| {
+                            ch.is_ascii_alphanumeric()
+                                || ch.is_ascii_whitespace()
+                                || matches!(ch, '_' | '-')
+                        })
+                });
+            if first.starts_with('{')
+                || (first.starts_with('[') && !ini_header)
+                || ["proxies:", "outbounds:", "servers:"]
+                    .iter()
+                    .any(|key| first.starts_with(key))
+            {
+                anyhow::bail!("malformed structured subscription");
+            }
+            return Ok(None);
+        };
+        let Some(value) = structured_subscription(value)? else {
+            return Ok(None);
+        };
+        if let serde_yaml::Value::Mapping(root) = &value
+            && let Some(proxies) =
+                yaml_value(root, "proxies").and_then(serde_yaml::Value::as_sequence)
+        {
+            return Ok(Some(parse_clash_proxies(proxies, subscription_id)?));
+        }
+        Ok(Some(json::parse_json_subscription(value, subscription_id)?))
+    };
+
+    if let Some(nodes) = parse_structured(trimmed)? {
+        return Ok(nodes);
+    }
+
+    let decoded = if looks_like_raw_text(trimmed) {
+        None
+    } else {
+        decode_base64_flexible(trimmed)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    };
+    if let Some(decoded) = decoded.as_deref()
+        && let Some(nodes) = parse_structured(decoded)?
+    {
+        return Ok(nodes);
+    }
+
+    parse_base64_subscription(
+        decoded.as_deref().unwrap_or(trimmed),
+        subscription_id,
+        subscription_tag,
+    )
+    .or_else(|_| {
+        let text = decoded.as_deref().unwrap_or(trimmed);
+        records::parse_records_subscription(
+            text.strip_prefix('\u{feff}').unwrap_or(text),
+            subscription_id,
+        )
+    })
+}
+
+fn looks_like_raw_text(text: &str) -> bool {
+    const RECORD_TYPES: &[&str] = &[
+        "ss",
+        "shadowsocks",
+        "socks5",
+        "vmess",
+        "vless",
+        "trojan",
+        "hysteria2",
+        "hy2",
+        "tuic",
+        "juicity",
+        "anytls",
+    ];
+    text.lines().map(str::trim).any(|line| {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        if line.starts_with('[')
+            || line.contains("://")
+            || line.starts_with("REMARKS=")
+            || line.starts_with("STATUS=")
+            || (line.contains('=') && !line.ends_with('='))
+        {
+            return true;
+        }
+        let Some((left, right)) = line.split_once('=') else {
+            return false;
+        };
+        let left = left.trim().to_ascii_lowercase();
+        let right = right
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        RECORD_TYPES.contains(&left.as_str()) || RECORD_TYPES.contains(&right.as_str())
+    })
 }
 
 fn parse_base64_subscription(
@@ -428,26 +597,28 @@ fn parse_base64_subscription(
     subscription_id: Option<uuid::Uuid>,
     subscription_tag: &str,
 ) -> anyhow::Result<Vec<Node>> {
+    const SKIP_PREFIXES: &[&str] = &["REMARKS=", "STATUS="];
+
     let trimmed = content.trim();
-
-    // Many providers return a raw list of node URIs even when the subscription
-    // is labelled "simple". Try base64 first, then fall back to raw lines.
-    let text = match decode_base64_flexible(trimmed) {
-        Ok(decoded) => String::from_utf8(decoded)?,
-        Err(_) => {
-            tracing::debug!(
-                subscription = subscription_tag,
-                category = "raw-node-list",
-                "subscription content is not base64"
-            );
-            trimmed.to_string()
-        }
+    let decoded = if trimmed.lines().map(str::trim).any(|line| {
+        line.contains("://") || SKIP_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+    }) {
+        None
+    } else {
+        decode_base64_flexible(trimmed).ok()
     };
-
+    let decoded_text = decoded
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    let text = decoded_text
+        .unwrap_or(trimmed)
+        .strip_prefix('\u{feff}')
+        .unwrap_or(decoded_text.unwrap_or(trimmed));
     let uris: Vec<&str> = text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| !SKIP_PREFIXES.iter().any(|prefix| line.starts_with(*prefix)))
         .collect();
 
     if uris.is_empty() {
@@ -480,26 +651,30 @@ fn parse_base64_subscription(
 
 fn decode_base64_flexible(input: &str) -> anyhow::Result<Vec<u8>> {
     use base64::Engine;
+    use std::borrow::Cow;
 
     let input = input.trim();
-
-    if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(input) {
-        return Ok(data);
-    }
-
-    let padded = if !input.len().is_multiple_of(4) {
-        let padding = 4 - (input.len() % 4);
-        let mut s = input.to_string();
-        for _ in 0..padding {
-            s.push('=');
-        }
-        s
+    let compact: Cow<'_, str> = if input.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        Cow::Owned(
+            input
+                .chars()
+                .filter(|ch| !ch.is_ascii_whitespace())
+                .collect(),
+        )
     } else {
-        input.to_string()
+        Cow::Borrowed(input)
     };
-
-    let data = base64::engine::general_purpose::STANDARD.decode(&padded)?;
-    Ok(data)
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(data) = engine.decode(compact.as_bytes()) {
+            return Ok(data);
+        }
+    }
+    anyhow::bail!("invalid base64 subscription body")
 }
 
 fn yaml_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
@@ -554,6 +729,7 @@ fn parse_vless_external_mode(
         (None, None) => false,
         (Some(_), Some(_)) => return Err("duplicate VLESS XUDP representations".into()),
     };
+    let xudp_disabled = xudp.is_some_and(|value| value.as_bool() == Some(false));
     if let Some(value) = yaml_alias(mapping, &["packet-addr", "packet_addr"])? {
         let enabled = value
             .as_bool()
@@ -700,7 +876,7 @@ fn parse_vless_external_mode(
     if mux_mode.is_some() && uot_enabled {
         return Err("VLESS multiplex and udp-over-tcp cannot both be enabled".into());
     }
-    let mode = if xudp_enabled {
+    let mut mode = if xudp_enabled {
         WireMode::Xudp
     } else if let Some(mode) = mux_mode {
         mode
@@ -709,10 +885,10 @@ fn parse_vless_external_mode(
     } else {
         WireMode::Legacy
     };
+    if udp == Some(true) && mode == WireMode::Legacy && !xudp_disabled {
+        mode = WireMode::Xudp;
+    }
     match (udp, mode) {
-        (Some(true), WireMode::Legacy) => {
-            Err("native VLESS UDP is unsupported; specify an explicit packet mode".into())
-        }
         (Some(false), mode) if mode != WireMode::Legacy => Err(format!(
             "VLESS mode '{}' enables UDP but udp is false",
             mode.as_str()
@@ -721,220 +897,789 @@ fn parse_vless_external_mode(
     }
 }
 
-fn parse_clash_subscription(
-    content: &str,
+fn yaml_text(value: &serde_yaml::Value, label: &str) -> Result<Option<String>, String> {
+    match value {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::String(value) => Ok(Some(value.clone())),
+        serde_yaml::Value::Number(value) => Ok(Some(value.to_string())),
+        _ => Err(format!("{label} must be a scalar")),
+    }
+}
+
+fn yaml_text_alias(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Result<Option<String>, String> {
+    yaml_alias(mapping, keys)?
+        .map(|value| yaml_text(value, keys[0]))
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn yaml_bool_alias(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Result<Option<bool>, String> {
+    yaml_alias(mapping, keys)?
+        .map(|value| match value {
+            serde_yaml::Value::Null => Ok(None),
+            serde_yaml::Value::Bool(value) => Ok(Some(*value)),
+            _ => Err(format!("{} must be boolean", keys[0])),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn yaml_u64(value: &serde_yaml::Value, label: &str) -> Result<u64, String> {
+    match value {
+        serde_yaml::Value::Number(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("{label} must be a non-negative integer")),
+        serde_yaml::Value::String(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| format!("{label} must be a non-negative integer")),
+        _ => Err(format!("{label} must be a non-negative integer")),
+    }
+}
+
+fn yaml_u64_alias(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Result<Option<u64>, String> {
+    yaml_alias(mapping, keys)?
+        .map(|value| match value {
+            serde_yaml::Value::Null => Ok(None),
+            value => yaml_u64(value, keys[0]).map(Some),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn yaml_duration_secs(value: &serde_yaml::Value, label: &str) -> Result<u64, String> {
+    match value {
+        serde_yaml::Value::Number(_) => yaml_u64(value, label),
+        serde_yaml::Value::String(raw) => {
+            let raw = raw.trim();
+            let (number, multiplier) = if let Some(value) = raw.strip_suffix("ms") {
+                (value, 0)
+            } else if let Some(value) = raw.strip_suffix('s') {
+                (value, 1)
+            } else if let Some(value) = raw.strip_suffix('m') {
+                (value, 60)
+            } else if let Some(value) = raw.strip_suffix('h') {
+                (value, 3600)
+            } else {
+                (raw, 1)
+            };
+            let number: u64 = number
+                .trim()
+                .parse()
+                .map_err(|_| format!("{label} must be a duration"))?;
+            if multiplier == 0 {
+                Ok(number / 1000)
+            } else {
+                number
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| format!("{label} duration is too large"))
+            }
+        }
+        _ => Err(format!("{label} must be a duration")),
+    }
+}
+
+fn yaml_duration_alias(
+    mapping: &serde_yaml::Mapping,
+    keys: &[&str],
+) -> Result<Option<u64>, String> {
+    yaml_alias(mapping, keys)?
+        .map(|value| match value {
+            serde_yaml::Value::Null => Ok(None),
+            value => yaml_duration_secs(value, keys[0]).map(Some),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn yaml_rate_mbps(value: &serde_yaml::Value, label: &str) -> Result<u32, String> {
+    let raw = yaml_text(value, label)?.ok_or_else(|| format!("{label} is empty"))?;
+    let raw = raw.trim();
+    let raw = raw
+        .strip_suffix("Mbps")
+        .or_else(|| raw.strip_suffix("mbps"))
+        .or_else(|| raw.strip_suffix("Mb/s"))
+        .unwrap_or(raw)
+        .trim();
+    raw.parse().map_err(|_| format!("{label} must be Mbps"))
+}
+
+fn yaml_rate_alias(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Result<Option<u32>, String> {
+    yaml_alias(mapping, keys)?
+        .map(|value| match value {
+            serde_yaml::Value::Null => Ok(None),
+            value => yaml_rate_mbps(value, keys[0]).map(Some),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn yaml_list_text(value: &serde_yaml::Value, label: &str) -> Result<Option<String>, String> {
+    match value {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::Sequence(values) => values
+            .iter()
+            .map(|value| yaml_text(value, label).map(|value| value.unwrap_or_default()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| Some(values.join(","))),
+        value => yaml_text(value, label),
+    }
+}
+
+fn yaml_list_alias(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Result<Option<String>, String> {
+    yaml_alias(mapping, keys)?
+        .map(|value| yaml_list_text(value, keys[0]))
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn yaml_ports(value: &serde_yaml::Value, label: &str) -> Result<Option<String>, String> {
+    let Some(value) = yaml_list_text(value, label)? else {
+        return Ok(None);
+    };
+    let value = value
+        .split(',')
+        .map(|part| part.trim().replace(':', "-"))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if value.is_empty() {
+        return Err(format!("{label} is empty"));
+    }
+    Ok(Some(value))
+}
+
+fn validate_imported_node(node: &Node) -> Result<(), String> {
+    fn nonempty<'a>(value: Option<&'a String>, label: &str) -> Result<&'a String, String> {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{label} is missing"))
+    }
+    match &node.outbound {
+        OutboundConfig::Shadowsocks(config) => {
+            nonempty(config.password.as_ref(), "Shadowsocks password")?;
+            nonempty(config.encryption.as_ref(), "Shadowsocks cipher")?;
+        }
+        OutboundConfig::Trojan(config) => {
+            nonempty(config.password.as_ref(), "Trojan password")?;
+        }
+        OutboundConfig::Vmess(config) => {
+            let uuid = nonempty(config.uuid.as_ref(), "VMess UUID")?;
+            uuid::Uuid::parse_str(uuid).map_err(|_| "VMess UUID is invalid")?;
+            let cipher = config.encryption.as_deref().unwrap_or("auto").trim();
+            if !cipher.eq_ignore_ascii_case("auto") && !cipher.eq_ignore_ascii_case("aes-128-gcm") {
+                return Err("VMess cipher is unsupported".into());
+            }
+        }
+        OutboundConfig::Vless(config) => {
+            let uuid = nonempty(config.uuid.as_ref(), "VLESS UUID")?;
+            uuid::Uuid::parse_str(uuid).map_err(|_| "VLESS UUID is invalid")?;
+            if config
+                .flow
+                .as_deref()
+                .is_some_and(|flow| !flow.trim().is_empty() && flow != "xtls-rprx-vision")
+            {
+                return Err("VLESS flow is unsupported".into());
+            }
+            if config.encryption.as_deref().is_some_and(|encryption| {
+                let encryption = encryption.trim();
+                !encryption.is_empty()
+                    && encryption != "none"
+                    && !encryption.starts_with("mlkem768x25519plus.")
+            }) {
+                return Err("VLESS encryption is unsupported".into());
+            }
+        }
+        OutboundConfig::Socks5(_) => {}
+        OutboundConfig::Hysteria2(_) => {}
+        OutboundConfig::Tuic(config) => {
+            let uuid = nonempty(config.uuid.as_ref(), "TUIC UUID")?;
+            uuid::Uuid::parse_str(uuid).map_err(|_| "TUIC UUID is invalid")?;
+            nonempty(config.password.as_ref(), "TUIC password")?;
+        }
+        OutboundConfig::Juicity(config) => {
+            let uuid = nonempty(config.uuid.as_ref(), "Juicity UUID")?;
+            uuid::Uuid::parse_str(uuid).map_err(|_| "Juicity UUID is invalid")?;
+            nonempty(config.password.as_ref(), "Juicity password")?;
+        }
+        OutboundConfig::AnyTls(config) => {
+            nonempty(config.password.as_ref(), "AnyTLS password")?;
+        }
+        OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
+    }
+    Ok(())
+}
+fn yaml_active(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Null => false,
+        serde_yaml::Value::String(value) => !value.trim().is_empty(),
+        serde_yaml::Value::Sequence(value) => !value.is_empty(),
+        serde_yaml::Value::Mapping(value) => !value.is_empty(),
+        _ => true,
+    }
+}
+
+fn apply_reality(
+    mapping: &serde_yaml::Mapping,
+    node: &mut Node,
+    protocol: NodeProtocol,
+    tls_explicit: Option<bool>,
+) -> Result<(), String> {
+    let Some(value) = yaml_value(mapping, "reality-opts") else {
+        return Ok(());
+    };
+    if matches!(value, serde_yaml::Value::Null) {
+        return Ok(());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+    ) {
+        return Err("REALITY is unsupported for this protocol".into());
+    }
+    if tls_explicit == Some(false) {
+        return Err("REALITY conflicts with tls=false".into());
+    }
+    let reality = value
+        .as_mapping()
+        .ok_or_else(|| "reality-opts must be a mapping".to_string())?;
+    let public_key = yaml_text_alias(reality, &["public-key", "public_key"])?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "REALITY public key is missing".to_string())?;
+    let short_id = yaml_text_alias(reality, &["short-id", "short_id"])?;
+    let spider_x = yaml_text_alias(reality, &["spider-x", "spider_x"])?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/".to_string());
+    let tls = node
+        .tls_mut()
+        .ok_or_else(|| "REALITY requires TLS".to_string())?;
+    tls.enabled = true;
+    tls.reality_public_key = Some(public_key);
+    tls.reality_short_id = short_id;
+    tls.reality_spider_x = Some(spider_x);
+    Ok(())
+}
+
+fn parse_clash_proxy(
+    mapping: &serde_yaml::Mapping,
+    subscription_id: Option<uuid::Uuid>,
+) -> Result<Option<Node>, String> {
+    let Some(proxy_type) = yaml_text_alias(mapping, &["type"])? else {
+        return Ok(None);
+    };
+    let protocol = match proxy_type.to_ascii_lowercase().as_str() {
+        "socks5" => NodeProtocol::Socks5,
+        "ss" | "shadowsocks" => NodeProtocol::SS,
+        "trojan" => NodeProtocol::Trojan,
+        "vmess" => NodeProtocol::VMess,
+        "vless" => NodeProtocol::VLess,
+        "hysteria2" | "hysteria" => NodeProtocol::Hysteria2,
+        "tuic" => NodeProtocol::Tuic,
+        "juicity" => NodeProtocol::Juicity,
+        "anytls" => NodeProtocol::AnyTLS,
+        _ => return Ok(None),
+    };
+    if ["plugin", "plugin-opts", "plugin_opts"]
+        .into_iter()
+        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("proxy plugins are unsupported".into());
+    }
+    let tls_capable = matches!(
+        protocol,
+        NodeProtocol::Trojan
+            | NodeProtocol::VMess
+            | NodeProtocol::VLess
+            | NodeProtocol::Hysteria2
+            | NodeProtocol::Tuic
+            | NodeProtocol::Juicity
+            | NodeProtocol::AnyTLS
+    );
+    if !tls_capable
+        && [
+            "tls",
+            "servername",
+            "server-name",
+            "sni",
+            "skip-cert-verify",
+            "skip_cert_verify",
+            "insecure",
+            "pin-sha256",
+            "pin_sha256",
+            "reality-opts",
+        ]
+        .into_iter()
+        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("TLS settings are unsupported for this protocol".into());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+    ) && [
+        "ws-opts",
+        "ws-path",
+        "ws-host",
+        "ws-headers",
+        "grpc-opts",
+        "grpc-service",
+    ]
+    .into_iter()
+    .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("stream transport settings are unsupported for this protocol".into());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
+    ) && yaml_value(mapping, "network").is_some_and(yaml_active)
+    {
+        return Err("network settings are unsupported for this protocol".into());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+    ) && yaml_value(mapping, "flow").is_some_and(yaml_active)
+    {
+        return Err("VLESS flow is unsupported for this protocol".into());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::SS | NodeProtocol::VMess | NodeProtocol::VLess
+    ) && ["cipher", "encryption"]
+        .into_iter()
+        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("encryption settings are unsupported for this protocol".into());
+    }
+    if !matches!(protocol, NodeProtocol::VLess)
+        && [
+            "packet-encoding",
+            "packet_encoding",
+            "packet-addr",
+            "packet_addr",
+            "xudp",
+            "mux",
+            "smux",
+            "multiplex",
+            "udp-over-tcp",
+            "udp_over_tcp",
+        ]
+        .into_iter()
+        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("VLESS packet wrappers are unsupported for this protocol".into());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
+    ) && yaml_value(mapping, "udp").is_some_and(yaml_active)
+    {
+        return Err("UDP capability is unsupported for this protocol".into());
+    }
+    if !matches!(protocol, NodeProtocol::Hysteria2)
+        && [
+            "obfs",
+            "obfs-password",
+            "obfs_password",
+            "ports",
+            "mport",
+            "port-hopping",
+            "port_hopping",
+            "up",
+            "down",
+            "upload-bandwidth",
+            "download-bandwidth",
+            "up-speed",
+            "down-speed",
+            "up_mbps",
+            "down_mbps",
+            "hop-interval",
+            "hop_interval",
+            "mhop",
+        ]
+        .into_iter()
+        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("Hysteria2 options are unsupported for this protocol".into());
+    }
+    if !matches!(protocol, NodeProtocol::Hysteria2)
+        && [
+            "disable-mtu-discovery",
+            "disable-path-mtu-discovery",
+            "disablePathMTUDiscovery",
+        ]
+        .into_iter()
+        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("Hysteria2 MTU discovery options are unsupported".into());
+    }
+    if !matches!(
+        protocol,
+        NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+    ) && [
+        "mtu",
+        "quic-mtu",
+        "quic_mtu",
+        "initial-stream-receive-window",
+        "initial-conn-receive-window",
+        "init-stream-receive-window",
+        "init-conn-receive-window",
+        "init_stream_receive_window",
+        "init_conn_receive_window",
+        "initStreamReceiveWindow",
+        "initConnReceiveWindow",
+    ]
+    .into_iter()
+    .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+    {
+        return Err("QUIC options are unsupported for this protocol".into());
+    }
+    if protocol != NodeProtocol::Tuic && yaml_value(mapping, "alpn").is_some_and(yaml_active) {
+        return Err("TUIC ALPN is unsupported for this protocol".into());
+    }
+    if yaml_bool_alias(mapping, &["disable-sni", "disable_sni"])? == Some(true) {
+        return Err("disable-sni is unsupported".into());
+    }
+    if let Some(mode) = yaml_text_alias(mapping, &["udp-relay-mode", "udp_relay_mode"])?
+        && (!matches!(protocol, NodeProtocol::Tuic) || !matches!(mode.trim(), "" | "native"))
+    {
+        return Err("unsupported TUIC UDP relay mode".into());
+    }
+    let server = yaml_text_alias(mapping, &["server"])?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "proxy server is missing".to_string())?;
+    let port = yaml_u64_alias(mapping, &["port"])?
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| "proxy port is invalid".to_string())?;
+    let name = yaml_text_alias(mapping, &["name"])?.unwrap_or_else(|| "imported-node".into());
+    let udp = yaml_bool_alias(mapping, &["udp"])?;
+    let tls_explicit = yaml_bool_alias(mapping, &["tls"])?;
+    let mandatory_tls = matches!(
+        protocol,
+        NodeProtocol::Trojan
+            | NodeProtocol::Hysteria2
+            | NodeProtocol::Tuic
+            | NodeProtocol::Juicity
+            | NodeProtocol::AnyTLS
+    );
+    let tls_enabled = tls_explicit.unwrap_or(mandatory_tls);
+    if mandatory_tls && !tls_enabled {
+        return Err("this imported protocol requires TLS".into());
+    }
+    let vless_mode = if protocol == NodeProtocol::VLess {
+        parse_vless_external_mode(mapping)?
+    } else {
+        honk_config::node::WireMode::Legacy
+    };
+    let mut node = Node {
+        name,
+        address: format!("{server}:{port}"),
+        host: server,
+        port,
+        outbound: OutboundConfig::from_protocol(protocol),
+        subscription_id,
+        ..Default::default()
+    };
+    let username = yaml_text_alias(mapping, &["username"])?;
+    let password = yaml_text_alias(mapping, &["password"])?;
+    let cipher = yaml_text_alias(mapping, &["cipher"])?;
+    match &mut node.outbound {
+        OutboundConfig::Shadowsocks(config) => {
+            config.password = password;
+            config.encryption = cipher;
+        }
+        OutboundConfig::Socks5(config) => {
+            config.username = username;
+            config.password = password;
+        }
+        OutboundConfig::Trojan(config) => {
+            config.password = password;
+        }
+        OutboundConfig::Vmess(config) => {
+            config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
+            config.encryption = yaml_text_alias(mapping, &["encryption"])?.or(cipher);
+        }
+        OutboundConfig::Vless(config) => {
+            config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
+            config.encryption = yaml_text_alias(mapping, &["encryption"])?.or(cipher);
+            config.flow =
+                yaml_text_alias(mapping, &["flow"])?.filter(|flow| !flow.trim().is_empty());
+            config.mode = vless_mode;
+        }
+        OutboundConfig::Hysteria2(config) => {
+            config.auth = yaml_text_alias(mapping, &["auth"])?.or(password);
+            let obfs = yaml_text_alias(mapping, &["obfs"])?;
+            if let Some(obfs) = obfs {
+                if !obfs.eq_ignore_ascii_case("salamander") {
+                    return Err("unsupported Hysteria2 obfuscation algorithm".into());
+                }
+                config.obfs = yaml_text_alias(mapping, &["obfs-password", "obfs_password"])?
+                    .filter(|password| !password.trim().is_empty())
+                    .ok_or_else(|| "Hysteria2 salamander password is missing".to_string())
+                    .map(Some)?;
+            } else if yaml_value(mapping, "obfs-password").is_some()
+                || yaml_value(mapping, "obfs_password").is_some()
+            {
+                return Err("Hysteria2 obfs-password requires salamander".into());
+            }
+            config.up_mbps =
+                yaml_rate_alias(mapping, &["up", "upload-bandwidth", "up-speed", "up_mbps"])?;
+            config.down_mbps = yaml_rate_alias(
+                mapping,
+                &["down", "download-bandwidth", "down-speed", "down_mbps"],
+            )?;
+            let ports = yaml_alias(mapping, &["ports"])?
+                .map(|value| yaml_ports(value, "ports"))
+                .transpose()?
+                .flatten();
+            let mport = yaml_text_alias(mapping, &["mport", "port-hopping", "port_hopping"])?
+                .map(|value| value.replace(':', "-"));
+            if ports.is_some() && mport.is_some() {
+                return Err("Hysteria2 port hopping aliases conflict".into());
+            }
+            config.port_hopping = ports.or(mport);
+            config.hop_interval =
+                yaml_duration_alias(mapping, &["hop-interval", "hop_interval", "mhop"])?;
+            config.init_stream_recv_window = yaml_u64_alias(
+                mapping,
+                &[
+                    "initial-stream-receive-window",
+                    "init-stream-receive-window",
+                    "init_stream_receive_window",
+                    "initStreamReceiveWindow",
+                ],
+            )?;
+            config.init_conn_recv_window = yaml_u64_alias(
+                mapping,
+                &[
+                    "initial-conn-receive-window",
+                    "init-conn-receive-window",
+                    "init_conn_receive_window",
+                    "initConnReceiveWindow",
+                ],
+            )?;
+            config.disable_mtu_discovery = yaml_bool_alias(
+                mapping,
+                &[
+                    "disable-mtu-discovery",
+                    "disable-path-mtu-discovery",
+                    "disablePathMTUDiscovery",
+                ],
+            )?;
+        }
+        OutboundConfig::Tuic(config) => {
+            config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(username);
+            config.password = password;
+            config.congestion = yaml_text_alias(
+                mapping,
+                &[
+                    "congestion-controller",
+                    "congestion-control",
+                    "congestion_control",
+                    "congestion",
+                ],
+            )?;
+            config.alpn = yaml_list_alias(mapping, &["alpn"])?;
+            config.init_stream_recv_window = yaml_u64_alias(
+                mapping,
+                &[
+                    "initial-stream-receive-window",
+                    "init-stream-receive-window",
+                    "init_stream_receive_window",
+                    "initStreamReceiveWindow",
+                ],
+            )?;
+            config.init_conn_recv_window = yaml_u64_alias(
+                mapping,
+                &[
+                    "initial-conn-receive-window",
+                    "init-conn-receive-window",
+                    "init_conn_receive_window",
+                    "initConnReceiveWindow",
+                ],
+            )?;
+        }
+        OutboundConfig::Juicity(config) => {
+            config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(username);
+            config.password = password;
+        }
+        OutboundConfig::AnyTls(config) => {
+            config.password = password;
+            config.network = yaml_text_alias(mapping, &["anytls-network"])?;
+            config.min_idle_session =
+                yaml_u64_alias(mapping, &["min-idle-session", "min_idle_session"])?
+                    .map(|value| {
+                        usize::try_from(value).map_err(|_| "AnyTLS session count is too large")
+                    })
+                    .transpose()?;
+            config.idle_session_check_interval = yaml_duration_alias(
+                mapping,
+                &["idle-session-check-interval", "idle_session_check_interval"],
+            )?;
+            config.idle_session_timeout =
+                yaml_duration_alias(mapping, &["idle-session-timeout", "idle_session_timeout"])?;
+        }
+        OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
+    }
+
+    if let Some(network) = yaml_text_alias(mapping, &["network"])? {
+        if let Some(transport) = node.transport_mut() {
+            if !matches!(network.as_str(), "tcp" | "ws" | "grpc") {
+                return Err("unsupported stream transport".into());
+            }
+            transport.transport = network;
+        } else if let Some(config) = node.anytls_mut() {
+            if !matches!(network.as_str(), "tcp" | "udp") {
+                return Err("unsupported AnyTLS network".into());
+            }
+            config.network = Some(network);
+        }
+    }
+    if let Some(udp) = udp {
+        let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
+        match &mut node.outbound {
+            OutboundConfig::Trojan(config) => config.network = Some(network),
+            OutboundConfig::Vmess(config) => config.network = Some(network),
+            OutboundConfig::Vless(config) => config.network = Some(network),
+            OutboundConfig::AnyTls(config) => config.network = Some(network),
+            _ => {}
+        }
+    }
+    if let Some(transport) = node.transport() {
+        if transport.transport != "ws"
+            && ["ws-opts", "ws-path", "ws-host", "ws-headers"]
+                .into_iter()
+                .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+        {
+            return Err("websocket options require websocket transport".into());
+        }
+        if transport.transport != "grpc"
+            && ["grpc-opts", "grpc-service", "grpc_service"]
+                .into_iter()
+                .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+        {
+            return Err("gRPC options require gRPC transport".into());
+        }
+    }
+    if let Some(transport) = node.transport_mut() {
+        if let Some(options) = yaml_value(mapping, "ws-opts") {
+            let options = options
+                .as_mapping()
+                .ok_or_else(|| "ws-opts must be a mapping".to_string())?;
+            if transport.transport != "ws" && !options.is_empty() {
+                return Err("ws-opts require websocket transport".into());
+            }
+            transport.ws_path = yaml_text_alias(options, &["path"])?;
+            if let Some(headers) = yaml_value(options, "headers") {
+                let headers = headers
+                    .as_mapping()
+                    .ok_or_else(|| "ws-opts.headers must be a mapping".to_string())?;
+                for (key, value) in headers {
+                    let key = key
+                        .as_str()
+                        .ok_or_else(|| "websocket header name is invalid".to_string())?;
+                    if !key.eq_ignore_ascii_case("host")
+                        && !matches!(value, serde_yaml::Value::Null)
+                    {
+                        return Err("unsupported websocket header".into());
+                    }
+                }
+                transport.ws_host = headers.iter().find_map(|(key, value)| {
+                    key.as_str()
+                        .filter(|key| key.eq_ignore_ascii_case("host"))
+                        .and_then(|_| yaml_text(value, "websocket host").ok().flatten())
+                });
+            }
+        }
+        transport.ws_path = transport
+            .ws_path
+            .take()
+            .or(yaml_text_alias(mapping, &["ws-path"])?);
+        transport.ws_host = transport
+            .ws_host
+            .take()
+            .or(yaml_text_alias(mapping, &["ws-host", "ws-headers"])?);
+        if let Some(options) = yaml_value(mapping, "grpc-opts") {
+            let options = options
+                .as_mapping()
+                .ok_or_else(|| "grpc-opts must be a mapping".to_string())?;
+            if transport.transport != "grpc" && !options.is_empty() {
+                return Err("grpc-opts require gRPC transport".into());
+            }
+            transport.grpc_service =
+                yaml_text_alias(options, &["grpc-service-name", "grpc_service_name"])?;
+        }
+        transport.grpc_service = transport
+            .grpc_service
+            .take()
+            .or(yaml_text_alias(mapping, &["grpc-service", "grpc_service"])?);
+    }
+
+    if let Some(tls) = node.tls_mut() {
+        tls.enabled = tls_enabled;
+        tls.sni = yaml_text_alias(mapping, &["servername", "server-name"])?
+            .or(yaml_text_alias(mapping, &["sni"])?);
+        tls.skip_cert_verify = yaml_bool_alias(
+            mapping,
+            &["skip-cert-verify", "skip_cert_verify", "insecure"],
+        )?
+        .unwrap_or(false);
+        tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256"])?;
+    }
+    apply_reality(mapping, &mut node, protocol, tls_explicit)?;
+    if let Some(mtu) = yaml_u64_alias(mapping, &["mtu", "quic-mtu", "quic_mtu"])? {
+        let mtu = u16::try_from(mtu).map_err(|_| "QUIC MTU is invalid")?;
+        if !(1200..=65527).contains(&mtu) {
+            return Err("QUIC MTU is invalid".into());
+        }
+        match &mut node.outbound {
+            OutboundConfig::Hysteria2(config) => config.quic.mtu = Some(mtu),
+            OutboundConfig::Tuic(config) => config.quic.mtu = Some(mtu),
+            OutboundConfig::Juicity(config) => config.quic.mtu = Some(mtu),
+            _ => {}
+        }
+    }
+    validate_imported_node(&node)?;
+    if let Err(_error) = node.validate_protocol() {
+        return Err("invalid imported node protocol settings".into());
+    }
+    node.id = node.derive_id();
+    Ok(Some(node))
+}
+
+fn parse_clash_proxies(
+    proxies: &[serde_yaml::Value],
     subscription_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<Vec<Node>> {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(content)?;
-    let proxies = yaml
-        .get("proxies")
-        .and_then(serde_yaml::Value::as_sequence)
-        .ok_or_else(|| anyhow::anyhow!("no 'proxies' array found in Clash YAML"))?;
     let mut nodes = Vec::new();
-
     for proxy in proxies {
         let Some(mapping) = proxy.as_mapping() else {
             continue;
         };
-        let get_value = |key: &str| mapping.get(serde_yaml::Value::String(key.to_string()));
-        let get_str = |key: &str| {
-            get_value(key)
-                .and_then(serde_yaml::Value::as_str)
-                .map(str::to_string)
-        };
-        let get_u16 = |key: &str| {
-            get_value(key)
-                .and_then(serde_yaml::Value::as_u64)
-                .and_then(|number| u16::try_from(number).ok())
-        };
-        let get_nested_str = |section: &str, key: &str| {
-            get_value(section)
-                .and_then(serde_yaml::Value::as_mapping)
-                .and_then(|nested| nested.get(serde_yaml::Value::String(key.to_string())))
-                .and_then(serde_yaml::Value::as_str)
-                .map(str::to_string)
-        };
-
-        let Some(proxy_type) = get_str("type") else {
-            continue;
-        };
-        let protocol = match proxy_type.to_lowercase().as_str() {
-            "socks5" => NodeProtocol::Socks5,
-            "ss" | "shadowsocks" => NodeProtocol::SS,
-            "trojan" => NodeProtocol::Trojan,
-            "vmess" => NodeProtocol::VMess,
-            "vless" => NodeProtocol::VLess,
-            "hysteria2" | "hysteria" => NodeProtocol::Hysteria2,
-            "tuic" => NodeProtocol::Tuic,
-            "juicity" => NodeProtocol::Juicity,
-            "anytls" => NodeProtocol::AnyTLS,
-            _ => {
-                tracing::warn!("skipping unsupported Clash proxy type: {}", proxy_type);
-                continue;
-            }
-        };
-        let Some(server) = get_str("server") else {
-            continue;
-        };
-        let Some(port) = get_u16("port") else {
-            continue;
-        };
-        let name = get_str("name").unwrap_or_else(|| format!("{proxy_type}-{server}:{port}"));
-        let plugin_configured = ["plugin", "plugin-opts"].into_iter().any(|key| {
-            get_value(key).is_some_and(|value| match value {
-                serde_yaml::Value::Null => false,
-                serde_yaml::Value::String(value) => !value.trim().is_empty(),
-                serde_yaml::Value::Sequence(value) => !value.is_empty(),
-                serde_yaml::Value::Mapping(value) => !value.is_empty(),
-                _ => true,
-            })
-        });
-        if plugin_configured {
-            tracing::warn!(
-                node = %name,
-                "skipping Clash node with unsupported proxy plugin"
-            );
-            continue;
-        }
-        let address = format!("{server}:{port}");
-        let vless_mode = if protocol == NodeProtocol::VLess {
-            match parse_vless_external_mode(mapping) {
-                Ok(mode) => mode,
-                Err(error) => {
-                    tracing::warn!(node = %name, reason = %error, "skipping unsupported VLESS node");
-                    continue;
-                }
-            }
-        } else {
-            honk_config::node::WireMode::Legacy
-        };
-        let mut node = Node {
-            name,
-            address,
-            host: server,
-            port,
-            outbound: OutboundConfig::from_protocol(protocol),
-            ..Default::default()
-        };
-
-        let username = get_str("username");
-        let password = get_str("password");
-        let cipher = get_str("cipher");
-        match &mut node.outbound {
-            OutboundConfig::Shadowsocks(config) => {
-                config.password = password;
-                config.encryption = cipher;
-            }
-            OutboundConfig::Socks5(config) => {
-                config.username = username;
-                config.password = password;
-            }
-            OutboundConfig::Trojan(config) => config.password = password,
-            OutboundConfig::Vmess(config) => {
-                config.uuid = get_str("uuid").or(password);
-                config.encryption = cipher;
-            }
-            OutboundConfig::Vless(config) => {
-                config.uuid = get_str("uuid").or(password);
-                config.encryption = get_str("encryption").or(cipher);
-                config.flow = get_str("flow").filter(|flow| !flow.is_empty());
-                config.mode = vless_mode;
-            }
-            OutboundConfig::Hysteria2(config) => {
-                config.auth = get_str("auth").or(password);
-            }
-            OutboundConfig::Tuic(config) => {
-                config.uuid = get_str("uuid").or(username);
-                config.password = password;
-            }
-            OutboundConfig::Juicity(config) => {
-                config.uuid = get_str("uuid").or(username);
-                config.password = password;
-            }
-            OutboundConfig::AnyTls(config) => config.password = password,
-            OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
-        }
-
-        if let Some(network) = get_str("network")
-            && let Some(transport) = node.transport_mut()
-        {
-            transport.transport = network;
-        }
-        if let Some(transport) = node.transport_mut() {
-            transport.ws_path = get_nested_str("ws-opts", "path").or_else(|| get_str("ws-path"));
-            transport.ws_host = get_value("ws-opts")
-                .and_then(serde_yaml::Value::as_mapping)
-                .and_then(|options| {
-                    options
-                        .get(serde_yaml::Value::String("headers".to_string()))
-                        .and_then(serde_yaml::Value::as_mapping)
-                })
-                .and_then(|headers| {
-                    headers.iter().find_map(|(key, value)| {
-                        key.as_str()
-                            .filter(|key| key.eq_ignore_ascii_case("host"))
-                            .and_then(|_| value.as_str())
-                            .map(str::to_string)
-                    })
-                })
-                .or_else(|| get_str("ws-headers"))
-                .or_else(|| get_str("ws-host"));
-            transport.grpc_service = get_nested_str("grpc-opts", "grpc-service-name")
-                .or_else(|| get_str("grpc-service"));
-        }
-
-        if let Some(tls_options) = node.tls_mut() {
-            if let Some(enabled) = get_value("tls").and_then(serde_yaml::Value::as_bool) {
-                tls_options.enabled = enabled;
-            }
-            tls_options.sni = get_str("servername").or_else(|| get_str("sni"));
-            if let Some(skip) = get_value("skip-cert-verify").and_then(serde_yaml::Value::as_bool) {
-                tls_options.skip_cert_verify = skip;
+        match parse_clash_proxy(mapping, subscription_id) {
+            Ok(Some(node)) => nodes.push(node),
+            Ok(None) | Err(_) => {
+                tracing::warn!("skipping unsupported or malformed subscription proxy");
             }
         }
-
-        if protocol == NodeProtocol::VLess
-            && let Some(reality_value) = get_value("reality-opts")
-        {
-            let Some(reality) = reality_value.as_mapping() else {
-                tracing::warn!("skipping VLESS Clash node with incomplete reality-opts");
-                continue;
-            };
-            let nested = |key: &str| {
-                reality
-                    .get(serde_yaml::Value::String(key.to_string()))
-                    .and_then(serde_yaml::Value::as_str)
-                    .map(str::to_string)
-            };
-            let Some(public_key) = nested("public-key").filter(|value| !value.trim().is_empty())
-            else {
-                tracing::warn!("skipping VLESS Clash node with incomplete reality-opts");
-                continue;
-            };
-            let tls = &mut node.vless_mut().unwrap().tls;
-            tls.reality_public_key = Some(public_key);
-            tls.reality_short_id = nested("short-id");
-            tls.reality_spider_x = Some(
-                nested("spider-x")
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "/".to_string()),
-            );
-            tls.enabled = true;
-        }
-        if let Err(error) = node.validate_protocol() {
-            tracing::warn!(node = %node.name, reason = %error, "skipping unsupported VLESS node");
-            continue;
-        }
-
-        node.subscription_id = subscription_id;
-        node.id = node.derive_id();
-        nodes.push(node);
     }
-
     if nodes.is_empty() {
         anyhow::bail!("no supported proxies found in Clash subscription");
     }
     Ok(nodes)
+}
+
+fn parse_clash_subscription(
+    content: &str,
+    subscription_id: Option<uuid::Uuid>,
+) -> anyhow::Result<Vec<Node>> {
+    let yaml = parse_structured_value(content)?;
+    let proxies = yaml
+        .get("proxies")
+        .and_then(serde_yaml::Value::as_sequence)
+        .ok_or_else(|| anyhow::anyhow!("no 'proxies' array found in Clash YAML"))?;
+    parse_clash_proxies(proxies, subscription_id)
 }
 
 /// Parse a single node share link via the unified parser in honk-config.
@@ -1071,16 +1816,93 @@ mod tests {
         let result = parse_base64_subscription(&encoded, None, "test");
         assert!(result.is_err());
     }
+
     #[test]
-    fn test_parse_subscription_rejects_duplicate_only_simple_payload() {
+    fn subscription_normalizes_bom_and_urlsafe_wrapped_base64() {
         let sub = Subscription {
             sub_type: SubscriptionType::Simple,
             ..Default::default()
         };
-        let uri = "socks5://127.0.0.1:1080#same";
-        let content = format!("{uri}\n{uri}");
-        let error = parse_subscription_content(&sub, &content).unwrap_err();
-        assert!(error.to_string().contains("duplicate endpoint identities"));
+        let uri = "socks5://127.0.0.1:1080#wrapped";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(uri);
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(7)
+            .map(std::str::from_utf8)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" \n");
+        let nodes = parse_subscription_content(&sub, &format!("\u{feff}{wrapped}")).unwrap();
+        assert_eq!(nodes[0].name, "wrapped");
+    }
+
+    #[test]
+    fn simple_and_custom_detect_structured_bodies_without_fallback() {
+        let yaml =
+            "proxies:\n  - type: socks5\n    server: 127.0.0.1\n    port: 1080\n    name: yaml\n";
+        let simple = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_subscription_content(&simple, yaml).unwrap()[0].name,
+            "yaml"
+        );
+
+        let custom = Subscription {
+            sub_type: SubscriptionType::Custom,
+            ..Default::default()
+        };
+        let json = r#"{"outbounds":[{"type":"socks","tag":"json","server":"127.0.0.1","server_port":1081}]}"#;
+        assert_eq!(
+            parse_subscription_content(&custom, json).unwrap()[0].name,
+            "json"
+        );
+        assert!(parse_subscription_content(&simple, r#"{"unknown":"wrapper"}"#).is_err());
+        assert!(
+            parse_subscription_content(
+                &simple,
+                "{\"outbounds\":[\ntrojan://secret@example.com:443#not-json",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_sip008_uses_server_schema_not_uri_parser() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Sip008,
+            ..Default::default()
+        };
+        let body = r#"{"servers":[{"server":"ss.example","server_port":8388,"method":"aes-128-gcm","password":"secret","remarks":"sip"}]}"#;
+        let nodes = parse_subscription_content(&sub, body).unwrap();
+        assert_eq!(nodes[0].name, "sip");
+        assert_eq!(nodes[0].protocol(), NodeProtocol::SS);
+    }
+
+    #[test]
+    fn json_subscription_names_accept_utf16_surrogate_pairs() {
+        for (sub_type, body) in [
+            (
+                SubscriptionType::Simple,
+                r#"{"outbounds":[{"type":"socks","tag":"node-\ud83d\ude00","server":"127.0.0.1","server_port":1080}]}"#,
+            ),
+            (
+                SubscriptionType::Clash,
+                r#"{"proxies":[{"type":"socks5","name":"node-\ud83d\ude00","server":"127.0.0.1","port":1080}]}"#,
+            ),
+            (
+                SubscriptionType::Sip008,
+                r#"{"servers":[{"remarks":"node-\ud83d\ude00","server":"127.0.0.1","server_port":8388,"method":"aes-128-gcm","password":"fixture"}]}"#,
+            ),
+        ] {
+            let sub = Subscription {
+                sub_type,
+                ..Default::default()
+            };
+            let nodes = parse_subscription_content(&sub, body).unwrap();
+            assert_eq!(nodes[0].name, "node-\u{1f600}");
+        }
     }
 
     #[test]
@@ -1091,33 +1913,11 @@ mod tests {
         };
         let content = concat!(
             "socks5://127.0.0.1:1080#same\n",
-            "socks5://127.0.0.1:1080#same-again\n",
-            "socks5://127.0.0.1:1081#unique"
+            "socks5://127.0.0.1:1080#same-again"
         );
         let nodes = parse_subscription_content(&sub, content).unwrap();
-        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "same");
-        assert_eq!(nodes[1].name, "unique");
-    }
-
-    #[test]
-    fn test_parse_subscription_rejects_duplicate_only_clash_payload() {
-        let sub = Subscription {
-            sub_type: SubscriptionType::Clash,
-            ..Default::default()
-        };
-        let yaml = r#"proxies:
-  - name: first
-    type: socks5
-    server: 127.0.0.1
-    port: 1080
-  - name: second
-    type: socks5
-    server: 127.0.0.1
-    port: 1080
-"#;
-        let error = parse_subscription_content(&sub, yaml).unwrap_err();
-        assert!(error.to_string().contains("duplicate endpoint identities"));
     }
 
     #[test]
@@ -1193,6 +1993,89 @@ proxies:
             Some("aes-256-gcm".to_string())
         );
     }
+
+    #[test]
+    fn imported_tls_required_protocols_and_quic_options_are_preserved() {
+        let implicit = r#"proxies:
+  - name: implicit-trojan
+    type: trojan
+    server: trojan.example
+    port: 443
+    password: trojan-secret
+"#;
+        let node = parse_clash_subscription(implicit, None).unwrap().remove(0);
+        assert!(node.trojan().unwrap().tls.enabled);
+        assert!(
+            parse_clash_subscription(
+                &implicit.replace(
+                    "password: trojan-secret",
+                    "password: trojan-secret\n    tls: false"
+                ),
+                None
+            )
+            .is_err()
+        );
+
+        let yaml = r#"proxies:
+  - name: hy2
+    type: hysteria2
+    server: hy2.example
+    port: 443
+    password: hy2-secret
+    obfs: salamander
+    obfs-password: obfs-secret
+    up: 100 Mbps
+    down-speed: 50 Mbps
+    ports: ["4000:5000", 6000]
+    hop-interval: 7s
+    initial-stream-receive-window: 1234
+    initial-conn-receive-window: 5678
+    disable-mtu-discovery: true
+    mtu: 1400
+  - name: tuic
+    type: tuic
+    server: tuic.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    password: tuic-secret
+    congestion-controller: bbr
+    alpn: [h3, hq-29]
+    initial-stream-receive-window: 2345
+    initial-conn-receive-window: 6789
+    mtu: 1450
+  - name: anytls
+    type: anytls
+    server: anytls.example
+    port: 443
+    password: anytls-secret
+    min-idle-session: 4
+    idle-session-check-interval: 30s
+    idle-session-timeout: 1m
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        let hy2 = nodes[0].hysteria2().unwrap();
+        assert_eq!(hy2.obfs.as_deref(), Some("obfs-secret"));
+        assert_eq!(hy2.up_mbps, Some(100));
+        assert_eq!(hy2.down_mbps, Some(50));
+        assert_eq!(hy2.port_hopping.as_deref(), Some("4000-5000,6000"));
+        assert_eq!(hy2.hop_interval, Some(7));
+        assert_eq!(hy2.init_stream_recv_window, Some(1234));
+        assert_eq!(hy2.init_conn_recv_window, Some(5678));
+        assert_eq!(hy2.quic.mtu, Some(1400));
+        assert!(hy2.quic.tls.enabled);
+        let tuic = nodes[1].tuic().unwrap();
+        assert_eq!(tuic.congestion.as_deref(), Some("bbr"));
+        assert_eq!(tuic.alpn.as_deref(), Some("h3,hq-29"));
+        assert_eq!(tuic.init_stream_recv_window, Some(2345));
+        assert_eq!(tuic.init_conn_recv_window, Some(6789));
+        assert_eq!(tuic.quic.mtu, Some(1450));
+        assert!(tuic.quic.tls.enabled);
+        let anytls = nodes[2].anytls().unwrap();
+        assert_eq!(anytls.min_idle_session, Some(4));
+        assert_eq!(anytls.idle_session_check_interval, Some(30));
+        assert_eq!(anytls.idle_session_timeout, Some(60));
+        assert!(anytls.tls.enabled);
+    }
     #[test]
     fn test_parse_clash_vless_nested_fields() {
         let subscription_id = uuid::Uuid::new_v4();
@@ -1251,7 +2134,7 @@ proxies:
 "#;
 
         let nodes = parse_clash_subscription(yaml, Some(subscription_id)).unwrap();
-        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes.len(), 3);
 
         let reality = &nodes[0];
         assert_eq!(reality.protocol(), NodeProtocol::VLess);
@@ -1291,7 +2174,6 @@ proxies:
             Some("nested-service")
         );
 
-        assert_eq!(nodes[3].vless().unwrap().uuid, None);
         for node in &nodes {
             assert_eq!(node.subscription_id, Some(subscription_id));
             assert_eq!(node.id, node.derive_id());
@@ -1393,7 +2275,8 @@ proxies:
             ("xudp: true", WireMode::Xudp),
             ("xudp: false", WireMode::Legacy),
             ("udp: true\nxudp: true", WireMode::Xudp),
-            ("udp: false", WireMode::Legacy),
+            ("udp: true", WireMode::Xudp),
+            ("udp: true\npacket-encoding: ''", WireMode::Xudp),
             (
                 "multiplex: { enabled: true, protocol: '', padding: false }",
                 WireMode::H2mux,
@@ -1410,6 +2293,23 @@ proxies:
                 "{options}"
             );
         }
+    }
+
+    #[test]
+    fn clash_vless_udp_defaults_to_xudp() {
+        let yaml = r#"proxies:
+  - name: ordinary
+    type: vless
+    server: vless.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    udp: true
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(
+            nodes[0].vless().unwrap().mode,
+            honk_config::node::WireMode::Xudp
+        );
     }
 
     #[test]
@@ -1437,8 +2337,6 @@ proxies:
             "smux: { enabled: true, min-streams: 1 }",
             "smux: { enabled: true, max-streams: 128 }",
             "smux: { enabled: true }\nudp-over-tcp: true",
-            "udp: true",
-            "udp: true\npacket-encoding: ''",
             "udp: false\nxudp: true",
         ] {
             let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();

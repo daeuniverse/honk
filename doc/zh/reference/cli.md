@@ -21,7 +21,9 @@ honk-core [OPTIONS] [COMMAND]
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |
 | `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录 warning 并仅在本进程关闭 NFQUEUE 暂存。 |
 
-Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
+两个二进制都提供 `-h`/`--help` 和 `-v`/`--version`。
+
+CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名；本地 Git 构建使用 `git describe --tags --always --match 'v*'`（tag，或最近 tag 加提交距离与哈希）。没有可用 Git 元数据时使用 Cargo 包版本。运行时不依赖 Git。
 
 ### 日志级别优先级
 
@@ -109,7 +111,7 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool root@GATEWAY:/tmp/
 | `geosite` | 列出、检查和反向搜索 `geosite.dat`。 |
 | `geoip` | 列出、检查和最长前缀搜索 `geoip.dat`。 |
 
-Clap 为二进制提供 `-h`/`--help` 和 `-V`/`--version`，每个命令族与 action 也有帮助信息。
+二进制提供 `-h`/`--help` 和 `-v`/`--version`，每个命令族与 action 也有帮助信息。构建版本与 `honk-core` 一致。
 
 ### `sub`
 
@@ -122,7 +124,7 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `<url\|file\|->` | 必填 | HTTP(S) 订阅 URL、每行一个分享链接的已有本地文件，或 `-`。`-` 从 stdin 读取且只接受一个 HTTP(S) 订阅 URL；不会从 stdin 读取分享链接行。 |
+| `<url\|file\|->` | 必填 | HTTP(S) 订阅 URL、已有本地订阅文件，或 `-`。`-` 从 stdin 读取且只接受一个 HTTP(S) 订阅 URL；不会从 stdin 读取订阅正文。 |
 | `--target HOST:PORT` | `cp.cloudflare.com:443` | 地址族连通性探测与 QUIC 探测使用的主机。 |
 | `--url TEST_URL` | `https://www.gstatic.com/generate_204` | 经代理的 URLTest 目标。 |
 | `--timeout SECS` | `5` | 每项探测的超时。 |
@@ -134,7 +136,7 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | `--v4-target IP:PORT` | `1.1.1.1:443` | v4 连通性探测使用的显式 IPv4 地址。 |
 | `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | v6 连通性探测使用的显式 IPv6 地址。 |
 
-远程订阅使用引擎的订阅解析器，包括其支持的编码、原始行和 Clash feed。已有本地文件按分享链接解析，忽略空行与 `#` 注释；无效行只计数，绝不打印。使用 `-` 可避免把含凭据的 provider URL 放入 argv 和进程列表。
+远程订阅与本地文件共享引擎的自动格式识别：编码/原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及受支持的 Surge/Surfboard/Loon/Quantumult X 记录。不支持的节点会被跳过，不打印原始输入。使用 `-` 可避免把含凭据的 provider URL 放入 argv 和进程列表。
 
 对每个节点，命令报告服务端地址族、完整的代理 IPv4/IPv6 交换、代理 URLTest 延迟、经 packet handler 的 DNS 查询，以及经该 handler 的真实 QUIC 握手。VMess、legacy VLESS 及 `network` 排除 UDP 的节点，其 UDP 显示 `n/a`；非 legacy VLESS 模式使用其配置的 packet transport。
 

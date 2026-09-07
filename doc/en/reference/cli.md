@@ -21,7 +21,9 @@ honk-core [OPTIONS] [COMMAND]
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
 | `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
 
-Clap also provides `-h`/`--help` and `-V`/`--version`.
+Both binaries provide `-h`/`--help` and `-v`/`--version`.
+
+The CLI and Clash API share a build-time version: release builds use the GitHub tag name; local Git builds use `git describe --tags --always --match 'v*'` (the tag, or the nearest tag plus commit distance and hash). Without usable Git metadata, the Cargo package version is used. Git is not required at runtime.
 
 ### Log-level precedence
 
@@ -109,7 +111,7 @@ The current `just build-musl` and `just deploy-vyos` recipes build and deploy on
 | `geosite` | List, inspect, and reverse-search `geosite.dat`. |
 | `geoip` | List, inspect, and longest-prefix search `geoip.dat`. |
 
-Clap provides `-h`/`--help` and `-V`/`--version` for the binary, with help on every command family and action.
+The binary provides `-h`/`--help` and `-v`/`--version`, with help on every command family and action. Its build version matches `honk-core`.
 
 ### `sub`
 
@@ -122,7 +124,7 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 
 | Argument / option | Default | Meaning |
 | --- | --- | --- |
-| `<url\|file\|->` | Required | HTTP(S) subscription URL, an existing local file containing one share link per line, or `-`. `-` reads exactly one HTTP(S) subscription URL from stdin; it does not read share-link lines from stdin. |
+| `<url\|file\|->` | Required | HTTP(S) subscription URL, an existing local subscription file, or `-`. `-` reads exactly one HTTP(S) subscription URL from stdin; it does not read a subscription body from stdin. |
 | `--target HOST:PORT` | `cp.cloudflare.com:443` | Host used by the family connectivity probes and QUIC probe. |
 | `--url TEST_URL` | `https://www.gstatic.com/generate_204` | Proxied URLTest target. |
 | `--timeout SECS` | `5` | Per-probe timeout. |
@@ -134,7 +136,7 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | `--v4-target IP:PORT` | `1.1.1.1:443` | Explicit IPv4 address for the v4 connectivity probe. |
 | `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | Explicit IPv6 address for the v6 connectivity probe. |
 
-Remote subscriptions use the engine's subscription parser, including supported encoded/raw/Clash feeds. Existing local files are parsed as share links, ignoring blank lines and `#` comments; invalid lines are counted but never printed. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
+Remote subscriptions and local files share the engine's automatic format detection: encoded/raw share links, Clash YAML/JSON, SIP008, sing-box JSON, and supported Surge/Surfboard/Loon/Quantumult X records. Unsupported nodes are skipped without printing their raw input. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
 
 For each node, the command reports server address families, full proxied IPv4 and IPv6 exchanges, proxied URLTest latency, a DNS query through the packet handler, and a real QUIC handshake through that handler. VMess, legacy VLESS, and nodes whose `network` excludes UDP show `n/a` for UDP; non-legacy VLESS modes use their configured packet transport.
 

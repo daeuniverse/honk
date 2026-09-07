@@ -142,7 +142,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         pool_ready_streams: never,
         pool_bare_tcp: never,
         generation_runtime: quic_runtime,
-        share_link_schemes: &["hysteria2", "hysteria"],
+        share_link_schemes: &["hysteria2", "hysteria", "hy2"],
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Tuic,

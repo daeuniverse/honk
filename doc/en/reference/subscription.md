@@ -20,7 +20,7 @@ subscription {
 
 The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append `(UA)` after a quoted URL to override it. The block form accepts `url`, optional `ua`, and optional `interval`; `interval` is a duration and defaults to `86400s`. Set it to `0` to disable periodic refresh.
 
-The URL may otherwise be single-quoted or bare, but ordinary HTTP(S) URLs must have a tag because the parser dispatches on the first `:`. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`; dae subscriptions do not auto-detect Clash YAML.
+The URL may otherwise be single-quoted or bare, but ordinary HTTP(S) URLs must have a tag because the parser dispatches on the first `:`. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
 ## Internal model
 
@@ -42,12 +42,12 @@ The internal body-selector behavior is:
 
 | `sub_type` | Parser behavior |
 | --- | --- |
-| `simple` | Standard-Base64 or plain-text share-link list. |
-| `clash` | Clash YAML with a top-level `proxies` sequence. |
-| `sip008` | Currently uses the same share-link-list parser as `simple`. |
-| `custom` | Tries `simple`, then Clash YAML. |
+| `simple` | Detects share-link lists, Clash YAML/JSON, SIP008, sing-box JSON, and supported client records. |
+| `clash` | YAML or JSON with a top-level `proxies` sequence. |
+| `sip008` | SIP008 `servers` objects or a bare server array; not a share-link list. |
+| `custom` | The same format detection as `simple`. |
 
-`honk-tool sub` uses `custom` for a fetched URL; dae entries remain `simple`.
+`honk-tool sub` uses the same parser for downloaded bodies and local files.
 
 ## Fetch, persistence, and recovery
 
@@ -73,17 +73,17 @@ Failure handling preserves a usable runtime rather than clearing it:
 
 - HTTP, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
-- An individual unsupported share link or Clash proxy is skipped. The whole body fails only when no supported nodes remain; an empty result never clears the previous generation.
+- An unsupported or malformed node is skipped individually. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
 
 Changing `global.store_subscribe` through SIGHUP is rejected as restart-required.
 
 ## Subscription body formats
 
-All accepted nodes receive the subscription ID. After parsing, duplicate derived node IDs are discarded with the first occurrence retained. A body whose supported entries all collapse to one duplicated identity is rejected rather than replacing the active subscription.
+All accepted nodes receive the subscription ID. Duplicate derived node IDs retain the first occurrence, including a body that repeats one usable endpoint. Importing a full client profile extracts its nodes, not its DNS, routing, groups, or remote-provider configuration.
 
-### `simple`
+### Share-link lists
 
-A `simple` body is either standard Base64 (padding optional) containing one share link per line, or the plain-text list itself:
+A list can be plain text or standard/URL-safe Base64, with optional padding and ASCII whitespace between encoded chunks. A leading UTF-8 BOM is accepted in raw and decoded bodies. Each line contains one share link:
 
 ```text
 # blank lines and comments are ignored
@@ -91,28 +91,32 @@ socks5://user:password@127.0.0.1:1080#local
 vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 ```
 
-Each non-comment line is parsed by `Node::from_share_link`. Unsupported or malformed lines are skipped. Share links with a non-empty proxy plugin are also skipped because honk does not execute plugins. The body is rejected when it contains no supported node URI. See the [node reference](./nodes.md) for canonical share-link fields and protocols.
+Blank lines, comments, and Shadowrocket `REMARKS=` / `STATUS=` metadata lines are ignored without node warnings. Every remaining line is parsed by `Node::from_share_link`; unsupported or malformed lines are skipped with a warning. Share links with a non-empty proxy plugin are also skipped because honk does not execute plugins. The body is rejected when it contains no supported node URI, including metadata-only bodies. See the [node reference](./nodes.md) for canonical share-link fields and protocols.
 
-### Clash YAML
+### Clash YAML and JSON
 
-A Clash body must contain a top-level `proxies` sequence. Non-mapping entries, entries without a string `type` or `server`, entries without an integer `port` fitting `u16`, and unsupported proxy types are skipped.
+A full profile or provider payload must contain a top-level `proxies` sequence. Entries without a supported `type`, server address, valid nonzero port, or required credentials are skipped. Ports may be integers or numeric strings. JSON is decoded natively, including UTF-16 surrogate-pair escapes in display names.
 
-Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vless`, `hysteria2`/`hysteria`, `tuic`, `juicity`, and `anytls`. The importer maps only the fields documented below; unrelated Clash keys are ignored unless listed as VLESS rejection inputs.
+Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vless`, `hysteria2`/`hysteria`, `tuic`, `juicity`, and `anytls`. Unrelated client metadata is ignored; unsupported wire transports, proxy plugins, and contradictory security settings are not silently reinterpreted.
 
 #### Common proxy fields
 
 | Clash field | Internal field | Rule |
 | --- | --- | --- |
 | `name` | `name` | Defaults to `<type>-<server>:<port>`. |
-| `server`, `port` | `host`, `port`, `address` | Required as a string and integer respectively. |
+| `server`, `port` | `host`, `port`, `address` | Required address and nonzero `u16` port; numeric port strings are accepted. |
 | `username` | `username` | Optional string. |
 | `password` | `password` | Optional string; VLESS applies the precedence below. |
 | `cipher` | `encryption` | Optional string; VLESS applies the precedence below. |
 | `plugin`, `plugin-opts` | — | Unsupported. An entry with either non-empty value is skipped before node publication; mapping-valued options are rejected too. |
 | `network` | `transport` | Optional transport string. |
-| `tls` | `tls` | Optional boolean. |
+| `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `sni` | `sni` | `servername` wins; `sni` is the fallback. |
 | `skip-cert-verify` | `skip_cert_verify` | Optional boolean. |
+
+#### Protocol-specific options
+
+Hysteria2 imports `password`/`auth`, `obfs: salamander` with `obfs-password`, upload/download bandwidth, `ports`/`mport` hopping ranges, `hop-interval`/`mhop`, receive windows, MTU, and MTU-discovery settings. TUIC imports UUID/password, congestion control, ALPN, receive windows, and MTU. AnyTLS imports `idle-session-check-interval`, `idle-session-timeout`, and `min-idle-session`. Supported spelling aliases are normalized before node identity is derived.
 
 #### VLESS transport and REALITY
 
@@ -138,12 +142,13 @@ Nested WS/gRPC values take precedence over their flat aliases. If `reality-opts`
 
 | Clash representation | Normalized mode | Conditions |
 | --- | --- | --- |
-| No enabled packet/multiplex option | `legacy` | Disabled blocks and `xudp: false` do not select a mode. |
+| No enabled packet/multiplex option and no `udp: true` | `legacy` | Disabled blocks and `xudp: false` do not select a mode. |
 | `smux` or `multiplex` with `enabled: true` | `h2mux` or `h2mux-padded` | Requires `protocol: h2mux` or an explicit boolean `padding`. `padding: true` selects `h2mux-padded`; otherwise `h2mux`. |
 | `udp-over-tcp: true` | `uot-v2` | Boolean shorthand. |
 | `udp-over-tcp: { enabled: true, version: 0|2 }` | `uot-v2` | Missing `version` is treated as `0`; `_` aliases are also accepted. |
 | `packet-encoding: xudp` | `xudp` | `packet_encoding` is the flat alias. |
 | `xudp: true` | `xudp` | Boolean shorthand. |
+| `udp: true` without another packet declaration | `xudp` | Matches the common Clash VLESS UDP default; an explicit mode takes precedence. |
 | Canonical share-link `vless_mode=mux-cool` | `mux-cool` | `mux-cool` is not accepted through Clash packet/mux aliases. |
 
 A VLESS Clash entry is rejected for any of these conditions:
@@ -154,22 +159,34 @@ A VLESS Clash entry is rejected for any of these conditions:
 - an enabled `smux`/`multiplex` block with neither `protocol: h2mux` nor an explicit `padding` boolean;
 - a multiplex protocol other than `h2mux`, `only-tcp: true`, enabled Brutal settings, or non-zero `max-connections`, `min-streams`, or `max-streams` tuning;
 - `udp-over-tcp` version other than `0` or `2`;
-- `udp: true` without an explicit non-legacy packet mode, or `udp: false` with a non-legacy mode;
+- `udp: true` contradicting an explicitly disabled packet mode, or `udp: false` with a non-legacy mode;
 - a packet encoding other than empty or `xudp`, including packetaddr and `mux-cool` aliases;
 - a non-legacy mode combined with VLESS Encryption, or with `flow` other than the supported `xudp` + `xtls-rprx-vision` combination.
 
 Canonical VLESS share links use `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. Ambiguous third-party share-link keys such as `smux`, `udp-over-tcp`, and `packet-encoding` are rejected rather than guessed.
 
+### SIP008 and sing-box JSON
+
+SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. Empty plugin fields are harmless; active plugins remain unsupported.
+
+sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet modes, and supported protocol tuning are normalized through the common node builder. A VLESS outbound defaults to XUDP unless it explicitly selects TCP-only or no packet encoding. Unsupported chaining, wire features, and authentication requirements are not silently dropped. Per-node uTLS fingerprint hints do not override honk's process-wide TLS settings.
+
+### Surge, Surfboard, Loon, and Quantumult X
+
+The importer accepts named comma-separated records from Surge/Surfboard/Loon and `protocol=endpoint,...,tag=name` records from Quantumult X. Full profiles use `[Proxy]` or `[server_local]`; other sections are ignored. Quoted names/passwords may contain commas, equals signs, escaped quotes, and intentional edge spaces.
+
+Supported records map credentials, TLS/SNI, WebSocket/gRPC, REALITY, and implemented protocol options to the same node model. Quantumult X `obfs=wss` uses `obfs-host` for both WebSocket Host and the default TLS SNI; an explicit TLS hostname wins. SSR, unsupported plugins/obfuscation, and unsupported transports are skipped rather than imported as another protocol.
+
 ## Offline parsing and probes
 
-`honk-tool sub` accepts a fetched subscription URL or a local file containing one share link per line. A local file avoids the subscription download and is useful for offline parsing, but the command then performs its configured connectivity and latency probes:
+`honk-tool sub` accepts a fetched subscription URL or a local file in any supported body format. A local file avoids the subscription download and is useful for offline parsing, but the command then performs its configured connectivity and latency probes:
 
 ```console
 honk-tool sub ./share-links.txt --limit 10
 honk-tool sub https://example.com/sub --ua honk-tool
 ```
 
-For a fetched URL, the tool uses `custom`, so it tries the simple list and then Clash YAML. Passing `-` reads one HTTP(S) subscription URL from standard input; it does not read a subscription body from standard input. See the [CLI reference](./cli.md) for probe flags and output.
+Downloaded bodies and local files use the same automatic detection. Passing `-` reads one HTTP(S) subscription URL from standard input; it does not read a subscription body from standard input. See the [CLI reference](./cli.md) for probe flags and output.
 
 ## Related docs
 

@@ -644,6 +644,22 @@ fn test_hysteria2_auth_and_obfs_params() {
 }
 
 #[test]
+fn shadowrocket_hysteria2_peer_preserves_sni_and_identity() {
+    let canonical = Node::from_share_link(
+        "hysteria2://secret@example.com:8443?sni=tls.example&insecure=1#edge",
+    )
+    .unwrap();
+    for query in ["peer=tls.example", "peer=ignored.example&sni=tls.example"] {
+        let node = Node::from_share_link(&format!(
+            "hysteria2://secret@example.com:8443?{query}&insecure=1#edge"
+        ))
+        .unwrap();
+        assert_eq!(node.outbound, canonical.outbound);
+        assert_eq!(node.id, canonical.id);
+    }
+}
+
+#[test]
 fn test_hysteria2_embedded_hop_ports() {
     // Official client style: the hop set lives in the authority; the first
     // entry becomes the nominal port.
@@ -935,6 +951,106 @@ fn test_vless_no_security_keeps_tls_default() {
 }
 
 #[test]
+fn shadowrocket_vless_reality_matches_canonical_link() {
+    let authority = "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:8443";
+    let canonical = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:8443?security=reality&sni=tls.example&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc&sid=0123456789abcdef&flow=xtls-rprx-vision#Hong%20Kong",
+    )
+    .unwrap();
+    for encoded in [
+        base64::engine::general_purpose::STANDARD.encode(authority),
+        b64(authority),
+    ] {
+        let node = Node::from_share_link(&format!(
+            "vless://{encoded}?tls=1&xtls=2&peer=ignored.example&sni=tls.example&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc&sid=0123456789abcdef&remark=Hong%20Kong"
+        ))
+        .unwrap();
+        assert_eq!(node.host, canonical.host);
+        assert_eq!(node.port, canonical.port);
+        assert_eq!(node.name, canonical.name);
+        assert_eq!(node.outbound, canonical.outbound);
+        assert_eq!(node.id, canonical.id);
+    }
+}
+
+#[test]
+fn shadowrocket_vless_plaintext_and_display_name() {
+    let authority = b64("b831381d-6324-4d53-ad4f-8cda48b30811@[2001:db8::1]:8443");
+    let canonical = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@[2001:db8::1]:8443?security=none#fragment",
+    )
+    .unwrap();
+    let node =
+        Node::from_share_link(&format!("vless://{authority}?remark=ignored#fragment")).unwrap();
+    assert_eq!(node.host, canonical.host);
+    assert_eq!(node.port, canonical.port);
+    assert_eq!(node.name, canonical.name);
+    assert_eq!(node.outbound, canonical.outbound);
+    assert_eq!(node.id, canonical.id);
+    let unnamed = Node::from_share_link(&format!("vless://{authority}")).unwrap();
+    assert_eq!(unnamed.name, format!("vless-{}", canonical.host));
+}
+
+#[test]
+fn shadowrocket_vless_rejects_invalid_authorities_and_security() {
+    for payload in [
+        "auto:credential-sentinel@example.com:443",
+        "b831381d-6324-4d53-ad4f-8cda48b30811",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:0",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:65536",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none",
+    ] {
+        let error = Node::from_share_link(&format!("vless://{}", b64(payload))).unwrap_err();
+        assert!(!error.to_string().contains("credential-sentinel"));
+    }
+    assert!(Node::from_share_link("vless://!!!").is_err());
+    let authority = b64("auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443");
+    for query in [
+        "tls=2",
+        "tls=1&xtls=1",
+        "tls=1&xtls=unknown",
+        "tls=0&xtls=2",
+        "tls=1&security=none",
+        "tls=0&pbk=AAA",
+        "tls=1&pbk=",
+        "tls=1&sid=",
+        "tls=1&pbk=AAA&security=tls",
+        "tls=1&xtls=0&flow=xtls-rprx-vision",
+        "tls=1&xtls=2&flow=xtls-rprx-direct",
+        "tls=1&obfs=http",
+    ] {
+        assert!(
+            Node::from_share_link(&format!("vless://{authority}?{query}")).is_err(),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn shadowrocket_vless_stream_transports_match_canonical_links() {
+    let authority = b64("auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443");
+    for (alias, canonical) in [
+        (
+            "obfs=websocket&obfsParam=cdn.example&path=%2Fws",
+            "type=ws&host=cdn.example&path=%2Fws",
+        ),
+        ("obfs=grpc&path=service", "type=grpc&serviceName=service"),
+    ] {
+        let node = Node::from_share_link(&format!(
+            "vless://{authority}?tls=1&xtls=0&peer=tls.example&{alias}#edge"
+        ))
+        .unwrap();
+        let canonical = Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&sni=tls.example&{canonical}#edge"
+        ))
+        .unwrap();
+        assert_eq!(node.outbound, canonical.outbound);
+        assert_eq!(node.id, canonical.id);
+    }
+}
+
+#[test]
 fn test_vless_encryption_param_and_identity() {
     let plain = Node::from_share_link("vless://uuid@example.com:443#plain").unwrap();
     let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1088,4 +1204,88 @@ fn test_vless_ws_host_falls_back_to_sni_without_ws() {
     .unwrap();
     assert_eq!(node.tls().unwrap().sni.as_deref(), Some("cdn.example"));
     assert!(node.transport().unwrap().ws_host.is_none());
+}
+
+#[test]
+fn hy2_alias_preserves_userpass_and_hopping_identity() {
+    let canonical = Node::from_share_link(
+        "hysteria2://user:password@example.com:123,5000-6000/?insecure=1#hy2",
+    )
+    .unwrap();
+    for link in [
+        "hy2://user:password@example.com:123,5000-6000/?insecure=1#hy2",
+        "HY2://user:password@example.com:123,5000-6000/?insecure=1#hy2",
+        "hysteria2://user%3Apassword@example.com:123,5000-6000/?insecure=1#hy2",
+    ] {
+        let node = Node::from_share_link(link).unwrap();
+        assert_eq!(
+            node.hysteria2().unwrap().auth.as_deref(),
+            Some("user:password")
+        );
+        assert_eq!(
+            node.hysteria2().unwrap().port_hopping.as_deref(),
+            Some("123,5000-6000")
+        );
+        assert_eq!(node.outbound, canonical.outbound);
+        assert_eq!(node.id, canonical.id);
+    }
+}
+
+#[test]
+fn shadowrocket_vmess_ws_and_grpc_match_v2rayn_json() {
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let authority = b64(&format!("auto:{uuid}@vmess.example.com:443"));
+    let ws_json = r#"{"ps":"vmess-ws","add":"vmess.example.com","port":"443","id":"b831381d-6324-4d53-ad4f-8cda48b30811","scy":"auto","net":"ws","host":"cdn.example.com","path":"/vmess-ws","tls":"tls","sni":"sni.example.com"}"#;
+    let canonical_ws = Node::from_share_link(&format!("vmess://{}", b64(ws_json))).unwrap();
+    let shadowrocket_ws = Node::from_share_link(&format!(
+        "vmess://{authority}?tfo=1&remark=vmess-ws&alterId=0&tls=1&peer=sni.example.com&obfs=websocket&path=%2Fvmess-ws&obfsParam=cdn.example.com"
+    ))
+    .unwrap();
+    assert_eq!(shadowrocket_ws.outbound, canonical_ws.outbound);
+    assert_eq!(shadowrocket_ws.id, canonical_ws.id);
+    let standard_authority = base64::engine::general_purpose::STANDARD
+        .encode(format!("auto:{uuid}@vmess.example.com:443"));
+    let standard_ws = Node::from_share_link(&format!(
+        "vmess://{standard_authority}?tls=1&peer=sni.example.com&obfs=websocket&path=%2Fvmess-ws&obfsParam=cdn.example.com"
+    ))
+    .unwrap();
+    assert_eq!(standard_ws.outbound, canonical_ws.outbound);
+    assert_eq!(standard_ws.id, canonical_ws.id);
+
+    let grpc_json = r#"{"ps":"vmess-grpc","add":"vmess.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","scy":"auto","net":"grpc","path":"vmess-grpc","host":"sni.example.com","tls":"tls"}"#;
+    let canonical_grpc = Node::from_share_link(&format!("vmess://{}", b64(grpc_json))).unwrap();
+    let shadowrocket_grpc = Node::from_share_link(&format!(
+        "vmess://{authority}?tfo=0&remark=vmess-grpc&alterId=0&tls=1&peer=sni.example.com&obfs=grpc&path=vmess-grpc&host=sni.example.com"
+    ))
+    .unwrap();
+    assert_eq!(shadowrocket_grpc.outbound, canonical_grpc.outbound);
+    assert_eq!(shadowrocket_grpc.id, canonical_grpc.id);
+}
+
+#[test]
+fn shadowrocket_vmess_rejects_bad_authorities_and_conflicts() {
+    let valid = "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443";
+    for payload in [
+        "auto:credential-sentinel@example.com:443",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:0",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:65536",
+        "auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443/path",
+    ] {
+        let error = Node::from_share_link(&format!("vmess://{}", b64(payload))).unwrap_err();
+        assert!(!error.to_string().contains("credential-sentinel"));
+    }
+    for query in [
+        "tls=2",
+        "alterId=1",
+        "obfs=http",
+        "obfs=websocket&type=grpc",
+        "allowInsecure=maybe",
+    ] {
+        assert!(
+            Node::from_share_link(&format!("vmess://{}?{query}", b64(valid))).is_err(),
+            "{query}"
+        );
+    }
+    assert!(Node::from_share_link("vmess://!!!").is_err());
 }

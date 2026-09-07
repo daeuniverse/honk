@@ -1,400 +1,136 @@
 //! Share-link parsing: build a [`Node`] from a proxy share URI.
 //!
 //! Supports the common `scheme://` share-link formats (socks5, ss,
-//! trojan, anytls, vmess, vless, hysteria2, tuic, juicity).
+//! trojan, anytls, vmess, vless, hysteria2/hy2, tuic, juicity).
 //! Shadowsocks links follow SIP002: the userinfo is either
 //! `base64(method:password)` or plain `method:password` (the method itself
 //! may still be base64-encoded), the whole `method:password@host:port`
 //! authority may also be base64-encoded, and an optional `/?plugin=...`
 //! query suffix carries the plugin name and options.
 //!
-//! `vmess://<base64>` does not follow the URL-shaped layout and is decoded
-//! before the generic URL path: the payload is base64 (URL-safe or standard
-//! alphabet) of a JSON object with the v2rayN field set (`add`, `port`,
-//! `id`, `scy`, `net`, `host`, `path`, `tls`, `sni`, ...).
+//! `vmess://<base64>` v2rayN links carry a JSON object with the fields
+//! (`add`, `port`, `id`, `scy`, `net`, `host`, `path`, `tls`, `sni`, ...).
+//! Shadowrocket links instead encode `auto:UUID@host:port` as the authority
+//! and carry transport/TLS options in the query.
 //!
 //! This is the single share-link parser for the whole workspace: the dae
 //! config parser and the core subscription fetcher both delegate to
 //! [`Node::from_share_link`].
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 use base64::Engine as _;
 
 use crate::error::ConfigError;
-use crate::node::Node;
-use crate::types::{NodeProtocol, parse_duration_secs};
+use crate::node::{Node, OutboundConfig};
+
+mod options;
 
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
     /// A chain describes several hops; only the first is parsed.
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
         let first = link.split("->").next().unwrap_or("").trim();
-        if let Some(payload) = first.strip_prefix("vmess://") {
-            return parse_vmess_link(payload);
-        }
-
-        let decoded_ss;
-        let first = match first.strip_prefix("ss://") {
-            Some(rest) => match decode_full_base64_ss_link(rest) {
-                Some(rebuilt) => {
-                    decoded_ss = rebuilt;
-                    decoded_ss.as_str()
-                }
-                None => first,
-            },
-            None => first,
+        let (decoded, shadowrocket) = match first.split_once("://") {
+            Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vmess") => {
+                let Some(decoded) = decode_full_base64_vmess_link(payload)? else {
+                    return parse_vmess_link(payload);
+                };
+                (Some(decoded), true)
+            }
+            Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vless") => {
+                let decoded = decode_full_base64_vless_link(payload)?;
+                let shadowrocket = decoded.is_some();
+                (decoded, shadowrocket)
+            }
+            Some((scheme, payload)) if scheme.eq_ignore_ascii_case("ss") => {
+                (decode_full_base64_ss_link(payload), false)
+            }
+            _ => (None, false),
         };
+        let first = decoded.as_deref().unwrap_or(first);
         let (first, embedded_hop_ports) = extract_hy2_hop_ports(first)?;
         let url = url::Url::parse(first.as_ref())
             .map_err(|_| ConfigError::Parse("invalid share link syntax".into()))?;
-        let scheme = url.scheme();
-        let protocol = match scheme {
-            "socks5" | "socks4" | "socks4a" => NodeProtocol::Socks5,
-            "ss" => NodeProtocol::SS,
-            "trojan" => NodeProtocol::Trojan,
-            "anytls" => NodeProtocol::AnyTLS,
-            "vmess" => NodeProtocol::VMess,
-            "vless" => NodeProtocol::VLess,
-            "hysteria2" | "hysteria" => NodeProtocol::Hysteria2,
-            "tuic" => NodeProtocol::Tuic,
-            "juicity" => NodeProtocol::Juicity,
-            _ => return Err(ConfigError::UnknownProtocol(scheme.to_string())),
-        };
-        let host = url
-            .host_str()
-            .ok_or_else(|| ConfigError::Parse("missing host in share link".into()))?
-            .to_string();
-        let port = url.port().unwrap_or(443);
-        let outbound = match protocol {
-            NodeProtocol::SS => crate::node::OutboundConfig::Shadowsocks(Default::default()),
-            NodeProtocol::Trojan => crate::node::OutboundConfig::Trojan(Default::default()),
-            NodeProtocol::VMess => crate::node::OutboundConfig::Vmess(Default::default()),
-            NodeProtocol::VLess => crate::node::OutboundConfig::Vless(Default::default()),
-            NodeProtocol::Socks5 => crate::node::OutboundConfig::Socks5(Default::default()),
-            NodeProtocol::Hysteria2 => crate::node::OutboundConfig::Hysteria2(Default::default()),
-            NodeProtocol::Tuic => crate::node::OutboundConfig::Tuic(Default::default()),
-            NodeProtocol::Juicity => crate::node::OutboundConfig::Juicity(Default::default()),
-            NodeProtocol::AnyTLS => crate::node::OutboundConfig::AnyTls(Default::default()),
-            NodeProtocol::Direct | NodeProtocol::Block => unreachable!(),
-        };
-        let mut node = Node {
-            host: host.clone(),
-            address: format!("{}:{}", host, port),
-            port,
-            outbound,
-            ..Default::default()
-        };
-
-        if let Some(config) = node.shadowsocks_mut() {
-            apply_ss_userinfo(config, &url);
-        } else {
-            let username = (!url.username().is_empty()).then(|| percent_decode_str(url.username()));
-            let password = url.password().map(percent_decode_str);
-            match &mut node.outbound {
-                crate::node::OutboundConfig::Socks5(config) => {
-                    config.username = username;
-                    config.password = password;
-                }
-                crate::node::OutboundConfig::Trojan(config) => {
-                    config.password = password.or(username);
-                }
-                crate::node::OutboundConfig::Vless(config) => {
-                    config.uuid = password.or(username);
-                }
-                crate::node::OutboundConfig::Hysteria2(config) => {
-                    config.auth = username.or(password);
-                }
-                crate::node::OutboundConfig::Tuic(config) => {
-                    config.uuid = username;
-                    config.password = password;
-                }
-                crate::node::OutboundConfig::Juicity(config) => {
-                    config.uuid = username;
-                    config.password = password;
-                }
-                crate::node::OutboundConfig::AnyTls(config) => {
-                    config.password = password.or(username);
-                }
-                crate::node::OutboundConfig::Vmess(_)
-                | crate::node::OutboundConfig::Shadowsocks(_)
-                | crate::node::OutboundConfig::Direct
-                | crate::node::OutboundConfig::Block => {}
-            }
-        }
-
+        let mut node = node_from_url(&url)?;
+        let query = options::parse_query(&url, node.protocol(), shadowrocket)?;
         node.name = url
             .fragment()
             .map(percent_decode_str)
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| format!("{}-{}", scheme, host));
+            .or_else(|| query.get("remark").filter(|name| !name.is_empty()).cloned())
+            .unwrap_or_else(|| format!("{}-{}", url.scheme(), node.host));
 
-        let mut query = HashMap::new();
-        let mut mode_seen = false;
-        for (key, value) in url.query_pairs() {
-            let key = key.into_owned();
-            if protocol == NodeProtocol::VLess
-                && matches!(key.as_str(), "vless_mode" | "packetEncoding")
-            {
-                if mode_seen {
-                    return Err(ConfigError::Parse(
-                        "duplicate VLESS share-link mode representation".into(),
-                    ));
-                }
-                mode_seen = true;
-            }
-            query.insert(key, value.into_owned());
-        }
-        if protocol != NodeProtocol::VLess
-            && (query.contains_key("vless_mode")
-                || query.get("packetEncoding").is_some_and(|v| v != "none"))
-        {
-            return Err(ConfigError::Parse(
-                "vless_mode/packetEncoding are valid only for VLESS share links".into(),
-            ));
-        }
-
-        if let Some(tls) = node.tls_mut() {
-            tls.enabled = match protocol {
-                NodeProtocol::Trojan | NodeProtocol::AnyTLS => true,
-                NodeProtocol::VLess | NodeProtocol::VMess => {
-                    match query.get("security").map(String::as_str) {
-                        Some("none") => false,
-                        Some(_) => true,
-                        None => protocol == NodeProtocol::VLess,
-                    }
-                }
-                _ => tls.enabled,
-            };
-            tls.sni = query.get("sni").cloned();
-            if let Some(value) = query
-                .get("allowInsecure")
-                .or_else(|| query.get("allow_insecure"))
-                .or_else(|| query.get("insecure"))
-            {
-                tls.skip_cert_verify = value == "1" || value.eq_ignore_ascii_case("true");
-            }
-            tls.pin_sha256 = query
-                .get("pinSHA256")
-                .or_else(|| query.get("pin_sha256"))
-                .cloned();
-            if let Some(value) = query.get("ech_config").or_else(|| query.get("echconfig")) {
-                tls.ech_enabled = true;
-                tls.ech_config = Some(value.clone());
-            } else if let Some(value) = query.get("ech") {
-                tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
-            }
-        }
-
-        if let Some(transport) = node.transport_mut() {
-            if let Some(value) = query.get("type").or_else(|| query.get("network")) {
-                transport.transport = value.clone();
-            }
-            let mut host_consumed = false;
-            match transport.transport.as_str() {
-                "ws" => {
-                    if let Some(value) = query.get("host") {
-                        transport.ws_host = Some(value.clone());
-                        host_consumed = true;
-                    }
-                    transport.ws_path = query.get("path").cloned();
-                }
-                "grpc" => {
-                    transport.grpc_service = query
-                        .get("serviceName")
-                        .or_else(|| query.get("service_name"))
-                        .cloned();
-                }
-                _ => {}
-            }
-            if !host_consumed
-                && node.tls().is_some_and(|tls| tls.sni.is_none())
-                && let Some(value) = query.get("host")
-                && let Some(tls) = node.tls_mut()
-            {
-                tls.sni = Some(value.clone());
-            }
-        } else if node.tls().is_some_and(|tls| tls.sni.is_none())
-            && let Some(value) = query.get("host")
-            && let Some(tls) = node.tls_mut()
-        {
-            tls.sni = Some(value.clone());
-        }
-
-        if let Some(value) = query.get("plugin") {
-            let Some(config) = node.shadowsocks_mut() else {
-                return Err(ConfigError::Parse(
-                    "plugin parameters are valid only for Shadowsocks links".into(),
-                ));
-            };
-            if let Some((name, options)) = value.split_once(';') {
-                config.plugin = Some(name.to_string());
-                if !options.is_empty() {
-                    config.plugin_opts = Some(options.to_string());
-                }
-            } else {
-                config.plugin = Some(value.clone());
-            }
-        }
-        if let Some(value) = query
-            .get("plugin-opts")
-            .or_else(|| query.get("plugin_opts"))
-        {
-            let Some(config) = node.shadowsocks_mut() else {
-                return Err(ConfigError::Parse(
-                    "plugin parameters are valid only for Shadowsocks links".into(),
-                ));
-            };
-            config.plugin_opts = Some(value.clone());
-        }
-
-        if let Some(config) = node.hysteria2_mut() {
-            if query.get("obfs").is_some_and(|value| value == "salamander") {
-                config.obfs = query
-                    .get("obfs-password")
-                    .filter(|value| !value.is_empty())
-                    .cloned();
-            }
-            config.up_mbps = query.get("upmbps").and_then(|value| value.parse().ok());
-            config.down_mbps = query.get("downmbps").and_then(|value| value.parse().ok());
-            let mport = query.get("mport").filter(|value| !value.is_empty());
-            if mport.is_some() && embedded_hop_ports.is_some() {
-                return Err(ConfigError::Parse(
-                    "hysteria2 port hopping specified in both address and mport".into(),
-                ));
-            }
-            config.port_hopping = mport.cloned().or(embedded_hop_ports);
-            config.hop_interval = query.get("mhop").and_then(|value| value.parse().ok());
-            config.init_stream_recv_window = query
-                .get("initStreamReceiveWindow")
-                .and_then(|value| value.parse().ok());
-            config.init_conn_recv_window = query
-                .get("initConnReceiveWindow")
-                .and_then(|value| value.parse().ok());
-            config.disable_mtu_discovery = query
-                .get("disablePathMTUDiscovery")
-                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-        }
-
-        if matches!(
-            protocol,
-            NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
-        ) && let Some(mtu) = query
-            .get("mtu")
-            .and_then(|value| value.parse::<u16>().ok())
-            .filter(|mtu| (1200..=65527).contains(mtu))
-        {
-            match &mut node.outbound {
-                crate::node::OutboundConfig::Hysteria2(config) => config.quic.mtu = Some(mtu),
-                crate::node::OutboundConfig::Tuic(config) => config.quic.mtu = Some(mtu),
-                crate::node::OutboundConfig::Juicity(config) => config.quic.mtu = Some(mtu),
-                _ => unreachable!(),
-            }
-        }
-
-        if let Some(config) = node.tuic_mut() {
-            config.init_stream_recv_window = query
-                .get("initStreamReceiveWindow")
-                .and_then(|value| value.parse().ok());
-            config.init_conn_recv_window = query
-                .get("initConnReceiveWindow")
-                .and_then(|value| value.parse().ok());
-            config.congestion = query
-                .get("congestion_control")
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            config.alpn = query
-                .get("alpn")
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-        }
-
-        if let Some(config) = node.anytls_mut() {
-            config.idle_session_check_interval = query
-                .get("idle_session_check_interval")
-                .and_then(|value| parse_duration_secs(value));
-            config.idle_session_timeout = query
-                .get("idle_session_timeout")
-                .and_then(|value| parse_duration_secs(value));
-            config.min_idle_session = query
-                .get("min_idle_session")
-                .and_then(|value| value.parse::<u16>().ok())
-                .map(usize::from);
-        }
-
-        if let Some(config) = node.vless_mut() {
-            if let Some(parameter) = [
-                "mux",
-                "smux",
-                "multiplex",
-                "udp-over-tcp",
-                "udp_over_tcp",
-                "packet-encoding",
-                "packet_encoding",
-                "packet-addr",
-                "packet_addr",
-                "xudp",
-                "only-tcp",
-                "only_tcp",
-                "brutal",
-                "brutal-opts",
-                "brutal_opts",
-                "max-connections",
-                "max_connections",
-                "min-streams",
-                "min_streams",
-                "max-streams",
-                "max_streams",
-            ]
-            .into_iter()
-            .find(|parameter| query.contains_key(*parameter))
-            {
-                return Err(ConfigError::Parse(format!(
-                    "unsupported VLESS share-link parameter '{parameter}'; use vless_mode"
-                )));
-            }
-            if let Some(mode) = query.get("vless_mode") {
-                config.mode = mode.parse()?;
-            } else if let Some(encoding) = query.get("packetEncoding") {
-                match encoding.as_str() {
-                    "xudp" => config.mode = crate::node::WireMode::Xudp,
-                    "none" => {}
-                    _ => {
-                        return Err(ConfigError::Parse(
-                            "unsupported VLESS packetEncoding (expected xudp or none)".into(),
-                        ));
-                    }
-                }
-            }
-            if query
-                .get("security")
-                .is_some_and(|value| value == "reality")
-            {
-                config.tls.enabled = true;
-                config.tls.reality_public_key = query.get("pbk").cloned();
-                config.tls.reality_short_id = query.get("sid").cloned();
-                config.tls.reality_spider_x = Some(
-                    query
-                        .get("spx")
-                        .filter(|value| !value.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| "/".to_string()),
-                );
-            }
-            config.flow = query.get("flow").cloned();
-            config.encryption = query
-                .get("encryption")
-                .filter(|value| !value.trim().is_empty())
-                .cloned();
-        }
-
+        options::apply_tls(&mut node, &query, shadowrocket)?;
+        options::apply_transport(&mut node, &query, shadowrocket)?;
+        options::apply_protocol(&mut node, &query, embedded_hop_ports, shadowrocket)?;
         node.validate_protocol()?;
         node.id = node.derive_id();
         Ok(node)
     }
+}
+
+fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
+    let outbound = match url.scheme() {
+        "socks5" | "socks4" | "socks4a" => OutboundConfig::Socks5(Default::default()),
+        "ss" => OutboundConfig::Shadowsocks(Default::default()),
+        "trojan" => OutboundConfig::Trojan(Default::default()),
+        "anytls" => OutboundConfig::AnyTls(Default::default()),
+        "vmess" => OutboundConfig::Vmess(Default::default()),
+        "vless" => OutboundConfig::Vless(Default::default()),
+        "hysteria2" | "hysteria" | "hy2" => OutboundConfig::Hysteria2(Default::default()),
+        "tuic" => OutboundConfig::Tuic(Default::default()),
+        "juicity" => OutboundConfig::Juicity(Default::default()),
+        scheme => return Err(ConfigError::UnknownProtocol(scheme.to_string())),
+    };
+    let host = url
+        .host_str()
+        .ok_or_else(|| ConfigError::Parse("missing host in share link".into()))?
+        .to_string();
+    let port = url.port().unwrap_or(443);
+    let mut node = Node {
+        address: format!("{host}:{port}"),
+        host,
+        port,
+        outbound,
+        ..Default::default()
+    };
+    if let Some(config) = node.shadowsocks_mut() {
+        apply_ss_userinfo(config, url);
+    } else {
+        let username = (!url.username().is_empty()).then(|| percent_decode_str(url.username()));
+        let password = url.password().map(percent_decode_str);
+        match &mut node.outbound {
+            OutboundConfig::Socks5(config) => {
+                config.username = username;
+                config.password = password;
+            }
+            OutboundConfig::Trojan(config) => config.password = password.or(username),
+            OutboundConfig::Vless(config) => config.uuid = password.or(username),
+            OutboundConfig::Hysteria2(config) => {
+                config.auth = match (username, password) {
+                    (Some(username), Some(password)) => Some(format!("{username}:{password}")),
+                    (username, None) => username,
+                    (None, Some(password)) => Some(format!(":{password}")),
+                };
+            }
+            OutboundConfig::Tuic(config) => {
+                config.uuid = username;
+                config.password = password;
+            }
+            OutboundConfig::Juicity(config) => {
+                config.uuid = username;
+                config.password = password;
+            }
+            OutboundConfig::AnyTls(config) => config.password = password.or(username),
+            OutboundConfig::Vmess(config) => {
+                config.uuid = password.or(username);
+                config.encryption = Some("auto".into());
+            }
+            OutboundConfig::Shadowsocks(_) | OutboundConfig::Direct | OutboundConfig::Block => {}
+        }
+    }
+    Ok(node)
 }
 
 /// Parse a `vmess://` share link: base64 of a JSON object (v2rayN schema).
@@ -598,18 +334,60 @@ fn decode_full_base64_ss_link(rest: &str) -> Option<String> {
     Some(format!("ss://{}{}", text, &rest[end..]))
 }
 
+fn decode_full_base64_vless_link(rest: &str) -> Result<Option<String>, ConfigError> {
+    decode_full_base64_authority(rest, "VLESS", false)
+}
+
+fn decode_full_base64_vmess_link(rest: &str) -> Result<Option<String>, ConfigError> {
+    decode_full_base64_authority(rest, "VMess", true)
+}
+
+fn decode_full_base64_authority(
+    rest: &str,
+    protocol: &str,
+    allow_json: bool,
+) -> Result<Option<String>, ConfigError> {
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.contains('@') {
+        return Ok(None);
+    }
+    let invalid = || ConfigError::Parse(format!("invalid {protocol} encoded authority"));
+    let decoded = base64_decode_flexible(authority)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid)?;
+    if allow_json && decoded.trim_start().starts_with('{') {
+        return Ok(None);
+    }
+    let decoded = decoded.strip_prefix("auto:").unwrap_or(&decoded);
+    let (credential, endpoint) = decoded.split_once('@').ok_or_else(invalid)?;
+    uuid::Uuid::parse_str(credential).map_err(|_| invalid())?;
+    if endpoint.contains(['/', '?', '#', '@', '\\'])
+        || endpoint.chars().any(char::is_whitespace)
+        || !endpoint.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(Some(format!("{protocol}://{decoded}{}", &rest[end..])))
+}
+
 /// Split official-style hop ports out of a hysteria2 authority
 /// (`hysteria2://auth@host:443,5000-6000/...`). The whole list is the hop
 /// set; the first entry stays in the rebuilt address as the nominal port so
 /// generic URL parsing and node identity keep working.
 fn extract_hy2_hop_ports(link: &str) -> Result<(Cow<'_, str>, Option<String>), ConfigError> {
-    let Some(scheme_len) = ["hysteria2://", "hysteria://"]
-        .iter()
-        .find(|prefix| link.starts_with(**prefix))
-        .map(|prefix| prefix.len())
-    else {
+    let Some((scheme, _)) = link.split_once("://") else {
         return Ok((Cow::Borrowed(link), None));
     };
+    if !(scheme.eq_ignore_ascii_case("hysteria2")
+        || scheme.eq_ignore_ascii_case("hysteria")
+        || scheme.eq_ignore_ascii_case("hy2"))
+    {
+        return Ok((Cow::Borrowed(link), None));
+    }
+    let scheme_len = scheme.len() + 3;
     let rest = &link[scheme_len..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
@@ -636,16 +414,13 @@ fn extract_hy2_hop_ports(link: &str) -> Result<(Cow<'_, str>, Option<String>), C
         return Ok((Cow::Borrowed(link), None));
     }
     if !valid_hop_port_spec(port_spec) {
-        return Err(ConfigError::Parse(format!(
-            "invalid hysteria2 hop port list '{port_spec}'"
-        )));
+        return Err(ConfigError::Parse("invalid hysteria2 hop port list".into()));
     }
     let first_port = port_spec
         .split([',', '-'])
         .next()
         .and_then(|part| part.trim().parse::<u16>().ok())
-        .filter(|port| *port > 0)
-        .ok_or_else(|| ConfigError::Parse(format!("invalid hysteria2 port '{port_spec}'")))?;
+        .ok_or_else(|| ConfigError::Parse("invalid hysteria2 port".into()))?;
     let spec_start = scheme_len + (authority.len() - host_port.len()) + colon + 1;
     let rebuilt = format!(
         "{}{}{}",

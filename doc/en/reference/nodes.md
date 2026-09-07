@@ -38,7 +38,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `id` | UUID | derived | Stable content identity described above; nil is invalid at runtime |
-| `name` | string | `""` | Dae tag, decoded fragment, VMess `ps`, or credential-free fallback |
+| `name` | string | `""` | Dae tag, decoded fragment, `remark` query, VMess `ps`, or credential-free fallback |
 | `protocol` | enum | `ss` | Derived from the share-link scheme |
 | `address` | string | `""` | Parsed links store `host:port` |
 | `host` | string | `""` | Explicit server host; otherwise `Node::host()` derives it from `address` |
@@ -48,8 +48,8 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `vless_mode` | `WireMode` | `legacy` | `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, or `mux-cool` |
 | `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
-| `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, VLESS historically defaults on |
-| `sni` | string? | null | TLS server name from `sni`, or an unconsumed `host` query |
+| `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
+| `sni` | string? | null | TLS server name from `sni`, then `peer`, then an unconsumed `host` query |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`, `allow_insecure`, or `insecure` equal to `1`/`true` |
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
 | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |
@@ -57,7 +57,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_public_key` | string? | null | REALITY X25519 public key from `pbk` |
 | `reality_short_id` | string? | null | REALITY short ID from `sid` |
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
-| `flow` | string? | null | VLESS flow from `flow`; only `xtls-rprx-vision` is supported |
+| `flow` | string? | null | VLESS flow from `flow` or Shadowrocket `xtls=2`; only `xtls-rprx-vision` is supported |
 | `network` | string? | null | Protocol network/capability hint; VMess JSON `net` and subscription import populate it |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
@@ -132,15 +132,35 @@ node {
 }
 ```
 
-VMess uses v2rayN base64 JSON rather than URL query parameters: `net`, `host`, `path`, and `sni` populate the equivalent fields.
+VMess accepts v2rayN Base64 JSON (`net`, `host`, `path`, `sni`) and Shadowrocket's `vmess://base64(auto:UUID@host:port)?...` authority form. The latter maps `tls`, `peer`/`sni`, `obfs=websocket|grpc`, `obfsParam`, `path`, and `remark`; standard/URL-safe Base64 and optional padding are accepted.
 
 Live interoperability has been verified for VLESS TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Vision's supported direct-copy combination is raw TCP with TLS or REALITY, not WS/gRPC.
 
+### Shadowrocket VLESS
+
+The unified parser accepts `vless://base64(auto:UUID@host:port)?...` and the same encoded authority without `auto:`. Standard and URL-safe Base64, with or without padding, are accepted; IPv6 endpoints must be bracketed. The encoded authority must contain a valid UUID and an explicit nonzero port. Malformed encoded authorities are rejected, never treated as hostnames or display names.
+
+The query mapping follows the [Shadowrocket exporter](https://github.com/cedar2025/Xboard/blob/master/app/Protocols/Shadowrocket.php):
+
+| Input | Meaning |
+| --- | --- |
+| `tls=0` / `tls=1` | Disable / enable TLS. Encoded links without security options default to plaintext; canonical `UUID@host:port` links retain their TLS-on default. |
+| `pbk`, `sid`, `spx` without `security` | Select REALITY; a non-empty `pbk` is mandatory. Explicit `security=reality` remains supported. |
+| `xtls=0` / `xtls=2` | No flow / `xtls-rprx-vision`. Retired XTLS Direct (`xtls=1`) and unknown values are rejected. |
+| `remark` | Display name when a non-empty fragment is absent; decoded once as a query value. |
+| `peer` | SNI fallback when `sni` is absent, also supported by Hysteria2 and the other URL-shaped TLS links. |
+| `obfs=websocket`, `obfsParam`, `path` | WebSocket transport, Host header fallback, and path. |
+| `obfs=grpc`, `path` | gRPC transport and service-name fallback. |
+
+Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host`, `serviceName`/`service_name`, and `sni` fields take precedence over their aliases. Normalization precedes node-ID derivation, so equivalent canonical and Shadowrocket links share identity.
+
 ### Hysteria2
+
+Both `hysteria2://` and `hy2://` are accepted. The entire percent-decoded userinfo is the authentication string: literal `user:password` retains both halves and the colon, matching percent-encoded `user%3Apassword`.
 
 | Link input | Node field / behavior |
 | --- | --- |
-| userinfo secret | `username`, `password`, and `hy2_auth` |
+| userinfo secret | `hy2_auth`; preserves the full `user:password` form rather than taking only the password |
 | `obfs=salamander&obfs-password=...` | Non-empty password becomes `hy2_obfs`; other/incomplete obfs input stays disabled |
 | `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`; a positive upload value enables Brutal, otherwise BBR is used; download is advertised in bytes/s |
 | `mport` / `mhop` | Port list/ranges and hop interval in seconds; interval defaults to 30 and clamps to the upstream minimum of 5. The official client form with hop ports embedded in the authority (`:443,5000-6000`) is equivalent to `mport`; specifying both is rejected, and a malformed embedded list fails at parse time |
@@ -148,7 +168,7 @@ Live interoperability has been verified for VLESS TCP+REALITY+Vision, TCP+REALIT
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC receive-window overrides |
 | `disablePathMTUDiscovery` | Disables QUIC PMTU discovery when `1`/`true` |
 | `mtu` | Shared QUIC UDP-payload cap, accepted only in 1200–65527 |
-| `sni`, insecure aliases, ECH parameters | Shared TLS behavior |
+| `sni` / `peer`, insecure aliases, ECH parameters | Shared TLS behavior; explicit `sni` takes precedence over `peer` |
 
 ```dae
 node {

@@ -38,7 +38,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | 字段 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `id` | UUID | 派生 | 上述稳定内容身份；运行时不允许 nil |
-| `name` | string | `""` | dae tag、解码后的 fragment、VMess `ps` 或不含凭据的回退名称 |
+| `name` | string | `""` | dae tag、解码后的 fragment、`remark` query、VMess `ps` 或不含凭据的回退名称 |
 | `protocol` | enum | `ss` | 从分享链接 scheme 派生 |
 | `address` | string | `""` | 解析后的链接存储 `host:port` |
 | `host` | string | `""` | 显式服务端主机；否则 `Node::host()` 从 `address` 派生 |
@@ -48,8 +48,8 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `vless_mode` | `WireMode` | `legacy` | `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 或 `mux-cool` |
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
-| `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，VLESS 历史默认开启 |
-| `sni` | string? | null | 来自 `sni` 或未被 transport 消耗的 `host` query 的 TLS 服务端名称 |
+| `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
+| `sni` | string? | null | TLS 服务端名称，依次取 `sni`、`peer`、未被 transport 消耗的 `host` query |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`、`allow_insecure` 或 `insecure` 等于 `1`/`true` |
 | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
 | `ech_config` | string? | null | 来自 `ech_config` 或 `echconfig` 的 Base64 ECHConfigList |
@@ -57,7 +57,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `reality_public_key` | string? | null | 来自 `pbk` 的 REALITY X25519 公钥 |
 | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
-| `flow` | string? | null | 来自 `flow` 的 VLESS flow；只支持 `xtls-rprx-vision` |
+| `flow` | string? | null | 来自 `flow` 或 Shadowrocket `xtls=2` 的 VLESS flow；只支持 `xtls-rprx-vision` |
 | `network` | string? | null | 协议网络/能力提示；VMess JSON `net` 与订阅导入会填充它 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
@@ -132,15 +132,35 @@ node {
 }
 ```
 
-VMess 使用 v2rayN base64 JSON 而不是 URL query 参数：`net`、`host`、`path` 与 `sni` 会填充对应字段。
+VMess 接受 v2rayN Base64 JSON（`net`、`host`、`path`、`sni`），也接受 Shadowrocket 的 `vmess://base64(auto:UUID@host:port)?...` authority 形式。后者映射 `tls`、`peer`/`sni`、`obfs=websocket|grpc`、`obfsParam`、`path` 和 `remark`；接受 standard / URL-safe Base64，有无 padding 均可。
 
 VLESS 已完成以下 live 互通验证：TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。Vision 支持的 direct-copy 组合是带 TLS 或 REALITY 的裸 TCP，而不是 WS/gRPC。
 
+### Shadowrocket VLESS
+
+统一解析器接受 `vless://base64(auto:UUID@host:port)?...`，以及省略 `auto:` 的编码 authority。支持 standard / URL-safe Base64，有无 padding 均可；IPv6 端点必须使用方括号。编码内容必须包含有效 UUID 和显式非零端口。格式错误的编码 authority 会被拒绝，不再误当作主机名或显示名称。
+
+query 映射遵循 [Shadowrocket 导出器](https://github.com/cedar2025/Xboard/blob/master/app/Protocols/Shadowrocket.php)：
+
+| 输入 | 含义 |
+| --- | --- |
+| `tls=0` / `tls=1` | 关闭 / 开启 TLS。编码链接没有安全选项时默认明文；规范 `UUID@host:port` 链接保留默认开启 TLS 的行为。 |
+| 未指定 `security` 时的 `pbk`、`sid`、`spx` | 选择 REALITY，必须提供非空 `pbk`。仍支持显式 `security=reality`。 |
+| `xtls=0` / `xtls=2` | 无 flow / `xtls-rprx-vision`。拒绝已淘汰的 XTLS Direct（`xtls=1`）及未知值。 |
+| `remark` | 没有非空 fragment 时用作显示名称，作为 query 值只解码一次。 |
+| `peer` | 缺少 `sni` 时的 SNI 回退值；Hysteria2 和其他 URL 形 TLS 链接也支持。 |
+| `obfs=websocket`、`obfsParam`、`path` | WebSocket transport、Host header 回退值和路径。 |
+| `obfs=grpc`、`path` | gRPC transport 和 service name 回退值。 |
+
+TLS/REALITY、flow 或 transport 声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把未支持的传输方式当作 TCP。规范 `host`、`serviceName`/`service_name`、`sni` 字段优先于对应别名。规范化发生在派生节点 ID 之前，因此等价的规范链接与 Shadowrocket 链接拥有相同身份。
+
 ### Hysteria2
+
+同时接受 `hysteria2://` 和 `hy2://`。完整的 percent-decoded userinfo 是认证字符串：字面 `user:password` 保留两部分及冒号，与 percent-encoded `user%3Apassword` 等价。
 
 | 链接输入 | 节点字段 / 行为 |
 | --- | --- |
-| userinfo 密钥 | `username`、`password` 与 `hy2_auth` |
+| userinfo 密钥 | `hy2_auth`；保留完整 `user:password`，而不是只取 password |
 | `obfs=salamander&obfs-password=...` | 非空密码成为 `hy2_obfs`；其他/不完整 obfs 输入保持关闭 |
 | `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`；`upmbps` 为正值时启用 Brutal，否则使用 BBR；下载值按 bytes/s 通告 |
 | `mport` / `mhop` | 端口列表/范围与以秒为单位的跳跃间隔；间隔默认 30，并钳制到上游规定的最小值 5。官方客户端把跳跃端口写在 authority 里的形式（`:443,5000-6000`）与 `mport` 等价；两者同时指定会被拒绝，非法的内嵌列表在解析期报错 |
@@ -148,7 +168,7 @@ VLESS 已完成以下 live 互通验证：TCP+REALITY+Vision、TCP+REALITY、TCP
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收窗口覆盖值 |
 | `disablePathMTUDiscovery` | 值为 `1`/`true` 时关闭 QUIC PMTU 发现 |
 | `mtu` | 共用 QUIC UDP-payload 上限；只接受 1200–65527 |
-| `sni`、insecure 别名、ECH 参数 | 共用 TLS 行为 |
+| `sni` / `peer`、insecure 别名、ECH 参数 | 共用 TLS 行为；显式 `sni` 优先于 `peer` |
 
 ```dae
 node {

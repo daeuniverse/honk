@@ -79,7 +79,7 @@ impl ProbeFailureKind {
 
 #[derive(Args)]
 pub struct SubArgs {
-    /// Subscription URL (http/https) or a local file with one share link per line.
+    /// Subscription URL (http/https) or a local subscription file.
     pub source: String,
     /// Test target for proxied connectivity/latency (host:port).
     #[arg(long, default_value = "cp.cloudflare.com:443")]
@@ -238,7 +238,7 @@ fn parse_subscription_url_from_stdin(input: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-/// Load nodes from a subscription URL or a local share-link file.
+/// Load nodes from a subscription URL or a local subscription file.
 async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
     let source = if args.source == "-" {
         let mut input = String::new();
@@ -250,12 +250,6 @@ async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
         args.source.clone()
     };
 
-    if args.source != "-" && std::path::Path::new(&source).exists() {
-        let content =
-            std::fs::read_to_string(&source).with_context(|| format!("read '{}'", args.source))?;
-        return parse_lines(&content);
-    }
-
     let sub = Subscription {
         name: "sub".into(),
         url: source,
@@ -263,34 +257,18 @@ async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
         user_agent: args.ua.clone(),
         ..Default::default()
     };
+    if args.source != "-" && std::path::Path::new(&sub.url).exists() {
+        let content =
+            std::fs::read_to_string(&sub.url).with_context(|| format!("read '{}'", args.source))?;
+        let nodes = honk_core::subscription::parse_subscription_content(&sub, &content)
+            .context("parse subscription file")?;
+        println!("parsed {} node(s)", nodes.len());
+        return Ok(nodes);
+    }
     let manager = SubscriptionManager::new()?;
     let started = Instant::now();
     let nodes = manager.fetch(&sub).await.context("fetch subscription")?;
     println!("fetched {} node(s) in {:?}", nodes.len(), started.elapsed());
-    Ok(nodes)
-}
-
-/// Parse a local file of share links (one per line, `#` comments allowed).
-fn parse_lines(content: &str) -> anyhow::Result<Vec<Node>> {
-    let mut nodes = Vec::new();
-    let mut skipped = 0usize;
-    for line in content.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match Node::from_share_link(line) {
-            Ok(node) => nodes.push(node),
-            Err(_) => skipped += 1,
-        }
-    }
-    if nodes.is_empty() {
-        anyhow::bail!("no valid share links in file");
-    }
-    if skipped > 0 {
-        println!("parsed {} node(s), {skipped} line(s) skipped", nodes.len());
-    } else {
-        println!("parsed {} node(s)", nodes.len());
-    }
     Ok(nodes)
 }
 
