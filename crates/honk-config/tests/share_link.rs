@@ -1282,6 +1282,7 @@ fn shadowrocket_vmess_rejects_bad_authorities_and_conflicts() {
         "obfs=websocket&type=grpc",
         "allowInsecure=maybe",
         "security=reality",
+        "security=reality&encryption=auto",
         "tls=1&pbk=active-reality-key",
         "encryption=chacha20-poly1305",
         "scy=none",

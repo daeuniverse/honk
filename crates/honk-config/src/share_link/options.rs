@@ -44,6 +44,14 @@ pub(super) fn parse_query(
         ));
     }
     if shadowrocket_vmess {
+        if query
+            .get("security")
+            .is_some_and(|value| !matches!(value.as_str(), "none" | "tls" | "auto" | "aes-128-gcm"))
+        {
+            return Err(ConfigError::Parse(
+                "unsupported encoded VMess security".into(),
+            ));
+        }
         if ["pbk", "sid", "spx"]
             .iter()
             .any(|key| query.get(*key).is_some_and(|value| !value.is_empty()))

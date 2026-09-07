@@ -181,7 +181,9 @@ The importer accepts named comma-separated records from Surge/Surfboard/Loon and
 
 Supported records map credentials, TLS/SNI, WebSocket/gRPC, REALITY, and implemented protocol options to the same node model. Quantumult X `obfs=wss` uses `obfs-host` for both WebSocket Host and the default TLS SNI; an explicit TLS hostname wins. SSR, unsupported plugins/obfuscation, and unsupported transports are skipped rather than imported as another protocol.
 
-Effective Quantumult X `tls-cert-sha256` and `tls-pubkey-sha256` pins are rejected: honk's leaf-certificate pin replaces PKI, and it is not substituted for an unverified foreign verification contract. With explicit `tls-verification=false`, QX ignores both pins and the import preserves that disabled verification. Legacy VMess `aead=false`, active Shadowsocks UoT/SSR, custom TLS ALPN, and disabled TLS-session reuse are also rejected rather than discarded.
+Surge `server-cert-fingerprint-sha256` maps to honk's leaf-certificate pin: both replace standard X.509 verification. Independent `server-cert-verify-name`, client certificates, `sni=off`, and Shadow TLS are not representable and are rejected rather than discarded ([Surge TLS reference](https://manual.nssurge.com/policies/tls.html)).
+
+Effective Quantumult X `tls-cert-sha256` and `tls-pubkey-sha256` pins are rejected: honk's leaf-certificate pin replaces PKI, and it is not substituted for an unverified foreign verification contract. With explicit `tls-verification=false`, QX ignores both pins and the import preserves that disabled verification. Effective QX REALITY ignores customized `tls-alpn` and session-ticket settings, as its [official configuration](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf) specifies; ordinary TLS does not. Legacy VMess `aead=false`, active Shadowsocks UoT/SSR, unsupported TLS ALPN, and disabled TLS-session reuse are rejected rather than discarded.
 
 ## Offline parsing and probes
 

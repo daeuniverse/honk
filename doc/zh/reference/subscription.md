@@ -181,7 +181,9 @@ sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess�
 
 受支持的记录把凭据、TLS/SNI、WebSocket/gRPC、REALITY 和已实现的协议选项映射到同一节点模型。Quantumult X 的 `obfs=wss` 同时使用 `obfs-host` 作为 WebSocket Host 和默认 TLS SNI；显式 TLS 主机名优先。SSR、不支持的插件/混淆及传输方式会被跳过，不会冒充另一种协议导入。
 
-有效的 Quantumult X `tls-cert-sha256` / `tls-pubkey-sha256` 固定证书设置会被拒绝：honk 的叶证书 pin 会替代 PKI，不能拿它替换尚未确认等价的外部验证约定。显式设置 `tls-verification=false` 时，QX 会忽略两类 pin，导入会保留该禁用验证行为。旧 VMess `aead=false`、启用的 Shadowsocks UoT/SSR、自定义 TLS ALPN 和禁用 TLS session 复用也会被拒绝，不会静默丢弃。
+Surge `server-cert-fingerprint-sha256` 映射到 honk 的叶证书 pin：两者都替代标准 X.509 验证。独立的 `server-cert-verify-name`、客户端证书、`sni=off` 和 Shadow TLS 无法表达，会被拒绝，不会静默丢弃（[Surge TLS 参考](https://manual.nssurge.com/policies/tls.html)）。
+
+有效的 Quantumult X `tls-cert-sha256` / `tls-pubkey-sha256` 固定证书设置会被拒绝：honk 的叶证书 pin 会替代 PKI，不能拿它替换尚未确认等价的外部验证约定。显式设置 `tls-verification=false` 时，QX 会忽略两类 pin，导入会保留该禁用验证行为。有效的 QX REALITY 会按[官方配置](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf)忽略自定义 `tls-alpn` 和 session-ticket 设置；普通 TLS 不适用该例外。旧 VMess `aead=false`、启用的 Shadowsocks UoT/SSR、不支持的 TLS ALPN 和禁用 TLS session 复用会被拒绝，不会静默丢弃。
 
 ## 离线解析与探测
 
