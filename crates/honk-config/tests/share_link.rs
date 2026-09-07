@@ -1246,7 +1246,7 @@ fn shadowrocket_vmess_ws_and_grpc_match_v2rayn_json() {
     let standard_authority = base64::engine::general_purpose::STANDARD
         .encode(format!("auto:{uuid}@vmess.example.com:443"));
     let standard_ws = Node::from_share_link(&format!(
-        "vmess://{standard_authority}?tls=1&peer=sni.example.com&obfs=websocket&path=%2Fvmess-ws&obfsParam=cdn.example.com"
+        "vmess://{standard_authority}?tls=1&peer=sni.example.com&obfs=websocket&path=%2Fvmess-ws&obfsParam=cdn.example.com&tls=1"
     ))
     .unwrap();
     assert_eq!(standard_ws.outbound, canonical_ws.outbound);
@@ -1281,6 +1281,10 @@ fn shadowrocket_vmess_rejects_bad_authorities_and_conflicts() {
         "obfs=http",
         "obfs=websocket&type=grpc",
         "allowInsecure=maybe",
+        "security=reality",
+        "tls=1&pbk=active-reality-key",
+        "encryption=chacha20-poly1305",
+        "scy=none",
     ] {
         assert!(
             Node::from_share_link(&format!("vmess://{}?{query}", b64(valid))).is_err(),

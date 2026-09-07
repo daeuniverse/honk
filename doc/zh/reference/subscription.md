@@ -118,6 +118,8 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 
 Hysteria2 导入 `password`/`auth`、`obfs: salamander` 与 `obfs-password`、上传/下载带宽、`ports`/`mport` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。TUIC 导入 UUID/password、拥塞控制、ALPN、接收窗口和 MTU。AnyTLS 导入 `idle-session-check-interval`、`idle-session-timeout` 和 `min-idle-session`。支持的拼写别名会在派生节点身份前规范化。
 
+显式关闭的功能 block 按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；节点模型无法保留显式 UDP 限制时会拒绝导入。TUIC 允许省略 password 或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN；Juicity 接收窗口固定为 8 MiB，因此拒绝非默认覆盖值。
+
 #### VLESS transport 与 REALITY
 
 VLESS 字段会在派生节点身份前应用：
@@ -136,7 +138,7 @@ VLESS 字段会在派生节点身份前应用：
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
-嵌套 WS/gRPC 值优先于其扁平别名。若存在 `reality-opts`，但它不是 mapping 或缺少非空 `public-key`，则跳过该条目；绝不会降级成普通 TLS。
+嵌套 WS/gRPC 值优先于其扁平别名。启用的 `reality-opts` 必须是 mapping 且含非空 `public-key`；无效的启用声明绝不会降级成普通 TLS。空 block 或显式禁用的功能 block 会被忽略。
 
 #### VLESS packet mode
 
@@ -153,14 +155,14 @@ VLESS 字段会在派生节点身份前应用：
 
 VLESS Clash 条目出现下列任一情况时会被拒绝：
 
-- 重复别名或重复 XUDP 表示；
+- 别名值相互冲突或重复 XUDP 表示；
 - H2MUX、UoT 与 XUDP 中启用多个 mode；
 - 启用 `packet-addr`/`packet_addr` 或顶层 `mux`；
 - 已启用的 `smux`/`multiplex` block 既没有 `protocol: h2mux`，也没有显式 `padding` bool；
 - multiplex 协议不是 `h2mux`、`only-tcp: true`、启用 Brutal 设置，或 `max-connections`、`min-streams`、`max-streams` 调优值非零；
 - `udp-over-tcp` version 不是 `0` 或 `2`；
 - `udp: true` 与显式禁用的 packet mode 冲突，或非 `legacy` mode 搭配 `udp: false`；
-- packet encoding 既不是空值也不是 `xudp`，包括 packetaddr 与 `mux-cool` 别名；
+- 未支持的 packet encoding（接受空值、`none`、`legacy` 与 `xudp`）；packetaddr 和 `mux-cool` 别名仍不支持；
 - 非 `legacy` mode 与 VLESS Encryption 组合，或与受支持的 `xudp` + `xtls-rprx-vision` 之外的 `flow` 组合。
 
 规范 VLESS 分享链接使用 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`。`smux`、`udp-over-tcp`、`packet-encoding` 等含义模糊的第三方分享链接 key 会被拒绝，不会猜测其语义。
@@ -169,13 +171,17 @@ VLESS Clash 条目出现下列任一情况时会被拒绝：
 
 SIP008 version 1/2 wrapper（`{"servers":[...]}`）及裸服务器数组会导入 Shadowsocks 的 `server`、`server_port`、`method`、`password` 和 `remarks`。空插件字段不会导致拒绝；有效的插件配置仍不受支持。
 
-sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet mode 和受支持的协议调优会通过共同的节点构建逻辑规范化。VLESS 默认使用 XUDP，除非显式选择仅 TCP 或不使用 packet encoding。不支持的链式代理、线协议功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
+sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet mode 和受支持的协议调优会通过共同的节点构建逻辑规范化。只有未启用 multiplex/UoT、未限制为仅 TCP 且没有显式 packet encoding 时，VLESS 才默认使用 XUDP。gRPC service name 为空或省略时保留 sing-box 的空 service，不套用 honk 的 `GunService` 默认值。Hysteria2 可以只提供 `server_ports`，以第一个跳跃端口作为名义端点。不支持的链式代理、线协议功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
+
+显式 sing-box 原生 VLESS UDP（`packet_encoding: ""` 且未限制为仅 TCP、未启用 wrapper）尚不支持，会跳过；启用 H2MUX 时由它承载 packet 路径，即使来源同时显式写出 `packet_encoding: "xudp"`。
 
 ### Surge、Surfboard、Loon 与 Quantumult X
 
 导入器接受 Surge/Surfboard/Loon 的具名逗号分隔记录，以及 Quantumult X 的 `protocol=endpoint,...,tag=name` 记录。完整配置使用 `[Proxy]` 或 `[server_local]`；其他 section 会被忽略。带引号的名称/密码可以包含逗号、等号、转义引号和有意保留的首尾空格。
 
 受支持的记录把凭据、TLS/SNI、WebSocket/gRPC、REALITY 和已实现的协议选项映射到同一节点模型。Quantumult X 的 `obfs=wss` 同时使用 `obfs-host` 作为 WebSocket Host 和默认 TLS SNI；显式 TLS 主机名优先。SSR、不支持的插件/混淆及传输方式会被跳过，不会冒充另一种协议导入。
+
+有效的 Quantumult X `tls-cert-sha256` / `tls-pubkey-sha256` 固定证书设置会被拒绝：honk 的叶证书 pin 会替代 PKI，不能拿它替换尚未确认等价的外部验证约定。显式设置 `tls-verification=false` 时，QX 会忽略两类 pin，导入会保留该禁用验证行为。旧 VMess `aead=false`、启用的 Shadowsocks UoT/SSR、自定义 TLS ALPN 和禁用 TLS session 复用也会被拒绝，不会静默丢弃。
 
 ## 离线解析与探测
 

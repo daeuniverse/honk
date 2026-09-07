@@ -194,7 +194,7 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 The Score group policy is always compiled and has no Cargo feature; Selector remains the omitted/default policy.
 
-`build.rs` (only with `ebpf`) locates the eBPF object (`crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o`), **verifies it contains `.BTF`** (rebuilds with `cargo +nightly` when missing or BTF-less — the rebuild strips `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` from the child env because an environment RUSTFLAGS overrides `crates/honk-ebpf/.cargo/config.toml`'s `--btf` flags and silently produces BTF-less objects), copies it to `OUT_DIR/honk-ebpf.o`, and sets `HONK_EBPF_OBJECT`; `lib.rs` embeds it with `include_bytes!`. Runtime override: `--bpf-object`.
+`build.rs` always emits `HONK_VERSION`: the GitHub release tag, local `git describe`, or the Cargo package version when Git metadata is unavailable. `honk_core::VERSION` supplies both CLIs and Clash `/version`; Git is not needed at runtime. With `ebpf`, the script also locates the eBPF object (`crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o`), **verifies it contains `.BTF`** (rebuilds with `cargo +nightly` when missing or BTF-less — the rebuild strips `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` from the child env because an environment RUSTFLAGS overrides `crates/honk-ebpf/.cargo/config.toml`'s `--btf` flags and silently produces BTF-less objects), copies it to `OUT_DIR/honk-ebpf.o`, and sets `HONK_EBPF_OBJECT`; `lib.rs` embeds it with `include_bytes!`. Runtime override: `--bpf-object`.
 
 Module map:
 

@@ -194,13 +194,20 @@ fn normalize_sing_box(value: Value) -> NodeResult {
         "server",
         "sing-box outbound server is missing or invalid",
     )?;
-    move_required_port(
-        &mut source,
-        &mut proxy,
-        "server_port",
-        "port",
-        "sing-box outbound port is missing or invalid",
-    )?;
+    let hopping_port = if protocol == Protocol::Hysteria2 {
+        normalize_server_ports(&mut source, &mut proxy)?
+    } else {
+        None
+    };
+    match (take(&mut source, "server_port"), hopping_port) {
+        (Some(port), _) if matches!(port.as_u64(), Some(1..=65535)) => {
+            put(&mut proxy, "port", port);
+        }
+        (Some(Value::Null) | None, Some(port)) => {
+            put(&mut proxy, "port", Value::Number(port.into()));
+        }
+        _ => return Err("sing-box outbound port is missing or invalid"),
+    }
 
     match protocol {
         Protocol::Shadowsocks => normalize_shadowsocks(source, proxy),
@@ -360,13 +367,16 @@ fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
     )?;
     let network = normalize_packet_network(&mut source, &mut proxy)?;
     let packet_encoding = take(&mut source, "packet_encoding");
+    let multiplex = normalize_vless_multiplex(&mut source, &mut proxy)?;
+    let uot = normalize_vless_uot(&mut source, &mut proxy)?;
     let packet_encoding = match packet_encoding {
-        None if network == PacketNetwork::Both => "xudp",
-        None => "",
+        None | Some(Value::Null) if network == PacketNetwork::Both && !multiplex && !uot => "xudp",
+        None | Some(Value::Null) => "",
         Some(Value::String(value)) if matches!(value.as_str(), "" | "xudp") => {
-            if network == PacketNetwork::TcpOnly {
-                ""
-            } else if value.is_empty() {
+            if value.is_empty() && network == PacketNetwork::Both && !multiplex && !uot {
+                return Err("native sing-box VLESS UDP is unsupported");
+            }
+            if network == PacketNetwork::TcpOnly || multiplex || uot || value.is_empty() {
                 ""
             } else {
                 "xudp"
@@ -380,8 +390,6 @@ fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
         "packet-encoding",
         Value::String(packet_encoding.into()),
     );
-    normalize_vless_multiplex(&mut source, &mut proxy)?;
-    normalize_vless_uot(&mut source, &mut proxy)?;
     normalize_transport(&mut source, &mut proxy)?;
     normalize_tls(&mut source, &mut proxy, Protocol::Vless, false)?;
     Ok(proxy)
@@ -447,7 +455,6 @@ fn normalize_hysteria2(mut source: Mapping, mut proxy: Mapping) -> Result<Mappin
         "hop-interval",
         "conflicting sing-box Hysteria2 hop interval fields",
     )?;
-    normalize_server_ports(&mut source, &mut proxy)?;
     normalize_hysteria2_obfs(&mut source, &mut proxy)?;
     normalize_quic_fields(&mut source, &mut proxy, true)?;
     normalize_tls(&mut source, &mut proxy, Protocol::Hysteria2, true)?;
@@ -597,15 +604,18 @@ fn reject_packet_encoding(source: &mut Mapping, error: &'static str) -> Result<(
 fn normalize_vless_multiplex(
     source: &mut Mapping,
     proxy: &mut Mapping,
-) -> Result<(), &'static str> {
+) -> Result<bool, &'static str> {
     let Some(value) = take(source, "multiplex") else {
-        return Ok(());
+        return Ok(false);
     };
+    if matches!(value, Value::Null) {
+        return Ok(false);
+    }
     let Value::Mapping(mut multiplex) = value else {
         return Err("sing-box VLESS multiplex settings must be an object");
     };
     if !take_bool(&mut multiplex, "enabled")?.unwrap_or(false) {
-        return Ok(());
+        return Ok(false);
     }
     match take(&mut multiplex, "protocol") {
         None => put(&mut multiplex, "protocol", Value::String("h2mux".into())),
@@ -629,19 +639,19 @@ fn normalize_vless_multiplex(
     )?;
     put(&mut multiplex, "enabled", Value::Bool(true));
     put(proxy, "multiplex", Value::Mapping(multiplex));
-    Ok(())
+    Ok(true)
 }
 
-fn normalize_vless_uot(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
+fn normalize_vless_uot(source: &mut Mapping, proxy: &mut Mapping) -> Result<bool, &'static str> {
     let Some(value) = take(source, "udp_over_tcp") else {
-        return Ok(());
+        return Ok(false);
     };
     let mut options = match value {
-        Value::Bool(false) | Value::Null => return Ok(()),
+        Value::Bool(false) | Value::Null => return Ok(false),
         Value::Bool(true) => Mapping::new(),
         Value::Mapping(mut options) => {
             if !take_bool(&mut options, "enabled")?.unwrap_or(false) {
-                return Ok(());
+                return Ok(false);
             }
             options
         }
@@ -659,7 +669,7 @@ fn normalize_vless_uot(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), 
     )?;
     put(&mut options, "enabled", Value::Bool(true));
     put(proxy, "udp-over-tcp", Value::Mapping(options));
-    Ok(())
+    Ok(true)
 }
 
 fn normalize_transport(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
@@ -746,13 +756,13 @@ fn normalize_grpc_transport(
     proxy: &mut Mapping,
 ) -> Result<(), &'static str> {
     let mut options = Mapping::new();
-    move_optional_string(
+    let service = take_optional_string(
         &mut transport,
-        &mut options,
         "service_name",
-        "grpc-service-name",
         "sing-box gRPC service name must be a string",
-    )?;
+    )?
+    .unwrap_or_else(|| Value::String(String::new()));
+    put(&mut options, "grpc-service-name", service);
     for key in ["idle_timeout", "ping_timeout", "permit_without_stream"] {
         reject_active_key(
             &mut transport,
@@ -830,10 +840,14 @@ fn normalize_tls(
         normalize_reality(reality, proxy, protocol, enabled)?;
     }
     if let Some(alpn) = alpn.filter(active) {
-        if protocol != Protocol::Tuic {
+        validate_alpn(&alpn)?;
+        let fixed_h3 = matches!(&alpn, Value::String(value) if value == "h3")
+            || matches!(&alpn, Value::Sequence(values) if values.len() == 1 && values[0].as_str() == Some("h3"));
+        if protocol != Protocol::Tuic
+            && !(matches!(protocol, Protocol::Hysteria2 | Protocol::Juicity) && fixed_h3)
+        {
             return Err("TLS ALPN is unsupported for this sing-box protocol");
         }
-        validate_alpn(&alpn)?;
         put(proxy, "alpn", alpn);
     }
     Ok(())
@@ -932,11 +946,15 @@ fn normalize_hysteria2_obfs(source: &mut Mapping, proxy: &mut Mapping) -> Result
     Ok(())
 }
 
-fn normalize_server_ports(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
+fn normalize_server_ports(
+    source: &mut Mapping,
+    proxy: &mut Mapping,
+) -> Result<Option<u16>, &'static str> {
     let Some(value) = take(source, "server_ports") else {
-        return Ok(());
+        return Ok(None);
     };
     let values = match value {
+        Value::Null => return Ok(None),
         Value::String(value) => vec![value],
         Value::Sequence(values) => values
             .into_iter()
@@ -948,7 +966,7 @@ fn normalize_server_ports(source: &mut Mapping, proxy: &mut Mapping) -> Result<(
         _ => return Err("sing-box Hysteria2 server ports must be a string array"),
     };
     if values.is_empty() || (values.len() == 1 && values[0].trim().is_empty()) {
-        return Ok(());
+        return Ok(None);
     }
     if values.iter().any(|value| value.trim().is_empty()) {
         return Err("sing-box Hysteria2 server ports must not contain empty entries");
@@ -958,8 +976,23 @@ fn normalize_server_ports(source: &mut Mapping, proxy: &mut Mapping) -> Result<(
         .map(|value| value.replace(':', "-"))
         .collect::<Vec<_>>()
         .join(",");
+    let mut first_port = None;
+    for range in ports.split(',') {
+        let (start, end) = range
+            .split_once('-')
+            .map_or((range, range), |(start, end)| (start, end));
+        let start = start.trim().parse::<u16>().ok().filter(|port| *port > 0);
+        let end = end.trim().parse::<u16>().ok().filter(|port| *port > 0);
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err("sing-box Hysteria2 server ports are invalid");
+        };
+        if start > end {
+            return Err("sing-box Hysteria2 server ports are invalid");
+        }
+        first_port.get_or_insert(start);
+    }
     put(proxy, "ports", Value::String(ports));
-    Ok(())
+    Ok(first_port)
 }
 
 fn normalize_quic_fields(
@@ -1244,10 +1277,10 @@ mod tests {
                     {"type":"vmess","tag":"vmess","server":"vmess.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000002","security":"auto","alter_id":0,"network":"tcp","tls":{"enabled":true,"server_name":"vmess-sni.example","insecure":true},"transport":{"type":"ws","path":"/socket","headers":{"Host":"ws-host.example"}}},
                     {"type":"vless","tag":"vless","server":"vless.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000003","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"vless-sni.example","reality":{"enabled":true,"public_key":"jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc","short_id":"abcd"},"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"TunService"}},
                     {"type":"trojan","tag":"trojan","server":"trojan.example","server_port":443,"password":"trojan-password","tls":{"enabled":true,"server_name":"trojan-sni.example"}},
-                    {"type":"hysteria2","tag":"hy2","server":"hy2.example","server_port":443,"server_ports":["20000:20002","8443"],"hop_interval":"15s","up_mbps":100,"down_mbps":200,"password":"hy2-password","obfs":{"type":"salamander","password":"obfs-password"},"initial_stream_receive_window":1048576,"initial_connection_receive_window":2097152,"disable_path_mtu_discovery":true,"tls":{"enabled":true,"server_name":"hy2-sni.example","insecure":true}},
+                    {"type":"hysteria2","tag":"hy2","server":"hy2.example","server_ports":["20000:20002","8443"],"hop_interval":"15s","up_mbps":100,"down_mbps":200,"password":"hy2-password","obfs":{"type":"salamander","password":"obfs-password"},"initial_stream_receive_window":1048576,"initial_connection_receive_window":2097152,"disable_path_mtu_discovery":true,"tls":{"enabled":true,"server_name":"hy2-sni.example","insecure":true,"alpn":["h3"]}},
                     {"type":"tuic","tag":"tuic","server":"tuic.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000004","password":"tuic-password","congestion_control":"bbr","udp_relay_mode":"native","initial_packet_size":1252,"tls":{"enabled":true,"server_name":"tuic-sni.example","alpn":["h3","tuic"]}},
                     {"type":"anytls","tag":"anytls","server":"anytls.example","server_port":443,"password":"anytls-password","network":"tcp","min_idle_session":4,"idle_session_check_interval":"30s","idle_session_timeout":"1m","tls":{"enabled":true,"server_name":"anytls-sni.example"}},
-                    {"type":"juicity","tag":"juicity","server":"juicity.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000005","password":"juicity-password","tls":{"enabled":true,"server_name":"juicity-sni.example"}}
+                    {"type":"juicity","tag":"juicity","server":"juicity.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000005","password":"juicity-password","initial_stream_receive_window":8388608,"initial_connection_receive_window":8388608,"tls":{"enabled":true,"server_name":"juicity-sni.example","alpn":["h3"]}}
                   ]
                 }"#,
             ),
@@ -1299,6 +1332,7 @@ mod tests {
         assert_eq!(vless.tls.reality_short_id.as_deref(), Some("abcd"));
 
         let hy2 = nodes[5].hysteria2().unwrap();
+        assert_eq!(nodes[5].port, 20_000);
         assert_eq!(hy2.auth.as_deref(), Some("hy2-password"));
         assert_eq!(hy2.obfs.as_deref(), Some("obfs-password"));
         assert_eq!(hy2.up_mbps, Some(100));
@@ -1328,8 +1362,9 @@ mod tests {
                 r#"{"outbounds":[
                   {"type":"vless","tag":"default-xudp","server":"one.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000011"},
                   {"type":"vless","tag":"explicit-native","server":"two.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000012","network":"tcp","packet_encoding":""},
-                  {"type":"vless","tag":"h2mux","server":"three.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000013","packet_encoding":"","multiplex":{"enabled":true,"protocol":"h2mux","padding":true}},
-                  {"type":"vless","tag":"uot","server":"four.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000014","packet_encoding":"","udp_over_tcp":{"enabled":true,"version":2}}
+                  {"type":"vless","tag":"h2mux","server":"three.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000013","multiplex":{"enabled":true,"protocol":"h2mux","padding":true}},
+                  {"type":"vless","tag":"uot","server":"four.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000014","udp_over_tcp":{"enabled":true,"version":2}},
+                  {"type":"vless","tag":"mux-explicit-xudp","server":"five.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000019","packet_encoding":"xudp","multiplex":{"enabled":true,"protocol":"h2mux"}}
                 ]}"#,
             ),
             None,
@@ -1340,6 +1375,35 @@ mod tests {
         assert_eq!(nodes[1].network(), Some("tcp"));
         assert_eq!(nodes[2].vless().unwrap().mode, WireMode::H2muxPadded);
         assert_eq!(nodes[3].vless().unwrap().mode, WireMode::UotV2);
+        assert_eq!(nodes[4].vless().unwrap().mode, WireMode::H2mux);
+    }
+
+    #[test]
+    fn sing_box_empty_grpc_and_tuic_defaults_are_preserved() {
+        let nodes = parse_json_subscription(
+            json(
+                r#"{"outbounds":[
+                  {"type":"vless","tag":"grpc-default","server":"one.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000015","transport":{"type":"grpc"}},
+                  {"type":"vless","tag":"grpc-empty","server":"two.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000016","transport":{"type":"grpc","service_name":""}},
+                  {"type":"tuic","tag":"tuic-missing-password","server":"three.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000017","tls":{"enabled":true}},
+                  {"type":"tuic","tag":"tuic-empty-password","server":"four.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000018","password":"","tls":{"enabled":true}}
+                ]}"#,
+            ),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(
+            nodes[0].transport().unwrap().grpc_service.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            nodes[1].transport().unwrap().grpc_service.as_deref(),
+            Some("")
+        );
+        assert!(nodes[2].tuic().unwrap().password.is_none());
+        assert!(nodes[3].tuic().unwrap().password.is_none());
     }
 
     #[test]
@@ -1349,6 +1413,12 @@ mod tests {
                 r#"{"outbounds":[
                   {"type":"selector","tag":"select","outbounds":["good"]},
                   {"type":"vless","tag":"bad-packet-mode","server":"bad.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000021","packet_encoding":"packetaddr"},
+                  {"type":"vless","tag":"unsupported-native-udp","server":"native.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000024","packet_encoding":""},
+                  {"type":"hysteria2","tag":"bad-hop-range","server":"bad-hop.example","server_ports":["9000:8000"],"password":"password","tls":{"enabled":true}},
+                  {"type":"hysteria2","tag":"bad-hy2-alpn","server":"bad-hy2.example","server_port":443,"password":"password","tls":{"enabled":true,"alpn":["hq-29"]}},
+                  {"type":"juicity","tag":"bad-juicity-alpn","server":"bad-juicity.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000022","password":"password","tls":{"enabled":true,"alpn":["hq-29"]}},
+                  {"type":"juicity","tag":"bad-window","server":"bad-window.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000023","password":"password","initial_stream_receive_window":1048576,"tls":{"enabled":true,"alpn":["h3"]}},
+                  {"type":"tuic","tag":"missing-tuic-uuid","server":"missing-tuic.example","server_port":443,"password":"password","tls":{"enabled":true}},
                   {"type":"shadowsocks","tag":"plugin","server":"plugin.example","server_port":8388,"method":"aes-256-gcm","password":"password","plugin":"v2ray-plugin"},
                   {"type":"shadowsocks","tag":"good","server":"good.example","server_port":8388,"method":"aes-256-gcm","password":"password"}
                 ]}"#,

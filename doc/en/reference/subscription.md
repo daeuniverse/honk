@@ -118,6 +118,8 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 
 Hysteria2 imports `password`/`auth`, `obfs: salamander` with `obfs-password`, upload/download bandwidth, `ports`/`mport` hopping ranges, `hop-interval`/`mhop`, receive windows, MTU, and MTU-discovery settings. TUIC imports UUID/password, congestion control, ALPN, receive windows, and MTU. AnyTLS imports `idle-session-check-interval`, `idle-session-timeout`, and `min-idle-session`. Supported spelling aliases are normalized before node identity is derived.
 
+Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols; an explicit UDP restriction is rejected where the node model cannot preserve it. TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection; Juicity receive windows remain fixed at 8 MiB, so non-default overrides are rejected.
+
 #### VLESS transport and REALITY
 
 VLESS fields are applied before node identity is derived:
@@ -136,7 +138,7 @@ VLESS fields are applied before node identity is derived:
 | `grpc-opts.grpc-service-name` | gRPC service name; falls back to `grpc-service`. |
 | `client-fingerprint` | Intentionally not imported. TLS fingerprint selection is process-wide through `global.tls_implementation` and `global.utls_imitate`. |
 
-Nested WS/gRPC values take precedence over their flat aliases. If `reality-opts` is present but is not a mapping or lacks a non-empty `public-key`, the entry is skipped; it is never downgraded to ordinary TLS.
+Nested WS/gRPC values take precedence over their flat aliases. Active `reality-opts` must be a mapping with a non-empty `public-key`; an invalid active declaration is never downgraded to ordinary TLS. Empty or explicitly disabled feature blocks are ignored.
 
 #### VLESS packet modes
 
@@ -153,14 +155,14 @@ Nested WS/gRPC values take precedence over their flat aliases. If `reality-opts`
 
 A VLESS Clash entry is rejected for any of these conditions:
 
-- duplicate aliases or duplicate XUDP representations;
+- conflicting alias values or duplicate XUDP representations;
 - more than one enabled mode among H2MUX, UoT, and XUDP;
 - enabled `packet-addr`/`packet_addr` or top-level `mux`;
 - an enabled `smux`/`multiplex` block with neither `protocol: h2mux` nor an explicit `padding` boolean;
 - a multiplex protocol other than `h2mux`, `only-tcp: true`, enabled Brutal settings, or non-zero `max-connections`, `min-streams`, or `max-streams` tuning;
 - `udp-over-tcp` version other than `0` or `2`;
 - `udp: true` contradicting an explicitly disabled packet mode, or `udp: false` with a non-legacy mode;
-- a packet encoding other than empty or `xudp`, including packetaddr and `mux-cool` aliases;
+- an unsupported packet encoding (empty, `none`, `legacy`, and `xudp` are recognized); packetaddr and `mux-cool` aliases remain unsupported;
 - a non-legacy mode combined with VLESS Encryption, or with `flow` other than the supported `xudp` + `xtls-rprx-vision` combination.
 
 Canonical VLESS share links use `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. Ambiguous third-party share-link keys such as `smux`, `udp-over-tcp`, and `packet-encoding` are rejected rather than guessed.
@@ -169,13 +171,17 @@ Canonical VLESS share links use `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xud
 
 SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. Empty plugin fields are harmless; active plugins remain unsupported.
 
-sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet modes, and supported protocol tuning are normalized through the common node builder. A VLESS outbound defaults to XUDP unless it explicitly selects TCP-only or no packet encoding. Unsupported chaining, wire features, and authentication requirements are not silently dropped. Per-node uTLS fingerprint hints do not override honk's process-wide TLS settings.
+sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet modes, and supported protocol tuning are normalized through the common node builder. VLESS defaults to XUDP only when no enabled multiplex/UoT wrapper, TCP-only restriction, or explicit packet encoding selects another behavior. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, and authentication requirements are not silently dropped. Per-node uTLS fingerprint hints do not override honk's process-wide TLS settings.
+
+Explicit sing-box native VLESS UDP (`packet_encoding: ""` without TCP-only or an enabled wrapper) is unsupported and skipped; enabled H2MUX owns the packet path even when the source also spells out `packet_encoding: "xudp"`.
 
 ### Surge, Surfboard, Loon, and Quantumult X
 
 The importer accepts named comma-separated records from Surge/Surfboard/Loon and `protocol=endpoint,...,tag=name` records from Quantumult X. Full profiles use `[Proxy]` or `[server_local]`; other sections are ignored. Quoted names/passwords may contain commas, equals signs, escaped quotes, and intentional edge spaces.
 
 Supported records map credentials, TLS/SNI, WebSocket/gRPC, REALITY, and implemented protocol options to the same node model. Quantumult X `obfs=wss` uses `obfs-host` for both WebSocket Host and the default TLS SNI; an explicit TLS hostname wins. SSR, unsupported plugins/obfuscation, and unsupported transports are skipped rather than imported as another protocol.
+
+Effective Quantumult X `tls-cert-sha256` and `tls-pubkey-sha256` pins are rejected: honk's leaf-certificate pin replaces PKI, and it is not substituted for an unverified foreign verification contract. With explicit `tls-verification=false`, QX ignores both pins and the import preserves that disabled verification. Legacy VMess `aead=false`, active Shadowsocks UoT/SSR, custom TLS ALPN, and disabled TLS-session reuse are also rejected rather than discarded.
 
 ## Offline parsing and probes
 

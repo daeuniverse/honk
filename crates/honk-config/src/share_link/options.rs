@@ -18,7 +18,7 @@ pub(super) fn parse_query(
     let mut mode_seen = false;
     for (key, value) in url.query_pairs() {
         let key = key.into_owned();
-        if shadowrocket_vmess && query.contains_key(&key) {
+        if shadowrocket_vmess && query.get(&key).is_some_and(|previous| previous != &value) {
             return Err(ConfigError::Parse(
                 "duplicate VMess share-link parameter".into(),
             ));
@@ -44,6 +44,14 @@ pub(super) fn parse_query(
         ));
     }
     if shadowrocket_vmess {
+        if ["pbk", "sid", "spx"]
+            .iter()
+            .any(|key| query.get(*key).is_some_and(|value| !value.is_empty()))
+        {
+            return Err(ConfigError::Parse(
+                "REALITY parameters are unsupported in encoded VMess links".into(),
+            ));
+        }
         if query.get("alterId").is_some_and(|value| value != "0") {
             return Err(ConfigError::Parse(
                 "unsupported VMess share-link option".into(),
@@ -313,6 +321,11 @@ pub(super) fn apply_protocol(
                         .filter(|value| !matches!(value.as_str(), "none" | "tls"))
                 })
             {
+                if !matches!(cipher.as_str(), "auto" | "aes-128-gcm") {
+                    return Err(ConfigError::Parse(
+                        "unsupported VMess share-link cipher".into(),
+                    ));
+                }
                 config.encryption = Some(cipher.clone());
             }
         }

@@ -681,17 +681,37 @@ fn yaml_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a ser
     mapping.get(serde_yaml::Value::String(key.to_string()))
 }
 
+fn yaml_values_equal(a: &serde_yaml::Value, b: &serde_yaml::Value) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (
+            serde_yaml::Value::Number(_) | serde_yaml::Value::String(_),
+            serde_yaml::Value::Number(_) | serde_yaml::Value::String(_),
+        ) => matches!(
+            (yaml_u64(a, "").ok(), yaml_u64(b, "").ok()),
+            (Some(a), Some(b)) if a == b
+        ),
+        _ => false,
+    }
+}
+
 fn yaml_alias<'a>(
     mapping: &'a serde_yaml::Mapping,
     keys: &[&str],
 ) -> Result<Option<&'a serde_yaml::Value>, String> {
     let mut found = None;
     for key in keys {
-        if let Some(value) = yaml_value(mapping, key) {
-            if found.is_some() {
-                return Err(format!("conflicting aliases '{}'", keys.join("/")));
-            }
-            found = Some(value);
+        let Some(value) = yaml_value(mapping, key) else {
+            continue;
+        };
+        match found {
+            None => found = Some(value),
+            Some(_) if matches!(value, serde_yaml::Value::Null) => {}
+            Some(previous) if matches!(previous, serde_yaml::Value::Null) => found = Some(value),
+            Some(previous) if yaml_values_equal(previous, value) => {}
+            Some(_) => return Err(format!("conflicting aliases '{}'", keys.join("/"))),
         }
     }
     Ok(found)
@@ -708,9 +728,26 @@ fn parse_vless_external_mode(
                 .ok_or_else(|| "VLESS udp must be boolean".to_string())
         })
         .transpose()?;
+    if yaml_value(mapping, "packet-encoding")
+        .is_some_and(|value| !matches!(value, serde_yaml::Value::Null))
+        && yaml_value(mapping, "packet_encoding")
+            .is_some_and(|value| !matches!(value, serde_yaml::Value::Null))
+    {
+        return Err("duplicate VLESS XUDP representations".into());
+    }
 
-    let packet_encoding = yaml_alias(mapping, &["packet-encoding", "packet_encoding"])?;
-    let xudp = yaml_value(mapping, "xudp");
+    let packet_encoding = yaml_alias(mapping, &["packet-encoding", "packet_encoding"])?
+        .filter(|value| yaml_active(value));
+    let xudp = yaml_value(mapping, "xudp").filter(|value| match value {
+        serde_yaml::Value::Null => false,
+        serde_yaml::Value::String(value) => !value.trim().is_empty(),
+        _ => true,
+    });
+    let packet_encoding_disabled = packet_encoding.is_some_and(|value| {
+        value
+            .as_str()
+            .is_some_and(|encoding| matches!(encoding.trim(), "none" | "legacy"))
+    });
     let xudp_enabled = match (packet_encoding, xudp) {
         (Some(value), None) => {
             let encoding = value
@@ -718,7 +755,7 @@ fn parse_vless_external_mode(
                 .ok_or_else(|| "VLESS packet encoding must be a string".to_string())?
                 .trim();
             match encoding {
-                "" => false,
+                "" | "none" | "legacy" => false,
                 "xudp" => true,
                 _ => return Err(format!("unsupported VLESS packet encoding '{encoding}'")),
             }
@@ -729,8 +766,11 @@ fn parse_vless_external_mode(
         (None, None) => false,
         (Some(_), Some(_)) => return Err("duplicate VLESS XUDP representations".into()),
     };
-    let xudp_disabled = xudp.is_some_and(|value| value.as_bool() == Some(false));
-    if let Some(value) = yaml_alias(mapping, &["packet-addr", "packet_addr"])? {
+    let xudp_disabled =
+        packet_encoding_disabled || xudp.is_some_and(|value| value.as_bool() == Some(false));
+    if let Some(value) =
+        yaml_alias(mapping, &["packet-addr", "packet_addr"])?.filter(|value| yaml_active(value))
+    {
         let enabled = value
             .as_bool()
             .ok_or_else(|| "VLESS packet-addr must be boolean".to_string())?;
@@ -738,7 +778,7 @@ fn parse_vless_external_mode(
             return Err("unsupported VLESS packet-addr mode".into());
         }
     }
-    if let Some(value) = yaml_value(mapping, "mux") {
+    if let Some(value) = yaml_value(mapping, "mux").filter(|value| yaml_active(value)) {
         let enabled = match value {
             serde_yaml::Value::Bool(enabled) => *enabled,
             serde_yaml::Value::Mapping(options) => match yaml_value(options, "enabled") {
@@ -755,7 +795,9 @@ fn parse_vless_external_mode(
     }
 
     let mut mux_mode = None;
-    if let Some(value) = yaml_alias(mapping, &["smux", "multiplex"])? {
+    if let Some(value) =
+        yaml_alias(mapping, &["smux", "multiplex"])?.filter(|value| yaml_active(value))
+    {
         let options = value
             .as_mapping()
             .ok_or_else(|| "VLESS multiplex settings must be a mapping".to_string())?;
@@ -842,7 +884,9 @@ fn parse_vless_external_mode(
     }
 
     let mut uot_enabled = false;
-    if let Some(value) = yaml_alias(mapping, &["udp-over-tcp", "udp_over_tcp"])? {
+    if let Some(value) =
+        yaml_alias(mapping, &["udp-over-tcp", "udp_over_tcp"])?.filter(|value| yaml_active(value))
+    {
         match value {
             serde_yaml::Value::Bool(enabled) => uot_enabled = *enabled,
             serde_yaml::Value::Mapping(options) => {
@@ -885,7 +929,10 @@ fn parse_vless_external_mode(
     } else {
         WireMode::Legacy
     };
-    if udp == Some(true) && mode == WireMode::Legacy && !xudp_disabled {
+    if udp == Some(true) && mode == WireMode::Legacy {
+        if xudp_disabled {
+            return Err("VLESS udp=true requires an enabled packet mode".into());
+        }
         mode = WireMode::Xudp;
     }
     match (udp, mode) {
@@ -1095,7 +1142,6 @@ fn validate_imported_node(node: &Node) -> Result<(), String> {
         OutboundConfig::Tuic(config) => {
             let uuid = nonempty(config.uuid.as_ref(), "TUIC UUID")?;
             uuid::Uuid::parse_str(uuid).map_err(|_| "TUIC UUID is invalid")?;
-            nonempty(config.password.as_ref(), "TUIC password")?;
         }
         OutboundConfig::Juicity(config) => {
             let uuid = nonempty(config.uuid.as_ref(), "Juicity UUID")?;
@@ -1109,14 +1155,41 @@ fn validate_imported_node(node: &Node) -> Result<(), String> {
     }
     Ok(())
 }
+
 fn yaml_active(value: &serde_yaml::Value) -> bool {
     match value {
         serde_yaml::Value::Null => false,
+        serde_yaml::Value::Bool(value) => *value,
+        serde_yaml::Value::Number(value) => {
+            value.as_i64() != Some(0) && value.as_u64() != Some(0) && value.as_f64() != Some(0.0)
+        }
         serde_yaml::Value::String(value) => !value.trim().is_empty(),
         serde_yaml::Value::Sequence(value) => !value.is_empty(),
-        serde_yaml::Value::Mapping(value) => !value.is_empty(),
-        _ => true,
+        serde_yaml::Value::Mapping(value) => {
+            !value.is_empty()
+                && yaml_value(value, "enabled").is_none_or(|enabled| {
+                    !matches!(
+                        enabled,
+                        serde_yaml::Value::Null | serde_yaml::Value::Bool(false)
+                    )
+                })
+        }
+        serde_yaml::Value::Tagged(_) => true,
     }
+}
+
+fn yaml_active_for_key(key: &str, value: &serde_yaml::Value) -> bool {
+    if matches!(key, "pin-sha256" | "pin_sha256") {
+        return !matches!(value, serde_yaml::Value::Null);
+    }
+    if matches!(key, "packet-encoding" | "packet_encoding") {
+        return match value {
+            serde_yaml::Value::Null => false,
+            serde_yaml::Value::String(value) => !matches!(value.trim(), "" | "none" | "legacy"),
+            _ => yaml_active(value),
+        };
+    }
+    yaml_active(value)
 }
 
 fn apply_reality(
@@ -1128,7 +1201,7 @@ fn apply_reality(
     let Some(value) = yaml_value(mapping, "reality-opts") else {
         return Ok(());
     };
-    if matches!(value, serde_yaml::Value::Null) {
+    if !yaml_active(value) {
         return Ok(());
     }
     if !matches!(
@@ -1209,7 +1282,7 @@ fn parse_clash_proxy(
             "reality-opts",
         ]
         .into_iter()
-        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+        .any(|key| yaml_value(mapping, key).is_some_and(|value| yaml_active_for_key(key, value)))
     {
         return Err("TLS settings are unsupported for this protocol".into());
     }
@@ -1266,16 +1339,31 @@ fn parse_clash_proxy(
             "udp_over_tcp",
         ]
         .into_iter()
-        .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+        .any(|key| yaml_value(mapping, key).is_some_and(|value| yaml_active_for_key(key, value)))
     {
         return Err("VLESS packet wrappers are unsupported for this protocol".into());
     }
-    if !matches!(
+    let udp = yaml_bool_alias(mapping, &["udp"])?;
+    let udp_capable = matches!(
+        protocol,
+        NodeProtocol::SS
+            | NodeProtocol::Trojan
+            | NodeProtocol::VLess
+            | NodeProtocol::Socks5
+            | NodeProtocol::Hysteria2
+            | NodeProtocol::Tuic
+            | NodeProtocol::Juicity
+            | NodeProtocol::AnyTLS
+    );
+    let udp_restrictable = matches!(
         protocol,
         NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
-    ) && yaml_value(mapping, "udp").is_some_and(yaml_active)
-    {
+    );
+    if udp == Some(true) && !udp_capable {
         return Err("UDP capability is unsupported for this protocol".into());
+    }
+    if udp == Some(false) && !udp_restrictable {
+        return Err("UDP restriction is unsupported for this protocol".into());
     }
     if !matches!(protocol, NodeProtocol::Hysteria2)
         && [
@@ -1323,6 +1411,8 @@ fn parse_clash_proxy(
         "quic_mtu",
         "initial-stream-receive-window",
         "initial-conn-receive-window",
+        "initial_stream_receive_window",
+        "initial_conn_receive_window",
         "init-stream-receive-window",
         "init-conn-receive-window",
         "init_stream_receive_window",
@@ -1335,8 +1425,44 @@ fn parse_clash_proxy(
     {
         return Err("QUIC options are unsupported for this protocol".into());
     }
-    if protocol != NodeProtocol::Tuic && yaml_value(mapping, "alpn").is_some_and(yaml_active) {
-        return Err("TUIC ALPN is unsupported for this protocol".into());
+    if protocol == NodeProtocol::Juicity {
+        for keys in [
+            [
+                "initial-stream-receive-window",
+                "initial_stream_receive_window",
+                "init-stream-receive-window",
+                "init_stream_receive_window",
+                "initStreamReceiveWindow",
+            ],
+            [
+                "initial-conn-receive-window",
+                "initial_conn_receive_window",
+                "init-conn-receive-window",
+                "init_conn_receive_window",
+                "initConnReceiveWindow",
+            ],
+        ] {
+            if keys
+                .iter()
+                .any(|key| yaml_value(mapping, key).is_some_and(yaml_active))
+                && let Some(window) = yaml_u64_alias(mapping, &keys)?
+                && !matches!(window, 0 | 8_388_608)
+            {
+                return Err("Juicity receive-window override is unsupported".into());
+            }
+        }
+    }
+    if yaml_value(mapping, "alpn").is_some_and(yaml_active) {
+        match protocol {
+            NodeProtocol::Tuic => {}
+            NodeProtocol::Hysteria2 | NodeProtocol::Juicity => {
+                let alpn = yaml_list_alias(mapping, &["alpn"])?.unwrap_or_default();
+                if !alpn.split(',').all(|value| value.trim() == "h3") {
+                    return Err("unsupported fixed QUIC ALPN".into());
+                }
+            }
+            _ => return Err("TUIC ALPN is unsupported for this protocol".into()),
+        }
     }
     if yaml_bool_alias(mapping, &["disable-sni", "disable_sni"])? == Some(true) {
         return Err("disable-sni is unsupported".into());
@@ -1352,8 +1478,9 @@ fn parse_clash_proxy(
     let port = yaml_u64_alias(mapping, &["port"])?
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| "proxy port is invalid".to_string())?;
-    let name = yaml_text_alias(mapping, &["name"])?.unwrap_or_else(|| "imported-node".into());
-    let udp = yaml_bool_alias(mapping, &["udp"])?;
+    let name = yaml_text_alias(mapping, &["name"])?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{proxy_type}-{server}:{port}"));
     let tls_explicit = yaml_bool_alias(mapping, &["tls"])?;
     let mandatory_tls = matches!(
         protocol,
@@ -1445,6 +1572,7 @@ fn parse_clash_proxy(
                 mapping,
                 &[
                     "initial-stream-receive-window",
+                    "initial_stream_receive_window",
                     "init-stream-receive-window",
                     "init_stream_receive_window",
                     "initStreamReceiveWindow",
@@ -1454,6 +1582,7 @@ fn parse_clash_proxy(
                 mapping,
                 &[
                     "initial-conn-receive-window",
+                    "initial_conn_receive_window",
                     "init-conn-receive-window",
                     "init_conn_receive_window",
                     "initConnReceiveWindow",
@@ -1485,6 +1614,7 @@ fn parse_clash_proxy(
                 mapping,
                 &[
                     "initial-stream-receive-window",
+                    "initial_stream_receive_window",
                     "init-stream-receive-window",
                     "init_stream_receive_window",
                     "initStreamReceiveWindow",
@@ -1494,6 +1624,7 @@ fn parse_clash_proxy(
                 mapping,
                 &[
                     "initial-conn-receive-window",
+                    "initial_conn_receive_window",
                     "init-conn-receive-window",
                     "init_conn_receive_window",
                     "initConnReceiveWindow",
@@ -1522,8 +1653,9 @@ fn parse_clash_proxy(
         }
         OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
     }
-
-    if let Some(network) = yaml_text_alias(mapping, &["network"])? {
+    if let Some(network) =
+        yaml_text_alias(mapping, &["network"])?.filter(|network| !network.trim().is_empty())
+    {
         if let Some(transport) = node.transport_mut() {
             if !matches!(network.as_str(), "tcp" | "ws" | "grpc") {
                 return Err("unsupported stream transport".into());
@@ -1563,7 +1695,7 @@ fn parse_clash_proxy(
         }
     }
     if let Some(transport) = node.transport_mut() {
-        if let Some(options) = yaml_value(mapping, "ws-opts") {
+        if let Some(options) = yaml_value(mapping, "ws-opts").filter(|value| yaml_active(value)) {
             let options = options
                 .as_mapping()
                 .ok_or_else(|| "ws-opts must be a mapping".to_string())?;
@@ -1589,18 +1721,23 @@ fn parse_clash_proxy(
                     key.as_str()
                         .filter(|key| key.eq_ignore_ascii_case("host"))
                         .and_then(|_| yaml_text(value, "websocket host").ok().flatten())
+                        .filter(|value| !value.trim().is_empty())
                 });
             }
         }
         transport.ws_path = transport
             .ws_path
             .take()
-            .or(yaml_text_alias(mapping, &["ws-path"])?);
-        transport.ws_host = transport
-            .ws_host
-            .take()
-            .or(yaml_text_alias(mapping, &["ws-host", "ws-headers"])?);
-        if let Some(options) = yaml_value(mapping, "grpc-opts") {
+            .or(yaml_text_alias(mapping, &["ws-path"])?.filter(|value| !value.trim().is_empty()));
+        if transport.ws_host.is_none() {
+            transport.ws_host =
+                yaml_text_alias(mapping, &["ws-headers"])?.filter(|value| !value.trim().is_empty());
+        }
+        if transport.ws_host.is_none() {
+            transport.ws_host =
+                yaml_text_alias(mapping, &["ws-host"])?.filter(|value| !value.trim().is_empty());
+        }
+        if let Some(options) = yaml_value(mapping, "grpc-opts").filter(|value| yaml_active(value)) {
             let options = options
                 .as_mapping()
                 .ok_or_else(|| "grpc-opts must be a mapping".to_string())?;
@@ -2721,5 +2858,246 @@ not-proxies: []
         let link = temp.path().join(SUBSCRIPTION_STORE_DIR);
         symlink(target, &link).unwrap();
         assert!(SubscriptionStore::open(link).is_err());
+    }
+    #[test]
+    fn clash_imports_intrinsic_udp_nodes_but_rejects_false_restrictions() {
+        let yaml = r#"proxies:
+  - name: ss-udp
+    type: ss
+    server: ss.example
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    udp: true
+  - name: socks-udp
+    type: socks5
+    server: socks.example
+    port: 1080
+    udp: true
+  - name: hy2-udp
+    type: hysteria2
+    server: hy2.example
+    port: 443
+    udp: true
+  - name: tuic-udp
+    type: tuic
+    server: tuic.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    udp: true
+  - name: juicity-udp
+    type: juicity
+    server: juicity.example
+    port: 443
+    uuid: 22222222-2222-4222-8222-222222222222
+    password: secret
+    udp: true
+  - name: false-restriction
+    type: socks5
+    server: false.example
+    port: 1080
+    udp: false
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ss-udp", "socks-udp", "hy2-udp", "tuic-udp", "juicity-udp"]
+        );
+    }
+
+    #[test]
+    fn clash_ignores_disabled_features_but_not_malformed_tls_pins() {
+        let yaml = r#"proxies:
+  - name: conflicting-aliases
+    type: trojan
+    server: conflict.example
+    port: 443
+    password: secret
+    skip-cert-verify: true
+    skip_cert_verify: false
+  - name: tls-disabled
+    type: socks5
+    server: socks.example
+    port: 1080
+    tls: false
+    flow: 0
+    network: null
+    encryption: ""
+    plugin: null
+    plugin-opts: {}
+    ws-opts:
+      enabled: false
+  - name: mux-disabled
+    type: trojan
+    server: trojan.example
+    port: 443
+    password: secret
+    tls: true
+    skip-cert-verify: true
+    skip_cert_verify: true
+    smux:
+      enabled: false
+  - name: malformed-pin
+    type: socks5
+    server: pin.example
+    port: 1080
+    pin-sha256:
+      enabled: false
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "tls-disabled");
+        assert_eq!(nodes[1].name, "mux-disabled");
+        assert!(nodes[1].trojan().unwrap().tls.skip_cert_verify);
+    }
+
+    #[test]
+    fn clash_accepts_fixed_h3_alpn_and_tuic_empty_password() {
+        let yaml = r#"proxies:
+  - name: hy2-h3
+    type: hysteria2
+    server: hy2.example
+    port: 443
+    password: secret
+    alpn: [h3]
+  - name: juicity-h3
+    type: juicity
+    server: juicity.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    password: secret
+    alpn: h3
+  - name: tuic-absent-password
+    type: tuic
+    server: tuic.example
+    port: 443
+    uuid: 22222222-2222-4222-8222-222222222222
+  - name: tuic-empty-password
+    type: tuic
+    server: tuic-empty.example
+    port: 443
+    uuid: 33333333-3333-4333-8333-333333333333
+    password: ""
+  - name: bad-alpn
+    type: hysteria2
+    server: bad.example
+    port: 443
+    alpn: [h3, hq-29]
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "hy2-h3",
+                "juicity-h3",
+                "tuic-absent-password",
+                "tuic-empty-password"
+            ]
+        );
+        assert_eq!(nodes[2].tuic().unwrap().password, None);
+        assert_eq!(nodes[3].tuic().unwrap().password.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn clash_restores_fallback_names_and_lazy_ws_host_precedence() {
+        let yaml = r#"proxies:
+  - type: socks5
+    server: first.example
+    port: 1080
+  - name: ""
+    type: socks5
+    server: second.example
+    port: 1081
+  - name: nested-host
+    type: vless
+    server: ws.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: ws
+    ws-opts:
+      headers:
+        Host: nested.example
+    ws-headers: [ignored-lower-priority-value]
+    ws-host:
+      ignored: malformed
+  - name: ordered-fallback
+    type: vless
+    server: fallback.example
+    port: 443
+    uuid: 22222222-2222-4222-8222-222222222222
+    network: ws
+    ws-headers: headers.example
+    ws-host: host.example
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(nodes[0].name, "socks5-first.example:1080");
+        assert_eq!(nodes[1].name, "socks5-second.example:1081");
+        assert_eq!(
+            nodes[2].vless().unwrap().transport.ws_host.as_deref(),
+            Some("nested.example")
+        );
+        assert_eq!(
+            nodes[3].vless().unwrap().transport.ws_host.as_deref(),
+            Some("headers.example")
+        );
+    }
+
+    #[test]
+    fn clash_rejects_legacy_vless_udp_and_nondefault_juicity_windows() {
+        let yaml = r#"proxies:
+  - name: legacy-udp
+    type: vless
+    server: legacy.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    udp: true
+    xudp: false
+  - name: disabled-packet-udp
+    type: vless
+    server: packet.example
+    port: 443
+    uuid: 22222222-2222-4222-8222-222222222222
+    udp: true
+    packet-encoding: none
+  - name: disabled-mux
+    type: vless
+    server: mux.example
+    port: 443
+    uuid: 33333333-3333-4333-8333-333333333333
+    udp: true
+    smux:
+      enabled: false
+  - name: default-window
+    type: juicity
+    server: juic-good.example
+    port: 443
+    uuid: 44444444-4444-4444-8444-444444444444
+    password: secret
+    initial-stream-receive-window: 8388608
+    initial-conn-receive-window: "8388608"
+    mtu: 1400
+  - name: custom-window
+    type: juicity
+    server: juic-bad.example
+    port: 443
+    uuid: 55555555-5555-4555-8555-555555555555
+    password: secret
+    initial-stream-receive-window: 1234
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "disabled-mux");
+        assert_eq!(
+            nodes[0].vless().unwrap().mode,
+            honk_config::node::WireMode::Xudp
+        );
+        assert_eq!(nodes[1].name, "default-window");
+        assert_eq!(nodes[1].juicity().unwrap().quic.mtu, Some(1400));
     }
 }

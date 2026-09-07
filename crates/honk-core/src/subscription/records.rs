@@ -79,6 +79,9 @@ struct Field {
     quoted: bool,
     /// A quoted value after `=` may intentionally contain edge spaces.
     quoted_value: bool,
+    /// The first `=` outside quotes, used to split the record header without
+    /// confusing an escaped/quoted `=` in a display name for the delimiter.
+    unquoted_equals: Option<usize>,
 }
 
 /// Split a record on unquoted commas.  Backslash escapes the following byte,
@@ -92,6 +95,7 @@ fn split_fields(line: &str) -> Option<Vec<Field>> {
     let mut after_quote = false;
     let mut quoted = false;
     let mut quoted_value = false;
+    let mut unquoted_equals = None::<usize>;
 
     for ch in line.chars() {
         if escaped {
@@ -137,12 +141,14 @@ fn split_fields(line: &str) -> Option<Vec<Field>> {
                     },
                     quoted,
                     quoted_value,
+                    unquoted_equals,
                 });
                 field.clear();
                 started = false;
                 after_quote = false;
                 quoted = false;
                 quoted_value = false;
+                unquoted_equals = None;
             }
             _ => {
                 if started || !ch.is_whitespace() {
@@ -150,6 +156,9 @@ fn split_fields(line: &str) -> Option<Vec<Field>> {
                 }
                 if !ch.is_whitespace() {
                     started = true;
+                }
+                if ch == '=' && unquoted_equals.is_none() {
+                    unquoted_equals = Some(field.len() - ch.len_utf8());
                 }
             }
         }
@@ -168,25 +177,26 @@ fn split_fields(line: &str) -> Option<Vec<Field>> {
         },
         quoted,
         quoted_value,
+        unquoted_equals,
     });
     Some(fields)
 }
-
 fn parse_record(fields: &[Field]) -> Option<Mapping> {
-    let first = fields.first()?.value.trim();
-    let (left, right) = first.split_once('=')?;
-    if is_qx_type(left.trim()) {
-        parse_qx(fields, canonical_type(left.trim())?)
-    } else if let Some(protocol) = canonical_type(right.trim()) {
+    let (left, right) = record_header(fields.first()?)?;
+    if let Some(protocol) = canonical_type(right) {
         parse_named(fields, protocol)
+    } else if let Some(protocol) = canonical_type(left)
+        && parse_endpoint(right).is_some()
+    {
+        parse_qx(fields, protocol)
     } else {
         None
     }
 }
 
 fn parse_named(fields: &[Field], protocol: &'static str) -> Option<Mapping> {
-    let (name, _) = fields.first()?.value.split_once('=')?;
-    let name = name.trim().to_string();
+    let (name, _) = record_header(fields.first()?)?;
+    let name = name.to_string();
     let server = normalize_host(fields.get(1)?.value.trim());
     if server.is_empty() {
         return None;
@@ -201,17 +211,24 @@ fn parse_named(fields: &[Field], protocol: &'static str) -> Option<Mapping> {
     if has_reality(&options) && !matches!(protocol, "vless" | "trojan") {
         return None;
     }
-    if reality_requested_without_fields(&options) || reality_disabled_with_fields(&options) {
+    if reality_requested_without_fields(&options)
+        || reality_disabled_with_fields(&options)
+        || reality_conflicts_with_disabled_tls(&options)
+        || !validate_record_controls(protocol, &options)
+    {
         return None;
     }
     if !apply_named_protocol(&mut map, protocol, &positions, &options) {
+        return None;
+    }
+    if !apply_udp_options(&mut map, &options) {
         return None;
     }
     Some(map)
 }
 
 fn parse_qx(fields: &[Field], protocol: &'static str) -> Option<Mapping> {
-    let endpoint = fields.first()?.value.split_once('=')?.1.trim();
+    let (_, endpoint) = record_header(fields.first()?)?;
     let (server, port) = parse_endpoint(endpoint)?;
     let (_, options) = positional_options(fields, 1);
     let name = options.get("tag").cloned().unwrap_or_default();
@@ -222,13 +239,172 @@ fn parse_qx(fields: &[Field], protocol: &'static str) -> Option<Mapping> {
     if has_reality(&options) && !matches!(protocol, "vless" | "trojan") {
         return None;
     }
-    if reality_requested_without_fields(&options) || reality_disabled_with_fields(&options) {
+    if reality_requested_without_fields(&options)
+        || reality_disabled_with_fields(&options)
+        || reality_conflicts_with_disabled_tls(&options)
+        || !validate_record_controls(protocol, &options)
+    {
         return None;
     }
     if !apply_qx_protocol(&mut map, protocol, &options) {
         return None;
     }
+    if !apply_udp_options(&mut map, &options) {
+        return None;
+    }
     Some(map)
+}
+
+fn record_header(field: &Field) -> Option<(&str, &str)> {
+    let delimiter = field.unquoted_equals?;
+    let (left, right) = field.value.split_at(delimiter);
+    Some((left.trim(), right.get(1..)?.trim()))
+}
+
+fn apply_udp_options(map: &mut Mapping, options: &HashMap<String, String>) -> bool {
+    let udp = match options.get("udp") {
+        Some(value) => parse_bool(value),
+        None => None,
+    };
+    if options.contains_key("udp") && udp.is_none() {
+        return false;
+    }
+    let relay = match options.get("udp-relay") {
+        Some(value) => parse_bool(value),
+        None => None,
+    };
+    if options.contains_key("udp-relay") && relay.is_none() {
+        return false;
+    }
+    if let (Some(udp), Some(relay)) = (udp, relay)
+        && udp != relay
+    {
+        return false;
+    }
+    if let Some(enabled) = relay.or(udp) {
+        put_bool(map, "udp", enabled);
+    }
+    true
+}
+
+fn validate_record_controls(protocol: &str, options: &HashMap<String, String>) -> bool {
+    if let Some(value) = options.get("aead") {
+        let Some(enabled) = parse_bool(value) else {
+            return false;
+        };
+        if (protocol == "vmess" && !enabled) || (protocol != "vmess" && enabled) {
+            return false;
+        }
+    }
+    for key in ["tls", "over-tls"] {
+        if let Some(value) = options.get(key) {
+            if parse_bool(value).is_none() {
+                return false;
+            }
+        }
+    }
+    let tls_enabled = ["tls", "over-tls"].into_iter().any(|key| {
+        options
+            .get(key)
+            .is_some_and(|value| parse_bool(value) == Some(true))
+    });
+    if !tls_capable(protocol)
+        && (tls_enabled
+            || options
+                .get("tls-verification")
+                .is_some_and(|value| parse_bool(value) == Some(true))
+            || [
+                "allow-insecure",
+                "insecure",
+                "server-name",
+                "servername",
+                "skip-cert-verify",
+                "sni",
+                "tls-host",
+                "tls-name",
+            ]
+            .into_iter()
+            .any(|key| {
+                options.get(key).is_some_and(|value| {
+                    !value.trim().is_empty() && parse_bool(value) != Some(false)
+                })
+            }))
+    {
+        return false;
+    }
+    if ["udp-over-tcp", "udp_over_tcp"].into_iter().any(|key| {
+        options
+            .get(key)
+            .is_some_and(|value| !is_disabled_wire_value(value))
+    }) || ["ssr-protocol", "ssr-protocol-param"]
+        .into_iter()
+        .any(|key| {
+            options
+                .get(key)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    {
+        return false;
+    }
+    if options
+        .get("tls-alpn")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return false;
+    }
+    for key in ["tls-no-session-ticket", "tls-no-session-reuse"] {
+        if let Some(value) = options.get(key) {
+            let Some(disabled) = parse_bool(value) else {
+                return false;
+            };
+            if disabled {
+                return false;
+            }
+        }
+    }
+    let verification = match options.get("tls-verification") {
+        Some(value) => parse_bool(value),
+        None => None,
+    };
+    if options.contains_key("tls-verification") && verification.is_none() {
+        return false;
+    }
+    let cert_pin = option(options, &["tls-cert-sha256"]);
+    let public_pin = option(options, &["tls-pubkey-sha256"]);
+    // Honk's leaf pin replaces PKI; QX's additional verification semantics
+    // are not established, so importing either effective pin would guess.
+    if verification != Some(false) && (public_pin.is_some() || cert_pin.is_some()) {
+        return false;
+    }
+    true
+}
+
+fn tls_capable(protocol: &str) -> bool {
+    matches!(
+        protocol,
+        "trojan" | "vmess" | "vless" | "hysteria2" | "tuic" | "juicity" | "anytls"
+    )
+}
+
+fn reality_conflicts_with_disabled_tls(options: &HashMap<String, String>) -> bool {
+    has_reality(options)
+        && (["tls", "over-tls"].into_iter().any(|key| {
+            options
+                .get(key)
+                .is_some_and(|value| parse_bool(value) == Some(false))
+        }) || options
+            .get("security")
+            .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+            || options
+                .get("obfs")
+                .is_some_and(|value| value.eq_ignore_ascii_case("ws")))
+}
+
+fn is_disabled_wire_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "none" | "off"
+    )
 }
 
 fn base_mapping(protocol: &str, name: String, server: String, port: u16) -> Mapping {
@@ -271,7 +447,8 @@ fn positional_options(fields: &[Field], start: usize) -> (Vec<String>, HashMap<S
 fn is_option_key(key: &str) -> bool {
     matches!(
         key.trim().to_ascii_lowercase().as_str(),
-        "alpn"
+        "aead"
+            | "alpn"
             | "allow-insecure"
             | "auth"
             | "chain"
@@ -335,13 +512,23 @@ fn is_option_key(key: &str) -> bool {
             | "sni"
             | "spider-x"
             | "spx"
+            | "ssr-protocol"
+            | "ssr-protocol-param"
             | "tag"
             | "tls"
+            | "tls-alpn"
+            | "tls-cert-sha256"
             | "tls-host"
             | "tls-name"
+            | "tls-no-session-reuse"
+            | "tls-no-session-ticket"
+            | "tls-pubkey-sha256"
+            | "tls13"
             | "tls-verification"
             | "transport"
             | "udp"
+            | "udp-over-tcp"
+            | "udp_over_tcp"
             | "udp-relay"
             | "underlying-proxy"
             | "underlying_proxy"
@@ -372,21 +559,22 @@ fn apply_named_protocol(
             if !set_required(map, "cipher", cipher) || !set_required(map, "password", password) {
                 return false;
             }
-            if [
-                "plugin",
-                "plugin-opts",
-                "plugin_opts",
-                "obfs",
-                "tls",
-                "over-tls",
-                "security",
-            ]
-            .into_iter()
-            .any(|key| {
-                options
-                    .get(key)
-                    .is_some_and(|value| !value.trim().is_empty())
-            }) {
+            if ["plugin", "plugin-opts", "plugin_opts", "obfs"]
+                .into_iter()
+                .any(|key| {
+                    options
+                        .get(key)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+                || ["tls", "over-tls"].into_iter().any(|key| {
+                    options
+                        .get(key)
+                        .is_some_and(|value| parse_bool(value) == Some(true))
+                })
+                || options.get("security").is_some_and(|value| {
+                    !value.trim().is_empty() && !value.eq_ignore_ascii_case("none")
+                })
+            {
                 return false;
             }
         }
@@ -471,6 +659,20 @@ fn apply_named_protocol(
             let uuid =
                 option(options, &["uuid", "username"]).or_else(|| positions.first().cloned());
             let password = option(options, &["password"]).or_else(|| positions.get(1).cloned());
+            if !set_required(map, "uuid", uuid) {
+                return false;
+            }
+            set_optional(map, "password", password);
+            put_bool(map, "tls", true);
+            if !apply_tls(map, protocol, options) {
+                return false;
+            }
+            apply_quic_common(map, options);
+        }
+        "juicity" => {
+            let uuid =
+                option(options, &["uuid", "username"]).or_else(|| positions.first().cloned());
+            let password = option(options, &["password"]).or_else(|| positions.get(1).cloned());
             if !set_required(map, "uuid", uuid) || !set_required(map, "password", password) {
                 return false;
             }
@@ -507,22 +709,21 @@ fn apply_qx_protocol(map: &mut Mapping, protocol: &str, options: &HashMap<String
             {
                 return false;
             }
-            if options
-                .get("obfs")
-                .is_some_and(|value| !value.trim().is_empty() && value != "none")
-                || [
-                    "tls",
-                    "over-tls",
-                    "network",
-                    "transport",
-                    "tls-host",
-                    "tls-verification",
-                ]
+            if options.get("obfs").is_some_and(|value| {
+                !value.trim().is_empty() && !value.eq_ignore_ascii_case("none")
+            }) || ["network", "transport", "tls-host"].into_iter().any(|key| {
+                options
+                    .get(key)
+                    .is_some_and(|value| !value.trim().is_empty())
+            }) || ["tls", "over-tls", "tls-verification"]
                 .into_iter()
                 .any(|key| {
                     options
                         .get(key)
-                        .is_some_and(|value| !value.trim().is_empty())
+                        .is_some_and(|value| parse_bool(value) == Some(true))
+                })
+                || options.get("security").is_some_and(|value| {
+                    !value.trim().is_empty() && !value.eq_ignore_ascii_case("none")
                 })
             {
                 return false;
@@ -531,21 +732,14 @@ fn apply_qx_protocol(map: &mut Mapping, protocol: &str, options: &HashMap<String
         "socks5" => {
             set_optional(map, "username", option(options, &["username"]));
             set_optional(map, "password", option(options, &["password"]));
-            if [
-                "obfs",
-                "network",
-                "transport",
-                "tls",
-                "over-tls",
-                "tls-host",
-                "tls-verification",
-            ]
-            .into_iter()
-            .any(|key| {
-                options
-                    .get(key)
-                    .is_some_and(|value| !value.trim().is_empty())
-            }) {
+            if ["obfs", "network", "transport", "tls-host"]
+                .into_iter()
+                .any(|key| {
+                    options
+                        .get(key)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+            {
                 return false;
             }
         }
@@ -590,14 +784,6 @@ fn apply_qx_protocol(map: &mut Mapping, protocol: &str, options: &HashMap<String
             if !apply_qx_reality(map, options) || !apply_vless_mode(map, options) {
                 return false;
             }
-            if let Some(value) = options.get("udp-relay") {
-                let Some(enabled) = parse_bool(value) else {
-                    return false;
-                };
-                if enabled {
-                    put_bool(map, "udp", true);
-                }
-            }
         }
         "hysteria2" => {
             set_optional(map, "auth", option(options, &["password", "auth"]));
@@ -608,6 +794,17 @@ fn apply_qx_protocol(map: &mut Mapping, protocol: &str, options: &HashMap<String
             apply_quic_common(map, options);
         }
         "tuic" => {
+            if !set_required(map, "uuid", option(options, &["uuid", "username"])) {
+                return false;
+            }
+            set_optional(map, "password", option(options, &["password"]));
+            put_bool(map, "tls", true);
+            if !apply_tls(map, protocol, options) {
+                return false;
+            }
+            apply_quic_common(map, options);
+        }
+        "juicity" => {
             if !set_required(map, "uuid", option(options, &["uuid", "username"]))
                 || !set_required(map, "password", option(options, &["password"]))
             {
@@ -794,7 +991,10 @@ fn apply_tls(map: &mut Mapping, protocol: &str, options: &HashMap<String, String
     set_optional(
         map,
         "servername",
-        option(options, &["servername", "sni", "tls-name", "tls-host"]),
+        option(
+            options,
+            &["servername", "server-name", "sni", "tls-name", "tls-host"],
+        ),
     );
     if protocol == "vless" {
         if let Some(value) = option(options, &["security"]) {
@@ -832,12 +1032,6 @@ fn apply_vless_mode(map: &mut Mapping, options: &HashMap<String, String>) -> boo
         if value == "xudp" {
             put_str(map, "packet-encoding", "xudp");
         }
-    }
-    if let Some(value) = option(options, &["udp"]) {
-        let Some(enabled) = parse_bool(&value) else {
-            return false;
-        };
-        put_bool(map, "udp", enabled);
     }
     true
 }
@@ -1001,13 +1195,10 @@ fn canonical_type(value: &str) -> Option<&'static str> {
         "vless" => Some("vless"),
         "hysteria2" | "hy2" => Some("hysteria2"),
         "tuic" => Some("tuic"),
+        "juicity" => Some("juicity"),
         "anytls" => Some("anytls"),
         _ => None,
     }
-}
-
-fn is_qx_type(value: &str) -> bool {
-    canonical_type(value).is_some()
 }
 
 fn parse_endpoint(value: &str) -> Option<(String, u16)> {
@@ -1087,69 +1278,163 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tokenizer_preserves_quoted_commas_and_escaped_quotes() {
-        let fields =
-            split_fields(r#""name, east"=ss,example.com,443,"aes-128-gcm","pa\"ss,word""#).unwrap();
-        assert_eq!(fields[0].value, "name, east=ss");
-        assert_eq!(fields[3].value, "aes-128-gcm");
-        assert_eq!(fields[4].value, "pa\"ss,word");
-    }
-
-    #[test]
-    fn quoted_positional_password_keeps_equals_and_edge_spaces() {
-        let node =
-            parse_records_subscription(r#"node=trojan, example.com, 443, " pass,word = " "#, None)
-                .unwrap()
-                .remove(0);
-        assert_eq!(
-            node.trojan().unwrap().password.as_deref(),
-            Some(" pass,word = ")
-        );
-        let node = parse_records_subscription(
-            r#"node=trojan, example.com, 443, password = " pass,word = " "#,
+    fn public_parser_preserves_quoted_names_and_protocol_word_names() {
+        let nodes = parse_records_subscription(
+            r#""edge=west"=trojan,example.com,443," pass,word = "
+trojan=trojan,example.com,443,password
+trojan=example.com:443,password=qx,tag=qx"#,
             None,
         )
-        .unwrap()
-        .remove(0);
+        .unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].name, "edge=west");
         assert_eq!(
-            node.trojan().unwrap().password.as_deref(),
+            nodes[0].trojan().unwrap().password.as_deref(),
+            Some(" pass,word = ")
+        );
+        assert_eq!(nodes[1].name, "trojan");
+        assert_eq!(nodes[1].protocol().as_str(), "trojan");
+        assert_eq!(nodes[2].name, "qx");
+    }
+
+    #[test]
+    fn public_parser_keeps_quoted_password_edge_spaces() {
+        let nodes = parse_records_subscription(
+            r#"node=trojan,example.com,443,password = " pass,word = ""#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            nodes[0].trojan().unwrap().password.as_deref(),
             Some(" pass,word = ")
         );
     }
 
     #[test]
-    fn qx_endpoint_parser_handles_bracketed_ipv6() {
-        assert_eq!(
-            parse_endpoint("[2001:db8::1]:443"),
-            Some(("2001:db8::1".into(), 443))
-        );
-        assert!(parse_endpoint("2001:db8::1:443").is_none());
-    }
-
-    #[test]
-    fn qx_reality_fields_are_normalized_without_leaking_record_text() {
-        let fields = split_fields(
-            "vless=[2001:db8::1]:443,method=none,password=uuid,obfs=over-tls,reality-base64-pubkey=key,reality-hex-shortid=sid,vless-flow=xtls-rprx-vision,tag=quoted",
+    fn unsupported_wire_extensions_are_dropped_with_sibling_survival() {
+        let nodes = parse_records_subscription(
+            "ss=example.com:443,method=aes-128-gcm,password=pwd,udp-relay=true,udp-over-tcp=sp.v2\n\
+             ss=example.com:443,method=aes-128-gcm,password=pwd,ssr-protocol=auth_chain_b\n\
+             trojan=example.com:443,password=chained,proxy=upstream\n\
+             trojan=example.com:443,password=survivor,tag=survivor",
+            None,
         )
         .unwrap();
-        let map = parse_record(&fields).unwrap();
-        assert_eq!(map.get("type").and_then(Value::as_str), Some("vless"));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "survivor");
         assert_eq!(
-            map.get("server").and_then(Value::as_str),
-            Some("2001:db8::1")
-        );
-        assert_eq!(map.get("name").and_then(Value::as_str), Some("quoted"));
-        assert!(map.get("reality-opts").is_some());
-        assert_eq!(
-            map.get("flow").and_then(Value::as_str),
-            Some("xtls-rprx-vision")
+            nodes[0].trojan().unwrap().password.as_deref(),
+            Some("survivor")
         );
     }
 
     #[test]
-    fn unsupported_transport_is_rejected_without_tcp_fallback() {
-        let fields =
-            split_fields("node=vless,example.com,443,uuid,transport=h2,over-tls=true").unwrap();
-        assert!(parse_record(&fields).is_none());
+    fn disabled_wire_defaults_remain_accepted() {
+        let nodes = parse_records_subscription(
+            "trojan=example.com:443,password=pwd,udp-relay=false,udp-over-tcp=false,ssr-protocol=,ssr-protocol-param=,fast-open=false,tls13=true",
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].trojan().is_some());
+    }
+
+    #[test]
+    fn conflicting_udp_aliases_are_rejected_without_dropping_siblings() {
+        let nodes = parse_records_subscription(
+            "trojan=example.com:443,password=conflict,udp=true,udp-relay=false\n\
+             trojan=example.com:443,password=survivor,udp-relay=true,tag=survivor",
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "survivor");
+    }
+
+    #[test]
+    fn qx_effective_pins_are_rejected_and_disabled_pins_stay_disabled() {
+        let cert_pin = "ab".repeat(32);
+        let public_pin = "cd".repeat(32);
+        let nodes = parse_records_subscription(
+            &format!(
+                "trojan=192.0.2.1:443,password=pwd,over-tls=true,tls-verification=true,tls-cert-sha256={cert_pin},server-name=certificate.example,tag=cert\n\
+                 trojan=192.0.2.1:443,password=pwd,tls-verification=true,tls-pubkey-sha256={public_pin},tag=unsupported\n\
+                 trojan=192.0.2.1:443,password=pwd,tls-verification=false,tls-pubkey-sha256={public_pin},tls-cert-sha256={cert_pin},server-name=certificate.example,tag=insecure"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1);
+        let insecure = &nodes[0];
+        assert_eq!(insecure.name, "insecure");
+        assert_eq!(
+            insecure.tls().unwrap().sni.as_deref(),
+            Some("certificate.example")
+        );
+        assert!(insecure.tls().unwrap().skip_cert_verify);
+        assert!(insecure.tls().unwrap().pin_sha256.is_none());
+    }
+
+    #[test]
+    fn qx_legacy_vmess_and_active_session_controls_are_rejected() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let nodes = parse_records_subscription(
+            &format!(
+                "vmess=example.com:80,password={uuid},aead=false,tag=legacy\n\
+                 vmess=example.com:80,password={uuid},aead=true,tag=aead\n\
+                 trojan=example.com:443,password=pwd,tls-no-session-reuse=true,tag=session\n\
+                 trojan=example.com:443,password=pwd,tls-no-session-reuse=false,tag=default"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().any(|node| node.name == "aead"));
+        assert!(nodes.iter().any(|node| node.name == "default"));
+    }
+
+    #[test]
+    fn tuic_empty_password_and_h3_alpn_are_returned() {
+        let uuid = "22222222-2222-4222-8222-222222222222";
+        let nodes = parse_records_subscription(
+            &format!(
+                "tuic=example.com:443,uuid={uuid},password=,alpn=h3,tag=tuic\n\
+                 juicity=example.com:443,uuid={uuid},password=pwd,alpn=h3,tag=juicity"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert!(
+            nodes
+                .iter()
+                .find(|node| node.name == "tuic")
+                .unwrap()
+                .tuic()
+                .is_some()
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.name == "juicity")
+                .unwrap()
+                .juicity()
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("pwd")
+        );
+    }
+
+    #[test]
+    fn reality_does_not_override_explicit_tls_disable() {
+        let nodes = parse_records_subscription(
+            "vless=example.com:443,password=33333333-3333-4333-8333-333333333333,obfs=over-tls,tls=false,reality-base64-pubkey=key,reality-hex-shortid=sid,tag=contradiction\n\
+             trojan=example.com:443,password=survivor,tag=survivor",
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "survivor");
     }
 }
