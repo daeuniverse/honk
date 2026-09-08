@@ -1,125 +1,237 @@
-# Routing engine
+# Compiled routing decision plane
 
-This document explains how the kernel and userspace choose an outbound for each flow; routing syntax and fields live in the [routing reference](../reference/routing.md).
+## Scope
 
-## Decision path
+Routing has one authored semantic model and two derived execution paths. The
+userspace `Router` evaluates a canonical policy IR; a restricted compiler lowers
+that same IR to native eBPF comparisons. The kernel does not interpret a second
+`MatchSet` program. Linux 7.2 is the real-backend baseline.
 
-A new flow is first classified by the eBPF routing engine. A complete kernel decision can remain on the native path when direct offload is safe; other decisions produce a handoff to the control plane. Userspace accepts the original destination, optionally learns a domain, re-runs the `Router` when required, applies the Clash mode, and resolves the resulting group to a leaf outbound.
+The static TC programs retain packet parsing, special/local/DNS exclusions,
+conntrack, mode and health enforcement, NFQUEUE ownership, redirection, and reply
+accounting. Generated code implements only `RoutingInput -> RoutingDecision`.
+No flow is sent to userspace merely because its policy is compiled. Existing
+native-direct and cached-flow paths remain native.
 
-The routing result is therefore a property of the flow, not of each packet. Established packets use the decision stored in conntrack state and do not repeat rule evaluation or read the current Clash-mode flags.
+## Rule semantics
 
-## Kernel routing
+The canonical IR retains ordered rule IDs, display metadata, conditions, and an
+outbound/mark/must action. Lower numeric priority wins; equal priorities retain
+source order. Conditions are ANDed, alternatives in a condition are ORed, and
+negation applies once to the entire condition. Fallback is a separate terminal
+action. Empty expanded sets remain conditions: positive empty sets are false,
+negative empty sets are true; they must not disappear and widen a compound rule.
 
-### `MatchSet` evaluation
+The cutover preserves the current userspace matching contract:
 
-`RoutingMatcherBuilder` sorts compiled routes by ascending priority and lowers each rule to the dae `match_set` ABI shared by `honk-core` and `honk-ebpf`. Each type-specific `MatchSet` carries a matcher value, negation bit, intermediate or final outbound, `must` bit, and mark.
+- Ordinary domain pattern/suffix/keyword alternatives form one condition;
+  geosite is a separate condition when both fields are present. Existing suffix,
+  regex, keyword, case, and geosite attribute behavior is retained.
+- Destination/source IP predicates preserve IPv4/IPv6 identity, including `/0`,
+  host addresses and overlapping prefixes.
+- Port ranges are inclusive. TCP/UDP and IPv4/IPv6 masks retain both alternatives.
+- Process patterns retain the 15-byte configuration normalization and substring
+  matching contract. Kernel process bytes are converted with the same lossy UTF-8
+  and trimming behavior as a routing handoff, without allocation.
+- Missing process/MAC/DSCP facts are not ordinary zero values. A missing domain
+  does not satisfy a positive domain condition and does not veto a negative one.
+- A configured `(must)` result is terminal. It is not the internal historical
+  `MustRules` opcode. Neither it nor `block` can be overridden by Clash mode.
 
-Multiple values inside one condition form an OR chain. Distinct conditions form an AND chain. The intermediate `LogicalOr` and `LogicalAnd` outcomes preserve this structure without allocating a rule object in the kernel. A final fallback entry gives unmatched flows a real outbound.
+The old compiler's dropped full/regex conditions, narrowed protocol unions,
+truncated rule chains, first-rule DNS projection, and overlapping-prefix bitmap
+loss are not compatibility requirements. The shared IR and independent semantic
+fixtures must prevent these errors rather than encode them into the new backend.
 
-At route entry, `route()` prepares full-prefix source, destination, and MAC keys and calls `bpf_loop` over the selected bank. `RouteCtx` maintains `GoodSubrule`, `BadRule`, `Must`, DNS-query, and domain-known state across loop iterations. A final result encodes the outbound in bits 0–7, the mark in bits 8–39, and `must` in bit 40.
+## Canonical policy and domain facts
 
-| Index | Meaning in the route state machine |
-| --- | --- |
-| `0` | `Direct` |
-| `1` | `Block` |
-| `2+` | User group, in configuration order |
-| `0xFC` | `MustRules`: record `Must` and continue evaluating |
-| `0xFD` | `ControlPlaneRouting`: defer the decision to userspace |
-| `0xFE` | `LogicalOr`: continue the current OR subrule |
-| `0xFF` | `LogicalAnd`: finish one condition and continue the rule |
+`CompiledRoute` contains metadata and a vector of `CompiledCondition` values,
+rather than parallel positive/negative matcher field lists. A condition contains
+one `CompiledPredicate` and its negation flag. Domain predicates reference an
+immutable, policy-local registry of compiled domain matchers. Rule names are
+labels, never bitmap identities. Identical domain predicates may share a stable
+predicate ID within one policy.
 
-`ControlPlaneRouting` is an intermediate handoff outcome, not a valid fallback. The fallback must resolve to `direct`, `block`, or a user group.
+The userspace reference and kernel compiler consume this representation. DNS and
+sniffing produce the truth bits of **all domain predicates**, not the first
+matching complete traffic rule. This includes predicates used by negated rules;
+the evaluator applies negation, not the projection writer. A known domain with
+no matching predicate produces a present zero bitmap. Removing its final live
+owner removes the IP entry.
 
-### Flow-group prefilter
+DNS association remains IP-based and source-independent, with multiple live
+owners ORed as before. It does not prove the exact SNI of every connection to a
+shared address. Dial-mode reality checks and permitted sniff rerouting remain
+userspace responsibilities. The migration does not introduce blanket
+unknown-to-punt behavior or silently change the four dial modes.
 
-Every physical rule bank has four groups: TCP/IPv4, TCP/IPv6, UDP/IPv4, and UDP/IPv6. The compiler gives every `MatchSet` in one rule chain the same group membership. `ROUTING_GROUP_META_MAP` stores one packed `RoutingGroupMeta { rule_count, bitmap }` for each group and generation.
+## Generated function ABI
 
-The datapath reads the generation selector once, selects the flow group, and loads that packed entry once. A clear bitmap bit skips the corresponding `ROUTING_MAP` lookup and state-machine step. Because a chain is never split across groups, skipping cannot strand `LogicalOr` or `LogicalAnd` state. Negated protocol or IP-version conditions stay in all groups because their complement may match any skipped group.
+The fixed-layout ABI lives in `honk-ebpf-common`. All fields use fixed-width
+integers; neither Rust enum layout, references, strings, nor allocator-owned
+objects cross the boundary.
 
-### LPM and learned-domain maps
+`RoutingInput` contains network-order source/destination addresses, a canonical
+16-byte MAC key, normalized process bytes and length, host-order ports, protocol
+and family masks, DSCP, and provenance/presence information. `RoutingDecision`
+contains outbound, mark, must, domain-finality, and rule ID. A scalar return code
+separates a successful decision from an unavailable or failed evaluator.
 
-Destination CIDRs, source CIDRs, and MAC prefixes live in separate LPM tries. Each LPM value is a bitmap of physical `MatchSet` slots, so prefixes shared by several rules merge their bits rather than overwriting one another. An LPM lookup is a match only when the current slot's bit is set.
+`domain_final` means that a later domain routing observation cannot change this
+phase's route under its dial mode: the policy has no domain predicates, domain
+rerouting is disabled, or a complete learned-domain bitmap was available. It is
+policy-generation data, not a separately published global routing flag.
 
-The kernel cannot see a hostname at TCP SYN time. Domain and geosite conditions compile to `DomainSet` placeholders. `DOMAIN_ROUTING_MAP` maps a DNS-learned destination IP to the corresponding per-generation rule bitmap; a present entry also sets `DomainKnown`, proving that all domain-set checks in this pass used a complete learned bitmap.
+A non-`must` direct result with unresolved domain finality is encoded as
+`ControlPlaneRouting` when handed to userspace. Passing it as final `direct`
+would make TCP and UDP initialization skip sniffing. Known direct, `must`,
+block, and mode-owned direct offload retain their terminal behavior.
 
-In `domain++` mode, a generic proxy rule with a destination-port condition is changed to `ControlPlaneRouting` when it has no domain/geosite, process, MAC, or DSCP constraint and is not `direct` or `block`. `domain` and `domain+` keep the initial port/IP decision in the kernel. A learned `DOMAIN_ROUTING_MAP` entry can still make later flows kernel-decidable.
+Miss-only inputs reuse the existing per-CPU packet scratch; cached packets do
+not clear that storage. Volatile slot accesses keep the complete input/output
+ABI live under LLVM optimization. Process normalization uses separately
+verified, bounded global subprograms so Unicode decoding does not multiply
+the WAN parser's verifier states.
 
-## Atomic routing publication
+The static callers convert the decision into their existing datapath actions.
+In particular, `ControlPlaneRouting` is not a `TC_ACT_*` value. An evaluator error
+runs the caller's existing fail-closed cleanup, including an outstanding UDP
+Preparing claim; it is not disguised as a userspace routing request.
 
-A routing push is a selector-last, two-phase commit. It never clears the active maps: doing so would expose an empty generation and drop new traffic while reload is in progress.
+## Restricted native backend
 
-1. Compile an immutable `RoutingPushPlan`—`MatchSet`s, LPM bitmaps, flow-group bitmaps, and domain projection metadata—without writing any BPF map.
-2. Read the active generation and fill the other `ROUTING_MAP` bank.
-3. Stage destination, source, and MAC LPM values containing both the active and replacement generations. Prune only keys used by neither plan.
-4. Write the replacement generation's exploded introspection metadata and all four packed `RoutingGroupMeta` entries.
-5. Flip `ROUTING_META_ACTIVE_GENERATION_SLOT` last.
+The backend emits typed eight-byte BPF instructions, checked labels/fixups,
+constant comparisons, masks, map lookups and terminal result writes. It owns no
+TLS/QUIC parser, proxy dialer, mode controller, health checker, or generic VM.
+Large IP/MAC/domain sets are data indexes, not thousands of inline literals.
 
-A route pass reads the selector only once, so it observes the complete old bank or the complete replacement. Stale physical tail slots are harmless because `rule_count` bounds `bpf_loop`. An LPM key retired by the replacement remains while the old bank can still be observed and disappears on the following transition.
+Each generation owns separate destination IPv4/IPv6 and source IPv4/IPv6 LPM
+maps, a MAC index and a domain hash map. Family-separated IP maps prevent an IPv6
+prefix from matching a mapped IPv4 flow. A more-specific LPM entry inherits all
+matching ancestor predicate bits, so longest-prefix lookup preserves ordered
+rule semantics. Facts use the full `DomainRouting` bitmap in their own generation;
+there is no shared two-bank LPM value that a staged prefix can shadow.
 
-DNS-learned domain bitmaps use the same generation boundary. Reload stages their inactive-generation half before switching the rule bank.
+Capacity and verifier limits are explicit errors. No rule chain is truncated and
+no missing outbound silently becomes direct. Generated source attribution records
+rule IDs and normalized rule descriptions. A raw loader uses the existing syscall
+and BTF infrastructure, not a new runtime clang/LLVM dependency or an ELF writer.
+It preserves the real function prototype and uses instruction-slot offsets for
+`func_info`/`line_info`; `.BTF.ext` byte offsets are not the raw syscall format.
 
-### Group ordinals and health during reload
+## Synchronous slots and atomic publication
 
-Configuration order defines both the routing outbound ordinal and the connectivity slot: group `i` uses `2 + i`. All leaf members of that group share the slot. For each TCP, DNS-UDP, or data-UDP network and each IP family, userspace publishes the OR of member health rather than one node's state.
+Every relevant, loaded TC program exposes two non-inlined, distinct BTF-global
+functions, `honk_route_slot0` and `honk_route_slot1`. Uninstalled functions return
+an error and contain no fallback rule engine. The backend loads the LAN/WAN L2/L3
+routing targets before admitting traffic, including variants that may be attached
+to an interface later.
 
-A reload may reorder groups and therefore change the meaning of an ordinal. Before switching routing generations, userspace marks every old-or-new transition slot alive. This temporary fail-open health snapshot prevents an old health bit from killing a newly assigned group. It then stages learned domains, switches the routing generation, and publishes the exact new per-group, per-network, per-family alive snapshot. Slots left after a publication error remain fail-open rather than inheriting stale failure state.
+`ROUTING_POLICY_ROOT` is a one-entry map-in-map pointing at an immutable
+`RoutingPolicyDescriptor`. The descriptor identifies the slot, policy generation,
+feature bits and the active domain-map ID for inspection. A route pass obtains
+one descriptor and calls exactly one synchronous slot. Cached packets do not
+perform this lookup.
 
-## Userspace `Router`
+Publication is serialized with the existing reload and DNS publication fences:
 
-`Router::new` compiles all rules once and sorts them by ascending priority. Positive matcher groups are ANDed and alternatives within a group are ORed; any matching negated condition vetoes the rule. `route_full` scans in priority order and returns the first match, while `route_with_must` returns that outbound plus its `must` flag or the default outbound with `must = false`.
+1. Compile and validate the complete candidate and retain the active policy.
+2. Build and fill candidate-owned fact maps, including its learned-domain state.
+3. Load the generated extension with those exact map FDs and valid BTF metadata.
+4. Attach it to the inactive slot of every relevant TC target.
+5. Replace the single generation root last.
+6. Only after that successful update returns may old TC slots/maps be retired.
+   Userspace IR/reference leases retain their own lifetime independently.
 
-The kernel's reserved `MustRules` outcome has Go dae's non-final behavior: it records `Must` and continues the scan. The current userspace implementation does not mirror that behavior: a rule carrying `must` is still the first-match terminal result of `route_full`. Thus a flow that falls back entirely to the userspace `Router` does not continue past a matching `must` rule; the returned flag only prevents later sniffing and Clash override. This is a current implementation limitation.
+Linux 7.2 waits for old non-sleepable BPF invocations before a successful
+map-in-map update returns. A plain root store, elapsed delay, or merely retaining
+two slots is not an equivalent grace period. The design does not rely on
+`BPF_LINK_UPDATE` for freplace (unsupported), nor detach/attach the active slot.
 
-IP and source-IP conditions use `BinaryLpmTrie`, a compact binary trie with 32 levels for IPv4 and 128 for IPv6. Lookup stops as soon as it encounters a matched prefix or a missing child.
+The native backend's publish operation is all-or-nothing before root commit.
+Failure during map construction, verification or any inactive attachment leaves
+the active code and facts intact. Failure is not handled by closing datapath
+admission, which would pass traffic through, or by punting all flows. Rule-derived
+flags and domain writers must use the same policy generation. Mode/NFQUEUE
+coordination and existing-flow ownership remain with their current controllers.
 
-`GeoAssets` parses `geoip.dat` and `geosite.dat` at most once per `Router` build and decodes only categories referenced by the configuration. `category@attr` splits at the first `@`, indexes the base category, and keeps entries carrying that attribute key; key presence is case-insensitive. `GeositeMatcher` uses hash sets for exact names and dot-boundary suffixes, one Aho-Corasick automaton for keywords, and compiled regular expressions for regex entries.
+Only the generation root is a stable policy pin. Tools resolve the active domain
+map through its descriptor instead of assuming that a same-named pinned map
+changes the references held by an already loaded BPF program.
 
-## Domain routing and sniffing
+## Verification and acceptance
 
-Domain routing has two views:
+Implementation is accepted only with all existing matchers supported and with:
 
-- DNS answers project domain-rule bitmaps into `DOMAIN_ROUTING_MAP`, allowing later connections to the returned IP to use the kernel view.
-- A connection without a learned IP mapping reaches userspace, where a sniffed name is added to `ConnectionInfo` and the full `Router` can evaluate the domain view.
+- Independent golden fixtures for precedence, OR/AND/negation, missing facts,
+  `(must)`/block/marks, IPv4/IPv6, overlap, process normalization, domain projection
+  and capacity failures.
+- Reference-versus-real-generated-BPF comparisons of the complete decision, not
+  only outbound or emitted structure, including source metadata and finality.
+- Real TC/cgroup/netns traffic for native direct, proxy, block, DNS, LAN/WAN,
+  TCP/UDP, and cached flows; queue/token tests retain the real NFQUEUE contract.
+- Failed staging/verification/attachment and repeated-generation tests proving
+  that no partial generation is visible and old flows remain owned.
+- Paired tests of full routing and traffic costs, hot/cold facts, reload latency,
+  JIT size, and peak memory. The strengthened packed-data/AOT bounded-loop path
+  is a baseline; isolated port microbenchmarks are not whole-engine proof.
 
-The DNS projection owns a generation-pinned `Router` and bitmap snapshot. Its worker acquires the backend and then a publication fence, rechecks the generation, and skips a stale batch before writing. A replacement snapshot therefore cannot be followed by an old DNS batch mutating the map. If the generation changes during reconciliation, desired state is rebuilt for the current snapshot.
+The earlier isolated Linux 7.2.3 prototype covered a protocol/port fragment only.
+The branch validation below exercises the production callers and full policy.
 
-TCP sniffing extracts TLS SNI or HTTP `Host` and returns the buffered prefix for forwarding. It reads at most 4096 bytes. A negative cache suppresses repeated work for destinations that repeatedly produce no usable domain.
+### Recorded branch validation
 
-UDP sniffing handles QUIC v1 and v2 Initial packets. It derives Initial keys, removes header protection, decrypts the payload, collects CRYPTO frames, reassembles them across fragments or packets, and runs the shared TLS ClientHello parser. Per-flow sessions and negative caches bound repeated attempts. An incomplete ClientHello is not treated as a final no-domain result because later Initial fragments may change routing.
+`just test-routing` builds a separate test object and runs 468 independent
+complete-decision goldens through the real root/slot path. It also exercises
+predicate bit 255 for domain, destination/source IP and MAC, rejects capacity
+257, and proves that failed inactive attachments and root writes retain the
+old policy. `just test-netns` includes this gate.
 
-The initial IP-based decision and the optional domain target are separate. A sniffed name can affect routing only for an accepted `domain` reality check or in `domain++`; `domain+` never changes the route. `must`, `block`, and reserved direct decisions remain final. A negative-cache hit skips name extraction and keeps the existing path.
+The pinned Ubuntu `7.2.0-070200-generic` VM passed all 12 root-only checks:
+TC/cgroup lifecycle and allocator compatibility, generated-policy publication,
+TC/TUN packet contracts, the production NFQUEUE contract, and real netns flows.
+CI builds the executables on its hosted runner and runs those exact artifacts
+inside this kernel rather than compiling again in the guest.
 
-### Dial modes
+On the isolated Linux 7.2.3 lab host, IPv4/IPv6 LAN checks covered 21 scenarios
+and WAN checks covered 12: direct/proxy/block TCP and UDP, MAC/source/destination
+conjunctions, DSCP, process matching, transparent DNS, hot and cold TLS domains,
+and native held-first-packet direct UDP. A 16 MiB TCP stream ran for 12.802 s
+across a reload that blocked new flows; policy publication took 9.43 ms and
+restoration 9.24 ms. Direct/global mode checks preserved block and must rules.
 
-| Mode | Sniff | Verify name against destination IP | Re-run routing | Dial behavior |
-| --- | --- | --- | --- | --- |
-| `ip` | No | Not applicable | No | Use the original destination IP. |
-| `domain` | Yes, unless a final/negative-cache path skips it | Yes; discard a mismatch | Only after verification succeeds | Use the verified name for proxy dialing; an unmatched domain rule falls through to later IP/port rules. |
-| `domain+` | Yes, with the same skips | No | No | Use the sniffed name for proxy dialing while preserving the initial route. |
-| `domain++` | Yes, with the same skips | No | Yes for non-reserved decisions | Re-run routing from SNI/HTTP Host and use the resulting proxy target. |
+Paired measurements used baseline `8b2ad586` (packed group metadata plus the
+existing bounded-loop matcher), the same host/config, five trials, 512 short
+connections at concurrency 16, and 8 × 8 MiB transfers at concurrency 4.
+Kernel timings below are whole-TC averages, including cached packets, not
+isolated generated-function timings.
 
-## Clash modes and direct offload
+| Equivalent workload | Baseline | Compiled | LAN TC mean, baseline → compiled |
+| --- | ---: | ---: | ---: |
+| must-direct connections/s | 9,719 | 9,738 | 382 → 342 ns |
+| compound-proxy connections/s | 4,149 | 4,084 | 684 → 694 ns |
+| cold-facts fallback connections/s | 6,241 | 6,709 | 598 → 563 ns |
+| must-direct bulk, MiB/s | 2,145 | 2,158 | 292 → 281 ns |
+| compound-proxy bulk, MiB/s | 1,944 | 2,011 | 422 → 423 ns |
 
-`ModeState` applies Clash mode only after the routing result. It never overrides `block` or a result carrying `must`.
+Final-artifact equivalent-path throughput ranged from -1.6% to +7.5%; the
+whole-TC averages are workload-dependent, not a blanket no-regression guarantee.
+Observed peak process RSS was 84,628 → 78,636 KiB. The candidate retained
+135,560 JIT bytes across its loaded
+programs, including the preloaded L3 variants and a 10,014-byte generated
+function. The allocation benchmark measured an unchanged reload at 15.33 →
+15.29 ms, with 20 allocations / 68,097 bytes and no flag writes in either case.
 
-| Mode | Userspace override | Route-time kernel policy |
-| --- | --- | --- |
-| `Rule` | Keep the routed outbound | Offload a plain `direct` result only when SNI cannot change it: `dial_mode: ip` or `domain+`, no domain-class rule exists, or this flow set `DomainKnown` through `DOMAIN_ROUTING_MAP`; otherwise hand off to userspace |
-| `Global` | Use the current GLOBAL selection when it resolves | Normally hand off to userspace. The exact lowercase GLOBAL selection `direct` is a special case that publishes `OFFLOAD_ALL` because every non-final result converges to direct |
-| `Direct` | Force `direct` | Offload every non-`must`, non-`block` result and normalize its cached outbound to `Direct` |
-
-`lan_ingress` reads `DATAPATH_FLAGS_MAP` once for a new flow. When the mode policy offloads a non-`must` flow, it records the decision in bit 57 of `RoutingMeta`; established packets then check only cached `outbound == Direct && (must || offload)`. A `direct(must)` flow uses the `must` bit and does not need bit 57.
-
-Offloaded flows never create a userspace relay or `/connections` entry and cannot be re-routed by later SNI. Their transmit packets and bytes are still counted at `lan_ingress`.
-
-## Health interaction
-
-Before redirect or native forwarding, the datapath checks `OUTBOUND_CONNECTIVITY_MAP`. A dead selected outbound returns `TC_ACT_SHOT`: honk fails closed rather than leaking the flow through `direct`. Destination port 53 is exempt for both TCP and UDP so DNS can reach the control plane and apply its own fallback policy.
-
-The group-shared slot normally contains the OR of all leaf health. A TCP group with exactly one unique leaf and no `final` keeps that slot open as a userspace last resort; the control plane still dials the same proxy, and successful traffic can revive it. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. Clash `Global` and `Direct` overrides still cannot bypass a `must` or `block` result. See the [datapath design](./datapath.md) for the exact redirect and drop paths.
+The positive-domain comparison is deliberately excluded: baseline traffic
+incorrectly used direct, while the candidate used the configured proxy.
+Baseline known-zero traffic timed out after DNS; the candidate completed at
+9,780 connections/s on the native path. These are correctness differences,
+not like-for-like speedups.
 
 ## Related docs
 
-- [Datapath design](./datapath.md)
-- [Control-plane design](./control-plane.md)
 - [Routing configuration reference](../reference/routing.md)
+- [Datapath](./datapath.md)
+- [DNS](./dns.md)
+- [NFQUEUE](./nfqueue.md)
+- [Control plane](./control-plane.md)

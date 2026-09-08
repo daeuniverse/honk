@@ -408,46 +408,6 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     }
 }
 
-/// Write one bounded chunk with `BPF_MAP_UPDATE_BATCH` (Linux 5.6+).
-pub fn bpf_update_batch<K: Pod, V: Pod>(
-    bpf: &Ebpf,
-    cap: &BatchCapability,
-    map: &str,
-    keys: &[K],
-    values: &[V],
-) -> anyhow::Result<bool> {
-    if cap.is_unsupported() {
-        return Ok(false);
-    }
-    if keys.is_empty() {
-        return Ok(true);
-    }
-    anyhow::ensure!(
-        keys.len() == values.len(),
-        "update_batch({map}): keys/values length mismatch"
-    );
-    anyhow::ensure!(
-        keys.len() <= BPF_BATCH_CHUNK,
-        "update_batch({map}): limited to {BPF_BATCH_CHUNK} elements per call"
-    );
-    let fd = map_fd(bpf, map)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.batch.map_fd = fd as u32;
-    attr.batch.keys = keys.as_ptr() as u64;
-    attr.batch.values = values.as_ptr() as u64;
-    attr.batch.count = keys.len() as u32;
-    let result = unsafe { bpf_syscall(BPF_MAP_UPDATE_BATCH as c_long, &mut attr) };
-    if !cap.observe(result) {
-        debug!(
-            "bpf update_batch({}) unsupported, using Aya array writes",
-            map
-        );
-        return Ok(false);
-    }
-    result.map_err(|error| anyhow::anyhow!("bpf update_batch({map}) errno={error}"))?;
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

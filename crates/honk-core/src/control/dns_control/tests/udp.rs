@@ -105,12 +105,9 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         must: false,
         mark: 0,
     };
-    let mut bitmap = honk_ebpf_common::DomainRouting::default();
-    bitmap.bitmap[0] = 1;
     let snapshot = Arc::new(crate::dns::projection::RoutingProjectionSnapshot::new(
         1,
         Arc::new(Router::new(&[route], "direct").expect("routing matcher")),
-        std::collections::HashMap::from([("dns".into(), vec![bitmap])]),
     ));
     let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
         generation: crate::dns::runtime::RuntimeGeneration::new(1),

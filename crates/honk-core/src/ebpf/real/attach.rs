@@ -9,6 +9,15 @@ impl RealEbpfBackend {
         wan_ifname: &str,
         single_homed: bool,
     ) -> anyhow::Result<Self> {
+        let version =
+            kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
+        anyhow::ensure!(
+            version >= (7, 2, 0),
+            "compiled routing requires Linux 7.2 or newer (running {}.{}.{})",
+            version.0,
+            version.1,
+            version.2
+        );
         let process_name_offsets = process_name::detect();
         let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
 
@@ -149,50 +158,6 @@ impl RealEbpfBackend {
             process_name::PnameCaptureMode::Comm => {
                 warn!("kernel argv capture unavailable; using thread comm")
             }
-        }
-        // Install a complete generation-0 fallback before any TC hook is
-        // attached. New flows therefore punt to userspace until the first
-        // compiled routing generation is published.
-        {
-            let generation = 0u32;
-            let cold_start = MatchSet {
-                match_type: MatchType::Fallback as u8,
-                outbound: OutboundIndex::ControlPlaneRouting as u8,
-                ..Default::default()
-            };
-            set_array_value(&mut bpf, "ROUTING_MAP", 0, &cold_start)
-                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_MAP init: {e}"))?;
-
-            let bitmap = [1u32, 0, 0, 0];
-            for group in 0..ROUTING_GROUP_COUNT as u32 {
-                for (word, value) in bitmap.iter().enumerate() {
-                    let slot = routing_meta_bitmap_base(generation)
-                        + group * ROUTING_GROUP_BITMAP_WORDS as u32
-                        + word as u32;
-                    set_array_value(&mut bpf, "ROUTING_META_MAP", slot, value)
-                        .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {e}"))?;
-                }
-            }
-            let count = 1u32;
-            let count_slot = routing_meta_count_slot(generation);
-            set_array_value(&mut bpf, "ROUTING_META_MAP", count_slot, &count)
-                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {e}"))?;
-            for group in 0..ROUTING_GROUP_COUNT as u32 {
-                let index = routing_group_meta_index(generation, group);
-                let meta = RoutingGroupMeta {
-                    rule_count: count,
-                    bitmap,
-                };
-                set_array_value(&mut bpf, "ROUTING_GROUP_META_MAP", index, &meta)
-                    .map_err(|e| anyhow::anyhow!("cold-start ROUTING_GROUP_META_MAP init: {e}"))?;
-            }
-            set_array_value(
-                &mut bpf,
-                "ROUTING_META_MAP",
-                ROUTING_META_ACTIVE_GENERATION_SLOT,
-                &generation,
-            )
-            .map_err(|e| anyhow::anyhow!("cold-start routing selector init: {e}"))?;
         }
         // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
         // This enables pname routing and control-plane traffic bypass (Go dae parity).
@@ -574,7 +539,10 @@ impl RealEbpfBackend {
             event_flush_handle,
             cap_lookup_and_delete: BatchCapability::new(),
             cap_lookup_batch: BatchCapability::new(),
-            cap_update_batch: BatchCapability::new(),
+            routing_generation: None,
+            routing_slot: 0,
+            routing_generation_counter: 0,
+            pending_domain: None,
         })
     }
 

@@ -157,14 +157,10 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     control
         .datapath_flags_handle()
         .expect("datapath flags coordinator")
-        .initialize(0, enabled, false)
+        .initialize(enabled, false)
         .await
         .unwrap();
-    let published = writes
-        .lock()
-        .ok()
-        .and_then(|values| values.last().copied())
-        .expect("initial flags");
+    let published = writes.lock().last().copied().expect("initial flags");
     assert_eq!(
         published & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY),
         0
@@ -3084,7 +3080,22 @@ fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>)
         groups,
         ..Default::default()
     };
-    config.routing.default_outbound = default_outbound.into();
+    config.routing.default_outbound = if let Some(node) = config
+        .nodes
+        .iter()
+        .find(|node| node.name == default_outbound)
+        && !matches!(default_outbound, "direct" | "block")
+    {
+        let name = format!("{default_outbound}-route");
+        config.groups.push(Group {
+            name: name.clone(),
+            nodes: vec![node.id],
+            ..Default::default()
+        });
+        name
+    } else {
+        default_outbound.into()
+    };
     config
 }
 
@@ -3245,7 +3256,7 @@ async fn udp_stats_lifecycle_dial_error_closes_guard_and_samples_dial() {
 
     serve_test_udp(&handle).await.unwrap();
 
-    assert_udp_outbound(&stats, "udp-test", 1, 0, 1);
+    assert_udp_outbound(&stats, "udp-test-route", 1, 0, 1);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.route_latency.count, 1);
     assert_eq!(udp.dial_latency.count, 1);
@@ -3309,7 +3320,7 @@ async fn udp_stats_lifecycle_first_send_error_closes_guard_and_records_error() {
 
     assert!(serve_test_udp(&handle).await.is_err());
 
-    assert_udp_outbound(&stats, "udp-test", 1, 0, 1);
+    assert_udp_outbound(&stats, "udp-test-route", 1, 0, 1);
 }
 
 #[tokio::test]
@@ -3447,7 +3458,7 @@ async fn udp_stats_lifecycle_slow_future_cancellation_drops_guard_without_error(
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
 
-    assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+    assert_udp_outbound(&stats, "udp-test-route", 1, 0, 0);
 }
 
 #[tokio::test]
@@ -3669,7 +3680,7 @@ async fn udp_stats_lifecycle_success_and_reply_eof_close_guard() {
     serve_test_udp(&handle).await.unwrap();
     tokio::task::yield_now().await;
 
-    assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+    assert_udp_outbound(&stats, "udp-test-route", 1, 0, 0);
 }
 
 #[test]
@@ -5384,7 +5395,13 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 .with_packet(handler),
             );
 
-            let mut config = udp_test_config("direct", vec![udp_test_node()], vec![]);
+            let node = udp_test_node();
+            let group = Group {
+                name: "udp-test-route".into(),
+                nodes: vec![node.id],
+                ..Default::default()
+            };
+            let mut config = udp_test_config("direct", vec![node], vec![group]);
             config.ensure_builtin_nodes();
             config.global.lan_interface = vec!["honk-lan0".into()];
             config.global.dial_mode = "domain++".into();
@@ -5399,7 +5416,9 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                         domain_suffix: vec!["never.invalid".into()],
                         ..Default::default()
                     },
-                    outbound: honk_config::routing::RoutingOutbound::Simple("udp-test".into()),
+                    outbound: honk_config::routing::RoutingOutbound::Simple(
+                        "udp-test-route".into(),
+                    ),
                     priority: 0,
                     must: false,
                     mark: 0,
@@ -5413,7 +5432,9 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                         port: vec!["41002".into()],
                         ..Default::default()
                     },
-                    outbound: honk_config::routing::RoutingOutbound::Simple("udp-test".into()),
+                    outbound: honk_config::routing::RoutingOutbound::Simple(
+                        "udp-test-route".into(),
+                    ),
                     priority: 0,
                     must: false,
                     mark: 0,

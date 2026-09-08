@@ -82,11 +82,9 @@ TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifie
 | `CONN_STATE_MAP` | Non-preallocated plain hash, maximum 524,288 entries. Stores per-flow TCP/UDP state and published routing metadata; userspace owns pressure eviction. |
 | `REDIRECT_TRACK` | Non-preallocated 65,536-entry hash. Maps a directional five-tuple to original MAC/interface, outbound, timestamp, and decision identity for reply restoration. |
 | `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry hash. Carries tuple-keyed route metadata to userspace. |
-| `ROUTING_MAP` | 256-entry array: two banks of 128 `MatchSet` rules. Userspace fills the inactive bank before switching generations. |
-| `ROUTING_META_MAP` | 35-entry array containing the active generation selector plus each generation's rule count and four flow-group bitmaps. The selector is the commit point. |
-| `ROUTING_GROUP_META_MAP` | Eight packed entries: two generations × TCP4/TCP6/UDP4/UDP6, each with a rule count and 128-bit bitmap. |
-| `DEST_LPM_ROUTING_MAP`, `SOURCE_LPM_ROUTING_MAP`, `MAC_LPM_ROUTING_MAP` | LPM tries, each capped at 65,536 entries, for destination CIDR, source CIDR, and MAC prefixes. |
-| `DOMAIN_ROUTING_MAP` | Non-preallocated 65,536-entry IP-to-domain-rule bitmap hash populated from DNS outcomes. |
+| `ROUTING_POLICY_ROOT` | One-entry map-in-map selecting an immutable policy descriptor and one of two synchronous generated-function slots. Successful root replacement supplies the old non-sleepable readers' grace period. |
+| Generation-owned IP/MAC indexes | Separate destination/source IPv4 and IPv6 LPM maps plus a MAC LPM map. Values are full per-generation predicate bitmaps, with ancestor bits inherited into more-specific prefixes. |
+| Generation-owned domain map | Non-preallocated IP-to-domain-predicate bitmap hash. DNS/sniff facts include positive and negated predicates; a present zero bitmap is known-false. The descriptor exposes its map ID for diagnostics. |
 | `OUTBOUND_CONNECTIVITY_MAP` | 1,536-entry array. Six liveness slots per outbound cover TCP/UDP class and IPv4/IPv6; an absent slot is treated as alive. |
 | `OUTBOUND_STATS` | 256-entry per-CPU array indexed directly by outbound. Each 32-byte value packs `tx_packets`, `tx_bytes`, `rx_packets`, and `rx_bytes`; the current ABI does not use `outbound * 4 + counter` indexing. |
 | `LISTEN_SOCKET_MAP` | 16-slot `SockMap`; keys `0..=9` hold the two TCP and eight UDP transparent listeners. |

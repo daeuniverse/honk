@@ -2,7 +2,7 @@
 
 This document describes the userspace DNS architecture shared by transparent port-53 interception and the optional `dns.bind` listener.
 
-Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; `DOMAIN_ROUTING_MAP` stores learned routing projections, not DNS responses.
+Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; the active policy's domain map stores learned predicate facts, not DNS responses.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ flowchart LR
     R --> O[Typed outcome]
     O --> X[Ingress reply]
     O --> M[Routing projection]
-    M --> D[DOMAIN_ROUTING_MAP]
+    M --> D[Active policy domain-fact map]
 ```
 
 Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`, forwarder, cache, singleflight set, upstream pools, and routing projection. An adapter owns admission until reply I/O completes; it does not write domain routes directly.
@@ -192,7 +192,7 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 
 ## Routing projection
 
-`DnsController` converts resolution outcomes into desired state rather than writing `DOMAIN_ROUTING_MAP` inline:
+`DnsController` converts resolution outcomes into desired state rather than writing the active policy's domain map inline:
 
 | Outcome | Projection observation |
 | --- | --- |
@@ -200,7 +200,7 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 | Accepted NODATA or NXDOMAIN | Clear that domain owner. |
 | Accepted SERVFAIL or rejected policy result | Retain current state. |
 
-`DOMAIN_ROUTING_MAP` remains global and source-independent. Source-aware request routing isolates DNS exchange scopes and answers; it does not partition eBPF domain observations or ordinary traffic routing.
+The domain association remains global and source-independent within each policy generation. Source-aware request routing isolates DNS exchange scopes and answers; it does not partition eBPF domain observations or ordinary traffic routing. Projection evaluates every domain predicate independently of non-domain rule conditions, including predicates used by negation; a known domain with no matching predicate retains a present zero bitmap.
 
 The worker reconciles generation-tagged desired state in batches of at most 256 sets/removes. Failed writes remain dirty and retry with bounded backoff. Before a batch mutates the backend, the worker acquires the backend lock and rechecks the generation while holding the publication fence. Reload installs the replacement projection snapshot under the same backend lock. An old batch can therefore neither enter nor continue mutating the map after a replacement generation is published.
 

@@ -63,7 +63,7 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     let now = tokio::time::Instant::now();
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
-    let mut backend = MockEbpfBackend::new();
+    let mut backend = backend_for_test(&snapshot(1, 1, 2));
     let key = maps::ip_addr_to_lpm_key(ip);
     state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
     let initial = state.batch(now);
@@ -196,13 +196,14 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
 
 #[tokio::test(start_paused = true)]
 async fn spawned_worker_converges_mock_map_after_transient_failure() {
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
-        Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
+    let current = snapshot(7, 1, 2);
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> = Arc::new(tokio::sync::RwLock::new(
+        Box::new(backend_for_test(&current)),
+    ));
     ebpf.write()
         .await
         .inject_projection_fault(ProjectionMapOperation::Set, 1, false)
         .expect("fault injection");
-    let current = snapshot(7, 1, 2);
     let projection = RoutingProjection::spawn(Arc::clone(&ebpf), Arc::clone(&current));
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
     projection.submit(current, positive("a.test", &[ip], Duration::from_secs(30)));

@@ -73,7 +73,7 @@ flowchart TB
 ### 报文路径
 
 1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。`direct(must)` 与路由时已安全的 direct 决策留在 Linux 原生路径；仍需用户态处理的决策不会卸载。
-2. [DNS 路径](./dns.md)让 TCP 和 UDP 目的端口 `53` 进入快速路径，跳过通用匹配循环并重定向到控制面。
+2. [DNS 路径](./dns.md)让 LAN TCP/UDP 目的端口 `53` 进入快速路径，跳过已编译的 traffic policy；WAN 路由保留非 must 的 53 端口控制面覆盖。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
 4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
 5. [控制面](./control-plane.md)恢复原始目的地址并消费 eBPF 路由 handoff。handoff 缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。
@@ -86,7 +86,7 @@ flowchart TB
 
 - **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带 `DAE_BYPASS_MARK`（`0x100`）或使用 loopback。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。
-- **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而 `DOMAIN_ROUTING_MAP` 投影仍为全局且不区分来源。
+- **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
 - **网络命名空间纪律：** 进程常驻 host netns。它只通过有作用域且完全同步的 `with_daens_netns` 调用进入 `daens`；`setns` 跨度内不得出现 `.await`，恢复原命名空间失败时进程必须中止。
 - **数据路径准入：** `DATAPATH_STATE_MAP[0]` 在全部监听 FD 已发布且全部接收循环已运行前保持关闭，并在拆除监听器前关闭。gate 关闭期间，TC 原样放行流量。
 - **NFQUEUE 就绪与所有权：** 启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；ready 变更必须经过 fence，生命周期歧义为致命错误，同一 netns 的防火墙管理器不得修改这些对象。
@@ -104,7 +104,7 @@ flowchart TB
 
 | Feature | 默认 | 作用 |
 | --- | --- | --- |
-| `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入 `honk-ebpf` 目标文件。运行时要求 Linux kernel 5.8+。 |
+| `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入静态 `honk-ebpf` 对象，用户态在运行时编译 policy extension。运行时要求 Linux kernel 7.2+。 |
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
 | `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |

@@ -1,30 +1,22 @@
 use aya_ebpf::Global;
-use aya_ebpf::bindings::__be32;
-use aya_ebpf::btf_maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf, SockMap};
+use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, RingBuf, SockMap};
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
     BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
     UdpDecisionSequence,
 };
 use honk_ebpf_common::event::DaeEvent;
-use honk_ebpf_common::redirect_need::{
-    DomainRouting, MAX_MATCH_SET_LEN, PIDName, RoutingHandoffEntry, TuplesKey,
-};
-use honk_ebpf_common::route::{
-    MatchSet, ROUTING_GROUP_META_MAP_LEN, ROUTING_META_MAP_LEN, RoutingGroupMeta,
-};
-use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
+use honk_ebpf_common::redirect_need::{PIDName, RoutingHandoffEntry, TuplesKey};
+use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, RoutingPolicyDescriptor};
+#[cfg(feature = "routing-test")]
+use honk_ebpf_common::{RoutingInput, RoutingTestResult};
 
-use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
 
-/// LPM tries allocate entries on demand; the shared limit preserves large
-/// GeoIP sets without reserving their maximum capacity at map creation.
-pub const MAX_LPM_SIZE: usize = honk_ebpf_common::MAX_LPM_SIZE as usize;
+/// LPM tries are generation-owned by userspace and bound to the generated
+/// routing extension; no legacy fact map is present in the static datapath.
 pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
-pub const MAX_LPM_NUM: usize = MAX_MATCH_SET_LEN + 8;
 pub const MAX_COOKIE_PID_PNAME_MAPPING_NUM: usize = 65536;
-pub const MAX_DOMAIN_ROUTING_NUM: usize = 65536;
 
 #[repr(C)]
 pub struct UdpDecisionScratch {
@@ -169,34 +161,19 @@ pub static ROUTING_HANDOFF_MAP: HashMap<
     1,
 > = HashMap::new();
 
+/// Stable one-entry policy root. The backend atomically swaps the immutable
+/// descriptor map only after every inactive target slot and its generation-owned
+/// fact maps are ready.
 #[btf_map]
-/// Two physical rule banks. `ROUTING_META_MAP[0]` selects the active bank;
-/// the inactive bank is populated before that single-slot switch.
-pub static ROUTING_MAP: Array<MatchSet, ROUTING_MAP_LEN, 0> = Array::new();
+pub static ROUTING_POLICY_ROOT: ArrayOfMaps<Array<RoutingPolicyDescriptor, 1>, 1> =
+    ArrayOfMaps::new();
+#[cfg(feature = "routing-test")]
+#[btf_map]
+pub static ROUTING_TEST_INPUT: Array<RoutingInput, 1> = Array::new();
 
-/// Routing metadata for the two rule banks. Slot 0 is the active generation;
-/// each following block contains one generation's count and group bitmaps.
+#[cfg(feature = "routing-test")]
 #[btf_map]
-pub static ROUTING_META_MAP: Array<u32, ROUTING_META_MAP_LEN, 0> = Array::new();
-/// Packed count and bitmap for each (generation, flow-group) pair.
-#[btf_map]
-pub static ROUTING_GROUP_META_MAP: Array<RoutingGroupMeta, { ROUTING_GROUP_META_MAP_LEN }, 0> =
-    Array::new();
-#[btf_map]
-pub static DOMAIN_ROUTING_MAP: HashMap<[__be32; 4], DomainRouting, MAX_DOMAIN_ROUTING_NUM, 1> =
-    HashMap::new();
-
-#[btf_map]
-pub static DEST_LPM_ROUTING_MAP: LpmTrie<[__be32; 4], DomainRouting, MAX_LPM_SIZE, 1> =
-    LpmTrie::new();
-
-#[btf_map]
-pub static SOURCE_LPM_ROUTING_MAP: LpmTrie<[__be32; 4], DomainRouting, MAX_LPM_SIZE, 1> =
-    LpmTrie::new();
-
-#[btf_map]
-pub static MAC_LPM_ROUTING_MAP: LpmTrie<[__be32; 4], DomainRouting, MAX_LPM_SIZE, 1> =
-    LpmTrie::new();
+pub static ROUTING_TEST_OUTPUT: Array<RoutingTestResult, 1> = Array::new();
 
 #[btf_map]
 pub static COOKIE_PID_MAP: HashMap<u64, PIDName, MAX_COOKIE_PID_PNAME_MAPPING_NUM, 1> =
@@ -250,12 +227,6 @@ pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();
 
 #[btf_map]
 pub static PKT_SCRATCH_KEY: PerCpuArray<ParsedPacket, 1> = PerCpuArray::new();
-
-#[btf_map]
-pub static ROUTE_CTX_SCRATCH_MAP: PerCpuArray<RouteCtx, 1> = PerCpuArray::new();
-
-#[btf_map]
-pub static WAN_EGRESS_ROUTE_SCRATCH_MAP: PerCpuArray<WanEgressRouteScratch, 1> = PerCpuArray::new();
 
 #[btf_map]
 pub static CONNTRACK_ARGS_MAP: PerCpuArray<ConntrackArgs, 1> = PerCpuArray::new();

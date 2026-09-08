@@ -86,8 +86,13 @@ test-config:
 test-ebpf:
     cargo test -p honk-ebpf-common
 
+
+# Real generated-policy goldens and atomic publication failures (Linux 7.2+, root).
+test-routing:
+    cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test
+    HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib compiled_policy_matches_goldens_and_preserves_failed_root -- --ignored --test-threads=1
 # Root-gated netlink/netns integration tests (NFQUEUE + netkit/veth/route/rule roundtrip)
-test-netns:
+test-netns: test-routing
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1

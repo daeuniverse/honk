@@ -16,6 +16,7 @@ network-types = "0.2.0"
 [features]
 default = []
 log = ["aya-log-ebpf"]
+routing-test = []
 
 [[bin]]
 name = "honk-ebpf"

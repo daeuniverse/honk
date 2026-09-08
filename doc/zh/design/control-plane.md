@@ -134,10 +134,10 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 1. Fence NFQUEUE readiness，并等待内核 reader-epoch 宽限期。
 2. 拒绝新的透明代理准入。
 3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 变空，并排空精确 endpoint retirement。
-4. 暂存并激活路由，再把新的出站 registry、DNS runtime pointer、Router、配置、组和 projection snapshot 作为一次串行 generation 变更发布。
-5. 发布新的静态 datapath flag，开放 pending 准入，最后重开 NFQUEUE。此后才停止拒绝新流。
+4. 构建 generation 私有事实、加载生成函数并附着全部 inactive slot，最后切换 `ROUTING_POLICY_ROOT`，再于同一串行边界内发布出站 registry、DNS runtime pointer、Router、配置、组和 projection snapshot。
+5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
-提交前构建失败不会触碰当前 generation。若 fence 后发布失败，控制平面重放精确的旧路由计划，恢复旧静态 flag，并重开旧 generation。若恢复不能证明数据路径健康，则继续拒绝准入。之后任何一次完整走完发布路径的 reload（闩锁期间会强制重推路由）会重新放开准入，因为到那一刻所有可能被撕裂的 map 都已重建（组连通性重发按既定策略仅告警、保持 fail-open）。
+提交前失败保留活动代码与事实，不再重放旧路由计划。Fence 后发布被拒绝时，控制器恢复组连通性并重开旧 generation；连通性恢复失败则继续拒绝准入。Root 切换成功后新 generation 已提交，之后若 NFQUEUE 重开失败，保留已发布的新 generation 并继续 fence 准入，直到后续成功 reload 修复。
 
 `DnsServiceProvider` 是一致的 DNS generation pointer。请求 lease 保留其 generation 的 forwarder、projection、transport pool 和出站运行时，直到退役。出站 registry 同样按 generation 持有：未变化的 node runtime 只在提交点转移，旧 registry 把这些 runtime 标记为已移出，然后开始优雅退役。现有 stream 与 `Ready` UDP endpoint 保持引用，同时旧 reusable pool 停止接受新工作并排空。
 

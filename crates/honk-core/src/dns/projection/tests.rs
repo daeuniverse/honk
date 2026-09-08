@@ -1,10 +1,8 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
-use honk_ebpf_common::DomainRouting;
 
 use super::state::DesiredState;
 use super::worker;
@@ -21,44 +19,32 @@ type TestProjection = (
     SharedBackend,
 );
 
-fn bitmap(bit: u32) -> DomainRouting {
-    let mut bitmap = DomainRouting::default();
-    bitmap.bitmap[0] = bit;
-    bitmap
-}
-
 fn snapshot(generation: u64, a: u32, b: u32) -> Arc<RoutingProjectionSnapshot> {
-    let routes = vec![
-        RoutingRule {
-            name: "a".to_owned(),
-            condition: RoutingCondition {
-                domain: vec!["a.test".to_owned()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("direct".to_owned()),
-            priority: 1,
-            must: false,
-            mark: 0,
-        },
-        RoutingRule {
-            name: "b".to_owned(),
-            condition: RoutingCondition {
-                domain: vec!["b.test".to_owned()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("direct".to_owned()),
-            priority: 2,
-            must: false,
-            mark: 0,
-        },
-    ];
+    let routes = (0..8)
+        .map(|bit| {
+            let domain = if a & (1 << bit) != 0 {
+                "a.test".to_owned()
+            } else if b & (1 << bit) != 0 {
+                "b.test".to_owned()
+            } else {
+                format!("unused-{bit}.test")
+            };
+            RoutingRule {
+                name: format!("predicate-{bit}"),
+                condition: RoutingCondition {
+                    domain: vec![domain],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("direct".to_owned()),
+                priority: bit,
+                must: false,
+                mark: 0,
+            }
+        })
+        .collect::<Vec<_>>();
     Arc::new(RoutingProjectionSnapshot::new(
         generation,
         Arc::new(Router::new(&routes, "direct").expect("test router")),
-        HashMap::from([
-            ("a".to_owned(), vec![bitmap(a)]),
-            ("b".to_owned(), vec![bitmap(b)]),
-        ]),
     ))
 }
 
@@ -70,6 +56,20 @@ fn positive<'a>(domain: &'a str, ips: &'a [IpAddr], ttl: Duration) -> Projection
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn live_domain_without_matching_predicate_projects_present_zero() {
+    let now = tokio::time::Instant::now();
+    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    state.observe(
+        positive("unknown.test", &[ip], Duration::from_secs(30)),
+        now,
+    );
+
+    let batch = state.batch(now);
+    assert_eq!(batch.sets.len(), 1);
+    assert_eq!(batch.sets[0].bitmap.bitmap, [0; 8]);
+}
 #[tokio::test(start_paused = true)]
 async fn shared_ip_clear_and_expiry_recompute_owner_or() {
     let now = tokio::time::Instant::now();
@@ -292,9 +292,23 @@ async fn refresh_and_ip_replacement_preserve_ttl_and_exact_revisions() {
     assert!(state.owner_domains().is_empty());
 }
 
+fn backend_for_test(snapshot: &RoutingProjectionSnapshot) -> MockEbpfBackend {
+    let plan = crate::control::routing_matcher::RoutingMatcherBuilder::compile(
+        &snapshot.matcher,
+        &std::collections::HashMap::from([("direct".to_owned(), 0)]),
+        "direct",
+        honk_config::types::DialMode::Domain,
+    )
+    .unwrap();
+    let mut backend = MockEbpfBackend::new();
+    backend.publish_routing_plan(0, &plan).unwrap();
+    backend
+}
+
 fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjection {
     let (wake, receiver) = tokio::sync::mpsc::channel(1);
     let counters = Arc::new(super::ProjectionCounters::default());
+    let backend = backend_for_test(&snapshot);
     (
         RoutingProjection {
             state: parking_lot::Mutex::new(DesiredState::new(snapshot, 10_000)),
@@ -310,7 +324,7 @@ fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjecti
             },
         },
         receiver,
-        Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new()))),
+        Arc::new(tokio::sync::RwLock::new(Box::new(backend))),
     )
 }
 

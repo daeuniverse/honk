@@ -66,11 +66,7 @@ fn runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
         generation: RuntimeGeneration::new(1),
         udp_query_limit: 256,
         forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            1,
-            router,
-            Default::default(),
-        )),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(1, router)),
         outbound_runtime: None,
         transport: transport.clone(),
     })

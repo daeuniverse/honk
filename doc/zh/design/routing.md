@@ -1,125 +1,193 @@
-# 路由引擎
+# 编译化路由决策面
 
-本文说明内核与用户态如何为每条流选择出站；路由语法与字段见[路由参考](../reference/routing.md)。
+## 范围
 
-## 决策路径
+路由只有一个手写语义模型，执行方式可以不同：用户态 `Router` 解释规范化的
+policy IR，受限编译器把同一 IR 降低为原生 eBPF 比较代码。内核不再解释另一套
+`MatchSet` 程序。真实后端的内核基线为 Linux 7.2。
 
-新流首先由 eBPF 路由引擎分类。安全直连卸载得到完整内核决策后可留在原生路径；其他决策会产生到控制平面的交接。用户态接收原始目的地址，按需获知域名，在必要时重新运行 `Router`，应用 Clash 模式，并把得到的组解析为叶子出站。
+静态 TC 程序继续负责报文解析、特殊/本地/DNS 排除、conntrack、mode 与健康检查、
+NFQUEUE 所有权、重定向和回包统计。生成函数只负责
+`RoutingInput -> RoutingDecision`。不会因为采用编译策略而把所有首包送到用户态；
+native-direct 与已有流缓存路径保持原生执行。
 
-因此，路由结果是流的属性，而不是每个数据包的属性。已建立流的数据包使用 conntrack 状态中保存的决策，不会重复执行规则求值，也不会读取当前 Clash 模式标志。
+## 规则语义
 
-## 内核路由
+规范化 IR 保存有序 RuleId、展示信息、条件与 outbound/mark/must 动作。priority
+数值越小越先匹配，同优先级保持声明顺序。条件之间 AND，同一条件的候选值 OR，
+否定只作用一次且覆盖整个条件。fallback 是独立的终结动作。空展开不能被丢弃：
+正向空集合为 false，负向空集合为 true，不能因 geo 资源没有匹配项而放宽复合规则。
 
-### `MatchSet` 求值
+切换保留当前用户态匹配合同：
 
-`RoutingMatcherBuilder` 按优先级升序排列已编译路由，并把每条规则降低为 `honk-core` 与 `honk-ebpf` 共享的 dae `match_set` ABI。每个按类型拆分的 `MatchSet` 都携带 matcher 值、取反位、中间或最终出站、`must` 位与 mark。
+- 普通 domain pattern/suffix/keyword 是同一条件内的 OR；与 geosite 字段同时存在
+  时，geosite 仍是独立条件。suffix、regex、keyword、大小写和 geosite 属性行为不变。
+- 目的/源 IP 保留 IPv4/IPv6 身份，覆盖 `/0`、裸主机地址及重叠前缀。
+- 端口区间包含两端；TCP/UDP 和 IPv4/IPv6 mask 可以同时包含两种值。
+- pname 保留配置端 15 字节规范化及子串匹配语义。内核进程字节按照 handoff 相同的
+  lossy UTF-8 与 trim 规则转换，热路径不分配堆内存。
+- 缺失 pname/MAC/DSCP 不是普通零值。缺失 domain 不满足正向条件，也不会触发负向
+  条件的 veto。
+- 配置 `(must)` 是终结结果，不是历史内部 `MustRules` opcode。Clash mode 不能
+  覆盖 must 或 block。
 
-同一条件内的多个值形成 OR 链，不同条件形成 AND 链。中间结果 `LogicalOr` 与 `LogicalAnd` 保留这一结构，内核中无需分配规则对象。最后的 fallback 条目为未匹配流提供真实出站。
+旧 lowering 丢弃 full/regex、把协议 OR 降成 TCP、截断规则链、DNS 只投影首条整规则、
+重叠 LPM 丢失祖先位图，都不是要保留的兼容行为。共享 IR 和独立 golden 案例需要
+阻止这些错误，不能把旧缺陷编码进新后端。
 
-进入路由时，`route()` 准备全前缀的源、目的与 MAC key，并对选中的 bank 调用 `bpf_loop`。`RouteCtx` 在循环迭代之间维护 `GoodSubrule`、`BadRule`、`Must`、DNS 查询和域名已知状态。最终结果以 0–7 位编码出站、8–39 位编码 mark、40 位编码 `must`。
+## 唯一 policy 与域名事实
 
-| 索引 | 在路由状态机中的含义 |
-| --- | --- |
-| `0` | `Direct` |
-| `1` | `Block` |
-| `2+` | 用户组，顺序与配置一致 |
-| `0xFC` | `MustRules`：记录 `Must` 并继续求值 |
-| `0xFD` | `ControlPlaneRouting`：把决策推迟到用户态 |
-| `0xFE` | `LogicalOr`：继续当前 OR 子规则 |
-| `0xFF` | `LogicalAnd`：结束一个条件并继续当前规则 |
+`CompiledRoute` 保存元数据和 `CompiledCondition` 列表，不再平行维护正负 matcher
+字段。每个条件包含一个 `CompiledPredicate` 和否定标志。域名条件引用 policy 内
+不可变的已编译 matcher registry。规则名只用于展示，不能当作 bitmap 身份；相同
+域名谓词可以在同一 policy 内共享 PredicateId。
 
-`ControlPlaneRouting` 是中间交接结果，不是有效 fallback。fallback 必须解析为 `direct`、`block` 或用户组。
+用户态 reference 与内核编译器消费这一表示。DNS 和 sniffing 产生的是**全部域名
+谓词**的真值位，而不是用伪造五元组选择一条完整 traffic rule。用于否定规则的谓词
+同样投影其正向真值，not 由 evaluator 应用。一个已知域名即使没有匹配任何谓词，也
+产生存在的零 bitmap；该 IP 的最后一个有效 owner 消失时才删除条目。
 
-### 流分组预过滤
+DNS 关联仍按 IP、与源客户端无关，并延续多个有效 owner 的 OR 聚合。这不证明共享
+IP 上每条连接的精确 SNI。dial-mode reality check 与允许的 sniff 重路由仍由用户态
+负责；迁移不采用“所有 unknown 都 punt”，也不暗改四种 dial mode。
 
-每个物理规则 bank 有四个组：TCP/IPv4、TCP/IPv6、UDP/IPv4 与 UDP/IPv6。编译器为同一规则链内的每个 `MatchSet` 分配相同组成员关系。`ROUTING_GROUP_META_MAP` 为每个组和 generation 保存一个打包的 `RoutingGroupMeta { rule_count, bitmap }`。
+## 生成函数 ABI
 
-数据平面只读取一次 generation 选择器，选择流分组，并只加载一次该打包条目。bitmap 位为零时跳过相应的 `ROUTING_MAP` 查找与状态机步骤。规则链不会跨组拆分，因此跳过操作不会遗留 `LogicalOr` 或 `LogicalAnd` 状态。取反的协议或 IP 版本条件保留在所有组中，因为其补集可能匹配任何原本会被跳过的组。
+固定布局放在 `honk-ebpf-common`，字段仅使用固定宽度整数。Rust enum 布局、引用、
+String 和 allocator 对象都不跨边界。
 
-### LPM 与已学习域名 map
+`RoutingInput` 包含网络序源/目的地址、规范化的 16 字节 MAC key、规范化进程字节及
+长度、主机序端口、协议/family mask、DSCP 和 provenance/presence 信息。
+`RoutingDecision` 包含 outbound、mark、must、domain-finality 与 RuleId；独立的
+标量返回码区分成功结果与 evaluator 不可用/执行失败。
 
-目的 CIDR、源 CIDR 与 MAC 前缀位于各自的 LPM trie。每个 LPM value 都是物理 `MatchSet` slot 的 bitmap，因此多条规则共享的前缀会合并各自 bit，而不会互相覆盖。仅当当前 slot 的 bit 已设置时，LPM 查找才算匹配。
+`domain_final` 表示在当前 dial mode 下，后续域名观察不能改变这一阶段的路由：
+policy 没有域名谓词、禁用了域名重路由，或已经取得完整的 learned-domain bitmap。
+它是 policy-generation 内的数据，不是另行发布、可能错代的全局路由 flag。
 
-TCP SYN 时内核看不到主机名。域名与 geosite 条件编译为 `DomainSet` 占位符。`DOMAIN_ROUTING_MAP` 把 DNS 学习到的目的 IP 映射到对应的、按 generation 划分的规则 bitmap；条目存在时还会设置 `DomainKnown`，证明本轮所有 domain-set 检查均使用了完整的已学习 bitmap。
+非 `must` 的 direct 结果若域名 finality 尚未确定，交接给用户态时必须编码为
+`ControlPlaneRouting`；若仍写成最终 direct，TCP/UDP 初始化会跳过嗅探。
+已知 direct、must、block 以及 mode 控制的 direct offload 保留终态语义。
 
-在 `domain++` 模式中，如果通用代理规则带有目的端口条件，但没有 domain/geosite、进程、MAC 或 DSCP 限制，且出站不是 `direct` 或 `block`，编译器会把它改为 `ControlPlaneRouting`。`domain` 与 `domain+` 在内核中保留初始端口/IP 决策。`DOMAIN_ROUTING_MAP` 学到条目后，后续流仍可由内核完成决策。
+只在路由 miss 时初始化输入，复用现有 per-CPU packet scratch，缓存包不清空它。
+slot 的 volatile 访问防止 LLVM 删除输入或折叠输出；pname 规范化由独立验证、
+有界的 global subprogram 完成，避免 Unicode 分支与 WAN parser 状态相乘。
 
-## 原子路由发布
+静态 caller 把逻辑结果转换为原有 datapath action。`ControlPlaneRouting` 不是
+`TC_ACT_*`。evaluator 出错时执行 caller 原有的 fail-closed 清理，包括尚未完成的
+UDP Preparing claim，不能把故障伪装成用户态补判请求。
 
-路由推送是选择器最后写入的双阶段提交。它绝不清空活动 map，否则会在重载发布期间暴露空 generation 并丢弃新流量。
+## 受限原生后端
 
-1. 编译不可变的 `RoutingPushPlan`——`MatchSet`、LPM bitmap、流分组 bitmap 与域名投影元数据——且不写任何 BPF map。
-2. 读取活动 generation，并填充另一个 `ROUTING_MAP` bank。
-3. 暂存同时包含活动 generation 与 replacement generation 的目的、源及 MAC LPM value。只删除两个 plan 均不使用的 key。
-4. 写入 replacement generation 的展开自省元数据与全部四个打包 `RoutingGroupMeta` 条目。
-5. 最后翻转 `ROUTING_META_ACTIVE_GENERATION_SLOT`。
+后端发射有类型的 8 字节 BPF 指令、经检查的 label/fixup、常量比较、mask、map lookup
+和终结结果写入。它不拥有 TLS/QUIC 解析、拨号、mode、健康检查或通用 VM。大的 IP、
+MAC、domain 集合保留为索引，不展开成成千上万条立即数比较。
 
-一次路由求值只读取一次选择器，因此只能看到完整的旧 bank 或完整的 replacement bank。旧的物理尾部 slot 不会造成影响，因为 `rule_count` 限制了 `bpf_loop`。replacement 淘汰的 LPM key 会在旧 bank 仍可能被观察时保留，并在下一次转换中消失。
+每一代拥有独立的目的 IPv4/IPv6、源 IPv4/IPv6 LPM maps、MAC 索引和 domain hash map。
+IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条目继承所有匹配祖先
+谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
+不再共享可能被新前缀提前遮挡的双 bank LPM value。
 
-DNS 学习到的域名 bitmap 使用同一 generation 边界。重载会在切换规则 bank 前暂存其 inactive generation 一半。
+容量和 verifier 限制是明确错误，不能截断规则链或把缺失 outbound 默认为 direct。
+生成源映射记录 RuleId 和规范化规则描述。raw loader 复用现有 syscall/BTF 基础，不
+增加运行时 clang/LLVM 或另一个 ELF writer。函数原型必须真实；raw `func_info` 与
+`line_info` 使用指令槽偏移，不能直接套用 ELF `.BTF.ext` 的字节偏移。
 
-### 重载期间的组序号与健康状态
+## 同步槽与原子发布
 
-配置顺序同时定义路由出站序号与 connectivity slot：组 `i` 使用 `2 + i`。该组所有叶子成员共享此 slot。对于 TCP、DNS-UDP 或数据 UDP 的每种网络以及每个 IP 地址族，用户态发布的是成员健康状态的 OR，而非某个节点的状态。
+每个相关 TC 程序暴露两个真正保留的、非内联、BTF-global 函数：
+`honk_route_slot0` 和 `honk_route_slot1`。未安装槽返回错误，不实现第二套 fallback
+路由器。后端在放行前加载 LAN/WAN L2/L3 路由目标，包括将来可能动态附着的 variant。
 
-重载可能重新排列组，从而改变序号含义。切换路由 generation 前，用户态先把所有旧组或新组涉及的转换 slot 标记为存活。这份临时 fail-open 健康快照可防止旧健康 bit 杀死新分配的组。随后，用户态暂存已学习域名、切换路由 generation，再发布准确的新每组、每网络、每地址族存活快照。发布出错后尚未覆盖的 slot 保持 fail-open，不会继承陈旧失败状态。
+`ROUTING_POLICY_ROOT` 是单项 map-in-map，指向不可变的
+`RoutingPolicyDescriptor`。descriptor 标识 slot、policy generation、feature bits
+及供诊断使用的 active domain-map ID。一次路由只取一个 descriptor，再同步调用一个
+槽；缓存命中报文不新增这个 lookup。
 
-## 用户态 `Router`
+发布与现有 reload、DNS publication fence 串行协调：
 
-`Router::new` 一次性编译全部规则，并按优先级升序排列。正向 matcher 组之间为 AND，组内备选项为 OR；任一取反条件命中都会否决该规则。`route_full` 按优先级扫描并返回第一条匹配，`route_with_must` 返回该出站及其 `must` 标志；若无规则匹配，则返回默认出站与 `must = false`。
+1. 编译、校验完整候选，保留 active policy。
+2. 创建并填充本代事实 maps，包括 learned-domain 快照。
+3. 用这些确切 map FD 和合法 BTF 加载生成扩展。
+4. 给全部相关 TC target 的 inactive 槽完成 attach。
+5. 最后只替换一个 generation root。
+6. 成功更新返回后才允许退休旧 TC 槽和旧 maps；用户态 IR/reference lease 独立保有
+   自己的生命周期。
 
-内核保留结果 `MustRules` 具备 Go dae 的非终结行为：它记录 `Must` 后继续扫描。当前用户态实现并未复现该行为：携带 `must` 的规则仍是 `route_full` 的第一匹配终结结果。因此，完全回退到用户态 `Router` 的流不会在匹配 `must` 规则后继续；返回的标志只阻止后续嗅探与 Clash override。这是当前实现限制。
+Linux 7.2 在 map-in-map 更新成功返回前等待旧 non-sleepable BPF 调用完成。普通 root
+store、固定延时或“有两个槽”不是等价 grace。不能依赖不支持的 freplace
+`BPF_LINK_UPDATE`，也不 detach/attach 活跃槽。
 
-IP 与源 IP 条件使用 `BinaryLpmTrie`：IPv4 有 32 层，IPv6 有 128 层的紧凑二叉 trie。查找遇到已匹配前缀或缺失子节点后立即停止。
+后端发布操作在 root commit 前必须 all-or-nothing。map 构建、verifier、任一 inactive
+attach 失败，都保留旧代码与旧事实。不能用关闭 datapath admission 来掩盖错误，因为
+当前关闭状态会直接放行；也不能把全部流量 punt。规则派生 flags 与 domain writer
+必须属于同一 policy generation。mode/NFQUEUE 协调和已有流仍由原 controller 管理。
 
-`GeoAssets` 在每次构建 `Router` 时至多解析一次 `geoip.dat` 与 `geosite.dat`，且只解码配置引用的类别。`category@attr` 在第一个 `@` 处分割，索引基础类别，并保留携带该属性 key 的条目；key 是否存在的判断不区分大小写。`GeositeMatcher` 对精确名称和点边界后缀使用 hash set，对关键词使用一个 Aho-Corasick 自动机，对 regex 条目使用已编译正则表达式。
+稳定 policy pin 只保留 generation root。诊断工具通过 descriptor 查找 active domain
+map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的引用。
 
-## 域名路由与嗅探
+## 验证与验收
 
-域名路由有两个视图：
+完整实现必须覆盖全部已有 matcher，并通过：
 
-- DNS 应答把域名规则 bitmap 投影到 `DOMAIN_ROUTING_MAP`，后续连接到返回 IP 时可使用内核视图。
-- 没有已学习 IP 映射的连接进入用户态；嗅探到的名称加入 `ConnectionInfo` 后，完整 `Router` 可求值域名视图。
+- 独立 golden：顺序、OR/AND/not、缺失事实、must/block/mark、IPv4/IPv6、前缀重叠、
+  pname 规范化、domain 投影及容量失败。
+- reference 与真实生成 BPF 的完整 decision 比较，不只比较 outbound 或生成结构；
+  包含源元数据和 finality。
+- 真实 TC/cgroup/netns：native direct、proxy、block、DNS、LAN/WAN、TCP/UDP 和缓存流；
+  queue/token 路径保留真实 NFQUEUE 合同测试。
+- staging/verification/attach 故障、连续换代、旧读者场景，证明不存在半发布且旧流
+  所有权不变。
+- 配对测量完整路由/流量成本、冷热事实、reload、JIT 大小和内存峰值。强化后的
+  packed-data/AOT bounded-loop 是基线；端口微基准不代表整个引擎不退化。
 
-DNS 投影拥有固定到 generation 的 `Router` 与 bitmap 快照。worker 先取得 backend，再取得发布 fence，并重新检查 generation；若 batch 已过期，则在写入前跳过。因此，发布 replacement 快照后，旧 DNS batch 无法再修改 map。reconcile 期间 generation 发生变化时，会按当前快照重建 desired state。
+此前 Linux 7.2.3 隔离原型只覆盖协议/端口片段。以下分支验证使用生产 caller 和
+完整 policy，而不是把片段结果外推为整条 datapath 的收益。
 
-TCP 嗅探提取 TLS SNI 或 HTTP `Host`，并返回缓冲的前缀供转发。读取上限为 4096 字节。negative cache 会为反复得不到可用域名的目的地址抑制重复工作。
+### 分支验证记录
 
-UDP 嗅探处理 QUIC v1 与 v2 Initial 包。它派生 Initial key、移除 header protection、解密 payload、收集 CRYPTO frame、跨 fragment 或 packet 重组，再运行共享的 TLS ClientHello parser。每流 session 与 negative cache 限制重复尝试。ClientHello 未完成时不会把结果视为最终无域名，因为后续 Initial fragment 仍可能改变路由。
+`just test-routing` 单独构建 test object，沿真实 root/slot 路径执行 468 组独立
+完整 decision golden，同时验证 domain、目的/源 IP、MAC 的谓词 bit 255、
+容量 257 的拒绝，以及 inactive attach/root write 失败时保留旧 policy。
+`just test-netns` 包含这个 gate。
 
-初始的 IP 路由决策与可选的域名拨号目标彼此独立。只有 `domain` 的 reality check 通过，或处于 `domain++` 时，嗅探名称才会影响路由；`domain+` 不会改变路由。`must`、`block` 与保留的直连决策保持最终状态。negative-cache 命中会跳过名称提取并保留现有路径。
+固定的 Ubuntu `7.2.0-070200-generic` VM 通过全部 12 项 root-only 检查：
+TC/cgroup 生命周期与 allocator 兼容性、生成 policy 发布、TC/TUN 报文合同、
+生产 NFQUEUE 合同和真实 netns 流量。CI 在 hosted runner 构建 executable，
+再于这个内核中运行相同产物，不在 guest 中重复编译。
 
-### 拨号模式
+隔离的 Linux 7.2.3 实验机通过 IPv4/IPv6 LAN 21 项、WAN 12 项检查，覆盖
+direct/proxy/block TCP/UDP、MAC/源地址/目的地址组合、DSCP、pname、透明 DNS、
+冷热域名 TLS，以及 NFQUEUE 持有首包后的 native direct UDP。16 MiB TCP 流持续
+12.802 秒，跨越阻断新流的 reload 后完整结束；policy 发布为 9.43 ms，
+恢复为 9.24 ms。Direct/global mode 检查保留了 block 与 must 的优先级。
 
-| 模式 | 嗅探 | 对目的 IP 校验名称 | 重新执行路由 | 拨号行为 |
-| --- | --- | --- | --- | --- |
-| `ip` | 否 | 不适用 | 否 | 使用原始目的 IP。 |
-| `domain` | 是，除非最终决策或 negative cache 跳过 | 是；不匹配则丢弃名称 | 仅校验通过后 | 代理按已校验名称拨号；域名规则未命中时继续匹配后续 IP/端口规则。 |
-| `domain+` | 是，跳过条件相同 | 否 | 否 | 代理使用嗅探名称拨号，同时保留初始路由。 |
-| `domain++` | 是，跳过条件相同 | 否 | 是，仅针对非保留决策 | 根据 SNI/HTTP Host 重新路由，再使用所得代理目标。 |
+配对基线为 `8b2ad586`（packed group metadata 与原有 bounded-loop matcher），
+同机同配置、五次重复；短连接每次 512 条、并发 16，bulk 每次 8 × 8 MiB、
+并发 4。下表 kernel 时间是包含缓存包的整条 TC 平均值，不是单独的生成函数时间。
 
-## Clash 模式与直连卸载
+| 等价负载 | 基线 | 编译版 | LAN TC 均值：基线 → 编译版 |
+| --- | ---: | ---: | ---: |
+| must-direct，连接/秒 | 9,719 | 9,738 | 382 → 342 ns |
+| compound-proxy，连接/秒 | 4,149 | 4,084 | 684 → 694 ns |
+| cold-facts fallback，连接/秒 | 6,241 | 6,709 | 598 → 563 ns |
+| must-direct bulk，MiB/s | 2,145 | 2,158 | 292 → 281 ns |
+| compound-proxy bulk，MiB/s | 1,944 | 2,011 | 422 → 423 ns |
 
-`ModeState` 只在得到路由结果后应用 Clash 模式。它绝不覆盖 `block` 或携带 `must` 的结果。
+最终产物的等价路径吞吐变化为 -1.6% 至 +7.5%；整条 TC 均值随负载而异，
+不能视为全面无回归保证。观测到的进程峰值 RSS 为
+84,628 → 78,636 KiB。编译版加载的程序合计 135,560 JIT 字节，包含预加载的
+L3 variants 与 10,014 字节生成函数。未变化配置的 reload 分配基准为
+15.33 → 15.29 ms，两者均为 20 次分配、68,097 字节且没有 flag 写入。
 
-| 模式 | 用户态 override | 路由时内核策略 |
-| --- | --- | --- |
-| `Rule` | 保留路由得到的出站 | 仅当 SNI 无法改变结果时卸载普通 `direct`：`dial_mode: ip` 或 `domain+`、不存在 domain-class 规则，或该流通过 `DOMAIN_ROUTING_MAP` 设置了 `DomainKnown`；否则交给用户态 |
-| `Global` | 当前 GLOBAL 选择可解析时使用该选择 | 通常交给用户态。GLOBAL 选择恰好是小写 `direct` 时例外：此时发布 `OFFLOAD_ALL`，因为每个非最终结果都会收敛到直连 |
-| `Direct` | 强制 `direct` | 卸载每个非 `must`、非 `block` 结果，并把缓存出站规范化为 `Direct` |
-
-`lan_ingress` 对每条新流只读取一次 `DATAPATH_FLAGS_MAP`。模式策略卸载非 `must` 流时，会把决策记录到 `RoutingMeta` 第 57 位；已建立流的数据包随后只检查缓存的 `outbound == Direct && (must || offload)`。`direct(must)` 流使用 `must` 位，不需要第 57 位。
-
-卸载流不会创建用户态中继或 `/connections` 条目，也无法再由后续 SNI 重路由。其发送包数与字节数仍在 `lan_ingress` 计数。
-
-## 与健康状态的交互
-
-重定向或原生转发前，数据平面检查 `OUTBOUND_CONNECTIVITY_MAP`。选中出站已死时返回 `TC_ACT_SHOT`：honk 以 fail-closed 方式处理，而不会把流量泄漏到 `direct`。TCP 与 UDP 的目的端口 53 都免除此检查，以便 DNS 到达控制平面并应用自己的 fallback 策略。
-
-组共享槽通常保存全部叶节点健康状态的 OR。未配置 `final` 且只有一个唯一叶节点的 TCP 组会保持该槽开放，作为用户态最后尝试；控制面仍拨同一个代理，成功的真实流量可以将其复活。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。Clash `Global` 与 `Direct` override 仍无法绕过 `must` 或 `block` 结果。精确重定向与丢弃路径见[数据平面设计](./datapath.md)。
+正向域名路径不作为等价性能比较：基线错误地直连，编译版按配置走代理。
+基线在 DNS 后的 known-zero 流量超时，编译版通过 native 路径达到
+9,780 连接/秒。这些是正确性差异，不能包装成同路径加速比。
 
 ## 相关文档
 
-- [数据平面设计](./datapath.md)
-- [控制平面设计](./control-plane.md)
 - [路由配置参考](../reference/routing.md)
+- [数据面](./datapath.md)
+- [DNS](./dns.md)
+- [NFQUEUE](./nfqueue.md)
+- [控制面](./control-plane.md)

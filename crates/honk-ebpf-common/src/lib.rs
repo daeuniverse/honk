@@ -6,22 +6,19 @@ pub mod conn;
 pub mod dae_ip;
 pub mod event;
 pub mod redirect_need;
-pub mod route;
+pub mod routing_policy;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
 pub use crate::conn::{ConnState, UdpDecisionSequence, UdpDecisionState};
 pub use crate::redirect_need::{
-    DomainRouting, PIDName, ROUTING_BITMAP_GENERATIONS, ROUTING_BITMAP_WORDS,
-    ROUTING_BITMAP_WORDS_PER_GENERATION, RoutingHandoffEntry, RoutingResult, Tuples, TuplesKey,
+    DomainRouting, PIDName, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult, Tuples,
+    TuplesKey,
 };
-pub use crate::route::{
-    MatchSet, MatchSetValue, MatchType, PortRange, ROUTING_GENERATION_COUNT,
-    ROUTING_GROUP_BITMAP_WORDS, ROUTING_GROUP_COUNT, ROUTING_GROUP_META_MAP_LEN,
-    ROUTING_GROUP_TCP4, ROUTING_GROUP_TCP6, ROUTING_GROUP_UDP4, ROUTING_GROUP_UDP6,
-    ROUTING_MAP_LEN, ROUTING_META_ACTIVE_GENERATION_SLOT, ROUTING_META_GENERATION_STRIDE,
-    ROUTING_META_MAP_LEN, RoutingGroupBitmaps, RoutingGroupMeta, routing_group_index,
-    routing_group_meta_index, routing_meta_bitmap_base, routing_meta_count_slot,
-    routing_meta_generation_base,
+pub use routing_policy::{
+    ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
+    ROUTING_FEATURE_PROCESS, ROUTING_POLICY_ROOT_NAME, ROUTING_PROCESS_MAX_LEN, ROUTING_SLOT_NAMES,
+    RoutingDecision, RoutingInput, RoutingPolicyDescriptor, RoutingTestResult,
+    normalize_process_name,
 };
 
 pub const TASK_COMM_LEN: usize = 16;
@@ -88,8 +85,6 @@ pub const fn extract_nfqueue_token(mark: u32) -> Option<u32> {
 /// pass its own traffic through without re-routing it.
 pub const DAE_BYPASS_MARK: u32 = 0x100;
 pub const MAX_OUTBOUNDS: u32 = 256;
-pub const MAX_MATCH_SET_LEN: u32 = 128;
-pub const MAX_LPM_SIZE: u32 = 2048000;
 
 // Rust struct with a memory layout identical to the C struct.
 #[repr(C)]
@@ -361,10 +356,9 @@ const _REDIRECT_ENTRY_TOKEN_OFFSET: () =
 /// never touch this map.
 ///
 /// `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`: the effective clash mode is `Rule`
-/// (including "clash API disabled", where no mode override ever applies), so
-/// `lan_ingress` may pass flows routed to `direct` straight through the
-/// kernel like Go dae — subject to the sniff constraint below — instead of
-/// redirecting them into userspace.
+/// (including "clash API disabled", where no mode override ever applies).
+/// `lan_ingress` may offload a non-must direct result only when that same
+/// compiled decision reports `domain_final`.
 pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
 
 /// `DATAPATH_FLAG_OFFLOAD_ALL`: the effective clash policy always selects
@@ -375,24 +369,6 @@ pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
 /// `OUTBOUND_DIRECT`.  The SNI constraint does not apply here: no sniffed
 /// domain can change an always-direct outcome.
 pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
-
-/// `DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES`: static routing property pushed
-/// together with the mode — `dial_mode: ip` or `domain+`, or the routing
-/// config contains no domain-class rule (domain/geosite, negated or not).
-/// Only then is a non-`must` `direct` routing decision provably free of SNI
-/// re-evaluation; otherwise offload additionally requires the flow itself to
-/// have been domain-judged via `DOMAIN_ROUTING_MAP`. Meaningful only together
-/// with `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`.
-///
-/// `Global` with the exact `direct` selection pushes `OFFLOAD_ALL`, because
-/// every non-final route converges to direct without userspace re-evaluation.
-/// Other Global selections push neither mode offload bit so traffic reaches
-/// the control plane for the selection override.
-/// `must`/`block` finals are never offloaded beyond the `must`-direct case
-/// in any mode.  Offloaded flows skip userspace relay entirely: no
-/// connection-tracker entry and no SNI-based re-route (Go dae parity), with
-/// tx stats still counted at `lan_ingress`.
-pub const DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES: u32 = 1 << 2;
 
 /// NFQUEUE staging is configured; without readiness, eligible new flows fail closed.
 pub const DATAPATH_FLAG_NFQ_ENABLED: u32 = 1 << 3;

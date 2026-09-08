@@ -53,6 +53,7 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
         "REDIRECT_TRACK",
         "ROUTING_HANDOFF_MAP",
         "CONN_STATE_OCCUPANCY",
+        honk_ebpf_common::ROUTING_POLICY_ROOT_NAME,
     ] {
         check_path(
             &args.pin_root.join(name).display().to_string(),

@@ -36,12 +36,15 @@ routing {
 | `dport(...)` | Destination port or inclusive `start-end` range | `port` |
 | `sport(...)` | Source port or inclusive `start-end` range | `source_port` |
 | `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | Executable basename from `argv[0]`, limited to 15 bytes; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously | `process_name` |
+| `pname(...)` | Substring patterns normalized to 15 bytes, matched against the executable basename from `argv[0]`; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously | `process_name` |
 | `mac(...)` | Source MAC address | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | DSCP value | `dscp` |
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
+
+Ordinary domain pattern/suffix/keyword alternatives share one condition. When the
+same rule also populates `geosite`, that field remains a separate AND-ed condition.
 
 A `mac(...)` bypass does not exempt a client from DNS interception: on LAN interfaces the port-`53` fast path runs before the routing engine, so no routing rule can exempt DNS. Only a specifically bound non-honk local `:53` listener takes precedence over the fast path (see the DNS design doc).
 
@@ -55,7 +58,7 @@ A `mac(...)` bypass does not exempt a client from DNS interception: on LAN inter
 
 Bare node names are not valid outbound targets: `Config::validate` rejects them. Wrap the node in a group (for example `filter: name('node')`) and reference the group instead. A group and a node also may not share a name.
 
-Appending `(must)` gives Go dae-compatible must semantics. A matching must rule does not finalize the rule search; evaluation continues and propagates the must state to the resulting outbound. Clash `Global` and `Direct` modes never override a must result. They also never override `block`.
+Appending `(must)` makes a matched result terminal and skips later domain rerouting. Clash `Global` and `Direct` modes never override a must result or `block`. It is not the historical internal `MustRules` opcode that continued scanning.
 
 ## Geo assets
 

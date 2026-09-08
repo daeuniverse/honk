@@ -133,6 +133,11 @@ impl GeoSourceSet {
         self.fingerprint
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_bytes(geosite: Vec<u8>, geoip: Vec<u8>) -> Self {
+        Self::from_sources(GeoSource::present(geosite), GeoSource::present(geoip))
+    }
+
     pub(crate) fn fingerprint_for(&self, requirements: &GeoRequirements) -> [u8; 32] {
         fingerprint_sources(
             &self.geosite,

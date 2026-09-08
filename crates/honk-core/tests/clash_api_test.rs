@@ -61,7 +61,7 @@ struct TestApp {
     log_dispatch: tracing::Dispatch,
     db_path: std::path::PathBuf,
     /// Every `set_datapath_flags` value the mock backend received.
-    ebpf_datapath_flags_writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    ebpf_datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -158,7 +158,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let traffic_router =
         honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
             .unwrap();
-    let ebpf_datapath_flags_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ebpf_datapath_flags_writes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
     mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
     let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy")));
@@ -166,7 +166,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         Arc::new(tokio::sync::RwLock::new(Box::new(mock_ebpf)));
     let datapath_flags =
         DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
-    datapath_flags.initialize(0, false, false).await.unwrap();
+    datapath_flags.initialize(false, false).await.unwrap();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
         stats: stats.clone(),
@@ -1075,7 +1075,7 @@ async fn test_mode_switch_updates_datapath_flags() {
         DATAPATH_FLAG_OFFLOAD_ALL as OFFLOAD_ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as OFFLOAD_RULE,
     };
 
-    let writes = || app.ebpf_datapath_flags_writes.lock().unwrap().clone();
+    let writes = || app.ebpf_datapath_flags_writes.lock().clone();
     assert_eq!(writes(), vec![OFFLOAD_RULE]);
 
     for (mode, expect_flags) in [

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -72,13 +71,7 @@ impl ProjectionBenchmark {
             mark: 0,
         };
         let matcher = Arc::new(Router::new(&[rule], "direct").expect("benchmark router"));
-        let mut bitmap = honk_ebpf_common::DomainRouting::default();
-        bitmap.bitmap[0] = 1;
-        let snapshot = Arc::new(RoutingProjectionSnapshot::new(
-            1,
-            matcher,
-            HashMap::from([("projection-bench".to_owned(), vec![bitmap])]),
-        ));
+        let snapshot = Arc::new(RoutingProjectionSnapshot::new(1, matcher));
         Self {
             replacement: ProjectionReplacementBenchmark::new(
                 snapshot,
@@ -190,7 +183,6 @@ fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
             Arc::clone(&shared.router),
-            Default::default(),
         )),
         outbound_runtime: None,
         transport: Arc::new(NoopTransport),

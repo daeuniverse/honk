@@ -238,37 +238,6 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
-    /// (Re)push the active routing plan when a previous publication failed;
-    /// reloads clear the dirty flag too. Without this retry a failed startup
-    /// push drops every new LAN flow until a reload or network event.
-    ///
-    /// `push_plan` stages with `active=None`, which prunes old-generation
-    /// LPM keys; that is safe here only because dirty means no publication
-    /// has ever succeeded, so no live readers exist on the other bank.
-    pub(in crate::control) async fn repush_routing_if_dirty(&self) {
-        if !self
-            .routing_publication_dirty
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        // Lock order matches the reload transaction (ebpf before
-        // active_routing_plan); the reverse would deadlock against it.
-        let mut ebpf = self.ebpf.write().await;
-        let plan = self.active_routing_plan.read().clone();
-        match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
-            Ok(_) => {
-                routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
-                self.routing_publication_dirty
-                    .store(false, std::sync::atomic::Ordering::Release);
-                info!("routing publication retry succeeded");
-            }
-            Err(e) => {
-                warn!("Failed to push routing to eBPF (non-fatal): {}", e);
-            }
-        }
-    }
-
     pub(in crate::control) async fn dispatch_control_command(
         &mut self,
         command: ControlCommand,
@@ -565,7 +534,6 @@ impl ControlPlane {
         #[cfg(not(feature = "ebpf"))]
         let mut nfqueue_runtime = ();
 
-        self.repush_routing_if_dirty().await;
         let (mut udp_removal_task, mut udp_removal_fatal_rx) = {
             let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = self.background_tasks.lock().await;
@@ -869,7 +837,6 @@ impl ControlPlane {
                         loop_count,
                         drain.active_count()
                     );
-                    self.repush_routing_if_dirty().await;
                     continue;
                 }
                 accept_result = accept_tcp_with_admission(

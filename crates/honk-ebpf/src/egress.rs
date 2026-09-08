@@ -19,13 +19,11 @@ use aya_ebpf_cty::c_void;
 use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
-    IpVersionType, RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
+    IpVersionType, L4ProtoType, RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
     conn::BpfStatsKey,
     redirect_need::{PIDName, RoutingHandoffEntry, Tuples, TuplesKey},
 };
 use network_types::eth::EthHdr;
-use network_types::tcp::TcpHdr;
-use network_types::udp::UdpHdr;
 
 use crate::{
     contrack::{
@@ -34,7 +32,7 @@ use crate::{
     },
     maps::{
         COOKIE_PID_MAP, OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK,
-        ROUTING_HANDOFF_MAP, WAN_EGRESS_ROUTE_SCRATCH_MAP, increment_bpf_stat,
+        ROUTING_HANDOFF_MAP, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     transport::{
@@ -355,10 +353,11 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 fn do_tproxy_wan_egress_tcp(
     ctx: &TcContext,
     link_h_len: u32,
-    tuples: &Tuples,
-    ethh: &EthHdr,
-    tcph: &TcpHdr,
+    pkt: &mut crate::transport::ParsedPacket,
 ) -> Verdict {
+    let tuples = &pkt.tuples;
+    let ethh = &pkt.ethh;
+    let tcph = &pkt.tcph;
     let tcp_state_syn = is_new_tcp_connection(tcph);
     let outbound: u8;
     let must: bool;
@@ -367,23 +366,15 @@ fn do_tproxy_wan_egress_tcp(
     let mut handoff_pname: Option<&[u8; TASK_COMM_LEN]> = None;
     let mut handoff_pid: u32 = 0;
 
-    let scratch_key: u32 = 0;
-    let scratch = match unsafe { WAN_EGRESS_ROUTE_SCRATCH_MAP.get_ptr_mut(scratch_key) } {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => return Err(TC_ACT_SHOT),
-    };
+    let mut mac = [0u8; 6];
 
     if tcp_state_syn {
-        *scratch = unsafe { mem::zeroed() };
-        scratch.flag[0] = 1u32; // L4ProtoType_TCP = 1
-
         let proto = ctx.skb.protocol() as u16;
-        scratch.flag[1] = if proto == ETH_P_IP.to_be() {
-            IpVersionType::V4 as u32
+        let ip_version = if proto == ETH_P_IP.to_be() {
+            IpVersionType::V4 as u8
         } else {
-            IpVersionType::V6 as u32
+            IpVersionType::V6 as u8
         };
-        scratch.flag[6] = tuples.dscp as u32;
 
         // Look up PID info for process-name routing; also check
         // control-plane traffic (single cookie lookup).
@@ -394,56 +385,47 @@ fn do_tproxy_wan_egress_tcp(
                 return Err(TC_ACT_OK);
             }
 
-            // Copy pname into flag[2..6] (4 × u32 = 16 bytes = TASK_COMM_LEN).
-            let pname_ptr = pid_pname.pname.as_ptr() as *const u32;
-            unsafe {
-                scratch.flag[2] = *pname_ptr;
-                scratch.flag[3] = *pname_ptr.add(1);
-                scratch.flag[4] = *pname_ptr.add(2);
-                scratch.flag[5] = *pname_ptr.add(3);
-            }
             handoff_pname = Some(&pid_pname.pname);
             handoff_pid = pid_pname.pid;
         }
 
-        scratch.flag[7] = 1; // is_wan = 1
+        let route_mac = if link_h_len == ETH_HLEN {
+            mac.copy_from_slice(&ethh.src_addr);
+            Some(&mac)
+        } else {
+            None
+        };
 
-        if link_h_len == ETH_HLEN {
-            let h_src = &ethh.src_addr;
-            scratch.mac_be[2] = u32::from_be_bytes([0, 0, h_src[0], h_src[1]]);
-            scratch.mac_be[3] = u32::from_be_bytes([h_src[2], h_src[3], h_src[4], h_src[5]]);
-            scratch.mac.copy_from_slice(h_src);
-        }
-
-        let h_dport = u16::from_be_bytes(tcph.dest);
-        let h_sport = u16::from_be_bytes(tcph.source);
-
-        let saddr = unsafe { &tuples.five.src_ip.u6_addr32 };
-        let daddr = unsafe { &tuples.five.dst_ip.u6_addr32 };
-        let s64_ret = crate::route::route(
-            &scratch.flag,
-            h_dport,
-            h_sport,
-            saddr,
-            daddr,
-            &scratch.mac_be,
+        let pname = pid_pname_opt.map(|pid_pname| &pid_pname.pname);
+        crate::route::build_input(
+            &mut pkt.routing_input,
+            tuples,
+            route_mac,
+            L4ProtoType::Tcp as u8,
+            ip_version,
+            true,
         );
+        let decision = match crate::route::route(&mut pkt.routing_input, pname) {
+            Ok(decision) => decision,
+            Err(_) => return Err(TC_ACT_SHOT),
+        };
 
-        if s64_ret < 0 {
-            return Err(TC_ACT_SHOT);
-        }
-
-        outbound = (s64_ret & 0xFF) as u8;
-        mark = (s64_ret >> 8) as u32;
-        must = ((s64_ret >> 40) & 1) != 0;
-        scratch.must_val = must as u8;
+        outbound =
+            if crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0 {
+                decision.outbound as u8
+            } else {
+                decision.handoff_outbound()
+            };
+        mark = decision.mark;
+        must = decision.must != 0;
+        let must_val = must as u8;
 
         let dscp = tuples.dscp;
         let (outbound_ptr, mark_ptr, must_ptr): (Option<&u8>, Option<&u32>, Option<&u8>) =
             if outbound == OUTBOUND_DIRECT && mark == 0 && !must {
                 (None, None, None)
             } else {
-                (Some(&outbound), Some(&mark), Some(&scratch.must_val))
+                (Some(&outbound), Some(&mark), Some(&must_val))
             };
 
         let pname_bytes: Option<&[u8; TASK_COMM_LEN]> = handoff_pname;
@@ -455,7 +437,7 @@ fn do_tproxy_wan_egress_tcp(
             outbound_ptr,
             mark_ptr,
             must_ptr,
-            Some(&scratch.mac),
+            Some(&mac),
             dscp,
             pname_bytes,
             handoff_pid,
@@ -490,7 +472,7 @@ fn do_tproxy_wan_egress_tcp(
                 must = ((meta_raw >> 40) & 1) != 0;
                 handoff_pname = Some(&conn.pname);
                 handoff_pid = conn.pid;
-                scratch.mac.copy_from_slice(&conn.mac);
+                mac.copy_from_slice(&conn.mac);
             } else {
                 // No cached routing — direct connection, pass through.
                 return Err(TC_ACT_OK);
@@ -549,7 +531,7 @@ fn do_tproxy_wan_egress_tcp(
         handoff.result.pid = handoff_pid;
         handoff.result.dscp = tuples.dscp;
         handoff.result.decision_token = 0;
-        handoff.result.mac.copy_from_slice(&scratch.mac);
+        handoff.result.mac.copy_from_slice(&mac);
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
         }
@@ -657,10 +639,10 @@ fn fast_path_decision(
 fn do_tproxy_wan_egress_udp(
     ctx: &TcContext,
     link_h_len: u32,
-    tuples: &Tuples,
-    ethh: &EthHdr,
-    udph: &UdpHdr,
+    pkt: &mut crate::transport::ParsedPacket,
 ) -> Verdict {
+    let tuples = &pkt.tuples;
+    let ethh = &pkt.ethh;
     let mut outbound: u8;
     let mut mark: u32;
     let must: bool;
@@ -669,22 +651,12 @@ fn do_tproxy_wan_egress_udp(
     let mut handoff_pid: u32 = 0;
     let mut decision_token: u32 = 0;
 
-    let scratch_key: u32 = 0;
-    let scratch = match unsafe { WAN_EGRESS_ROUTE_SCRATCH_MAP.get_ptr_mut(scratch_key) } {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => return Err(TC_ACT_SHOT),
-    };
-
-    *scratch = unsafe { mem::zeroed() };
-    scratch.flag[0] = 2u32; // L4ProtoType_UDP = 2
-
     let proto = ctx.skb.protocol() as u16;
-    scratch.flag[1] = if proto == ETH_P_IP.to_be() {
-        IpVersionType::V4 as u32
+    let ip_version = if proto == ETH_P_IP.to_be() {
+        IpVersionType::V4 as u8
     } else {
-        IpVersionType::V6 as u32
+        IpVersionType::V6 as u8
     };
-    scratch.flag[6] = tuples.dscp as u32;
 
     // Check control plane (single cookie lookup).
     let pid_pname_opt = pid_is_control_plane(ctx);
@@ -732,52 +704,40 @@ fn do_tproxy_wan_egress_udp(
     }
 
     if let Some(pid_pname) = pid_pname_opt {
-        let pname_ptr = pid_pname.pname.as_ptr() as *const u32;
-        unsafe {
-            scratch.flag[2] = *pname_ptr;
-            scratch.flag[3] = *pname_ptr.add(1);
-            scratch.flag[4] = *pname_ptr.add(2);
-            scratch.flag[5] = *pname_ptr.add(3);
-        }
         handoff_pname = Some(&pid_pname.pname);
         handoff_pid = pid_pname.pid;
     }
 
-    scratch.flag[7] = 1; // is_wan = 1
-
-    if link_h_len == ETH_HLEN {
-        let h_src = &ethh.src_addr;
-        scratch.mac_be[2] = u32::from_be_bytes([0, 0, h_src[0], h_src[1]]);
-        scratch.mac_be[3] = u32::from_be_bytes([h_src[2], h_src[3], h_src[4], h_src[5]]);
-        mac.copy_from_slice(h_src);
-        scratch.mac.copy_from_slice(h_src);
-    }
-
-    let h_dport = u16::from_be_bytes(udph.dst);
-    let h_sport = u16::from_be_bytes(udph.src);
-
-    let saddr = unsafe { &tuples.five.src_ip.u6_addr32 };
-    let daddr = unsafe { &tuples.five.dst_ip.u6_addr32 };
-    let s64_ret = crate::route::route(
-        &scratch.flag,
-        h_dport,
-        h_sport,
-        saddr,
-        daddr,
-        &scratch.mac_be,
+    let route_mac = if link_h_len == ETH_HLEN {
+        mac.copy_from_slice(&ethh.src_addr);
+        Some(&mac)
+    } else {
+        None
+    };
+    let pname = pid_pname_opt.map(|pid_pname| &pid_pname.pname);
+    crate::route::build_input(
+        &mut pkt.routing_input,
+        tuples,
+        route_mac,
+        L4ProtoType::Udp as u8,
+        ip_version,
+        true,
     );
+    let decision = match crate::route::route(&mut pkt.routing_input, pname) {
+        Ok(decision) => decision,
+        Err(_) => return Err(TC_ACT_SHOT),
+    };
 
-    if s64_ret < 0 {
-        return Err(TC_ACT_SHOT);
-    }
-
-    outbound = (s64_ret & 0xFF) as u8;
-    mark = (s64_ret >> 8) as u32;
-    must = ((s64_ret >> 40) & 1) != 0;
-    if !must
-        && outbound != OUTBOUND_BLOCK
-        && crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0
-    {
+    let force_direct =
+        crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0;
+    outbound = if force_direct {
+        decision.outbound as u8
+    } else {
+        decision.handoff_outbound()
+    };
+    mark = decision.mark;
+    must = decision.must != 0;
+    if !must && outbound != OUTBOUND_BLOCK && force_direct {
         if outbound != OUTBOUND_DIRECT {
             mark = 0;
         }
@@ -881,8 +841,8 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     match pkt.l4proto {
-        IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, &pkt.tuples, &pkt.ethh, &pkt.tcph),
-        IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, &pkt.tuples, &pkt.ethh, &pkt.udph),
+        IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt),
+        IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
         _ => Ok(TC_ACT_OK),
     }
 }

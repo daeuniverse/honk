@@ -182,8 +182,17 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         )
         .await
         .expect("UDP query");
-    assert_eq!(udp_response, a_response(&query, [192, 0, 2, 20]));
-    assert_eq!(udp.calls(), 1, "ingress profiles must not share cache keys");
+    assert_eq!(udp_response, a_response(&query, [192, 0, 2, 10]));
+    assert_eq!(
+        initial.calls(),
+        2,
+        "ingress profiles must not share cache keys"
+    );
+    assert_eq!(
+        udp.calls(),
+        0,
+        "unchanged reload retains the active transport"
+    );
 
     let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.cache.ttl = 301;
@@ -193,7 +202,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         .await
         .expect("changed-policy internal query");
     assert_eq!(changed, a_response_with_ttl(&query, [192, 0, 2, 20], 301));
-    assert_eq!(udp.calls(), 2);
+    assert_eq!(udp.calls(), 1);
 
     let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.cache.ttl = 302;
@@ -210,7 +219,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         a_response_with_ttl(&tcp_query, [192, 0, 2, 30], 302)
     );
     assert_eq!(tcp.calls(), 1);
-    assert_eq!(initial.calls(), 1);
+    assert_eq!(initial.calls(), 2);
     assert!(control.is_datapath_healthy());
 }
 

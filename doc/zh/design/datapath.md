@@ -82,11 +82,9 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `CONN_STATE_MAP` | 不预分配的普通 hash，最多 524,288 项。保存每流 TCP/UDP 状态和已发布路由元数据；用户空间负责压力驱逐。 |
 | `REDIRECT_TRACK` | 不预分配的 65,536 项 hash。把有方向的五元组映射到原始 MAC/接口、出站、时间戳和决策身份，用于恢复回复路径。 |
 | `ROUTING_HANDOFF_MAP` | 不预分配的 65,536 项 hash。向用户空间传递以 tuple 为 key 的路由元数据。 |
-| `ROUTING_MAP` | 256 项数组：两个各含 128 个 `MatchSet` 规则的 bank。用户空间在切换 generation 前填满 inactive bank。 |
-| `ROUTING_META_MAP` | 35 项数组，包含 active generation selector，以及每个 generation 的规则数和四个流量组 bitmap。selector 是提交点。 |
-| `ROUTING_GROUP_META_MAP` | 八个紧凑条目：两个 generation × TCP4/TCP6/UDP4/UDP6；每项包含规则数和 128-bit bitmap。 |
-| `DEST_LPM_ROUTING_MAP`, `SOURCE_LPM_ROUTING_MAP`, `MAC_LPM_ROUTING_MAP` | LPM trie，每个上限 65,536 项，分别匹配目的 CIDR、源 CIDR 和 MAC 前缀。 |
-| `DOMAIN_ROUTING_MAP` | 不预分配的 65,536 项 IP 到域名规则 bitmap hash，由 DNS 结果填充。 |
+| `ROUTING_POLICY_ROOT` | 单项 map-in-map，选择不可变 policy descriptor 和两个同步生成函数槽之一。root 成功替换返回后，旧 non-sleepable 读者已完成 grace。 |
+| 按代持有的 IP/MAC 索引 | 分离的目的/源 IPv4、IPv6 LPM maps 及 MAC LPM。value 是完整的本代谓词 bitmap，更具体前缀继承祖先位。 |
+| 按代持有的 domain map | 不预分配的 IP 到域名谓词 bitmap hash。DNS/sniff 事实覆盖正负条件；存在的零 bitmap 表示 known-false。descriptor 提供其 map ID 供诊断读取。 |
 | `OUTBOUND_CONNECTIVITY_MAP` | 1,536 项数组。每个出站有六个存活槽，覆盖 TCP/UDP 类别与 IPv4/IPv6；缺失槽按存活处理。 |
 | `OUTBOUND_STATS` | 直接以出站编号为索引的 256 项 per-CPU 数组。每个 32-byte 值紧凑保存 `tx_packets`、`tx_bytes`、`rx_packets`、`rx_bytes`；当前 ABI 不使用 `outbound * 4 + counter` 索引。 |
 | `LISTEN_SOCKET_MAP` | 16 槽 `SockMap`；key `0..=9` 保存两个 TCP 和八个 UDP 透明监听器。 |

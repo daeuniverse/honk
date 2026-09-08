@@ -17,9 +17,8 @@ pub struct RoutingRule {
     /// Priority (lower = higher priority)
     #[serde(default)]
     pub priority: u32,
-    /// If true, this is a "must" rule: matching it does NOT produce a final
-    /// outbound decision. Instead, the search continues and the must flag is
-    /// propagated to the next matching rule's outbound (Go dae compatible).
+    /// If true, this is a terminal "must" rule: matching it selects the
+    /// outbound and tells the control plane to skip TLS/HTTP sniffing.
     #[serde(default)]
     pub must: bool,
     /// fwmark to set on matched connections (0 = no mark).

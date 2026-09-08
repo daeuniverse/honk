@@ -200,6 +200,19 @@ impl ControlPlaneHandle {
             domain_verified,
             handoff,
         );
+        if let Some(handoff) = handoff
+            && handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
+            && !reroute_by_sniffed_domain
+            && !self.connection_tracker.is_enabled()
+        {
+            return RoutingDecision {
+                outbound: self.outbound_index_to_name(handoff.outbound).await,
+                must: handoff.must != 0,
+                mark: handoff.mark,
+                matched_rule: None,
+                reroute_by_sniffed_domain: false,
+            };
+        }
         let route_with_domain = Self::should_route_with_sniffed_domain(
             dial_mode,
             conn_info.domain.as_deref(),
@@ -256,57 +269,20 @@ impl ControlPlaneHandle {
         }
     }
 
-    /// Publish the matched sniffed-domain bitmap so later route-time
-    /// decisions can use the learned destination IP. Best-effort: a write
-    /// failure never fails the flow.
-    pub(super) async fn push_sniffed_domain_bitmap(
-        &self,
-        conn_info: &ConnectionInfo,
-        domain: &str,
-        dst_ip: std::net::IpAddr,
-    ) {
-        let (rule_name, bitmaps, bitmap_generation) = {
-            let router = self.router.read().await;
-            match router.route_full(conn_info) {
-                Some(matched) => {
-                    let rule_name = matched.rule_name.to_string();
-                    let (bitmaps, generation) = {
-                        let db = DOMAIN_BITMAPS.read();
-                        let generation = crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        (db.get(&rule_name).cloned().unwrap_or_default(), generation)
-                    };
-                    (rule_name, bitmaps, generation)
-                }
-                None => return,
-            }
-        };
-        if bitmaps.is_empty() {
+    /// Publish all matching domain predicates, independently of the flow's
+    /// non-domain conditions. Publication failure remains health-neutral.
+    pub(super) async fn push_sniffed_domain_bitmap(&self, domain: &str, dst_ip: std::net::IpAddr) {
+        // Keep the same router generation until the backend write completes;
+        // reload acquires these locks in this order before replacing either.
+        let router = self.router.read().await;
+        let Some(bitmap) = router.domain_bitmap(domain) else {
             return;
-        }
-        let mut merged = DomainRouting::default();
-        for bm in &bitmaps {
-            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                *word |= value;
-            }
-        }
+        };
         let lpm_key = crate::ebpf::maps::ip_addr_to_lpm_key(dst_ip);
         let mut ebpf = self.ebpf.write().await;
-        if crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
-            .load(std::sync::atomic::Ordering::Acquire)
-            != bitmap_generation
-        {
-            return;
-        }
-        match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
-            Ok(()) => debug!(
-                "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
-                dst_ip, domain, rule_name
-            ),
-            Err(error) => warn!(
-                "Failed to update DOMAIN_ROUTING_MAP for {} ({}): {}",
-                dst_ip, domain, error
-            ),
+        match ebpf.add_domain_ip_bitmap(&lpm_key, &bitmap) {
+            Ok(()) => debug!(%domain, %dst_ip, "sniffed domain facts published"),
+            Err(error) => warn!(%error, %domain, %dst_ip, "failed to publish sniffed domain facts"),
         }
     }
 }

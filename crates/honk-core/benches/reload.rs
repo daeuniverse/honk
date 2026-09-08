@@ -77,7 +77,7 @@ struct Fixture {
     runtime: Runtime,
     control_plane: ControlPlane,
     config: Config,
-    flag_writes: Arc<std::sync::Mutex<Vec<u32>>>,
+    flag_writes: Arc<parking_lot::Mutex<Vec<u32>>>,
     #[cfg(feature = "reload-bench-counters")]
     routing_writes: Arc<AtomicU64>,
     #[cfg(feature = "reload-bench-counters")]
@@ -168,7 +168,7 @@ impl Fixture {
 
     fn observation(&self) -> Observation {
         Observation {
-            flag_writes: self.flag_writes.lock().unwrap().len() as u64,
+            flag_writes: self.flag_writes.lock().len() as u64,
             #[cfg(feature = "reload-bench-counters")]
             dns_generation: self.control_plane.reload_benchmark_dns_generation(),
             #[cfg(feature = "reload-bench-counters")]

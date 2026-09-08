@@ -68,10 +68,30 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src, llvm-tools
-      - name: Install build and kernel-test dependencies
+      - name: Install build and VM dependencies
         run: |
+          echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev iproute2 iptables zstd
+          sudo apt-get install --yes --no-install-recommends \
+            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm -a -w /dev/kvm
+      - name: Install virtme-ng 1.41
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl" \
+            https://files.pythonhosted.org/packages/41/f2/ca99d9bae0a227be4e09082b9dd9fe3bf931900e36aca6e05f85a4599aea/virtme_ng-1.41-py3-none-any.whl
+          echo "2031f0f2c67947829e030d66b28950adcef351a17a8455483b57d27b6246f2d2  $RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl" | sha256sum -c -
+          /usr/bin/python3 -m venv --system-site-packages "$RUNNER_TEMP/virtme-ng"
+          "$RUNNER_TEMP/virtme-ng/bin/pip" --disable-pip-version-check install --no-deps \
+            "$RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl"
+          echo "$RUNNER_TEMP/virtme-ng/bin" >> "$GITHUB_PATH"
       - name: Install bpf-linker 0.11.0
         run: |
           curl -fsSL --retry 3 -o /tmp/bpf-linker.tar.zst \
@@ -90,74 +110,62 @@ jobs:
         run: |
           cd crates/honk-ebpf
           cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+      - name: Build routing-test eBPF object separately
+        run: |
+          cd crates/honk-ebpf
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test" \
+            cargo +nightly build --release --features routing-test \
+              -Zbuild-std=core --target bpfel-unknown-none
       # aya refuses objects without BTF ("no BTF parsed for object") — fail
       # here instead of at runtime on a gateway.
-      - name: Verify eBPF object has BTF
-        run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+      - name: Verify eBPF objects have BTF
+        run: |
+          readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+          readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
       - name: Run eBPF-feature unit tests
         run: |
           cargo +stable test -p honk-core --features ebpf --lib -- \
             --skip test_routing_with_config_dae
-      # Map pinning needs bpffs; the hosted VM image does not guarantee that it is mounted.
-      - name: Prepare the VM kernel
+      - name: Compile real-kernel test binaries on the host
         run: |
-          test -e /sys/fs/cgroup/cgroup.controllers
-          if ! mountpoint -q /sys/fs/bpf; then
-            sudo mount -t bpf bpf /sys/fs/bpf
-          fi
-          test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
-
-      - name: Verify eBPF lifecycle and pinned-map compatibility
+          {
+            cargo +stable test -p honk-core --features ebpf --lib --test ebpf_datapath_test --no-run --message-format=json
+            cargo +stable test -p honk-nfqueue --lib --no-run --message-format=json
+          } | jq -sr '
+            def executable($name):
+              [.[] | select(.reason == "compiler-artifact" and .target.name == $name and .executable != null) | .executable]
+              | unique | if length == 1 then .[0] else error("missing or ambiguous test executable: " + $name) end;
+            "HONK_CORE_TEST_BIN=" + (executable("honk_core") | @sh),
+            "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
+            "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh)
+          ' > target/kernel-test-bins.env
+      - name: Fetch verified Linux 7.2 image and modules
         run: |
-          sudo env \
-            HOME="$HOME" \
-            PATH="$PATH" \
-            CARGO_HOME="$HOME/.cargo" \
-            RUSTUP_HOME="$HOME/.rustup" \
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-            RUST_BACKTRACE=1 \
-            "$HOME/.cargo/bin/cargo" +stable test \
-              -p honk-core --features ebpf --lib ebpf::real::tests -- \
-              --ignored --test-threads=1
-
-      - name: Verify TC packet contracts and isolated L3 TUN
+          kernel_dir="$RUNNER_TEMP/linux-v7.2"
+          base=https://kernel.ubuntu.com/mainline/v7.2/amd64
+          image=linux-image-unsigned-7.2.0-070200-generic_7.2.0-070200.202608162350_amd64.deb
+          modules=linux-modules-7.2.0-070200-generic_7.2.0-070200.202608162350_amd64.deb
+          mkdir -p "$kernel_dir"
+          curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$image" "$base/$image"
+          curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$modules" "$base/$modules"
+          echo "bd94fb85bfa402307040d4cd6745f7b04d467ddce1ccc312253e50f975cc38a2  $kernel_dir/$image" | sha256sum -c -
+          echo "13ab3038e131dc8914e3a7cfaafbd2990b8c9c1aeeb574c2e5895f1e032c4ecf  $kernel_dir/$modules" | sha256sum -c -
+          dpkg-deb --extract "$kernel_dir/$image" "$kernel_dir/root"
+          dpkg-deb --extract "$kernel_dir/$modules" "$kernel_dir/root"
+          echo "HONK_CI_KERNEL_IMAGE=$kernel_dir/root/boot/vmlinuz-7.2.0-070200-generic" >> "$GITHUB_ENV"
+      - name: Run all real-kernel gates on Linux 7.2
         run: |
-          sudo env \
-            HOME="$HOME" \
-            PATH="$PATH" \
-            CARGO_HOME="$HOME/.cargo" \
-            RUSTUP_HOME="$HOME/.rustup" \
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-            RUST_BACKTRACE=1 \
-            "$HOME/.cargo/bin/cargo" +stable test \
-              -p honk-core --features ebpf --test ebpf_datapath_test -- \
-              --ignored --test-threads=1
-
-      - name: Run real-kernel NFQUEUE contract
-        run: |
-          sudo env \
-            HOME="$HOME" \
-            PATH="$PATH" \
-            CARGO_HOME="$HOME/.cargo" \
-            RUSTUP_HOME="$HOME/.rustup" \
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-            RUST_BACKTRACE=1 \
-            "$HOME/.cargo/bin/cargo" +stable test \
-              -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- \
-              --ignored --test-threads=1
-
-      - name: Run real-kernel network namespace tests
-        run: |
-          sudo env \
-            HOME="$HOME" \
-            PATH="$PATH" \
-            CARGO_HOME="$HOME/.cargo" \
-            RUSTUP_HOME="$HOME/.rustup" \
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-            RUST_BACKTRACE=1 \
-            "$HOME/.cargo/bin/cargo" +stable test \
-              -p honk-core --features ebpf --lib netns -- \
-              --ignored --test-threads=1
+          vng -r "$HONK_CI_KERNEL_IMAGE" \
+            --user root \
+            --rwdir "$GITHUB_WORKSPACE" \
+            --cpus 2 \
+            --memory 4G \
+            -- \
+            env \
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+              RUST_BACKTRACE=1 \
+              HONK_ROUTING_TEST_OBJECT="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf" \
+              bash "$GITHUB_WORKSPACE/.github/ci/ebpf-vm-tests.sh"
 
   review-bot:
     name: mechanical PR review

@@ -2,7 +2,7 @@
 
 本文说明透明 53 端口拦截与可选 `dns.bind` 监听器共用的用户态 DNS 架构。
 
-字段级设置、可接受的 URI 形式及默认值见 [DNS 配置参考](../reference/dns.md)。缓存完全位于用户态；`DOMAIN_ROUTING_MAP` 保存学习到的路由投影，不保存 DNS 应答。
+字段级设置、可接受的 URI 形式及默认值见 [DNS 配置参考](../reference/dns.md)。缓存完全位于用户态；active policy 的 domain map 保存学习到的谓词事实，不保存 DNS 应答。
 
 ## 架构
 
@@ -18,7 +18,7 @@ flowchart LR
     R --> O[类型化结果]
     O --> X[入口应答]
     O --> M[路由投影]
-    M --> D[DOMAIN_ROUTING_MAP]
+    M --> D[Active policy 的域名事实 map]
 ```
 
 两个入口 adapter 使用同一个 `DnsController`、当前 `DnsServiceProvider`、forwarder、缓存、singleflight 集合、上游池与路由投影。adapter 从准入开始一直持有所有权，直至应答 I/O 完成；它不会直接写 domain route。
@@ -192,7 +192,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 ## 路由投影
 
-`DnsController` 将解析结果转换为 desired state，而不是内联写 `DOMAIN_ROUTING_MAP`：
+`DnsController` 将解析结果转换为 desired state，而不是内联写 active policy 的 domain map：
 
 | 结果 | 投影 observation |
 | --- | --- |
@@ -200,7 +200,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | 已接受的 NODATA 或 NXDOMAIN | 清除该域名 owner。 |
 | 已接受的 SERVFAIL 或被策略拒绝 | 保留当前状态。 |
 
-`DOMAIN_ROUTING_MAP` 保持全局且与来源无关。带来源的请求路由隔离 DNS 交换 scope 与应答；它不划分 eBPF domain observation 或普通流量路由。
+每个 policy generation 内的域名关联仍为全局且与来源无关。带来源的请求路由隔离 DNS 交换 scope 与应答；它不划分 eBPF domain observation 或普通流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时仍保留存在的零 bitmap。
 
 worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired state。失败写入保持 dirty，并以有界退避重试。批次修改 backend 前，worker 获取 backend lock，并在持有 publication fence 时重新检查 generation。reload 在同一个 backend lock 下安装替换投影快照。因此，旧批次在替换 generation 发布后既不能进入，也不能继续修改 map。
 

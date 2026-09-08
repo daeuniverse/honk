@@ -36,12 +36,15 @@ routing {
 | `dport(...)` | 目的端口或闭区间 `start-end` | `port` |
 | `sport(...)` | 源端口或闭区间 `start-end` | `source_port` |
 | `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | `argv[0]` 的可执行文件 basename，最多 15 字节；运行时 BTF 偏移或 cgroup verifier 拒绝内核 argv 读取时，cgroup hook 同步使用调用线程的 `comm` | `process_name` |
+| `pname(...)` | 按 15 字节规范化的子串模式，匹配 `argv[0]` 的可执行文件 basename；运行时 BTF 偏移或 cgroup verifier 拒绝内核 argv 读取时，cgroup hook 同步使用调用线程的 `comm` | `process_name` |
 | `mac(...)` | 源 MAC 地址 | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | DSCP 值 | `dscp` |
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
+
+普通 domain pattern/suffix/keyword 互为同一条件内的备选；同一规则另有 `geosite`
+字段时，它仍是一个独立的 AND 条件。
 
 `mac(...)` 放行不能让客户端免于 DNS 拦截：LAN 接口上 53 端口快速路径先于路由引擎执行，任何路由规则都无法豁免 DNS。只有明确绑定的本机非 honk `:53` 监听能在快速路径之前取得流量（见 DNS 设计文档）。
 
@@ -55,7 +58,7 @@ routing {
 
 裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。
 
-追加 `(must)` 会启用兼容 Go dae 的 must 语义。must 规则命中后不会结束规则搜索；匹配继续，并把 must 状态传播到最终出站。Clash `Global` 和 `Direct` 模式绝不会覆盖 must 结果，也绝不会覆盖 `block`。
+追加 `(must)` 后，命中的结果立即终结规则搜索并跳过后续域名重路由。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续搜索”的 `MustRules` opcode。
 
 ## Geo 资源
 

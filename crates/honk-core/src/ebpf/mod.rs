@@ -22,20 +22,6 @@ pub const UDP_DECISION_RETIRE_FENCE_MAP: &str = "UDP_DECISION_RETIRE_FENCE";
 /// overestimates live occupancy between sweep calibrations.
 pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
-/// Raw key sets identifying the LPM entries that belong to the current
-/// ruleset generation, consumed by [`EbpfBackend::prune_lpm_entries`].
-/// Keys are the 20-byte raw `LpmKey` encoding produced by
-/// [`maps::lpm_key_bytes`].
-#[derive(Debug, Default, Clone)]
-pub struct LpmKeepSet {
-    /// Keys present in DEST_LPM_ROUTING_MAP for the current generation.
-    pub dest: std::collections::HashSet<[u8; 20]>,
-    /// Keys present in SOURCE_LPM_ROUTING_MAP for the current generation.
-    pub source: std::collections::HashSet<[u8; 20]>,
-    /// Keys present in MAC_LPM_ROUTING_MAP for the current generation.
-    pub mac: std::collections::HashSet<[u8; 20]>,
-}
-
 /// Callback for a bounded janitor scan. Return `false` to stop the scan at a
 /// chunk boundary (used to enforce the janitor time budget).
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> bool + 'a;
@@ -47,12 +33,12 @@ pub type RoutingHandoffChunkVisitor<'a> =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPushPhase {
     DomainRouting,
-    Rules,
     DestinationLpm,
     SourceLpm,
     MacLpm,
-    Meta,
-    PruneLpm,
+    Program,
+    Attach,
+    Root,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,65 +372,38 @@ pub trait EbpfBackend: Send + Sync {
     /// was recreated, so its hooks died with it).
     fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
 
-    /// Fill the inactive physical routing-rule bank. The bank is not visible
-    /// to the datapath until `publish_routing_generation` flips its selector.
-    fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()>;
-    /// Return the bank currently selected by the datapath.
+    /// Atomically publish a complete compiled routing plan into `slot`.
+    /// Implementations stage every generation-owned fact map and program before
+    /// committing the stable policy root; errors leave the prior root untouched.
+    fn publish_routing_plan(
+        &mut self,
+        slot: u32,
+        plan: &crate::control::routing_matcher::RoutingPushPlan,
+    ) -> anyhow::Result<()>;
+    /// Return the slot currently selected by the stable policy root.
     fn active_routing_generation(&self) -> anyhow::Result<u32> {
         Ok(0)
     }
-    /// Fill the inactive generation's exploded introspection metadata and all
-    /// four packed `RoutingGroupMeta` entries, then atomically activate it by
-    /// writing only the selector slot. Implementations MUST leave the prior
-    /// generation selected until every packed entry is complete.
-    fn publish_routing_generation(
+    /// Stage learned domain entries in private candidate memory. The entries
+    /// become visible only when the matching routing plan is published.
+    fn stage_domain_routing_generation(
         &mut self,
         generation: u32,
-        count: u32,
-        group_bitmaps: &RoutingGroupBitmaps,
+        entries: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()>;
-    fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    fn add_source_lpm_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    /// Merge a resolved-IP bitmap into the active routing generation.
+    /// OR a learned domain bitmap into the active generation-owned map.
     fn add_domain_ip_bitmap(
         &mut self,
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let _ = ip_key;
-        let _ = bitmap;
-        Ok(())
-    }
-    /// Replace the active generation's bitmap while retaining the inactive
-    /// half for packets that entered before a routing publication.
+    ) -> anyhow::Result<()>;
+    /// Replace one entry in the active generation-owned domain HASH map.
+    /// A present all-zero value is meaningful and must not be removed.
     fn set_domain_ip_bitmap(
         &mut self,
-        _ip_key: &LpmKey,
-        _bitmap: &DomainRouting,
-    ) -> Result<(), DomainRouteWriteError> {
-        Ok(())
-    }
-
-    /// Overwrite a bounded batch of DOMAIN_ROUTING_MAP entries. The default
-    /// keeps every backend correct; native backends may replace it with one
-    /// batch syscall without changing projection reconciliation semantics.
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), DomainRouteWriteError>;
     fn set_domain_ip_bitmap_batch(
         &mut self,
         entries: &[(LpmKey, DomainRouting)],
@@ -455,15 +414,8 @@ pub trait EbpfBackend: Send + Sync {
         }
         Ok(())
     }
-    /// Remove the DOMAIN_ROUTING_MAP entry for `ip_key` (16-byte IP key).
-    /// Used by the domain-route rebuild for learned IPs whose domain no
-    /// longer matches any domain rule under the current ruleset.
-    fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> Result<(), DomainRouteWriteError> {
-        Ok(())
-    }
-
-    /// Remove a bounded batch of DOMAIN_ROUTING_MAP entries. The returned
-    /// index identifies the first entry not known to have been applied.
+    /// Remove an entry from the active generation-owned domain HASH map.
+    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> Result<(), DomainRouteWriteError>;
     fn remove_domain_ip_bitmap_batch(
         &mut self,
         keys: &[LpmKey],
@@ -472,23 +424,6 @@ pub trait EbpfBackend: Send + Sync {
             self.remove_domain_ip_bitmap(key)
                 .map_err(|error| (index, error))?;
         }
-        Ok(())
-    }
-
-    /// Populate the inactive generation for every learned domain route before
-    /// publishing its matching rule bank.
-    fn stage_domain_routing_generation(
-        &mut self,
-        generation: u32,
-        entries: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()>;
-    /// Delete dest/source/MAC LPM entries whose raw key is not in `keep`.
-    ///
-    /// Post-commit cleanup for the two-phase routing push.  This replaces
-    /// the former `clear_stale_lpm_entries` (zero-bitmap deletion): LPM
-    /// values are now overwritten per key during the push, so stale state
-    /// is exactly the set of keys the new ruleset no longer references.
-    fn prune_lpm_entries(&mut self, _keep: &LpmKeepSet) -> anyhow::Result<()> {
         Ok(())
     }
 

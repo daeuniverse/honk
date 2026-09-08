@@ -282,16 +282,6 @@ async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
         test_dns_forwarder(),
     )
     .unwrap();
-    let initial_plan = control_plane.active_routing_plan.read().clone();
-    routing_matcher::RoutingMatcherBuilder::push_plan(
-        &mut **control_plane.ebpf.write().await,
-        &initial_plan,
-    )
-    .unwrap();
-    routing_matcher::RoutingMatcherBuilder::activate_projection(&initial_plan);
-    control_plane
-        .routing_publication_dirty
-        .store(false, std::sync::atomic::Ordering::Release);
     control_plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
         crate::mode::ModeState::new("Rule", "Proxy"),
     )));
@@ -452,109 +442,53 @@ async fn failed_reload_keeps_old_score_authority() {
 
 #[tokio::test]
 async fn post_publication_datapath_failure_is_committed_degraded() {
-    for failed_ordinal in [2, 3] {
-        let cp = test_cp().await;
-        assert!(cp.datapath_flags.is_some());
-        let first_interval = Config::default().global.check_interval_secs + 1;
-        assert!(
-            cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new(),)
-                .await
-        );
-        let provider = cp.dns_controller.runtime_provider();
-        let before_dns = provider.current_generation();
-        let before_manager = cp.group_manager.read().clone();
-        let expected_flags;
-        {
-            let mut ebpf = cp.ebpf.write().await;
-            expected_flags = *ebpf.datapath_flags_write_log().last().unwrap();
-            ebpf.clear_datapath_flags_write_log();
-            ebpf.arm_datapath_flags_write_fault(failed_ordinal).unwrap();
-            assert!(ebpf.datapath_flags_write_log().is_empty());
-        }
-        let interval = first_interval + failed_ordinal as u64;
-        let drain = DrainTracker::new();
-        let expected_new_flags =
-            expected_flags & !honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES;
-        assert_ne!(expected_new_flags, expected_flags);
-        let mut replacement = score_reload_config(interval);
-        replacement
-            .routing
-            .rules
-            .push(honk_config::routing::RoutingRule {
-                name: "distinct-static-flags".into(),
-                condition: honk_config::routing::RoutingCondition {
-                    domain: vec!["static-flags.example".into()],
-                    ..Default::default()
-                },
-                outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
-                priority: 0,
-                must: false,
-                mark: 0,
-            });
-
-        let result = cp.apply_runtime_config(replacement, &drain).await;
-        let ebpf = cp.ebpf.read().await;
-        let writes = ebpf.datapath_flags_write_log();
-        let trace = ebpf.datapath_flags_write_trace();
-        drop(ebpf);
-
-        let expected_writes = if failed_ordinal == 2 {
-            vec![expected_flags, expected_new_flags]
-        } else {
-            vec![expected_flags, expected_new_flags, expected_new_flags]
-        };
-        assert_eq!(writes, expected_writes);
-        assert_eq!(trace.len(), failed_ordinal);
-        let expected_origins = if failed_ordinal == 2 {
-            vec![
-                DatapathFlagsWriteOrigin::FenceNfqueue,
-                DatapathFlagsWriteOrigin::SetStatic,
-            ]
-        } else {
-            vec![
-                DatapathFlagsWriteOrigin::FenceNfqueue,
-                DatapathFlagsWriteOrigin::SetStatic,
-                DatapathFlagsWriteOrigin::ReopenNfqueue,
-            ]
-        };
-        for (index, write) in trace.iter().enumerate() {
-            assert_eq!(write.ordinal, index + 1);
-            assert_eq!(write.flags, expected_writes[index]);
-            assert_eq!(write.origin, expected_origins[index]);
-            assert_eq!(write.failed, index + 1 == failed_ordinal);
-        }
-        let labelled_trace: Vec<_> = trace
-            .iter()
-            .map(|write| (write.origin, write.flags, write.failed))
-            .collect();
-        assert!(labelled_trace.last().unwrap().2);
-        println!("failed_ordinal={failed_ordinal} stage_trace={labelled_trace:?}");
-        assert!(
-            result,
-            "post-publication failure {failed_ordinal} is committed"
-        );
-        assert_ne!(provider.current_generation(), before_dns);
-        assert_eq!(cp.config.read().await.global.check_interval_secs, interval);
-        assert!(!Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
-        assert!(!cp.is_datapath_healthy());
-        assert!(drain.should_reject());
-        assert!(cp.drain_tracker.should_reject());
-        assert!(
-            before_manager
-                .selection_plan_for_target("score", &score_reload_context())
-                .entries[0]
-                .feedback
-                .is_none()
-        );
-        assert!(
-            cp.group_manager
-                .read()
-                .selection_plan_for_target("score", &score_reload_context())
-                .entries[0]
-                .feedback
-                .is_some()
-        );
+    let cp = test_cp_with_nfq(true).await;
+    let first_interval = Config::default().global.check_interval_secs + 1;
+    assert!(
+        cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new())
+            .await
+    );
+    let provider = cp.dns_controller.runtime_provider();
+    let before_dns = provider.current_generation();
+    let before_manager = cp.group_manager.read().clone();
+    {
+        let mut ebpf = cp.ebpf.write().await;
+        ebpf.clear_datapath_flags_write_log();
+        ebpf.arm_datapath_flags_write_fault(2).unwrap();
     }
+    let interval = first_interval + 1;
+    let drain = DrainTracker::new();
+    assert!(
+        cp.apply_runtime_config(score_reload_config(interval), &drain)
+            .await
+    );
+    assert_ne!(provider.current_generation(), before_dns);
+    assert_eq!(cp.config.read().await.global.check_interval_secs, interval);
+    assert!(!Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
+    assert!(!cp.is_datapath_healthy());
+    assert!(drain.should_reject());
+    assert!(cp.drain_tracker.should_reject());
+    let trace = cp.ebpf.read().await.datapath_flags_write_trace();
+    let last_applied = trace.iter().rev().find(|write| !write.failed).unwrap();
+    assert_eq!(
+        last_applied.flags & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY,
+        0
+    );
+    assert!(
+        before_manager
+            .selection_plan_for_target("score", &score_reload_context())
+            .entries[0]
+            .feedback
+            .is_none()
+    );
+    assert!(
+        cp.group_manager
+            .read()
+            .selection_plan_for_target("score", &score_reload_context())
+            .entries[0]
+            .feedback
+            .is_some()
+    );
 }
 
 /// A fence failure rejects the reload before anything was torn down, so the
@@ -591,18 +525,12 @@ async fn fence_failure_rejects_reload_without_stranding_datapath() {
     assert!(!cp.drain_tracker.should_reject());
     let ebpf = cp.ebpf.read().await;
     let trace = ebpf.datapath_flags_write_trace();
-    let origins: Vec<_> = trace.iter().map(|write| write.origin).collect();
+    assert!(trace.first().unwrap().failed);
+    assert!(!trace.last().unwrap().failed);
     assert_eq!(
-        origins,
-        vec![
-            DatapathFlagsWriteOrigin::FenceNfqueue,
-            DatapathFlagsWriteOrigin::SetStatic,
-            DatapathFlagsWriteOrigin::ReopenNfqueue,
-        ],
-        "fence failure must restore old flags and reopen admission"
+        trace.last().unwrap().origin,
+        DatapathFlagsWriteOrigin::ReopenNfqueue
     );
-    assert!(trace[0].failed);
-    assert!(!trace[1].failed && !trace[2].failed);
 }
 
 /// The production incident shape: quiesce fails after READY=false was
@@ -636,15 +564,6 @@ async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
     assert!(!cp.drain_tracker.should_reject());
     let ebpf = cp.ebpf.read().await;
     let trace = ebpf.datapath_flags_write_trace();
-    let origins: Vec<_> = trace.iter().map(|write| write.origin).collect();
-    assert_eq!(
-        origins,
-        vec![
-            DatapathFlagsWriteOrigin::FenceNfqueue,
-            DatapathFlagsWriteOrigin::SetStatic,
-            DatapathFlagsWriteOrigin::ReopenNfqueue,
-        ]
-    );
     assert!(!trace.iter().any(|write| write.failed));
     assert_eq!(
         trace[0].flags & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY,
@@ -1211,31 +1130,35 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
 }
 
 #[tokio::test]
-async fn router_only_semantic_reload_fences_sniffed_bitmap_writers() {
+async fn semantic_domain_reload_replaces_matching_predicates() {
     let cp = test_cp().await;
-    let mut first = changed_routing_config();
-    first.routing.rules[0].condition.domain = vec!["first.example".into()];
+    let mut config = changed_routing_config();
+    config.routing.rules[0].outbound =
+        honk_config::routing::RoutingOutbound::Simple("block".into());
+    config.routing.rules[0].condition.domain = vec!["first.example".into()];
     assert!(
-        cp.apply_runtime_config(first.clone(), &DrainTracker::new())
+        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
             .await
     );
-    let ebpf_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
-    let bitmap_generation =
-        routing_matcher::DOMAIN_BITMAPS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-
-    first.routing.rules[0].condition.domain = vec!["second.example".into()];
-    assert!(cp.apply_runtime_config(first, &DrainTracker::new()).await);
-
-    assert_eq!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
-        ebpf_generation,
-        "equal eBPF plan bytes should not flip the map bank"
-    );
-    assert!(
-        routing_matcher::DOMAIN_BITMAPS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-            > bitmap_generation,
-        "replacing the userspace Router must fence stale bitmap writers"
-    );
+    let mut connection = crate::routing::ConnectionInfo {
+        domain: Some("first.example".into()),
+        dst_ip: "192.0.2.1".parse().unwrap(),
+        dst_port: 443,
+        src_ip: "198.51.100.1".parse().unwrap(),
+        src_port: 41000,
+        protocol: "tcp",
+        process_name: None,
+        mac: None,
+        dscp: None,
+    };
+    let first = cp.router.read().await.route(&connection).to_owned();
+    assert_eq!(first, "block");
+    config.routing.rules[0].condition.domain = vec!["second.example".into()];
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    let router = cp.router.read().await;
+    assert_eq!(router.route(&connection), router.default_outbound());
+    connection.domain = Some("second.example".into());
+    assert_eq!(router.route(&connection), first);
 }
 #[tokio::test]
 async fn identical_subscription_merge_skips_runtime_generation() {
@@ -1272,54 +1195,6 @@ async fn identical_subscription_merge_skips_runtime_generation() {
             .get(),
         before,
         "identical effective subscription data must not publish a generation"
-    );
-}
-
-#[tokio::test]
-async fn unchanged_reload_retries_dirty_startup_routing() {
-    let cp = test_cp().await;
-    let before = cp.ebpf.read().await.active_routing_generation().unwrap();
-    cp.routing_publication_dirty
-        .store(true, std::sync::atomic::Ordering::Release);
-
-    assert!(
-        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
-            .await
-    );
-    assert_ne!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
-        before
-    );
-    assert!(
-        !cp.routing_publication_dirty
-            .load(std::sync::atomic::Ordering::Acquire)
-    );
-}
-
-#[tokio::test]
-async fn dirty_startup_routing_is_republished_by_periodic_retry() {
-    let cp = test_cp().await;
-    cp.routing_publication_dirty
-        .store(true, std::sync::atomic::Ordering::Release);
-    let before = cp.ebpf.read().await.active_routing_generation().unwrap();
-
-    cp.repush_routing_if_dirty().await;
-
-    assert_ne!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
-        before
-    );
-    assert!(
-        !cp.routing_publication_dirty
-            .load(std::sync::atomic::Ordering::Acquire)
-    );
-
-    let stable = cp.ebpf.read().await.active_routing_generation().unwrap();
-    cp.repush_routing_if_dirty().await;
-    assert_eq!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
-        stable,
-        "clean flag must make the retry a no-op"
     );
 }
 
@@ -1407,12 +1282,12 @@ async fn client_subnet_reload_injects_upstream_query() {
 }
 
 #[tokio::test]
-async fn routing_push_failure_replays_old_plan_and_keeps_userspace_generation() {
+async fn routing_push_failure_keeps_active_policy_and_userspace_generation() {
     let cp = test_cp().await;
     cp.ebpf
         .write()
         .await
-        .inject_routing_fault(RoutingPushPhase::Meta, 1)
+        .inject_routing_fault(RoutingPushPhase::Root, 1)
         .unwrap();
     let mut replacement = changed_routing_config();
     replacement.global.check_interval_secs += 1;
@@ -1455,40 +1330,58 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
 }
 
 #[tokio::test]
-async fn replay_failure_latches_until_a_successful_reload_repairs() {
+async fn repeated_publication_failures_preserve_serving_generation() {
     let cp = test_cp().await;
+    let active = cp.ebpf.read().await.active_routing_generation().unwrap();
     cp.ebpf
         .write()
         .await
-        .inject_routing_fault(RoutingPushPhase::Meta, 2)
+        .inject_routing_fault(RoutingPushPhase::Root, 2)
         .unwrap();
-
-    cp.apply_runtime_config(changed_routing_config(), &DrainTracker::new())
-        .await;
-
-    assert!(!cp.is_datapath_healthy());
-    assert!(cp.drain_tracker.should_reject());
-
-    // A build-phase rejection changes nothing and must not re-arm the latch.
-    let mut invalid = Config::default();
-    invalid.dns.upstream[0].address.clear();
-    cp.apply_runtime_config(invalid, &DrainTracker::new()).await;
-    assert!(!cp.is_datapath_healthy());
-    assert!(cp.drain_tracker.should_reject());
-
-    // The next completed slow path re-pushes the torn bank and re-arms.
-    let bank_before = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let mut replacement = changed_routing_config();
+    replacement.global.check_interval_secs += 1;
+    for _ in 0..2 {
+        let drain = DrainTracker::new();
+        assert!(!cp.apply_runtime_config(replacement.clone(), &drain).await);
+        assert!(cp.is_datapath_healthy());
+        assert!(!drain.should_reject());
+        assert!(!cp.drain_tracker.should_reject());
+        assert_eq!(
+            cp.ebpf.read().await.active_routing_generation().unwrap(),
+            active
+        );
+        assert_eq!(
+            cp.config.read().await.global.check_interval_secs,
+            Config::default().global.check_interval_secs
+        );
+    }
     assert!(
-        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+        cp.apply_runtime_config(replacement.clone(), &DrainTracker::new())
             .await
     );
-    assert!(cp.is_datapath_healthy());
-    assert!(!cp.drain_tracker.should_reject());
     assert_ne!(
         cp.ebpf.read().await.active_routing_generation().unwrap(),
-        bank_before,
-        "an unchanged config must still re-push while latched unhealthy"
+        active
     );
+    assert_eq!(
+        cp.config.read().await.global.check_interval_secs,
+        replacement.global.check_interval_secs
+    );
+}
+
+#[tokio::test]
+async fn initial_policy_failure_aborts_controller_construction() {
+    let mut backend = MockEbpfBackend::new();
+    backend.fail_next_routing_phase(RoutingPushPhase::Root);
+    let result = ControlPlane::new(
+        Config::default(),
+        Box::new(backend),
+        Router::new(&[], "direct").unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        test_dns_forwarder(),
+    );
+    assert!(result.is_err());
 }
 
 #[tokio::test]

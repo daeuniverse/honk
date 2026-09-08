@@ -78,6 +78,7 @@ pub struct ParsedPacket {
     pub udph: UdpHdr,
     pub l4proto: u8,
     pub listener_l4proto: u8,
+    pub routing_input: honk_ebpf_common::RoutingInput,
 }
 
 /// Malformed packet: invalid header, bad length, too many extension headers.
@@ -695,7 +696,7 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
         };
     }
 
-    *out = unsafe { mem::zeroed() };
+    // Miss-only routing scratch must not add clearing work to cached packets.
     out.ethh = tctx.ethh;
     out.tcph = tctx.tcph;
     out.udph = tctx.udph;

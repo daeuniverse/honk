@@ -73,7 +73,7 @@ flowchart TB
 ### Packet walk
 
 1. The [datapath](./datapath.md) classifies LAN-forwarded traffic at LAN TC and host-originated TCP/UDP at WAN TC. `direct(must)` and route-time-safe direct decisions remain on the native Linux path; decisions that still need userspace are not offloaded.
-2. The [DNS path](./dns.md) sends TCP and UDP destination port `53` through a fast path that skips the general match loop and redirects to the control plane.
+2. The [DNS path](./dns.md) sends LAN TCP and UDP destination port `53` through a fast path that skips the compiled traffic policy. WAN routing retains its non-must port-53 control-plane override.
 3. The [datapath](./datapath.md) redirects ordinary proxy and userspace decisions through `dae0`; inside `daens`, `sk_lookup` assigns them to the [control plane's](./control-plane.md) transparent TCP or UDP listener.
 4. The [NFQUEUE staging](./nfqueue.md) path is enabled by default through `global.nfqueue_enable` when startup prerequisites pass; it holds only ambiguous LAN-forwarded UDP after LAN TC and before conntrack/NAT. Each staged flow carries a unique decision token in fixed queue `320`; host-originated WAN traffic stays on the ordinary transparent path.
 5. The [control plane](./control-plane.md) recovers the original destination and consumes the eBPF routing handoff. A missing handoff or `ControlPlaneRouting` outcome enters userspace routing.
@@ -86,7 +86,7 @@ flowchart TB
 
 - **Bypass-mark discipline:** dials, probes, DNS upstreams, QUIC endpoints, and transparent listeners carry `DAE_BYPASS_MARK` (`0x100`) or use loopback. Accepted TCP sockets have the listener mark cleared; ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
 - **Anyfrom UDP replies:** proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. Replying from the TPROXY listener exposes the `dae0` source and fails on the return path.
-- **DNS source boundary:** transparent and `dns.bind` adapters derive the logical client source from the socket peer; flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope, while `DOMAIN_ROUTING_MAP` projection remains global and source-independent.
+- **DNS source boundary:** transparent and `dns.bind` adapters derive the logical client source from the socket peer; flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope, while each policy generation's domain-predicate projection remains global and source-independent.
 - **Network-namespace discipline:** the process remains in the host netns. It enters `daens` only through scoped, fully synchronous `with_daens_netns` calls; no `.await` may occur across `setns`, and failure to restore the original namespace aborts the process.
 - **Datapath admission:** `DATAPATH_STATE_MAP[0]` stays closed until every listener FD is published and every receive loop is running, and closes before listener teardown. TC passes traffic unchanged while the gate is closed.
 - **NFQUEUE readiness and ownership:** enabled-but-not-ready staging drops only new flows that require staging. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; readiness changes are fenced, lifecycle ambiguity is fatal, and same-netns firewall managers must not mutate those objects.
@@ -104,7 +104,7 @@ flowchart TB
 
 | Feature | Default | Effect |
 | --- | --- | --- |
-| `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the `honk-ebpf` object. Requires Linux kernel 5.8+ at runtime. |
+| `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the static `honk-ebpf` object, and userspace compiles policy extensions at runtime. Requires Linux kernel 7.2+ at runtime. |
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
 | `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |

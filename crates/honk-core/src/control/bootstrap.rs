@@ -56,7 +56,7 @@ impl ControlPlane {
 
     pub(crate) fn new_with_upstream_pool_and_budget(
         config: Config,
-        ebpf: Box<dyn EbpfBackend>,
+        mut ebpf: Box<dyn EbpfBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
@@ -92,9 +92,6 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
-        // NodeId → eBPF outbound id for OUTBOUND_CONNECTIVITY_MAP pushes,
-        // numbered exactly like push_routing_to_ebpf (group i → UserBase+i).
-        // Rebuilt on config reload.
         let outbound_id_map = Arc::new(parking_lot::RwLock::new(build_outbound_id_map(&config)));
         {
             let map = outbound_id_map.clone();
@@ -162,7 +159,8 @@ impl ControlPlane {
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
-        let initial_push_result = initial_routing_plan.result();
+        routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &initial_routing_plan)
+            .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let config_arc = Arc::new(RwLock::new(Arc::new(config)));
@@ -174,7 +172,6 @@ impl ControlPlane {
                 routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                     0,
                     pinned_router,
-                    initial_push_result.domain_bitmaps,
                 )),
                 outbound_runtime: Some(outbound_runtime),
                 transport: dns_upstream_pool,
@@ -276,7 +273,6 @@ impl ControlPlane {
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
-            routing_publication_dirty: std::sync::atomic::AtomicBool::new(true),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]

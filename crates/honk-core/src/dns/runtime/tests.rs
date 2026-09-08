@@ -105,11 +105,7 @@ fn runtime_with_outbound(
         generation: RuntimeGeneration::new(generation),
         udp_query_limit: 256,
         forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            generation,
-            router,
-            Default::default(),
-        )),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime,
         transport: transport.clone(),
     });
@@ -138,11 +134,7 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
         generation: RuntimeGeneration::new(generation),
         udp_query_limit: 256,
         forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            generation,
-            router,
-            Default::default(),
-        )),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime: None,
         transport: pool,
     })

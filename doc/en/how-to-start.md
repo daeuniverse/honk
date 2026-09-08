@@ -15,8 +15,7 @@ uname -r
 ```
 
 - Only Linux is supported. The real transparent datapath must run as `root`.
-- The current eBPF program uses `bpf_loop`, which requires upstream Linux `5.17+` unless the distribution backports it.
-- Linux `6.8+` is recommended. The `bpf_redirect_peer` fast path is also available on kernels with the safe backports in `5.15.164+`, `6.1.99+`, and `6.6.40+`; other supported kernels automatically use ordinary redirect.
+- Linux `7.2+` is required for compiled routing and its synchronous map-in-map publication guarantee. Older kernels are rejected before attachment.
 - `netkit` is optional. honk falls back to veth when the kernel does not support it.
 
 `lan_interface` intercepts traffic entering the gateway from the LAN. `wan_interface` intercepts traffic originated by the gateway itself:
@@ -346,7 +345,7 @@ cargo +stable run --release -p honk-core -- \
 | --- | --- |
 | `bpf-linker-wrapper` is missing | Replace the maintainer-local path with the `bpf-linker` in PATH as shown in the source-build section. |
 | `no BTF parsed for object` | Clear `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, rebuild the eBPF object, and confirm `.BTF` with `readelf`. |
-| The verifier reports `unknown bpf func`/`bpf_loop` | Upgrade the kernel or use a distribution kernel that explicitly backports the helper. |
+| The kernel or verifier rejects compiled routing | Use Linux `7.2+` with BPF/BTF and freplace support. Keep the full verifier log and the generated rule attribution; do not bypass the startup failure. |
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |

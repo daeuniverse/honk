@@ -1,10 +1,6 @@
 use crate::{TASK_COMM_LEN, dae_ip::In6Addr};
 
-pub const MAX_MATCH_SET_LEN: usize = 128;
-pub const ROUTING_BITMAP_WORDS_PER_GENERATION: usize = MAX_MATCH_SET_LEN / 32;
-pub const ROUTING_BITMAP_GENERATIONS: usize = 2;
-pub const ROUTING_BITMAP_WORDS: usize =
-    ROUTING_BITMAP_WORDS_PER_GENERATION * ROUTING_BITMAP_GENERATIONS;
+pub const ROUTING_BITMAP_WORDS: usize = crate::ROUTING_FACT_CAPACITY / 32;
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -73,18 +69,8 @@ const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
 pub struct DomainRouting {
     pub bitmap: [u32; ROUTING_BITMAP_WORDS],
 }
-
-impl DomainRouting {
-    pub fn for_generation(&self, generation: u32) -> Self {
-        let mut shifted = Self::default();
-        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-        if offset + ROUTING_BITMAP_WORDS_PER_GENERATION <= shifted.bitmap.len() {
-            shifted.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
-                .copy_from_slice(&self.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
-        }
-        shifted
-    }
-}
+const _: () = assert!(ROUTING_BITMAP_WORDS == crate::ROUTING_FACT_CAPACITY / 32);
+const _: () = assert!(core::mem::size_of::<DomainRouting>() == 32);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

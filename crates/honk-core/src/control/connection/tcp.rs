@@ -227,14 +227,11 @@ impl ControlPlaneHandle {
         let matched_rule = route.matched_rule;
         let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
 
-        // For userspace-routed flows with a sniffed domain, write the resolved
-        // IP back into eBPF DOMAIN_ROUTING_MAP so the next connection to the
-        // same IP can be fast-pathed by eBPF domain rules instead of being
-        // sniffed again.
+        // Seed current predicate facts so later flows need not repeat sniffing.
         if let Some(domain) = &domain
             && Self::should_write_sniffed_domain_bitmap(handoff.as_ref(), reroute_by_sniffed_domain)
         {
-            self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+            self.push_sniffed_domain_bitmap(domain, original_dst.ip())
                 .await;
         }
 

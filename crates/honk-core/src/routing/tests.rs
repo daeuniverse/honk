@@ -477,14 +477,11 @@ fn test_process_name_route_matching_uses_kernel_comm_limit() {
 
     let router = Router::new(&rules, "proxy").unwrap();
 
-    assert_eq!(
-        router.route(&make_conn(Some("systemd-resolve"), None)),
-        "direct"
-    );
-    assert_eq!(
-        router.compiled_routes()[0].process_names,
-        vec!["systemd-resolve"]
-    );
+    let process_condition = &router.compiled_routes()[0].conditions[0];
+    assert!(matches!(
+        &process_condition.predicate,
+        CompiledPredicate::ProcessName(names) if names == &["systemd-resolve".to_owned()]
+    ));
 }
 
 #[test]
@@ -1010,60 +1007,7 @@ fn test_geosite_matcher_semantics() {
 }
 
 #[test]
-fn test_route_domain_matches_suffix_and_skips_ip_port_only() {
-    let rules = vec![
-        // Pure IP rule — must NOT match a domain-only probe even if
-        // 0.0.0.0 happens to sit inside a broad CIDR.
-        RoutingRule {
-            name: "ip-private".into(),
-            condition: RoutingCondition {
-                ip: vec!["0.0.0.0/0".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("direct".into()),
-            priority: 0,
-            must: false,
-            mark: 0,
-        },
-        // Pure port rule — domain-only probes have port 0, but even if
-        // they did match, route_domain skips non-domain rules.
-        RoutingRule {
-            name: "port-proxy".into(),
-            condition: RoutingCondition {
-                port: vec!["443".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("proxy".into()),
-            priority: 1,
-            must: false,
-            mark: 0,
-        },
-        RoutingRule {
-            name: "suffix-google".into(),
-            condition: RoutingCondition {
-                domain_suffix: vec!["google.com".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("google-group".into()),
-            priority: 2,
-            must: false,
-            mark: 0,
-        },
-    ];
-
-    let router = Router::new(&rules, "final-group").unwrap();
-
-    let m = router.route_domain("www.google.com").expect("suffix match");
-    assert_eq!(m.rule_name, "suffix-google");
-    assert_eq!(m.outbound_name, "google-group");
-
-    // No domain rule → None (do NOT fall through to default / IP / port).
-    assert!(router.route_domain("www.example.com").is_none());
-    assert!(router.route_domain("analytics.tiktok.com").is_none());
-}
-
-#[test]
-fn test_route_domain_does_not_claim_default_as_match() {
+fn test_domain_bitmap_does_not_claim_default_as_match() {
     let rules = vec![RoutingRule {
         name: "cn-suffix".into(),
         condition: RoutingCondition {
@@ -1076,19 +1020,72 @@ fn test_route_domain_does_not_claim_default_as_match() {
         mark: 0,
     }];
     let router = Router::new(&rules, "🍥 final").unwrap();
+    assert_eq!(router.domain_predicate_count(), 1);
 
+    let mut conn = make_conn(None, None);
+    conn.domain = Some("baidu.cn".into());
+    let bitmap = router.domain_bitmap("baidu.cn").expect("domain facts");
     assert_eq!(
-        router.route_domain("baidu.cn").map(|m| m.outbound_name),
+        router
+            .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+            .map(|matched| matched.outbound_name),
         Some("direct")
     );
-    // Unmatched domain must not pretend to match the default outbound.
-    assert!(router.route_domain("example.org").is_none());
-    // Real connection-time routing still returns the default via route().
-    let mut conn = make_conn(None, None);
+
     conn.domain = Some("example.org".into());
-    conn.dst_ip = "1.2.3.4".parse().unwrap();
-    conn.dst_port = 443;
+    let bitmap = router
+        .domain_bitmap("example.org")
+        .expect("known domain facts");
+    assert_eq!(bitmap.bitmap[0], 0);
+    assert!(
+        router
+            .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+            .is_none()
+    );
     assert_eq!(router.route(&conn), "🍥 final");
+}
+
+#[test]
+fn domain_bitmap_covers_full_regex_and_negative_compound_conditions() {
+    let rules = vec![RoutingRule {
+        name: "compound-domain".into(),
+        condition: RoutingCondition {
+            domain: vec!["exact.test".into(), "*.blocked.test".into()],
+            domain_regex: vec![r"^regex\.test$".into()],
+            not: honk_config::routing::RoutingNotCondition {
+                domain_suffix: vec!["blocked.test".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("proxy".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "direct").unwrap();
+    assert_eq!(router.domain_predicate_count(), 2);
+
+    let mut conn = make_conn(None, None);
+    for domain in ["exact.test", "regex.test"] {
+        conn.domain = Some(domain.into());
+        let bitmap = router.domain_bitmap(domain).unwrap();
+        assert_eq!(
+            router
+                .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+                .map(|matched| matched.outbound_name),
+            Some("proxy")
+        );
+    }
+    conn.domain = Some("exact.blocked.test".into());
+    let bitmap = router
+        .domain_bitmap(conn.domain.as_deref().unwrap())
+        .unwrap();
+    assert!(
+        router
+            .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+            .is_none()
+    );
 }
 
 mod negation {
@@ -1281,35 +1278,6 @@ mod negation {
         let mut veto = conn();
         veto.dst_ip = "192.168.1.1".parse().unwrap();
         check(not(&[("geo_ip", "private")]), &hit, &veto);
-    }
-
-    #[test]
-    fn test_negated_geosite_matcher() {
-        // Build the base route without geo assets; then swap in a synthetic
-        // negated geosite matcher (the dat-backed positive side is covered
-        // by test_geosite_route above).
-        let router =
-            Router::new(&[rule("neg", not(&[("port", "53")]), "proxy")], "direct").unwrap();
-        let route = &router.compiled_routes()[0];
-        let domains = vec![GeositeDomain::Domain("x.com".into())];
-        let route = CompiledRoute {
-            not_ports: Vec::new(),
-            not_geosite_domains: domains.clone(),
-            not_geosite_matcher: GeositeMatcher::build(&domains),
-            ..route.clone()
-        };
-        let router = Router {
-            routes: vec![route].into(),
-            default_outbound: "direct".into(),
-        };
-        let mut veto = conn();
-        veto.domain = Some("www.x.com".into());
-        assert_eq!(router.route(&veto), "direct");
-        let mut hit = conn();
-        hit.domain = Some("y.com".into());
-        assert_eq!(router.route(&hit), "proxy");
-        // Unknown domain never vetoes a negated geosite matcher.
-        assert_eq!(router.route(&conn()), "proxy");
     }
 
     #[test]

@@ -154,6 +154,10 @@ fn embed_ebpf_object() {
                 // produce a BTF-less object again.
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                // Parent workspace analysis must not turn this separate build into clippy.
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CLIPPY_ARGS")
+                .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
                 .current_dir(&ebpf_crate)
                 .status()
                 .expect("failed to build eBPF object");

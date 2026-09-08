@@ -226,18 +226,16 @@ impl DesiredState {
     fn recompute_ips(&mut self, ips: impl IntoIterator<Item = IpAddr>) {
         for ip in ips {
             let mut aggregate = DomainRouting::default();
+            let mut known = false;
             if let Some(domains) = self.reverse.get(&ip) {
                 for domain in domains {
                     if let Some(bitmap) = self.snapshot.bitmap_for(domain) {
+                        known = true;
                         or_bitmap(&mut aggregate, &bitmap);
                     }
                 }
             }
-            let next = aggregate
-                .bitmap
-                .iter()
-                .any(|word| *word != 0)
-                .then_some(aggregate);
+            let next = known.then_some(aggregate);
             let unchanged = match (self.desired.get(&ip), next.as_ref()) {
                 (Some(current), Some(next)) => current.bitmap == next.bitmap,
                 (None, None) => true,
@@ -309,20 +307,17 @@ impl DesiredState {
             .iter()
             .filter_map(|(ip, domains)| {
                 let mut aggregate = DomainRouting::default();
+                let mut known = false;
                 for domain in domains {
                     if let Some(bitmap) = snapshot.bitmap_for(domain) {
+                        known = true;
                         or_bitmap(&mut aggregate, &bitmap);
                     }
                 }
-                aggregate
-                    .bitmap
-                    .iter()
-                    .any(|word| *word != 0)
-                    .then_some((*ip, aggregate))
+                known.then_some((*ip, aggregate))
             })
             .collect()
     }
-
     pub(super) fn expire(&mut self, now: Instant) {
         self.prune_stale_expiry_heads();
         while let Some(Reverse(deadline)) = self.expiry_deadlines.peek() {

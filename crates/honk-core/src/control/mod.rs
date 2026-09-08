@@ -43,7 +43,6 @@ pub mod udp_endpoint;
 mod udp_removal;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
-use crate::control::routing_matcher::DOMAIN_BITMAPS;
 use crate::control::udp_endpoint::{EndpointReservation, UdpEndpointPool, UdpInitLease};
 use crate::dns::DnsResolver;
 use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
@@ -181,8 +180,6 @@ pub struct ControlPlane {
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
-    /// Startup publication is non-fatal; the next reload must retry it.
-    routing_publication_dirty: std::sync::atomic::AtomicBool,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -231,15 +228,10 @@ impl ControlPlane {
         nfqueue_enabled: bool,
         nfqueue_ready: bool,
     ) -> anyhow::Result<()> {
-        let static_flags = {
-            let config = self.config.read().await;
-            let plan = self.active_routing_plan.read();
-            direct_offload_static_bit(&config, &plan)
-        };
         self.datapath_flags
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("datapath flags writer is not running"))?
-            .initialize(static_flags, nfqueue_enabled, nfqueue_ready)
+            .initialize(nfqueue_enabled, nfqueue_ready)
             .await
     }
 
@@ -325,21 +317,6 @@ impl ControlPlane {
     }
 }
 
-/// The static half of the datapath offload policy: non-`must` direct
-/// offload is safe when sniffing cannot change routing (`ip`/`domain+`) or
-/// the routing config contains no domain-class rule at all.
-fn direct_offload_static_bit(config: &Config, plan: &routing_matcher::RoutingPushPlan) -> u32 {
-    let dial_mode = match config.global.dial_mode.parse::<DialMode>() {
-        Ok(mode) => mode,
-        Err(_) => return 0,
-    };
-    if matches!(dial_mode, DialMode::Ip | DialMode::DomainPlus) || !plan.has_domain_rules {
-        honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES
-    } else {
-        0
-    }
-}
-
 impl ControlPlane {
     fn compile_routing_plan(
         config: &Config,
@@ -348,7 +325,11 @@ impl ControlPlane {
         let mut outbound_name_to_id = std::collections::HashMap::new();
         outbound_name_to_id.insert("direct".into(), OutboundIndex::Direct as u8);
         outbound_name_to_id.insert("block".into(), OutboundIndex::Block as u8);
-        outbound_name_to_id.insert("must_rules".into(), OutboundIndex::MustRules as u8);
+        anyhow::ensure!(
+            config.groups.len()
+                <= (OutboundIndex::MustRules as usize - OutboundIndex::UserBase as usize),
+            "too many routing groups for the outbound index namespace"
+        );
         for (i, group) in config.groups.iter().enumerate() {
             let id = OutboundIndex::UserBase as u8 + i as u8;
             outbound_name_to_id.insert(group.name.clone(), id);
@@ -360,12 +341,12 @@ impl ControlPlane {
             .parse::<DialMode>()
             .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
         let fallback_outbound = config.routing.default_outbound.as_str();
-        Ok(routing_matcher::RoutingMatcherBuilder::compile(
-            router.compiled_routes(),
+        routing_matcher::RoutingMatcherBuilder::compile(
+            router,
             &outbound_name_to_id,
             fallback_outbound,
             dial_mode,
-        ))
+        )
     }
 }
 

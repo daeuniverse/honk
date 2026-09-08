@@ -6,7 +6,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -15,7 +15,8 @@ use honk_ebpf_common::conn::ConnState;
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::redirect_need::{DomainRouting, RoutingHandoffEntry, TuplesKey};
 use honk_ebpf_common::{
-    OUTBOUND_STATS_MAP_LEN, OutboundStatsCounters, RedirectEntry, RedirectTuple,
+    OUTBOUND_STATS_MAP_LEN, OutboundStatsCounters, ROUTING_FACT_CAPACITY, ROUTING_POLICY_ROOT_NAME,
+    RedirectEntry, RedirectTuple, RoutingPolicyDescriptor,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,6 +26,8 @@ use honk_ebpf_common::{
 const BPF_OBJ_GET: i64 = 7;
 const BPF_MAP_LOOKUP_ELEM: i64 = 1;
 const BPF_MAP_GET_NEXT_KEY: i64 = 4;
+const BPF_MAP_GET_FD_BY_ID: i64 = 14;
+const BPF_OBJ_GET_INFO_BY_FD: i64 = 15;
 
 #[repr(C)]
 #[derive(Default)]
@@ -258,6 +261,94 @@ fn open(pin_root: &Path, name: &str) -> anyhow::Result<RawFd> {
     bpf_obj_get(&path).with_context(|| format!("open pinned map {}", path.display()))
 }
 
+fn map_by_id(id: u32) -> io::Result<OwnedFd> {
+    let attr = [id, 0, 0];
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_GET_FD_BY_ID,
+            attr.as_ptr(),
+            std::mem::size_of_val(&attr),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) })
+    }
+}
+
+fn check_map_layout(fd: RawFd, kind: u32, key_size: u32, value_size: u32) -> anyhow::Result<()> {
+    #[repr(C)]
+    struct InfoAttr {
+        fd: u32,
+        len: u32,
+        info: u64,
+    }
+    let mut info = [0u32; 6];
+    let mut attr = InfoAttr {
+        fd: fd as u32,
+        len: std::mem::size_of_val(&info) as u32,
+        info: info.as_mut_ptr() as u64,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET_INFO_BY_FD,
+            &mut attr,
+            std::mem::size_of::<InfoAttr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    anyhow::ensure!(
+        (info[0], info[2], info[3]) == (kind, key_size, value_size),
+        "unexpected routing map layout: type={} key={} value={}",
+        info[0],
+        info[2],
+        info[3]
+    );
+    Ok(())
+}
+
+fn open_domain_map(pin_root: &Path) -> anyhow::Result<OwnedFd> {
+    let root = unsafe { OwnedFd::from_raw_fd(open(pin_root, ROUTING_POLICY_ROOT_NAME)?) };
+    check_map_layout(root.as_raw_fd(), 12, 4, 4)?;
+    let key = 0u32.to_ne_bytes();
+    // A generation can retire between reading its ID and acquiring an FD.
+    for _ in 0..3 {
+        let descriptor_id = read_value::<u32>(root.as_raw_fd(), &key)?
+            .context("no routing policy has been published")?;
+        let descriptor = match map_by_id(descriptor_id) {
+            Ok(fd) => fd,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        check_map_layout(
+            descriptor.as_raw_fd(),
+            2,
+            4,
+            std::mem::size_of::<RoutingPolicyDescriptor>() as u32,
+        )?;
+        let policy = read_value::<RoutingPolicyDescriptor>(descriptor.as_raw_fd(), &key)?
+            .context("routing descriptor is empty")?;
+        let domain = match map_by_id(policy.domain_map_id) {
+            Ok(fd) => fd,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        check_map_layout(
+            domain.as_raw_fd(),
+            1,
+            16,
+            std::mem::size_of::<DomainRouting>() as u32,
+        )?;
+        return Ok(domain);
+    }
+    anyhow::bail!("routing changed while opening the domain map; retry the command")
+}
+
 fn matches_ip(key: &TuplesKey, ip: &Option<IpAddr>) -> bool {
     match ip {
         None => true,
@@ -332,8 +423,8 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             println!("-- {shown}/{} entries", entries.len());
         }
         "domain-routing" => {
-            let fd = open(&args.pin_root, "DOMAIN_ROUTING_MAP")?;
-            let entries = map_entries(fd, 16, std::mem::size_of::<DomainRouting>())?;
+            let fd = open_domain_map(&args.pin_root)?;
+            let entries = map_entries(fd.as_raw_fd(), 16, std::mem::size_of::<DomainRouting>())?;
             let mut shown = 0usize;
             for (kb, vb) in &entries {
                 let mut addr: In6Addr = unsafe { std::mem::zeroed() };
@@ -349,10 +440,10 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                     continue;
                 }
                 shown += 1;
-                let rules: Vec<u32> = (0..128u32)
+                let predicates: Vec<u32> = (0..ROUTING_FACT_CAPACITY as u32)
                     .filter(|i| v.bitmap[(i / 32) as usize] & (1 << (i % 32)) != 0)
                     .collect();
-                println!("{ip} rules={rules:?}");
+                println!("{ip} predicates={predicates:?}");
             }
             println!("-- {shown}/{} entries", entries.len());
         }

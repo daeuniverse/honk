@@ -1,7 +1,6 @@
 //! Runtime capability probing for batched `bpf()` map commands.
 //!
-//! aya 0.14 does not expose `BPF_MAP_LOOKUP_BATCH`/
-//! `BPF_MAP_UPDATE_BATCH` (Linux 5.6+) or
+//! aya 0.14 does not expose `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+) or
 //! `BPF_MAP_LOOKUP_AND_DELETE_ELEM` (Linux 4.20+), so `ebpf::real` issues
 //! them as raw syscalls. Availability is detected at runtime instead of
 //! relying on kernel version parsing. A capability failure sends subsequent
@@ -11,8 +10,7 @@
 //! The observation is per command, not per (command, map): every map the batch
 //! paths touch belongs to the htab family (`REDIRECT_TRACK`,
 //! `ROUTING_HANDOFF_MAP`, `CONN_STATE_MAP` and `COOKIE_PID_MAP` are plain
-//! hash), and `BPF_MAP_UPDATE_BATCH` is only used on the `ROUTING_MAP`
-//! array, so a single verdict per command is valid for all of them.
+//! hash), so a single verdict per command is valid for all of them.
 
 use std::ffi::c_long;
 use std::sync::atomic::{AtomicBool, Ordering};
