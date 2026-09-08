@@ -1,6 +1,6 @@
 # Group reference
 
-This page defines the current `group { ... }` configuration surface and member-selection semantics.
+This page defines the current `group { ... }` configuration surface and member-selection semantics. A configuration may define at most 250 top-level user groups; higher routing ordinals are reserved by the ABI.
 
 ## Syntax
 

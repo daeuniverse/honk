@@ -77,7 +77,7 @@ struct Fixture {
     runtime: Runtime,
     control_plane: ControlPlane,
     config: Config,
-    flag_writes: Arc<parking_lot::Mutex<Vec<u32>>>,
+    flag_writes: Box<dyn Fn() -> u64>,
     #[cfg(feature = "reload-bench-counters")]
     routing_writes: Arc<AtomicU64>,
     #[cfg(feature = "reload-bench-counters")]
@@ -124,7 +124,15 @@ impl Fixture {
         );
 
         let backend = MockEbpfBackend::new();
-        let flag_writes = Arc::clone(&backend.datapath_flags_writes);
+        let flag_writes = {
+            let writes = Arc::clone(&backend.datapath_flags_writes);
+            Box::new(move || {
+                writes
+                    .try_lock()
+                    .expect("reload recorder must be idle between reloads")
+                    .len() as u64
+            }) as Box<dyn Fn() -> u64>
+        };
         #[cfg(feature = "reload-bench-counters")]
         let routing_writes = backend.routing_map_write_counter();
         #[cfg(feature = "reload-bench-counters")]
@@ -168,7 +176,7 @@ impl Fixture {
 
     fn observation(&self) -> Observation {
         Observation {
-            flag_writes: self.flag_writes.lock().len() as u64,
+            flag_writes: (self.flag_writes)(),
             #[cfg(feature = "reload-bench-counters")]
             dns_generation: self.control_plane.reload_benchmark_dns_generation(),
             #[cfg(feature = "reload-bench-counters")]

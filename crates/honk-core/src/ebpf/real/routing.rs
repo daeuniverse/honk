@@ -1,5 +1,6 @@
 use super::*;
 use crate::ebpf::DomainRouteWriteError;
+use crate::ebpf::maps::DOMAIN_MAP_CAPACITY;
 use aya::maps::{ArrayOfMaps as AyaArrayOfMaps, IterableMap};
 use aya::programs::{ProgramError, ProgramFd, SchedClassifier};
 #[cfg(test)]
@@ -19,7 +20,6 @@ const ROUTING_TARGETS: [&str; 4] = [
     "wan_egress_l3",
 ];
 const FACT_MAP_CAPACITY: u32 = 2_048_000;
-const DOMAIN_CAPACITY: u32 = 65_536;
 const BPF_F_NO_PREALLOC: u32 = 1;
 const VERIFIER_LOG_SIZE: usize = 1 << 20;
 
@@ -242,7 +242,7 @@ fn create_maps(
     facts: &crate::control::routing_matcher::RoutingFactMaps,
     domain_entries: &[(LpmKey, DomainRouting)],
 ) -> anyhow::Result<RoutingMaps> {
-    let mut domain = RoutingDomain::create(DOMAIN_CAPACITY, BPF_F_NO_PREALLOC)?;
+    let mut domain = RoutingDomain::create(DOMAIN_MAP_CAPACITY, BPF_F_NO_PREALLOC)?;
     for (key, value) in domain_entries {
         domain.insert(key.data, value, 0)?;
     }

@@ -14,9 +14,13 @@ native-direct 与已有流缓存路径保持原生执行。
 ## 规则语义
 
 规范化 IR 保存有序 RuleId、展示信息、条件与 outbound/mark/must 动作。priority
-数值越小越先匹配，同优先级保持声明顺序。条件之间 AND，同一条件的候选值 OR，
-否定只作用一次且覆盖整个条件。fallback 是独立的终结动作。空展开不能被丢弃：
-正向空集合为 false，负向空集合为 true，不能因 geo 资源没有匹配项而放宽复合规则。
+数值越小越先匹配，同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配
+`0, 1, ...`；生成的本地规则使用 priority `0` 并追加在用户规则之后，因此只
+优先于更高 priority 的用户规则。较早命中的用户 priority-0 规则仍先生效。
+条件之间 AND，同一条件的候选值 OR，否定只作用一次且覆盖整个条件。fallback
+是独立的终结动作。空展开不能被丢弃：正向空集合为 false，负向空集合为 true，
+不能因 geo 资源没有匹配项而放宽复合规则。
+
 
 切换保留当前用户态匹配合同：
 
@@ -158,67 +162,18 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 - 配对测量完整路由/流量成本、冷热事实、reload、JIT 大小和内存峰值。强化后的
   packed-data/AOT bounded-loop 是基线；端口微基准不代表整个引擎不退化。
 
-此前 Linux 7.2.3 隔离原型只覆盖协议/端口片段。以下分支验证使用生产 caller 和
-完整 policy，而不是把片段结果外推为整条 datapath 的收益。
-
 ### 分支验证记录
 
-`10.10.10.117` 的 Linux `6.12.94+deb13-amd64` 使用静态 musl 测试程序通过全部
-15 项真实内核检查，另通过 no-op reload、assembler 和 fingerprint 的 10 项 library
-检查。测试使用独立 network、mount、cgroup namespace 和私有 bpffs，未停止或重启
-现有 honk 服务。首次 verifier 检查发现进程名规范化中的 `% 48` 无法给输出指针提供
-有界偏移；改为构造指针前显式检查偏移后，6.12 可以验证通过，合法输入的输出不变。
+当前 CI 的真实内核基线是固定的 Ubuntu Linux
+`6.12.0-061200-generic` VM。CI 在 hosted runner 上构建测试 executable，
+再在该 VM 中运行完全相同的产物，不会在 guest 内重新编译。VM 执行 root-only
+路由与集成 gate；`just test-routing` 还会沿真实 root/slot 路径检查生成 policy，
+包括优先级、完整 decision 元数据、容量失败和发布失败保留旧状态。
+`just test-netns` 包含该路由 gate。
 
-
-`just test-routing` 单独构建 test object，沿真实 root/slot 路径执行 117 个手写用例
-在四种 dial mode 下的 468 次完整 decision 比较，同时验证 domain、目的/源 IP、MAC
-的谓词 bit 255、谓词容量 257 的拒绝，以及包含 65,537 个独立前缀的单条规则首尾命中
-和相邻地址不命中。发布失败检查保留依赖真实事实的命中和不命中结果，在解除占用的
-attachment 后成功重新发布，确认冻结 root 的具体 syscall 错误，并重新附着所有
-inactive target 以验证 link 清理。`just test-netns` 包含这个 gate。
-
-这些检查拆为使用独立 backend fixture 的原生测试场景；发布场景显式安装自己的
-baseline，并保留同一 backend 上的失败到恢复链。Local 和 VM gate 都选择整个
-routing-test 模块，而不是一个巨型测试函数。Golden case 显式携带名称及 must/punt
-元数据，不再让数组位置决定语义。
-
-结构整理前后的 32 组生成程序指令与 source record 逐字节相同，256 组策略相等性关系
-也保持不变；扩展 gate 的全部 15 项检查已在 Linux `7.2.0-cachyos` 通过。此前容量修复
-还在 256 MiB 地址空间限制下，通过生产 parser 和 emitter 检查了 10,000 个进程名
-候选，正常返回容量错误而非 abort。以下 VM 和实验室记录早于这些新增检查。
-
-固定的 Ubuntu `7.2.0-070200-generic` VM 通过全部 12 项 root-only 检查：
-TC/cgroup 生命周期与 allocator 兼容性、生成 policy 发布、TC/TUN 报文合同、
-生产 NFQUEUE 合同和真实 netns 流量。CI 在 hosted runner 构建 executable，
-再于这个内核中运行相同产物，不在 guest 中重复编译。
-
-隔离的 Linux 7.2.3 实验机通过 IPv4/IPv6 LAN 21 项、WAN 12 项检查，覆盖
-direct/proxy/block TCP/UDP、MAC/源地址/目的地址组合、DSCP、pname、透明 DNS、
-冷热域名 TLS，以及 NFQUEUE 持有首包后的 native direct UDP。16 MiB TCP 流持续
-12.802 秒，跨越阻断新流的 reload 后完整结束；policy 发布为 9.43 ms，
-恢复为 9.24 ms。Direct/global mode 检查保留了 block 与 must 的优先级。
-
-配对基线为 `8b2ad586`（packed group metadata 与原有 bounded-loop matcher），
-同机同配置、五次重复；短连接每次 512 条、并发 16，bulk 每次 8 × 8 MiB、
-并发 4。下表 kernel 时间是包含缓存包的整条 TC 平均值，不是单独的生成函数时间。
-
-| 等价负载 | 基线 | 编译版 | LAN TC 均值：基线 → 编译版 |
-| --- | ---: | ---: | ---: |
-| must-direct，连接/秒 | 9,719 | 9,738 | 382 → 342 ns |
-| compound-proxy，连接/秒 | 4,149 | 4,084 | 684 → 694 ns |
-| cold-facts fallback，连接/秒 | 6,241 | 6,709 | 598 → 563 ns |
-| must-direct bulk，MiB/s | 2,145 | 2,158 | 292 → 281 ns |
-| compound-proxy bulk，MiB/s | 1,944 | 2,011 | 422 → 423 ns |
-
-最终产物的等价路径吞吐变化为 -1.6% 至 +7.5%；整条 TC 均值随负载而异，
-不能视为全面无回归保证。观测到的进程峰值 RSS 为
-84,628 → 78,636 KiB。编译版加载的程序合计 135,560 JIT 字节，包含预加载的
-L3 variants 与 10,014 字节生成函数。未变化配置的 reload 分配基准为
-15.33 → 15.29 ms，两者均为 20 次分配、68,097 字节且没有 flag 写入。
-
-正向域名路径不作为等价性能比较：基线错误地直连，编译版按配置走代理。
-基线在 DNS 后的 known-zero 流量超时，编译版通过 native 路径达到
-9,780 连接/秒。这些是正确性差异，不能包装成同路径加速比。
+性能测量及历史原型/实验室记录有意不保留在本设计页。reload 基准定义见
+[`crates/honk-core/benches/reload.rs`](../../../crates/honk-core/benches/reload.rs)；
+[`CI workflow`](../../../.github/workflows/ci.yml) 是 VM 命令和固定镜像的来源。
 
 ## 相关文档
 

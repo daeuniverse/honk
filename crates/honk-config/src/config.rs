@@ -433,8 +433,9 @@ impl Config {
     /// Inject terminal must-direct routing rules for every address assigned to
     /// configured lan/wan interfaces, so traffic to the gateway itself
     /// (admin UI, SSH, clash API) bypasses the proxy even when every node is
-    /// dead. These rules take priority over user rules; without any match they
-    /// save local traffic from a proxied fallback and fail-closed drop.
+    /// dead. Generated rules use priority 0 and are appended after user rules:
+    /// they outrank user rules with a higher priority, while stable equal-
+    /// priority ordering lets an existing user priority-0 rule win first.
     ///
     /// Best-effort and idempotent: interfaces that cannot be read
     /// (missing, `auto` without a default route) are skipped. Returns whether

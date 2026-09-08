@@ -211,15 +211,15 @@ experimental {
 
 ## 构建组
 
-静态名称使用 `filter: name(...)`，订阅来源使用 `filter: subtag(...)`，嵌套组使用 `filter: group(...)`。以 `&&` 连接的谓词执行 AND，`!` 对单个谓词取反；不同 `filter:` 行执行 OR。没有 filter 且没有嵌套组时包含全部节点，仅有嵌套组时不会自动包含全部节点。策略可选 `selector`/`fixed`、`urltest`/`min_moving_avg`、`loadbalance`/`roundrobin` 或 `fallback`；用 `final` 指定全部成员死亡后的结果。组拨号最终总会解析到一个叶子节点。
+静态名称使用 `filter: name(...)`，订阅来源使用 `filter: subtag(...)`，嵌套组使用 `filter: group(...)`。以 `&&` 连接的谓词执行 AND，`!` 对单个谓词取反；不同 `filter:` 行执行 OR。没有 filter 且没有嵌套组时包含全部节点，仅有嵌套组时不会自动包含全部节点。策略可选 `selector`/`fixed`、`urltest`/`min_moving_avg`、`loadbalance`/`roundrobin` 或 `fallback`；用 `final` 指定全部成员死亡后的结果。组拨号最终总会解析到一个叶子节点。每份配置最多可定义 250 个顶层用户组；更高序号由路由 ABI 保留。
 
 详见 [组参考](./reference/groups.md)。
 
 ## 编写路由规则
 
-规则按源码顺序执行，写作 `matcher(...) [&& !matcher(...)] -> outbound`，最后是 `fallback: outbound`。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先包一层组（例如 `filter: name('节点名')`）。`(must)` 决策是终局的：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
+规则按 `priority` 升序执行；dae 解析器按源码顺序分配 `0, 1, ...`，同优先级保持稳定的源码顺序。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先包一层组（例如 `filter: name('节点名')`）。`(must)` 决策是终局的：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
 
-honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>) -> direct(must)`，使网关服务不依赖代理健康状态。失活出站通常执行 fail-closed：新流会被丢弃而不会泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。应保留 `dip(geoip: private) -> direct(must)`，让公网 `fallback` 指向多成员且 `policy: fallback`、带显式 fail-closed `final` 的组，并至少保留一个强制经 `direct` 的 DNS 上游。
+honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>) -> direct(must)`，使网关服务不依赖代理健康状态。生成规则使用 priority 0，并追加在用户规则之后：它们只优先于更高 priority 的用户规则；若更早的用户 priority-0 规则命中，仍由该用户规则先生效。失活出站通常执行 fail-closed：新流会被丢弃而不会泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。应保留 `dip(geoip: private) -> direct(must)`，让公网 `fallback` 指向多成员且 `policy: fallback`、带显式 fail-closed `final` 的组，并至少保留一个强制经 `direct` 的 DNS 上游。
 
 详见 [路由参考](./reference/routing.md)。
 

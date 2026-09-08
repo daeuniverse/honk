@@ -477,10 +477,10 @@ impl ControlPlane {
                     .into_iter()
                     .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
                     .collect::<Vec<_>>();
-                let mut new_domain_routes = projection_publication
-                    .project(&projection_snapshot)
-                    .into_iter()
-                    .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
+                let new_projection = projection_publication.project(&projection_snapshot);
+                let mut new_domain_routes = new_projection
+                    .iter()
+                    .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(*ip), *bitmap))
                     .collect::<Vec<_>>();
                 old_domain_routes
                     .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
@@ -558,7 +558,10 @@ impl ControlPlane {
                 }
                 // The projection worker takes eBPF before its generation fence;
                 // publish under both locks so an old batch cannot enter this snapshot.
-                projection_publication.commit(projection_snapshot);
+                projection_publication.commit(
+                    projection_snapshot,
+                    routing_publication_needed.then_some(new_projection),
+                );
                 Ok(old_registry)
             }
         };

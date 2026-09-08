@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -171,17 +172,25 @@ impl PreparedProjectionPublication<'_> {
     pub(crate) fn project(
         &self,
         snapshot: &RoutingProjectionSnapshot,
-    ) -> Vec<(IpAddr, DomainRouting)> {
-        self.projection
-            .state
-            .lock()
-            .project(snapshot)
-            .into_iter()
-            .collect()
+    ) -> BTreeMap<IpAddr, DomainRouting> {
+        self.projection.state.lock().project(snapshot)
     }
 
-    pub(crate) fn commit(self, snapshot: Arc<RoutingProjectionSnapshot>) {
-        self.projection.state.lock().update_snapshot(snapshot);
+    pub(crate) fn commit(
+        self,
+        snapshot: Arc<RoutingProjectionSnapshot>,
+        published: Option<BTreeMap<IpAddr, DomainRouting>>,
+    ) {
+        let mut state = self.projection.state.lock();
+        if let Some(published) = published {
+            // A reload pre-fills the map outside the incremental worker. Record
+            // that exact set, including owners that expired while it loaded.
+            state.applied = published;
+            state.dirty_ips.clear();
+            state.retries.clear();
+        }
+        state.update_snapshot(snapshot);
+        drop(state);
         self.projection.notify_worker();
     }
 }

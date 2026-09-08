@@ -226,6 +226,177 @@ async fn ten_thousand_and_first_domain_evicts_exact_oldest_owner() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn ip_capacity_prefers_matching_facts_and_bounds_reload_projection() {
+    use super::state::{IP_CAPACITY, ZERO_IP_CAPACITY};
+
+    let now = tokio::time::Instant::now();
+    let current = snapshot(1, 1, 2);
+    let mut state = DesiredState::new(Arc::clone(&current), 10_000);
+    for index in 0..10_000u32 {
+        let ips = (0..7)
+            .map(|offset| IpAddr::V4(Ipv4Addr::from(index * 7 + offset)))
+            .collect::<Vec<_>>();
+        state.observe(
+            positive(&format!("d{index}.test"), &ips, Duration::from_secs(300)),
+            now,
+        );
+    }
+    assert_eq!(state.desired.len(), ZERO_IP_CAPACITY);
+    assert_eq!(state.project(&current).len(), ZERO_IP_CAPACITY);
+    assert!(
+        !state
+            .desired
+            .contains_key(&IpAddr::V4(Ipv4Addr::from(69_999)))
+    );
+
+    let matching = (100_000..100_000 + IP_CAPACITY as u32 + 1)
+        .map(|ip| IpAddr::V4(Ipv4Addr::from(ip)))
+        .collect::<Vec<_>>();
+    state.observe(positive("a.test", &matching, Duration::from_secs(300)), now);
+    assert_eq!(state.desired.len(), IP_CAPACITY);
+    assert!(state.desired.values().all(|entry| entry.bitmap[0] == 1));
+    assert!(state.desired.contains_key(&matching[0]));
+    assert!(!state.desired.contains_key(matching.last().unwrap()));
+    let projected = state.project(&current);
+    assert_eq!(
+        state
+            .desired
+            .iter()
+            .map(|(ip, value)| (*ip, value.bitmap))
+            .collect::<Vec<_>>(),
+        projected
+            .iter()
+            .map(|(ip, value)| (*ip, value.bitmap))
+            .collect::<Vec<_>>()
+    );
+    while !state.dirty_ips.is_empty() {
+        let batch = state.batch(now);
+        state.commit_success(batch.generation, &batch.sets, &batch.removes);
+    }
+    let earlier = IpAddr::V4(Ipv4Addr::from(99_999));
+    state.observe(
+        positive("b.test", &[earlier], Duration::from_secs(300)),
+        now,
+    );
+    let eviction = state.batch(now);
+    assert!(
+        eviction.sets.is_empty(),
+        "full projection must free a slot before admitting a new IP"
+    );
+    assert_eq!(eviction.removes[0].ip, matching[IP_CAPACITY - 1]);
+    state.record_failure(eviction.removes[0].ip, now);
+    assert!(
+        state.batch(now).sets.is_empty(),
+        "failed eviction must retain the reservation"
+    );
+    assert!(
+        state.next_deadline().unwrap() > now,
+        "blocked admission must not busy-loop"
+    );
+    state.commit_success(eviction.generation, &[], &eviction.removes);
+    let admitted = state.batch(now);
+    assert_eq!(admitted.sets[0].ip, earlier);
+    assert_eq!(admitted.sets[0].bitmap.bitmap[0], 2);
+    state.commit_success(admitted.generation, &admitted.sets, &[]);
+    assert_eq!(state.applied.len(), IP_CAPACITY);
+    state.observe(ProjectionObservation::Clear { domain: "b.test" }, now);
+    state.observe(positive("a.test", &matching, Duration::from_secs(300)), now);
+    assert!(state.desired.contains_key(&matching[IP_CAPACITY - 1]));
+
+    let replacement = snapshot(2, 0, 2);
+    let projected = state.project(&replacement);
+    state.update_snapshot(replacement);
+    assert_eq!(state.desired.len(), ZERO_IP_CAPACITY);
+    assert_eq!(
+        state
+            .desired
+            .iter()
+            .map(|(ip, value)| (*ip, value.bitmap))
+            .collect::<Vec<_>>(),
+        projected
+            .iter()
+            .map(|(ip, value)| (*ip, value.bitmap))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_blocked_retry_waits_for_removal_without_spinning() {
+    use super::state::IP_CAPACITY;
+
+    let now = tokio::time::Instant::now();
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    let ips = (100_000..100_000 + IP_CAPACITY as u32)
+        .map(|ip| IpAddr::V4(Ipv4Addr::from(ip)))
+        .collect::<Vec<_>>();
+    state.observe(positive("a.test", &ips, Duration::from_secs(300)), now);
+    loop {
+        let mut batch = state.batch(now);
+        if batch.sets.is_empty() {
+            break;
+        }
+        if batch.sets.iter().any(|set| set.ip == ips[0]) {
+            state.record_failure(ips[0], now);
+            batch.sets.retain(|set| set.ip != ips[0]);
+        }
+        state.commit_success(batch.generation, &batch.sets, &batch.removes);
+    }
+    assert_eq!(state.applied.len(), IP_CAPACITY - 1);
+
+    let later = now + Duration::from_millis(10);
+    state.observe(
+        positive(
+            "b.test",
+            &[Ipv4Addr::from(99_999).into()],
+            Duration::from_secs(300),
+        ),
+        later,
+    );
+    let batch = state.batch(later);
+    assert_eq!(batch.removes[0].ip, ips[IP_CAPACITY - 1]);
+    state.record_failure(batch.removes[0].ip, later);
+    state.commit_success(batch.generation, &batch.sets, &[]);
+    assert_eq!(state.applied.len(), IP_CAPACITY);
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let blocked = state.batch(tokio::time::Instant::now());
+    assert!(blocked.sets.is_empty() && blocked.removes.is_empty());
+    assert_eq!(
+        state.next_deadline(),
+        Some(later + Duration::from_millis(100))
+    );
+
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let removal = state.batch(tokio::time::Instant::now());
+    state.commit_success(removal.generation, &[], &removal.removes);
+    let resumed = state.batch(tokio::time::Instant::now());
+    assert_eq!(resumed.sets[0].ip, ips[0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mapped_ipv6_and_ipv4_share_one_projected_fact() {
+    let now = tokio::time::Instant::now();
+    let current = snapshot(1, 1, 2);
+    let mut state = DesiredState::new(Arc::clone(&current), 10_000);
+    let ip = Ipv4Addr::new(192, 0, 2, 1);
+    state.observe(
+        positive("a.test", &[ip.into()], Duration::from_secs(30)),
+        now,
+    );
+    state.observe(
+        positive(
+            "b.test",
+            &[ip.to_ipv6_mapped().into()],
+            Duration::from_secs(30),
+        ),
+        now,
+    );
+    let projected = state.project(&current);
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[&IpAddr::V4(ip)].bitmap[0], 3);
+}
+
+#[tokio::test(start_paused = true)]
 async fn million_hot_owner_refreshes_keep_heaps_and_revision_bounded() {
     let now = tokio::time::Instant::now();
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55));

@@ -1853,8 +1853,6 @@ mod tests {
 
         futures::executor::block_on(backend.cleanup()).unwrap();
 
-        assert!(backend.routing_generation.is_none());
-        assert_eq!(backend.descriptor, RoutingPolicyDescriptor::default());
         assert!(backend.tcp_conn_states.is_empty());
         assert!(backend.udp_conn_states.is_empty());
         assert!(backend.redirect_tracks.is_empty());

@@ -9,7 +9,7 @@ condition [&& condition ...] -> outbound[(must)]
 fallback: outbound
 ```
 
-- 规则按源码顺序确定优先级：解析器依次分配 `0, 1, ...` 的 `priority` 值，值越小越先执行。第一个最终匹配生效。
+- 规则按 `priority` 升序执行，数值越小越先运行；同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配 `0, 1, ...`，而生成的本地规则使用 priority `0` 并追加在用户规则之后。
 - `default:` 是 `fallback:` 的别名。没有规则最终确定结果时使用 fallback 目标；省略时默认为 `direct`。
 - 同一个 matcher 内以逗号分隔的参数互为备选。不同的非空条件组必须全部匹配。
 - matcher 的括号参数列表可以跨物理行。语句一直延续到右括号和 `-> outbound`。
@@ -56,9 +56,9 @@ routing {
 | `block` | 内建阻断出站 |
 | 组名 | 按该出站组及其策略解析 |
 
-裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。
+裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。每份配置最多可定义 250 个顶层用户组；更高的路由序号由 ABI 保留。
 
-追加 `(must)` 后，命中的结果立即终结规则搜索并跳过后续域名重路由。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续搜索”的 `MustRules` opcode。
+追加 `(must)` 后，命中的结果立即终结规则搜索并跳过后续域名重路由。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续扫描”的 `MustRules` opcode。
 
 ## Geo 资源
 
@@ -90,7 +90,7 @@ honk 在启动、reload 和接口拓扑变化时，为配置的 LAN 与 WAN 接�
 dip(<each LAN/WAN interface address>) -> direct(must)
 ```
 
-地址会转换为主机 CIDR（`/32` 或 `/128`）。不存在的接口和无法解析的 `auto` 接口会被跳过。这些规则让 SSH、管理界面和 Clash API 等网关本地服务保持可达，而不依赖代理健康状态。
+生成规则使用 priority `0`，并追加在用户规则之后。因此稳定的同优先级顺序会让较早命中的用户 priority-0 规则先生效；生成规则只优先于更高 priority 的用户规则。地址会转换为主机 CIDR（`/32` 或 `/128`）。不存在的接口和无法解析的 `auto` 接口会被跳过。这些规则让 SSH、管理界面和 Clash API 等网关本地服务保持可达，而不依赖代理健康状态。
 
 ## Fail-closed 行为
 

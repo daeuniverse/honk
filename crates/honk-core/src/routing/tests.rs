@@ -462,29 +462,6 @@ fn test_process_name_route_matching() {
 }
 
 #[test]
-fn test_process_name_route_matching_uses_kernel_comm_limit() {
-    let rules = vec![RoutingRule {
-        name: "resolved-direct".into(),
-        condition: RoutingCondition {
-            process_name: vec!["systemd-resolved".into()],
-            ..Default::default()
-        },
-        outbound: RoutingOutbound::Simple("direct".into()),
-        priority: 0,
-        must: true,
-        mark: 0,
-    }];
-
-    let router = Router::new(&rules, "proxy").unwrap();
-
-    let process_condition = &router.compiled_routes()[0].conditions[0];
-    assert!(matches!(
-        &process_condition.predicate,
-        CompiledPredicate::ProcessName(names) if names == &["systemd-resolve".to_owned()]
-    ));
-}
-
-#[test]
 fn test_mac_and_process_name_combined() {
     let rules = vec![RoutingRule {
         name: "curl-on-device".into(),

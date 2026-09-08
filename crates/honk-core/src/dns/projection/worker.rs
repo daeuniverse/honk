@@ -82,7 +82,7 @@ async fn flush_after_snapshot(
     let mut successful_sets = Vec::new();
     let mut successful_removes = Vec::new();
     let mut failures = Vec::new();
-    {
+    let writes_current = {
         let mut backend = ebpf.write().await;
         let publication = projection.publication_fence.read();
         if batch.generation != projection.state.lock().snapshot.generation() {
@@ -111,27 +111,14 @@ async fn flush_after_snapshot(
                 Err(error) => failures.push((remove.ip, error)),
             }
         }
-    }
 
-    let (writes_current, generation_changed) = {
+        // Keep map writes and their applied accounting under the same generation fence.
         let mut state = projection.state.lock();
-        let generation_changed = batch.generation != state.snapshot.generation();
         for (ip, _) in &failures {
             state.record_failure(*ip, now);
         }
-        (
-            state.commit_success(batch.generation, &successful_sets, &successful_removes),
-            generation_changed,
-        )
+        state.commit_success(batch.generation, &successful_sets, &successful_removes)
     };
-    if generation_changed {
-        counters.generation_rebuilds.fetch_add(1, Ordering::Relaxed);
-        crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionStaleGeneration);
-        tracing::debug!(
-            reason = "generation_changed_during_write",
-            "DNS routing projection write became stale"
-        );
-    }
     if !writes_current {
         crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionRetry);
         projection.notify_worker();

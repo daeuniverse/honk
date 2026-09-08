@@ -7,6 +7,8 @@
 
 pub use honk_ebpf_common::LpmKey;
 
+pub(crate) const DOMAIN_MAP_CAPACITY: u32 = 65_536;
+
 /// Convert an already-validated [`ipnet::IpNet`] directly into its LPM key.
 ///
 /// Preserve the supplied address bytes, including host bits, without a CIDR

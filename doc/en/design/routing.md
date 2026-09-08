@@ -17,10 +17,14 @@ native-direct and cached-flow paths remain native.
 
 The canonical IR retains ordered rule IDs, display metadata, conditions, and an
 outbound/mark/must action. Lower numeric priority wins; equal priorities retain
-source order. Conditions are ANDed, alternatives in a condition are ORed, and
+stable source order. The dae parser assigns source-order priorities `0, 1, ...`;
+generated local rules use priority `0` and are appended after user rules, so they
+outrank only user rules with a higher priority. An earlier user priority-0 match
+still wins. Conditions are ANDed, alternatives in a condition are ORed, and
 negation applies once to the entire condition. Fallback is a separate terminal
 action. Empty expanded sets remain conditions: positive empty sets are false,
 negative empty sets are true; they must not disappear and widen a compound rule.
+
 
 The configuration model and parser live in
 [`crates/honk-config/src/routing.rs`](../../../crates/honk-config/src/routing.rs)
@@ -234,82 +238,20 @@ Implementation is accepted only with all existing matchers supported and with:
   JIT size, and peak memory. The strengthened packed-data/AOT bounded-loop path
   is a baseline; isolated port microbenchmarks are not whole-engine proof.
 
-The earlier isolated Linux 7.2.3 prototype covered a protocol/port fragment only.
-The branch validation below exercises the production callers and full policy.
-
 ### Recorded branch validation
 
-Linux `6.12.94+deb13-amd64` on `10.10.10.117` passed all 15 real-kernel checks
-with static musl test executables, plus the no-op reload, assembler, and fingerprint
-library checks (10 tests). The run used private network, mount, and cgroup
-namespaces with a private bpffs; the existing honk service was not stopped or
-restarted. Its first verifier run exposed unbounded output-pointer arithmetic
-after `% 48` in process-name normalization. An explicit offset check before pointer
-construction fixes that 6.12 verifier limitation without changing valid outputs.
+The current CI real-kernel baseline is the pinned Ubuntu Linux
+`6.12.0-061200-generic` VM. CI builds the test executables on the hosted runner
+and runs those exact artifacts in the VM; it does not compile again in the guest.
+The VM runs the root-only routing and integration gates, while `just test-routing`
+also exercises the generated policy through the root/slot path, including
+precedence, complete decision metadata, capacity failures, and failed-publication
+preservation. `just test-netns` includes that routing gate.
 
-
-`just test-routing` builds a separate test object and runs 117 hand-authored cases
-in four dial modes (468 complete-decision comparisons) through the real root/slot
-path. It also exercises predicate bit 255 for domain, destination/source IP and
-MAC, rejects predicate capacity 257, and publishes a single rule with 65,537
-distinct prefixes, checking its first/last hits and adjacent miss. Publication
-failure checks preserve fact-dependent hits and misses, successfully republish
-after an occupied attachment, identify the frozen-root syscall error, and reattach
-every inactive target to verify link cleanup. `just test-netns` includes this gate.
-
-These checks are separate native test scenarios with fresh backend fixtures;
-the publication scenario explicitly installs its own baseline and retains the
-same-backend failure-to-repair sequence. Both local and VM gates select the
-routing-test module, not one monolithic test name. Golden cases carry explicit
-labels and must/punt metadata rather than deriving their meaning from array positions.
-
-The structural cleanup preserved byte-for-byte instructions and source records
-for 32 generated programs plus 256 policy-equality relations, and passed all
-15 checks in the expanded gate on Linux `7.2.0-cachyos`. The earlier capacity
-repair also checked 10,000 process-name alternatives through the production parser
-and emitter under a 256 MiB address-space limit, returning a capacity error rather
-than aborting. The VM and lab records below predate these added checks.
-
-The pinned Ubuntu `7.2.0-070200-generic` VM passed all 12 root-only checks:
-TC/cgroup lifecycle and allocator compatibility, generated-policy publication,
-TC/TUN packet contracts, the production NFQUEUE contract, and real netns flows.
-CI builds the executables on its hosted runner and runs those exact artifacts
-inside this kernel rather than compiling again in the guest.
-
-On the isolated Linux 7.2.3 lab host, IPv4/IPv6 LAN checks covered 21 scenarios
-and WAN checks covered 12: direct/proxy/block TCP and UDP, MAC/source/destination
-conjunctions, DSCP, process matching, transparent DNS, hot and cold TLS domains,
-and native held-first-packet direct UDP. A 16 MiB TCP stream ran for 12.802 s
-across a reload that blocked new flows; policy publication took 9.43 ms and
-restoration 9.24 ms. Direct/global mode checks preserved block and must rules.
-
-Paired measurements used baseline `8b2ad586` (packed group metadata plus the
-existing bounded-loop matcher), the same host/config, five trials, 512 short
-connections at concurrency 16, and 8 × 8 MiB transfers at concurrency 4.
-Kernel timings below are whole-TC averages, including cached packets, not
-isolated generated-function timings.
-
-| Equivalent workload | Baseline | Compiled | LAN TC mean, baseline → compiled |
-| --- | ---: | ---: | ---: |
-| must-direct connections/s | 9,719 | 9,738 | 382 → 342 ns |
-| compound-proxy connections/s | 4,149 | 4,084 | 684 → 694 ns |
-| cold-facts fallback connections/s | 6,241 | 6,709 | 598 → 563 ns |
-| must-direct bulk, MiB/s | 2,145 | 2,158 | 292 → 281 ns |
-| compound-proxy bulk, MiB/s | 1,944 | 2,011 | 422 → 423 ns |
-
-Final-artifact equivalent-path throughput ranged from -1.6% to +7.5%; the
-whole-TC averages are workload-dependent, not a blanket no-regression guarantee.
-Observed peak process RSS was 84,628 → 78,636 KiB. The candidate retained
-135,560 JIT bytes across its loaded
-programs, including the preloaded L3 variants and a 10,014-byte generated
-function. The allocation benchmark measured an unchanged reload at 15.33 →
-15.29 ms, with 20 allocations / 68,097 bytes and no flag writes in either case.
-
-The positive-domain comparison is deliberately excluded: baseline traffic
-incorrectly used direct, while the candidate used the configured proxy.
-Baseline known-zero traffic timed out after DNS; the candidate completed at
-9,780 connections/s on the native path. These are correctness differences,
-not like-for-like speedups.
+Performance measurements and historical prototype/lab records are intentionally
+not kept on this design page. The reload benchmark definition lives in
+[`crates/honk-core/benches/reload.rs`](../../../crates/honk-core/benches/reload.rs);
+the [CI workflow](../../../.github/workflows/ci.yml) remains the source for the VM command and pinned image.
 
 ## Related docs
 

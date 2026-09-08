@@ -211,15 +211,15 @@ See the [node reference](./reference/nodes.md).
 
 ## Building groups
 
-Use `filter: name(...)` for static names, `filter: subtag(...)` for subscription provenance, and `filter: group(...)` for nested groups. Predicates joined by `&&` are ANDed and `!` negates one predicate; separate `filter:` lines are ORed. No filters and no nested groups include all nodes, while nested groups alone do not. Choose `selector`/`fixed`, `urltest`/`min_moving_avg`, `loadbalance`/`roundrobin`, or `fallback`; set `final` for the all-dead result. Group dials always resolve to one leaf node.
+Use `filter: name(...)` for static names, `filter: subtag(...)` for subscription provenance, and `filter: group(...)` for nested groups. Predicates joined by `&&` are ANDed and `!` negates one predicate; separate `filter:` lines are ORed. No filters and no nested groups include all nodes, while nested groups alone do not. Choose `selector`/`fixed`, `urltest`/`min_moving_avg`, `loadbalance`/`roundrobin`, or `fallback`; set `final` for the all-dead result. Group dials always resolve to one leaf node. A configuration may define at most 250 top-level user groups; higher ordinals are reserved by the routing ABI.
 
 See the [group reference](./reference/groups.md).
 
 ## Writing routing rules
 
-Rules are source-ordered and use `matcher(...) [&& !matcher(...)] -> outbound`, followed by `fallback: outbound`. Targets are `direct`, `block`, or a group; a bare node name is rejected at load — wrap it in a group (e.g. `filter: name('node')`). A `(must)` decision is final: sniffing is skipped, and Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
+Rules are evaluated by ascending `priority`; the dae parser assigns `0, 1, ...` in source order, and stable equal-priority ordering preserves source order. Targets are `direct`, `block`, or a group; a bare node name is rejected at load — wrap it in a group (e.g. `filter: name('node')`). A `(must)` decision is final: sniffing is skipped, and Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
 
-honk injects `dip(<every configured LAN/WAN interface address>) -> direct(must)` at startup and reload so gateway services do not depend on proxy health. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` keeps that same proxy as a last resort; UDP and all-dead multi-leaf groups remain fail-closed. Keep `dip(geoip: private) -> direct(must)`, point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
+honk injects `dip(<every configured LAN/WAN interface address>) -> direct(must)` at startup and reload so gateway services do not depend on proxy health. Generated rules use priority 0 and are appended after user rules: they outrank user rules with a higher priority, but an earlier user priority-0 match still wins. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` keeps that same proxy as a last resort; UDP and all-dead multi-leaf groups remain fail-closed. Keep `dip(geoip: private) -> direct(must)`, point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
 
 See the [routing reference](./reference/routing.md).
 

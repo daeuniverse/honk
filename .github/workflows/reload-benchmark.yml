@@ -65,6 +65,7 @@ jobs:
           PY
       - name: Benchmark main
         run: |
+          set -euo pipefail
           cd baseline
           HONK_RELOAD_EXPECT_NOOP=0 \
           HONK_RELOAD_METRICS_ONLY=1 \
@@ -74,6 +75,7 @@ jobs:
             | tee ../main-reload.log
       - name: Benchmark candidate
         run: |
+          set -euo pipefail
           cd candidate
           HONK_RELOAD_METRICS_ONLY=1 \
           CARGO_TARGET_DIR="$RUNNER_TEMP/reload-candidate-target" \
