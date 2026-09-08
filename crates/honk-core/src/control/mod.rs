@@ -341,7 +341,7 @@ impl ControlPlane {
             .parse::<DialMode>()
             .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
         let fallback_outbound = config.routing.default_outbound.as_str();
-        routing_matcher::RoutingMatcherBuilder::compile(
+        routing_matcher::RoutingPushPlan::compile(
             router,
             &outbound_name_to_id,
             fallback_outbound,

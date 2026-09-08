@@ -90,8 +90,8 @@ impl ControlPlane {
     }
     /// Atomically publish a rebuilt router, config, group manager, outbound
     /// runtime generation, DNS runtime, and exact eBPF routing plan. Build
-    /// failures leave the current generation untouched; an eBPF push failure
-    /// replays the exact active plan before admission resumes. SIGHUP,
+    /// failures leave the current generation untouched; an eBPF publication
+    /// failure retains the active plan without replay. SIGHUP,
     /// subscription merges, and public callers share this serialized path.
     pub(in crate::control) async fn apply_runtime_config(
         &self,
@@ -500,44 +500,27 @@ impl ControlPlane {
                     error!(%error, ?restore, "Failed to open group connectivity for reload transition");
                     break 'publication Err(());
                 }
-                if routing_publication_needed {
-                    let active_generation = match ebpf.active_routing_generation() {
-                        Ok(generation) => generation,
-                        Err(error) => {
-                            let restore =
-                                publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
-                            error!(%error, ?restore, "Failed to read active routing generation");
-                            break 'publication Err(());
-                        }
-                    };
-                    let next_generation = active_generation ^ 1;
-                    if let Err(error) =
-                        ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
-                    {
-                        let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
-                        error!(%error, ?restore, "Failed to stage learned domain routes");
-                        break 'publication Err(());
-                    }
-                    if let Err(error) = ebpf.publish_routing_plan(next_generation, &new_plan) {
-                        match publish_group_connectivity(ebpf.as_mut(), &old_connectivity) {
-                            Ok(()) => error!(
+                if routing_publication_needed
+                    && let Err(error) = ebpf.publish_routing_plan(&new_plan, &new_domain_routes)
+                {
+                    match publish_group_connectivity(ebpf.as_mut(), &old_connectivity) {
+                        Ok(()) => error!(
+                            %error,
+                            "Compiled routing publication failed; active generation retained"
+                        ),
+                        Err(restore_error) => {
+                            error!(
                                 %error,
-                                "Compiled routing publication failed; active generation retained"
-                            ),
-                            Err(restore_error) => {
-                                error!(
-                                    %error,
-                                    %restore_error,
-                                    "Routing publication rejected but health restoration failed"
-                                );
-                                self.datapath_healthy
-                                    .store(false, std::sync::atomic::Ordering::Release);
-                                self.drain_tracker.start_rejecting();
-                                drain.start_rejecting();
-                            }
+                                %restore_error,
+                                "Routing publication rejected but health restoration failed"
+                            );
+                            self.datapath_healthy
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            self.drain_tracker.start_rejecting();
+                            drain.start_rejecting();
                         }
-                        break 'publication Err(());
                     }
+                    break 'publication Err(());
                 }
 
                 if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {

@@ -162,7 +162,7 @@ honk-tool bpf stats [--pin-root PATH]
 | --- | --- |
 | `conn-state` | Tuple, outbound, mark, must flag, state, and last-seen timestamp. |
 | `redirect-track` | Reply-rewrite source/destination, outbound, WAN direction, interface, and last-seen timestamp. |
-| `domain-routing` | DNS-learned IP and routing-rule bitmap indices. |
+| `domain-routing` | Learned IP and active-policy domain-predicate bitmap indices, from DNS or sniffed evidence; known-zero entries remain visible. |
 | `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
 
 The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.

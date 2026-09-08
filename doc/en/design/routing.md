@@ -112,6 +112,17 @@ matching ancestor predicate bits, so longest-prefix lookup preserves ordered
 rule semantics. Facts use the full `DomainRouting` bitmap in their own generation;
 there is no shared two-bank LPM value that a staged prefix can shadow.
 
+Fact preparation keeps hash-first duplicate coalescing, sorts only unique keys,
+and applies ancestor inheritance in the original vector before compacting its
+retained capacity. Assembler-owned ordinal labels identify internal branches;
+only rule source records retain diagnostic text. Input/output offsets come from
+the shared ABI declarations rather than an independently maintained offset table.
+
+Policy identity hashes length-framed normalized rule fields, ordered domain
+registry keys and selected geo digests, never derived trie nodes or `Debug`
+renderings. It preserves effective no-op reloads: changing an ignored process-name
+suffix must not republish an equal native plan and discard sniff-only facts.
+
 Each fact LPM retains the 2,048,000-entry limit without preallocation; the learned
 domain hash retains 65,536 entries. Prefix count is independent of predicate count:
 one GeoIP predicate can contain hundreds of thousands of prefixes. The emitter
@@ -138,6 +149,11 @@ to an interface later.
 feature bits and the active domain-map ID for inspection. A route pass obtains
 one descriptor and calls exactly one synchronous slot. Cached packets do not
 perform this lookup.
+
+The controller supplies the immutable plan and the complete learned-domain slice
+in one backend publication call. The backend chooses its inactive slot and owns
+the candidate locally; no caller-selected slot or pending-domain handshake is
+needed. Static plan reuse and DNS projection ownership remain separate.
 
 Publication is serialized with the existing reload and DNS publication fences:
 
@@ -196,10 +212,18 @@ failure checks preserve fact-dependent hits and misses, successfully republish
 after an occupied attachment, identify the frozen-root syscall error, and reattach
 every inactive target to verify link cleanup. `just test-netns` includes this gate.
 
-The expanded gate passed on Linux `7.2.0-cachyos`. A separate production
-parser-to-emitter check with 10,000 process-name alternatives returned a capacity
-error under a 256 MiB address-space limit instead of aborting. The VM and lab
-records below predate these added capacity and publication-recovery checks.
+These checks are separate native test scenarios with fresh backend fixtures;
+the publication scenario explicitly installs its own baseline and retains the
+same-backend failure-to-repair sequence. Both local and VM gates select the
+routing-test module, not one monolithic test name. Golden cases carry explicit
+labels and must/punt metadata rather than deriving their meaning from array positions.
+
+The structural cleanup preserved byte-for-byte instructions and source records
+for 32 generated programs plus 256 policy-equality relations, and passed all
+15 checks in the expanded gate on Linux `7.2.0-cachyos`. The earlier capacity
+repair also checked 10,000 process-name alternatives through the production parser
+and emitter under a 256 MiB address-space limit, returning a capacity error rather
+than aborting. The VM and lab records below predate these added checks.
 
 The pinned Ubuntu `7.2.0-070200-generic` VM passed all 12 root-only checks:
 TC/cgroup lifecycle and allocator compatibility, generated-policy publication,

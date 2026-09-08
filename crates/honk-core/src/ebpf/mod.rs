@@ -372,25 +372,18 @@ pub trait EbpfBackend: Send + Sync {
     /// was recreated, so its hooks died with it).
     fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
 
-    /// Atomically publish a complete compiled routing plan into `slot`.
+    /// Atomically publish a complete compiled routing plan into an inactive slot.
     /// Implementations stage every generation-owned fact map and program before
     /// committing the stable policy root; errors leave the prior root untouched.
     fn publish_routing_plan(
         &mut self,
-        slot: u32,
         plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()>;
     /// Return the slot currently selected by the stable policy root.
     fn active_routing_generation(&self) -> anyhow::Result<u32> {
         Ok(0)
     }
-    /// Stage learned domain entries in private candidate memory. The entries
-    /// become visible only when the matching routing plan is published.
-    fn stage_domain_routing_generation(
-        &mut self,
-        generation: u32,
-        entries: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()>;
     /// OR a learned domain bitmap into the active generation-owned map.
     fn add_domain_ip_bitmap(
         &mut self,

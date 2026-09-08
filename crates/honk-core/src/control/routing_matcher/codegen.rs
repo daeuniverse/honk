@@ -13,9 +13,8 @@ use aya_obj::generated::{
 };
 use honk_ebpf_common::{
     ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
-    ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN,
+    ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
 };
-use std::collections::HashMap;
 
 const R0: u8 = 0;
 const R1: u8 = 1;
@@ -32,22 +31,22 @@ const MAP_LOOKUP_ELEM: i32 = 1;
 const BPF_INSTRUCTION_CAPACITY: usize = 1_000_000;
 const PSEUDO_MAP_FD: u8 = 1;
 const STACK_KEY: i16 = -64;
-const INPUT_SRC_IP: i16 = 0;
-const INPUT_DST_IP: i16 = 16;
-const INPUT_MAC: i16 = 32;
-const INPUT_PNAME: i16 = 48;
-const INPUT_SRC_PORT: i16 = 96;
-const INPUT_DST_PORT: i16 = 100;
-const INPUT_PROTO: i16 = 104;
-const INPUT_VERSION: i16 = 108;
-const INPUT_DSCP: i16 = 112;
-const INPUT_PNAME_LEN: i16 = 120;
-const INPUT_MAC_PRESENT: i16 = 124;
-const OUTBOUND: i16 = 0;
-const MARK: i16 = 4;
-const MUST: i16 = 8;
-const DOMAIN_FINAL: i16 = 12;
-const RULE_ID: i16 = 16;
+const INPUT_SRC_IP: i16 = std::mem::offset_of!(RoutingInput, src_ip) as i16;
+const INPUT_DST_IP: i16 = std::mem::offset_of!(RoutingInput, dst_ip) as i16;
+const INPUT_MAC: i16 = std::mem::offset_of!(RoutingInput, mac) as i16;
+const INPUT_PNAME: i16 = std::mem::offset_of!(RoutingInput, pname) as i16;
+const INPUT_SRC_PORT: i16 = std::mem::offset_of!(RoutingInput, src_port) as i16;
+const INPUT_DST_PORT: i16 = std::mem::offset_of!(RoutingInput, dst_port) as i16;
+const INPUT_PROTO: i16 = std::mem::offset_of!(RoutingInput, l4proto) as i16;
+const INPUT_VERSION: i16 = std::mem::offset_of!(RoutingInput, ip_version) as i16;
+const INPUT_DSCP: i16 = std::mem::offset_of!(RoutingInput, dscp) as i16;
+const INPUT_PNAME_LEN: i16 = std::mem::offset_of!(RoutingInput, pname_len) as i16;
+const INPUT_MAC_PRESENT: i16 = std::mem::offset_of!(RoutingInput, mac_present) as i16;
+const OUTBOUND: i16 = std::mem::offset_of!(RoutingDecision, outbound) as i16;
+const MARK: i16 = std::mem::offset_of!(RoutingDecision, mark) as i16;
+const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
+const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
+const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RoutingMapFds {
@@ -72,11 +71,14 @@ pub struct RoutingBytecode {
     pub lines: Vec<RoutingSourceLine>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Label(usize);
+
 struct Assembler {
     insns: Vec<bpf_insn>,
     lines: Vec<RoutingSourceLine>,
-    labels: HashMap<String, usize>,
-    fixups: Vec<(usize, String)>,
+    labels: Vec<Option<usize>>,
+    fixups: Vec<(usize, Label)>,
 }
 
 impl Assembler {
@@ -84,7 +86,7 @@ impl Assembler {
         Self {
             insns: Vec::new(),
             lines: Vec::new(),
-            labels: HashMap::new(),
+            labels: Vec::new(),
             fixups: Vec::new(),
         }
     }
@@ -97,9 +99,14 @@ impl Assembler {
         });
     }
 
-    fn label(&mut self, name: impl AsRef<str>) {
-        self.labels
-            .insert(name.as_ref().to_owned(), self.insns.len());
+    fn label(&mut self) -> Label {
+        let label = Label(self.labels.len());
+        self.labels.push(None);
+        label
+    }
+
+    fn bind(&mut self, label: Label) {
+        self.labels[label.0] = Some(self.insns.len());
     }
 
     fn emit(&mut self, code: u32, dst: u8, src: u8, off: i16, imm: i32) -> anyhow::Result<usize> {
@@ -119,25 +126,25 @@ impl Assembler {
         Ok(offset)
     }
 
-    fn jump(&mut self, op: u32, dst: u8, imm: i32, target: impl AsRef<str>) -> anyhow::Result<()> {
+    fn jump(&mut self, op: u32, dst: u8, imm: i32, target: Label) -> anyhow::Result<()> {
         let index = self.emit(BPF_JMP | op | BPF_K, dst, 0, 0, imm)?;
-        self.fixups.push((index, target.as_ref().to_owned()));
+        self.fixups.push((index, target));
         Ok(())
     }
 
-    fn ja(&mut self, target: impl AsRef<str>) -> anyhow::Result<()> {
+    fn ja(&mut self, target: Label) -> anyhow::Result<()> {
         let index = self.emit(BPF_JMP | BPF_JA, 0, 0, 0, 0)?;
-        self.fixups.push((index, target.as_ref().to_owned()));
+        self.fixups.push((index, target));
         Ok(())
     }
 
     fn finish(mut self) -> anyhow::Result<RoutingBytecode> {
-        for (index, target) in self.fixups {
+        for (index, label) in self.fixups {
             let target = self
                 .labels
-                .get(&target)
-                .copied()
-                .with_context(|| format!("unresolved jump label '{target}'"))?;
+                .get(label.0)
+                .and_then(|target| *target)
+                .with_context(|| format!("unresolved jump label ordinal {}", label.0))?;
             let delta = target as isize - index as isize - 1;
             ensure!(
                 i16::try_from(delta).is_ok(),
@@ -220,11 +227,12 @@ pub fn emit_routing_program(
 
     let mut asm = Assembler::new();
     asm.source(0, "routing function prologue");
-    for (register, label) in [(R1, "input_nonnull"), (R2, "decision_nonnull")] {
-        asm.jump(BPF_JNE, register, 0, label)?;
+    for register in [R1, R2] {
+        let nonnull = asm.label();
+        asm.jump(BPF_JNE, register, 0, nonnull)?;
         asm.mov_imm(R0, -libc::EFAULT)?;
         asm.exit()?;
-        asm.label(label);
+        asm.bind(nonnull);
     }
     asm.mov_reg(R6, R1)?;
     asm.mov_reg(R7, R2)?;
@@ -245,26 +253,19 @@ pub fn emit_routing_program(
         asm.add_imm(R2, STACK_DOMAIN_KEY as i32)?;
         asm.call(MAP_LOOKUP_ELEM)?;
         asm.mov_reg(R8, R0)?;
-        asm.jump(BPF_JEQ, R8, 0, "domain_absent")?;
+        let domain_absent = asm.label();
+        asm.jump(BPF_JEQ, R8, 0, domain_absent)?;
         asm.st_imm(R7, DOMAIN_FINAL, 1)?;
-        asm.label("domain_absent");
+        asm.bind(domain_absent);
     }
 
-    for (index, rule) in plan.rules.iter().enumerate() {
-        asm.source(rule.id + 1, rule.source.clone());
-        let fail = format!("rule_{index}_fail");
-        for (condition_index, condition) in rule.conditions.iter().enumerate() {
-            let pass = format!("rule_{index}_condition_{condition_index}_pass");
-            emit_condition(
-                &mut asm,
-                condition,
-                &pass,
-                &fail,
-                &fds,
-                index,
-                condition_index,
-            )?;
-            asm.label(&pass);
+    for rule in &plan.rules {
+        asm.source(rule.id + 1, rule.source.as_str());
+        let fail = asm.label();
+        for condition in &rule.conditions {
+            let pass = asm.label();
+            emit_condition(&mut asm, condition, pass, fail, &fds)?;
+            asm.bind(pass);
         }
         asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
         asm.st_imm(R7, MARK, rule.mark as i32)?;
@@ -272,7 +273,7 @@ pub fn emit_routing_program(
         asm.st_imm(R7, RULE_ID, rule.id as i32)?;
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
-        asm.label(&fail);
+        asm.bind(fail);
     }
 
     asm.source(0, "fallback");
@@ -385,35 +386,17 @@ fn validate_plan(plan: &RoutingPushPlan) -> anyhow::Result<()> {
 fn emit_condition(
     asm: &mut Assembler,
     condition: &KernelCondition,
-    pass: &str,
-    fail: &str,
+    pass: Label,
+    fail: Label,
     fds: &RoutingMapFds,
-    rule: usize,
-    condition_index: usize,
 ) -> anyhow::Result<()> {
-    let truth = format!("condition_{rule}_{condition_index}_truth");
+    let truth = asm.label();
     if condition.not {
-        emit_predicate(
-            asm,
-            &condition.predicate,
-            fail,
-            &truth,
-            fds,
-            rule,
-            condition_index,
-        )?;
+        emit_predicate(asm, &condition.predicate, fail, truth, fds)?;
     } else {
-        emit_predicate(
-            asm,
-            &condition.predicate,
-            &truth,
-            fail,
-            fds,
-            rule,
-            condition_index,
-        )?;
+        emit_predicate(asm, &condition.predicate, truth, fail, fds)?;
     }
-    asm.label(&truth);
+    asm.bind(truth);
     asm.ja(pass)?;
     Ok(())
 }
@@ -421,13 +404,10 @@ fn emit_condition(
 fn emit_predicate(
     asm: &mut Assembler,
     predicate: &KernelPredicate,
-    on_true: &str,
-    on_false: &str,
+    on_true: Label,
+    on_false: Label,
     fds: &RoutingMapFds,
-    rule: usize,
-    condition: usize,
 ) -> anyhow::Result<()> {
-    let label = |suffix: &str| format!("pred_{rule}_{condition}_{suffix}");
     match predicate {
         KernelPredicate::Domain(id) => {
             emit_domain_bit(asm, *id, on_true, on_false)?;
@@ -460,24 +440,10 @@ fn emit_predicate(
             emit_lpm_bit(asm, fds.mac, *id, 128, INPUT_MAC, on_true, on_false)?;
         }
         KernelPredicate::DestinationPort(ranges) => {
-            emit_port_ranges(
-                asm,
-                ranges,
-                INPUT_DST_PORT,
-                on_true,
-                on_false,
-                &label("dport"),
-            )?;
+            emit_port_ranges(asm, ranges, INPUT_DST_PORT, on_true, on_false)?;
         }
         KernelPredicate::SourcePort(ranges) => {
-            emit_port_ranges(
-                asm,
-                ranges,
-                INPUT_SRC_PORT,
-                on_true,
-                on_false,
-                &label("sport"),
-            )?;
+            emit_port_ranges(asm, ranges, INPUT_SRC_PORT, on_true, on_false)?;
         }
         KernelPredicate::Protocol(mask) => {
             emit_mask_scalar(asm, INPUT_PROTO, *mask as i32, on_true, on_false)?;
@@ -497,7 +463,7 @@ fn emit_predicate(
             }
         }
         KernelPredicate::ProcessName(names) => {
-            emit_process_names(asm, names, on_true, on_false, &label("pname"))?;
+            emit_process_names(asm, names, on_true, on_false)?;
         }
     }
     Ok(())
@@ -507,8 +473,8 @@ fn emit_mask_scalar(
     asm: &mut Assembler,
     offset: i16,
     mask: i32,
-    on_true: &str,
-    on_false: &str,
+    on_true: Label,
+    on_false: Label,
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, offset)?;
     if mask == 0 {
@@ -525,24 +491,23 @@ fn emit_port_ranges(
     asm: &mut Assembler,
     ranges: &[crate::routing::PortRange],
     offset: i16,
-    on_true: &str,
-    on_false: &str,
-    label_prefix: &str,
+    on_true: Label,
+    on_false: Label,
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, offset)?;
     if ranges.is_empty() {
         asm.ja(on_false)?;
         return Ok(());
     }
-    for (index, range) in ranges.iter().enumerate() {
-        let next = format!("{label_prefix}_next_{index}");
-        let inside = format!("{label_prefix}_inside_{index}");
-        asm.jump(BPF_JGE, R0, range.start as i32, &inside)?;
-        asm.ja(&next)?;
-        asm.label(&inside);
-        asm.jump(BPF_JGT, R0, range.end as i32, &next)?;
+    for range in ranges {
+        let next = asm.label();
+        let inside = asm.label();
+        asm.jump(BPF_JGE, R0, range.start as i32, inside)?;
+        asm.ja(next)?;
+        asm.bind(inside);
+        asm.jump(BPF_JGT, R0, range.end as i32, next)?;
         asm.ja(on_true)?;
-        asm.label(&next);
+        asm.bind(next);
     }
     asm.ja(on_false)?;
     Ok(())
@@ -551,50 +516,41 @@ fn emit_port_ranges(
 fn emit_process_names(
     asm: &mut Assembler,
     names: &[Vec<u8>],
-    on_true: &str,
-    on_false: &str,
-    prefix: &str,
+    on_true: Label,
+    on_false: Label,
 ) -> anyhow::Result<()> {
     if names.is_empty() {
         asm.ja(on_false)?;
         return Ok(());
     }
-    for (name_index, bytes) in names.iter().enumerate() {
-        let next_name = format!("{prefix}_next_name_{name_index}");
+    for bytes in names {
+        let next_name = asm.label();
         asm.ldx_w(R4, R6, INPUT_PNAME_LEN)?;
         if bytes.is_empty() {
             asm.jump(BPF_JNE, R4, 0, on_true)?;
             continue;
         }
-        asm.jump(
-            BPF_JGE,
-            R4,
-            bytes.len() as i32,
-            format!("{prefix}_long_{name_index}"),
-        )?;
-        asm.ja(&next_name)?;
-        asm.label(format!("{prefix}_long_{name_index}"));
-        // Input pname is bounded to 48 bytes.  Each candidate offset is
-        // checked against pname_len before reading, so missing bytes never
-        // become ordinary zeroes.
-        for offset in 0..=(48usize.saturating_sub(bytes.len())) {
-            let next = format!("{prefix}_next_{name_index}_{offset}");
-            asm.jump(
-                BPF_JGE,
-                R4,
-                (offset + bytes.len()) as i32,
-                format!("{prefix}_enough_{name_index}_{offset}"),
-            )?;
-            asm.ja(&next)?;
-            asm.label(format!("{prefix}_enough_{name_index}_{offset}"));
+        let long = asm.label();
+        asm.jump(BPF_JGE, R4, bytes.len() as i32, long)?;
+        asm.ja(next_name)?;
+        asm.bind(long);
+        // Input pname is bounded to ROUTING_PROCESS_MAX_LEN bytes. Each
+        // candidate offset is checked against pname_len before reading, so
+        // missing bytes never become ordinary zeroes.
+        for offset in 0..=(ROUTING_PROCESS_MAX_LEN.saturating_sub(bytes.len())) {
+            let next = asm.label();
+            let enough = asm.label();
+            asm.jump(BPF_JGE, R4, (offset + bytes.len()) as i32, enough)?;
+            asm.ja(next)?;
+            asm.bind(enough);
             for (byte_index, byte) in bytes.iter().enumerate() {
                 asm.ldx_b(R5, R6, INPUT_PNAME + offset as i16 + byte_index as i16)?;
-                asm.jump(BPF_JNE, R5, *byte as i32, &next)?;
+                asm.jump(BPF_JNE, R5, *byte as i32, next)?;
             }
             asm.ja(on_true)?;
-            asm.label(&next);
+            asm.bind(next);
         }
-        asm.label(&next_name);
+        asm.bind(next_name);
     }
     asm.ja(on_false)?;
     Ok(())
@@ -603,8 +559,8 @@ fn emit_process_names(
 fn emit_domain_bit(
     asm: &mut Assembler,
     id: u32,
-    on_true: &str,
-    on_false: &str,
+    on_true: Label,
+    on_false: Label,
 ) -> anyhow::Result<()> {
     asm.jump(BPF_JEQ, R8, 0, on_false)?;
     asm.ldx_w(R2, R8, (id / 32 * 4) as i16)?;
@@ -619,19 +575,19 @@ fn emit_family_map_bit(
     id: u32,
     v4_fd: i32,
     v6_fd: i32,
-    on_true: &str,
-    on_false: &str,
+    on_true: Label,
+    on_false: Label,
     input_offset: i16,
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, INPUT_VERSION)?;
-    let v4 = format!("ip_v4_{}", asm.insns.len());
-    let v6 = format!("ip_v6_{}", asm.insns.len());
-    asm.jump(BPF_JEQ, R0, 1, &v4)?;
-    asm.jump(BPF_JEQ, R0, 2, &v6)?;
+    let v4 = asm.label();
+    let v6 = asm.label();
+    asm.jump(BPF_JEQ, R0, 1, v4)?;
+    asm.jump(BPF_JEQ, R0, 2, v6)?;
     asm.ja(on_false)?;
-    asm.label(&v4);
+    asm.bind(v4);
     emit_lpm_bit(asm, v4_fd, id, 32, input_offset + 12, on_true, on_false)?;
-    asm.label(&v6);
+    asm.bind(v6);
     emit_lpm_bit(asm, v6_fd, id, 128, input_offset, on_true, on_false)?;
     Ok(())
 }
@@ -642,8 +598,8 @@ fn emit_lpm_bit(
     id: u32,
     prefix_len: u32,
     input_offset: i16,
-    on_true: &str,
-    on_false: &str,
+    on_true: Label,
+    on_false: Label,
 ) -> anyhow::Result<()> {
     write_key_from_input(asm, input_offset, prefix_len)?;
     load_map_fd(asm, fd)?;
@@ -714,7 +670,8 @@ mod tests {
         assert_eq!(last, BPF_INSTRUCTION_CAPACITY - 1);
         assert_eq!(asm.insns.len(), BPF_INSTRUCTION_CAPACITY);
 
-        assert!(asm.ja("past_capacity").is_err());
+        let past_capacity = asm.label();
+        assert!(asm.ja(past_capacity).is_err());
         assert_eq!(asm.insns.len(), BPF_INSTRUCTION_CAPACITY);
         assert!(asm.fixups.is_empty());
 
@@ -723,5 +680,78 @@ mod tests {
             .expect("a boundary-sized program must still finish");
         assert_eq!(bytecode.insns.len(), BPF_INSTRUCTION_CAPACITY);
         assert_eq!(bytecode.insns[last].code, (BPF_JMP | BPF_EXIT) as u8);
+    }
+
+    #[test]
+    fn assembler_rejects_unresolved_referenced_label() {
+        let mut asm = Assembler::new();
+        let missing = asm.label();
+        asm.ja(missing).expect("jump itself should be emitted");
+
+        assert!(asm.finish().is_err());
+    }
+
+    #[test]
+    fn assembler_accepts_signed_jump_range_endpoints() {
+        let mut forward = Assembler::new();
+        let target = forward.label();
+        let _unused = forward.label();
+        forward.ja(target).unwrap();
+        forward
+            .insns
+            .resize_with(i16::MAX as usize + 1, || bpf_insn {
+                code: 0,
+                _bitfield_align_1: [],
+                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
+                off: 0,
+                imm: 0,
+            });
+        forward.bind(target);
+        let bytecode = forward.finish().unwrap();
+        assert_eq!(bytecode.insns[0].off, i16::MAX);
+
+        let mut backward = Assembler::new();
+        let target = backward.label();
+        backward.bind(target);
+        backward.insns.resize_with(i16::MAX as usize, || bpf_insn {
+            code: 0,
+            _bitfield_align_1: [],
+            _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
+            off: 0,
+            imm: 0,
+        });
+        backward.ja(target).unwrap();
+        let bytecode = backward.finish().unwrap();
+        assert_eq!(bytecode.insns[i16::MAX as usize].off, i16::MIN);
+
+        let mut too_far_forward = Assembler::new();
+        let target = too_far_forward.label();
+        too_far_forward.ja(target).unwrap();
+        too_far_forward
+            .insns
+            .resize_with(i16::MAX as usize + 2, || bpf_insn {
+                code: 0,
+                _bitfield_align_1: [],
+                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
+                off: 0,
+                imm: 0,
+            });
+        too_far_forward.bind(target);
+        assert!(too_far_forward.finish().is_err());
+
+        let mut too_far_backward = Assembler::new();
+        let target = too_far_backward.label();
+        too_far_backward.bind(target);
+        too_far_backward
+            .insns
+            .resize_with(i16::MAX as usize + 1, || bpf_insn {
+                code: 0,
+                _bitfield_align_1: [],
+                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
+                off: 0,
+                imm: 0,
+            });
+        too_far_backward.ja(target).unwrap();
+        assert!(too_far_backward.finish().is_err());
     }
 }

@@ -1160,6 +1160,69 @@ async fn semantic_domain_reload_replaces_matching_predicates() {
     connection.domain = Some("second.example".into());
     assert_eq!(router.route(&connection), first);
 }
+
+#[tokio::test]
+async fn normalized_routing_reload_preserves_sniff_only_facts() {
+    let cp = test_cp().await;
+    let mut config = changed_routing_config();
+    config.routing.rules[0].condition.domain = vec!["sniff-only.example".into()];
+    config.routing.rules[0].condition.process_name = vec!["abcdefghijklmnop".into()];
+    assert!(
+        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+            .await
+    );
+    let positive = crate::ebpf::maps::ip_addr_to_lpm_key("192.0.2.31".parse().unwrap());
+    let negative = crate::ebpf::maps::ip_addr_to_lpm_key("192.0.2.32".parse().unwrap());
+    let bitmap = cp
+        .router
+        .read()
+        .await
+        .domain_bitmap("sniff-only.example")
+        .unwrap();
+    let zero = honk_ebpf_common::DomainRouting::default();
+    let expected = vec![
+        (crate::ebpf::maps::lpm_key_bytes(&positive), bitmap.bitmap),
+        (crate::ebpf::maps::lpm_key_bytes(&negative), zero.bitmap),
+    ];
+    let facts = |backend: &dyn crate::ebpf::EbpfBackend| {
+        backend
+            .projection_map_snapshot()
+            .into_iter()
+            .map(|(key, value)| (key, value.bitmap))
+            .collect::<Vec<_>>()
+    };
+    let active_slot = {
+        let mut backend = cp.ebpf.write().await;
+        backend.add_domain_ip_bitmap(&positive, &bitmap).unwrap();
+        backend.add_domain_ip_bitmap(&negative, &zero).unwrap();
+        assert_eq!(facts(backend.as_ref()), expected);
+        backend.active_routing_generation().unwrap()
+    };
+
+    config.routing.rules[0].condition.process_name = vec!["abcdefghijklmnoX".into()];
+    assert!(
+        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+            .await
+    );
+    assert_eq!(
+        cp.config.read().await.routing.rules[0]
+            .condition
+            .process_name,
+        config.routing.rules[0].condition.process_name
+    );
+    {
+        let backend = cp.ebpf.read().await;
+        assert_eq!(backend.active_routing_generation().unwrap(), active_slot);
+        assert_eq!(facts(backend.as_ref()), expected);
+    }
+
+    config.routing.rules[0].condition.domain = vec!["changed.example".into()];
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    let backend = cp.ebpf.read().await;
+    assert_ne!(backend.active_routing_generation().unwrap(), active_slot);
+    assert!(backend.projection_map_snapshot().is_empty());
+}
+
 #[tokio::test]
 async fn identical_subscription_merge_skips_runtime_generation() {
     let subscription_id = uuid::Uuid::new_v4();

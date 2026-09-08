@@ -3,7 +3,7 @@
 //! This module is deliberately only a compiler.  It has no map side effects;
 //! publication is delegated to the backend after a complete plan exists.
 
-use crate::ebpf::{EbpfBackend, maps};
+use crate::ebpf::maps;
 use crate::routing::{CompiledPredicate, CompiledRoute, Router};
 use honk_config::types::DialMode;
 use honk_ebpf_common::{
@@ -76,20 +76,7 @@ pub struct RoutingPushPlan {
     pub(crate) domain_predicate_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RoutingPushResult {
-    pub rule_count: usize,
-    pub domain_predicate_count: usize,
-}
-
 impl RoutingPushPlan {
-    pub fn result(&self) -> RoutingPushResult {
-        RoutingPushResult {
-            rule_count: self.rules.len(),
-            domain_predicate_count: self.domain_predicate_count,
-        }
-    }
-
     pub fn semantically_eq(&self, other: &Self) -> bool {
         self.fallback == other.fallback
             && self.features == other.features
@@ -99,33 +86,14 @@ impl RoutingPushPlan {
             && self.rules == other.rules
             && fact_maps_equal(&self.facts, &other.facts)
     }
-}
 
-fn fact_maps_equal(a: &RoutingFactMaps, b: &RoutingFactMaps) -> bool {
-    fn eq(x: &[(LpmKey, DomainRouting)], y: &[(LpmKey, DomainRouting)]) -> bool {
-        x.len() == y.len()
-            && x.iter().zip(y).all(|((ka, va), (kb, vb))| {
-                ka.prefix_len == kb.prefix_len && ka.data == kb.data && va.bitmap == vb.bitmap
-            })
-    }
-    eq(&a.destination_v4, &b.destination_v4)
-        && eq(&a.destination_v6, &b.destination_v6)
-        && eq(&a.source_v4, &b.source_v4)
-        && eq(&a.source_v6, &b.source_v6)
-        && eq(&a.mac, &b.mac)
-}
-
-/// Builder for the compiler and the atomic backend publication boundary.
-pub struct RoutingMatcherBuilder;
-
-impl RoutingMatcherBuilder {
     /// Compile a Router into native rules and generation-owned fact indexes.
     pub fn compile(
         router: &Router,
         outbound_ids: &HashMap<String, u8>,
         fallback: &str,
         dial_mode: DialMode,
-    ) -> anyhow::Result<RoutingPushPlan> {
+    ) -> anyhow::Result<Self> {
         let fallback = outbound_ids
             .get(fallback)
             .copied()
@@ -279,7 +247,7 @@ impl RoutingMatcherBuilder {
             hash.update([*id]);
         }
 
-        Ok(RoutingPushPlan {
+        Ok(Self {
             rules,
             facts,
             fallback,
@@ -289,17 +257,20 @@ impl RoutingMatcherBuilder {
             domain_predicate_count,
         })
     }
+}
 
-    /// Publish a complete candidate through the backend's one atomic boundary.
-    pub fn push_plan(
-        ebpf: &mut dyn EbpfBackend,
-        plan: &RoutingPushPlan,
-    ) -> anyhow::Result<RoutingPushResult> {
-        let active = ebpf.active_routing_generation()?;
-        anyhow::ensure!(active < 2, "invalid active routing slot {active}");
-        ebpf.publish_routing_plan(active ^ 1, plan)?;
-        Ok(plan.result())
+fn fact_maps_equal(a: &RoutingFactMaps, b: &RoutingFactMaps) -> bool {
+    fn eq(x: &[(LpmKey, DomainRouting)], y: &[(LpmKey, DomainRouting)]) -> bool {
+        x.len() == y.len()
+            && x.iter().zip(y).all(|((ka, va), (kb, vb))| {
+                ka.prefix_len == kb.prefix_len && ka.data == kb.data && va.bitmap == vb.bitmap
+            })
     }
+    eq(&a.destination_v4, &b.destination_v4)
+        && eq(&a.destination_v6, &b.destination_v6)
+        && eq(&a.source_v4, &b.source_v4)
+        && eq(&a.source_v6, &b.source_v6)
+        && eq(&a.mac, &b.mac)
 }
 
 #[derive(Default)]
@@ -421,8 +392,8 @@ fn inherit_prefix_bits(entries: &mut Vec<(LpmKey, DomainRouting)>) {
             })
             .or_insert((key, value));
     }
-    let mut ordered: Vec<_> = merged.into_values().collect();
-    ordered.sort_by(|(a, _), (b, _)| {
+    entries.extend(merged.into_values());
+    entries.sort_by(|(a, _), (b, _)| {
         let a_bytes = maps::lpm_key_bytes(a);
         let b_bytes = maps::lpm_key_bytes(b);
         a_bytes[4..20]
@@ -430,10 +401,9 @@ fn inherit_prefix_bits(entries: &mut Vec<(LpmKey, DomainRouting)>) {
             .then(a.prefix_len.cmp(&b.prefix_len))
     });
     let mut stack: Vec<(LpmKey, DomainRouting)> = Vec::with_capacity(129);
-    let mut result = Vec::with_capacity(ordered.len());
-    for (key, mut value) in ordered {
+    for (key, value) in entries.iter_mut() {
         while let Some((ancestor, _)) = stack.last() {
-            if prefix_contains(ancestor, &key) {
+            if prefix_contains(ancestor, key) {
                 break;
             }
             stack.pop();
@@ -443,10 +413,9 @@ fn inherit_prefix_bits(entries: &mut Vec<(LpmKey, DomainRouting)>) {
                 *left |= right;
             }
         }
-        stack.push((key, value));
-        result.push((key, value));
+        stack.push((*key, *value));
     }
-    *entries = result;
+    entries.shrink_to_fit();
 }
 
 fn prefix_contains(parent: &LpmKey, child: &LpmKey) -> bool {
@@ -468,16 +437,39 @@ mod tests {
 
     #[test]
     fn canonical_prefixes_inherit_without_cross_family_matches() {
-        let parent: ipnet::IpNet = "10.0.0.0/8".parse().unwrap();
-        let child: ipnet::IpNet = "10.1.0.0/16".parse().unwrap();
+        let parent = "10.0.0.0/8".parse().unwrap();
+        let child = "10.1.0.0/16".parse().unwrap();
+        let sibling = "10.2.0.0/16".parse().unwrap();
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
+        add_ip_facts(&mut v4, &mut v6, &[child], 255);
         add_ip_facts(&mut v4, &mut v6, &[parent], 0);
-        add_ip_facts(&mut v4, &mut v6, &[child], 1);
+        add_ip_facts(&mut v4, &mut v6, &[sibling], 31);
+        add_ip_facts(&mut v4, &mut v6, &[child, child], 1);
+        add_ip_facts(&mut v4, &mut v6, &["::/0".parse().unwrap()], 63);
+        add_ip_facts(&mut v4, &mut v6, &["2001:db8::/32".parse().unwrap()], 255);
         inherit_prefix_bits(&mut v4);
-        assert_eq!(v4.len(), 2);
-        assert_eq!(v4[0].1.bitmap[0], 0b01);
-        assert_eq!(v4[1].1.bitmap[0], 0b11);
-        assert!(v6.is_empty());
+        inherit_prefix_bits(&mut v6);
+        let bitmaps = |entries: &[(LpmKey, DomainRouting)]| {
+            entries
+                .iter()
+                .map(|(_, value)| value.bitmap)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bitmaps(&v4),
+            vec![
+                [1, 0, 0, 0, 0, 0, 0, 0],
+                [3, 0, 0, 0, 0, 0, 0, 1 << 31],
+                [1 | (1 << 31), 0, 0, 0, 0, 0, 0, 0],
+            ]
+        );
+        assert_eq!(
+            bitmaps(&v6),
+            vec![
+                [0, 1 << 31, 0, 0, 0, 0, 0, 0],
+                [0, 1 << 31, 0, 0, 0, 0, 0, 1 << 31],
+            ]
+        );
     }
 }

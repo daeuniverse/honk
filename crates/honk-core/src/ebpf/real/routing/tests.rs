@@ -1,10 +1,9 @@
 use super::*;
-use crate::control::routing_matcher::RoutingMatcherBuilder;
+use crate::control::routing_matcher::RoutingPushPlan;
 use crate::routing::{ConnectionInfo, Router, golden};
 use honk_config::types::DialMode;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-
 fn input(connection: &ConnectionInfo) -> RoutingInput {
     fn bytes(ip: IpAddr) -> [u8; 16] {
         match ip {
@@ -45,7 +44,7 @@ fn object() -> Vec<u8> {
 
 #[test]
 #[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
-fn compiled_policy_matches_goldens_and_preserves_failed_root() {
+fn four_mode_golden_policies() {
     let (router, cases) = golden::fixtures();
     let ids = HashMap::from([
         ("direct".into(), 0),
@@ -60,8 +59,8 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
         DialMode::DomainPlus,
         DialMode::DomainPlusPlus,
     ] {
-        let plan = RoutingMatcherBuilder::compile(&router, &ids, "direct", mode).unwrap();
-        RoutingMatcherBuilder::push_plan(&mut backend, &plan).unwrap();
+        let plan = RoutingPushPlan::compile(&router, &ids, "direct", mode).unwrap();
+        backend.publish_routing_plan(&plan, &[]).unwrap();
         let mut present = HashSet::new();
         for case in &cases {
             let input = input(&case.connection);
@@ -98,7 +97,17 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
         }
     }
     eprintln!("native routing: {comparisons} complete-decision golden comparisons");
+}
 
+#[test]
+#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+fn large_prefix_fact_policy() {
+    let ids = HashMap::from([
+        ("direct".into(), 0),
+        ("block".into(), 1),
+        ("proxy".into(), 2),
+    ]);
+    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
     let prefixes = (0..=65_536u32)
         .map(|offset| format!("{}/32", std::net::Ipv4Addr::from(0x0a00_0000u32 + offset)))
         .collect();
@@ -117,9 +126,8 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
         "direct",
     )
     .unwrap();
-    let large_plan =
-        RoutingMatcherBuilder::compile(&large_router, &ids, "direct", DialMode::Ip).unwrap();
-    RoutingMatcherBuilder::push_plan(&mut backend, &large_plan).unwrap();
+    let large_plan = RoutingPushPlan::compile(&large_router, &ids, "direct", DialMode::Ip).unwrap();
+    backend.publish_routing_plan(&large_plan, &[]).unwrap();
     let large_match = RoutingDecision {
         outbound: 2,
         mark: 0x500,
@@ -148,7 +156,17 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
             rule_id: u32::MAX,
         }
     );
+}
 
+#[test]
+#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+fn predicate_bits_and_capacity_limits() {
+    let ids = HashMap::from([
+        ("direct".into(), 0),
+        ("block".into(), 1),
+        ("proxy".into(), 2),
+    ]);
+    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
     for domains in [true, false] {
         let rules = (0..256)
             .map(|index| honk_config::routing::RoutingRule {
@@ -173,8 +191,8 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
             })
             .collect::<Vec<_>>();
         let router = Router::new(&rules, "direct").unwrap();
-        let plan = RoutingMatcherBuilder::compile(&router, &ids, "direct", DialMode::Ip).unwrap();
-        RoutingMatcherBuilder::push_plan(&mut backend, &plan).unwrap();
+        let plan = RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip).unwrap();
+        backend.publish_routing_plan(&plan, &[]).unwrap();
         let mut connection = golden::connection();
         if domains {
             let bitmap = router.domain_bitmap("fact-255.test").unwrap();
@@ -221,15 +239,44 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
             must: false,
             mark: 0,
         });
-        let rejected = Router::new(&overflow, "direct").and_then(|router| {
-            RoutingMatcherBuilder::compile(&router, &ids, "direct", DialMode::Ip)
-        });
+        let rejected = Router::new(&overflow, "direct")
+            .and_then(|router| RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip));
         assert!(rejected.is_err());
         assert_eq!(
             backend.run_routing_test(&input(&connection)).unwrap(),
             observed
         );
     }
+}
+
+#[test]
+#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+fn publication_failure_recovery_and_frozen_root() {
+    let ids = HashMap::from([
+        ("direct".into(), 0),
+        ("block".into(), 1),
+        ("proxy".into(), 2),
+    ]);
+    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
+    let initial_rules = (0..256)
+        .map(|index| honk_config::routing::RoutingRule {
+            name: format!("initial-{index}"),
+            condition: honk_config::routing::RoutingCondition {
+                ip: vec![format!("192.0.2.{index}")],
+                source_ip: vec![format!("198.51.100.{index}")],
+                mac: vec![format!("02:00:00:00:00:{index:02x}")],
+                ..Default::default()
+            },
+            outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
+            priority: 0,
+            must: false,
+            mark: 0x600 + index,
+        })
+        .collect::<Vec<_>>();
+    let initial_router = Router::new(&initial_rules, "direct").unwrap();
+    let initial_plan =
+        RoutingPushPlan::compile(&initial_router, &ids, "direct", DialMode::Ip).unwrap();
+    backend.publish_routing_plan(&initial_plan, &[]).unwrap();
 
     let mut active_hit_connection = golden::connection();
     active_hit_connection.dst_ip = "192.0.2.255".parse().unwrap();
@@ -278,26 +325,17 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     };
     let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
     let recovery =
-        RoutingMatcherBuilder::compile(&recovery_router, &ids, "direct", DialMode::Ip).unwrap();
+        RoutingPushPlan::compile(&recovery_router, &ids, "direct", DialMode::Ip).unwrap();
     let inactive_slot = old_slot ^ 1;
     let inactive_name = ROUTING_SLOT_NAMES[inactive_slot as usize];
     let targets = backend.routing_targets(inactive_name).unwrap();
     let maps = create_maps(&recovery.facts, &[]).unwrap();
-    let bytecode = crate::control::routing_matcher::codegen::emit_routing_program(
-        &recovery,
-        crate::control::routing_matcher::codegen::RoutingMapFds {
-            destination_v4: lpm_fd(&maps.destination_v4),
-            destination_v6: lpm_fd(&maps.destination_v6),
-            source_v4: lpm_fd(&maps.source_v4),
-            source_v6: lpm_fd(&maps.source_v6),
-            mac: lpm_fd(&maps.mac),
-            domain: map_fd(&maps.domain),
-        },
-    )
-    .unwrap();
+    let bytecode =
+        crate::control::routing_matcher::codegen::emit_routing_program(&recovery, maps.fds())
+            .unwrap();
     let (_btf, program) = load_extension(&targets[0], inactive_name, &bytecode).unwrap();
     let occupied = attach_extension(&program, targets.last().unwrap()).unwrap();
-    assert!(RoutingMatcherBuilder::push_plan(&mut backend, &recovery).is_err());
+    assert!(backend.publish_routing_plan(&recovery, &[]).is_err());
     assert_eq!(
         backend.run_routing_test(&active_hit).unwrap().decision,
         active_hit_decision
@@ -311,7 +349,7 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     drop(program);
     drop(maps);
 
-    RoutingMatcherBuilder::push_plan(&mut backend, &recovery).unwrap();
+    backend.publish_routing_plan(&recovery, &[]).unwrap();
     let recovered_slot = backend.active_routing_generation().unwrap();
     assert_eq!(recovered_slot, inactive_slot);
     let recovered_hit_decision = RoutingDecision {
@@ -337,8 +375,7 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     let root_candidate_router =
         Router::new(std::slice::from_ref(&root_candidate_rule), "direct").unwrap();
     let root_candidate =
-        RoutingMatcherBuilder::compile(&root_candidate_router, &ids, "direct", DialMode::Ip)
-            .unwrap();
+        RoutingPushPlan::compile(&root_candidate_router, &ids, "direct", DialMode::Ip).unwrap();
     let root_candidate_slot = recovered_slot ^ 1;
     let root_candidate_name = ROUTING_SLOT_NAMES[root_candidate_slot as usize];
     let root_candidate_targets = backend.routing_targets(root_candidate_name).unwrap();
@@ -356,7 +393,9 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     attr.__bindgen_anon_2.map_fd = root.fd().as_fd().as_raw_fd() as u32;
     bpf_syscall(bpf_cmd::BPF_MAP_FREEZE, &mut attr).unwrap();
 
-    let root_error = RoutingMatcherBuilder::push_plan(&mut backend, &root_candidate).unwrap_err();
+    let root_error = backend
+        .publish_routing_plan(&root_candidate, &[])
+        .unwrap_err();
     assert!(
         matches!(
             root_error.downcast_ref::<aya::maps::MapError>(),
@@ -379,14 +418,7 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     let probe_maps = create_maps(&root_candidate.facts, &[]).unwrap();
     let probe_bytecode = crate::control::routing_matcher::codegen::emit_routing_program(
         &root_candidate,
-        crate::control::routing_matcher::codegen::RoutingMapFds {
-            destination_v4: lpm_fd(&probe_maps.destination_v4),
-            destination_v6: lpm_fd(&probe_maps.destination_v6),
-            source_v4: lpm_fd(&probe_maps.source_v4),
-            source_v6: lpm_fd(&probe_maps.source_v6),
-            mac: lpm_fd(&probe_maps.mac),
-            domain: map_fd(&probe_maps.domain),
-        },
+        probe_maps.fds(),
     )
     .unwrap();
     let (_probe_btf, probe_program) = load_extension(

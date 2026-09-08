@@ -256,6 +256,19 @@ fn create_maps(
     })
 }
 
+impl RoutingMaps {
+    fn fds(&self) -> crate::control::routing_matcher::codegen::RoutingMapFds {
+        crate::control::routing_matcher::codegen::RoutingMapFds {
+            destination_v4: lpm_fd(&self.destination_v4),
+            destination_v6: lpm_fd(&self.destination_v6),
+            source_v4: lpm_fd(&self.source_v4),
+            source_v6: lpm_fd(&self.source_v6),
+            mac: lpm_fd(&self.mac),
+            domain: map_fd(&self.domain),
+        }
+    }
+}
+
 fn map_fd<K: Pod, V: Pod>(map: &AyaHashMap<AyaMapData, K, V>) -> RawFd {
     map.map().fd().as_fd().as_raw_fd()
 }
@@ -300,35 +313,20 @@ impl RealEbpfBackend {
 
     pub(super) fn publish_compiled_routing(
         &mut self,
-        slot: u32,
         plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
+        let active = self.routing_slot;
         anyhow::ensure!(
-            slot < ROUTING_SLOT_NAMES.len() as u32,
-            "invalid routing slot {slot}"
+            active < ROUTING_SLOT_NAMES.len() as u32,
+            "invalid active routing slot {active}"
         );
-        anyhow::ensure!(
-            self.routing_generation.is_none() || slot != self.routing_slot,
-            "routing slot {slot} is active"
-        );
+        let slot = active ^ 1;
         let slot_name = ROUTING_SLOT_NAMES[slot as usize];
-        let domain_entries = self
-            .pending_domain
-            .take()
-            .filter(|(candidate, _)| *candidate == slot)
-            .map(|(_, entries)| entries)
-            .unwrap_or_default();
         let targets = self.routing_targets(slot_name)?;
-        let maps = create_maps(&plan.facts, &domain_entries)?;
-        let fds = crate::control::routing_matcher::codegen::RoutingMapFds {
-            destination_v4: lpm_fd(&maps.destination_v4),
-            destination_v6: lpm_fd(&maps.destination_v6),
-            source_v4: lpm_fd(&maps.source_v4),
-            source_v6: lpm_fd(&maps.source_v6),
-            mac: lpm_fd(&maps.mac),
-            domain: map_fd(&maps.domain),
-        };
-        let bytecode = crate::control::routing_matcher::codegen::emit_routing_program(plan, fds)?;
+        let maps = create_maps(&plan.facts, learned_domains)?;
+        let bytecode =
+            crate::control::routing_matcher::codegen::emit_routing_program(plan, maps.fds())?;
         let (btf, program) = load_extension(&targets[0], slot_name, &bytecode)?;
         let mut links = Vec::with_capacity(targets.len());
         for target in &targets {
@@ -421,7 +419,6 @@ impl RealEbpfBackend {
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,
-            pending_domain: None,
         })
     }
 

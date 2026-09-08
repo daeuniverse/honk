@@ -69,7 +69,7 @@ A configured `policy: score` group is represented as Clash `type: "url_test"` fo
 {"mode":"Global"}
 ```
 
-The mode update goes through `DatapathFlagsHandle`, the sole serialized writer for the shared mode and `DATAPATH_FLAGS_MAP`. Mode changes therefore compose atomically with reload's NFQUEUE fence, reopen, disable, and static-flag updates instead of republishing stale readiness bits. A cache database, when enabled, stores the normalized mode.
+The mode update goes through `DatapathFlagsHandle`, the sole serialized writer for the shared mode and `DATAPATH_FLAGS_MAP`. Mode changes therefore compose atomically with reload's NFQUEUE fence, reopen, and disable operations instead of republishing stale readiness bits. Rule-derived feature bits belong to the immutable routing policy descriptor. A cache database, when enabled, stores the normalized mode.
 
 `PUT /proxies/{name}` accepts the body regardless of `Content-Type`. For a configured Selector group, the target must be a direct member tag; a leaf reachable only through a nested group is not a direct member. An actual choice change invokes the group manager's cache callback, so an enabled `cache_file` persists the choice in `cache.db`. If that group sets `interrupt_connections`, honk removes tracked connections associated with the group, its member tags, and reachable leaves so subsequent traffic redials through the new choice. Writing the existing choice does nothing. URLTest, LoadBalance, Fallback, and Score groups reject the mutation.
 

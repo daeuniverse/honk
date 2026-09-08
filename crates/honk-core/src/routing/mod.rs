@@ -3,9 +3,9 @@
 use honk_config::routing::RoutingRule;
 use honk_ebpf_common::{DomainRouting, ROUTING_FACT_CAPACITY};
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use std::{net::IpAddr, sync::Arc};
 
+mod fingerprint;
 mod geo;
 mod ir;
 mod lpm;
@@ -383,7 +383,7 @@ impl Router {
 
         let (default_outbound, _default_must) = parse_outbound(default_outbound);
         let policy_fingerprint =
-            fingerprint_policy(&compiled, &registry.0, &default_outbound, geo_fingerprint);
+            fingerprint::policy(&compiled, &registry.0, &default_outbound, geo_fingerprint);
         Ok(Self {
             routes: CompiledRoutes::new(compiled, geo_fingerprint, requirements),
             default_outbound: default_outbound.into(),
@@ -716,28 +716,6 @@ fn protocol_value(protocol: &str) -> u8 {
     } else {
         0
     }
-}
-
-fn fingerprint_policy(
-    routes: &[CompiledRoute],
-    domain_matchers: &[DomainMatcher],
-    default_outbound: &str,
-    geo_fingerprint: [u8; 32],
-) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"honk.routing-policy.v1\0");
-    hash.update(default_outbound.as_bytes());
-    hash.update([0]);
-    hash.update(geo_fingerprint);
-    for route in routes {
-        hash.update(format!("{route:?}").as_bytes());
-        hash.update([0]);
-    }
-    for matcher in domain_matchers {
-        hash.update(format!("{:?}", matcher.key()).as_bytes());
-        hash.update([0]);
-    }
-    hash.finalize().into()
 }
 
 /// Normalize MAC to canonical `aa:bb:cc:dd:ee:ff` form.

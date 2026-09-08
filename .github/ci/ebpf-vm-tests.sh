@@ -21,8 +21,8 @@ test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 
 "$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1
 "$HONK_CORE_TEST_BIN" \
-  ebpf::real::routing::tests::compiled_policy_matches_goldens_and_preserves_failed_root \
-  --ignored --exact --test-threads=1
+  ebpf::real::routing::tests \
+  --ignored --test-threads=1
 "$HONK_DATAPATH_TEST_BIN" --ignored --test-threads=1
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \
   --ignored --test-threads=1

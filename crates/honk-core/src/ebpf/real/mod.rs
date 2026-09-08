@@ -77,8 +77,6 @@ pub struct RealEbpfBackend {
     routing_generation: Option<routing::RoutingGeneration>,
     routing_slot: u32,
     routing_generation_counter: u64,
-    /// Learned domain entries staged for an inactive slot.
-    pending_domain: Option<(u32, Vec<(LpmKey, DomainRouting)>)>,
 }
 
 /// Detect the first cgroup2 mount point from /proc/mounts.
@@ -516,10 +514,10 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn publish_routing_plan(
         &mut self,
-        slot: u32,
         plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
-        self.publish_compiled_routing(slot, plan)
+        self.publish_compiled_routing(plan, learned_domains)
     }
 
     fn active_routing_generation(&self) -> anyhow::Result<u32> {
@@ -576,20 +574,6 @@ impl EbpfBackend for RealEbpfBackend {
                 "active domain map delete: {error}"
             ))),
         }
-    }
-
-    fn stage_domain_routing_generation(
-        &mut self,
-        generation: u32,
-        entries: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(generation < 2, "invalid routing slot {generation}");
-        anyhow::ensure!(
-            self.routing_generation.is_none() || generation != self.routing_slot,
-            "routing slot {generation} is active"
-        );
-        self.pending_domain = Some((generation, entries.to_vec()));
-        Ok(())
     }
 
     fn tcp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
@@ -1159,7 +1143,6 @@ impl EbpfBackend for RealEbpfBackend {
         // The root and generated freplace links remain valid until every
         // network entry point is detached above.
         self.routing_generation = None;
-        self.pending_domain = None;
         // Stop the DaeEvent ringbuf consumer as well; it owns the
         // EVENT_RINGBUF MapData taken out of the Ebpf object.
         if let Some(h) = self.event_flush_handle.take() {

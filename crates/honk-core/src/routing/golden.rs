@@ -269,10 +269,23 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
         }
     }
 
+    struct CompoundCase {
+        name: &'static str,
+        condition: Value,
+        must: bool,
+        #[cfg(feature = "ebpf")]
+        generic_port_punt: bool,
+        samples: Vec<(ConnectionInfo, bool)>,
+    }
+
     let extras = [
-        (
-            json!({"source_port":["60000"], "domain":["exact.test"], "domain_suffix":["suffix.test"], "domain_keyword":["needle"], "domain_regex":[r"^rx[0-9]+\.test$"]}),
-            vec![
+        CompoundCase {
+            name: "ordinary-domain-alternatives",
+            condition: json!({"source_port":["60000"], "domain":["exact.test"], "domain_suffix":["suffix.test"], "domain_keyword":["needle"], "domain_regex":[r"^rx[0-9]+\.test$"]}),
+            must: false,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: false,
+            samples: vec![
                 (
                     sample(|c| {
                         c.src_port = 60000;
@@ -302,10 +315,14 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                     true,
                 ),
             ],
-        ),
-        (
-            json!({"source_port":["60001"], "domain":["other.test"], "domain_suffix":["geo.test"], "geosite":["lab"]}),
-            vec![
+        },
+        CompoundCase {
+            name: "ordinary-geosite-conjunction",
+            condition: json!({"source_port":["60001"], "domain":["other.test"], "domain_suffix":["geo.test"], "geosite":["lab"]}),
+            must: false,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: false,
+            samples: vec![
                 (
                     sample(|c| {
                         c.src_port = 60001;
@@ -321,10 +338,14 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                     false,
                 ),
             ],
-        ),
-        (
-            json!({"source_port":["60002"], "ip":["::/0"]}),
-            vec![
+        },
+        CompoundCase {
+            name: "ipv6-only-prefix",
+            condition: json!({"source_port":["60002"], "ip":["::/0"]}),
+            must: false,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: false,
+            samples: vec![
                 (
                     sample(|c| {
                         c.src_port = 60002;
@@ -335,14 +356,22 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                 ),
                 (sample(|c| c.src_port = 60002), false),
             ],
-        ),
-        (
-            json!({"source_port":["60003"], "ip":["10.1.0.0/16"], "port":["80"]}),
-            vec![],
-        ),
-        (
-            json!({"source_port":["60003"], "ip":["10.0.0.0/8"], "port":["443"]}),
-            vec![(
+        },
+        CompoundCase {
+            name: "destination-specific-port-miss",
+            condition: json!({"source_port":["60003"], "ip":["10.1.0.0/16"], "port":["80"]}),
+            must: false,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: false,
+            samples: vec![],
+        },
+        CompoundCase {
+            name: "destination-parent-must",
+            condition: json!({"source_port":["60003"], "ip":["10.0.0.0/8"], "port":["443"]}),
+            must: true,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: false,
+            samples: vec![(
                 sample(|c| {
                     c.src_port = 60003;
                     c.dst_ip = "10.1.2.3".parse().unwrap();
@@ -350,14 +379,22 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                 }),
                 true,
             )],
-        ),
-        (
-            json!({"port":["60004"], "source_ip":["172.16.1.0/24"], "source_port":["80"]}),
-            vec![],
-        ),
-        (
-            json!({"port":["60004"], "source_ip":["172.16.0.0/12"], "source_port":["443"]}),
-            vec![(
+        },
+        CompoundCase {
+            name: "source-specific-port-miss",
+            condition: json!({"port":["60004"], "source_ip":["172.16.1.0/24"], "source_port":["80"]}),
+            must: false,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: false,
+            samples: vec![],
+        },
+        CompoundCase {
+            name: "source-parent-port-punt",
+            condition: json!({"port":["60004"], "source_ip":["172.16.0.0/12"], "source_port":["443"]}),
+            must: false,
+            #[cfg(feature = "ebpf")]
+            generic_port_punt: true,
+            samples: vec![(
                 sample(|c| {
                     c.src_port = 443;
                     c.src_ip = "172.16.1.2".parse().unwrap();
@@ -365,30 +402,30 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                 }),
                 true,
             )],
-        ),
+        },
     ];
-    for (index, (value, samples)) in extras.into_iter().enumerate() {
+    for (index, case) in extras.into_iter().enumerate() {
         let id = rules.len();
         let mark = 0x400 + index as u32;
         rules.push(RoutingRule {
-            name: format!("compound-{index}"),
-            condition: serde_json::from_value(value).unwrap(),
+            name: case.name.into(),
+            condition: serde_json::from_value(case.condition).unwrap(),
             outbound: RoutingOutbound::Simple("proxy".into()),
             priority: 0,
-            must: index == 4,
+            must: case.must,
             mark,
         });
-        for (sample_index, (connection, hit)) in samples.into_iter().enumerate() {
+        for (sample_index, (connection, hit)) in case.samples.into_iter().enumerate() {
             cases.push(GoldenCase {
-                label: format!("compound/{index}/{sample_index}"),
+                label: format!("{}/{sample_index}", case.name),
                 connection,
                 decision: if hit {
-                    expected(Some(id), 2, mark, index == 4)
+                    expected(Some(id), 2, mark, case.must)
                 } else {
                     expected(None, 0, 0, false)
                 },
                 #[cfg(feature = "ebpf")]
-                generic_port_punt: hit && index == 6,
+                generic_port_punt: hit && case.generic_port_punt,
             });
         }
     }

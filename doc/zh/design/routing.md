@@ -88,6 +88,14 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
 不再共享可能被新前缀提前遮挡的双 bank LPM value。
 
+事实准备先用 hash 合并重复键，只排序唯一键，再在原向量中继承祖先位并压缩保留容量。
+内部跳转由 assembler 自己分配的 ordinal label 标识，只有规则 source record 保留
+诊断文本。输入/输出偏移从共享 ABI 声明推导，不再独立维护一份偏移表。
+
+策略身份散列带长度边界的规范化规则字段、有序 domain registry key 和选定 geo digest，
+不遍历派生 trie，也不依赖 `Debug` 文本。有效 no-op reload 的身份保持不变：只修改被
+忽略的进程名后缀，不应重新发布相等的 native plan 并丢弃 sniff-only facts。
+
 每个事实 LPM 保留 2,048,000 条容量且不预分配；学习到的 domain hash 保留 65,536 条。
 前缀数量与谓词数量独立：一个 GeoIP 谓词可以包含数十万个前缀。emitter 在每次插入指令前
 检查 1,000,000 条指令预算，耗尽时立即返回错误，不再继续展开指令或 fixup。
@@ -107,6 +115,10 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 `RoutingPolicyDescriptor`。descriptor 标识 slot、policy generation、feature bits
 及供诊断使用的 active domain-map ID。一次路由只取一个 descriptor，再同步调用一个
 槽；缓存命中报文不新增这个 lookup。
+
+控制器用一次 backend 发布调用传入不可变 plan 和完整 learned-domain slice。
+后端自行选择 inactive slot 并局部持有候选，不再需要调用方选槽或 pending-domain
+握手。静态 plan 复用与 DNS projection ownership 仍然分离。
 
 发布与现有 reload、DNS publication fence 串行协调：
 
@@ -157,9 +169,15 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 attachment 后成功重新发布，确认冻结 root 的具体 syscall 错误，并重新附着所有
 inactive target 以验证 link 清理。`just test-netns` 包含这个 gate。
 
-扩展后的 gate 已在 Linux `7.2.0-cachyos` 通过。独立的生产 parser 到 emitter 检查
-在 256 MiB 地址空间限制下处理 10,000 个进程名候选时正常返回容量错误，不再 abort。
-以下 VM 和实验室记录早于这些新增容量与发布恢复检查。
+这些检查拆为使用独立 backend fixture 的原生测试场景；发布场景显式安装自己的
+baseline，并保留同一 backend 上的失败到恢复链。Local 和 VM gate 都选择整个
+routing-test 模块，而不是一个巨型测试函数。Golden case 显式携带名称及 must/punt
+元数据，不再让数组位置决定语义。
+
+结构整理前后的 32 组生成程序指令与 source record 逐字节相同，256 组策略相等性关系
+也保持不变；扩展 gate 的全部 15 项检查已在 Linux `7.2.0-cachyos` 通过。此前容量修复
+还在 256 MiB 地址空间限制下，通过生产 parser 和 emitter 检查了 10,000 个进程名
+候选，正常返回容量错误而非 abort。以下 VM 和实验室记录早于这些新增检查。
 
 固定的 Ubuntu `7.2.0-070200-generic` VM 通过全部 12 项 root-only 检查：
 TC/cgroup 生命周期与 allocator 兼容性、生成 policy 发布、TC/TUN 报文合同、

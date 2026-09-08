@@ -159,7 +159,7 @@ impl ControlPlane {
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
-        routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &initial_routing_plan)
+        ebpf.publish_routing_plan(&initial_routing_plan, &[])
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));

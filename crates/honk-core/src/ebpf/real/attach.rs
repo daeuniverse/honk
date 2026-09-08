@@ -542,7 +542,6 @@ impl RealEbpfBackend {
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,
-            pending_domain: None,
         })
     }
 

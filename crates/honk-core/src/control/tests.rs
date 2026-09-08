@@ -5459,7 +5459,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             {
                 let plan = control.active_routing_plan.read().clone();
                 let mut ebpf = control.ebpf.write().await;
-                routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan)?;
+                ebpf.publish_routing_plan(&plan, &[])?;
             }
             let sequence_ready = control.rotate_udp_decision_generation().await?;
             let mut nfqueue = control

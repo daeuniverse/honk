@@ -162,7 +162,7 @@ honk-tool bpf stats [--pin-root PATH]
 | --- | --- |
 | `conn-state` | Tuple、出站、mark、must 标记、状态与最近出现时间戳。 |
 | `redirect-track` | 回包改写源/目的地址、出站、WAN 方向、接口与最近出现时间戳。 |
-| `domain-routing` | DNS 学习的 IP 与路由规则位图索引。 |
+| `domain-routing` | 从 DNS 或嗅探结果学习的 IP，以及活动 policy 的域名谓词位图索引；已知但全零的条目仍会显示。 |
 | `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
 
 实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。

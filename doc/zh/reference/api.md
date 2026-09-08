@@ -69,7 +69,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 {"mode":"Global"}
 ```
 
-模式更新经过 `DatapathFlagsHandle`；它是 shared mode 与 `DATAPATH_FLAGS_MAP` 唯一的串行化 writer。因此模式修改会与 reload 的 NFQUEUE fence、reopen、disable 和 static flag 更新原子组合，不会重新发布过期的 readiness bit。启用 cache database 时会保存规范化后的模式。
+模式更新经过 `DatapathFlagsHandle`；它是 shared mode 与 `DATAPATH_FLAGS_MAP` 唯一的串行化 writer。因此模式修改会与 reload 的 NFQUEUE fence、reopen 和 disable 操作原子组合，不会重新发布过期的 readiness bit。规则派生的 feature bit 属于不可变的路由 policy descriptor。启用 cache database 时会保存规范化后的模式。
 
 `PUT /proxies/{name}` 不要求特定 `Content-Type`。对已配置的 Selector 组，目标必须是直接成员 tag；只能经嵌套组到达的叶节点并非直接成员。选择确实发生变化时会调用 group manager 的 cache callback，因此启用 `cache_file` 后会把选择持久化到 `cache.db`。若该组设置了 `interrupt_connections`，honk 会移除与该组、其成员 tag 及可达叶节点关联的已跟踪连接，使后续流量通过新选择重新拨号。写入已有选择不会触发操作。URLTest、LoadBalance、Fallback 及 Score 组都会拒绝该修改。
 

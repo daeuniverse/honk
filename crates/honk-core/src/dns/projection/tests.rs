@@ -293,7 +293,7 @@ async fn refresh_and_ip_replacement_preserve_ttl_and_exact_revisions() {
 }
 
 fn backend_for_test(snapshot: &RoutingProjectionSnapshot) -> MockEbpfBackend {
-    let plan = crate::control::routing_matcher::RoutingMatcherBuilder::compile(
+    let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
         &snapshot.matcher,
         &std::collections::HashMap::from([("direct".to_owned(), 0)]),
         "direct",
@@ -301,7 +301,7 @@ fn backend_for_test(snapshot: &RoutingProjectionSnapshot) -> MockEbpfBackend {
     )
     .unwrap();
     let mut backend = MockEbpfBackend::new();
-    backend.publish_routing_plan(0, &plan).unwrap();
+    backend.publish_routing_plan(&plan, &[]).unwrap();
     backend
 }
 
