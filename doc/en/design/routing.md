@@ -112,6 +112,12 @@ matching ancestor predicate bits, so longest-prefix lookup preserves ordered
 rule semantics. Facts use the full `DomainRouting` bitmap in their own generation;
 there is no shared two-bank LPM value that a staged prefix can shadow.
 
+Each fact LPM retains the 2,048,000-entry limit without preallocation; the learned
+domain hash retains 65,536 entries. Prefix count is independent of predicate count:
+one GeoIP predicate can contain hundreds of thousands of prefixes. The emitter
+checks its 1,000,000-instruction budget before each instruction insertion and stops
+immediately on exhaustion, before further instruction or fixup expansion.
+
 Capacity and verifier limits are explicit errors. No rule chain is truncated and
 no missing outbound silently becomes direct. Generated source attribution records
 rule IDs and normalized rule descriptions. A raw loader uses the existing syscall
@@ -181,11 +187,19 @@ The branch validation below exercises the production callers and full policy.
 
 ### Recorded branch validation
 
-`just test-routing` builds a separate test object and runs 468 independent
-complete-decision goldens through the real root/slot path. It also exercises
-predicate bit 255 for domain, destination/source IP and MAC, rejects capacity
-257, and proves that failed inactive attachments and root writes retain the
-old policy. `just test-netns` includes this gate.
+`just test-routing` builds a separate test object and runs 117 hand-authored cases
+in four dial modes (468 complete-decision comparisons) through the real root/slot
+path. It also exercises predicate bit 255 for domain, destination/source IP and
+MAC, rejects predicate capacity 257, and publishes a single rule with 65,537
+distinct prefixes, checking its first/last hits and adjacent miss. Publication
+failure checks preserve fact-dependent hits and misses, successfully republish
+after an occupied attachment, identify the frozen-root syscall error, and reattach
+every inactive target to verify link cleanup. `just test-netns` includes this gate.
+
+The expanded gate passed on Linux `7.2.0-cachyos`. A separate production
+parser-to-emitter check with 10,000 process-name alternatives returned a capacity
+error under a 256 MiB address-space limit instead of aborting. The VM and lab
+records below predate these added capacity and publication-recovery checks.
 
 The pinned Ubuntu `7.2.0-070200-generic` VM passed all 12 root-only checks:
 TC/cgroup lifecycle and allocator compatibility, generated-policy publication,

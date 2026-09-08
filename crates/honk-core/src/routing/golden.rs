@@ -7,6 +7,7 @@ pub(crate) struct GoldenCase {
     pub label: String,
     pub connection: ConnectionInfo,
     pub decision: RoutingDecision,
+    #[cfg(feature = "ebpf")]
     pub generic_port_punt: bool,
 }
 
@@ -259,6 +260,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                     } else {
                         expected(None, 0, 0, false)
                     },
+                    #[cfg(feature = "ebpf")]
                     generic_port_punt: matched
                         && !negated
                         && matches!(field, "port" | "source_port"),
@@ -385,6 +387,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                 } else {
                     expected(None, 0, 0, false)
                 },
+                #[cfg(feature = "ebpf")]
                 generic_port_punt: hit && index == 6,
             });
         }
@@ -415,6 +418,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             c.dst_port = 53;
         }),
         decision: expected(Some(priority_id), 1, 0x502, true),
+        #[cfg(feature = "ebpf")]
         generic_port_punt: false,
     });
     cases.push(GoldenCase {
@@ -424,12 +428,14 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             c.dst_port = 53;
         }),
         decision: expected(Some(priority_id + 1), 0, 0x503, true),
+        #[cfg(feature = "ebpf")]
         generic_port_punt: false,
     });
     cases.push(GoldenCase {
         label: "fallback".into(),
         connection: connection(),
         decision: expected(None, 0, 0, false),
+        #[cfg(feature = "ebpf")]
         generic_port_punt: false,
     });
 

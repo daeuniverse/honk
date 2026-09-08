@@ -99,6 +99,56 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     }
     eprintln!("native routing: {comparisons} complete-decision golden comparisons");
 
+    let prefixes = (0..=65_536u32)
+        .map(|offset| format!("{}/32", std::net::Ipv4Addr::from(0x0a00_0000u32 + offset)))
+        .collect();
+    let large_router = Router::new(
+        &[honk_config::routing::RoutingRule {
+            name: "large-ip-fact".into(),
+            condition: honk_config::routing::RoutingCondition {
+                ip: prefixes,
+                ..Default::default()
+            },
+            outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
+            priority: 0,
+            must: false,
+            mark: 0x500,
+        }],
+        "direct",
+    )
+    .unwrap();
+    let large_plan =
+        RoutingMatcherBuilder::compile(&large_router, &ids, "direct", DialMode::Ip).unwrap();
+    RoutingMatcherBuilder::push_plan(&mut backend, &large_plan).unwrap();
+    let large_match = RoutingDecision {
+        outbound: 2,
+        mark: 0x500,
+        must: 0,
+        domain_final: 1,
+        rule_id: 0,
+    };
+    for destination in ["10.0.0.0", "10.1.0.0"] {
+        let mut connection = golden::connection();
+        connection.dst_ip = destination.parse().unwrap();
+        let observed = backend.run_routing_test(&input(&connection)).unwrap();
+        assert_eq!(observed.status, 0);
+        assert_eq!(observed.decision, large_match);
+    }
+    let mut outside = golden::connection();
+    outside.dst_ip = "10.1.0.1".parse().unwrap();
+    let observed = backend.run_routing_test(&input(&outside)).unwrap();
+    assert_eq!(observed.status, 0);
+    assert_eq!(
+        observed.decision,
+        RoutingDecision {
+            outbound: 0,
+            mark: 0,
+            must: 0,
+            domain_final: 1,
+            rule_id: u32::MAX,
+        }
+    );
+
     for domains in [true, false] {
         let rules = (0..256)
             .map(|index| honk_config::routing::RoutingRule {
@@ -181,22 +231,60 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
         );
     }
 
-    let unchanged_input = input(&golden::connection());
-    let before = backend.run_routing_test(&unchanged_input).unwrap();
+    let mut active_hit_connection = golden::connection();
+    active_hit_connection.dst_ip = "192.0.2.255".parse().unwrap();
+    active_hit_connection.src_ip = "198.51.100.255".parse().unwrap();
+    active_hit_connection.mac = Some("02:00:00:00:00:ff".into());
+    let active_hit = input(&active_hit_connection);
+    let mut active_miss_connection = active_hit_connection.clone();
+    active_miss_connection.src_ip = "203.0.113.1".parse().unwrap();
+    let active_miss = input(&active_miss_connection);
+    let active_hit_decision = RoutingDecision {
+        outbound: 2,
+        mark: 0x6ff,
+        must: 0,
+        domain_final: 1,
+        rule_id: 255,
+    };
+    let active_miss_decision = RoutingDecision {
+        outbound: 0,
+        mark: 0,
+        must: 0,
+        domain_final: 1,
+        rule_id: u32::MAX,
+    };
+    assert_eq!(
+        backend.run_routing_test(&active_hit).unwrap().decision,
+        active_hit_decision
+    );
+    assert_eq!(
+        backend.run_routing_test(&active_miss).unwrap().decision,
+        active_miss_decision
+    );
     let old_slot = backend.active_routing_generation().unwrap();
-    let replacement = RoutingMatcherBuilder::compile(
-        &Router::new(&[], "block").unwrap(),
-        &ids,
-        "block",
-        DialMode::Ip,
-    )
-    .unwrap();
-    let targets = backend
-        .routing_targets(ROUTING_SLOT_NAMES[(old_slot ^ 1) as usize])
-        .unwrap();
-    let maps = create_maps(&replacement.facts, &[]).unwrap();
+
+    let recovery_rule = honk_config::routing::RoutingRule {
+        name: "publication-recovery".into(),
+        condition: honk_config::routing::RoutingCondition {
+            ip: vec!["192.0.2.255".into()],
+            source_ip: vec!["198.51.100.255".into()],
+            mac: vec!["02:00:00:00:00:ff".into()],
+            ..Default::default()
+        },
+        outbound: honk_config::routing::RoutingOutbound::Simple("block".into()),
+        priority: 0,
+        must: false,
+        mark: 0x700,
+    };
+    let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
+    let recovery =
+        RoutingMatcherBuilder::compile(&recovery_router, &ids, "direct", DialMode::Ip).unwrap();
+    let inactive_slot = old_slot ^ 1;
+    let inactive_name = ROUTING_SLOT_NAMES[inactive_slot as usize];
+    let targets = backend.routing_targets(inactive_name).unwrap();
+    let maps = create_maps(&recovery.facts, &[]).unwrap();
     let bytecode = crate::control::routing_matcher::codegen::emit_routing_program(
-        &replacement,
+        &recovery,
         crate::control::routing_matcher::codegen::RoutingMapFds {
             destination_v4: lpm_fd(&maps.destination_v4),
             destination_v6: lpm_fd(&maps.destination_v6),
@@ -207,21 +295,55 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
         },
     )
     .unwrap();
-    let (_btf, program) = load_extension(
-        &targets[0],
-        ROUTING_SLOT_NAMES[(old_slot ^ 1) as usize],
-        &bytecode,
-    )
-    .unwrap();
+    let (_btf, program) = load_extension(&targets[0], inactive_name, &bytecode).unwrap();
     let occupied = attach_extension(&program, targets.last().unwrap()).unwrap();
-    assert!(RoutingMatcherBuilder::push_plan(&mut backend, &replacement).is_err());
-    assert_eq!(backend.run_routing_test(&unchanged_input).unwrap(), before);
+    assert!(RoutingMatcherBuilder::push_plan(&mut backend, &recovery).is_err());
+    assert_eq!(
+        backend.run_routing_test(&active_hit).unwrap().decision,
+        active_hit_decision
+    );
+    assert_eq!(
+        backend.run_routing_test(&active_miss).unwrap().decision,
+        active_miss_decision
+    );
     assert_eq!(backend.active_routing_generation().unwrap(), old_slot);
     drop(occupied);
     drop(program);
     drop(maps);
 
-    // Freezing the real root forces the final syscall to fail after every inactive attachment.
+    RoutingMatcherBuilder::push_plan(&mut backend, &recovery).unwrap();
+    let recovered_slot = backend.active_routing_generation().unwrap();
+    assert_eq!(recovered_slot, inactive_slot);
+    let recovered_hit_decision = RoutingDecision {
+        outbound: 1,
+        mark: 0x700,
+        must: 0,
+        domain_final: 1,
+        rule_id: 0,
+    };
+    assert_eq!(
+        backend.run_routing_test(&active_hit).unwrap().decision,
+        recovered_hit_decision
+    );
+    assert_eq!(
+        backend.run_routing_test(&active_miss).unwrap().decision,
+        active_miss_decision
+    );
+
+    let mut root_candidate_rule = recovery_rule;
+    root_candidate_rule.name = "root-failure".into();
+    root_candidate_rule.outbound = honk_config::routing::RoutingOutbound::Simple("proxy".into());
+    root_candidate_rule.mark = 0x701;
+    let root_candidate_router =
+        Router::new(std::slice::from_ref(&root_candidate_rule), "direct").unwrap();
+    let root_candidate =
+        RoutingMatcherBuilder::compile(&root_candidate_router, &ids, "direct", DialMode::Ip)
+            .unwrap();
+    let root_candidate_slot = recovered_slot ^ 1;
+    let root_candidate_name = ROUTING_SLOT_NAMES[root_candidate_slot as usize];
+    let root_candidate_targets = backend.routing_targets(root_candidate_name).unwrap();
+
+    // Freezing only the real root makes its root-last update fail with EPERM.
     let aya::maps::Map::ArrayOfMaps(root) = backend
         .bpf()
         .unwrap()
@@ -233,9 +355,49 @@ fn compiled_policy_matches_goldens_and_preserves_failed_root() {
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
     attr.__bindgen_anon_2.map_fd = root.fd().as_fd().as_raw_fd() as u32;
     bpf_syscall(bpf_cmd::BPF_MAP_FREEZE, &mut attr).unwrap();
-    for _ in 0..2 {
-        assert!(RoutingMatcherBuilder::push_plan(&mut backend, &replacement).is_err());
-        assert_eq!(backend.run_routing_test(&unchanged_input).unwrap(), before);
-        assert_eq!(backend.active_routing_generation().unwrap(), old_slot);
-    }
+
+    let root_error = RoutingMatcherBuilder::push_plan(&mut backend, &root_candidate).unwrap_err();
+    assert!(
+        matches!(
+            root_error.downcast_ref::<aya::maps::MapError>(),
+            Some(aya::maps::MapError::SyscallError(error))
+                if error.io_error.raw_os_error() == Some(libc::EPERM)
+        ),
+        "{root_error:#}"
+    );
+    assert_eq!(
+        backend.run_routing_test(&active_hit).unwrap().decision,
+        recovered_hit_decision
+    );
+    assert_eq!(
+        backend.run_routing_test(&active_miss).unwrap().decision,
+        active_miss_decision
+    );
+    assert_eq!(backend.active_routing_generation().unwrap(), recovered_slot);
+
+    // Every root-failed candidate link must have unwound from the inactive targets.
+    let probe_maps = create_maps(&root_candidate.facts, &[]).unwrap();
+    let probe_bytecode = crate::control::routing_matcher::codegen::emit_routing_program(
+        &root_candidate,
+        crate::control::routing_matcher::codegen::RoutingMapFds {
+            destination_v4: lpm_fd(&probe_maps.destination_v4),
+            destination_v6: lpm_fd(&probe_maps.destination_v6),
+            source_v4: lpm_fd(&probe_maps.source_v4),
+            source_v6: lpm_fd(&probe_maps.source_v6),
+            mac: lpm_fd(&probe_maps.mac),
+            domain: map_fd(&probe_maps.domain),
+        },
+    )
+    .unwrap();
+    let (_probe_btf, probe_program) = load_extension(
+        &root_candidate_targets[0],
+        root_candidate_name,
+        &probe_bytecode,
+    )
+    .unwrap();
+    let _released_links = root_candidate_targets
+        .iter()
+        .map(|target| attach_extension(&probe_program, target))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .unwrap();
 }

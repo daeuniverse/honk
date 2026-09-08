@@ -88,6 +88,10 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
 不再共享可能被新前缀提前遮挡的双 bank LPM value。
 
+每个事实 LPM 保留 2,048,000 条容量且不预分配；学习到的 domain hash 保留 65,536 条。
+前缀数量与谓词数量独立：一个 GeoIP 谓词可以包含数十万个前缀。emitter 在每次插入指令前
+检查 1,000,000 条指令预算，耗尽时立即返回错误，不再继续展开指令或 fixup。
+
 容量和 verifier 限制是明确错误，不能截断规则链或把缺失 outbound 默认为 direct。
 生成源映射记录 RuleId 和规范化规则描述。raw loader 复用现有 syscall/BTF 基础，不
 增加运行时 clang/LLVM 或另一个 ELF writer。函数原型必须真实；raw `func_info` 与
@@ -146,10 +150,16 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 
 ### 分支验证记录
 
-`just test-routing` 单独构建 test object，沿真实 root/slot 路径执行 468 组独立
-完整 decision golden，同时验证 domain、目的/源 IP、MAC 的谓词 bit 255、
-容量 257 的拒绝，以及 inactive attach/root write 失败时保留旧 policy。
-`just test-netns` 包含这个 gate。
+`just test-routing` 单独构建 test object，沿真实 root/slot 路径执行 117 个手写用例
+在四种 dial mode 下的 468 次完整 decision 比较，同时验证 domain、目的/源 IP、MAC
+的谓词 bit 255、谓词容量 257 的拒绝，以及包含 65,537 个独立前缀的单条规则首尾命中
+和相邻地址不命中。发布失败检查保留依赖真实事实的命中和不命中结果，在解除占用的
+attachment 后成功重新发布，确认冻结 root 的具体 syscall 错误，并重新附着所有
+inactive target 以验证 link 清理。`just test-netns` 包含这个 gate。
+
+扩展后的 gate 已在 Linux `7.2.0-cachyos` 通过。独立的生产 parser 到 emitter 检查
+在 256 MiB 地址空间限制下处理 10,000 个进程名候选时正常返回容量错误，不再 abort。
+以下 VM 和实验室记录早于这些新增容量与发布恢复检查。
 
 固定的 Ubuntu `7.2.0-070200-generic` VM 通过全部 12 项 root-only 检查：
 TC/cgroup 生命周期与 allocator 兼容性、生成 policy 发布、TC/TUN 报文合同、

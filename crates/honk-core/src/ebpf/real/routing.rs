@@ -18,7 +18,7 @@ const ROUTING_TARGETS: [&str; 4] = [
     "wan_egress_l2",
     "wan_egress_l3",
 ];
-const FACT_MAP_CAPACITY: u32 = 65_536;
+const FACT_MAP_CAPACITY: u32 = 2_048_000;
 const DOMAIN_CAPACITY: u32 = 65_536;
 const BPF_F_NO_PREALLOC: u32 = 1;
 const VERIFIER_LOG_SIZE: usize = 1 << 20;

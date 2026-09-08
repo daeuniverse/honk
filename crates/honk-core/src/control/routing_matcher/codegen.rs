@@ -29,6 +29,7 @@ const R8: u8 = 8;
 const R10: u8 = 10;
 const STACK_DOMAIN_KEY: i16 = -96;
 const MAP_LOOKUP_ELEM: i32 = 1;
+const BPF_INSTRUCTION_CAPACITY: usize = 1_000_000;
 const PSEUDO_MAP_FD: u8 = 1;
 const STACK_KEY: i16 = -64;
 const INPUT_SRC_IP: i16 = 0;
@@ -101,7 +102,11 @@ impl Assembler {
             .insert(name.as_ref().to_owned(), self.insns.len());
     }
 
-    fn emit(&mut self, code: u32, dst: u8, src: u8, off: i16, imm: i32) -> usize {
+    fn emit(&mut self, code: u32, dst: u8, src: u8, off: i16, imm: i32) -> anyhow::Result<usize> {
+        ensure!(
+            self.insns.len() < BPF_INSTRUCTION_CAPACITY,
+            "routing program exceeds BPF instruction capacity"
+        );
         let insn = bpf_insn {
             code: code as u8,
             _bitfield_align_1: [],
@@ -111,24 +116,22 @@ impl Assembler {
         };
         let offset = self.insns.len();
         self.insns.push(insn);
-        offset
+        Ok(offset)
     }
 
-    fn jump(&mut self, op: u32, dst: u8, imm: i32, target: impl AsRef<str>) {
-        let index = self.emit(BPF_JMP | op | BPF_K, dst, 0, 0, imm);
+    fn jump(&mut self, op: u32, dst: u8, imm: i32, target: impl AsRef<str>) -> anyhow::Result<()> {
+        let index = self.emit(BPF_JMP | op | BPF_K, dst, 0, 0, imm)?;
         self.fixups.push((index, target.as_ref().to_owned()));
+        Ok(())
     }
 
-    fn ja(&mut self, target: impl AsRef<str>) {
-        let index = self.emit(BPF_JMP | BPF_JA, 0, 0, 0, 0);
+    fn ja(&mut self, target: impl AsRef<str>) -> anyhow::Result<()> {
+        let index = self.emit(BPF_JMP | BPF_JA, 0, 0, 0, 0)?;
         self.fixups.push((index, target.as_ref().to_owned()));
+        Ok(())
     }
 
     fn finish(mut self) -> anyhow::Result<RoutingBytecode> {
-        ensure!(
-            self.insns.len() <= 1_000_000,
-            "routing program exceeds BPF instruction capacity"
-        );
         for (index, target) in self.fixups {
             let target = self
                 .labels
@@ -148,41 +151,53 @@ impl Assembler {
         })
     }
 
-    fn mov_reg(&mut self, dst: u8, src: u8) {
-        self.emit(BPF_ALU64 | BPF_MOV | BPF_X, dst, src, 0, 0);
+    fn mov_reg(&mut self, dst: u8, src: u8) -> anyhow::Result<()> {
+        self.emit(BPF_ALU64 | BPF_MOV | BPF_X, dst, src, 0, 0)?;
+        Ok(())
     }
-    fn mov_imm(&mut self, dst: u8, imm: i32) {
-        self.emit(BPF_ALU64 | BPF_MOV | BPF_K, dst, 0, 0, imm);
+    fn mov_imm(&mut self, dst: u8, imm: i32) -> anyhow::Result<()> {
+        self.emit(BPF_ALU64 | BPF_MOV | BPF_K, dst, 0, 0, imm)?;
+        Ok(())
     }
-    fn add_imm(&mut self, dst: u8, imm: i32) {
-        self.emit(BPF_ALU64 | BPF_K, dst, 0, 0, imm);
+    fn add_imm(&mut self, dst: u8, imm: i32) -> anyhow::Result<()> {
+        self.emit(BPF_ALU64 | BPF_K, dst, 0, 0, imm)?;
+        Ok(())
     }
-    fn and_imm(&mut self, dst: u8, imm: i32) {
-        self.emit(BPF_ALU64 | BPF_AND | BPF_K, dst, 0, 0, imm);
+    fn and_imm(&mut self, dst: u8, imm: i32) -> anyhow::Result<()> {
+        self.emit(BPF_ALU64 | BPF_AND | BPF_K, dst, 0, 0, imm)?;
+        Ok(())
     }
-    fn ldx_w(&mut self, dst: u8, src: u8, off: i16) {
-        self.emit(BPF_LDX | BPF_W | BPF_MEM, dst, src, off, 0);
+    fn ldx_w(&mut self, dst: u8, src: u8, off: i16) -> anyhow::Result<()> {
+        self.emit(BPF_LDX | BPF_W | BPF_MEM, dst, src, off, 0)?;
+        Ok(())
     }
-    fn ldx_b(&mut self, dst: u8, src: u8, off: i16) {
-        self.emit(BPF_LDX | BPF_B | BPF_MEM, dst, src, off, 0);
+    fn ldx_b(&mut self, dst: u8, src: u8, off: i16) -> anyhow::Result<()> {
+        self.emit(BPF_LDX | BPF_B | BPF_MEM, dst, src, off, 0)?;
+        Ok(())
     }
-    fn ldx_dw(&mut self, dst: u8, src: u8, off: i16) {
-        self.emit(BPF_LDX | BPF_DW | BPF_MEM, dst, src, off, 0);
+    fn ldx_dw(&mut self, dst: u8, src: u8, off: i16) -> anyhow::Result<()> {
+        self.emit(BPF_LDX | BPF_DW | BPF_MEM, dst, src, off, 0)?;
+        Ok(())
     }
-    fn stx_dw(&mut self, dst: u8, src: u8, off: i16) {
-        self.emit(BPF_STX | BPF_DW | BPF_MEM, dst, src, off, 0);
+    fn stx_dw(&mut self, dst: u8, src: u8, off: i16) -> anyhow::Result<()> {
+        self.emit(BPF_STX | BPF_DW | BPF_MEM, dst, src, off, 0)?;
+        Ok(())
     }
-    fn stx_w(&mut self, dst: u8, src: u8, off: i16) {
-        self.emit(BPF_STX | BPF_W | BPF_MEM, dst, src, off, 0);
+    fn stx_w(&mut self, dst: u8, src: u8, off: i16) -> anyhow::Result<()> {
+        self.emit(BPF_STX | BPF_W | BPF_MEM, dst, src, off, 0)?;
+        Ok(())
     }
-    fn st_imm(&mut self, dst: u8, off: i16, imm: i32) {
-        self.emit(BPF_ST | BPF_W | BPF_MEM, dst, 0, off, imm);
+    fn st_imm(&mut self, dst: u8, off: i16, imm: i32) -> anyhow::Result<()> {
+        self.emit(BPF_ST | BPF_W | BPF_MEM, dst, 0, off, imm)?;
+        Ok(())
     }
-    fn call(&mut self, helper: i32) {
-        self.emit(BPF_JMP | BPF_CALL, 0, 0, 0, helper);
+    fn call(&mut self, helper: i32) -> anyhow::Result<()> {
+        self.emit(BPF_JMP | BPF_CALL, 0, 0, 0, helper)?;
+        Ok(())
     }
-    fn exit(&mut self) {
-        self.emit(BPF_JMP | BPF_EXIT, 0, 0, 0, 0);
+    fn exit(&mut self) -> anyhow::Result<()> {
+        self.emit(BPF_JMP | BPF_EXIT, 0, 0, 0, 0)?;
+        Ok(())
     }
 }
 
@@ -206,32 +221,32 @@ pub fn emit_routing_program(
     let mut asm = Assembler::new();
     asm.source(0, "routing function prologue");
     for (register, label) in [(R1, "input_nonnull"), (R2, "decision_nonnull")] {
-        asm.jump(BPF_JNE, register, 0, label);
-        asm.mov_imm(R0, -libc::EFAULT);
-        asm.exit();
+        asm.jump(BPF_JNE, register, 0, label)?;
+        asm.mov_imm(R0, -libc::EFAULT)?;
+        asm.exit()?;
         asm.label(label);
     }
-    asm.mov_reg(R6, R1);
-    asm.mov_reg(R7, R2);
-    asm.st_imm(R7, OUTBOUND, plan.fallback as i32);
-    asm.st_imm(R7, MARK, 0);
-    asm.st_imm(R7, MUST, 0);
+    asm.mov_reg(R6, R1)?;
+    asm.mov_reg(R7, R2)?;
+    asm.st_imm(R7, OUTBOUND, plan.fallback as i32)?;
+    asm.st_imm(R7, MARK, 0)?;
+    asm.st_imm(R7, MUST, 0)?;
     asm.st_imm(
         R7,
         DOMAIN_FINAL,
         (!plan.has_domain_rules || plan.features & ROUTING_FEATURE_DOMAIN_REROUTE == 0) as i32,
-    );
-    asm.st_imm(R7, RULE_ID, u32::MAX as i32);
+    )?;
+    asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
 
     if plan.has_domain_rules {
-        write_domain_key_from_input(&mut asm);
-        load_map_fd(&mut asm, fds.domain);
-        asm.mov_reg(R2, R10);
-        asm.add_imm(R2, STACK_DOMAIN_KEY as i32);
-        asm.call(MAP_LOOKUP_ELEM);
-        asm.mov_reg(R8, R0);
-        asm.jump(BPF_JEQ, R8, 0, "domain_absent");
-        asm.st_imm(R7, DOMAIN_FINAL, 1);
+        write_domain_key_from_input(&mut asm)?;
+        load_map_fd(&mut asm, fds.domain)?;
+        asm.mov_reg(R2, R10)?;
+        asm.add_imm(R2, STACK_DOMAIN_KEY as i32)?;
+        asm.call(MAP_LOOKUP_ELEM)?;
+        asm.mov_reg(R8, R0)?;
+        asm.jump(BPF_JEQ, R8, 0, "domain_absent")?;
+        asm.st_imm(R7, DOMAIN_FINAL, 1)?;
         asm.label("domain_absent");
     }
 
@@ -251,22 +266,22 @@ pub fn emit_routing_program(
             )?;
             asm.label(&pass);
         }
-        asm.st_imm(R7, OUTBOUND, rule.outbound as i32);
-        asm.st_imm(R7, MARK, rule.mark as i32);
-        asm.st_imm(R7, MUST, rule.must as i32);
-        asm.st_imm(R7, RULE_ID, rule.id as i32);
-        asm.mov_imm(R0, 0);
-        asm.exit();
+        asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
+        asm.st_imm(R7, MARK, rule.mark as i32)?;
+        asm.st_imm(R7, MUST, rule.must as i32)?;
+        asm.st_imm(R7, RULE_ID, rule.id as i32)?;
+        asm.mov_imm(R0, 0)?;
+        asm.exit()?;
         asm.label(&fail);
     }
 
     asm.source(0, "fallback");
-    asm.st_imm(R7, OUTBOUND, plan.fallback as i32);
-    asm.st_imm(R7, MARK, 0);
-    asm.st_imm(R7, MUST, 0);
-    asm.st_imm(R7, RULE_ID, u32::MAX as i32);
-    asm.mov_imm(R0, 0);
-    asm.exit();
+    asm.st_imm(R7, OUTBOUND, plan.fallback as i32)?;
+    asm.st_imm(R7, MARK, 0)?;
+    asm.st_imm(R7, MUST, 0)?;
+    asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
+    asm.mov_imm(R0, 0)?;
+    asm.exit()?;
     asm.finish()
 }
 fn validate_plan(plan: &RoutingPushPlan) -> anyhow::Result<()> {
@@ -399,7 +414,7 @@ fn emit_condition(
         )?;
     }
     asm.label(&truth);
-    asm.ja(pass);
+    asm.ja(pass)?;
     Ok(())
 }
 
@@ -415,7 +430,7 @@ fn emit_predicate(
     let label = |suffix: &str| format!("pred_{rule}_{condition}_{suffix}");
     match predicate {
         KernelPredicate::Domain(id) => {
-            emit_domain_bit(asm, *id, on_true, on_false);
+            emit_domain_bit(asm, *id, on_true, on_false)?;
         }
         KernelPredicate::DestinationIp(id) => {
             emit_family_map_bit(
@@ -426,7 +441,7 @@ fn emit_predicate(
                 on_true,
                 on_false,
                 INPUT_DST_IP,
-            );
+            )?;
         }
         KernelPredicate::SourceIp(id) => {
             emit_family_map_bit(
@@ -437,12 +452,12 @@ fn emit_predicate(
                 on_true,
                 on_false,
                 INPUT_SRC_IP,
-            );
+            )?;
         }
         KernelPredicate::Mac(id) => {
-            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT);
-            asm.jump(BPF_JEQ, R0, 0, on_false);
-            emit_lpm_bit(asm, fds.mac, *id, 128, INPUT_MAC, on_true, on_false);
+            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
+            asm.jump(BPF_JEQ, R0, 0, on_false)?;
+            emit_lpm_bit(asm, fds.mac, *id, 128, INPUT_MAC, on_true, on_false)?;
         }
         KernelPredicate::DestinationPort(ranges) => {
             emit_port_ranges(
@@ -452,7 +467,7 @@ fn emit_predicate(
                 on_true,
                 on_false,
                 &label("dport"),
-            );
+            )?;
         }
         KernelPredicate::SourcePort(ranges) => {
             emit_port_ranges(
@@ -462,41 +477,48 @@ fn emit_predicate(
                 on_true,
                 on_false,
                 &label("sport"),
-            );
+            )?;
         }
         KernelPredicate::Protocol(mask) => {
-            emit_mask_scalar(asm, INPUT_PROTO, *mask as i32, on_true, on_false);
+            emit_mask_scalar(asm, INPUT_PROTO, *mask as i32, on_true, on_false)?;
         }
         KernelPredicate::IpVersion(mask) => {
-            emit_mask_scalar(asm, INPUT_VERSION, *mask as i32, on_true, on_false);
+            emit_mask_scalar(asm, INPUT_VERSION, *mask as i32, on_true, on_false)?;
         }
         KernelPredicate::Dscp(values) => {
-            asm.ldx_w(R0, R6, INPUT_DSCP);
+            asm.ldx_w(R0, R6, INPUT_DSCP)?;
             if values.is_empty() {
-                asm.ja(on_false);
+                asm.ja(on_false)?;
             } else {
                 for value in values {
-                    asm.jump(BPF_JEQ, R0, *value as i32, on_true);
+                    asm.jump(BPF_JEQ, R0, *value as i32, on_true)?;
                 }
-                asm.ja(on_false);
+                asm.ja(on_false)?;
             }
         }
         KernelPredicate::ProcessName(names) => {
-            emit_process_names(asm, names, on_true, on_false, &label("pname"));
+            emit_process_names(asm, names, on_true, on_false, &label("pname"))?;
         }
     }
     Ok(())
 }
 
-fn emit_mask_scalar(asm: &mut Assembler, offset: i16, mask: i32, on_true: &str, on_false: &str) {
-    asm.ldx_w(R0, R6, offset);
+fn emit_mask_scalar(
+    asm: &mut Assembler,
+    offset: i16,
+    mask: i32,
+    on_true: &str,
+    on_false: &str,
+) -> anyhow::Result<()> {
+    asm.ldx_w(R0, R6, offset)?;
     if mask == 0 {
-        asm.ja(on_false);
+        asm.ja(on_false)?;
     } else {
-        asm.and_imm(R0, mask);
-        asm.jump(BPF_JNE, R0, 0, on_true);
-        asm.ja(on_false);
+        asm.and_imm(R0, mask)?;
+        asm.jump(BPF_JNE, R0, 0, on_true)?;
+        asm.ja(on_false)?;
     }
+    Ok(())
 }
 
 fn emit_port_ranges(
@@ -506,23 +528,24 @@ fn emit_port_ranges(
     on_true: &str,
     on_false: &str,
     label_prefix: &str,
-) {
-    asm.ldx_w(R0, R6, offset);
+) -> anyhow::Result<()> {
+    asm.ldx_w(R0, R6, offset)?;
     if ranges.is_empty() {
-        asm.ja(on_false);
-        return;
+        asm.ja(on_false)?;
+        return Ok(());
     }
     for (index, range) in ranges.iter().enumerate() {
         let next = format!("{label_prefix}_next_{index}");
         let inside = format!("{label_prefix}_inside_{index}");
-        asm.jump(BPF_JGE, R0, range.start as i32, &inside);
-        asm.ja(&next);
+        asm.jump(BPF_JGE, R0, range.start as i32, &inside)?;
+        asm.ja(&next)?;
         asm.label(&inside);
-        asm.jump(BPF_JGT, R0, range.end as i32, &next);
-        asm.ja(on_true);
+        asm.jump(BPF_JGT, R0, range.end as i32, &next)?;
+        asm.ja(on_true)?;
         asm.label(&next);
     }
-    asm.ja(on_false);
+    asm.ja(on_false)?;
+    Ok(())
 }
 
 fn emit_process_names(
@@ -531,16 +554,16 @@ fn emit_process_names(
     on_true: &str,
     on_false: &str,
     prefix: &str,
-) {
+) -> anyhow::Result<()> {
     if names.is_empty() {
-        asm.ja(on_false);
-        return;
+        asm.ja(on_false)?;
+        return Ok(());
     }
     for (name_index, bytes) in names.iter().enumerate() {
         let next_name = format!("{prefix}_next_name_{name_index}");
-        asm.ldx_w(R4, R6, INPUT_PNAME_LEN);
+        asm.ldx_w(R4, R6, INPUT_PNAME_LEN)?;
         if bytes.is_empty() {
-            asm.jump(BPF_JNE, R4, 0, on_true);
+            asm.jump(BPF_JNE, R4, 0, on_true)?;
             continue;
         }
         asm.jump(
@@ -548,8 +571,8 @@ fn emit_process_names(
             R4,
             bytes.len() as i32,
             format!("{prefix}_long_{name_index}"),
-        );
-        asm.ja(&next_name);
+        )?;
+        asm.ja(&next_name)?;
         asm.label(format!("{prefix}_long_{name_index}"));
         // Input pname is bounded to 48 bytes.  Each candidate offset is
         // checked against pname_len before reading, so missing bytes never
@@ -561,27 +584,34 @@ fn emit_process_names(
                 R4,
                 (offset + bytes.len()) as i32,
                 format!("{prefix}_enough_{name_index}_{offset}"),
-            );
-            asm.ja(&next);
+            )?;
+            asm.ja(&next)?;
             asm.label(format!("{prefix}_enough_{name_index}_{offset}"));
             for (byte_index, byte) in bytes.iter().enumerate() {
-                asm.ldx_b(R5, R6, INPUT_PNAME + offset as i16 + byte_index as i16);
-                asm.jump(BPF_JNE, R5, *byte as i32, &next);
+                asm.ldx_b(R5, R6, INPUT_PNAME + offset as i16 + byte_index as i16)?;
+                asm.jump(BPF_JNE, R5, *byte as i32, &next)?;
             }
-            asm.ja(on_true);
+            asm.ja(on_true)?;
             asm.label(&next);
         }
         asm.label(&next_name);
     }
-    asm.ja(on_false);
+    asm.ja(on_false)?;
+    Ok(())
 }
 
-fn emit_domain_bit(asm: &mut Assembler, id: u32, on_true: &str, on_false: &str) {
-    asm.jump(BPF_JEQ, R8, 0, on_false);
-    asm.ldx_w(R2, R8, (id / 32 * 4) as i16);
-    asm.and_imm(R2, (1u32 << (id % 32)) as i32);
-    asm.jump(BPF_JNE, R2, 0, on_true);
-    asm.ja(on_false);
+fn emit_domain_bit(
+    asm: &mut Assembler,
+    id: u32,
+    on_true: &str,
+    on_false: &str,
+) -> anyhow::Result<()> {
+    asm.jump(BPF_JEQ, R8, 0, on_false)?;
+    asm.ldx_w(R2, R8, (id / 32 * 4) as i16)?;
+    asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
+    asm.jump(BPF_JNE, R2, 0, on_true)?;
+    asm.ja(on_false)?;
+    Ok(())
 }
 
 fn emit_family_map_bit(
@@ -592,17 +622,18 @@ fn emit_family_map_bit(
     on_true: &str,
     on_false: &str,
     input_offset: i16,
-) {
-    asm.ldx_w(R0, R6, INPUT_VERSION);
+) -> anyhow::Result<()> {
+    asm.ldx_w(R0, R6, INPUT_VERSION)?;
     let v4 = format!("ip_v4_{}", asm.insns.len());
     let v6 = format!("ip_v6_{}", asm.insns.len());
-    asm.jump(BPF_JEQ, R0, 1, &v4);
-    asm.jump(BPF_JEQ, R0, 2, &v6);
-    asm.ja(on_false);
+    asm.jump(BPF_JEQ, R0, 1, &v4)?;
+    asm.jump(BPF_JEQ, R0, 2, &v6)?;
+    asm.ja(on_false)?;
     asm.label(&v4);
-    emit_lpm_bit(asm, v4_fd, id, 32, input_offset + 12, on_true, on_false);
+    emit_lpm_bit(asm, v4_fd, id, 32, input_offset + 12, on_true, on_false)?;
     asm.label(&v6);
-    emit_lpm_bit(asm, v6_fd, id, 128, input_offset, on_true, on_false);
+    emit_lpm_bit(asm, v6_fd, id, 128, input_offset, on_true, on_false)?;
+    Ok(())
 }
 
 fn emit_lpm_bit(
@@ -613,42 +644,84 @@ fn emit_lpm_bit(
     input_offset: i16,
     on_true: &str,
     on_false: &str,
-) {
-    write_key_from_input(asm, input_offset, prefix_len);
-    load_map_fd(asm, fd);
-    asm.mov_reg(R2, R10);
-    asm.add_imm(R2, STACK_KEY as i32);
-    asm.call(MAP_LOOKUP_ELEM);
-    asm.jump(BPF_JEQ, R0, 0, on_false);
-    asm.ldx_w(R2, R0, (id / 32 * 4) as i16);
-    asm.and_imm(R2, (1u32 << (id % 32)) as i32);
-    asm.jump(BPF_JNE, R2, 0, on_true);
-    asm.ja(on_false);
+) -> anyhow::Result<()> {
+    write_key_from_input(asm, input_offset, prefix_len)?;
+    load_map_fd(asm, fd)?;
+    asm.mov_reg(R2, R10)?;
+    asm.add_imm(R2, STACK_KEY as i32)?;
+    asm.call(MAP_LOOKUP_ELEM)?;
+    asm.jump(BPF_JEQ, R0, 0, on_false)?;
+    asm.ldx_w(R2, R0, (id / 32 * 4) as i16)?;
+    asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
+    asm.jump(BPF_JNE, R2, 0, on_true)?;
+    asm.ja(on_false)?;
+    Ok(())
 }
 
-fn write_key_from_input(asm: &mut Assembler, input_offset: i16, prefix_len: u32) {
-    asm.st_imm(R10, STACK_KEY, prefix_len as i32);
+fn write_key_from_input(
+    asm: &mut Assembler,
+    input_offset: i16,
+    prefix_len: u32,
+) -> anyhow::Result<()> {
+    asm.st_imm(R10, STACK_KEY, prefix_len as i32)?;
     for index in 0..4 {
-        asm.st_imm(R10, STACK_KEY + 4 + index * 4, 0);
+        asm.st_imm(R10, STACK_KEY + 4 + index * 4, 0)?;
     }
-    asm.mov_reg(R2, R6);
+    asm.mov_reg(R2, R6)?;
     let words = if prefix_len == 32 { 1 } else { 4 };
     for index in 0..words {
         let offset = index as i16 * 4;
-        asm.ldx_w(R3, R2, input_offset + offset);
-        asm.stx_w(R10, R3, STACK_KEY + 4 + offset);
+        asm.ldx_w(R3, R2, input_offset + offset)?;
+        asm.stx_w(R10, R3, STACK_KEY + 4 + offset)?;
     }
+    Ok(())
 }
 
-fn write_domain_key_from_input(asm: &mut Assembler) {
-    asm.mov_reg(R2, R6);
-    asm.ldx_dw(R3, R2, INPUT_DST_IP);
-    asm.stx_dw(R10, R3, STACK_DOMAIN_KEY);
-    asm.ldx_dw(R3, R2, INPUT_DST_IP + 8);
-    asm.stx_dw(R10, R3, STACK_DOMAIN_KEY + 8);
+fn write_domain_key_from_input(asm: &mut Assembler) -> anyhow::Result<()> {
+    asm.mov_reg(R2, R6)?;
+    asm.ldx_dw(R3, R2, INPUT_DST_IP)?;
+    asm.stx_dw(R10, R3, STACK_DOMAIN_KEY)?;
+    asm.ldx_dw(R3, R2, INPUT_DST_IP + 8)?;
+    asm.stx_dw(R10, R3, STACK_DOMAIN_KEY + 8)?;
+    Ok(())
 }
 
-fn load_map_fd(asm: &mut Assembler, fd: i32) {
-    asm.emit(BPF_LD | BPF_DW | BPF_IMM, R1, PSEUDO_MAP_FD, 0, fd);
-    asm.emit(0, 0, 0, 0, 0);
+fn load_map_fd(asm: &mut Assembler, fd: i32) -> anyhow::Result<()> {
+    asm.emit(BPF_LD | BPF_DW | BPF_IMM, R1, PSEUDO_MAP_FD, 0, fd)?;
+    asm.emit(0, 0, 0, 0, 0)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assembler_stops_at_instruction_capacity_without_publishing_fixup() {
+        let mut asm = Assembler::new();
+        asm.insns
+            .resize_with(BPF_INSTRUCTION_CAPACITY - 1, || bpf_insn {
+                code: 0,
+                _bitfield_align_1: [],
+                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
+                off: 0,
+                imm: 0,
+            });
+
+        let last = asm
+            .emit(BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
+            .expect("the last instruction within capacity must be emitted");
+        assert_eq!(last, BPF_INSTRUCTION_CAPACITY - 1);
+        assert_eq!(asm.insns.len(), BPF_INSTRUCTION_CAPACITY);
+
+        assert!(asm.ja("past_capacity").is_err());
+        assert_eq!(asm.insns.len(), BPF_INSTRUCTION_CAPACITY);
+        assert!(asm.fixups.is_empty());
+
+        let bytecode = asm
+            .finish()
+            .expect("a boundary-sized program must still finish");
+        assert_eq!(bytecode.insns.len(), BPF_INSTRUCTION_CAPACITY);
+        assert_eq!(bytecode.insns[last].code, (BPF_JMP | BPF_EXIT) as u8);
+    }
 }
