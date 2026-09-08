@@ -143,13 +143,15 @@ fn named_tls_controls_are_mapped_or_rejected_without_losing_siblings() {
             None,
         )
         .unwrap();
-    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes.len(), 3);
     assert_eq!(nodes[0].name, "pinned");
     assert_eq!(
         nodes[0].tls().unwrap().pin_sha256.as_deref(),
         Some(pin.as_str())
     );
-    assert_eq!(nodes[1].name, "metadata");
+    assert_eq!(nodes[1].name, "custom-alpn");
+    assert_eq!(nodes[1].tls().unwrap().alpn, ["h2"]);
+    assert_eq!(nodes[2].name, "metadata");
 }
 
 #[test]

@@ -167,6 +167,26 @@ pub(super) fn list_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<Stri
     parsed_alias(mapping, keys, list_text)
 }
 
+pub(super) fn alpn_list(value: &Value) -> Result<Vec<String>, &'static str> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(value) => Ok(value
+            .split(',')
+            .map(|value| value.trim().to_owned())
+            .collect()),
+        Value::Sequence(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or("ALPN must be a string or string array")
+            })
+            .collect(),
+        _ => Err("ALPN must be a string or string array"),
+    }
+}
+
 pub(super) fn ports(value: &Value) -> Result<Option<String>, &'static str> {
     let Some(value) = list_text(value)? else {
         return Ok(None);

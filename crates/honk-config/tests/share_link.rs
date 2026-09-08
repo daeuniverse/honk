@@ -87,6 +87,32 @@ fn test_node_serialization_bytes_match_flat_wire_goldens() {
 }
 
 #[test]
+fn test_tls_alpn_flat_wire_round_trip_and_legacy_omission() {
+    let legacy = Node::from_share_link("anytls://secret@example.com:443#anytls").unwrap();
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("tls_alpn")
+            .is_none()
+    );
+
+    let mut node = legacy;
+    node.tls_mut().unwrap().alpn = vec!["h2".into(), "http/1.1".into()];
+    node.validate_protocol().unwrap();
+    node.id = node.derive_id();
+    let value = serde_json::to_value(&node).unwrap();
+    assert_eq!(value["tls_alpn"], serde_json::json!(["h2", "http/1.1"]));
+
+    let restored: Node = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(restored.tls().unwrap().alpn, node.tls().unwrap().alpn);
+    assert_eq!(restored.id, node.id);
+
+    let mut unsupported = value;
+    unsupported["tls"] = false.into();
+    assert!(serde_json::from_value::<Node>(unsupported).is_err());
+}
+
+#[test]
 fn test_legacy_cross_protocol_fields_are_stripped() {
     let json = r#"{
         "name":"dirty-id",
@@ -403,12 +429,14 @@ fn sample_config() -> Config {
         )
         .unwrap(),
     );
-    config.nodes.push(
-        Node::from_share_link(
-            "anytls://uuid-pw@any.example.com:443?insecure=1&idle_session_timeout=1m&min_idle_session=4#anytls-node",
-        )
-        .unwrap(),
-    );
+    let mut anytls = Node::from_share_link(
+        "anytls://uuid-pw@any.example.com:443?insecure=1&idle_session_timeout=1m&min_idle_session=4#anytls-node",
+    )
+    .unwrap();
+    anytls.tls_mut().unwrap().alpn = vec!["h2".into()];
+    anytls.validate_protocol().unwrap();
+    anytls.id = anytls.derive_id();
+    config.nodes.push(anytls);
     config
 }
 

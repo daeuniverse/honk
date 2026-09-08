@@ -168,7 +168,7 @@ mod tests {
                     {"type":"trojan","tag":"trojan","server":"trojan.example","server_port":443,"password":"trojan-password","tls":{"enabled":true,"server_name":"trojan-sni.example"}},
                     {"type":"hysteria2","tag":"hy2","server":"hy2.example","server_ports":["20000:20002","8443"],"hop_interval":"15s","up_mbps":100,"down_mbps":200,"password":"hy2-password","obfs":{"type":"salamander","password":"obfs-password"},"initial_stream_receive_window":1048576,"initial_connection_receive_window":2097152,"disable_path_mtu_discovery":true,"tls":{"enabled":true,"server_name":"hy2-sni.example","insecure":true,"alpn":["h3"]}},
                     {"type":"tuic","tag":"tuic","server":"tuic.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000004","password":"tuic-password","congestion_control":"bbr","udp_relay_mode":"native","initial_packet_size":1252,"tls":{"enabled":true,"server_name":"tuic-sni.example","alpn":["h3","tuic"]}},
-                    {"type":"anytls","tag":"anytls","server":"anytls.example","server_port":443,"password":"anytls-password","network":"tcp","min_idle_session":4,"idle_session_check_interval":"30s","idle_session_timeout":"1m","tls":{"enabled":true,"server_name":"anytls-sni.example"}},
+                    {"type":"anytls","tag":"anytls","server":"anytls.example","server_port":443,"password":"anytls-password","network":"tcp","min_idle_session":4,"idle_session_check_interval":"30s","idle_session_timeout":"1m","tls":{"enabled":true,"server_name":"anytls-sni.example","alpn":["h2"]}},
                     {"type":"juicity","tag":"juicity","server":"juicity.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000005","password":"juicity-password","initial_stream_receive_window":8388608,"initial_connection_receive_window":8388608,"tls":{"enabled":true,"server_name":"juicity-sni.example","alpn":["h3"]}}
                   ]
                 }"#,
@@ -238,6 +238,7 @@ mod tests {
         assert_eq!(tuic.quic.mtu, Some(1252));
 
         let anytls = nodes[7].anytls().unwrap();
+        assert_eq!(anytls.tls.alpn, ["h2"]);
         assert_eq!(anytls.network.as_deref(), Some("tcp"));
         assert_eq!(anytls.min_idle_session, Some(4));
         assert_eq!(anytls.idle_session_check_interval, Some(30));
@@ -306,6 +307,7 @@ mod tests {
                   {"type":"hysteria2","tag":"bad-hop-range","server":"bad-hop.example","server_ports":["9000:8000"],"password":"password","tls":{"enabled":true}},
                   {"type":"hysteria2","tag":"bad-hy2-alpn","server":"bad-hy2.example","server_port":443,"password":"password","tls":{"enabled":true,"alpn":["hq-29"]}},
                   {"type":"juicity","tag":"bad-juicity-alpn","server":"bad-juicity.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000022","password":"password","tls":{"enabled":true,"alpn":["hq-29"]}},
+                  {"type":"anytls","tag":"bad-anytls-alpn","server":"bad-anytls.example","server_port":443,"password":"password","tls":{"enabled":true,"alpn":["h2",42]}},
                   {"type":"juicity","tag":"bad-window","server":"bad-window.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000023","password":"password","initial_stream_receive_window":1048576,"tls":{"enabled":true,"alpn":["h3"]}},
                   {"type":"tuic","tag":"missing-tuic-uuid","server":"missing-tuic.example","server_port":443,"password":"password","tls":{"enabled":true}},
                   {"type":"shadowsocks","tag":"plugin","server":"plugin.example","server_port":8388,"method":"aes-256-gcm","password":"password","plugin":"v2ray-plugin"},

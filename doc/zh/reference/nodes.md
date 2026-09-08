@@ -27,7 +27,7 @@ node {
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow` 以及每种非 `legacy` VLESS mode。调优参数与显示元数据不参与。
+凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow`、每种非 `legacy` VLESS mode，以及非空的结构化 `tls_alpn` 覆盖值（保留顺序与成员边界）。空 `tls_alpn` 保留旧 ID。调优参数与显示元数据不参与。
 
 因此，只要可拨号端点不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
 
@@ -50,6 +50,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
 | `sni` | string? | null | TLS 服务端名称，依次取 `sni`、`peer`、未被 transport 消耗的 `host` query |
+| `tls_alpn` | string[] | `[]` | 结构化配置/订阅导入的普通裸 TCP TLS ALPN；空列表保留 TLS profile 默认值。非空值支持 AnyTLS 与 TCP Trojan/VMess/VLESS，不支持关闭 TLS、REALITY、WS/gRPC 或 QUIC。TUIC 继续使用 `tuic_alpn`；这不是分享链接 query。 |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`、`allow_insecure` 或 `insecure` 等于 `1`/`true` |
 | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
 | `ech_config` | string? | null | 来自 `ech_config` 或 `echconfig` 的 Base64 ECHConfigList |

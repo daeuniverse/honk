@@ -112,6 +112,60 @@ fn imported_tls_required_protocols_and_quic_options_are_preserved() {
     assert_eq!(anytls.idle_session_timeout, Some(60));
     assert!(anytls.tls.enabled);
 }
+
+#[test]
+fn anytls_alpn_import_preserves_distinct_endpoints() {
+    let subscription = Subscription::default();
+    let nodes = parse_subscription_content(
+        &subscription,
+        r#"proxies:
+  - {name: issue-173, server: anytls.example, port: 123, type: anytls, client-fingerprint: chrome, idle-session-check-interval: 30, idle-session-timeout: 30, min-idle-session: 0, alpn: [h2], password: secret, sni: tls.example, skip-cert-verify: true, udp: true, tfo: false}
+  - {name: other-alpn, server: anytls.example, port: 123, type: anytls, password: secret, sni: tls.example, alpn: [http/1.1]}
+  - {name: duplicate, server: anytls.example, port: 123, type: anytls, password: secret, sni: tls.example, alpn: [h2]}
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["issue-173", "other-alpn"]
+    );
+    let anytls = nodes[0].anytls().unwrap();
+    assert_eq!(anytls.tls.alpn, ["h2"]);
+    assert_eq!(nodes[1].tls().unwrap().alpn, ["http/1.1"]);
+    assert!(anytls.tls.enabled);
+    assert!(anytls.tls.skip_cert_verify);
+    assert_eq!(anytls.network.as_deref(), Some("tcp,udp"));
+    assert_eq!(anytls.min_idle_session, Some(0));
+    assert_eq!(anytls.idle_session_check_interval, Some(30));
+    assert_eq!(anytls.idle_session_timeout, Some(30));
+}
+
+#[test]
+fn clash_alpn_keeps_opaque_members_and_rejects_non_strings() {
+    let nodes = parse_clash_subscription(
+        r#"proxies:
+  - {name: opaque, type: anytls, server: anytls.example, port: 443, password: secret, alpn: ["h2,http/1.1"]}
+  - {name: separate, type: anytls, server: anytls.example, port: 443, password: secret, alpn: [h2, http/1.1]}
+  - {name: malformed, type: anytls, server: anytls.example, port: 443, password: secret, alpn: [h2, 123]}
+"#,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["opaque", "separate"]
+    );
+    assert_eq!(nodes[0].tls().unwrap().alpn, ["h2,http/1.1"]);
+    assert_eq!(nodes[1].tls().unwrap().alpn, ["h2", "http/1.1"]);
+    assert_ne!(nodes[0].id, nodes[1].id);
+}
 #[test]
 fn test_parse_clash_vless_nested_fields() {
     let subscription_id = uuid::Uuid::new_v4();

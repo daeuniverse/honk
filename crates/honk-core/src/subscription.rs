@@ -599,14 +599,18 @@ fn parse_clash_proxies(
     subscription_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<Vec<Node>> {
     let mut nodes = Vec::new();
-    for proxy in proxies {
+    for (index, proxy) in proxies.iter().enumerate() {
         let Some(mapping) = proxy.as_mapping() else {
             continue;
         };
         match clash::parse_clash_proxy(mapping, subscription_id) {
             Ok(node) => nodes.push(node),
-            Err(_) => {
-                tracing::warn!("skipping unsupported or malformed subscription proxy");
+            Err(reason) => {
+                tracing::warn!(
+                    proxy_index = index + 1,
+                    reason,
+                    "skipping unsupported or malformed subscription proxy"
+                );
             }
         }
     }

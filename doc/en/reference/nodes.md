@@ -27,7 +27,7 @@ A malformed recognized link is dropped with `node section: skipping unparseable 
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and every non-`legacy` VLESS mode. Tuning and display metadata do not participate.
+The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, every non-`legacy` VLESS mode, and nonempty structured `tls_alpn` overrides (with order and member boundaries preserved). Empty `tls_alpn` retains legacy IDs. Tuning and display metadata do not participate.
 
 Identity is therefore stable across rename, reload, and subscription refresh when the dialable endpoint is unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
 
@@ -50,6 +50,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
 | `sni` | string? | null | TLS server name from `sni`, then `peer`, then an unconsumed `host` query |
+| `tls_alpn` | string[] | `[]` | Structured/imported ordinary raw-TCP TLS ALPN; empty preserves the TLS profile default. Nonempty values are supported for AnyTLS and TCP Trojan/VMess/VLESS, not disabled TLS, REALITY, WS/gRPC, or QUIC. TUIC retains `tuic_alpn`; this is not a share-link query. |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`, `allow_insecure`, or `insecure` equal to `1`/`true` |
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
 | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |

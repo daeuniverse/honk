@@ -39,6 +39,8 @@ struct FlatNode {
     #[serde(default)]
     sni: Option<String>,
     #[serde(default)]
+    tls_alpn: Vec<String>,
+    #[serde(default)]
     skip_cert_verify: bool,
     #[serde(default)]
     ech_enabled: bool,
@@ -356,6 +358,7 @@ impl FlatNode {
             reality_short_id: self.reality_short_id.take(),
             reality_spider_x: self.reality_spider_x.take(),
             pin_sha256: self.tls_pin_sha256.take(),
+            alpn: std::mem::take(&mut self.tls_alpn),
         }
     }
 
@@ -480,7 +483,13 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
         };
-        Ok(Node {
+        if !flat.tls_alpn.is_empty() {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{}' sets tls_alpn on a protocol without TLS",
+                flat.name
+            )));
+        }
+        let node = Node {
             id: flat.id,
             name: flat.name,
             address: flat.address,
@@ -493,7 +502,11 @@ impl TryFrom<FlatNode> for Node {
             group_id: flat.group_id,
             created_at: flat.created_at,
             updated_at: flat.updated_at,
-        })
+        };
+        if node.tls().is_some_and(|tls| !tls.alpn.is_empty()) {
+            node.validate_protocol()?;
+        }
+        Ok(node)
     }
 }
 
@@ -508,6 +521,7 @@ struct WireOptions<'a> {
     transport: &'a str,
     tls: bool,
     sni: Option<&'a str>,
+    tls_alpn: Option<&'a [String]>,
     skip_cert_verify: bool,
     ech_enabled: bool,
     ech_config: Option<&'a str>,
@@ -549,6 +563,7 @@ impl<'a> WireOptions<'a> {
     fn set_tls(&mut self, tls: &'a TlsOptions) {
         self.tls = tls.enabled;
         self.sni = tls.sni.as_deref();
+        self.tls_alpn = (!tls.alpn.is_empty()).then_some(tls.alpn.as_slice());
         self.skip_cert_verify = tls.skip_cert_verify;
         self.ech_enabled = tls.ech_enabled;
         self.ech_config = tls.ech_config.as_deref();
@@ -663,7 +678,8 @@ impl Serialize for Node {
         S: Serializer,
     {
         let wire = WireOptions::from_node(self);
-        let mut state = serializer.serialize_struct("Node", 56)?;
+        let mut state =
+            serializer.serialize_struct("Node", 56 + usize::from(wire.tls_alpn.is_some()))?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("protocol", &self.protocol())?;
@@ -679,6 +695,9 @@ impl Serialize for Node {
         state.serialize_field("transport", wire.transport)?;
         state.serialize_field("tls", &wire.tls)?;
         state.serialize_field("sni", &wire.sni)?;
+        if let Some(tls_alpn) = wire.tls_alpn {
+            state.serialize_field("tls_alpn", tls_alpn)?;
+        }
         state.serialize_field("skip_cert_verify", &wire.skip_cert_verify)?;
         state.serialize_field("ech_enabled", &wire.ech_enabled)?;
         state.serialize_field("ech_config", &wire.ech_config)?;
