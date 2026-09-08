@@ -5,7 +5,7 @@
 Routing has one authored semantic model and two derived execution paths. The
 userspace `Router` evaluates a canonical policy IR; a restricted compiler lowers
 that same IR to native eBPF comparisons. The kernel does not interpret a second
-`MatchSet` program. Linux 6.12 is the real-backend baseline.
+policy representation. Linux 6.12 is the real-backend baseline.
 
 The static TC programs retain packet parsing, special/local/DNS exclusions,
 conntrack, mode and health enforcement, NFQUEUE ownership, redirection, and reply
@@ -22,6 +22,18 @@ negation applies once to the entire condition. Fallback is a separate terminal
 action. Empty expanded sets remain conditions: positive empty sets are false,
 negative empty sets are true; they must not disappear and widen a compound rule.
 
+The configuration model and parser live in
+[`crates/honk-config/src/routing.rs`](../../../crates/honk-config/src/routing.rs)
+and its routing parser. `RoutingRule` carries one outbound tag, priority, mark,
+and an explicit terminal `must` flag; `RoutingCondition` carries the positive
+and negated matcher lists. `RoutingOutbound` is a single string target (a group
+or built-in `direct`/`block`). `ClashRuleDisplay` retains simple matcher types
+and uses `complex` for compound, negated, or parser-recorded `must` statements.
+`Config::validate` rejects a rule or fallback that names a configured node
+directly; use a group (including a one-node filter group).
+
+## Kernel routing
+
 The cutover preserves the current userspace matching contract:
 
 - Ordinary domain pattern/suffix/keyword alternatives form one condition;
@@ -35,8 +47,9 @@ The cutover preserves the current userspace matching contract:
   and trimming behavior as a routing handoff, without allocation.
 - Missing process/MAC/DSCP facts are not ordinary zero values. A missing domain
   does not satisfy a positive domain condition and does not veto a negative one.
-- A configured `(must)` result is terminal. It is not the internal historical
-  `MustRules` opcode. Neither it nor `block` can be overridden by Clash mode.
+- A configured `(must)` result is terminal: it sets the explicit `must` decision
+  field and skips sniffing. Neither it nor `block` can be overridden by Clash
+  mode.
 
 The old compiler's dropped full/regex conditions, narrowed protocol unions,
 truncated rule chains, first-rule DNS projection, and overlapping-prefix bitmap
@@ -51,6 +64,27 @@ one `CompiledPredicate` and its negation flag. Domain predicates reference an
 immutable, policy-local registry of compiled domain matchers. Rule names are
 labels, never bitmap identities. Identical domain predicates may share a stable
 predicate ID within one policy.
+
+### Source organization
+
+- [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
+  userspace `Router`, priority-ordered compiled routes, `route_with_must`,
+  `GeositeMatcher`, and the `BinaryLpmTrie`/geo-asset helpers. `geo.rs` parses
+  `geoip.dat`/`geosite.dat` once per `Router` build and decodes only referenced
+  codes; `category@attr` splits at the first `@` and filters attribute keys
+  case-insensitively.
+- [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs) —
+  compiles the IR into `RoutingPushPlan` and has no map side effects.
+  [`crates/honk-core/src/ebpf/real/routing.rs`](../../../crates/honk-core/src/ebpf/real/routing.rs)
+  owns generation maps, extension loading, target attachment, and publication.
+- [`crates/honk-ebpf/src/route.rs`](../../../crates/honk-ebpf/src/route.rs) —
+  static root/slot facade and fixed-ABI dispatch; it contains no interpreter or
+  fallback rule engine. Static TC callers retain packet parsing and enforcement
+  around this synchronous call.
+- Older sockops/sk_msg redirection experiments are not part of the current
+  datapath. They were removed after kernel-panic reports on some kernels; TC
+  redirect is the supported path, and the loader resolves only current program
+  names.
 
 The userspace reference and kernel compiler consume this representation. DNS and
 sniffing produce the truth bits of **all domain predicates**, not the first
@@ -109,8 +143,8 @@ Each generation owns separate destination IPv4/IPv6 and source IPv4/IPv6 LPM
 maps, a MAC index and a domain hash map. Family-separated IP maps prevent an IPv6
 prefix from matching a mapped IPv4 flow. A more-specific LPM entry inherits all
 matching ancestor predicate bits, so longest-prefix lookup preserves ordered
-rule semantics. Facts use the full `DomainRouting` bitmap in their own generation;
-there is no shared two-bank LPM value that a staged prefix can shadow.
+rule semantics. Facts use the complete `DomainRouting` bitmap within their own
+generation; a staged prefix cannot shadow facts from another generation.
 
 Fact preparation keeps hash-first duplicate coalescing, sorts only unique keys,
 and applies ancestor inheritance in the original vector before compacting its
@@ -157,13 +191,13 @@ needed. Static plan reuse and DNS projection ownership remain separate.
 
 Publication is serialized with the existing reload and DNS publication fences:
 
-1. Compile and validate the complete candidate and retain the active policy.
-2. Build and fill candidate-owned fact maps, including its learned-domain state.
-3. Load the generated extension with those exact map FDs and valid BTF metadata.
-4. Attach it to the inactive slot of every relevant TC target.
-5. Replace the single generation root last.
-6. Only after that successful update returns may old TC slots/maps be retired.
-   Userspace IR/reference leases retain their own lifetime independently.
+ 1. Compile and validate the complete candidate and retain the active policy.
+ 2. Build and fill candidate-owned fact maps, including its learned-domain state.
+ 3. Load the generated extension with those exact map FDs and valid BTF metadata.
+ 4. Attach it to the inactive slot of every relevant TC target.
+ 5. Replace the single generation root last.
+ 6. Only after that successful update returns may old TC slots/maps be retired.
+    Userspace IR/reference leases retain their own lifetime independently.
 
 Linux 6.12 waits for old non-sleepable BPF invocations before a successful
 map-in-map update returns: its

@@ -2,7 +2,7 @@
 
 This document describes the userspace DNS architecture shared by transparent port-53 interception and the optional `dns.bind` listener.
 
-Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; the active policy's domain map stores learned predicate facts, not DNS responses.
+Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; generation-owned routing projection and domain-fact maps store learned predicate facts, not DNS responses.
 
 ## Architecture
 
@@ -18,19 +18,33 @@ flowchart LR
     R --> O[Typed outcome]
     O --> X[Ingress reply]
     O --> M[Routing projection]
-    M --> D[Active policy domain-fact map]
+    M --> D[Generation-owned domain-fact maps]
 ```
 
 Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`, forwarder, cache, singleflight set, upstream pools, and routing projection. An adapter owns admission until reply I/O completes; it does not write domain routes directly.
+
+- [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) — `DnsConfig` (`bind`, `upstream`, `routing`, `strategy`, `cache`, `fixed_domain_ttl`). `DnsBindEndpoint` / `DnsBindTransport` / `DnsBindError` parse current-dae listeners with semantic equality; `DnsConfig::bind_endpoint` maps empty to disabled. Bind syntax: [Configuration](../configuration.md). `DnsUpstream`: name, address, `protocol: DnsProtocol`, `tls_server_name`, **`outbound: Option<String>`** dial-path proxy tag.
+  Dae routing: first-match `DnsRequestRule`/`DnsResponseRule`, AND-ed negatable `DnsCond`s. Request: Qname/Qtype/Sip; response: Qname/Qtype/Upstream/Ip. `Sip` accepts mixed host/CIDR arguments, never response rules. Actions: Reject/AsIs/Accept/Upstream(name); legacy `rules`/`fallback` convert. `types.rs::DnsProtocol`: 6 variants—Udp, Tcp, Tls (DoT), Https (DoH), H3 (DoH3), Quic (DoQ). Only the dae parser populates request/response routing types; they deliberately sit outside serde.
+- DNS hosts use immutable, generation-pinned snapshots. Ordered `use_host` sources merge before request routing, cache lookup, or upstream exchange. Source syntax, precedence, and transactional SIGHUP behavior: [Configuration](../configuration.md).
+
+- [`src/dns/`](../../../crates/honk-core/src/dns/) — module ownership:
+    - `runtime/` — `DnsRuntime` and `DnsServiceProvider`; [generations and retirement](#generations-and-reload).
+    - `forwarder/`, `engine/`, `planner/`, `policy.rs` — [resolution pipeline](#resolution-pipeline) and request/response policy.
+    - `cache/` — [answer cache and persistence](#cache-and-persistence).
+    - `upstream_pool/`, `transport/` — [upstream sessions and drivers](#upstream-transports).
+    - `projection/` — generation-owned routing projection and domain-fact reconciliation ([routing projection](#routing-projection)).
+    - `service.rs`, `resolver.rs` — current-provider access for transparent DNS, `dns.bind`, Clash API, and application lookups.
 
 ## Ingress paths
 
 | Path | Socket and destination model | Reply model |
 | --- | --- | --- |
-| Transparent port 53 | The eBPF TCP and UDP fast path redirects port-53 traffic without the full route loop. The adapter preserves the intercepted original destination and ingress transport. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` dials that original destination and preserves TCP/UDP, including UDP `TC` fallback to TCP. |
+| Transparent port 53 | LAN-forwarded TCP and UDP destination port `53` takes the eBPF early fast path, which skips the compiled traffic policy and redirects to the control plane. Host-originated WAN port-53 traffic uses the generated routing result; a non-`must` result is handed to userspace as `ControlPlaneRouting` with its mark intact, while terminal `must` decisions retain their native result. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` dials that original destination and preserves TCP/UDP, including UDP `TC` fallback to TCP. |
 | Standalone `dns.bind` | Selected TCP/UDP sockets are ordinary unmarked sockets in the host network namespace. They have no intercepted destination. | TCP replies on the accepted socket. UDP uses packet info so a wildcard bind replies from the exact local address and interface that received the query. |
 
-`DnsRequestMeta` carries the logical client source and intercepted destination as one immutable value. Both transparent and standalone adapters set `source_ip` from the socket peer; only transparent interception sets `original_dst`. IPv4-mapped IPv6 peers normalize to IPv4. Flow-associated TCP/UDP lookups use the admitted flow's client address and have no intercepted DNS destination. Internal, bootstrap, prefetch, and Clash API queries have neither value.
+`DnsRequestMeta { source_ip, original_dst }` carries the logical client source and intercepted destination as one immutable value. Both transparent and standalone adapters set `source_ip` from the socket peer; only transparent interception sets `original_dst`. IPv4-mapped IPv6 peers normalize to IPv4. Flow-associated TCP/UDP lookups use the admitted flow's client address and have no intercepted DNS destination. Internal, bootstrap, prefetch, and Clash API queries have neither value.
+
+Stale refresh and preferred-family siblings retain the initiating `DnsRequestMeta`. Source-aware flow resolution without an intercepted destination fails closed when policy selects `asis`.
 
 The standalone listener has these lifecycle and admission invariants:
 
@@ -87,6 +101,8 @@ If Honk's selected upstream is also dnsmasq `127.0.0.1:53` while dnsmasq forward
 ## Resolution pipeline
 
 The production path is ordered as follows:
+
+Production `DnsService` callers require strict query/response wire validation before cache publication. The raw `DnsForwarder::resolve*` compatibility surface remains for legacy internal callers.
 
 | Stage | Invariant |
 | --- | --- |
@@ -192,7 +208,7 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 
 ## Routing projection
 
-`DnsController` converts resolution outcomes into desired state rather than writing the active policy's domain map inline:
+`DnsController` converts resolution outcomes into generation-owned desired state rather than writing domain facts inline:
 
 | Outcome | Projection observation |
 | --- | --- |
@@ -202,19 +218,19 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 
 The domain association remains global and source-independent within each policy generation. Source-aware request routing isolates DNS exchange scopes and answers; it does not partition eBPF domain observations or ordinary traffic routing. Projection evaluates every domain predicate independently of non-domain rule conditions, including predicates used by negation; a known domain with no matching predicate retains a present zero bitmap.
 
-The worker reconciles generation-tagged desired state in batches of at most 256 sets/removes. Failed writes remain dirty and retry with bounded backoff. Before a batch mutates the backend, the worker acquires the backend lock and rechecks the generation while holding the publication fence. Reload installs the replacement projection snapshot under the same backend lock. An old batch can therefore neither enter nor continue mutating the map after a replacement generation is published.
+The worker reconciles generation-tagged desired state in batches of at most 256 sets/removes. Failed writes remain dirty and retry with bounded backoff. Before a batch mutates a generation-owned domain-fact map, the worker acquires the backend lock and rechecks the generation while holding the publication fence. Reload installs the replacement projection snapshot under the same backend lock. An old batch can therefore neither enter nor continue mutating the map after a replacement generation is published.
 
 ## Generations and reload
 
-One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. DNS proxy transports use a fresh outbound runtime registry, independent of both traffic session reuse and predecessor DNS sessions. The DNS registry shares its source configuration generation's dial semaphore and the process-wide physical-dial ceiling, not its retirement flag or protocol pools.
+One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of both traffic session reuse and predecessor DNS sessions. The DNS registry shares its source configuration generation's dial semaphore and the process-wide physical-dial ceiling, not its retirement flag or protocol pools.
 
 The existing TLS maintenance pass also reaps the active DNS registry's idle connectors. Terminal registry shutdown releases its cached connectors even while a retired runtime remains retained.
 
-Publication makes the replacement immediately available with independent execution resources: even a saturated predecessor cannot consume its query/UDP quota or make it join an old flight. The completed-answer cache, publication/flush fence, and persistence remain shared; they do not own in-flight work. Old query leases drain naturally through reply I/O, then retirement joins background workers, closes DNS transports and their private proxy sessions, and retires the captured traffic registry's non-transferred reusable state.
+Publication makes the replacement immediately available with independent execution resources: even a saturated predecessor cannot consume its query/UDP quota or make it join an old flight. The completed-answer cache, publication/flush fence, and persistence remain shared; they do not own in-flight work. Old query leases drain naturally through reply I/O, then retirement joins background workers, closes DNS transports, closes their private outbound runtime fork only after those transports drain, and retires the captured traffic registry's non-transferred reusable state.
 
-The 30-second deadline bounds waiting for query leases, not completion of transport and outbound-pool teardown. It is a safety cutoff, not a prerequisite for new service: expiry cancels runtime-owned forwarding and admitted reply futures. Bootstrap fallback after forwarding has returned is outside that cancellation scope. At most four retired runtimes remain retained; cap eviction and provider shutdown force the same cancellation. A ready terminal `SERVFAIL` reply is still attempted, but stalled admitted reply I/O is cancelled; a cancelled TCP write closes the connection.
+The 30-second deadline bounds waiting for query leases, not completion of transport and outbound-pool teardown. It is a safety cutoff, not a prerequisite for new service: expiry cancels runtime-owned forwarding and admitted reply futures before transport teardown. Bootstrap fallback after forwarding has returned is outside that cancellation scope. At most four retired runtimes remain retained; cap eviction and provider shutdown force the same cancellation. A ready terminal `SERVFAIL` reply is still attempted, but stalled admitted reply I/O is cancelled; a cancelled TCP write closes the connection.
 
-Provider-owned retirement supervisors are reaped and joined at shutdown. Listener sockets and process-wide physical resource limits remain shared, so isolation does not promise service after descriptor exhaustion.
+`DnsServiceProvider` owns every retirement and forced-close supervisor; they are reaped and joined at shutdown. Listener sockets and process-wide physical resource limits remain shared, so isolation does not promise service after descriptor exhaustion.
 
 SIGHUP builds policy, `/etc/hosts`, groups, routing, upstream transports, projection data, and the outbound runtime before the commit point. Publication occurs with the control-plane routing/config locks; failed preparation leaves the current generation intact. A semantic `dns.bind` change is the exception: listener ownership is process-scoped and the reload is rejected as restart-required.
 

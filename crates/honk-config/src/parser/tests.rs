@@ -40,7 +40,7 @@ global {
     }
 
     #[test]
-    fn test_millisecond_durations_reject_values_they_cannot_read() {
+    fn test_millisecond_durations_keep_the_default_and_warn() {
         for (value, expected) in [("50ms", 50), ("0ms", 0), ("0.5s", 500), ("50", 50)] {
             let input = format!("global {{\n    check_tolerance: {value}\n}}");
             let config = parse_dae_config(&input).unwrap();
@@ -50,18 +50,45 @@ global {
         for value in [
             "1m", "2h", "1min", "abc", "-5ms", "-0.5s", "1.5ms", "inf", "nan", "",
         ] {
-            for (setting, key) in [
-                ("global.check_tolerance", "check_tolerance"),
-                ("global.sniffing_timeout", "sniffing_timeout"),
+            for (setting, key, default) in [
+                ("global.check_tolerance", "check_tolerance", 50),
+                ("global.sniffing_timeout", "sniffing_timeout", 30),
             ] {
                 let input = format!("global {{\n    {key}: {value}\n}}");
-                let error = parse_dae_config(&input).unwrap_err();
-                assert!(matches!(error, crate::ConfigError::Parse(_)), "{value}");
+                let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let writer = std::sync::Arc::clone(&output);
+                let subscriber = tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(move || LogWriter(std::sync::Arc::clone(&writer)))
+                    .finish();
+                let config = tracing::subscriber::with_default(subscriber, || {
+                    parse_dae_config(&input).unwrap()
+                });
+                let observed = match key {
+                    "check_tolerance" => config.global.check_tolerance_ms,
+                    _ => config.global.sniffing_timeout_ms,
+                };
+                assert_eq!(observed, default, "{setting} for {value}");
+                let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
                 assert!(
-                    error.to_string().contains(setting),
-                    "error must identify {setting} for {value}: {error}"
+                    logged.contains(setting),
+                    "warning must identify {setting} for {value}: {logged}"
                 );
             }
+        }
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 

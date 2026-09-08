@@ -287,11 +287,32 @@ impl Node {
         if let Some(config) = self.vless() {
             config.validate(&self.name)?;
         }
+        let Some(tls) = self.tls() else {
+            return Ok(());
+        };
+        tls.validate_alpn()?;
+        if tls.alpn.is_empty() {
+            return Ok(());
+        }
+        let reality = tls.reality_public_key.is_some()
+            || tls.reality_short_id.is_some()
+            || tls.reality_spider_x.is_some();
+        let raw_tcp = self.anytls().is_some()
+            || self
+                .transport()
+                .is_some_and(|transport| matches!(transport.transport.as_str(), "" | "tcp"));
+        if !tls.enabled || reality || !raw_tcp {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{}' sets TLS ALPN outside enabled non-REALITY raw TCP TLS",
+                self.name
+            )));
+        }
         Ok(())
     }
 
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
+    /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = format!(
             "{}|{}|{}|{}|{}",
@@ -301,7 +322,14 @@ impl Node {
             self.outbound.credential_fingerprint(),
             self.outbound.dial_shape_fingerprint()
         );
-        uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes())
+        let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
+        if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
+            let alpn = serde_json::to_vec(&("tls-alpn", &tls.alpn))
+                .expect("TLS ALPN strings are JSON serializable");
+            uuid::Uuid::new_v5(&legacy_id, &alpn)
+        } else {
+            legacy_id
+        }
     }
 }
 
@@ -617,5 +645,89 @@ mod tests {
         let mut other_insecure = node.clone();
         other_insecure.tls_mut().unwrap().skip_cert_verify = true;
         assert_eq!(node.derive_id(), other_insecure.derive_id());
+    }
+
+    #[test]
+    fn test_tls_alpn_identity_is_ordered_and_framed() {
+        let legacy = Node::from_share_link("anytls://secret@example.com:443#anytls").unwrap();
+        assert_eq!(
+            legacy.id.to_string(),
+            "743d15b1-586a-5095-9e49-58c6f444f738"
+        );
+
+        let id_with = |protocols: &[&str]| {
+            let mut node = legacy.clone();
+            node.tls_mut().unwrap().alpn = protocols.iter().map(|value| (*value).into()).collect();
+            node.validate_protocol().unwrap();
+            node.derive_id()
+        };
+        assert_eq!(id_with(&[]), legacy.id);
+        let ids = [
+            id_with(&["h2"]),
+            id_with(&["h2", "http/1.1"]),
+            id_with(&["http/1.1", "h2"]),
+            id_with(&["a,b", "c"]),
+            id_with(&["a", "b,c"]),
+        ];
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            ids.len()
+        );
+        assert!(ids.iter().all(|id| *id != legacy.id));
+
+        let mut explicit = legacy.clone();
+        explicit.anytls_mut().unwrap().password = Some("p".into());
+        explicit.tls_mut().unwrap().alpn = vec!["X||tcp||||||||".into()];
+        let mut embedded = legacy;
+        embedded.anytls_mut().unwrap().password = Some("p||tcp|||||||||tls-alpn:1:14:X".into());
+        assert_ne!(explicit.derive_id(), embedded.derive_id());
+    }
+
+    #[test]
+    fn test_tls_alpn_validation_boundaries_and_context() {
+        for protocol in [String::new(), "x".repeat(256), "é".repeat(128)] {
+            let tls = TlsOptions {
+                alpn: vec![protocol],
+                ..Default::default()
+            };
+            assert!(tls.validate_alpn().is_err());
+        }
+
+        let mut tls = TlsOptions {
+            alpn: vec!["x".repeat(255); 255],
+            ..Default::default()
+        };
+        tls.alpn.push("x".repeat(252));
+        assert!(tls.validate_alpn().is_ok());
+        tls.alpn.push("x".into());
+        assert!(tls.validate_alpn().is_err());
+
+        let mut raw = Node::from_share_link("trojan://secret@example.com:443").unwrap();
+        raw.transport_mut().unwrap().transport.clear();
+        raw.tls_mut().unwrap().alpn = vec!["h2".into()];
+        assert!(raw.validate_protocol().is_ok());
+
+        let mut disabled = Node::from_share_link("trojan://secret@example.com:443").unwrap();
+        disabled.tls_mut().unwrap().enabled = false;
+        disabled.tls_mut().unwrap().alpn = vec!["h2".into()];
+
+        let mut wrapped =
+            Node::from_share_link("trojan://secret@example.com:443?type=ws&path=%2Fproxy").unwrap();
+        wrapped.tls_mut().unwrap().alpn = vec!["h2".into()];
+
+        let mut reality =
+            Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=public-key")
+                .unwrap();
+        reality.tls_mut().unwrap().alpn = vec!["h2".into()];
+
+        let mut quic = Node::from_share_link("hysteria2://secret@example.com:443").unwrap();
+        quic.tls_mut().unwrap().alpn = vec!["h3".into()];
+
+        for node in [disabled, wrapped, reality, quic] {
+            assert!(node.validate_protocol().is_err(), "{}", node.name);
+        }
     }
 }

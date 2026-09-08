@@ -137,6 +137,7 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
                 "servername",
                 "server-name",
                 "sni",
+                "alpn",
                 "skip-cert-verify",
                 "skip_cert_verify",
                 "insecure",
@@ -516,22 +517,23 @@ fn apply_tls(
         )?
         .unwrap_or(false);
         tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256"])?;
+        if !supports_quic(protocol)
+            && let Some(alpn) = yaml_value(mapping, "alpn")
+        {
+            tls.alpn = fields::alpn_list(alpn)?;
+        }
     }
     apply_reality(mapping, node, protocol, tls_explicit)
 }
 
 fn apply_quic(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str> {
     let protocol = node.protocol();
-    if yaml_value(mapping, "alpn").is_some_and(yaml_active) {
-        match protocol {
-            NodeProtocol::Tuic => {}
-            NodeProtocol::Hysteria2 | NodeProtocol::Juicity => {
-                let alpn = yaml_list_alias(mapping, &["alpn"])?.unwrap_or_default();
-                if !alpn.split(',').all(|value| value.trim() == "h3") {
-                    return Err("unsupported fixed QUIC ALPN");
-                }
-            }
-            _ => return Err("TUIC ALPN is unsupported for this protocol"),
+    if matches!(protocol, NodeProtocol::Hysteria2 | NodeProtocol::Juicity)
+        && yaml_value(mapping, "alpn").is_some_and(yaml_active)
+    {
+        let alpn = yaml_list_alias(mapping, &["alpn"])?.unwrap_or_default();
+        if !alpn.split(',').all(|value| value.trim() == "h3") {
+            return Err("unsupported fixed QUIC ALPN");
         }
     }
     if let Some(mode) = yaml_text_alias(mapping, &["udp-relay-mode", "udp_relay_mode"])?

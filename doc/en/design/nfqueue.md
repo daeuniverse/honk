@@ -52,6 +52,11 @@ flowchart LR
 
 The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 
+Linux mechanism used only by `honk-core`'s `ebpf` feature.
+Parse one exact-sized datagram allocation. `QueueStats` separates current-instance
+depth from process-wide drops accumulated across hard rebinds, reports latest
+kernel-read availability/errors, and always refreshes held-guard/effective-buffer gauges.
+
 ## Decision-token protocol
 
 `UDP_DECISION_SEQUENCE` is a pinned, persistent one-slot spin-locked allocator. Its legacy value is exactly 12 bytes: lock, full raw token in `next`, and `exhausted`. Startup validates this ABI and value but never rewrites it. Ordinary restart and cleanup preserve the pin so an older binary can resume at the same raw-token boundary after rollback.

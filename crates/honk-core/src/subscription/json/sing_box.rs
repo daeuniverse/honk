@@ -168,7 +168,7 @@ fn normalize_vmess(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
         "sing-box VMess UoT is unsupported",
     )?;
     normalize_transport(&mut source, &mut proxy)?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::VMess)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -204,7 +204,7 @@ fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
         Value::String(packet_encoding.into()),
     );
     normalize_transport(&mut source, &mut proxy)?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::VLess)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -222,7 +222,7 @@ fn normalize_trojan(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
         "sing-box Trojan UoT is unsupported",
     )?;
     normalize_transport(&mut source, &mut proxy)?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::Trojan)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -249,7 +249,7 @@ fn normalize_hysteria2(mut source: Mapping, mut proxy: Mapping) -> Result<Mappin
     }
     normalize_hysteria2_obfs(&mut source, &mut proxy)?;
     normalize_quic_fields(&mut source, &mut proxy)?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::Hysteria2)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -283,7 +283,7 @@ fn normalize_tuic(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'
         }
     }
     normalize_quic_fields(&mut source, &mut proxy)?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::Tuic)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -295,7 +295,7 @@ fn normalize_juicity(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping,
     )?;
     reject_packet_network(&mut source)?;
     normalize_quic_fields(&mut source, &mut proxy)?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::Juicity)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -322,7 +322,7 @@ fn normalize_anytls(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
         "multiplex",
         "sing-box AnyTLS multiplex settings are unsupported",
     )?;
-    normalize_tls(&mut source, &mut proxy, NodeProtocol::AnyTLS)?;
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 
@@ -504,11 +504,7 @@ fn normalize_grpc_transport(
     Ok(())
 }
 
-fn normalize_tls(
-    source: &mut Mapping,
-    proxy: &mut Mapping,
-    protocol: NodeProtocol,
-) -> Result<(), &'static str> {
+fn normalize_tls(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
     let Some(value) = source.remove("tls") else {
         put(proxy, "tls", Value::Bool(false));
         return Ok(());
@@ -551,15 +547,8 @@ fn normalize_tls(
     if let Some(reality) = reality {
         normalize_reality(reality, proxy)?;
     }
-    if let Some(alpn) = alpn.filter(active) {
+    if let Some(alpn) = alpn.filter(|value| !value.is_null()) {
         validate_alpn(&alpn)?;
-        let fixed_h3 = matches!(&alpn, Value::String(value) if value == "h3")
-            || matches!(&alpn, Value::Sequence(values) if values.len() == 1 && values[0].as_str() == Some("h3"));
-        if protocol != NodeProtocol::Tuic
-            && !(matches!(protocol, NodeProtocol::Hysteria2 | NodeProtocol::Juicity) && fixed_h3)
-        {
-            return Err("TLS ALPN is unsupported for this sing-box protocol");
-        }
         put(proxy, "alpn", alpn);
     }
     Ok(())

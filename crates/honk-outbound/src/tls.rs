@@ -365,6 +365,9 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
 /// root store. Runtime registries use this before publication; connectors are
 /// built lazily when a node first enters the active working set.
 pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
+    if node.tls().is_some_and(|tls| !tls.alpn.is_empty()) {
+        node.validate_protocol()?;
+    }
     load_ech_config_list(node)?;
     if let Some(pin) = node.tls().and_then(|tls| tls.pin_sha256.as_deref())
         && parse_pin_sha256(pin).is_none()
@@ -539,31 +542,47 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         })?),
         None => None,
     };
+    let custom_alpn = if tls.alpn.is_empty() {
+        None
+    } else {
+        node.validate_protocol()?;
+        let mut wire = Vec::with_capacity(tls.alpn.iter().map(|proto| 1 + proto.len()).sum());
+        for proto in &tls.alpn {
+            wire.push(proto.len() as u8);
+            wire.extend_from_slice(proto.as_bytes());
+        }
+        Some(wire)
+    };
+    let websocket = node
+        .transport()
+        .is_some_and(|transport| transport.transport == "ws");
+    let alps = chrome
+        && if tls.alpn.is_empty() {
+            !websocket
+        } else {
+            tls.alpn.iter().any(|protocol| protocol == "h2")
+        };
+    let default_alpn = chrome.then_some(if websocket {
+        HTTP11_ALPN_WIRE
+    } else {
+        CHROME_ALPN_WIRE
+    });
+    let alpn_wire = custom_alpn.as_deref().or(default_alpn);
     let mut builder = base_builder(tls.skip_cert_verify || pin.is_some())?;
     if let Some(pin) = pin {
         builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
     }
     if chrome {
         apply_chrome_ctx(&mut builder)?;
-        builder.set_alpn_protos(
-            if node
-                .transport()
-                .is_some_and(|transport| transport.transport == "ws")
-            {
-                HTTP11_ALPN_WIRE
-            } else {
-                CHROME_ALPN_WIRE
-            },
-        )?;
+    }
+    if let Some(alpn_wire) = alpn_wire {
+        builder.set_alpn_protos(alpn_wire)?;
     }
 
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
-        alps: chrome
-            && !node
-                .transport()
-                .is_some_and(|transport| transport.transport == "ws"),
+        alps,
         ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
     })

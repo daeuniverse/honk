@@ -914,7 +914,10 @@ impl OutboundRuntimeRegistry {
             }
             // Validate cheap, fail-closed TLS inputs before publishing the
             // generation. The heavyweight SSL_CTX/root store stays lazy.
-            if node.tls().is_some_and(|tls| tls.enabled) {
+            if node
+                .tls()
+                .is_some_and(|tls| tls.enabled || !tls.alpn.is_empty())
+            {
                 crate::tls::validate_connector_config(node).map_err(|source| {
                     RuntimeRegistryError::Tls {
                         node: node.name.clone(),

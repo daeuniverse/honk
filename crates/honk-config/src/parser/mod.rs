@@ -14,6 +14,7 @@ use crate::group::Group;
 use crate::node::Node;
 use crate::subscription::Subscription;
 use regex::Regex;
+use tracing::warn;
 #[derive(Debug, Clone)]
 struct Section {
     name: String,
@@ -803,7 +804,8 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.check_interval_secs = parse_duration_secs(v);
     }
     if let Some(v) = kv.get("check_tolerance") {
-        cfg.check_tolerance_ms = parse_checked_duration_ms(v, "global.check_tolerance")?;
+        cfg.check_tolerance_ms =
+            lenient_duration_ms(v, "global.check_tolerance", cfg.check_tolerance_ms);
     }
     if let Some(v) = kv.get("dial_mode") {
         cfg.dial_mode = v.clone();
@@ -815,7 +817,8 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.allow_insecure = parse_bool(v);
     }
     if let Some(v) = kv.get("sniffing_timeout") {
-        cfg.sniffing_timeout_ms = parse_checked_duration_ms(v, "global.sniffing_timeout")?;
+        cfg.sniffing_timeout_ms =
+            lenient_duration_ms(v, "global.sniffing_timeout", cfg.sniffing_timeout_ms);
     }
     if let Some(v) = kv.get("tls_implementation") {
         cfg.tls_implementation = v.clone();
@@ -1217,10 +1220,21 @@ fn parse_duration_secs(s: &str) -> u64 {
     crate::types::parse_duration_secs(s).unwrap_or(0)
 }
 
-fn parse_checked_duration_ms(s: &str, setting: &str) -> Result<u64, crate::ConfigError> {
-    crate::types::parse_duration_ms(s).ok_or_else(|| {
-        crate::ConfigError::Parse(format!("invalid millisecond duration for {setting}: {s}"))
-    })
+/// Keep the documented default for a timer the grammar cannot read. Guessing
+/// wrong here only changes how eagerly URLTest switches member, which does not
+/// justify refusing the whole configuration. Non-finite and negative values
+/// stay unreadable because `as u64` would saturate them to `u64::MAX`.
+fn lenient_duration_ms(value: &str, setting: &str, default: u64) -> u64 {
+    match crate::types::parse_duration_ms(value) {
+        Some(milliseconds) => milliseconds,
+        None => {
+            warn!(
+                setting,
+                value, default, "duration is not milliseconds, `ms` or `s`; keeping the default"
+            );
+            default
+        }
+    }
 }
 
 fn parse_ip_prefer(s: &str) -> crate::dns::DnsStrategy {

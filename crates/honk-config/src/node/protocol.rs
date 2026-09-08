@@ -14,6 +14,28 @@ pub struct TlsOptions {
     pub reality_short_id: Option<String>,
     pub reality_spider_x: Option<String>,
     pub pin_sha256: Option<String>,
+    pub alpn: Vec<String>,
+}
+
+impl TlsOptions {
+    pub(super) fn validate_alpn(&self) -> Result<(), crate::ConfigError> {
+        let mut encoded_len = 0usize;
+        for protocol in &self.alpn {
+            let len = protocol.len();
+            if !(1..=255).contains(&len) {
+                return Err(crate::ConfigError::Validation(
+                    "TLS ALPN protocol names must be 1..=255 bytes".into(),
+                ));
+            }
+            encoded_len += len + 1;
+        }
+        if encoded_len > 65_533 {
+            return Err(crate::ConfigError::Validation(
+                "TLS ALPN protocol list exceeds 65533 encoded bytes".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

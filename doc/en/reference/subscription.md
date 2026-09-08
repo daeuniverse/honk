@@ -73,7 +73,7 @@ Failure handling preserves a usable runtime rather than clearing it:
 
 - HTTP, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
-- An unsupported or malformed node is skipped individually. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
+- An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based proxy index and a static rejection reason, never the raw record or its credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
 
 Changing `global.store_subscribe` through SIGHUP is rejected as restart-required.
 
@@ -113,12 +113,15 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `sni` | `sni` | `servername` wins; `sni` is the fallback. |
 | `skip-cert-verify` | `skip_cert_verify` | Optional boolean. |
+| `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for AnyTLS and ordinary raw-TCP Trojan/VMess/VLESS TLS; explicit values reach the TLS handshake in both `tls` and `utls` modes. QUIC retains the protocol-specific rules below. |
 
 #### Protocol-specific options
 
 Hysteria2 imports `password`/`auth`, `obfs: salamander` with `obfs-password`, upload/download bandwidth, `ports`/`mport` hopping ranges, `hop-interval`/`mhop`, receive windows, MTU, and MTU-discovery settings. TUIC imports UUID/password, congestion control, ALPN, receive windows, and MTU. AnyTLS imports `idle-session-check-interval`, `idle-session-timeout`, and `min-idle-session`. Supported spelling aliases are normalized before node identity is derived.
 
 Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols; an explicit UDP restriction is rejected where the node model cannot preserve it. TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection; Juicity receive windows remain fixed at 8 MiB, so non-default overrides are rejected.
+
+TCP TLS ALPN list members are preserved verbatim, including order; each name must occupy 1–255 UTF-8 bytes and the length-prefixed list may not exceed 65,533 bytes. This is a syntactic ceiling; the complete ClientHello also has TLS-library size limits. Absent, null, or empty imported `alpn` lists preserve existing TLS-profile defaults and node IDs; the flat `tls_alpn` field accepts omission or a string array, not null. Nonempty overrides participate in identity and are rejected with disabled TLS, REALITY, WebSocket, or gRPC rather than silently discarded. Chrome ALPS is offered only when the actual ALPN list contains `h2`. Share-link ALPN compatibility is unchanged; this applies to structured subscription imports and the flat `tls_alpn` model field.
 
 #### VLESS transport and REALITY
 

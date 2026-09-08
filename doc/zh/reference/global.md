@@ -25,10 +25,10 @@
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔；省略端口时默认为 `53`。 |
 | `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。必须为正；解析失败的值会变成零并在校验时被拒绝。UDP 预热 coordinator 也使用该值，但实际下限为 10 秒。 |
-| `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。接受裸毫秒数、`ms` 或 `s`，其余写法在配置加载时被拒绝。 |
+| `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。接受裸毫秒数、`ms` 或 `s`，其余写法沿用此默认值并记录一条警告。 |
 | `dial_mode` | `dial_mode` | `"domain"` | 目的域名发现和路由模式：`ip`、`domain`、`domain+` 或 `domain++`。参见[拨号模式](#拨号模式)。 |
 | `allow_insecure` | `allow_insecure` | `false` | 全局 TLS 校验回退兼容字段。当前 TLS connector 不读取该字段；跳过证书校验需在节点分享链接中按节点配置。 |
-| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段。dae 解析器会保存该时长，但当前控制面不读取它。接受裸毫秒数、`ms` 或 `s`，其余写法在配置加载时被拒绝。 |
+| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段。dae 解析器会保存该时长，但当前控制面不读取它。接受裸毫秒数、`ms` 或 `s`，其余写法沿用此默认值并记录一条警告。 |
 | `tls_implementation` | `tls_implementation` | `"tls"` | `tls` 使用常规 BoringSSL 客户端 profile；`utls` 启用 honk 的真实 Chrome ClientHello profile。 |
 | `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 使用 `utls` 时请求的指纹 profile。当前只实现 `chrome*`；其他值会告警并仍使用 Chrome。 |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello 分片兼容开关；当前 TLS connector 不读取该字段。 |

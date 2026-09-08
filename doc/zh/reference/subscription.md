@@ -73,7 +73,7 @@ SIGHUP 时，fetch 身份（URL + 配置的 `ua` + headers）相同的订阅保�
 
 - HTTP、解析或没有可用节点的失败不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。
 - 持久化写入在解析成功后失败属于非致命错误：新解析出的节点仍会返回用于发布，而原子写入路径绝不会安装只写了一部分的正文。下次重启因此可以恢复磁盘上保留的任一完整有效正文。
-- 不支持或格式错误的节点会逐个跳过。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
+- 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的 proxy 索引和固定拒绝原因，不包含原始记录或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
 
 通过 SIGHUP 修改 `global.store_subscribe` 会因需要重启而被拒绝。
 
@@ -113,12 +113,15 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `tls` | `tls` | 可选 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 默认启用 TLS，并拒绝显式关闭。 |
 | `servername`, `sni` | `sni` | `servername` 优先，`sni` 作为回退。 |
 | `skip-cert-verify` | `skip_cert_verify` | 可选 bool。 |
+| `alpn` | `tls_alpn` | AnyTLS 与普通裸 TCP Trojan/VMess/VLESS TLS 的有序字符串列表（或逗号分隔字符串）；显式值在 `tls` 与 `utls` 模式下都会用于实际 TLS 握手。QUIC 继续使用下文的协议专属规则。 |
 
 #### 协议专属选项
 
 Hysteria2 导入 `password`/`auth`、`obfs: salamander` 与 `obfs-password`、上传/下载带宽、`ports`/`mport` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。TUIC 导入 UUID/password、拥塞控制、ALPN、接收窗口和 MTU。AnyTLS 导入 `idle-session-check-interval`、`idle-session-timeout` 和 `min-idle-session`。支持的拼写别名会在派生节点身份前规范化。
 
 显式关闭的功能 block 按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；节点模型无法保留显式 UDP 限制时会拒绝导入。TUIC 允许省略 password 或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN；Juicity 接收窗口固定为 8 MiB，因此拒绝非默认覆盖值。
+
+TCP TLS ALPN 列表成员及顺序原样保留；每个名称必须占 1–255 个 UTF-8 字节，带长度前缀的完整列表不得超过 65,533 字节。这是语法上限；完整 ClientHello 还受 TLS 库的大小限制。导入的 `alpn` 省略、为 null 或空列表时保留原有 TLS profile 默认值及节点 ID；扁平字段 `tls_alpn` 只接受省略或字符串数组，不接受 null。非空覆盖值参与节点身份派生；与关闭 TLS、REALITY、WebSocket 或 gRPC 组合时会拒绝，不会静默丢弃。只有实际 ALPN 列表包含 `h2` 时才发送 Chrome ALPS。分享链接原有的 ALPN 兼容行为不变；这里适用于结构化订阅导入及扁平模型字段 `tls_alpn`。
 
 #### VLESS transport 与 REALITY
 

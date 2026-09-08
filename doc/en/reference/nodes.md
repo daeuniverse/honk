@@ -27,7 +27,7 @@ A malformed recognized link is dropped with `node section: skipping unparseable 
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and every non-`legacy` VLESS mode. Tuning and display metadata do not participate.
+The credential fingerprint follows each handler's field precedence. The legacy dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and every non-`legacy` VLESS mode. Nonempty structured `tls_alpn` derives a child UUID v5 using the legacy ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains legacy IDs. Tuning and display metadata do not participate.
 
 Identity is therefore stable across rename, reload, and subscription refresh when the dialable endpoint is unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
 
@@ -50,6 +50,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
 | `sni` | string? | null | TLS server name from `sni`, then `peer`, then an unconsumed `host` query |
+| `tls_alpn` | string[] | `[]` | Structured/imported ordinary raw-TCP TLS ALPN; empty preserves the TLS profile default. Nonempty values are supported for AnyTLS and TCP Trojan/VMess/VLESS, not disabled TLS, REALITY, WS/gRPC, or QUIC. TUIC retains `tuic_alpn`; this is not a share-link query. |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`, `allow_insecure`, or `insecure` equal to `1`/`true` |
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
 | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |
@@ -86,6 +87,8 @@ Validation requires every non-built-in node to have a non-empty name and either 
 ### Structured-loader compatibility
 
 TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol`; non-default fields left over from other protocols are stripped without rejecting the node, and one warning lists the stripped field names. For example, `tls: true` on an `ss` node is ignored with a warning rather than enabling TLS. `username` is not a credential alias for Trojan, VLESS, Hysteria2, or AnyTLS; when supplied without that protocol's effective credential field, it is stripped with a targeted warning, preserving legacy behavior and IDs. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
+
+The new `tls_alpn` field is deliberately excluded from legacy stripping: a nonempty value on an unsupported protocol or TLS context rejects the node instead of silently changing its handshake.
 
 ## Protocols
 

@@ -25,10 +25,10 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method sent by the URL health check. An empty value is treated as `HEAD`. |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | Comma-separated DNS targets for UDP health checks; a missing port defaults to `53`. |
 | `check_interval` | `check_interval_secs` | `30s` | Global health-check interval. Must be positive; a value that fails to parse becomes zero and is rejected at validation. The UDP warm coordinator also uses it, with an effective minimum of 10 seconds. |
-| `check_tolerance` | `check_tolerance_ms` | `50ms` | Latency improvement required before URLTest changes its selected member. Accepts bare milliseconds, `ms`, or `s`; anything else is rejected when the configuration loads. |
+| `check_tolerance` | `check_tolerance_ms` | `50ms` | Latency improvement required before URLTest changes its selected member. Accepts bare milliseconds, `ms`, or `s`; anything else keeps this default and logs a warning. |
 | `dial_mode` | `dial_mode` | `"domain"` | Destination-domain discovery and routing mode: `ip`, `domain`, `domain+`, or `domain++`. See [Dial modes](#dial-modes). |
 | `allow_insecure` | `allow_insecure` | `false` | Compatibility global TLS-verification fallback. Current TLS connectors do not read it; certificate skipping is configured per node in its share link. |
-| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | Compatibility sniffing timeout. The dae parser stores the duration, but the current control plane does not read it. Accepts bare milliseconds, `ms`, or `s`; anything else is rejected when the configuration loads. |
+| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | Compatibility sniffing timeout. The dae parser stores the duration, but the current control plane does not read it. Accepts bare milliseconds, `ms`, or `s`; anything else keeps this default and logs a warning. |
 | `tls_implementation` | `tls_implementation` | `"tls"` | `tls` uses the regular BoringSSL client profile; `utls` enables honk's real Chrome ClientHello profile. |
 | `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Fingerprint profile requested with `utls`. Only `chrome*` is implemented; other values warn and still use Chrome. |
 | `tls_fragment` | `tls_fragment` | `false` | Compatibility TLS ClientHello-fragmentation switch. The current TLS connector does not read it. |
