@@ -83,12 +83,15 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     node: &Node,
     tcp: TcpStream,
 ) -> anyhow::Result<MaybeTls> {
+    let tls = node.tls().unwrap();
+    if !tls.alpn.is_empty() {
+        node.validate_protocol()?;
+    }
     if let Some(reality) = crate::reality::parse_reality_config(node)? {
         let tls_stream =
             crate::reality::reality_connect(tcp, &reality, crate::tls::chrome_mode()).await?;
         return Ok(MaybeTls::Tls(Box::new(tls_stream)));
     }
-    let tls = node.tls().unwrap();
     if tls.enabled {
         let connector = crate::tls::build_connector(node)?;
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());

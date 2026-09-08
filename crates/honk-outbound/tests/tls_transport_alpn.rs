@@ -179,3 +179,56 @@ async fn connector_applies_explicit_alpn_and_preserves_profile_defaults() {
         Some(b"http/1.1".as_slice())
     );
 }
+
+#[tokio::test]
+async fn direct_tcp_dial_rejects_ignored_alpn() {
+    use honk_outbound::proxy::{TcpOutbound, trojan::TrojanHandler};
+    use tokio::io::AsyncReadExt;
+
+    let mut disabled = node("tcp", &["h2"]);
+    disabled.tls_mut().unwrap().enabled = false;
+    let mut reality = node("tcp", &["h2"]);
+    reality.tls_mut().unwrap().reality_public_key =
+        Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".into());
+    for node in [disabled, reality] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tcp, peer) = tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let (mut peer, _) = peer.unwrap();
+        let deadline = std::time::Duration::from_secs(1);
+        let error = tokio::time::timeout(
+            deadline,
+            TrojanHandler::new().dial_with_tcp(&node, address, None, tcp.unwrap(), deadline),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ConfigError>(),
+            Some(ConfigError::Validation(_))
+        ));
+        let received = tokio::time::timeout(deadline, peer.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received, 0,
+            "rejected configuration must send no proxy or TLS bytes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_quic_config_rejects_tcp_alpn() {
+    let mut quic_node = Node::from_share_link("hy2://secret@example.com:443").unwrap();
+    quic_node.tls_mut().unwrap().alpn = vec!["h2".into()];
+    for node in [quic_node, node("tcp", &["h2"])] {
+        let error = honk_outbound::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ConfigError>(),
+            Some(ConfigError::Validation(_))
+        ));
+    }
+}

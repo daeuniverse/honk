@@ -392,18 +392,6 @@ impl OutboundConfig {
             fingerprint.push('|');
             fingerprint.push_str(config.mode.as_str());
         }
-        if let Some(tls) = tls
-            && !tls.alpn.is_empty()
-        {
-            use std::fmt::Write as _;
-
-            write!(fingerprint, "|tls-alpn:{}", tls.alpn.len())
-                .expect("writing to String cannot fail");
-            for protocol in &tls.alpn {
-                write!(fingerprint, ":{}:", protocol.len()).expect("writing to String cannot fail");
-                fingerprint.push_str(protocol);
-            }
-        }
         fingerprint
     }
 }

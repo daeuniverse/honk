@@ -1330,10 +1330,6 @@ pub async fn client_config(
     alpn: &[&[u8]],
     options: QuicClientOptions,
 ) -> anyhow::Result<ClientConfig> {
-    let alpn_wire = alpn
-        .iter()
-        .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
-        .collect::<Vec<u8>>();
     let tls = node.tls().ok_or_else(|| {
         anyhow!(
             "node '{}' protocol '{}' has no QUIC TLS configuration",
@@ -1341,6 +1337,16 @@ pub async fn client_config(
             node.protocol().as_str()
         )
     })?;
+    if !tls.alpn.is_empty() {
+        return Err(honk_config::ConfigError::Validation(
+            "TCP TLS ALPN is unsupported for QUIC; use protocol-specific ALPN".into(),
+        )
+        .into());
+    }
+    let alpn_wire = alpn
+        .iter()
+        .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
+        .collect::<Vec<u8>>();
     let ech = match crate::tls::load_ech_config_list(node)? {
         Some(list) => Some(Arc::new(list)),
         None if tls.ech_enabled => {

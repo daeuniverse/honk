@@ -121,7 +121,7 @@ Hysteria2 导入 `password`/`auth`、`obfs: salamander` 与 `obfs-password`、�
 
 显式关闭的功能 block 按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；节点模型无法保留显式 UDP 限制时会拒绝导入。TUIC 允许省略 password 或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN；Juicity 接收窗口固定为 8 MiB，因此拒绝非默认覆盖值。
 
-TCP TLS ALPN 列表成员及顺序原样保留；每个名称必须占 1–255 个 UTF-8 字节，带长度前缀的完整列表不得超过 65,533 字节。省略、null 或空列表保留原有 TLS profile 默认值及节点 ID。非空覆盖值参与节点身份派生；与关闭 TLS、REALITY、WebSocket 或 gRPC 组合时会拒绝，不会静默丢弃。只有实际 ALPN 列表包含 `h2` 时才发送 Chrome ALPS。分享链接原有的 ALPN 兼容行为不变；这里适用于结构化订阅导入及扁平模型字段 `tls_alpn`。
+TCP TLS ALPN 列表成员及顺序原样保留；每个名称必须占 1–255 个 UTF-8 字节，带长度前缀的完整列表不得超过 65,533 字节。这是语法上限；完整 ClientHello 还受 TLS 库的大小限制。导入的 `alpn` 省略、为 null 或空列表时保留原有 TLS profile 默认值及节点 ID；扁平字段 `tls_alpn` 只接受省略或字符串数组，不接受 null。非空覆盖值参与节点身份派生；与关闭 TLS、REALITY、WebSocket 或 gRPC 组合时会拒绝，不会静默丢弃。只有实际 ALPN 列表包含 `h2` 时才发送 Chrome ALPS。分享链接原有的 ALPN 兼容行为不变；这里适用于结构化订阅导入及扁平模型字段 `tls_alpn`。
 
 #### VLESS transport 与 REALITY
 

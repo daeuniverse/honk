@@ -312,6 +312,7 @@ impl Node {
 
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
+    /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = format!(
             "{}|{}|{}|{}|{}",
@@ -321,7 +322,14 @@ impl Node {
             self.outbound.credential_fingerprint(),
             self.outbound.dial_shape_fingerprint()
         );
-        uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes())
+        let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
+        if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
+            let alpn = serde_json::to_vec(&("tls-alpn", &tls.alpn))
+                .expect("TLS ALPN strings are JSON serializable");
+            uuid::Uuid::new_v5(&legacy_id, &alpn)
+        } else {
+            legacy_id
+        }
     }
 }
 
@@ -669,6 +677,13 @@ mod tests {
             ids.len()
         );
         assert!(ids.iter().all(|id| *id != legacy.id));
+
+        let mut explicit = legacy.clone();
+        explicit.anytls_mut().unwrap().password = Some("p".into());
+        explicit.tls_mut().unwrap().alpn = vec!["X||tcp||||||||".into()];
+        let mut embedded = legacy;
+        embedded.anytls_mut().unwrap().password = Some("p||tcp|||||||||tls-alpn:1:14:X".into());
+        assert_ne!(explicit.derive_id(), embedded.derive_id());
     }
 
     #[test]
