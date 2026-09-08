@@ -397,8 +397,8 @@ impl RealEbpfBackend {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
         anyhow::ensure!(
-            version >= (7, 2, 0),
-            "routing tests require Linux 7.2 or newer"
+            version >= (6, 12, 0),
+            "routing tests require Linux 6.12 or newer"
         );
         let bpf = EbpfLoader::new().load(obj)?;
         Ok(Self {

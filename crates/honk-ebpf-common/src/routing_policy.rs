@@ -297,8 +297,11 @@ unsafe fn read_name_byte(input: &[u8], offset: usize) -> u8 {
 
 #[inline(always)]
 unsafe fn write_name_byte(output: &mut [u8; ROUTING_PROCESS_MAX_LEN], offset: usize, byte: u8) {
-    let offset = unsafe { core::ptr::read_volatile(&offset) } % ROUTING_PROCESS_MAX_LEN;
-    unsafe { *output.as_mut_ptr().add(offset) = byte };
+    // Linux 6.12 does not bound BPF_MOD results; check before deriving the pointer.
+    let offset = unsafe { core::ptr::read_volatile(&offset) };
+    if offset < ROUTING_PROCESS_MAX_LEN {
+        unsafe { *output.as_mut_ptr().add(offset) = byte };
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +341,14 @@ mod normalization_tests {
     #[test]
     fn incomplete_sequence_is_one_replacement() {
         assert_eq!(normalized(&[0xE2, 0x82]), "�".as_bytes());
+    }
+
+    #[test]
+    fn replacement_bytes_fill_the_entire_output_capacity() {
+        let input = [0xff; crate::TASK_COMM_LEN];
+        let expected = "�".repeat(crate::TASK_COMM_LEN);
+        assert_eq!(normalized(&input), expected.as_bytes());
+        assert_eq!(expected.len(), ROUTING_PROCESS_MAX_LEN);
     }
 
     #[test]

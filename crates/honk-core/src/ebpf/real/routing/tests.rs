@@ -43,7 +43,7 @@ fn object() -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn four_mode_golden_policies() {
     let (router, cases) = golden::fixtures();
     let ids = HashMap::from([
@@ -100,7 +100,7 @@ fn four_mode_golden_policies() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn large_prefix_fact_policy() {
     let ids = HashMap::from([
         ("direct".into(), 0),
@@ -159,7 +159,7 @@ fn large_prefix_fact_policy() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn predicate_bits_and_capacity_limits() {
     let ids = HashMap::from([
         ("direct".into(), 0),
@@ -250,7 +250,7 @@ fn predicate_bits_and_capacity_limits() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 7.2+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn publication_failure_recovery_and_frozen_root() {
     let ids = HashMap::from([
         ("direct".into(), 0),

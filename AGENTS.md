@@ -190,7 +190,7 @@ Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `ho
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — real eBPF backend via aya plus `honk-nfqueue` (requires Linux kernel 7.2+); without it the engine runs on `MockEbpfBackend`. A requested `global.nfqueue_enable=true` is logged and disabled for this process on mock/no-`ebpf` startup or failed fixed-queue preflight.
+- `ebpf` — real eBPF backend via aya plus `honk-nfqueue` (requires Linux kernel 6.12+); without it the engine runs on `MockEbpfBackend`. A requested `global.nfqueue_enable=true` is logged and disabled for this process on mock/no-`ebpf` startup or failed fixed-queue preflight.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `mimalloc` — shipped binary allocates through mimalloc (see Technology stack); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
@@ -301,7 +301,7 @@ cargo test --all                      # full suite (see current validation guida
 ### honk-core with real eBPF
 
 ```bash
-# Requires Linux kernel 7.2+, clang/llvm/libbpf headers, nightly + bpf-linker.
+# Requires Linux kernel 6.12+, clang/llvm/libbpf headers, nightly + bpf-linker.
 # build.rs auto-builds the eBPF object on first build (~30s).
 cargo build --release -p honk-core --features ebpf
 sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedded object
@@ -328,7 +328,7 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 | Recipe                                                                          | Purpose                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `build` / `check` / `lint` / `fmt`                                              | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all`                                                                                                                                                                 |
-| `test-routing`                                                                    | Root-gated compiled-policy check: builds the `routing-test` eBPF object and exercises the real object against independent goldens plus failed root-publication preservation (Linux 7.2+) |
+| `test-routing` | Root-gated compiled-policy check: builds the `routing-test` eBPF object and exercises the real object against independent goldens plus failed root-publication preservation (Linux 6.12+) |
 | `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf`                  | Test suites (`test` = full workspace; `test-ci` = CI gate with the known legacy routing failure skipped; `test-ebpf` = honk-ebpf-common only)                                                                                                |
 | `test-netns`                                                                    | Depends on `test-routing`; root-gated real-kernel tests for production NFQUEUE/nftables IPv4+IPv6 held-verdict contract, eBPF netlink/netns roundtrips, link ownership/rebind lifecycle, and pinned allocator rollback compatibility (`--features ebpf --ignored`, serial) |
 | `outbound-ci` / `outbound-ci-e2e`                                               | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change                                                            |
@@ -349,7 +349,7 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
 ### CI / releases
 
-`.github/workflows/ci.yml` runs fmt + clippy, the workspace gate, and an Ubuntu hosted-VM eBPF job. The VM job BTF-checks the kernel object, mounts bpffs, installs the geo assets required by eBPF-feature routing tests, runs the full `honk-core --features ebpf --lib` gate, then runs the real NFQUEUE/nftables netns contract, TC/cgroup link lifecycle, pinned allocator rollback-compatibility test, and root-only network tests serially without a job container.
+`.github/workflows/ci.yml` runs fmt + clippy, the workspace gate, and an Ubuntu hosted-VM eBPF job. The VM job boots the pinned Linux 6.12 image, BTF-checks the kernel object, mounts bpffs, installs the geo assets required by eBPF-feature routing tests, runs the full `honk-core --features ebpf --lib` gate, then runs the real NFQUEUE/nftables netns contract, TC/cgroup link lifecycle, pinned allocator rollback-compatibility test, and root-only network tests serially without a job container.
 
 `.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the named temporary routing exclude listed below — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). Each of the four target triples ships a default mimalloc build and a `-stock` build without the `mimalloc` feature (lower RSS high-water on small gateways). The eBPF object is built once on the host with the latest nightly and pinned prebuilt `bpf-linker`, then **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
 

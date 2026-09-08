@@ -5,7 +5,7 @@
 Routing has one authored semantic model and two derived execution paths. The
 userspace `Router` evaluates a canonical policy IR; a restricted compiler lowers
 that same IR to native eBPF comparisons. The kernel does not interpret a second
-`MatchSet` program. Linux 7.2 is the real-backend baseline.
+`MatchSet` program. Linux 6.12 is the real-backend baseline.
 
 The static TC programs retain packet parsing, special/local/DNS exclusions,
 conntrack, mode and health enforcement, NFQUEUE ownership, redirection, and reply
@@ -165,8 +165,10 @@ Publication is serialized with the existing reload and DNS publication fences:
 6. Only after that successful update returns may old TC slots/maps be retired.
    Userspace IR/reference leases retain their own lifetime independently.
 
-Linux 7.2 waits for old non-sleepable BPF invocations before a successful
-map-in-map update returns. A plain root store, elapsed delay, or merely retaining
+Linux 6.12 waits for old non-sleepable BPF invocations before a successful
+map-in-map update returns: its
+[`maybe_wait_bpf_programs`](https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c)
+uses `synchronize_rcu()`. A plain root store, elapsed delay, or merely retaining
 two slots is not an equivalent grace period. The design does not rely on
 `BPF_LINK_UPDATE` for freplace (unsupported), nor detach/attach the active slot.
 
@@ -202,6 +204,15 @@ The earlier isolated Linux 7.2.3 prototype covered a protocol/port fragment only
 The branch validation below exercises the production callers and full policy.
 
 ### Recorded branch validation
+
+Linux `6.12.94+deb13-amd64` on `10.10.10.117` passed all 15 real-kernel checks
+with static musl test executables, plus the no-op reload, assembler, and fingerprint
+library checks (10 tests). The run used private network, mount, and cgroup
+namespaces with a private bpffs; the existing honk service was not stopped or
+restarted. Its first verifier run exposed unbounded output-pointer arithmetic
+after `% 48` in process-name normalization. An explicit offset check before pointer
+construction fixes that 6.12 verifier limitation without changing valid outputs.
+
 
 `just test-routing` builds a separate test object and runs 117 hand-authored cases
 in four dial modes (468 complete-decision comparisons) through the real root/slot

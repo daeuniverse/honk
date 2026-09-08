@@ -9,7 +9,7 @@ test -x "$HONK_NFQUEUE_TEST_BIN"
 
 cd "$repo"
 test "$(id -u)" -eq 0
-test "$(uname -r)" = 7.2.0-070200-generic
+test "$(uname -r)" = 6.12.0-061200-generic
 test -d "/lib/modules/$(uname -r)"
 modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
 test -e /sys/fs/cgroup/cgroup.controllers

@@ -139,21 +139,21 @@ jobs:
             "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
             "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh)
           ' > target/kernel-test-bins.env
-      - name: Fetch verified Linux 7.2 image and modules
+      - name: Fetch verified Linux 6.12 image and modules
         run: |
-          kernel_dir="$RUNNER_TEMP/linux-v7.2"
-          base=https://kernel.ubuntu.com/mainline/v7.2/amd64
-          image=linux-image-unsigned-7.2.0-070200-generic_7.2.0-070200.202608162350_amd64.deb
-          modules=linux-modules-7.2.0-070200-generic_7.2.0-070200.202608162350_amd64.deb
+          kernel_dir="$RUNNER_TEMP/linux-v6.12"
+          base=https://kernel.ubuntu.com/mainline/v6.12/amd64
+          image=linux-image-unsigned-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb
+          modules=linux-modules-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb
           mkdir -p "$kernel_dir"
           curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$image" "$base/$image"
           curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$modules" "$base/$modules"
-          echo "bd94fb85bfa402307040d4cd6745f7b04d467ddce1ccc312253e50f975cc38a2  $kernel_dir/$image" | sha256sum -c -
-          echo "13ab3038e131dc8914e3a7cfaafbd2990b8c9c1aeeb574c2e5895f1e032c4ecf  $kernel_dir/$modules" | sha256sum -c -
+          echo "3f156eab453866391b1939652829c67f4e4e9a9c18917d76751f41a26da4a330  $kernel_dir/$image" | sha256sum -c -
+          echo "5c1bb612091143332f4ca1892086e29b676cc27c83f74cd2d48115203a0c72d8  $kernel_dir/$modules" | sha256sum -c -
           dpkg-deb --extract "$kernel_dir/$image" "$kernel_dir/root"
           dpkg-deb --extract "$kernel_dir/$modules" "$kernel_dir/root"
-          echo "HONK_CI_KERNEL_IMAGE=$kernel_dir/root/boot/vmlinuz-7.2.0-070200-generic" >> "$GITHUB_ENV"
-      - name: Run all real-kernel gates on Linux 7.2
+          echo "HONK_CI_KERNEL_IMAGE=$kernel_dir/root/boot/vmlinuz-6.12.0-061200-generic" >> "$GITHUB_ENV"
+      - name: Run all real-kernel gates on Linux 6.12
         run: |
           vng -r "$HONK_CI_KERNEL_IMAGE" \
             --user root \

@@ -10,7 +10,7 @@
 
 **honk** 是面向 Linux 的 Rust 透明代理引擎，其 eBPF 数据面与配置形态受 [dae](https://github.com/daeuniverse/dae) 启发，出站组、多协议拨号器和 Clash 兼容 API 则受 [sing-box](https://github.com/SagerNet/sing-box) 启发。
 
-它**不是**任一项目的逐行移植。报文路径保留 dae 的 TC + `dae0`/`daens` 模型；唯一的用户态路由 IR 在 Linux 7.2+ 上编译为按代管理的 BPF 策略函数。出站与控制栈采用面向 sing-box 的设计。
+它**不是**任一项目的逐行移植。报文路径保留 dae 的 TC + `dae0`/`daens` 模型；唯一的用户态路由 IR 在 Linux 6.12+ 上编译为按代管理的 BPF 策略函数。出站与控制栈采用面向 sing-box 的设计。
 
 > **状态：实验版本（`v0.0.1-alpha`）。** honk 处于早期 alpha 阶段。接口可能发生破坏性变更，部分功能尚未完成（见 TODO），真实环境验证也仍然有限。不建议用于生产环境。
 

@@ -104,7 +104,7 @@ zip = { workspace = true, optional = true }
 
 [features]
 default = ["clash-api", "mimalloc", "rprx"]
-# Enable real eBPF support (requires Linux kernel 5.8+)
+# Enable real eBPF support (requires Linux kernel 6.12+)
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "dep:tower-http", "dep:percent-encoding", "dep:zip"]

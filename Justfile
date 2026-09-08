@@ -87,7 +87,7 @@ test-ebpf:
     cargo test -p honk-ebpf-common
 
 
-# Real generated-policy goldens and atomic publication failures (Linux 7.2+, root).
+# Real generated-policy goldens and atomic publication failures (Linux 6.12+, root).
 test-routing:
     cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test
     HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::routing::tests -- --ignored --test-threads=1

@@ -4,7 +4,7 @@
 
 路由只有一个手写语义模型，执行方式可以不同：用户态 `Router` 解释规范化的
 policy IR，受限编译器把同一 IR 降低为原生 eBPF 比较代码。内核不再解释另一套
-`MatchSet` 程序。真实后端的内核基线为 Linux 7.2。
+`MatchSet` 程序。真实后端的内核基线为 Linux 6.12。
 
 静态 TC 程序继续负责报文解析、特殊/本地/DNS 排除、conntrack、mode 与健康检查、
 NFQUEUE 所有权、重定向和回包统计。生成函数只负责
@@ -130,9 +130,10 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 6. 成功更新返回后才允许退休旧 TC 槽和旧 maps；用户态 IR/reference lease 独立保有
    自己的生命周期。
 
-Linux 7.2 在 map-in-map 更新成功返回前等待旧 non-sleepable BPF 调用完成。普通 root
-store、固定延时或“有两个槽”不是等价 grace。不能依赖不支持的 freplace
-`BPF_LINK_UPDATE`，也不 detach/attach 活跃槽。
+Linux 6.12 在 map-in-map 更新成功返回前等待旧 non-sleepable BPF 调用完成：
+[`maybe_wait_bpf_programs`](https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c)
+使用 `synchronize_rcu()`。普通 root store、固定延时或“有两个槽”不是等价 grace。
+不能依赖不支持的 freplace `BPF_LINK_UPDATE`，也不 detach/attach 活跃槽。
 
 后端发布操作在 root commit 前必须 all-or-nothing。map 构建、verifier、任一 inactive
 attach 失败，都保留旧代码与旧事实。不能用关闭 datapath admission 来掩盖错误，因为
@@ -161,6 +162,13 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 完整 policy，而不是把片段结果外推为整条 datapath 的收益。
 
 ### 分支验证记录
+
+`10.10.10.117` 的 Linux `6.12.94+deb13-amd64` 使用静态 musl 测试程序通过全部
+15 项真实内核检查，另通过 no-op reload、assembler 和 fingerprint 的 10 项 library
+检查。测试使用独立 network、mount、cgroup namespace 和私有 bpffs，未停止或重启
+现有 honk 服务。首次 verifier 检查发现进程名规范化中的 `% 48` 无法给输出指针提供
+有界偏移；改为构造指针前显式检查偏移后，6.12 可以验证通过，合法输入的输出不变。
+
 
 `just test-routing` 单独构建 test object，沿真实 root/slot 路径执行 117 个手写用例
 在四种 dial mode 下的 468 次完整 decision 比较，同时验证 domain、目的/源 IP、MAC

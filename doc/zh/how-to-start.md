@@ -15,7 +15,7 @@ uname -r
 ```
 
 - 仅支持 Linux；真实透明代理必须以 `root` 运行。
-- 编译式路由及其 map-in-map 同步发布保证要求 Linux `7.2+`。旧内核会在附着前被拒绝。
+- 编译式路由及其 map-in-map 同步发布保证要求 Linux `6.12+`。旧内核会在附着前被拒绝。
 - `netkit` 不是必需项；内核不支持时 honk 自动回退到 veth。
 
 `lan_interface` 用于代理从局域网进入网关的流量，`wan_interface` 用于代理网关本机发起的流量：
@@ -344,7 +344,7 @@ cargo +stable run --release -p honk-core -- \
 | --- | --- |
 | `bpf-linker-wrapper` 不存在 | 按源码构建章节把维护者路径替换为 PATH 中的 `bpf-linker`。 |
 | `no BTF parsed for object` | 清除 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS`，重新构建 eBPF object，并用 `readelf` 确认 `.BTF`。 |
-| 内核或 verifier 拒绝编译式路由 | 使用支持 BPF/BTF 和 freplace 的 Linux `7.2+`，保留完整 verifier 日志及生成规则定位信息，不要绕过启动失败。 |
+| 内核或 verifier 拒绝编译式路由 | 使用支持 BPF/BTF 和 freplace 的 Linux `6.12+`，保留完整 verifier 日志及生成规则定位信息，不要绕过启动失败。 |
 | pin map 报 `Invalid argument` | `/sys/fs/bpf` 不是 bpffs；按上文重新挂载。 |
 | mock 启动成功但流量不经过 honk | 这是预期行为；使用含 `ebpf` feature 的构建并以 root 启动。 |
 | NFQUEUE disabled 或 queue busy | 检查 nftables/NFQUEUE 内核支持、queue 320 占用者和残留 honk 实例；确实不需要时设置 `nfqueue_enable: false`。 |
