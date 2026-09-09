@@ -24,6 +24,7 @@ jobs:
           components: rustfmt, clippy
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
       - run: cargo fmt --all -- --check
@@ -37,6 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
 
@@ -71,18 +73,24 @@ jobs:
       - name: Install build and VM dependencies
         run: |
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
             python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
-      - name: Enable KVM
+      - name: Enable KVM when the runner exposes it
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
             sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -r /dev/kvm -a -w /dev/kvm
+          sudo udevadm trigger --name-match=kvm || true
+          if test -r /dev/kvm -a -w /dev/kvm; then
+            echo "HONK_CI_VNG_ACCEL=" >> "$GITHUB_ENV"
+          else
+            echo "::warning::/dev/kvm is not available on this runner; the real-kernel gate runs under TCG"
+            echo "HONK_CI_VNG_ACCEL=--disable-kvm" >> "$GITHUB_ENV"
+          fi
       - name: Install virtme-ng 1.41
         run: |
           curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl" \
@@ -139,6 +147,11 @@ jobs:
             "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
             "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh)
           ' > target/kernel-test-bins.env
+      - name: Restore the Linux 6.12 debs from the cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/linux-v6.12/*.deb
+          key: linux-v6.12-6.12.0-061200.202411220723-amd64
       - name: Fetch verified Linux 6.12 image and modules
         run: |
           kernel_dir="$RUNNER_TEMP/linux-v6.12"
@@ -146,8 +159,9 @@ jobs:
           image=linux-image-unsigned-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb
           modules=linux-modules-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb
           mkdir -p "$kernel_dir"
-          curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$image" "$base/$image"
-          curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$modules" "$base/$modules"
+          for deb in "$image" "$modules"; do
+            test -f "$kernel_dir/$deb" || curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$deb" "$base/$deb"
+          done
           echo "3f156eab453866391b1939652829c67f4e4e9a9c18917d76751f41a26da4a330  $kernel_dir/$image" | sha256sum -c -
           echo "5c1bb612091143332f4ca1892086e29b676cc27c83f74cd2d48115203a0c72d8  $kernel_dir/$modules" | sha256sum -c -
           dpkg-deb --extract "$kernel_dir/$image" "$kernel_dir/root"
@@ -156,6 +170,7 @@ jobs:
       - name: Run all real-kernel gates on Linux 6.12
         run: |
           vng -r "$HONK_CI_KERNEL_IMAGE" \
+            $HONK_CI_VNG_ACCEL \
             --user root \
             --rwdir "$GITHUB_WORKSPACE" \
             --cpus 2 \
