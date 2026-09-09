@@ -277,10 +277,6 @@ pub fn emit_routing_program(
     }
 
     asm.source(0, "fallback");
-    asm.st_imm(R7, OUTBOUND, plan.fallback as i32)?;
-    asm.st_imm(R7, MARK, 0)?;
-    asm.st_imm(R7, MUST, 0)?;
-    asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
     asm.mov_imm(R0, 0)?;
     asm.exit()?;
     asm.finish()
@@ -390,15 +386,11 @@ fn emit_condition(
     fail: Label,
     fds: &RoutingMapFds,
 ) -> anyhow::Result<()> {
-    let truth = asm.label();
     if condition.not {
-        emit_predicate(asm, &condition.predicate, fail, truth, fds)?;
+        emit_predicate(asm, &condition.predicate, fail, pass, fds)
     } else {
-        emit_predicate(asm, &condition.predicate, truth, fail, fds)?;
+        emit_predicate(asm, &condition.predicate, pass, fail, fds)
     }
-    asm.bind(truth);
-    asm.ja(pass)?;
-    Ok(())
 }
 
 fn emit_predicate(

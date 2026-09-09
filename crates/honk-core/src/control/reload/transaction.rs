@@ -12,21 +12,6 @@ impl Drop for PreDnsPublicationHookGuard<'_> {
     }
 }
 
-fn domain_routes_eq(
-    left: &[(crate::ebpf::maps::LpmKey, honk_ebpf_common::DomainRouting)],
-    right: &[(crate::ebpf::maps::LpmKey, honk_ebpf_common::DomainRouting)],
-) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|((left_key, left), (right_key, right))| {
-                crate::ebpf::maps::lpm_key_bytes(left_key)
-                    == crate::ebpf::maps::lpm_key_bytes(right_key)
-                    && left.bitmap == right.bitmap
-            })
-}
-
 fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
     let mut static_nodes = Vec::with_capacity(candidate.nodes.len());
     let mut candidate_subscription_nodes =
@@ -472,24 +457,18 @@ impl ControlPlane {
                 );
                 let new_connectivity =
                     group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
-                let mut old_domain_routes = projection_publication
-                    .project(&old_projection_snapshot)
-                    .into_iter()
-                    .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
-                    .collect::<Vec<_>>();
+                let old_projection = projection_publication.project(&old_projection_snapshot);
                 let new_projection = projection_publication.project(&projection_snapshot);
-                let mut new_domain_routes = new_projection
-                    .iter()
-                    .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(*ip), *bitmap))
-                    .collect::<Vec<_>>();
-                old_domain_routes
-                    .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
-                new_domain_routes
-                    .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
                 // Recover a degraded runtime with a complete generation before reopening admission.
                 let routing_publication_needed = !self.is_datapath_healthy()
                     || !old_plan.semantically_eq(&new_plan)
-                    || !domain_routes_eq(&old_domain_routes, &new_domain_routes);
+                    || !old_projection
+                        .iter()
+                        .map(|(ip, bitmap)| (ip, &bitmap.bitmap))
+                        .eq(new_projection
+                            .iter()
+                            .map(|(ip, bitmap)| (ip, &bitmap.bitmap)));
+                drop(old_projection);
                 let provider = self.dns_controller.runtime_provider();
                 let publication = provider.prepare_publication(new_runtime);
 
@@ -500,27 +479,33 @@ impl ControlPlane {
                     error!(%error, ?restore, "Failed to open group connectivity for reload transition");
                     break 'publication Err(());
                 }
-                if routing_publication_needed
-                    && let Err(error) = ebpf.publish_routing_plan(&new_plan, &new_domain_routes)
-                {
-                    match publish_group_connectivity(ebpf.as_mut(), &old_connectivity) {
-                        Ok(()) => error!(
-                            %error,
-                            "Compiled routing publication failed; active generation retained"
-                        ),
-                        Err(restore_error) => {
-                            error!(
+                if routing_publication_needed {
+                    let mut new_domain_routes = new_projection
+                        .iter()
+                        .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(*ip), *bitmap))
+                        .collect::<Vec<_>>();
+                    new_domain_routes
+                        .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
+                    if let Err(error) = ebpf.publish_routing_plan(&new_plan, &new_domain_routes) {
+                        match publish_group_connectivity(ebpf.as_mut(), &old_connectivity) {
+                            Ok(()) => error!(
                                 %error,
-                                %restore_error,
-                                "Routing publication rejected but health restoration failed"
-                            );
-                            self.datapath_healthy
-                                .store(false, std::sync::atomic::Ordering::Release);
-                            self.drain_tracker.start_rejecting();
-                            drain.start_rejecting();
+                                "Compiled routing publication failed; active generation retained"
+                            ),
+                            Err(restore_error) => {
+                                error!(
+                                    %error,
+                                    %restore_error,
+                                    "Routing publication rejected but health restoration failed"
+                                );
+                                self.datapath_healthy
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                self.drain_tracker.start_rejecting();
+                                drain.start_rejecting();
+                            }
                         }
+                        break 'publication Err(());
                     }
-                    break 'publication Err(());
                 }
 
                 if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {

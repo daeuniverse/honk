@@ -70,19 +70,19 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     backend
         .set_domain_ip_bitmap(&key, &initial.sets[0].bitmap)
         .expect("initial write");
-    assert!(state.commit_success(initial.generation, &initial.sets, &[]));
+    assert!(state.commit_success(&initial.sets, &[]));
 
     state.observe(ProjectionObservation::Clear { domain: "a.test" }, now);
     let stale_remove = state.batch(now);
     state.observe(positive("b.test", &[ip], Duration::from_secs(30)), now);
     backend.remove_domain_ip_bitmap(&key).expect("stale remove");
-    assert!(!state.commit_success(stale_remove.generation, &[], &stale_remove.removes));
+    assert!(!state.commit_success(&[], &stale_remove.removes));
 
     let repaired = state.batch(now);
     backend
         .set_domain_ip_bitmap(&key, &repaired.sets[0].bitmap)
         .expect("repair write");
-    assert!(state.commit_success(repaired.generation, &repaired.sets, &repaired.removes));
+    assert!(state.commit_success(&repaired.sets, &repaired.removes));
     assert!(state.dirty_ips.is_empty());
     assert_eq!(
         backend.projection_map_snapshot()[0].1.bitmap,

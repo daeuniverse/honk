@@ -226,6 +226,8 @@ The worker reconciles generation-tagged desired state in batches of at most 256 
 
 Retry wakeups and batch admission use the same capacity-aware per-IP deadline; an overdue insertion blocked by a full projection cannot spin while a deletion backs off. A successful reload records the exact IP slice installed in the new map as applied state before reconciling current owners, including any that expired during loading. Worker writes and their acknowledgements remain under one generation fence, so an old completion cannot overwrite that published accounting. Reloads that keep the physical map also keep its existing applied state.
 
+Incremental acknowledgement compares the successful write with the current desired bitmap or absence, without retaining historical per-IP revisions. Owner TTL sequences and policy generations remain independent guards.
+
 ## Generations and reload
 
 One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of both traffic session reuse and predecessor DNS sessions. The DNS registry shares its source configuration generation's dial semaphore and the process-wide physical-dial ceiling, not its retirement flag or protocol pools.

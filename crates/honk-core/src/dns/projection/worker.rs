@@ -105,10 +105,10 @@ async fn flush_after_snapshot(
             }
         }
         for remove in &batch.removes {
-            let key = maps::ip_addr_to_lpm_key(remove.ip);
+            let key = maps::ip_addr_to_lpm_key(*remove);
             match backend.remove_domain_ip_bitmap(&key) {
                 Ok(()) => successful_removes.push(*remove),
-                Err(error) => failures.push((remove.ip, error)),
+                Err(error) => failures.push((*remove, error)),
             }
         }
 
@@ -117,7 +117,7 @@ async fn flush_after_snapshot(
         for (ip, _) in &failures {
             state.record_failure(*ip, now);
         }
-        state.commit_success(batch.generation, &successful_sets, &successful_removes)
+        state.commit_success(&successful_sets, &successful_removes)
     };
     if !writes_current {
         crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionRetry);

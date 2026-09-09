@@ -210,6 +210,8 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 重试唤醒与批次准入共用同一个带容量判断的逐 IP deadline；投影已满时，过期但无法准入的新增项不会在删除退避期间空转。成功 reload 会先把新 map 实际安装的完整 IP 集合记为 applied，再协调当前 owner，包括加载期间已到期的 owner。worker 的 map 写入与确认保持在同一个 generation fence 内，旧完成事件不能覆盖新发布的记账。保留物理 map 的 reload 也保留原有 applied 状态。
 
+增量确认将成功写入与当前期望位图或缺失状态比较，不保留历史 IP revision 账本。owner 的 TTL sequence 与策略 generation 仍分别保护各自的边界。
+
 ## Generation 与 reload
 
 一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、路由与组快照、transport manager、路由投影、捕获的 bootstrap resolver，以及代内 query/UDP 准入。新构建的 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于同一代。DNS 代理 transport 使用全新的 outbound runtime registry，不复用普通流量或旧 DNS 代的 session。该 DNS registry 与来源配置代共享 dial semaphore，并保留进程级 physical-dial 上限，但不共享退役标志或协议连接池。

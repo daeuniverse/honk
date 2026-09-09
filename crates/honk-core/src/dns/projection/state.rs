@@ -71,20 +71,13 @@ pub(super) struct RetryMetadata {
 pub(super) struct Batch {
     pub(super) generation: u64,
     pub(super) sets: Vec<PendingSet>,
-    pub(super) removes: Vec<PendingRemove>,
+    pub(super) removes: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PendingSet {
     pub(super) ip: IpAddr,
     pub(super) bitmap: DomainRouting,
-    pub(super) revision: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PendingRemove {
-    pub(super) ip: IpAddr,
-    pub(super) revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -103,7 +96,6 @@ pub(super) struct DesiredState {
     pub(super) desired: BTreeMap<IpAddr, DomainRouting>,
     zero_ips: BTreeSet<IpAddr>,
     capacity_warning_emitted: bool,
-    pub(super) revisions: BTreeMap<IpAddr, u64>,
     pub(super) applied: BTreeMap<IpAddr, DomainRouting>,
     pub(super) dirty_ips: BTreeSet<IpAddr>,
     pub(super) retries: BTreeMap<IpAddr, RetryMetadata>,
@@ -122,7 +114,6 @@ impl DesiredState {
             desired: BTreeMap::new(),
             zero_ips: BTreeSet::new(),
             capacity_warning_emitted: false,
-            revisions: BTreeMap::new(),
             applied: BTreeMap::new(),
             dirty_ips: BTreeSet::new(),
             retries: BTreeMap::new(),
@@ -301,18 +292,12 @@ impl DesiredState {
                 self.capacity_warning_emitted = true;
             }
             if evicted != Some(ip) || self.applied.contains_key(&ip) {
-                self.mark_dirty(ip);
+                self.dirty_ips.insert(ip);
             }
             if let Some(evicted) = evicted.filter(|evicted| *evicted != ip) {
-                self.mark_dirty(evicted);
+                self.dirty_ips.insert(evicted);
             }
         }
-    }
-
-    fn mark_dirty(&mut self, ip: IpAddr) {
-        let revision = self.revisions.entry(ip).or_default();
-        *revision = revision.wrapping_add(1);
-        self.dirty_ips.insert(ip);
     }
 
     pub(super) fn rebuild_all(&mut self) {
@@ -329,7 +314,7 @@ impl DesiredState {
             if self.desired.get(&ip).map(|entry| entry.bitmap) != next
                 || self.applied.get(&ip).map(|entry| entry.bitmap) != next
             {
-                self.mark_dirty(ip);
+                self.dirty_ips.insert(ip);
             }
         }
         self.zero_ips = desired

@@ -1,8 +1,9 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::state::{Batch, DesiredState, IP_CAPACITY, PendingRemove, PendingSet, RetryMetadata};
+use super::state::{Batch, DesiredState, IP_CAPACITY, PendingSet, RetryMetadata};
 
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
@@ -43,22 +44,15 @@ impl DesiredState {
                     sets.push(PendingSet {
                         ip,
                         bitmap: *desired,
-                        revision: self.revisions.get(&ip).copied().unwrap_or_default(),
                     });
                 }
                 None if self.applied.contains_key(&ip) => {
-                    removes.push(PendingRemove {
-                        ip,
-                        revision: self.revisions.get(&ip).copied().unwrap_or_default(),
-                    });
+                    removes.push(ip);
                 }
                 Some(_) | None => {
                     self.dirty_ips.remove(&ip);
                     self.retries.remove(&ip);
                 }
-            }
-            if sets.len() + removes.len() >= MAX_BATCH_ENTRIES {
-                break;
             }
         }
         Batch {
@@ -68,49 +62,29 @@ impl DesiredState {
         }
     }
 
-    pub(super) fn commit_success(
-        &mut self,
-        generation: u64,
-        sets: &[PendingSet],
-        removes: &[PendingRemove],
-    ) -> bool {
-        if generation != self.snapshot.generation() {
-            for set in sets {
-                self.applied.insert(set.ip, set.bitmap);
-            }
-            for remove in removes {
-                self.applied.remove(&remove.ip);
-            }
-            self.rebuild_all();
-            return false;
-        }
+    pub(super) fn commit_success(&mut self, sets: &[PendingSet], removes: &[IpAddr]) -> bool {
         let mut current = true;
         for set in sets {
             self.applied.insert(set.ip, set.bitmap);
-            if self.revisions.get(&set.ip) == Some(&set.revision)
-                && self
-                    .desired
-                    .get(&set.ip)
-                    .is_some_and(|desired| desired.bitmap == set.bitmap.bitmap)
+            self.retries.remove(&set.ip);
+            if self
+                .desired
+                .get(&set.ip)
+                .is_some_and(|desired| desired.bitmap == set.bitmap.bitmap)
             {
                 self.dirty_ips.remove(&set.ip);
-                self.retries.remove(&set.ip);
             } else {
                 self.dirty_ips.insert(set.ip);
-                self.retries.remove(&set.ip);
                 current = false;
             }
         }
-        for remove in removes {
-            self.applied.remove(&remove.ip);
-            if self.revisions.get(&remove.ip) == Some(&remove.revision)
-                && !self.desired.contains_key(&remove.ip)
-            {
-                self.dirty_ips.remove(&remove.ip);
-                self.retries.remove(&remove.ip);
+        for &ip in removes {
+            self.applied.remove(&ip);
+            self.retries.remove(&ip);
+            if !self.desired.contains_key(&ip) {
+                self.dirty_ips.remove(&ip);
             } else {
-                self.dirty_ips.insert(remove.ip);
-                self.retries.remove(&remove.ip);
+                self.dirty_ips.insert(ip);
                 current = false;
             }
         }
