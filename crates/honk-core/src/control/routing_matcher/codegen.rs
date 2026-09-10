@@ -72,7 +72,13 @@ struct FactCache {
     ready: i16,
 }
 
-fn fact_caches(plan: &RoutingPushPlan) -> [Option<FactCache>; 3] {
+struct FactCaches {
+    slots: [Option<FactCache>; 3],
+    must_ready: u8,
+    may_ready: u8,
+}
+
+fn fact_caches(plan: &RoutingPushPlan) -> FactCaches {
     let mut uses = [0u8; 3];
     for condition in plan.rules.iter().flat_map(|rule| &rule.conditions) {
         if let Some(kind) = FactKind::of(&condition.predicate) {
@@ -83,13 +89,17 @@ fn fact_caches(plan: &RoutingPushPlan) -> [Option<FactCache>; 3] {
     // Separate DW slots preserve ready constants on 6.12; packed W flags
     // lose precision and exhaust the verifier budget on mixed 256-bit policies.
     // Pairs occupy [-32, -1] and [-80, -65], outside both key buffers.
-    std::array::from_fn(|index| {
-        let pointer = [-16, -32, -80][index];
-        (uses[index] == 2).then_some(FactCache {
-            pointer,
-            ready: pointer + 8,
-        })
-    })
+    FactCaches {
+        slots: std::array::from_fn(|index| {
+            let pointer = [-16, -32, -80][index];
+            (uses[index] == 2).then_some(FactCache {
+                pointer,
+                ready: pointer + 8,
+            })
+        }),
+        must_ready: 0,
+        may_ready: 0,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -294,8 +304,8 @@ pub fn emit_routing_program(
     )?;
     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
 
-    let caches = fact_caches(plan);
-    for cache in caches.iter().flatten() {
+    let mut caches = fact_caches(plan);
+    for cache in caches.slots.iter().flatten() {
         asm.st_dw_imm(R10, cache.pointer, 0)?;
         asm.st_dw_imm(R10, cache.ready, 0)?;
     }
@@ -316,9 +326,21 @@ pub fn emit_routing_program(
     for rule in &plan.rules {
         asm.source(rule.id + 1, rule.source.as_str());
         let fail = asm.label();
+        let mut failure_ready: Option<(u8, u8)> = None;
         for condition in &rule.conditions {
             let pass = asm.label();
             emit_condition(&mut asm, condition, pass, fail, &fds, &caches)?;
+            if let Some(kind) = FactKind::of(&condition.predicate) {
+                let bit = 1u8 << kind as u8;
+                caches.must_ready |= bit;
+                caches.may_ready |= bit;
+            }
+            // Every failed condition can enter the next rule, including a
+            // short circuit before this rule's first fact lookup.
+            failure_ready = Some(match failure_ready {
+                None => (caches.must_ready, caches.may_ready),
+                Some((must, may)) => (must & caches.must_ready, may | caches.may_ready),
+            });
             asm.bind(pass);
         }
         asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
@@ -328,6 +350,7 @@ pub fn emit_routing_program(
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
         asm.bind(fail);
+        (caches.must_ready, caches.may_ready) = failure_ready.unwrap_or_default();
     }
 
     asm.source(0, "fallback");
@@ -439,7 +462,7 @@ fn emit_condition(
     pass: Label,
     fail: Label,
     fds: &RoutingMapFds,
-    caches: &[Option<FactCache>; 3],
+    caches: &FactCaches,
 ) -> anyhow::Result<()> {
     if condition.not {
         emit_predicate(asm, &condition.predicate, fail, pass, fds, caches)
@@ -454,7 +477,7 @@ fn emit_predicate(
     on_true: Label,
     on_false: Label,
     fds: &RoutingMapFds,
-    caches: &[Option<FactCache>; 3],
+    caches: &FactCaches,
 ) -> anyhow::Result<()> {
     match predicate {
         KernelPredicate::Domain(id) => {
@@ -613,23 +636,31 @@ fn emit_fact_bit(
     asm: &mut Assembler,
     kind: FactKind,
     id: u32,
-    caches: &[Option<FactCache>; 3],
+    caches: &FactCaches,
     on_true: Label,
     on_false: Label,
     fds: &RoutingMapFds,
 ) -> anyhow::Result<()> {
-    if let Some(cache) = caches[kind as usize] {
-        let reuse = asm.label();
-        let ready = asm.label();
-        asm.ldx_dw(R0, R10, cache.ready)?;
-        asm.jump(BPF_JNE, R0, 0, reuse)?;
-        emit_fact_lookup(asm, kind, fds)?;
-        asm.stx_dw(R10, R0, cache.pointer)?;
-        asm.st_dw_imm(R10, cache.ready, 1)?;
-        asm.ja(ready)?;
-        asm.bind(reuse);
-        asm.ldx_dw(R0, R10, cache.pointer)?;
-        asm.bind(ready);
+    if let Some(cache) = caches.slots[kind as usize] {
+        let bit = 1u8 << kind as u8;
+        if caches.must_ready & bit != 0 {
+            asm.ldx_dw(R0, R10, cache.pointer)?;
+        } else {
+            let branch = (caches.may_ready & bit != 0).then(|| (asm.label(), asm.label()));
+            if let Some((reuse, _)) = branch {
+                asm.ldx_dw(R0, R10, cache.ready)?;
+                asm.jump(BPF_JNE, R0, 0, reuse)?;
+            }
+            emit_fact_lookup(asm, kind, fds)?;
+            asm.stx_dw(R10, R0, cache.pointer)?;
+            asm.st_dw_imm(R10, cache.ready, 1)?;
+            if let Some((reuse, ready)) = branch {
+                asm.ja(ready)?;
+                asm.bind(reuse);
+                asm.ldx_dw(R0, R10, cache.pointer)?;
+                asm.bind(ready);
+            }
+        }
     } else {
         emit_fact_lookup(asm, kind, fds)?;
     }
@@ -642,13 +673,14 @@ fn emit_fact_lookup(
     fds: &RoutingMapFds,
 ) -> anyhow::Result<()> {
     let absent = asm.label();
+    let lookup = asm.label();
     let done = asm.label();
     match kind {
         FactKind::Mac => {
             asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
             asm.jump(BPF_JEQ, R0, 0, absent)?;
-            emit_lpm_lookup(asm, fds.mac, 128, INPUT_MAC)?;
-            asm.ja(done)?;
+            write_key_from_input(asm, INPUT_MAC, 128)?;
+            load_map_fd(asm, fds.mac)?;
         }
         FactKind::Destination | FactKind::Source => {
             let (v4_fd, v6_fd, input_offset) = match kind {
@@ -662,30 +694,23 @@ fn emit_fact_lookup(
             asm.jump(BPF_JEQ, R0, 2, v6)?;
             asm.ja(absent)?;
             asm.bind(v4);
-            emit_lpm_lookup(asm, v4_fd, 32, input_offset + 12)?;
-            asm.ja(done)?;
+            write_key_from_input(asm, input_offset + 12, 32)?;
+            load_map_fd(asm, v4_fd)?;
+            asm.ja(lookup)?;
             asm.bind(v6);
-            emit_lpm_lookup(asm, v6_fd, 128, input_offset)?;
-            asm.ja(done)?;
+            write_key_from_input(asm, input_offset, 128)?;
+            load_map_fd(asm, v6_fd)?;
         }
     }
+    asm.bind(lookup);
+    asm.mov_reg(R2, R10)?;
+    asm.add_imm(R2, STACK_KEY as i32)?;
+    asm.call(MAP_LOOKUP_ELEM)?;
+    asm.ja(done)?;
     asm.bind(absent);
     asm.mov_imm(R0, 0)?;
     asm.bind(done);
     Ok(())
-}
-
-fn emit_lpm_lookup(
-    asm: &mut Assembler,
-    fd: i32,
-    prefix_len: u32,
-    input_offset: i16,
-) -> anyhow::Result<()> {
-    write_key_from_input(asm, input_offset, prefix_len)?;
-    load_map_fd(asm, fd)?;
-    asm.mov_reg(R2, R10)?;
-    asm.add_imm(R2, STACK_KEY as i32)?;
-    asm.call(MAP_LOOKUP_ELEM)
 }
 
 fn write_key_from_input(
@@ -694,15 +719,14 @@ fn write_key_from_input(
     prefix_len: u32,
 ) -> anyhow::Result<()> {
     asm.st_imm(R10, STACK_KEY, prefix_len as i32)?;
-    for index in 0..4 {
-        asm.st_imm(R10, STACK_KEY + 4 + index * 4, 0)?;
-    }
-    asm.mov_reg(R2, R6)?;
     let words = if prefix_len == 32 { 1 } else { 4 };
     for index in 0..words {
-        let offset = index as i16 * 4;
-        asm.ldx_w(R3, R2, input_offset + offset)?;
+        let offset = index * 4;
+        asm.ldx_w(R3, R6, input_offset + offset)?;
         asm.stx_w(R10, R3, STACK_KEY + 4 + offset)?;
+    }
+    for index in words..4 {
+        asm.st_imm(R10, STACK_KEY + 4 + index * 4, 0)?;
     }
     Ok(())
 }

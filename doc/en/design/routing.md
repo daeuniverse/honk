@@ -159,6 +159,15 @@ look up unreached categories, but repeated categories pay stack initialization.
 No fact pointer survives the invocation or crosses a generation. The entry
 domain lookup remains unchanged because it also determines `domain_final`.
 
+Emission tracks three-bit definite/possible readiness masks. Every failed
+condition is a predecessor of the next rule: definite readiness intersects at
+that join, while possible readiness unions. A known first use omits the ready
+check, a definitely ready use only reloads its pointer, and an uncertain use
+keeps the runtime guard. NULL and missing-input results count as computed;
+negation does not change that state. Cache initialization remains unchanged.
+IPv4/IPv6 key construction and map selection join at one lookup call; only
+IPv4 key padding is zeroed, without clearing bytes immediately overwritten.
+
 Fact preparation keeps hash-first duplicate coalescing, sorts only unique keys,
 and applies ancestor inheritance in the original vector before compacting its
 retained capacity. Assembler-owned ordinal labels identify internal branches;

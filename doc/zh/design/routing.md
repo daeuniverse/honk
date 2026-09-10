@@ -98,6 +98,12 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 不预查未到达的类别，但重复类别仍有入口栈初始化成本。fact pointer 不跨调用或
 generation 保留。domain 入口 lookup 不变，因为它还负责确定 `domain_final`。
 
+发射时用两个三位掩码跟踪“必然已计算”和“可能已计算”。每个失败条件都是下一规则的
+前驱：合流时前者取交集，后者取并集。确定首次使用时省去 ready 检查，必然已计算时只
+重载 pointer，不确定时保留运行时守卫。NULL 和输入缺失也算完成计算，否定不改变此
+状态；入口缓存初始化保持不变。IPv4/IPv6 分别构造 key、选择 map，再合流到一次
+lookup；仅清零 IPv4 key 的 padding，不清零马上会被覆盖的字节。
+
 事实准备先用 hash 合并重复键，只排序唯一键，再在原向量中继承祖先位并压缩保留容量。
 内部跳转由 assembler 自己分配的 ordinal label 标识，只有规则 source record 保留
 诊断文本。输入/输出偏移从共享 ABI 声明推导，不再独立维护一份偏移表。
