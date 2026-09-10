@@ -199,6 +199,7 @@ impl ControlPlaneHandle {
         } else {
             quic_domain.clone()
         };
+        let target_is_domain = target_domain.is_some();
         #[cfg(feature = "ebpf")]
         let final_rule_mark = final_udp_rule_mark(routed_direct, &outbound_name, routed_mark);
         #[cfg(not(feature = "ebpf"))]
@@ -475,6 +476,7 @@ impl ControlPlaneHandle {
         let endpoint = Arc::new(UdpEndpoint::new_scored(
             transport,
             relay_addr,
+            target_is_domain,
             node.id,
             scheduler_ipver,
             score_reporter,

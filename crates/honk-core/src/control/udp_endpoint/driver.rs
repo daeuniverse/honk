@@ -678,6 +678,12 @@ async fn receive_loop(
             );
             continue;
         }
+        // Remote DNS may choose another address or family for the same logical peer.
+        let source = if endpoint.target_is_domain {
+            client_dst
+        } else {
+            source
+        };
         if source.is_ipv4() != client_addr.is_ipv4() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

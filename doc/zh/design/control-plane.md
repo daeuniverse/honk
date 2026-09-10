@@ -82,7 +82,7 @@ Endpoint 创建是事务性的：
 
 SOCKS5 UDP 在 endpoint 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 endpoint 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。`PacketTransport::relay_addr()` 和接收来源元数据暴露的是逻辑目标，因此 endpoint 首回复校验不会把 SOCKS relay 与远端 peer 混淆。
 
-回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通用 endpoint 保留其 original-destination socket，并按 endpoint 缓存已接受的其他 full-cone 来源。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。
+回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket，并按 endpoint 缓存已接受的其他 full-cone 来源。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。
 
 Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 排空 `Initializing` lease 及其保留资源，但保留 `Ready` endpoint。每次 retirement 和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
 

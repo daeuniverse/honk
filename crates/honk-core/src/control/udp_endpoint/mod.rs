@@ -50,6 +50,7 @@ pub struct UdpEndpoint {
     pub proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
     /// The relay target address (upstream proxy).
     pub relay_addr: SocketAddr,
+    target_is_domain: bool,
     /// NodeId of the proxy node this endpoint dials through — used to
     /// report UDP liveness when a reply actually arrives (see
     /// `receive_loop`) and to retire the endpoint on node death.
@@ -96,6 +97,7 @@ impl UdpEndpoint {
         Self::new_scored(
             proxy_socket,
             relay_addr,
+            false,
             node_id,
             honk_outbound::alive::IpVersion::V4,
             None,
@@ -105,6 +107,7 @@ impl UdpEndpoint {
     pub fn new_scored(
         proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
         relay_addr: SocketAddr,
+        target_is_domain: bool,
         node_id: uuid::Uuid,
         health_family: honk_outbound::alive::IpVersion,
         score_reporter: Option<ScoreReporter>,
@@ -114,6 +117,7 @@ impl UdpEndpoint {
             dead: AtomicBool::new(false),
             proxy_socket,
             relay_addr,
+            target_is_domain,
             node_id,
             expires_at: AtomicI64::new(now + nanos_from_dur(DEFAULT_NAT_TIMEOUT)),
             has_reply: AtomicBool::new(false),
