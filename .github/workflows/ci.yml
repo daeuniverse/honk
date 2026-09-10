@@ -76,13 +76,20 @@ jobs:
             busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
             python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
-      - name: Enable KVM
+      - name: Configure KVM
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
-            sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -r /dev/kvm -a -w /dev/kvm
+          if test -e /dev/kvm; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+              sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm || true
+            if test -r /dev/kvm -a -w /dev/kvm; then
+              echo "HONK_CI_VNG_DISABLE_KVM=0" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+          echo "KVM unavailable on this runner; using virtme-ng software emulation"
+          echo "HONK_CI_VNG_DISABLE_KVM=1" >> "$GITHUB_ENV"
       - name: Install virtme-ng 1.41
         run: |
           curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl" \
@@ -155,7 +162,12 @@ jobs:
           echo "HONK_CI_KERNEL_IMAGE=$kernel_dir/root/boot/vmlinuz-6.12.0-061200-generic" >> "$GITHUB_ENV"
       - name: Run all real-kernel gates on Linux 6.12
         run: |
+          kvm_args=()
+          if test "${HONK_CI_VNG_DISABLE_KVM:-0}" = 1; then
+            kvm_args+=(--disable-kvm)
+          fi
           vng -r "$HONK_CI_KERNEL_IMAGE" \
+            "${kvm_args[@]}" \
             --user root \
             --rwdir "$GITHUB_WORKSPACE" \
             --cpus 2 \
