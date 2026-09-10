@@ -2,7 +2,7 @@
 
 This guide shows how to assemble and operate a honk configuration without repeating the field inventories in the reference docs.
 
-honk uses dae configuration syntax. The runtime sections and CLI entry point are listed below; `include {}` composes files and is covered next.
+honk uses dae configuration syntax as a dialect: the known differences from dae are listed in the [dialect reference](./reference/dialect.md). The runtime sections and CLI entry point are listed below; `include {}` composes files and is covered next.
 
 | Section | Purpose | Reference |
 | --- | --- | --- |
