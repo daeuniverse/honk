@@ -170,16 +170,17 @@ honk-tool bpf stats [--pin-root PATH]
 ### `diagnose`
 
 ```text
-honk-tool diagnose [--api URL] [--pin-root PATH] [--tproxy-mark VALUE]
+honk-tool diagnose [--api URL] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark VALUE]
 ```
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `--api URL` | `http://127.0.0.1:9090` | 明文 HTTP Clash API 基础 URL。空值跳过 API 检查；内置客户端不支持 HTTPS。 |
+| `--secret TOKEN` | `HONK_API_SECRET`（若已设置） | Clash API 的 Bearer 令牌。命令行参数优先于环境变量。 |
 | `--pin-root PATH` | `/sys/fs/bpf` | 检查 pin map 是否存在及读取统计时使用的根目录。 |
 | `--tproxy-mark VALUE` | `134217728`（`0x08000000`） | `daens` 策略规则中预期的 fwmark。 |
 
-该检查只读。它查找引擎进程（`honk-core`、`honk` 或 `dae`）、`/var/run/netns/daens`、`/sys/class/net/dae0`、`daens` 内的 fwmark 规则、必需的 pin map、可读取的占用/溢出统计，以及 `<api>/version` 可达性。最后一行严格为 `diagnose: all checks passed` 或 `diagnose: N issue(s) found`。发现失败检查会计入汇总，但本身不会改变进程退出状态。
+该检查只读。它查找引擎进程（`honk-core`、`honk` 或 `dae`）、`/var/run/netns/daens`、`/sys/class/net/dae0`、`daens` 内的 fwmark 规则、必需的 pin map、可读取的占用/溢出统计，并检查 `<api>/version` 是否返回成功的 HTTP 响应。API 返回 2xx 状态码时打印 `[ok]` 和响应正文；返回非 2xx 状态码时打印 `[FAIL]` 和状态文本。标准输出末尾为 `diagnose: all checks passed` 或 `diagnose: N issue(s) found`。存在失败检查时，退出状态为 `1`，错误信息包含问题数量；全部通过时，退出状态为 `0`。
 
 ### `geosite` 与 `geoip`
 

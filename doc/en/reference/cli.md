@@ -170,16 +170,17 @@ The implementation opens pins with raw `bpf(2)` operations; it does not use aya,
 ### `diagnose`
 
 ```text
-honk-tool diagnose [--api URL] [--pin-root PATH] [--tproxy-mark VALUE]
+honk-tool diagnose [--api URL] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark VALUE]
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--api URL` | `http://127.0.0.1:9090` | Plain-HTTP Clash API base URL. An empty value skips the API check; the built-in client does not support HTTPS. |
+| `--secret TOKEN` | `HONK_API_SECRET`, if set | Bearer token for the Clash API. The flag overrides the environment variable. |
 | `--pin-root PATH` | `/sys/fs/bpf` | Root used for pinned-map presence and statistics reads. |
 | `--tproxy-mark VALUE` | `134217728` (`0x08000000`) | Expected fwmark in the `daens` policy rule. |
 
-The check is read-only. It looks for an engine process (`honk-core`, `honk`, or `dae`), `/var/run/netns/daens`, `/sys/class/net/dae0`, the fwmark rule inside `daens`, required pinned maps, readable occupancy/overflow statistics, and `<api>/version` reachability. It ends with exactly `diagnose: all checks passed` or `diagnose: N issue(s) found`. Detected failed checks are summarized but do not by themselves change the process exit status.
+The check is read-only. It looks for an engine process (`honk-core`, `honk`, or `dae`), `/var/run/netns/daens`, `/sys/class/net/dae0`, the fwmark rule inside `daens`, required pinned maps, readable occupancy/overflow statistics, and a successful HTTP response from `<api>/version`. The API check prints `[ok]` with the body for a 2xx status, or `[FAIL]` with the status text for a non-2xx status. Standard output ends with `diagnose: all checks passed` or `diagnose: N issue(s) found`. Failed checks cause exit status `1` and an error message with the issue count; all checks passing gives exit status `0`.
 
 ### `geosite` and `geoip`
 

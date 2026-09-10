@@ -125,8 +125,11 @@ tx/rx counters.
 ### `diagnose` — one-shot health check
 
 ```bash
-honk-tool diagnose [--api http://127.0.0.1:9090] [--pin-root PATH] [--tproxy-mark 0x8000000]
+honk-tool diagnose [--api http://127.0.0.1:9090] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark 0x8000000]
 ```
+
+For an authenticated Clash API, supply `--secret TOKEN` or set `HONK_API_SECRET`.
+The flag takes precedence; the token is sent as `Authorization: Bearer`.
 
 Read-only checks, each printed as `[ok]` / `[FAIL]`:
 
@@ -136,9 +139,11 @@ Read-only checks, each printed as `[ok]` / `[FAIL]`:
 4. required pinned maps present (`CONN_STATE_MAP`, `REDIRECT_TRACK`,
    `ROUTING_HANDOFF_MAP`, `CONN_STATE_OCCUPANCY`),
 5. conn-state occupancy + overflow counters readable,
-6. clash API reachable (`/version`).
+6. clash API returns a 2xx status (`/version`), printing the response body;
+   a non-2xx status prints `[FAIL]` with the status text.
 
-Exits with `all checks passed` or `N issue(s) found`.
+Standard output ends with `diagnose: all checks passed` (exit status `0`) or
+`diagnose: N issue(s) found` (exit status `1`, with the count in the error message).
 
 ## Design notes
 

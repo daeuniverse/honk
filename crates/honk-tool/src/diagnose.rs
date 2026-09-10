@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Args)]
 pub struct DiagnoseArgs {
@@ -15,6 +16,9 @@ pub struct DiagnoseArgs {
     /// Clash API base URL to probe (empty = skip API checks).
     #[arg(long, default_value = "http://127.0.0.1:9090")]
     pub api: String,
+    /// Clash API Bearer token (overrides HONK_API_SECRET).
+    #[arg(long, env = "HONK_API_SECRET", hide_env_values = true)]
+    pub secret: Option<String>,
     /// Expected TPROXY mark (hex, no 0x).
     #[arg(long, default_value_t = 0x0800_0000)]
     pub tproxy_mark: u32,
@@ -75,7 +79,7 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
 
     if !args.api.is_empty() {
         let url = format!("{}/version", args.api.trim_end_matches('/'));
-        match reqwest_get(&url).await {
+        match reqwest_get(&url, args.secret.as_deref()).await {
             Ok(body) => println!("[ok] clash API {}: {}", args.api, body.trim()),
             Err(e) => {
                 println!("[FAIL] clash API {}: {}", args.api, e);
@@ -92,6 +96,7 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
             format!("diagnose: {issues} issue(s) found")
         }
     );
+    anyhow::ensure!(issues == 0, "diagnose: {issues} issue(s) found");
     Ok(())
 }
 
@@ -126,7 +131,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
 }
 
 /// Minimal GET helper (avoids pulling reqwest into the tool for one call).
-async fn reqwest_get(url: &str) -> anyhow::Result<String> {
+async fn reqwest_get(url: &str, secret: Option<&str>) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| anyhow::anyhow!("only http:// API URLs are supported"))?;
@@ -135,13 +140,41 @@ async fn reqwest_get(url: &str) -> anyhow::Result<String> {
         None => (rest, "/"),
     };
     let stream = tokio::net::TcpStream::connect(host).await?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    tokio::io::AsyncWriteExt::write_all(
-        &mut writer,
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await?;
-    let mut buf = String::new();
-    tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await?;
-    Ok(buf)
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(secret) = secret {
+        request.push_str("Authorization: Bearer ");
+        request.push_str(secret);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    writer.write_all(request.as_bytes()).await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let mut status = line.split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")),
+        "invalid HTTP status line"
+    );
+    let code = status
+        .next()
+        .filter(|code| code.len() == 3)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP status code"))?;
+    anyhow::ensure!((200..300).contains(&code), "{}", line.trim_end());
+    loop {
+        line.clear();
+        anyhow::ensure!(
+            reader.read_line(&mut line).await? != 0,
+            "incomplete HTTP response headers"
+        );
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+    let mut body = String::new();
+    reader.read_to_string(&mut body).await?;
+    Ok(body)
 }
