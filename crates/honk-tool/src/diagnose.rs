@@ -3,7 +3,7 @@
 //! Read-only: inspects the process, namespace/veth plumbing, pinned maps,
 //! policy routing, and the clash API.  Requires root for the map reads.
 
-use std::path::PathBuf;
+use std::{ffi::OsString, io, path::PathBuf};
 
 use clap::Args;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -101,13 +101,27 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
 }
 
 fn find_engine() -> Option<(u32, String)> {
-    for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        let pid: u32 = match entry.file_name().to_str()?.parse() {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    find_engine_in(entries.map(|entry| entry.map(|entry| (entry.file_name(), entry.path()))))
+}
+
+fn find_engine_in(
+    entries: impl Iterator<Item = io::Result<(OsString, PathBuf)>>,
+) -> Option<(u32, String)> {
+    for entry in entries {
+        let Ok((name, path)) = entry else {
+            continue;
+        };
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let pid: u32 = match name.parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+        let Ok(comm) = std::fs::read_to_string(path.join("comm")) else {
+            continue;
+        };
         let comm = comm.trim().to_string();
         if comm == "honk-core" || comm == "honk" || comm == "dae" {
             return Some((pid, comm));
@@ -177,4 +191,32 @@ async fn reqwest_get(url: &str, secret: Option<&str>) -> anyhow::Result<String> 
     let mut body = String::new();
     reader.read_to_string(&mut body).await?;
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::find_engine_in;
+
+    #[test]
+    fn find_engine_skips_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_comm = dir.path().join("100");
+        let engine = dir.path().join("200");
+        std::fs::create_dir(&missing_comm).unwrap();
+        std::fs::create_dir(&engine).unwrap();
+        std::fs::write(engine.join("comm"), "honk-core\n").unwrap();
+        let entries = [
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Ok((OsString::from_vec(vec![0xff]), dir.path().to_path_buf())),
+            Ok(("100".into(), missing_comm)),
+            Ok(("200".into(), engine)),
+        ];
+
+        let found = find_engine_in(entries.into_iter());
+
+        assert_eq!(found, Some((200, "honk-core".to_owned())));
+    }
 }
