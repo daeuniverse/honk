@@ -1200,169 +1200,117 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
 }
 
 #[tokio::test]
-async fn udp_endpoint_replies_from_each_accepted_transport_source() {
-    let source_socket_a = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
-    let source_socket_b = std::net::UdpSocket::bind("127.0.0.3:0").unwrap();
-    let source_a = source_socket_a.local_addr().unwrap();
-    let source_b = source_socket_b.local_addr().unwrap();
-    let factory = Arc::new(InjectedReplySocketFactory::new([
-        source_socket_a,
-        source_socket_b,
-    ]));
-    let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
-        1,
-        factory.clone(),
-    ));
-    let stats = Arc::new(StatsManager::new());
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let client = client_socket.local_addr().unwrap();
-    let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, source_a, b"request", slow_permit, &stats)
-    {
-        EndpointReservation::Initializing(lease) => lease,
-        _ => panic!("reply-source fixture must initialize"),
-    };
-    let transport = Arc::new(
-        ScriptedPacketTransport::with_receive_actions(
+async fn udp_endpoint_reply_sources_follow_target_policy() {
+    for target_is_domain in [false, true] {
+        let source_socket_a = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+        let source_a = source_socket_a.local_addr().unwrap();
+        let source_socket_b = std::net::UdpSocket::bind((
+            "127.0.0.3",
+            if target_is_domain { source_a.port() } else { 0 },
+        ))
+        .unwrap();
+        let source_b = source_socket_b.local_addr().unwrap();
+        let factory = Arc::new(InjectedReplySocketFactory::new([
+            source_socket_a,
+            source_socket_b,
+        ]));
+        let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+            1,
+            factory.clone(),
+        ));
+        let stats = Arc::new(StatsManager::new());
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if target_is_domain {
+            client_socket.connect(source_a).await.unwrap();
+        }
+        let client = client_socket.local_addr().unwrap();
+        let replies: &[(&[u8], SocketAddr, SocketAddr)] = if target_is_domain {
+            &[
+                (b"resolved-v4", source_b, source_a),
+                (
+                    b"resolved-v6",
+                    SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), source_a.port()),
+                    source_a,
+                ),
+            ]
+        } else {
+            &[
+                (b"from-b", source_b, source_b),
+                (b"from-a", source_a, source_a),
+                (b"from-b-again", source_b, source_b),
+            ]
+        };
+        let transport = Arc::new(
+            ScriptedPacketTransport::with_receive_actions(
+                source_a,
+                [DriverSendAction::Ok],
+                replies
+                    .iter()
+                    .map(|(payload, source, _)| DriverReceiveAction::Packet {
+                        data: payload.to_vec(),
+                        source: *source,
+                    })
+                    .chain([DriverReceiveAction::Pending]),
+            )
+            .allowing_full_cone_replies(),
+        );
+        let endpoint = if target_is_domain {
+            Arc::new(UdpEndpoint::new_scored(
+                transport,
+                source_a,
+                true,
+                TEST_NODE_ID,
+                honk_outbound::alive::IpVersion::V4,
+                None,
+            ))
+        } else {
+            driver_test_endpoint(transport, source_a)
+        };
+        endpoint.record_pending_reply_peer(source_a);
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease =
+            match pool.reserve_or_enqueue(client, source_a, b"request", slow_permit, &stats) {
+                EndpointReservation::Initializing(lease) => lease,
+                _ => panic!("reply-source fixture must initialize"),
+            };
+        let queue_rx = lease.take_queue_receiver().unwrap();
+        let reply_socket = Arc::new(pool.create_reply_socket(source_a).unwrap());
+        let mut driver = pool.spawn_driver(
+            client,
             source_a,
-            [DriverSendAction::Ok],
-            [
-                DriverReceiveAction::Packet {
-                    data: b"from-b".to_vec(),
-                    source: source_b,
-                },
-                DriverReceiveAction::Packet {
-                    data: b"from-a".to_vec(),
-                    source: source_a,
-                },
-                DriverReceiveAction::Packet {
-                    data: b"from-b-again".to_vec(),
-                    source: source_b,
-                },
-                DriverReceiveAction::Pending,
-            ],
-        )
-        .allowing_full_cone_replies(),
-    );
-    let endpoint = driver_test_endpoint(transport, source_a);
-    endpoint.record_pending_reply_peer(source_a);
-    let queue_rx = lease.take_queue_receiver().unwrap();
-    let reply_socket = Arc::new(pool.create_reply_socket(source_a).unwrap());
-    let mut driver = pool.spawn_driver(
-        client,
-        source_a,
-        lease.generation(),
-        lease.decision_token(),
-        Arc::clone(&endpoint),
-        queue_rx,
-        reply_socket,
-        Arc::new(honk_outbound::alive::AliveDialerSet::new()),
-        Arc::clone(&stats),
-        "test-node".to_owned(),
-    );
-    driver.wait_ready().await.unwrap();
-    assert!(lease.commit_ready(endpoint));
-    driver.start(lease.take_first().unwrap()).unwrap();
-    drop(lease);
-    driver.wait_first_ack().await.unwrap();
+            lease.generation(),
+            lease.decision_token(),
+            Arc::clone(&endpoint),
+            queue_rx,
+            reply_socket,
+            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            stats,
+            "test-node".to_owned(),
+        );
+        driver.wait_ready().await.unwrap();
+        assert!(lease.commit_ready(endpoint));
+        driver.start(lease.take_first().unwrap()).unwrap();
+        drop(lease);
+        driver.wait_first_ack().await.unwrap();
 
-    let mut buf = [0u8; 16];
-    for (expected_payload, expected_source) in [
-        (b"from-b".as_slice(), source_b),
-        (b"from-a".as_slice(), source_a),
-        (b"from-b-again".as_slice(), source_b),
-    ] {
-        let (n, source) =
-            tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(&buf[..n], expected_payload);
-        assert_eq!(source, expected_source);
+        let mut buf = [0u8; 32];
+        for &(expected_payload, _, expected_source) in replies {
+            let (n, source) =
+                tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("UDP reply timed out (domain target: {target_is_domain})")
+                    })
+                    .unwrap();
+            assert_eq!(&buf[..n], expected_payload);
+            assert_eq!(source, expected_source);
+        }
+        if !target_is_domain {
+            assert_eq!(factory.created(), vec![source_a, source_b]);
+        }
+        driver.abort();
+        assert!(pool.shutdown().await);
     }
-    assert_eq!(factory.created(), vec![source_a, source_b]);
-
-    driver.abort();
-    assert!(pool.shutdown().await);
-}
-
-#[tokio::test]
-async fn udp_domain_replies_preserve_the_connected_clients_original_destination() {
-    let original_socket = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
-    let original = original_socket.local_addr().unwrap();
-    let resolved_socket = std::net::UdpSocket::bind(("127.0.0.3", original.port())).unwrap();
-    let resolved = resolved_socket.local_addr().unwrap();
-    let factory = Arc::new(InjectedReplySocketFactory::new([
-        original_socket,
-        resolved_socket,
-    ]));
-    let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(1, factory));
-    let stats = Arc::new(StatsManager::new());
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client_socket.connect(original).await.unwrap();
-    let client = client_socket.local_addr().unwrap();
-    let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, original, b"request", slow_permit, &stats)
-    {
-        EndpointReservation::Initializing(lease) => lease,
-        _ => panic!("domain-reply fixture must initialize"),
-    };
-    let transport = Arc::new(
-        ScriptedPacketTransport::with_receive_actions(
-            original,
-            [DriverSendAction::Ok],
-            [
-                DriverReceiveAction::Packet {
-                    data: b"resolved-v4".to_vec(),
-                    source: resolved,
-                },
-                DriverReceiveAction::Packet {
-                    data: b"resolved-v6".to_vec(),
-                    source: SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), original.port()),
-                },
-                DriverReceiveAction::Pending,
-            ],
-        )
-        .allowing_full_cone_replies(),
-    );
-    let endpoint = Arc::new(UdpEndpoint::new_scored(
-        transport,
-        original,
-        true,
-        TEST_NODE_ID,
-        honk_outbound::alive::IpVersion::V4,
-        None,
-    ));
-    let queue_rx = lease.take_queue_receiver().unwrap();
-    let reply_socket = Arc::new(pool.create_reply_socket(original).unwrap());
-    let mut driver = pool.spawn_driver(
-        client,
-        original,
-        lease.generation(),
-        lease.decision_token(),
-        Arc::clone(&endpoint),
-        queue_rx,
-        reply_socket,
-        Arc::new(honk_outbound::alive::AliveDialerSet::new()),
-        stats,
-        "test-node".to_owned(),
-    );
-    driver.wait_ready().await.unwrap();
-    assert!(lease.commit_ready(endpoint));
-    driver.start(lease.take_first().unwrap()).unwrap();
-    drop(lease);
-    driver.wait_first_ack().await.unwrap();
-
-    let mut buf = [0u8; 32];
-    for expected in [b"resolved-v4", b"resolved-v6"] {
-        let n = tokio::time::timeout(Duration::from_secs(1), client_socket.recv(&mut buf))
-            .await
-            .expect("domain reply did not reach the original connected UDP client")
-            .unwrap();
-        assert_eq!(&buf[..n], expected);
-    }
-    driver.abort();
-    assert!(pool.shutdown().await);
 }
 
 #[tokio::test]
