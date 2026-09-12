@@ -1,11 +1,13 @@
 ### honk-core with real eBPF
 
+Read with: `AGENTS.md` (Technology stack, Current validation guidance, Notes for agents); `configuration.md` for NFQUEUE activation; `test-locations.md` for where the real-kernel tests live; the VM procedure is `.github/workflows/ci.yml` and skill `honk-real-ebpf-tests`.
+
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows Configuration.
+- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows `configuration.md`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
-- `mimalloc` — shipped binary allocates through mimalloc (see Technology stack); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
+- `mimalloc` — shipped binary allocates through mimalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
@@ -20,7 +22,7 @@ sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedde
 sudo ./target/release/honk-core --config c.dae --bpf-object /path.o    # external object
 ```
 
-NFQUEUE activation, mock/preflight fallback, and restart requirements: Configuration.
+NFQUEUE activation, mock/preflight fallback, and restart requirements: `configuration.md`.
 
 Dev without kernel eBPF (unprivileged):
 

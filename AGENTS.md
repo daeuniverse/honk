@@ -22,7 +22,7 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 
 `honk` is a Rust transparent-proxy engine for Linux, **inspired by** [dae](https://github.com/daeuniverse/dae) (eBPF datapath and configuration surface) and [sing-box](https://github.com/SagerNet/sing-box) (outbound groups, multi-protocol dialers, Clash-compatible API). It is not a line-for-line port of either: the kernel path uses TC hooks with a restricted native-BPF routing policy compiled from userspace, while the userspace outbound/control stack follows sing-box-oriented designs.
 
-- `honk-core` intercepts via TC redirect and userspace proxy relay. Ambiguous LAN UDP uses default-on NFQUEUE 320 when prerequisites pass (`global.nfqueue_enable: false` disables; see Configuration). Its owned nftables table/chain installs no global `iptables` TPROXY rules.
+- `honk-core` intercepts via TC redirect and userspace proxy relay. Ambiguous LAN UDP uses default-on NFQUEUE 320 when prerequisites pass (`global.nfqueue_enable: false` disables; see `.agents/rules/configuration.md`). Its owned nftables table/chain installs no global `iptables` TPROXY rules.
 - `honk-config` provides shared types/parsers for original dae `{ section { ... } }`, the primary and only documented config syntax.
 - Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/daeuniverse/honk>
@@ -87,6 +87,8 @@ cargo build --release -p honk-core    # engine (default features: clash-api, moc
 cargo test --all                      # full suite (see current validation guidance below)
 ```
 
+Real-eBPF and standalone eBPF builds: `.agents/rules/real-ebpf.md`. CI and releases: `.agents/rules/release.md`.
+
 ### Justfile (preferred for day-to-day dev)
 
 | Recipe                                                                          | Purpose                                                                                                                                                                                                                                      |
@@ -116,11 +118,10 @@ Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.
 Do not treat dated pass counts as repository status; use the current command output and CI for that evidence. The workspace gate below retains the known legacy routing exclude. The current compiled-routing gate is `just test-routing`: it builds a real `routing-test` eBPF object and exercises independent policy goldens plus preservation of the active root when publication fails.
 
 ```bash
-CARGO_TARGET_DIR=/root/code/honk/target \
-  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   cargo test --workspace --no-fail-fast -- \
     --skip test_routing_with_config_dae
-CARGO_TARGET_DIR=/root/code/honk/target cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Group-policy/scorer changes should run `cargo test -p honk-config group_policy`, `cargo test -p honk-outbound group::score`, and focused core Score/Clash tests before the workspace gate (Score needs no feature flag).
@@ -134,6 +135,7 @@ not the unprivileged suite. Deployment A/B needs real eBPF/netns/upstreams and t
 
 `routing::tests::test_geosite_*` need `geosite.dat`/`geoip.dat`. Both tests call `use_repo_geo_assets()`, which points `DAE_LOCATION_ASSET` at the checkout root, so files at the top of the checkout are the quickest local setup; otherwise the loader falls through the documented geo asset search order, which is how CI's `/etc/dae` install works, and the tests fail for a reason unrelated to the change under test.
 Unset `HTTP_PROXY`/`HTTPS_PROXY` so reqwest does not proxy Clash UI loopback fetches.
+The maintainer's REALITY interop lab: `.agents/rules/maintainer-lab.md` (not required for contributions).
 
 REALITY `dest` TLS Certificate messages must stay **under 8 KiB**: sing-box buffers
 8192 bytes; `dl.google.com` works, `www.microsoft.com` at 8273 B fails.
@@ -162,9 +164,12 @@ REALITY `dest` TLS Certificate messages must stay **under 8 KiB**: sing-box buff
 - **A new test must fail without the change.** Remove the production hunk, run it, read the failure; a test that passes either way is not evidence. Read what already covers the behaviour first — several deliberate oddities here are pinned by one test. A deletion needs no test of its own.
 - **Say which gates you ran and which you did not.** Running a subset is fine; reporting no limits after running a subset is not.
 - `cargo test --all`: unprivileged default workspace unit/integration suites, using mock eBPF/loopback where appropriate. `just test-routing` runs the root-only compiled-policy goldens and failed-publication checks on Linux 6.12+; `just test-netns` depends on it and runs the remaining real NFQUEUE/eBPF integration checks.
+- Test locations: `.agents/rules/test-locations.md`.
 - Older standalone netns/podman scripts mentioned in stale docs are absent; use the supported `just test-netns` gate above.
 
 ## Notes for agents
+
+Configuration contracts (settings, dialect, `honk-tool`): `.agents/rules/configuration.md`. Deployment and security-sensitive paths: `.agents/rules/deployment.md`, `.agents/rules/security.md`.
 
 Shared eBPF/`honk-core` constants and `#[repr(C)]` structs in `#![no_std]`; `aya` is non-BPF-only for `Pod` impls. **Layouts and map key sizes must agree**: change types/constants together in [this crate](crates/honk-ebpf-common), `honk-ebpf`, and `honk-core` map writers.
 

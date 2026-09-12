@@ -1,4 +1,10 @@
-Install boring-sys prerequisites (Technology stack) and its REALITY-hooks checkout
+## Maintainer lab
+
+Read with: `AGENTS.md` (Current validation guidance: the REALITY `dest` certificate constraint) and `doc/en/design/outbound.md` (REALITY client).
+
+The maintainer's own interop setup, kept for reference; contributions do not require it.
+
+Install boring-sys prerequisites (`AGENTS.md`, Technology stack) and its REALITY-hooks checkout
 at pinned `/root/code/boring-rprx/boring-sys`. Cross-build with `ci/zig*`, not containers.
 
 REALITY / xtls-rprx-vision interop uses two live servers, not the unprivileged suite:
