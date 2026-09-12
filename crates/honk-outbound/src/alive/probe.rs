@@ -194,8 +194,8 @@ impl AliveDialerSet {
     /// (sing-box urltest `url` option). `tag` is the member identity the
     /// result is recorded under (a direct member's node name, or a
     /// sub-group's tag); `leaf` is the concrete node actually dialed (for
-    /// a sub-group member, its current pick). TCP-only, plain HTTP like
-    /// the global path: try up to 3 resolved addresses (any family),
+    /// sub-group member, its current pick). TCP-only HTTP like the global
+    /// path: try up to 3 resolved addresses (any family),
     /// first success wins. State is tracked per (tag, url) and never
     /// touches the global six domains.
     pub async fn probe_node_with_url(
@@ -217,15 +217,6 @@ impl AliveDialerSet {
         let Some(ref prober) = prober_opt else {
             return false;
         };
-        if url.starts_with("https://") {
-            // The periodic probe is plain HTTP/1.1 only; an https check URL
-            // is downgraded (the request still proves reachability —
-            // redirect/4xx responses count as healthy).
-            tracing::debug!(
-                "check URL '{}' uses https; probing over plain HTTP instead",
-                url
-            );
-        }
         let addrs = self.check_ips_for_url(url).await;
         if addrs.is_empty() {
             tracing::debug!(

@@ -129,7 +129,7 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 
 | 探测路径 | 行为 |
 | --- | --- |
-| TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。冷的可复用节点会先在临时 runtime 中建立 session/client；setup 不计时，随后只有完成的 HTTP 交换才把暖路径 RTT 记录到匹配的 TCP 地址族状态。setup 与目标交换失败都会更新活性/冷却，但不贡献延迟或排名 strike。 |
+| TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。`ProxyHttpProber` 将 HTTP 执行交给下述 outbound 共享测量路径；只有成功的热路径 RTT 进入匹配的 TCP 地址族状态。setup 与目标交换失败会更新活性/冷却，但不贡献延迟或排名 strike。 |
 | UDP 健康 | 通过节点自己的 `dial_udp_transport`，向第一个 `udp_check_dns` 目标发送一个最小 DNS 查询。成功记录实测 RTT，并把 `DnsUdp` 与 `DataUdp` 都标记为存活；失败分别给两个 UDP 域增加一次探测失败——除非同周期的独立 Score QUIC 握手成功，此时只有 `DnsUdp` 记录失败，`DataUdp` 由握手成功标记为存活（被封的 `:53` 检查目标不能判死一条正常的 UDP 数据通路）。它从不修改 TCP 状态。 |
 | Score QUIC 评分 | 通过新的 packet transport 为 Score 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`，无论 DNS 探测成败都会运行。成功或失败会更新精确 `DataUdp` 分数与聚合先验，不奖励未观测的 byte volume；当 DNS 探测失败而握手成功时，还会按上表所述复活 `DataUdp` 活性。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
@@ -139,6 +139,12 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 alive→dead 转换会调用控制面死亡回调，清除该节点的池连接与 UDP endpoint，避免新流量取得陈旧的可复用对象。
 
 每个节点最近一次真实 TCP 延迟样本每 60 秒写入 `cache.db`；启动时只恢复不超过 24 小时的样本。存活性从不由缓存恢复。合成 10 秒占位样本带有标记，不显示在历史中，不进入移动平均，也不会作为最近真实样本持久化；选择降级由失败 strike 计数承担，与占位样本无关。
+
+`honk-outbound/src/urltest.rs` 统一负责 HTTP 请求构造和测量，URL 解释委托给 `honk-config::check` 的规范解码器。core 与 generation URLTest 还共享显式冷 session 预热，并在创建资源或反馈之前保留可失败的节点准入；独立工具调用保留 handler 内部的 setup 和 CLI 外层 deadline。请求使用不含凭据的 authority，仅保留非默认端口，移除 fragment，并保留原始路径、查询串及点段；仅有查询串的 URL 使用 `/?query`。HTTPS 验证证书并协商 `h2,http/1.1`，禁用 server push。第一轮使用 HEAD，第二轮使用配置方法（delay 测试为 HEAD）；两轮最终响应的解码状态都必须为有效的 200–499。HTTP/1 会在同一轮内消费临时响应头后再读取最终响应，但不支持协议切换；每轮响应头累计上限为 16 KiB。HTTP/2 响应头列表使用相同大小上限。
+
+报告值为第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮 I/O 失败或超时可以回退到已验证的第一轮样本；HTTP/1 要求尚未收到响应字节，HTTP/2 还将正常 GOAWAY 视为传输关闭。畸形、截断、过大或部分接收后超时的 HTTP/1 响应头会失败。只复用已经预热或无状态的 generation runtime；冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放。session 准备、拨号、TLS、HTTP/2 启动与每轮请求分别使用阶段预算；core 仍单独保留配置的连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。健康调度与记账仍由 `alive` 负责；只有 delay 包装层写入拨号失败 strike，组 delay 并发上限仍为 10。
+
+已知上游限制：[`h2` 0.4.19 会把缺少响应 `:status` 的情况默认解码为 200](https://github.com/hyperium/h2/issues/958)。探测器只能检查解码后的状态，无法恢复被遗漏的伪头，因此这种畸形 HTTP/2 响应仍可能被判为健康。该依赖修复已明确延期，等待上游处理，不引入本地 fork 或 vendor 补丁。
 
 ## UDP 候选资格
 

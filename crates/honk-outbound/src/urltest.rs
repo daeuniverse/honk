@@ -2,17 +2,17 @@
 //!
 //! Dials a liveness URL through a proxy node and reports one **warm-path
 //! round trip**: the proxy dial, target TLS handshake, and a first throwaway
-//! request are all untimed; only the second `HEAD /` (or a real HTTP/2
-//! request when the server negotiates h2 via ALPN) is measured, so every
-//! protocol reports the same "already-warm node" latency — the number real
-//! traffic pays through the connection pool. A second request that fails or
-//! times out falls back to the first exchange's time. Successful
-//! measurements feed the node's latency history in [`AliveDialerSet`]. A
-//! lone failure leaves history unchanged; a second consecutive failure adds
+//! request are all untimed; only the second configured request is measured.
+//! Every protocol therefore reports the same "already-warm node" latency —
+//! the number real traffic pays through the connection pool. A second request
+//! whose transport fails or times out falls back to the first exchange's time;
+//! rejected response heads and bad decoded status codes never do. Successful measurements
+//! feed the node's latency history in [`AliveDialerSet`].
+//! A lone failure leaves history unchanged; a second consecutive failure adds
 //! a synthetic penalty and demotes the node.
 //!
-//! Used by the clash API delay endpoints; the periodic health check loop in
-//! `alive` is unaffected by these ad-hoc measurements.
+//! Shared by clash delay measurements and periodic HTTP health checks; their
+//! wrappers remain responsible for alive-state updates.
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use crate::group::{
@@ -21,11 +21,12 @@ use crate::group::{
 };
 use crate::proxy::{ProxyRegistry, TcpOutbound};
 use anyhow::{Context, anyhow};
+use honk_config::check::{HttpCheckTarget, decode_health_http_target, decode_http_check_target};
 use honk_config::node::Node;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(test)]
 fn no_feedback() -> Option<ScoreReporter> {
     None
@@ -65,12 +66,6 @@ fn reporter_error(reporter: &Option<ScoreReporter>, error: &anyhow::Error) {
     }
 }
 
-fn reporter_timeout(reporter: &Option<ScoreReporter>) {
-    if let Some(reporter) = reporter {
-        reporter.finish(ScoreOutcome::Timeout);
-    }
-}
-
 fn reporter_success(reporter: &Option<ScoreReporter>) {
     if let Some(reporter) = reporter {
         reporter.finish(ScoreOutcome::Success);
@@ -82,6 +77,79 @@ pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
 
 /// Default per-node measurement timeout.
 pub const DEFAULT_URLTEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Build a request from one of the canonical HTTP check target decoders.
+///
+/// The target owns the credential-free authority and raw request target, so
+/// URL serialization cannot normalize dot segments or leak user information.
+fn build_http_probe_request(
+    target: &HttpCheckTarget,
+    method: http::Method,
+) -> anyhow::Result<http::Request<()>> {
+    let scheme = if target.is_https() { "https" } else { "http" };
+    let uri = format!(
+        "{scheme}://{}{}",
+        target.authority(),
+        target.request_target()
+    );
+    http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(http::header::USER_AGENT, "honk-http-probe/1.0")
+        .body(())
+        .context("failed to build HTTP probe request")
+}
+
+fn probe_method(method: &str) -> anyhow::Result<http::Method> {
+    if method.is_empty() {
+        return Ok(http::Method::HEAD);
+    }
+    http::Method::from_bytes(method.as_bytes()).context("invalid HTTP probe method")
+}
+
+fn decode_probe_url(url: &str, default_https: bool) -> anyhow::Result<HttpCheckTarget> {
+    decode_http_check_target(url, default_https).map_err(|_| anyhow!("invalid HTTP probe URL"))
+}
+
+/// Build the URLTest request using HTTPS for schemeless targets.
+pub fn http_probe_request(url: &str, method: &str) -> anyhow::Result<http::Request<()>> {
+    let target = decode_probe_url(normalize_url(url), true)?;
+    build_http_probe_request(&target, probe_method(method)?)
+}
+
+/// Build the health-check request using HTTP for schemeless targets and dae's
+/// comma-separated literal fallback convention.
+pub fn health_http_probe_request(url: &str, method: &str) -> anyhow::Result<http::Request<()>> {
+    let target = decode_health_http_target(url).map_err(|_| anyhow!("invalid HTTP probe URL"))?;
+    build_http_probe_request(&target, probe_method(method)?)
+}
+
+fn request_target(request: &http::Request<()>) -> anyhow::Result<HttpCheckTarget> {
+    let uri = request.uri().to_string();
+    decode_probe_url(&uri, true)
+}
+
+fn normalize_url(url: &str) -> &str {
+    let url = url.trim();
+    if url.is_empty() {
+        DEFAULT_URLTEST_URL
+    } else {
+        url
+    }
+}
+
+fn urltest_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        DEFAULT_URLTEST_TIMEOUT
+    } else {
+        timeout
+    }
+}
+
+fn validate_runtime(runtime: &Arc<crate::runtime::NodeRuntime>) -> anyhow::Result<()> {
+    crate::runtime::NodeRuntime::validate_for_ephemeral(runtime.node.as_ref())
+        .map_err(anyhow::Error::new)
+}
 
 /// Optional resolver for check-URL hosts: `(host, port) → addr`.
 /// honk-core installs the DNS-forwarder-backed resolver so delay
@@ -122,91 +190,26 @@ async fn urltest_node_impl(
     timeout: Duration,
     group_manager: Option<&GroupManager>,
 ) -> anyhow::Result<Duration> {
+    validate_runtime(runtime)?;
+    let timeout = urltest_timeout(timeout);
+    let request = http_probe_request(url, "")?;
+    urltest_request_impl(runtime, handler, &request, timeout, group_manager).await
+}
+
+async fn urltest_request_impl(
+    runtime: &Arc<crate::runtime::NodeRuntime>,
+    handler: &dyn TcpOutbound,
+    request: &http::Request<()>,
+    timeout: Duration,
+    group_manager: Option<&GroupManager>,
+) -> anyhow::Result<Duration> {
+    validate_runtime(runtime)?;
     let node = runtime.node.as_ref();
-    let url = normalize_url(url);
-    let timeout = if timeout.is_zero() {
-        DEFAULT_URLTEST_TIMEOUT
-    } else {
-        timeout
-    };
-    if node.protocol() == honk_config::types::NodeProtocol::Direct {
-        let target = parse_url_target(url)?;
-        let host = target.host();
-        let port = target.port();
-        let is_https = target.is_https();
-        let authority = target.authority();
-        let addr = {
-            let hook = URLTEST_RESOLVER.read().clone();
-            match hook {
-                Some(hook) => hook(host.to_owned(), port)
-                    .await
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-                None => crate::bootstrap::resolve(host)
-                    .await
-                    .with_context(|| format!("failed to resolve '{host}:{port}'"))?
-                    .into_iter()
-                    .next()
-                    .map(|ip| SocketAddr::new(ip, port))
-                    .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-            }
-        };
-        let feedback = group_manager.and_then(|manager| {
-            let family = if addr.is_ipv6() {
-                IpVersion::V6
-            } else {
-                IpVersion::V4
-            };
-            let target = host
-                .parse::<std::net::IpAddr>()
-                .map_or_else(|_| ScoreTarget::domain(host, port), |_| addr.into());
-            manager
-                .feedback_for_node(
-                    node.id,
-                    ScoreSelectionContext {
-                        network: SelectionNetwork::Tcp,
-                        probe_domain: ProbeDomain::Tcp,
-                        target_family: Some(family),
-                        health_family: family,
-                        target: Some(target),
-                    },
-                )
-                .map(|feedback| feedback.streak_neutral())
-        });
-        return measure_head_exchange(
-            runtime,
-            handler,
-            host,
-            Some(host),
-            authority,
-            is_https,
-            addr,
-            timeout,
-            feedback,
-        )
-        .await;
-    }
-    let target = parse_url_target(url)?;
+    let target = request_target(request)?;
     let host = target.host();
     let port = target.port();
-    let is_https = target.is_https();
-    let authority = target.authority();
-    let addr = {
-        let hook = URLTEST_RESOLVER.read().clone();
-        match hook {
-            Some(hook) => hook(host.to_owned(), port)
-                .await
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-            None => tokio::net::lookup_host((host, port))
-                .await
-                .with_context(|| format!("failed to resolve '{host}:{port}'"))?
-                .next()
-                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-        }
-    };
+    let direct = node.protocol() == honk_config::types::NodeProtocol::Direct;
+    let addr = resolve_urltest_address(host, port, direct).await?;
     let feedback = group_manager.and_then(|manager| {
         let family = if addr.is_ipv6() {
             IpVersion::V6
@@ -229,19 +232,48 @@ async fn urltest_node_impl(
             )
             .map(|feedback| feedback.streak_neutral())
     });
-    measure_head_exchange(
+    measure_http_probe(
         runtime,
         handler,
-        host,
-        Some(host),
-        authority,
-        is_https,
+        request,
         addr,
+        Some(host),
+        timeout,
         timeout,
         feedback,
     )
     .await
 }
+
+async fn resolve_urltest_address(
+    host: &str,
+    port: u16,
+    direct: bool,
+) -> anyhow::Result<SocketAddr> {
+    let hook = URLTEST_RESOLVER.read().clone();
+    if let Some(hook) = hook {
+        return hook(host.to_string(), port)
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
+    }
+    if direct {
+        return crate::bootstrap::resolve(host)
+            .await
+            .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+            .into_iter()
+            .next()
+            .map(|ip| SocketAddr::new(ip, port))
+            .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))
+}
+
 /// Reuse an already-warm generation runtime; otherwise create a throwaway
 /// runtime whose guard closes any session or client established for probing.
 pub fn try_probe_runtime(
@@ -281,6 +313,50 @@ pub fn probe_runtime(
         .unwrap_or_else(|_| panic!("invalid node passed to URLTest runtime probe"))
 }
 
+/// Prepare a cold reusable transport for one HTTP probe attempt.
+///
+/// The caller owns generation dial scoping and any ephemeral runtime guard.
+pub async fn warm_http_probe(
+    runtime: &Arc<crate::runtime::NodeRuntime>,
+    warmable: Option<&dyn crate::proxy::WarmableOutbound>,
+    connect_timeout: Duration,
+    timeout: Duration,
+    feedback: Option<ScoreFeedback>,
+) -> anyhow::Result<()> {
+    validate_runtime(runtime)?;
+    if runtime.is_warm_or_stateless() {
+        return Ok(());
+    }
+    let reporter = start_feedback(feedback);
+    let result = match warmable {
+        Some(warmable) => {
+            let warm = crate::runtime::capture_dial_admission().scope(warmable.warm(
+                Arc::clone(runtime),
+                connect_timeout,
+                crate::proxy::WarmRequirement::Session,
+            ));
+            match tokio::time::timeout(timeout, warm).await {
+                Ok(result) => result,
+                Err(_) => Err(phase_timeout("HTTP probe warm-up timed out")),
+            }
+        }
+        None => Err(anyhow!("no warm handler for node '{}'", runtime.node.name)),
+    };
+    match result {
+        Ok(()) => {
+            reporter_setup(&reporter);
+            if let Some(reporter) = &reporter {
+                reporter.finish_setup_only();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            reporter_error(&reporter, &error);
+            Err(error)
+        }
+    }
+}
+
 /// Reuse an already-warm generation runtime. Cold reusable transports warm a
 /// throwaway runtime before measurement so a group scan retains no new state.
 pub async fn urltest_node_in_generation_with_feedback(
@@ -313,53 +389,29 @@ async fn urltest_node_in_generation_impl(
     timeout: Duration,
     group_manager: Option<&GroupManager>,
 ) -> anyhow::Result<Duration> {
-    let timeout = if timeout.is_zero() {
-        DEFAULT_URLTEST_TIMEOUT
-    } else {
-        timeout
-    };
+    let timeout = urltest_timeout(timeout);
+    let request = http_probe_request(url, "")?;
     let (runtime, guard) = try_probe_runtime(generation, node)?;
+    let warm_feedback = if runtime.is_warm_or_stateless() {
+        None
+    } else {
+        group_manager.and_then(|manager| {
+            manager
+                .feedback_for_node(
+                    node.id,
+                    ScoreSelectionContext::aggregate(
+                        SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        IpVersion::V4,
+                    ),
+                )
+                .map(|feedback| feedback.streak_neutral())
+        })
+    };
     let result = generation
         .scope_dials(async {
-            if !runtime.is_warm_or_stateless() {
-                let warm_reporter = start_feedback(group_manager.and_then(|manager| {
-                    manager
-                        .feedback_for_node(
-                            node.id,
-                            ScoreSelectionContext::aggregate(
-                                SelectionNetwork::Tcp,
-                                ProbeDomain::Tcp,
-                                IpVersion::V4,
-                            ),
-                        )
-                        .map(|feedback| feedback.streak_neutral())
-                }));
-                let warmed = match warmable {
-                    Some(warmable) => {
-                        crate::runtime::capture_dial_admission()
-                            .scope(warmable.warm(
-                                Arc::clone(&runtime),
-                                timeout,
-                                crate::proxy::WarmRequirement::Session,
-                            ))
-                            .await
-                    }
-                    None => Err(anyhow!("no warm handler for node '{}'", node.name)),
-                };
-                match warmed {
-                    Ok(()) => {
-                        reporter_setup(&warm_reporter);
-                        if let Some(reporter) = &warm_reporter {
-                            reporter.finish_setup_only();
-                        }
-                    }
-                    Err(error) => {
-                        reporter_error(&warm_reporter, &error);
-                        return Err(error);
-                    }
-                }
-            }
-            urltest_node_impl(&runtime, handler, url, timeout, group_manager).await
+            warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
+            urltest_request_impl(&runtime, handler, &request, timeout, group_manager).await
         })
         .await;
     if let Some(guard) = guard {
@@ -377,90 +429,75 @@ pub async fn urltest_node_addr(
     addr: SocketAddr,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    let url = normalize_url(url);
-    let target = parse_url_target(url)?;
-    let host = target.host();
-    let authority = target.authority();
-    measure_head_exchange(
-        runtime,
-        handler,
-        host,
-        None,
-        authority,
-        target.is_https(),
-        addr,
-        timeout,
-        None,
+    let timeout = urltest_timeout(timeout);
+    let request = http_probe_request(url, "")?;
+    measure_http_probe(
+        runtime, handler, &request, addr, None, timeout, timeout, None,
     )
     .await
 }
 
+fn phase_timeout(message: &'static str) -> anyhow::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, message).into()
+}
+
+/// Dial and perform two bounded HTTP exchanges, returning the warm-path RTT.
+/// Uses the request's URI and method; probe headers and the empty body are fixed.
 #[allow(clippy::too_many_arguments)]
-async fn measure_head_exchange(
+pub async fn measure_http_probe(
     runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
-    host: &str,
-    target_domain: Option<&str>,
-    authority: &str,
-    is_https: bool,
+    request: &http::Request<()>,
     addr: SocketAddr,
+    target_domain: Option<&str>,
+    connect_timeout: Duration,
     timeout: Duration,
     feedback: Option<ScoreFeedback>,
 ) -> anyhow::Result<Duration> {
+    validate_runtime(runtime)?;
+    let target = request_target(request)?;
+    let normalized_request = build_http_probe_request(&target, request.method().clone())?;
+    let request = &normalized_request;
+    let host = target.host();
+    let is_https = target.is_https();
     let node = runtime.node.as_ref();
     let reporter = start_feedback(feedback);
-    let timed_out = || {
-        anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "phase timed out",
-        ))
-    };
-    // Every phase gets its own `timeout` budget — dial, target TLS, the
-    // warm-up request, the measured request — so a slow node fails (or
-    // falls back) per phase instead of one outer clock killing
-    // slow-but-working measurements.
-    let dial = crate::runtime::capture_dial_admission().scope(handler.dial_runtime(
-        Arc::clone(runtime),
-        addr,
-        target_domain,
-        timeout,
-    ));
-    let proxy = match tokio::time::timeout(timeout, dial).await {
-        Ok(Ok(proxy)) => proxy,
-        Ok(Err(error)) => {
-            reporter_error(&reporter, &error);
-            return Err(error);
-        }
-        Err(_) => {
-            reporter_timeout(&reporter);
-            return Err(timed_out().context("urltest dial timed out"));
-        }
-    };
-    reporter_setup(&reporter);
-    tracing::debug!(node = %node.name, %addr, "urltest: dial established");
-    let stream = proxy.stream;
     let result = async {
+        // Dial, target TLS, HTTP/2 startup, and both exchanges each receive
+        // their own phase budget rather than sharing one outer clock.
+        let dial = crate::runtime::capture_dial_admission().scope(handler.dial_runtime(
+            Arc::clone(runtime),
+            addr,
+            target_domain,
+            connect_timeout,
+        ));
+        let proxy = tokio::time::timeout(timeout, dial)
+            .await
+            .map_err(|_| phase_timeout("HTTP probe dial timed out"))??;
+        reporter_setup(&reporter);
+        tracing::debug!(node = %node.name, %addr, "HTTP probe dial established");
+        let stream = proxy.stream;
         if is_https {
             let connector = https_connector()?;
-            let tls = match tokio::time::timeout(timeout, connector.connect(host, stream)).await {
-                Ok(result) => result.context("TLS handshake failed")?,
-                Err(_) => return Err(timed_out().context("urltest TLS handshake timed out")),
-            };
+            let tls = tokio::time::timeout(timeout, connector.connect(host, stream))
+                .await
+                .map_err(|_| phase_timeout("HTTP probe TLS handshake timed out"))?
+                .context("HTTP probe TLS handshake failed")?;
             tracing::debug!(
                 node = %node.name,
                 alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
-                "urltest: TLS established"
+                "HTTP probe TLS established"
             );
             match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => exchange_head_h2(tls, authority, &reporter, timeout).await,
+                Some(b"h2") => exchange_http2(tls, request, &reporter, timeout).await,
                 _ => {
                     let mut tls = tls;
-                    exchange_head(&mut tls, authority, &reporter, timeout).await
+                    exchange_http1(&mut tls, request, &reporter, timeout).await
                 }
             }
         } else {
             let mut stream = stream;
-            exchange_head(&mut stream, authority, &reporter, timeout).await
+            exchange_http1(&mut stream, request, &reporter, timeout).await
         }
     }
     .await;
@@ -470,21 +507,13 @@ async fn measure_head_exchange(
             Ok(elapsed)
         }
         Err(error) => {
-            if error.chain().any(|source| {
-                source
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
-            }) {
-                reporter_timeout(&reporter);
-            } else {
-                reporter_error(&reporter, &error);
-            }
+            reporter_error(&reporter, &error);
             Err(error)
         }
     }
 }
 
-/// BoringSSL connector with webpki root verification for urltest.
+/// BoringSSL connector with webpki root verification for HTTP probes.
 /// Built once and reused across measurements (it never changes at runtime).
 /// Offers `h2,http/1.1`; the exchange dispatches on the negotiated ALPN.
 fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
@@ -497,160 +526,321 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
     }
 }
 
-/// HTTP/2 variant of [`exchange_head`]: two HEAD requests over a fresh H2
-/// session (same layer as the DoH transport); the second request is the
-/// reported warm-path sample, resolved when its response HEADERS arrive.
-async fn exchange_head_h2<S>(
+enum RoundError {
+    Transport(anyhow::Error),
+    Invalid(anyhow::Error),
+}
+
+impl RoundError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Transport(error) | Self::Invalid(error) => error,
+        }
+    }
+}
+
+struct H2Driver(Option<tokio::task::JoinHandle<()>>);
+
+impl H2Driver {
+    async fn stop(mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+}
+
+impl Drop for H2Driver {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abort();
+        }
+    }
+}
+
+fn h2_round_error(error: h2::Error, context: &'static str) -> RoundError {
+    let transport =
+        error.is_io() || (error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR));
+    let error = anyhow::Error::new(error).context(context);
+    if transport {
+        RoundError::Transport(error)
+    } else {
+        RoundError::Invalid(error)
+    }
+}
+
+fn request_with_method(
+    request: &http::Request<()>,
+    method: http::Method,
+) -> anyhow::Result<http::Request<()>> {
+    let target = request_target(request)?;
+    build_http_probe_request(&target, method)
+}
+
+async fn h2_round(
+    sender: &mut h2::client::SendRequest<bytes::Bytes>,
+    request: &http::Request<()>,
+    method: http::Method,
+    reporter: &Option<ScoreReporter>,
+    first_response: bool,
+) -> Result<(Duration, http::StatusCode), RoundError> {
+    std::future::poll_fn(|context| sender.poll_ready(context))
+        .await
+        .map_err(|error| h2_round_error(error, "HTTP/2 request readiness failed"))?;
+    let outgoing = request_with_method(request, method.clone()).map_err(RoundError::Invalid)?;
+    let start = Instant::now();
+    let (response, _) = sender
+        .send_request(outgoing, true)
+        .map_err(|error| h2_round_error(error, "HTTP/2 request send failed"))?;
+    let uri_bytes = request
+        .uri()
+        .authority()
+        .map_or(0, |authority| authority.as_str().len())
+        .saturating_add(
+            request
+                .uri()
+                .path_and_query()
+                .map_or(1, |target| target.as_str().len()),
+        );
+    reporter_tx(reporter, method.as_str().len().saturating_add(uri_bytes));
+    let response = response
+        .await
+        .map_err(|error| h2_round_error(error, "HTTP/2 response failed"))?;
+    if first_response {
+        reporter_first_response(reporter);
+    }
+    reporter_rx(reporter, 1);
+    // ponytail: h2 defaults missing :status to 200; await hyperium/h2#958 rather than fork locally.
+    Ok((start.elapsed(), response.status()))
+}
+
+/// Two requests over a fresh HTTP/2 connection. The connection driver is
+/// owned by this future and aborted on both ordinary return and cancellation.
+async fn exchange_http2<S>(
     stream: S,
-    authority: &str,
+    request: &http::Request<()>,
     reporter: &Option<ScoreReporter>,
     timeout: Duration,
 ) -> anyhow::Result<Duration>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (sender, conn) = h2::client::handshake(stream)
+    let (mut sender, connection) = tokio::time::timeout(
+        timeout,
+        h2::client::Builder::new()
+            .enable_push(false)
+            .max_header_list_size(MAX_HTTP_RESPONSE_HEAD as u32)
+            .handshake(stream),
+    )
+    .await
+    .map_err(|_| phase_timeout("HTTP/2 probe startup timed out"))?
+    .map_err(|error| anyhow::Error::new(error).context("HTTP/2 probe startup failed"))?;
+    let driver = H2Driver(Some(tokio::spawn(async move {
+        let _ = connection.await;
+    })));
+    let result = async {
+        let (warm, status) = match tokio::time::timeout(
+            timeout,
+            h2_round(&mut sender, request, http::Method::HEAD, reporter, true),
+        )
         .await
-        .map_err(|e| anyhow!("HTTP/2 handshake: {e}"))?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let round = |first_response: bool| {
-        let mut sender = sender.clone();
-        let authority = authority.to_string();
-        let reporter = reporter.clone();
-        async move {
-            let req = http::Request::builder()
-                .method("HEAD")
-                .uri(format!("https://{authority}/"))
-                .header("user-agent", "honk-urltest/1.0")
-                .body(())
-                .map_err(|e| anyhow!("h2 request build: {e}"))?;
-            let start = Instant::now();
-            let (response_fut, _send_stream) = sender
-                .send_request(req, true)
-                .map_err(|e| anyhow!("h2 send_request: {e}"))?;
-            reporter_tx(&reporter, authority.len().saturating_add(1));
-            let response = response_fut
-                .await
-                .map_err(|e| anyhow!("h2 response: {e}"))?;
-            if first_response {
-                reporter_first_response(&reporter);
+        {
+            Ok(result) => result.map_err(RoundError::into_error)?,
+            Err(_) => return Err(phase_timeout("HTTP probe warm-up request timed out")),
+        };
+        validate_status_code(status)?;
+        match tokio::time::timeout(
+            timeout,
+            h2_round(
+                &mut sender,
+                request,
+                request.method().clone(),
+                reporter,
+                false,
+            ),
+        )
+        .await
+        {
+            Ok(Ok((measured, status))) => {
+                validate_status_code(status)?;
+                Ok(measured)
             }
-            reporter_rx(&reporter, 1);
-            Ok::<_, anyhow::Error>((start.elapsed(), response.status().as_u16()))
+            Ok(Err(RoundError::Transport(_))) | Err(_) => Ok(warm),
+            Ok(Err(RoundError::Invalid(error))) => Err(error),
         }
-    };
-    // Each round has its own budget: a slow warm-up fails the measurement
-    // (the old single-request shape); a slow or lost measured request falls
-    // back to the warm sample. A bad status on either request is a real
-    // measurement failure, never a fallback.
-    let (warm, warm_status) = match tokio::time::timeout(timeout, round(true)).await {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "urltest warm-up request timed out",
-            )
-            .into());
-        }
-    };
-    if !(200..500).contains(&warm_status) {
-        return Err(anyhow!("bad status code: {}", warm_status));
     }
-    match tokio::time::timeout(timeout, round(false)).await {
-        Ok(Ok((measured, status))) => {
-            if !(200..500).contains(&status) {
-                return Err(anyhow!("bad status code: {}", status));
-            }
-            Ok(measured)
+    .await;
+    driver.stop().await;
+    result
+}
+
+fn http1_wire_request(
+    request: &http::Request<()>,
+    method: &http::Method,
+    close: bool,
+) -> anyhow::Result<String> {
+    let target = request_target(request)?;
+    Ok(format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-http-probe/1.0\r\n{}\r\n",
+        method,
+        target.request_target(),
+        target.authority(),
+        if close { "Connection: close\r\n" } else { "" }
+    ))
+}
+
+const MAX_HTTP_RESPONSE_HEAD: usize = 16 * 1024;
+
+async fn read_response_head<S>(
+    stream: &mut S,
+    reporter: &Option<ScoreReporter>,
+    first_response: bool,
+    response_started: &mut bool,
+) -> Result<http::StatusCode, RoundError>
+where
+    S: AsyncBufRead + Unpin,
+{
+    let mut head = Vec::with_capacity(1024);
+    let mut total = 0;
+    loop {
+        if total == MAX_HTTP_RESPONSE_HEAD {
+            return Err(RoundError::Invalid(anyhow!(
+                "HTTP response heads exceed {MAX_HTTP_RESPONSE_HEAD} bytes"
+            )));
         }
-        Ok(Err(_)) | Err(_) => Ok(warm),
+        let first_bytes = !*response_started;
+        let (consumed, complete) = {
+            let available = match stream.fill_buf().await {
+                Ok(available) => available,
+                Err(error) if !*response_started => {
+                    return Err(RoundError::Transport(
+                        anyhow::Error::new(error).context("HTTP probe read failed"),
+                    ));
+                }
+                Err(error) => {
+                    return Err(RoundError::Invalid(
+                        anyhow::Error::new(error).context("truncated HTTP response head"),
+                    ));
+                }
+            };
+            if available.is_empty() {
+                return if !*response_started {
+                    Err(RoundError::Transport(anyhow!(
+                        "connection closed without an HTTP response"
+                    )))
+                } else {
+                    Err(RoundError::Invalid(anyhow!("truncated HTTP response head")))
+                };
+            }
+            *response_started = true;
+            let take = available.len().min(MAX_HTTP_RESPONSE_HEAD - total);
+            let old_len = head.len();
+            head.extend_from_slice(&available[..take]);
+            let scan_from = old_len.saturating_sub(3);
+            let complete = head[scan_from..]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| scan_from + offset + 4);
+            let consumed = complete.map_or(take, |end| end - old_len);
+            (consumed, complete)
+        };
+        stream.consume(consumed);
+        total += consumed;
+        if first_response && first_bytes {
+            reporter_first_response(reporter);
+        }
+        reporter_rx(reporter, consumed);
+        if let Some(end) = complete {
+            head.truncate(end);
+            let status = validate_response_head(&head).map_err(RoundError::Invalid)?;
+            if !status.is_informational() || status == http::StatusCode::SWITCHING_PROTOCOLS {
+                return Ok(status);
+            }
+            head.clear();
+        }
     }
 }
 
-/// Two HEAD requests on one connection. The reported sample is the second
-/// request: the first absorbs the remaining warm-up (target connect/TLS
-/// already happened on this stream), so the number is one warm-path round
-/// trip. Each round has its own `timeout` budget; a second request that
-/// fails at I/O or times out falls back to the first exchange's time, while
-/// a bad status on either request fails the measurement.
-async fn exchange_head<S>(
+async fn http1_round<S>(
     stream: &mut S,
-    authority: &str,
+    request: &http::Request<()>,
+    method: &http::Method,
+    close: bool,
+    reporter: &Option<ScoreReporter>,
+    first_response: bool,
+    timeout: Duration,
+) -> Result<(Duration, http::StatusCode), RoundError>
+where
+    S: AsyncBufRead + AsyncWrite + Unpin,
+{
+    let wire = http1_wire_request(request, method, close).map_err(RoundError::Invalid)?;
+    let mut response_started = false;
+    let round = async {
+        let start = Instant::now();
+        stream.write_all(wire.as_bytes()).await.map_err(|error| {
+            RoundError::Transport(anyhow::Error::new(error).context("HTTP probe write failed"))
+        })?;
+        reporter_tx(reporter, wire.len());
+        let status =
+            read_response_head(stream, reporter, first_response, &mut response_started).await?;
+        Ok((start.elapsed(), status))
+    };
+    match tokio::time::timeout(timeout, round).await {
+        Ok(result) => result,
+        Err(_) => {
+            let error = phase_timeout("HTTP probe request timed out");
+            if response_started {
+                Err(RoundError::Invalid(
+                    error.context("incomplete HTTP response head"),
+                ))
+            } else {
+                Err(RoundError::Transport(error))
+            }
+        }
+    }
+}
+
+/// Two HTTP/1.x requests on one connection. Only measured-round transport
+/// failure may fall back to the validated warm response.
+async fn exchange_http1<S>(
+    stream: &mut S,
+    request: &http::Request<()>,
     reporter: &Option<ScoreReporter>,
     timeout: Duration,
 ) -> anyhow::Result<Duration>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // One request: write HEAD, read to the header boundary. This is
-    // transfer only — status validation stays with the caller so a bad
-    // status on the measured request is never mistaken for a lost
-    // connection.
-    async fn round<S: AsyncRead + AsyncWrite + Unpin>(
-        stream: &mut S,
-        authority: &str,
-        close: bool,
-        reporter: &Option<ScoreReporter>,
-        first_response: bool,
-    ) -> anyhow::Result<(Duration, Vec<u8>)> {
-        let request = format!(
-            "HEAD / HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: honk-urltest/1.0\r\n{}\r\n",
-            if close { "Connection: close\r\n" } else { "" }
-        );
-        let start = Instant::now();
-        stream.write_all(request.as_bytes()).await?;
-        reporter_tx(reporter, request.len());
-        let mut buf = Vec::with_capacity(1024);
-        let mut chunk = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
-            }
-            if buf.is_empty() && first_response {
-                reporter_first_response(reporter);
-            }
-            reporter_rx(reporter, n);
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16 * 1024 {
-                break;
-            }
-        }
-        // An empty read-out means the peer closed without answering; that is
-        // a lost connection, not a status the caller can judge.
-        if buf.is_empty() {
-            return Err(anyhow!("connection closed without a response"));
-        }
-        Ok((start.elapsed(), buf))
-    }
-
-    // Each round has its own budget: a slow warm-up fails the measurement
-    // (the old single-request shape); a lost or slow measured request falls
-    // back to the warm sample. A bad status on either request fails.
-    let (warm, warm_buf) = match tokio::time::timeout(
+    let mut stream = BufReader::new(stream);
+    let (warm, status) = http1_round(
+        &mut stream,
+        request,
+        &http::Method::HEAD,
+        false,
+        reporter,
+        true,
         timeout,
-        round(stream, authority, false, reporter, true),
+    )
+    .await
+    .map_err(RoundError::into_error)?;
+    validate_status_code(status)?;
+    match http1_round(
+        &mut stream,
+        request,
+        request.method(),
+        true,
+        reporter,
+        false,
+        timeout,
     )
     .await
     {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "urltest warm-up request timed out",
-            )
-            .into());
-        }
-    };
-    validate_status(&warm_buf)?;
-    match tokio::time::timeout(timeout, round(stream, authority, true, reporter, false)).await {
-        Ok(Ok((measured, buf))) => {
-            validate_status(&buf)?;
+        Ok((measured, status)) => {
+            validate_status_code(status)?;
             Ok(measured)
         }
-        Ok(Err(_)) | Err(_) => Ok(warm),
+        Err(RoundError::Transport(_)) => Ok(warm),
+        Err(RoundError::Invalid(error)) => Err(error),
     }
 }
 
@@ -690,8 +880,9 @@ async fn urltest_group_impl(
     timeout: Duration,
     group_manager: Option<Arc<GroupManager>>,
 ) -> Vec<(String, anyhow::Result<Duration>)> {
+    let timeout = urltest_timeout(timeout);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
-    let url = normalize_url(url).to_string();
+    let url = url.to_string();
     let mut join_set = tokio::task::JoinSet::new();
     for node in members {
         let node = node.clone();
@@ -745,38 +936,75 @@ async fn urltest_group_impl(
     results
 }
 
-/// Empty URLs fall back to the default HTTPS liveness URL; an explicit
-/// URL (http or https) is always honored as given.
-fn normalize_url(url: &str) -> &str {
-    let url = url.trim();
-    if url.is_empty() {
-        DEFAULT_URLTEST_URL
+fn validate_status_code(status: http::StatusCode) -> anyhow::Result<()> {
+    if (200..500).contains(&status.as_u16()) {
+        Ok(())
     } else {
-        url
+        Err(anyhow!("bad status code: {status}"))
     }
 }
 
-fn parse_url_target(url: &str) -> anyhow::Result<honk_config::check::HttpCheckTarget> {
-    Ok(honk_config::check::decode_http_check_target(url, true)?)
-}
-
-fn validate_status(buf: &[u8]) -> anyhow::Result<()> {
-    let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
-    let status_line = String::from_utf8_lossy(&buf[..line_end]);
-    let mut parts = status_line.split_whitespace();
-    let version = parts.next().unwrap_or("");
-    if !version.starts_with("HTTP/") {
-        return Err(anyhow!("malformed HTTP response: '{}'", status_line.trim()));
+fn validate_response_head(head: &[u8]) -> anyhow::Result<http::StatusCode> {
+    if head.len() > MAX_HTTP_RESPONSE_HEAD || !head.ends_with(b"\r\n\r\n") {
+        return Err(anyhow!("incomplete HTTP response head"));
     }
-    let code: u16 = parts
+    let mut lines = head[..head.len() - 2].split(|byte| *byte == b'\n');
+    let status = lines
         .next()
-        .ok_or_else(|| anyhow!("missing status code in '{}'", status_line.trim()))?
-        .parse()
-        .context("invalid status code")?;
-    if !(200..500).contains(&code) {
-        return Err(anyhow!("bad status code: {}", code));
+        .and_then(|line| line.strip_suffix(b"\r"))
+        .ok_or_else(|| anyhow!("malformed HTTP status line"))?;
+    let separator = status
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or_else(|| anyhow!("malformed HTTP status line"))?;
+    let version = &status[..separator];
+    if version != b"HTTP/1.0" && version != b"HTTP/1.1" {
+        return Err(anyhow!("unsupported HTTP response version"));
     }
-    Ok(())
+    let remainder = &status[separator + 1..];
+    let code_end = remainder
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(remainder.len());
+    let code = &remainder[..code_end];
+    if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
+        return Err(anyhow!("malformed HTTP status code"));
+    }
+    if remainder[code_end..]
+        .iter()
+        .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
+    {
+        return Err(anyhow!("malformed HTTP reason phrase"));
+    }
+    let status = http::StatusCode::from_bytes(code).context("invalid HTTP status code")?;
+
+    for raw_line in lines {
+        if raw_line.is_empty() {
+            continue;
+        }
+        let line = raw_line
+            .strip_suffix(b"\r")
+            .ok_or_else(|| anyhow!("malformed HTTP header line ending"))?;
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| anyhow!("malformed HTTP response header"))?;
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().copied().all(is_header_name_byte) {
+            return Err(anyhow!("malformed HTTP response header name"));
+        }
+        if line[colon + 1..]
+            .iter()
+            .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
+        {
+            return Err(anyhow!("malformed HTTP response header value"));
+        }
+    }
+    Ok(status)
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 #[cfg(test)]
@@ -827,6 +1055,7 @@ mod tests {
     use crate::proxy::ProxyStream;
     use honk_config::types::NodeProtocol;
     use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Mock handler: dials the requested target with a plain TcpStream
     /// (no proxy protocol, no SO_MARK). Nodes named "bad" always fail.
@@ -1186,9 +1415,10 @@ mod tests {
                 .await
                 .unwrap();
         });
-        exchange_head(
+        let request = http_probe_request("http://localhost/", "").unwrap();
+        exchange_http1(
             &mut client,
-            "localhost",
+            &request,
             &no_feedback(),
             Duration::from_secs(5),
         )
@@ -1244,51 +1474,336 @@ mod tests {
         addr
     }
 
-    /// Spawn a minimal HTTP/2 server answering every request with 204.
-    async fn spawn_h2_server() -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut conn = h2::server::handshake(sock).await.unwrap();
-                    while let Some(result) = conn.accept().await {
-                        let (_request, mut respond) = result.unwrap();
-                        let response = http::Response::builder().status(204).body(()).unwrap();
-                        respond.send_response(response, true).unwrap();
-                    }
-                });
-            }
-        });
-        addr
+    async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let size = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(size, 0, "request closed before its header completed");
+            request.extend_from_slice(&chunk[..size]);
+        }
+        request
     }
 
-    /// The h2 probe path completes against an h2-only server — this is the
-    /// gstatic case that used to fail with "malformed HTTP response".
     #[tokio::test]
-    async fn test_exchange_head_h2() {
-        let addr = spawn_h2_server().await;
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_head_h2(stream, "localhost", &no_feedback(), Duration::from_secs(5))
-            .await
-            .expect("h2 HEAD exchange must succeed");
+    async fn http1_uses_configured_method_target_and_authority() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let warm = read_request_head(&mut server).await;
+            assert!(warm.starts_with(b"HEAD /health/ready?source=urltest HTTP/1.1\r\n"));
+            assert!(
+                warm.windows(b"Host: probe.example:8080\r\n".len())
+                    .any(|part| part == b"Host: probe.example:8080\r\n")
+            );
+            server
+                .write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </ready>\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let measured = read_request_head(&mut server).await;
+            assert!(measured.starts_with(b"GET /health/ready?source=urltest HTTP/1.1\r\n"));
+            assert!(
+                measured
+                    .windows(b"Host: probe.example:8080\r\n".len())
+                    .any(|part| part == b"Host: probe.example:8080\r\n")
+            );
+            server
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let request = http_probe_request(
+            "http://probe.example:8080/health/ready?source=urltest",
+            "GET",
+        )
+        .unwrap();
+        exchange_http1(
+            &mut client,
+            &request,
+            &no_feedback(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        peer.await.unwrap();
+    }
 
-        // A non-2xx..4xx status is a measurement failure.
+    #[tokio::test]
+    async fn partial_measured_response_timeout_is_not_a_fallback_success() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let peer = tokio::spawn(async move {
+            let _ = read_request_head(&mut server).await;
+            server
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = read_request_head(&mut server).await;
+            server
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
+        let result = exchange_http1(
+            &mut client,
+            &request,
+            &no_feedback(),
+            Duration::from_millis(50),
+        )
+        .await;
+        peer.abort();
+        let _ = peer.await;
+        assert!(
+            result.is_err(),
+            "partial response cannot become warm success"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_truncated_or_oversized_response_is_not_a_fallback_success() {
+        for response in [
+            b"not an HTTP response\r\n\r\n".to_vec(),
+            b"HTTP/1.1 204 No Content\r\nContent-Len".to_vec(),
+            format!(
+                "HTTP/1.1 204 No Content\r\nX-Pad: {}\r\n\r\n",
+                "a".repeat(MAX_HTTP_RESPONSE_HEAD)
+            )
+            .into_bytes(),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let _ = read_request_head(&mut server).await;
+                server
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = read_request_head(&mut server).await;
+                let _ = server.write_all(&response).await;
+            });
+            let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
+            assert!(
+                exchange_http1(
+                    &mut client,
+                    &request,
+                    &no_feedback(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_uses_configured_method_target_and_authority() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (observed, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(sock).await.unwrap();
+            while let Some(result) = connection.accept().await {
+                let (request, mut respond) = result.unwrap();
+                let push = http::Request::builder()
+                    .uri("http://probe.example/pushed")
+                    .body(())
+                    .unwrap();
+                assert!(
+                    respond.push_request(push).is_err(),
+                    "probes must refuse server push"
+                );
+                observed
+                    .send((request.method().clone(), request.uri().clone()))
+                    .unwrap();
+                let response = http::Response::builder().status(204).body(()).unwrap();
+                respond.send_response(response, true).unwrap();
+            }
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request =
+            http_probe_request("http://probe.example:8080?source=urltest", "GET").unwrap();
+        exchange_http2(stream, &request, &no_feedback(), Duration::from_secs(5))
+            .await
+            .expect("HTTP/2 exchange must succeed");
+
+        let first = requests.recv().await.unwrap();
+        let second = requests.recv().await.unwrap();
+        assert_eq!(first.0, http::Method::HEAD);
+        assert_eq!(second.0, http::Method::GET);
+        for (_, uri) in [first, second] {
+            assert_eq!(uri.authority().unwrap().as_str(), "probe.example:8080");
+            assert_eq!(uri.path_and_query().unwrap().as_str(), "/?source=urltest");
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_rejects_bad_warm_status() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            let mut conn = h2::server::handshake(sock).await.unwrap();
-            let (_req, mut respond) = conn.accept().await.unwrap().unwrap();
-            let response = http::Response::builder().status(500).body(()).unwrap();
-            respond.send_response(response, true).unwrap();
+            let mut connection = h2::server::handshake(sock).await.unwrap();
+            let mut first = true;
+            while let Some(request) = connection.accept().await {
+                let (_request, mut respond) = request.unwrap();
+                let status = if first { 500 } else { 204 };
+                first = false;
+                respond
+                    .send_response(
+                        http::Response::builder().status(status).body(()).unwrap(),
+                        true,
+                    )
+                    .unwrap();
+            }
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
         assert!(
-            exchange_head_h2(stream, "localhost", &no_feedback(), Duration::from_secs(5))
+            exchange_http2(stream, &request, &no_feedback(), Duration::from_secs(1))
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn h2_falls_back_only_for_graceful_goaway() {
+        for (reason, healthy) in [(0_u32, true), (1, false)] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let peer = tokio::spawn(async move {
+                let mut preface = [0; 24];
+                server.read_exact(&mut preface).await.unwrap();
+                server
+                    .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                loop {
+                    let mut header = [0; 9];
+                    server.read_exact(&mut header).await.unwrap();
+                    let length = ((header[0] as usize) << 16)
+                        | ((header[1] as usize) << 8)
+                        | header[2] as usize;
+                    let mut payload = vec![0; length];
+                    server.read_exact(&mut payload).await.unwrap();
+                    if header[3] == 4 && header[4] == 0 {
+                        server
+                            .write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0])
+                            .await
+                            .unwrap();
+                    }
+                    if header[3] == 1 {
+                        // Deliver :status 204 and GOAWAY together, before stream 3 can open.
+                        let mut frames = vec![
+                            0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89, 0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ];
+                        frames.extend_from_slice(&reason.to_be_bytes());
+                        server.write_all(&frames).await.unwrap();
+                        std::future::pending::<()>().await;
+                    }
+                }
+            });
+            let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
+            let result =
+                exchange_http2(client, &request, &no_feedback(), Duration::from_secs(1)).await;
+            peer.abort();
+            let _ = peer.await;
+            assert_eq!(result.is_ok(), healthy, "GOAWAY({reason}): {result:?}");
+        }
+    }
+
+    struct DropWatch<S> {
+        stream: S,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        block_writes: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<S> Drop for DropWatch<S> {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for DropWatch<S> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_read(context, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for DropWatch<S> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.block_writes.load(std::sync::atomic::Ordering::Acquire) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.block_writes.load(std::sync::atomic::Ordering::Acquire) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.block_writes.load(std::sync::atomic::Ordering::Acquire) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_stalled_h2_probe_drops_its_driver_stream() {
+        let (client, server) = tokio::io::duplex(4096);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let block_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watched = DropWatch {
+            stream: client,
+            dropped: Arc::clone(&dropped),
+            block_writes: Arc::clone(&block_writes),
+        };
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            let (_request, _respond) = connection.accept().await.unwrap().unwrap();
+            let _ = accepted.send(());
+            let _held = (connection, _request, _respond);
+            std::future::pending::<()>().await;
+        });
+        let probe = tokio::spawn(async move {
+            let request = http_probe_request("http://probe.example/stall", "HEAD").unwrap();
+            exchange_http2(watched, &request, &no_feedback(), Duration::from_secs(5)).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        block_writes.store(true, std::sync::atomic::Ordering::Release);
+        probe.abort();
+        let _ = probe.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled HTTP/2 driver must release its stream");
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -1310,78 +1825,92 @@ mod tests {
         assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
     }
     #[test]
-    fn test_normalize_and_parse_url() {
-        assert_eq!(normalize_url(""), DEFAULT_URLTEST_URL);
+    fn http_probe_request_preserves_uri_and_validates_inputs() {
+        let request =
+            http_probe_request("example.com:8443/ready,check?region=us,west", "GET").unwrap();
+        assert_eq!(request.method(), http::Method::GET);
+        assert_eq!(
+            request.uri().to_string(),
+            "https://example.com:8443/ready,check?region=us,west"
+        );
+        let target = request_target(&request).unwrap();
+        assert_eq!(
+            (
+                target.host(),
+                target.authority(),
+                target.port(),
+                target.is_https()
+            ),
+            ("example.com", "example.com:8443", 8443, true)
+        );
 
-        assert_eq!(
-            normalize_url("http://www.gstatic.com/generate_204"),
-            "http://www.gstatic.com/generate_204"
-        );
-        assert_eq!(
-            normalize_url("https://example.com/x"),
-            "https://example.com/x"
-        );
-
-        let target = parse_url_target(DEFAULT_URLTEST_URL).unwrap();
-        assert_eq!(
-            (target.host(), target.port(), target.is_https()),
-            ("www.gstatic.com", 443, true)
-        );
-        let target = parse_url_target("https://127.0.0.1:8080/").unwrap();
-        assert_eq!(
-            (target.host(), target.port(), target.is_https()),
-            ("127.0.0.1", 8080, true)
-        );
-        let target = parse_url_target("https://[::1]/").unwrap();
-        assert_eq!(
-            (target.host(), target.port(), target.is_https()),
-            ("::1", 443, true)
-        );
-        let target = parse_url_target("http://[::1]:8080/").unwrap();
+        let ipv6 = http_probe_request("http://[::1]:8080/status?full=1", "").unwrap();
+        assert_eq!(ipv6.method(), http::Method::HEAD);
+        assert_eq!(ipv6.uri().authority().unwrap().as_str(), "[::1]:8080");
+        let target = request_target(&ipv6).unwrap();
         assert_eq!(
             (target.host(), target.port(), target.is_https()),
             ("::1", 8080, false)
         );
-        // Schemeless URLs are treated as https on port 443.
-        let target = parse_url_target("example.com/204").unwrap();
+
+        let health = health_http_probe_request("probe.example/ready,1.1.1.1", "").unwrap();
+        assert_eq!(health.method(), http::Method::HEAD);
+        assert_eq!(health.uri().to_string(), "http://probe.example/ready");
+
         assert_eq!(
-            (target.host(), target.port(), target.is_https()),
-            ("example.com", 443, true)
+            http_probe_request("", "").unwrap().uri().to_string(),
+            DEFAULT_URLTEST_URL
         );
-        assert!(parse_url_target("https://").is_err());
+        assert!(http_probe_request("ftp://example.com/", "HEAD").is_err());
+        assert!(http_probe_request("https://", "HEAD").is_err());
+        assert!(http_probe_request("https://example.com:99999/", "HEAD").is_err());
+        assert!(http_probe_request("https://example.com/", "GET\r\nInjected: yes").is_err());
+        let error = http_probe_request("https:///u:PRIVATE@example.invalid/", "HEAD").unwrap_err();
+        assert!(!format!("{error:#}").contains("PRIVATE"));
     }
 
     #[test]
     fn c25_urltest_authority_boundaries() {
         for (input, expected) in [
             (
-                "http://u:PRIVATE@host:8080/path?q",
-                ("host", "host:8080", 8080, false),
+                "http://u:PRIVATE@host:8080/path?q#fragment",
+                ("host", "host:8080", 8080, false, "/path?q"),
             ),
-            ("https://host?q=1", ("host", "host", 443, true)),
-            ("http://[::1]:8080?q=1", ("::1", "[::1]:8080", 8080, false)),
+            ("https://host?q=1", ("host", "host", 443, true, "/?q=1")),
+            (
+                "http://[::1]:8080?q=1",
+                ("::1", "[::1]:8080", 8080, false, "/?q=1"),
+            ),
+            (
+                "http://host/a/../health?q=1",
+                ("host", "host", 80, false, "/a/../health?q=1"),
+            ),
         ] {
-            let target = parse_url_target(input).unwrap();
+            let request = http_probe_request(input, "").unwrap();
+            let target = request_target(&request).unwrap();
             assert_eq!(
                 (
                     target.host(),
                     target.authority(),
                     target.port(),
-                    target.is_https()
+                    target.is_https(),
+                    target.request_target(),
                 ),
                 expected
             );
+            assert!(!request.uri().authority().unwrap().as_str().contains('@'));
         }
     }
     /// The HEAD exchange itself is protocol-agnostic; exercise it over a
     /// plain stream against a local HTTP server.
     #[tokio::test]
-    async fn test_exchange_head_plain_http() {
+    async fn test_exchange_http1_plain_http() {
+        let request = http_probe_request("http://localhost/", "").unwrap();
         let addr = spawn_mock_http_server().await;
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_head(
+        exchange_http1(
             &mut stream,
-            "localhost",
+            &request,
             &no_feedback(),
             Duration::from_secs(5),
         )
@@ -1392,12 +1921,13 @@ mod tests {
     /// A server that closes after the first response still yields a sample:
     /// the warm-up exchange's own time is reported.
     #[tokio::test]
-    async fn test_exchange_head_falls_back_when_server_closes() {
+    async fn test_exchange_http1_falls_back_when_server_closes() {
+        let request = http_probe_request("http://localhost/", "").unwrap();
         let addr = spawn_close_after_response_server().await;
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_head(
+        exchange_http1(
             &mut stream,
-            "localhost",
+            &request,
             &no_feedback(),
             Duration::from_secs(5),
         )
@@ -1408,7 +1938,7 @@ mod tests {
     /// The reported sample excludes warm-up: a server that stalls only the
     /// first response must still measure a fast second round trip.
     #[tokio::test]
-    async fn test_exchange_head_reports_warm_round_trip() {
+    async fn test_exchange_http1_reports_warm_round_trip() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1426,10 +1956,11 @@ mod tests {
                     .unwrap();
             }
         });
+        let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_head(
+        let measured = exchange_http1(
             &mut stream,
-            "localhost",
+            &request,
             &no_feedback(),
             Duration::from_secs(5),
         )
@@ -1444,7 +1975,7 @@ mod tests {
     /// The sample really is the second request, not min(#1, #2): a stall on
     /// the second response must show up in the sample.
     #[tokio::test]
-    async fn test_exchange_head_reports_the_second_round_trip() {
+    async fn test_exchange_http1_reports_the_second_round_trip() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1462,10 +1993,11 @@ mod tests {
                     .unwrap();
             }
         });
+        let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_head(
+        let measured = exchange_http1(
             &mut stream,
-            "localhost",
+            &request,
             &no_feedback(),
             Duration::from_secs(5),
         )
@@ -1480,7 +2012,7 @@ mod tests {
     /// A bad status on the measured request fails the measurement; only a
     /// lost connection or a timeout falls back to the warm sample.
     #[tokio::test]
-    async fn test_exchange_head_bad_status_on_second_request_fails() {
+    async fn test_exchange_http1_bad_status_on_second_request_fails() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1498,11 +2030,12 @@ mod tests {
                 sock.write_all(response).await.unwrap();
             }
         });
+        let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         assert!(
-            exchange_head(
+            exchange_http1(
                 &mut stream,
-                "localhost",
+                &request,
                 &no_feedback(),
                 Duration::from_secs(5)
             )
@@ -1514,7 +2047,7 @@ mod tests {
     /// A measured request that outlives its own budget falls back to the
     /// warm sample instead of failing the whole measurement.
     #[tokio::test]
-    async fn test_exchange_head_slow_second_request_falls_back() {
+    async fn test_exchange_http1_slow_second_request_falls_back() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1532,10 +2065,11 @@ mod tests {
                     .unwrap();
             }
         });
+        let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_head(
+        let measured = exchange_http1(
             &mut stream,
-            "localhost",
+            &request,
             &no_feedback(),
             Duration::from_millis(100),
         )
@@ -1680,32 +2214,117 @@ mod tests {
 #[cfg(test)]
 mod direct_urltest_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let size = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(size, 0);
+            head.extend_from_slice(&chunk[..size]);
+        }
+        head
+    }
 
     #[tokio::test]
-    async fn direct_urltest_measures_requested_url() {
+    async fn direct_urltest_routes_the_full_requested_target() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let n = stream.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..n]).starts_with("HEAD / HTTP/1.1"));
-            stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        let server = tokio::spawn(async move {
+            let (mut wrong, _) = listener.accept().await.unwrap();
+            let request = read_head(&mut wrong).await;
+            assert!(request.starts_with(b"HEAD /wrong?probe=1 HTTP/1.1\r\n"));
+            wrong
+                .write_all(b"HTTP/1.1 500 Wrong Target\r\nContent-Length: 0\r\n\r\n")
                 .await
                 .unwrap();
+
+            let (mut correct, _) = listener.accept().await.unwrap();
+            let expected_host = format!("Host: {addr}\r\n");
+            for _ in 0..2 {
+                let request = read_head(&mut correct).await;
+                assert!(request.starts_with(b"HEAD /requested?probe=1 HTTP/1.1\r\n"));
+                assert!(
+                    request
+                        .windows(expected_host.len())
+                        .any(|part| part == expected_host.as_bytes())
+                );
+                correct
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
         });
         let node = honk_config::Config::builtin_direct_node();
+        let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
         let handler = crate::proxy::direct::DirectHandler::new();
-        let latency = urltest_node(
-            &crate::runtime::NodeRuntime::ephemeral(&node),
+        assert!(
+            urltest_node(
+                &runtime,
+                &handler,
+                &format!("http://{addr}/wrong?probe=1"),
+                Duration::from_secs(2),
+            )
+            .await
+            .is_err()
+        );
+        urltest_node(
+            &runtime,
             &handler,
-            &format!("http://{addr}/requested"),
+            &format!("http://{addr}/requested?probe=1"),
             Duration::from_secs(2),
         )
         .await
-        .expect("direct urltest must exchange with the requested URL");
-        assert!(latency < Duration::from_secs(2));
+        .expect("direct URLTest must route the requested path, query, and authority");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_request_normalizes_query_only_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let head = read_head(&mut stream).await;
+                assert!(
+                    !head
+                        .windows(b"PRIVATE".len())
+                        .any(|part| part == b"PRIVATE")
+                );
+                let response = if head.starts_with(b"HEAD /?check=1 HTTP/1.1\r\n") {
+                    b"HTTP/1.1 204 No Content\r\n\r\n".as_slice()
+                } else {
+                    b"HTTP/1.1 503 Wrong Target\r\n\r\n".as_slice()
+                };
+                if stream.write_all(response).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let node = honk_config::Config::builtin_direct_node();
+        let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
+        let request = http::Request::builder()
+            .method("HEAD")
+            .uri(format!("http://u:PRIVATE@{addr}?check=1"))
+            .body(())
+            .unwrap();
+        let result = measure_http_probe(
+            &guard.runtime(),
+            &crate::proxy::direct::DirectHandler::new(),
+            &request,
+            addr,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+        guard.close().await;
+        peer.abort();
+        let _ = peer.await;
+        assert!(result.is_ok(), "native request target rejected: {result:?}");
     }
 }
 

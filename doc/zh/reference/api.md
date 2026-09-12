@@ -55,7 +55,9 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 调用方通过 `?url=` 指定测试 URL。组请求最多同时执行 `URLTEST_MAX_CONCURRENT`（10）项经代理的测量。
 
-延迟测试报告的是节点热路径上的一个 round trip：代理拨号、目标站 TLS 握手与第一个探路请求都不计时，只测量已建立连接上的第二个请求（`HEAD /`；ALPN 协商出 h2 时为 HTTP/2 请求），到收到响应 header 为止。第二个请求失败或超时时，回退为第一个交换的耗时。预热、拨号、目标 TLS、探路请求、正式测量各自使用一份指定的 timeout 预算，慢节点按阶段失败（或回退），而不是共用一个时钟拖垮整个测量。冷可复用 transport——AnyTLS、VLESS H2MUX/Mux.Cool、Hysteria2、TUIC 与 Juicity——先在临时 runtime 中建立 session 或 QUIC client，再执行测量。临时 runtime 随后关闭，因此扫描大组不会为每个已测试节点留下常驻可复用状态。
+延迟测试使用规范的 HTTP 检查目标解码器：HEAD 保留原始路径与查询串（包括点段和仅查询串的 `/?query`），authority 移除凭据和默认端口，fragment 不会发送。它与周期健康检查共享 HTTP 实现，报告第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 与第一轮请求。HTTPS 验证证书，协商 HTTP/2 或 HTTP/1.1，并禁用 server push。两轮最终响应的解码状态都必须为有效的 200–499。第二轮传输失败或超时可回退到已验证的第一轮样本；HTTP/1 部分响应即使超时也不回退，而正常 HTTP/2 GOAWAY 可以回退。每轮 HTTP/1 临时响应头与最终响应头的累计上限为 16 KiB，H2 响应头列表上限同样为 16 KiB。session 预热、拨号、目标 TLS、H2 启动与每轮请求分别使用阶段预算。冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放，因此组扫描不会为每个已测试节点留下新的常驻可复用 runtime。
+
+已知限制：[`h2` 0.4.19 可能把缺少 `:status` 的响应报告为 200](https://github.com/hyperium/h2/issues/958)，因此这种畸形 HTTP/2 响应仍可能得到成功的延迟结果。该依赖修复已明确延期，等待上游处理，不使用本地 fork/vendor 补丁。
 
 成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
 

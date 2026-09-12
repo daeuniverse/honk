@@ -1,12 +1,20 @@
 use super::*;
 use honk_outbound::group::{
-    ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+    ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
+    SelectionNetwork,
 };
 
 type ProbeReporter = Option<ScoreReporter>;
-#[cfg(test)]
-fn empty_probe_reporter() -> ProbeReporter {
-    None
+
+fn probe_feedback(
+    manager: &SharedGroupManager,
+    node_id: uuid::Uuid,
+    context: ScoreSelectionContext,
+) -> Option<ScoreFeedback> {
+    manager
+        .read()
+        .feedback_for_node(node_id, context)
+        .map(ScoreFeedback::streak_neutral)
 }
 
 fn start_probe_feedback(
@@ -14,10 +22,7 @@ fn start_probe_feedback(
     node_id: uuid::Uuid,
     context: ScoreSelectionContext,
 ) -> ProbeReporter {
-    manager
-        .read()
-        .feedback_for_node(node_id, context)
-        .map(|feedback| feedback.streak_neutral().start())
+    probe_feedback(manager, node_id, context).map(|feedback| feedback.start())
 }
 
 fn probe_setup(reporter: &ProbeReporter) {
@@ -58,30 +63,34 @@ fn target_family(addr: SocketAddr) -> IpVersion {
     }
 }
 
-fn http_probe_context(url: &str, addr: SocketAddr) -> ScoreSelectionContext {
+fn http_probe_context(request: &http::Request<()>, addr: SocketAddr) -> ScoreSelectionContext {
     let family = target_family(addr);
-    let target = honk_config::check::decode_health_http_target(url)
-        .ok()
-        .map(|target| {
-            target.host().parse::<std::net::IpAddr>().map_or_else(
-                |_| ScoreTarget::domain(target.host(), target.port()),
-                |_| addr.into(),
-            )
-        });
+    let host = request
+        .uri()
+        .host()
+        .unwrap_or_default()
+        .trim_matches(['[', ']']);
+    let port = request.uri().port_u16().unwrap_or_else(|| {
+        if request.uri().scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
+    let target = host
+        .parse::<std::net::IpAddr>()
+        .map_or_else(|_| ScoreTarget::domain(host, port), |_| addr.into());
     ScoreSelectionContext {
         network: SelectionNetwork::Tcp,
         probe_domain: ProbeDomain::Tcp,
         target_family: Some(family),
         health_family: family,
-        target,
+        target: Some(target),
     }
 }
 
-/// HTTP-based health check prober that routes requests through proxy nodes.
-///
-/// Implements `HttpProber` for `AliveDialerSet`, matching Go's `Dialer.HttpCheck`.
-/// Resolves the check URL's hostname, dials through the proxy node via the
-/// `ProxyRegistry`, sends a raw HTTP request, and validates the status code.
+/// Adapts health configuration, generation ownership, and Score feedback
+/// to the shared outbound HTTP measurement.
 pub(super) struct ProxyHttpProber {
     config: Arc<RwLock<Arc<Config>>>,
     proxy_registry: Arc<ProxyRegistry>,
@@ -159,11 +168,29 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     );
                 }
             };
-            let domain = if protocol == NodeProtocol::Direct {
-                None
-            } else {
-                url_host(&check_url)
+
+            let request = match honk_outbound::urltest::health_http_probe_request(
+                &check_url,
+                &check_method,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
+                        "invalid HTTP probe request: {error:#}"
+                    ));
+                }
             };
+            let host = request
+                .uri()
+                .host()
+                .unwrap_or_default()
+                .trim_matches(['[', ']']);
+            let target_domain =
+                if protocol == NodeProtocol::Direct || host.parse::<std::net::IpAddr>().is_ok() {
+                    None
+                } else {
+                    Some(host.to_string())
+                };
             let (runtime, ephemeral) =
                 match honk_outbound::urltest::try_probe_runtime(&generation, &node) {
                     Ok(runtime) => runtime,
@@ -173,8 +200,10 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                         );
                     }
                 };
-            if !runtime.is_warm_or_stateless() {
-                let warm_reporter = start_probe_feedback(
+            let warm_feedback = if runtime.is_warm_or_stateless() {
+                None
+            } else {
+                probe_feedback(
                     &group_manager,
                     node.id,
                     ScoreSelectionContext::aggregate(
@@ -182,96 +211,43 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                         ProbeDomain::Tcp,
                         target_family(addr),
                     ),
-                );
-                let warmed = match entry.warmable.as_ref() {
-                    Some(warmable) => {
-                        tokio::time::timeout(
-                            timeout,
-                            generation.scope_dials(warmable.warm(
-                                Arc::clone(&runtime),
-                                connect_timeout,
-                                honk_outbound::proxy::WarmRequirement::Session,
-                            )),
-                        )
-                        .await
-                    }
-                    None => Ok(Err(anyhow::anyhow!(
-                        "no warm handler for node '{}'",
-                        node.name
-                    ))),
-                };
-                match warmed {
-                    Ok(Ok(())) => {
-                        probe_setup(&warm_reporter);
-                        if let Some(reporter) = &warm_reporter {
-                            reporter.finish_setup_only();
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        probe_finish(&warm_reporter, ScoreOutcome::from_error(&error));
-                        close_ephemeral(ephemeral).await;
-                        return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
-                            "warm failed: {error}"
-                        ));
-                    }
-                    Err(_) => {
-                        probe_finish(&warm_reporter, ScoreOutcome::Timeout);
-                        close_ephemeral(ephemeral).await;
-                        return honk_outbound::alive::HttpProbeResult::SetupFailure(
-                            "warm timeout".into(),
-                        );
-                    }
-                }
+                )
+            };
+            if let Err(error) = generation
+                .scope_dials(honk_outbound::urltest::warm_http_probe(
+                    &runtime,
+                    entry.warmable.as_deref(),
+                    connect_timeout,
+                    timeout,
+                    warm_feedback,
+                ))
+                .await
+            {
+                close_ephemeral(ephemeral).await;
+                return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
+                    "warm failed: {error:#}"
+                ));
             }
 
-            let reporter = start_probe_feedback(
-                &group_manager,
-                node.id,
-                http_probe_context(&check_url, addr),
-            );
-            // Dial and TLS are setup, not measurement: the reported latency
-            // is one warm-path round trip (see http1_exchange). Each phase
-            // has its own `timeout` budget; no single outer clock.
-            let dial = generation.scope_dials(entry.tcp.dial_runtime(
-                runtime,
-                addr,
-                domain.as_deref(),
-                connect_timeout,
-            ));
-            let proxy = match tokio::time::timeout(timeout, dial).await {
-                Ok(result) => match result {
-                    Ok(proxy) => proxy,
-                    Err(error) => {
-                        probe_finish(&reporter, ScoreOutcome::from_error(&error));
-                        close_ephemeral(ephemeral).await;
-                        return honk_outbound::alive::HttpProbeResult::ExchangeFailure(
-                            error.to_string(),
-                        );
-                    }
-                },
-                Err(_) => {
-                    probe_finish(&reporter, ScoreOutcome::Timeout);
-                    close_ephemeral(ephemeral).await;
-                    return honk_outbound::alive::HttpProbeResult::ExchangeFailure(
-                        "HTTP probe dial timeout".into(),
-                    );
-                }
-            };
-            probe_setup(&reporter);
-            let result =
-                Self::http_check(proxy.stream, &check_url, &check_method, &reporter, timeout).await;
+            let feedback =
+                probe_feedback(&group_manager, node.id, http_probe_context(&request, addr));
+            let result = generation
+                .scope_dials(honk_outbound::urltest::measure_http_probe(
+                    &runtime,
+                    entry.tcp.as_ref(),
+                    &request,
+                    addr,
+                    target_domain.as_deref(),
+                    connect_timeout,
+                    timeout,
+                    feedback,
+                ))
+                .await;
             close_ephemeral(ephemeral).await;
             match result {
-                Ok(elapsed) => {
-                    probe_finish(&reporter, ScoreOutcome::Success);
-                    honk_outbound::alive::HttpProbeResult::WarmSuccess(elapsed)
-                }
+                Ok(elapsed) => honk_outbound::alive::HttpProbeResult::WarmSuccess(elapsed),
                 Err(error) => {
-                    probe_finish(
-                        &reporter,
-                        ScoreOutcome::from_error(&anyhow::Error::msg(error.clone())),
-                    );
-                    honk_outbound::alive::HttpProbeResult::ExchangeFailure(error)
+                    honk_outbound::alive::HttpProbeResult::ExchangeFailure(format!("{error:#}"))
                 }
             }
         })
@@ -282,156 +258,6 @@ async fn close_ephemeral(guard: Option<honk_outbound::runtime::EphemeralRuntimeG
     if let Some(guard) = guard {
         guard.close().await;
     }
-}
-
-/// Bare host part of a check URL (`http://host[:port]/path` → `host`).
-fn url_host(url: &str) -> Option<String> {
-    let target = honk_config::check::decode_health_http_target(url).ok()?;
-    if target.host().parse::<std::net::IpAddr>().is_ok() {
-        None
-    } else {
-        Some(target.host().to_owned())
-    }
-}
-
-impl ProxyHttpProber {
-    /// Perform an HTTP health check over an already-established connection.
-    /// HTTPS targets get a verified TLS layer before the HTTP/1.1 exchange;
-    /// status codes 200-499 are considered healthy.
-    async fn http_check(
-        stream: Box<dyn crate::proxy::AsyncReadWrite>,
-        url: &str,
-        method: &str,
-        reporter: &ProbeReporter,
-        timeout: Duration,
-    ) -> Result<Duration, String> {
-        let target = honk_config::check::decode_health_http_target(url)
-            .map_err(|error| error.to_string())?;
-        let (host, authority, path) = (target.host(), target.authority(), target.request_target());
-        let method = if method.is_empty() { "GET" } else { method };
-        if target.is_https() {
-            let connector = health_https_connector()?;
-            let mut tls = tokio::time::timeout(timeout, connector.connect(host, stream))
-                .await
-                .map_err(|_| "HTTPS handshake timeout".to_string())?
-                .map_err(|error| format!("HTTPS handshake failed: {error}"))?;
-            Self::http1_exchange(&mut tls, authority, path, method, reporter, timeout).await
-        } else {
-            let mut stream = stream;
-            Self::http1_exchange(stream.as_mut(), authority, path, method, reporter, timeout).await
-        }
-    }
-
-    /// Read one HTTP/1.x response head (up to the header boundary),
-    /// returning the buffered bytes. Unbounded internally; the caller wraps
-    /// each round in its own timeout.
-    async fn read_response_head<S>(stream: &mut S) -> Result<Vec<u8>, String>
-    where
-        S: tokio::io::AsyncRead + Unpin + ?Sized,
-    {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::with_capacity(1024);
-        let mut chunk = [0u8; 1024];
-        loop {
-            let n = stream
-                .read(&mut chunk)
-                .await
-                .map_err(|error| format!("HTTP read failed: {error}"))?;
-            if n == 0 {
-                if buf.is_empty() {
-                    return Err("empty HTTP response".to_string());
-                }
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16 * 1024 {
-                break;
-            }
-        }
-        Ok(buf)
-    }
-
-    /// Two requests on the warmed connection: the first (untimed HEAD, any
-    /// status accepted) absorbs every remaining setup cost, the second is the
-    /// reported warm-path sample. Each round has its own `timeout`
-    /// budget: a slow warm-up fails the probe; a measured request that fails
-    /// or times out falls back to the warm exchange's time, but a bad status
-    /// on it fails the probe.
-    async fn http1_exchange<S>(
-        stream: &mut S,
-        authority: &str,
-        path: &str,
-        method: &str,
-        reporter: &ProbeReporter,
-        timeout: Duration,
-    ) -> Result<Duration, String>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
-    {
-        use tokio::io::AsyncWriteExt;
-        let warm_request = format!(
-            "HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: honk-health/1.0\r\n\r\n"
-        );
-        let warm_start = std::time::Instant::now();
-        let warm_round = async {
-            stream
-                .write_all(warm_request.as_bytes())
-                .await
-                .map_err(|error| format!("HTTP write failed: {error}"))?;
-            probe_tx(reporter, warm_request.len());
-            Self::read_response_head(stream).await
-        };
-        let head = match tokio::time::timeout(timeout, warm_round).await {
-            Ok(result) => result?,
-            Err(_) => return Err("HTTP warm-up timeout".to_string()),
-        };
-        probe_first_response(reporter);
-        probe_rx(reporter, head.len());
-        let warm = warm_start.elapsed();
-
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: honk-health/1.0\r\nConnection: close\r\n\r\n"
-        );
-        let start = std::time::Instant::now();
-        let measured_round = async {
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .map_err(|error| format!("HTTP write failed: {error}"))?;
-            probe_tx(reporter, request.len());
-            Self::read_response_head(stream).await
-        };
-        let buf = match tokio::time::timeout(timeout, measured_round).await {
-            Ok(Ok(buf)) => buf,
-            Ok(Err(_)) | Err(_) => return Ok(warm),
-        };
-        probe_rx(reporter, buf.len());
-        let elapsed = start.elapsed();
-        let response = String::from_utf8_lossy(&buf);
-        let status_line = response.lines().next().unwrap_or("");
-        let mut parts = status_line.split_whitespace();
-        let _version = parts
-            .next()
-            .ok_or_else(|| format!("malformed HTTP status: {status_line}"))?;
-        let status_code = parts
-            .next()
-            .ok_or_else(|| format!("malformed HTTP status: {status_line}"))?
-            .parse::<u16>()
-            .map_err(|error| format!("invalid HTTP status '{status_line}': {error}"))?;
-        if !(200..500).contains(&status_code) {
-            return Err(format!("bad status code: {status_code}"));
-        }
-        Ok(elapsed)
-    }
-}
-
-fn health_https_connector() -> Result<honk_outbound::tls::TlsConnector, String> {
-    static CONNECTOR: std::sync::LazyLock<Result<honk_outbound::tls::TlsConnector, String>> =
-        std::sync::LazyLock::new(|| {
-            honk_outbound::tls::build_dns_connector(false, b"\x08http/1.1")
-                .map_err(|error| format!("failed to build health-check TLS connector: {error:#}"))
-        });
-    CONNECTOR.clone()
 }
 
 /// Default DNS target for UDP health checks when `udp_check_dns` is unset
@@ -895,149 +721,5 @@ pub(super) fn is_broadcast_or_multicast(ip: &std::net::IpAddr) -> bool {
 }
 
 #[cfg(test)]
-mod http_probe_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn c25_health_sends_authority_and_path_query_without_credentials() {
-        for (url_host, suffix, path) in [
-            ("localhost", "/check?q=1#fragment", "/check?q=1"),
-            ("localhost", "?q=1", "/?q=1"),
-            ("localhost", "/a/../health?q=1#fragment", "/a/../health?q=1"),
-            (
-                "localhost",
-                "/a/%2e%2e/health?q=1#fragment",
-                "/a/%2e%2e/health?q=1",
-            ),
-            ("[::1]", "/check?q=1#fragment", "/check?q=1"),
-        ] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let expected_authority = format!("{url_host}:{}", addr.port());
-            let peer = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                for _ in 0..2 {
-                    let mut request = Vec::new();
-                    while !request.ends_with(b"\r\n\r\n") {
-                        request.push(stream.read_u8().await.unwrap());
-                    }
-                    let request = String::from_utf8(request).unwrap();
-                    assert_eq!(
-                        request.split_once("\r\n").unwrap().0,
-                        format!("HEAD {path} HTTP/1.1")
-                    );
-                    assert!(request.contains(&format!("\r\nHost: {expected_authority}\r\n")));
-                    assert!(!request.contains("PRIVATE") && !request.contains("Authorization:"));
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                        .await
-                        .unwrap();
-                }
-            });
-            let url = format!("http://user:PRIVATE@{url_host}:{}{suffix}", addr.port());
-            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            ProxyHttpProber::http_check(
-                Box::new(stream),
-                &url,
-                "HEAD",
-                &empty_probe_reporter(),
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-            peer.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn https_health_check_starts_with_tls_client_hello() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut content_type = [0u8; 1];
-            stream.read_exact(&mut content_type).await.unwrap();
-            content_type[0]
-        });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-
-        let reporter = empty_probe_reporter();
-        let result = ProxyHttpProber::http_check(
-            Box::new(stream),
-            "https://localhost/generate_204",
-            "HEAD",
-            &reporter,
-            Duration::from_secs(5),
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(peer.await.unwrap(), 22, "TLS handshake record expected");
-    }
-
-    /// The reported probe latency is the second request's round trip: a
-    /// stalled first response must not leak into the sample.
-    #[tokio::test]
-    async fn http_probe_reports_warm_round_trip() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            for round in 0..2 {
-                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
-                    break;
-                }
-                if round == 0 {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                    .await
-                    .unwrap();
-            }
-        });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let reporter = empty_probe_reporter();
-        let measured = ProxyHttpProber::http_check(
-            Box::new(stream),
-            "http://localhost/",
-            "HEAD",
-            &reporter,
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        assert!(
-            measured < Duration::from_millis(100),
-            "warm round trip must exclude the stalled first response: {measured:?}"
-        );
-    }
-
-    /// A server that closes after one response still yields the warm
-    /// sample instead of failing the probe.
-    #[tokio::test]
-    async fn http_probe_falls_back_when_server_closes() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let reporter = empty_probe_reporter();
-        ProxyHttpProber::http_check(
-            Box::new(stream),
-            "http://localhost/",
-            "HEAD",
-            &reporter,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("single-response server must fall back to the warm sample");
-    }
-}
+#[path = "probers_tests.rs"]
+mod http_probe_tests;
