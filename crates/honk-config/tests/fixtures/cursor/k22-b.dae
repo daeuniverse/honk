@@ -1,0 +1,3 @@
+subscription {
+    sub: https://example.com/sub?filter='hk'#token
+}

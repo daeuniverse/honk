@@ -65,7 +65,9 @@ fn control_plane(mut config: Config, forwarder: Arc<DnsForwarder>) -> ControlPla
 
 async fn reload_config(control: &ControlPlane, config: Config) {
     assert!(
-        control.reload_runtime_config(config).await,
+        control
+            .reload_runtime_config(config, Default::default())
+            .await,
         "runtime reload should publish"
     );
 }
@@ -77,7 +79,9 @@ async fn reload_current(control: &ControlPlane) {
 
 async fn try_reload_current(control: &ControlPlane) -> bool {
     let config = control.config_handle().read().await.as_ref().clone();
-    control.reload_runtime_config(config).await
+    control
+        .reload_runtime_config(config, Default::default())
+        .await
 }
 
 #[tokio::test]
@@ -96,7 +100,7 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
     replacement.id = replacement.derive_id();
 
     control
-        .merge_subscription_nodes(subscription_id, vec![replacement])
+        .merge_subscription_nodes(subscription_id, vec![replacement], Vec::new())
         .await;
 
     let active = control.config_handle();

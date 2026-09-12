@@ -567,7 +567,9 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     );
     let mut candidate = config.clone();
     candidate.global.tcp_check_url = vec!["https://changed.example.test:9444/new".into()];
-    let accepted = cp.reload_runtime_config(candidate).await;
+    let accepted = cp
+        .reload_runtime_config(candidate, Default::default())
+        .await;
 
     let result =
         honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
@@ -5160,8 +5162,14 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     cp.initialize_datapath_flags(false, false).await.unwrap();
 
     let drain = DrainTracker::new();
-    assert!(cp.apply_runtime_config(Config::default(), &drain).await);
-    assert!(cp.apply_runtime_config(Config::default(), &drain).await);
+    assert!(
+        cp.apply_runtime_config(Config::default(), Default::default(), &drain)
+            .await
+    );
+    assert!(
+        cp.apply_runtime_config(Config::default(), Default::default(), &drain)
+            .await
+    );
 
     assert_eq!(
         detach.load(Ordering::Relaxed),

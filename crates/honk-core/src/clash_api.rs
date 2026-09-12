@@ -76,6 +76,8 @@ use crate::mode::{DatapathFlagsHandle, ModeState, SharedModeState};
 
 pub struct ClashState {
     pub config: Arc<tokio::sync::RwLock<Arc<Config>>>,
+    /// Access only while holding `config`; reload publishes both under that lock.
+    pub diagnostics: crate::config_diagnostics::SharedDiagnostics,
     pub stats: Arc<crate::stats::StatsManager>,
     pub alive_set: Arc<AliveDialerSet>,
     /// Hot-swappable group manager cell; a config reload swaps the inner
@@ -328,8 +330,10 @@ async fn version() -> Json<serde_json::Value> {
 
 /// GET /configs — current configuration snapshot in Clash-compatible format.
 async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
-    let mode = s.mode_state.read().mode.clone();
+    // Reload publishes settings and diagnostic provenance under this lock.
     let config = s.config.read().await;
+    let mode = s.mode_state.read().mode.clone();
+    let diagnostics = s.diagnostics.read().snapshot(&config.subscriptions);
     Json(serde_json::json!({
         "mode": mode,
         "mode-list": ["Rule", "Global", "Direct"],
@@ -341,6 +345,7 @@ async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
         "bind-address": "*",
         "log-level": config.global.log_level,
         "tun": {"enable": false},
+        "honk-diagnostics": diagnostics,
     }))
 }
 

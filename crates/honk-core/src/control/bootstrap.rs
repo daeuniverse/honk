@@ -224,6 +224,9 @@ impl ControlPlane {
 
         let control_plane = Self {
             config: config_arc,
+            diagnostics: std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::config_diagnostics::ActiveDiagnostics::default(),
+            )),
             reload_lock: tokio::sync::Mutex::new(()),
             log_file_override: None,
             effective_log_file,

@@ -82,7 +82,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         let mut candidate = config.clone();
         candidate.global.udp_check_dns = new_raw.into_iter().map(str::to_owned).collect();
         let accepted = cp
-            .apply_runtime_config(candidate.clone(), &DrainTracker::new())
+            .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
             .await;
         let outcome = UdpProber::probe_udp(&prober, &node.name, Duration::from_secs(1)).await;
         assert!(outcome.dns.is_ok(), "{outcome:?}");
@@ -162,7 +162,7 @@ async fn c28_dae_tolerance_reload_changes_real_urltest_selection() {
 
     let candidate = dae_urltest_config(10);
     let accepted = cp
-        .apply_runtime_config(candidate, &DrainTracker::new())
+        .apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
         .await;
     assert!(accepted, "dae tolerance-only reload must remain admissible");
     assert_eq!(

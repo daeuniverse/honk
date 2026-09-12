@@ -1,0 +1,8 @@
+group {
+    g {
+        filter: 'unterminated
+    }
+}
+routing {
+    fallback: direct
+}

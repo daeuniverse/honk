@@ -1,4 +1,5 @@
 use super::*;
+use crate::config_diagnostics::DiagnosticUpdate;
 
 #[cfg(test)]
 pub(in crate::control) struct PreDnsPublicationHookGuard<'a> {
@@ -12,7 +13,10 @@ impl Drop for PreDnsPublicationHookGuard<'_> {
     }
 }
 
-fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
+fn rebase_subscription_nodes(
+    current: &Config,
+    candidate: &mut Config,
+) -> std::collections::HashSet<uuid::Uuid> {
     let mut static_nodes = Vec::with_capacity(candidate.nodes.len());
     let mut candidate_subscription_nodes =
         std::collections::HashMap::<uuid::Uuid, Vec<Node>>::new();
@@ -27,6 +31,7 @@ fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
         }
     }
     let mut matched_previous = std::collections::HashSet::new();
+    let mut retained_providers = std::collections::HashSet::new();
 
     for subscription in candidate.subscriptions.iter_mut().filter(|sub| sub.enabled) {
         let candidate_id = subscription.id;
@@ -41,6 +46,7 @@ fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
                 .iter()
                 .filter(|node| node.subscription_id == Some(previous.id));
             if current_nodes.clone().next().is_some() {
+                retained_providers.insert(previous.id);
                 static_nodes.extend(current_nodes.cloned());
                 continue;
             }
@@ -60,6 +66,7 @@ fn rebase_subscription_nodes(current: &Config, candidate: &mut Config) {
         &candidate.nodes,
         &candidate.subscriptions,
     );
+    retained_providers
 }
 
 impl ControlPlane {
@@ -80,11 +87,17 @@ impl ControlPlane {
     /// subscription merges, and public callers share this serialized path.
     pub(in crate::control) async fn apply_runtime_config(
         &self,
-        new_config: Config,
+        mut new_config: Config,
+        diagnostics: crate::config_diagnostics::DiagnosticBuckets,
         drain: &DrainTracker,
     ) -> bool {
         let _reload = self.reload_lock.lock().await;
-        match self.apply_runtime_config_locked(new_config, drain).await {
+        crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
+        let update = DiagnosticUpdate::Replace(diagnostics);
+        match self
+            .apply_resolved_runtime_config_locked(new_config, drain, update, None)
+            .await
+        {
             Ok(applied) => applied,
             Err(error) => {
                 crate::report_runtime_admission_error(&error);
@@ -92,37 +105,30 @@ impl ControlPlane {
             }
         }
     }
-
-    /// Apply a SIGHUP candidate after rebasing its in-memory subscription
-    /// nodes against the snapshot being replaced. The signal task may have
-    /// prepared the candidate while another runtime update was committing.
     pub(in crate::control) async fn apply_sighup_config(
         &self,
         mut new_config: Config,
+        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
         authorizations: &mut crate::subscription::SubscriptionAuthorizations,
     ) -> Result<bool, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
-        let current = self.config.read().await.clone();
-        rebase_subscription_nodes(&current, &mut new_config);
+        let current_guard = self.config.read().await;
+        let current = Arc::clone(&current_guard);
+        let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
+        drop(current_guard);
         new_config.ensure_local_direct_rules();
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
-        self.apply_resolved_runtime_config_locked_with_authorizations(
+        self.apply_resolved_runtime_config_locked(
             new_config,
             drain,
+            DiagnosticUpdate::Rebase {
+                static_diagnostics: diagnostics,
+                retained_provider_ids: retained_providers,
+            },
             Some(authorizations),
         )
         .await
-    }
-
-    pub(in crate::control) async fn apply_runtime_config_locked(
-        &self,
-        mut new_config: Config,
-        drain: &DrainTracker,
-    ) -> Result<bool, honk_config::error::DetailedConfigError> {
-        crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
-        self.apply_resolved_runtime_config_locked(new_config, drain)
-            .await
     }
 
     /// Validate and publish an explicit runtime configuration through the serialized
@@ -131,7 +137,14 @@ impl ControlPlane {
     /// Operator-document restrictions apply here, not to provider nodes admitted by
     /// subscription merges. Direct callers cannot reconcile process-owned workers;
     /// use SIGHUP to add, remove, or change subscription worker specifications.
-    pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
+    ///
+    /// The supplied diagnostics are the candidate's full provenance and replace
+    /// the active provenance only when the candidate is committed.
+    pub async fn reload_runtime_config(
+        &self,
+        new_config: Config,
+        diagnostics: crate::config_diagnostics::DiagnosticBuckets,
+    ) -> bool {
         // A candidate equal to the admitted active configuration has already
         // passed exactly these checks; re-deriving 512 node identities on an
         // identical SIGHUP is the cost the reload benchmark guards against.
@@ -141,24 +154,31 @@ impl ControlPlane {
             return false;
         }
         let drain = Arc::clone(&self.drain_tracker);
-        self.apply_runtime_config(new_config, &drain).await
+        self.apply_runtime_config(new_config, diagnostics, &drain)
+            .await
     }
 
     pub(in crate::control) async fn apply_resolved_runtime_config_locked(
         &self,
-        new_config: Config,
-        drain: &DrainTracker,
-    ) -> Result<bool, honk_config::error::DetailedConfigError> {
-        self.apply_resolved_runtime_config_locked_with_authorizations(new_config, drain, None)
-            .await
-    }
-
-    async fn apply_resolved_runtime_config_locked_with_authorizations(
-        &self,
         mut new_config: Config,
         drain: &DrainTracker,
+        diagnostic_update: DiagnosticUpdate,
         authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
     ) -> Result<bool, honk_config::error::DetailedConfigError> {
+        if let DiagnosticUpdate::Replace(buckets) = &diagnostic_update
+            && buckets.providers.len() > 1
+        {
+            let mut provider_ids =
+                std::collections::HashSet::with_capacity(buckets.providers.len());
+            if buckets
+                .providers
+                .iter()
+                .any(|(id, _)| !provider_ids.insert(*id))
+            {
+                error!("reload rejected: duplicate provider diagnostic buckets");
+                return Ok(false);
+            }
+        }
         if let Err(error) =
             crate::subscription::validate_subscription_ids(&new_config.subscriptions)
         {
@@ -206,6 +226,10 @@ impl ControlPlane {
                     policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
                 })
             {
+                if !matches!(&diagnostic_update, DiagnosticUpdate::Preserve) {
+                    let _config = self.config.write().await;
+                    self.diagnostics.write().buckets.apply(diagnostic_update);
+                }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(true);
             }
@@ -547,6 +571,11 @@ impl ControlPlane {
                 publication.commit();
                 *router_guard = new_router;
                 *config_guard = Arc::new(new_config);
+                {
+                    let mut active_diagnostics = self.diagnostics.write();
+                    active_diagnostics.generation = generation.get();
+                    active_diagnostics.buckets.apply(diagnostic_update);
+                }
                 if let Some(authorizations) = authorizations {
                     authorizations
                         .publish(&current_config.subscriptions, &config_guard.subscriptions);

@@ -58,6 +58,10 @@ flowchart LR
 
 `src/node/validation.rs` 负责节点自身及集合准入，复用 `src/node/protocol.rs` 中的 VLESS 和 ALPN 检查。校验携带固定字段与原因，只在失败时分配诊断上下文。详细 Config 加载接口和集合准入保留原始原因及从 1 开始的节点序号；包含文件中的语义错误先保留失败字段的来源，再投影旧错误类别。节点警告及分享链接早期错误都在解析器边界补充物理条目坐标，不受节点标签影响。`Config::validate` 投影 `Config::validate_detailed` 的结果；DNS 引用校验仍与运行时共用 `DnsRouting::request_source`，仅在拒绝时构造诊断路径。
 
+`src/parser/mod.rs` 负责文件级 `include` 和有序顶层分派。`lexer.rs` 与 `cursor.rs` 保留引用源文本的词法单元、注释范围及有界片段，`read.rs` 提供共享的标量与表达式读取接口；各节由 `scalars.rs`、`entries.rs`、`groups.rs`、`dns.rs` 和 `routing.rs` 读取。包含文件的 glob 模式以入口文件所在目录为基准解析；匹配文件的规范化路径不得超出入口目录。重复包含和循环包含均被拒绝。允许忽略未知内容的读取器整块跳过未知嵌套块，不应用其子项；节点和订阅的兼容包装块仍会遍历，`experimental` 外层和 NFQUEUE 错误仍会终止解析。
+
+各读取器直接返回类型化错误；只有最外层尝试发布终止诊断。诊断提示在尝试结束时借助按来源区分的前缀最大值索引统一排序，保留原有追加顺序和调用方已有诊断，避免反复插入向量。
+
 ## 高层数据路径
 
 ```mermaid

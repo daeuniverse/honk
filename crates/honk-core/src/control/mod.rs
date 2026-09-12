@@ -117,6 +117,7 @@ type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Arc<Config>>>,
+    diagnostics: crate::config_diagnostics::SharedDiagnostics,
     /// Reuse decisions must observe the generation they eventually replace.
     reload_lock: tokio::sync::Mutex<()>,
     log_file_override: Option<PathBuf>,
@@ -237,8 +238,19 @@ impl ControlPlane {
             .await
     }
 
+    pub fn diagnostics_handle(&self) -> crate::config_diagnostics::SharedDiagnostics {
+        self.diagnostics.clone()
+    }
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
+    }
+
+    pub(crate) async fn install_startup_diagnostics(
+        &self,
+        buckets: crate::config_diagnostics::DiagnosticBuckets,
+    ) {
+        let _config = self.config.write().await;
+        self.diagnostics.write().buckets = buckets;
     }
 
     #[cfg(feature = "reload-bench-counters")]

@@ -1,0 +1,7 @@
+subscription {
+    paid : https://example.com/sub
+    paid plan: https://example.com/plan
+}
+routing {
+    fallback: direct
+}

@@ -1,0 +1,10 @@
+dns {
+    routing {
+        request {
+            'unterminated
+        }
+    }
+}
+routing {
+    fallback: direct
+}

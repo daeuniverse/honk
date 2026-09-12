@@ -49,6 +49,7 @@ jobs:
           cp candidate/crates/honk-core/benches/reload.rs baseline/crates/honk-core/benches/reload.rs
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           manifest = Path("baseline/crates/honk-core/Cargo.toml")
           text = manifest.read_text()
@@ -62,6 +63,16 @@ jobs:
           if 'path = "src/main.rs"\nbench = false' not in text:
               text = text.replace('path = "src/main.rs"', 'path = "src/main.rs"\nbench = false')
           manifest.write_text(text)
+
+          # Keep the workload identical; adapt only the old reload call signature.
+          api = Path("baseline/crates/honk-core/src/control/reload/transaction.rs").read_text()
+          legacy_reload = r"pub async fn reload_runtime_config\(\s*&self,\s*new_config:\s*Config,?\s*\)"
+          if re.search(legacy_reload, api):
+              harness = Path("baseline/crates/honk-core/benches/reload.rs")
+              text = harness.read_text()
+              call = "reload_runtime_config(config, Default::default())"
+              assert text.count(call) == 1, "reload benchmark adapter changed"
+              harness.write_text(text.replace(call, "reload_runtime_config(config)"))
           PY
       - name: Benchmark main
         run: |

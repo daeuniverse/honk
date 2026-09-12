@@ -406,15 +406,28 @@ impl SubscriptionStore {
     }
 
     pub async fn load_nodes(&self, sub: &Subscription) -> anyhow::Result<Option<Vec<Node>>> {
+        let mut diagnostics = Vec::new();
+        let result = self
+            .load_nodes_with_diagnostics(sub, &mut diagnostics)
+            .await;
+        report_detailed_diagnostics(&diagnostics);
+        result
+    }
+
+    pub async fn load_nodes_with_diagnostics(
+        &self,
+        sub: &Subscription,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> anyhow::Result<Option<Vec<Node>>> {
         let path = self.path_for(sub);
         let content = match tokio::task::spawn_blocking(move || read_store_file(&path)).await? {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        parse_subscription_content(sub, &content)
-            .with_context(|| format!("invalid stored subscription '{}'", sub.name))
+        parse_subscription_content_with_diagnostics(sub, &content, diagnostics)
             .map(Some)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     async fn store_content(&self, sub: &Subscription, content: String) -> anyhow::Result<()> {

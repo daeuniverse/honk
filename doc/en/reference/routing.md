@@ -12,11 +12,12 @@ fallback: outbound
 - Rules are evaluated by ascending `priority`; lower values run first. Equal priorities retain stable source order. The dae parser assigns `priority` values `0, 1, ...` in source order, while generated local rules use priority `0` and are appended after user rules.
 - `default:` is an alias of `fallback:`. The fallback target applies when no rule finalizes; if omitted, it defaults to `direct`.
 - Comma-separated arguments inside a matcher are alternatives. Different populated condition groups must all match.
-- A parenthesized argument list may span physical lines. The statement continues through its closing `)` and `-> outbound`.
-- Single or double quotes keep `,`, `)`, `&&`, and `->` literal inside matcher arguments. A prefixed argument may quote only its value, as in `domain(full: 'example.com')`; backslashes are preserved rather than decoded.
+- A parenthesized argument list may span physical lines within one source file. The statement continues through its closing `)` and `-> outbound`; an included file cannot finish another file's unfinished call.
+- Single or double quotes protect every interior byte, including whitespace, `#`, braces, `,`, `)`, `&&`, and `->`. Quotes open at the start of a token or immediately after an unquoted `(` or `,`; a prefixed argument may quote its value in a separate token, as in `domain(full: 'example.com')`. Backslashes are preserved, not decoded. An opened quote must close on the same physical line; otherwise the configuration fails with `unterminated-quote`.
 - A leading `!` negates only the single matcher immediately following it. A rule matches when its positive conditions match and none of its negated matchers hits.
 - An unknown or unsniffed domain counts as “not x” for a negated domain or geosite matcher. It does not veto that rule.
 - Unknown nonempty predicates, whitespace before matcher parentheses, and trailing matcher text reject the configuration with a located diagnostic. Unsupported nonempty terms are never removed from a conjunction. Existing empty traffic-term and empty-argument behavior is unchanged.
+- An unquoted token-head `#` starts a comment; a glued `#` is data. `domain(x) -> proxy#c` targets the literal name `proxy#c` and emits `legacy-glued-hash`. Write `-> proxy # comment` for a comment. The first unquoted arrow separates the action; later arrows remain target data with `legacy-arrow-target`.
 
 ```dae
 routing {

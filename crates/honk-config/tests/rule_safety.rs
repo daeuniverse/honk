@@ -2,12 +2,12 @@ use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
 
 #[test]
 fn unsafe_traffic_terms_reject_at_file_boundary() {
-    for matcher in [
-        "unknown(PRIVATE)",
-        "!unknown(PRIVATE)",
-        "dport (443)",
-        "dport(443)junk",
-        "dport(443) domain(PRIVATE)",
+    for (matcher, code) in [
+        ("unknown(PRIVATE)", "unknown-traffic-predicate"),
+        ("!unknown(PRIVATE)", "unknown-traffic-predicate"),
+        ("dport (443)", "unknown-traffic-predicate"),
+        ("dport(443)junk", "trailing-matcher-text"),
+        ("dport(443) domain(PRIVATE)", "unknown-traffic-predicate"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("input.dae");
@@ -20,7 +20,7 @@ fn unsafe_traffic_terms_reject_at_file_boundary() {
         let error =
             Config::from_file_with_detailed_diagnostics(path.to_str().unwrap(), &mut diagnostics)
                 .unwrap_err();
-        assert_eq!(error.diagnostic.code, "unknown-traffic-predicate");
+        assert_eq!(error.diagnostic.code, code);
         assert_eq!(error.diagnostic.setting.to_string(), "routing.rules[1]");
         assert_eq!(error.diagnostic.line, Some(2));
         assert!(!format!("{diagnostics:?}{error:?}").contains("PRIVATE"));
@@ -34,7 +34,7 @@ fn invalid_dns_conjunct_omits_whole_rule() {
         ("unknown(PRIVATE)", "invalid-dns-rule"),
         ("!sub(PRIVATE)", "unsupported-dns-condition"),
         ("qname (PRIVATE)", "invalid-dns-rule"),
-        ("qname(PRIVATE)junk", "invalid-dns-rule"),
+        ("qname(PRIVATE)junk", "trailing-matcher-text"),
         ("qtype(A,TYPO)", "invalid-qtype"),
         ("!qtype(TYPO)", "invalid-qtype"),
     ] {

@@ -182,6 +182,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         runtime_registry,
         mode_state,
         datapath_flags,
+        diagnostics: Arc::new(parking_lot::RwLock::new(
+            honk_core::config_diagnostics::ActiveDiagnostics::default(),
+        )),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
@@ -869,6 +872,76 @@ async fn test_put_and_patch_without_content_type() {
         .await
         .unwrap();
     assert_eq!(body["mode"], "Global");
+}
+
+#[tokio::test]
+async fn test_configs_additive_safe_diagnostics_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("private-input.dae");
+    std::fs::write(
+        &path,
+        "global {\n    check_tolerance: private-raw-scalar\n}\n",
+    )
+    .unwrap();
+    let mut file_diagnostics = Vec::new();
+    let mut config =
+        Config::from_file_with_detailed_diagnostics(path.to_str().unwrap(), &mut file_diagnostics)
+            .unwrap();
+    let provider = honk_config::subscription::Subscription {
+        name: "private-provider-name".into(),
+        url: "http://127.0.0.1/private-provider-url".into(),
+        ..Default::default()
+    };
+    let mut provider_diagnostics = Vec::new();
+    config.nodes = honk_core::subscription::parse_subscription_content_with_diagnostics(
+        &provider,
+        "socks5://127.0.0.1:1080#private-node-name\nprivate-raw-provider-line",
+        &mut provider_diagnostics,
+    )
+    .unwrap();
+    config.subscriptions.push(provider.clone());
+    let app = spawn_app_with_config(config, "", "").await;
+    {
+        let _config = app.state.config.read().await;
+        let mut active = app.state.diagnostics.write();
+        active.generation = 7;
+        active.buckets.static_diagnostics = file_diagnostics;
+        active
+            .buckets
+            .replace_provider(provider.id, provider_diagnostics);
+    }
+
+    let body: serde_json::Value = http_client()
+        .get(app.url("/configs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["mode"], "Rule");
+    assert_eq!(body["log-level"], "info");
+    let snapshot = &body["honk-diagnostics"];
+    assert_eq!(snapshot["generation"], 7);
+    let diagnostics = snapshot["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|row| row["setting"] == "global.check_tolerance")
+    );
+    let sources = snapshot["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    assert!(diagnostics.iter().any(|row| row["source"] == 1));
+    for row in diagnostics {
+        assert!(sources.iter().any(|source| source["id"] == row["source"]));
+    }
+    let serialized = body.to_string();
+    assert!(!serialized.contains("private-"), "{serialized}");
+    assert!(!serialized.contains(path.to_str().unwrap()), "{serialized}");
+    assert!(
+        !serialized.contains(&provider.id.to_string()),
+        "{serialized}"
+    );
 }
 
 /// Parent selector containing a sub-group: the sub-group tag appears in
@@ -1827,6 +1900,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
         datapath_flags: app.state.datapath_flags.clone(),
+        diagnostics: app.state.diagnostics.clone(),
         secret: String::new(),
         external_ui: String::new(),
         router: app.state.router.clone(),

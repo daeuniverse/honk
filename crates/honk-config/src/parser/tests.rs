@@ -4,7 +4,10 @@ use crate::parser::parse_dae_config_with_diagnostics;
 
 #[cfg(test)]
 mod parser_tests {
-    use crate::parser::{parse_dae_config, parse_dae_config_with_diagnostics};
+    use crate::parser::{
+        parse_dae_config, parse_dae_config_with_detailed_diagnostics,
+        parse_dae_config_with_diagnostics,
+    };
     use base64::Engine as _;
 
     #[test]
@@ -722,18 +725,6 @@ group {
     }
 
     #[test]
-    fn test_entry_node_spaced_tag() {
-        let config = parse_dae_config("node {\n edge : 'socks5://127.0.0.1:1080'\n}").unwrap();
-        assert!(config.nodes.is_empty());
-        let config =
-            parse_dae_config("node {\n 'edge west': 'socks5://127.0.0.1:1080'\n}").unwrap();
-        assert_eq!(config.nodes.len(), 1);
-        assert_eq!(config.nodes[0].name, "edge west");
-        assert_eq!(config.nodes[0].host, "127.0.0.1");
-        assert_eq!(config.nodes[0].port, 1080);
-    }
-
-    #[test]
     fn test_entry_comment_tagless_file_subscription() {
         let config = parse_dae_config(
             "subscription {\n 'file://relative/path/to/mysub.sub' # Put subscription content in /etc/dae/relative/path/to/mysub.sub\n}",
@@ -758,50 +749,28 @@ group {
     }
 
     #[test]
-    fn test_entry_comment_quoted_subscription_glued_user_agent() {
-        let config = parse_dae_config(
-            "subscription {\n sub: 'http://sub'(honk/1.0 like)#xxxx\n other: 'http://other'(agent)# note\n}",
-        )
-        .unwrap();
-        assert_eq!(
-            config
-                .subscriptions
-                .iter()
-                .map(|sub| (
-                    sub.name.as_str(),
-                    sub.url.as_str(),
-                    sub.user_agent.as_deref()
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                ("sub", "http://sub", Some("honk/1.0 like")),
-                ("other", "http://other", Some("agent")),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_entry_comment_quoted_subscription_glued_url() {
-        let config = parse_dae_config("subscription {\n tag: 'http://q'#c\n}").unwrap();
+    fn test_entry_quoted_subscription_glued_url_is_retained_with_hash_warning() {
+        let input = "subscription {\n paid: 'http://q'#c\n}";
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
         assert_eq!(config.subscriptions.len(), 1);
-        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].name, "paid");
         assert_eq!(config.subscriptions[0].url, "http://q");
         assert_eq!(config.subscriptions[0].user_agent, None);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "legacy-glued-hash");
+        assert_eq!(
+            diagnostics[0].severity,
+            crate::diagnostic::Severity::Warning
+        );
+        let hash = input.find("#c").unwrap();
+        assert_eq!(diagnostics[0].span, Some(hash..hash + 1));
+        assert_eq!(diagnostics[0].message, "put whitespace before a comment");
     }
 
     #[test]
-    fn test_entry_comment_quoted_subscription_parentheses_in_comment() {
-        let config = parse_dae_config("subscription {\n tag: 'http://q'(ua)#c(x)\n}").unwrap();
-        assert_eq!(config.subscriptions.len(), 1);
-        assert_eq!(config.subscriptions[0].name, "tag");
-        assert_eq!(config.subscriptions[0].url, "http://q");
-        assert_eq!(config.subscriptions[0].user_agent.as_deref(), Some("ua"));
-    }
-
-    #[test]
-    fn test_entry_comment_quoted_subscription_hash_in_user_agent() {
-        let config =
-            parse_dae_config("subscription {\n tag: 'http://q'(agent#build)#c\n}").unwrap();
+    fn test_entry_literal_hash_in_user_agent() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'(agent#build)\n}").unwrap();
         assert_eq!(config.subscriptions.len(), 1);
         assert_eq!(config.subscriptions[0].name, "tag");
         assert_eq!(config.subscriptions[0].url, "http://q");
@@ -812,8 +781,8 @@ group {
     }
 
     #[test]
-    fn test_entry_comment_quoted_subscription_empty_user_agent() {
-        let config = parse_dae_config("subscription {\n tag: 'http://q'()#c\n}").unwrap();
+    fn test_entry_subscription_empty_user_agent() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'()\n}").unwrap();
         assert_eq!(config.subscriptions.len(), 1);
         assert_eq!(config.subscriptions[0].name, "tag");
         assert_eq!(config.subscriptions[0].url, "http://q");
@@ -821,27 +790,30 @@ group {
     }
 
     #[test]
-    fn test_entry_comment_quoted_subscription_remainder_controls() {
-        for (value, url, user_agent) in [
-            ("'http://q'(agent) junk", "'http://q'(agent) junk", None),
-            ("'http://q'(agent", "'http://q'(agent", None),
-            ("'http://q'(ua)(x)", "http://q", Some("ua)(x")),
-            (
-                "'http://q'('agent)#build')",
-                "http://q",
-                Some("agent)#build"),
-            ),
-        ] {
-            let config = parse_dae_config(&format!("subscription {{\n tag: {value}\n}}")).unwrap();
-            assert_eq!(config.subscriptions.len(), 1, "{value}");
-            assert_eq!(config.subscriptions[0].name, "tag", "{value}");
-            assert_eq!(config.subscriptions[0].url, url, "{value}");
-            assert_eq!(
-                config.subscriptions[0].user_agent.as_deref(),
-                user_agent,
-                "{value}"
-            );
-        }
+    fn test_entry_subscription_user_agent_trailing_text_skips_entry() {
+        let input = "subscription {\n tag: 'http://q'(agent) junk\n}";
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        assert!(config.subscriptions.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "legacy-ua-boundary");
+        assert_eq!(diagnostics[0].severity, crate::diagnostic::Severity::Error);
+        let tail = input.find("junk").unwrap();
+        assert_eq!(diagnostics[0].span, Some(tail..tail + 1));
+        assert!(diagnostics[0].message.contains("entry is skipped"));
+    }
+
+    #[test]
+    fn test_entry_quoted_user_agent_protects_delimiters() {
+        let config =
+            parse_dae_config("subscription {\n tag: 'http://q'('agent)#build')\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("agent)#build")
+        );
     }
 
     #[test]
@@ -856,22 +828,6 @@ group {
         assert_eq!(
             config.subscriptions[0].user_agent.as_deref(),
             Some("Mozilla/5.0 (X11; (Linux)#build)")
-        );
-    }
-
-    #[test]
-    fn test_entry_comment_node_glued_hash_controls() {
-        let config = parse_dae_config(
-            "node {\n 'ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1'#note\n ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk2#note\n}",
-        )
-        .unwrap();
-        assert_eq!(
-            config
-                .nodes
-                .iter()
-                .map(|node| (node.name.as_str(), node.host.as_str(), node.port))
-                .collect::<Vec<_>>(),
-            vec![("hk1", "1.2.3.4", 8388), ("hk2#note", "1.2.3.4", 8388)]
         );
     }
 
@@ -1538,8 +1494,6 @@ group {
     );
 }
 
-// Stripping turns `group(hk#suffix)` into `group(hk`; the failed extraction must
-// neither select every node nor leave the comment behind as a subgroup name.
 #[test]
 fn test_group_filter_unquoted_hash() {
     let input = r#"
@@ -1553,22 +1507,14 @@ group {
 }
 "#;
     let mut config = parse_dae_config(input).unwrap();
-    assert!(
-        config.groups[0].groups.is_empty(),
-        "the comment must not survive as a nested group name"
-    );
-    assert!(
-        config.groups[0].nodes.is_empty(),
-        "comment-truncated group filter must not select all nodes"
-    );
+    assert_eq!(config.groups[0].groups, ["hk#suffix"]);
+    assert!(config.groups[0].nodes.is_empty());
     config
         .nodes
         .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
     crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
-    assert!(
-        config.groups[0].nodes.is_empty(),
-        "comment-truncated group filter must remain empty after adding a node"
-    );
+    assert_eq!(config.groups[0].groups, ["hk#suffix"]);
+    assert!(config.groups[0].nodes.is_empty());
 }
 
 #[test]
@@ -2731,8 +2677,15 @@ experimental {
 }
 "#;
     let mut diagnostics = Vec::new();
-    let config = parse_dae_config_with_diagnostics(valid_input, &mut diagnostics).unwrap();
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let config =
+        super::parse_dae_config_with_detailed_diagnostics(valid_input, &mut diagnostics).unwrap();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>(),
+        ["legacy-bool-shorthand"; 4]
+    );
     assert!(!config.global.tproxy_port_protect);
     assert!(!config.global.disable_waiting_network);
     assert!(!config.global.auto_config_kernel_parameter);

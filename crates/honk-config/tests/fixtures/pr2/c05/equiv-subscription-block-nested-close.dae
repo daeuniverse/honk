@@ -1,0 +1,11 @@
+subscription {
+  detailed: {
+    url: 'http://example.test/subscription'
+    ua: 'provider/2.0'
+    interval: '10000s'
+  }
+  inline: 'http://example.test/sub'(honk/1.0 like)
+}
+routing {
+  fallback: direct
+}

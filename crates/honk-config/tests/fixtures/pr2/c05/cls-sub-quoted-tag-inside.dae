@@ -1,0 +1,6 @@
+subscription {
+    'paid:https://example.com/sub'
+}
+routing {
+    fallback: direct
+}

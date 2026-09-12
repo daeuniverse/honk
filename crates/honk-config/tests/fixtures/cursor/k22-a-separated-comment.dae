@@ -1,0 +1,7 @@
+subscription {
+    sub: 'http://sub'(ua) # }
+    other: 'http://other'
+}
+routing {
+    fallback: direct
+}

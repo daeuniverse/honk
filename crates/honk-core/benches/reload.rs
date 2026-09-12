@@ -34,6 +34,12 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+async fn reload(control_plane: &ControlPlane, config: Config) -> bool {
+    control_plane
+        .reload_runtime_config(config, Default::default())
+        .await
+}
+
 #[derive(Clone, Copy)]
 struct Observation {
     flag_writes: u64,
@@ -153,7 +159,7 @@ impl Fixture {
             )
             .expect("control plane")
         };
-        assert!(runtime.block_on(control_plane.reload_runtime_config(config.clone())));
+        assert!(runtime.block_on(reload(&control_plane, config.clone())));
         Self {
             _directory: directory,
             runtime,
@@ -168,10 +174,7 @@ impl Fixture {
     }
 
     fn reload(&self, config: Config) {
-        assert!(
-            self.runtime
-                .block_on(self.control_plane.reload_runtime_config(config))
-        );
+        assert!(self.runtime.block_on(reload(&self.control_plane, config)));
     }
 
     fn observation(&self) -> Observation {
@@ -468,7 +471,7 @@ fn bench_reload(c: &mut Criterion) {
         bencher.to_async(&fixture.runtime).iter_batched(
             || black_box(fixture.config.clone()),
             |config| async {
-                assert!(fixture.control_plane.reload_runtime_config(config).await);
+                assert!(reload(&fixture.control_plane, config).await);
             },
             BatchSize::SmallInput,
         );

@@ -23,15 +23,20 @@ subscription {
 
 tag 可以省略。条目不带引号时，第一个 `:` 之前的文本是 tag；如果该冒号属于 `://`，则没有 tag，也不会按 URL 中后续的冒号拆分。tag 和 URL 都可以使用配对的单引号或双引号。带引号的 tag 后接 `:` 表示显式 tag；否则，解析器先去掉 URL 的外层引号，再应用相同的首个冒号规则。因此，`'paid:https://example.com/sub'` 的 tag 是 `paid`，而 `'https://example.com/sub'` 没有 tag。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，会自动识别下文列出的正文格式。
 
+解析器先处理链接后缀，再规范化引号内的 tag：`'paid:https://example.com/sub'(agent)` 和 `'paid:https://example.com/sub'#note` 都保留 tag `paid`。诊断条目序号按源顺序统一计算块形式和行内声明，包括被跳过的条目。
+条目以引号开头时，只有紧接结束引号后的冒号（允许中间有空白）才声明显式 tag。未加引号的 User-Agent 或紧贴链接的注释后缀中的冒号仍是后缀数据：`'https://example.com/sub'(agent:1)` 仍是不带 tag 的条目。
+
 不带 tag 的条目使用 URL 的主机名作为名称：`'https://example.com/sub'` 的名称是 `example.com`。如果无法解析出主机名，名称保持为空，配置验证会拒绝该条目。验证不要求名称唯一：显式 tag `example.com` 与该主机上不带 tag 的 URL 都匹配 `subtag(example.com)`，该筛选条件会选中两个订阅的节点。按主机名生成名称仅适用于 dae；JSON、YAML 和 TOML 仍要求提供 `name`。
 
 不带 tag 且不含 `://` 的文本会被忽略。带显式 tag 的条目仍交给配置验证，要求名称非空且 URL 使用 HTTP(S)。`file://`、`http-file://` 和 `https-file://` 仍不受支持。
 
-条目行中，配对引号之外的 `#` 位于语句开头或紧跟 ASCII 空格、制表符时，会开始注释。裸 URL 中紧贴前文的 `#` 仍是数据，即使前一个字符是括号也不例外，例如 `https://example.com/sub?filter=(hk)#token`。未配对的引号按普通文本处理。User-Agent 中若包含前有空格的 `#`，应给 UA 加引号：`'https://example.com/sub'('agent # build')`；否则，注释会截断该后缀。
+条目行中，配对引号之外的 `#` 位于语句开头或紧跟 ASCII 空格、制表符时，会开始注释。裸 URL 中紧贴前文的 `#` 仍是数据，即使前一个字符是括号也不例外，例如 `https://example.com/sub?filter=(hk)#token`。User-Agent 中若包含前有空格的 `#`，应给 UA 加引号：`'https://example.com/sub'('agent # build')`；否则，注释会截断该后缀。
 
-URL 带引号时，紧跟结束引号的 `#` 也会开始注释；紧跟使 `(UA)` 后缀嵌套深度回到零的 `)` 时同样如此。例如，`'http://q'#c` 和 `'http://q'(ua)#c` 都保留 URL `http://q`，只有后者设置 UA `ua`。配对引号内的括号不计入嵌套深度。后缀内部紧贴前文的 `#` 仍是 UA 数据，包括 `(Mozilla/5.0 (X11; (Linux)#build))` 中的 `#`。UA 仍取第一个 `(` 与最后一个 `)` 之间的文本，因此 `(ua)(x)` 得到 `ua)(x`。出现其他尾随文本（例如 `(agent) junk`）时，仍将整个值作为 URL。
+URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为注释接受，并在该字节处产生 `legacy-glued-hash` 警告，提示在注释前加空白。`'http://q'#c` 和 `'http://q'(ua)#c` 都保留 URL `http://q`，只有后者设置 UA `ua`。配对引号内的括号不计入嵌套深度。后缀内部紧贴前文的 `#` 仍是 UA 数据，包括 `(Mozilla/5.0 (X11; (Linux)#build))` 中的 `#`。其他尾随文本（包括 `(ua)(x)` 或 `(agent) junk`）使条目被跳过，并产生 `trailing-entry-text` 或 `legacy-ua-boundary` 诊断。
 
-此规则在块扫描之后执行。行尾注释中未加引号的大括号仍参与块结构解析：`tag: 'https://h/p' # {` 仍会触发块未闭合错误。此类注释应独占一行。块形式中的 `url`、`ua` 和 `interval` 解析不变。
+这种紧贴尾部的兼容截断发生在块结构识别之后，并非词法注释。`sub: 'http://q'(ua)# }` 中独立的 `}` 仍会关闭订阅块，后续条目可能因此落在块外。请写成 `(ua) # }`，使花括号成为注释数据。
+
+引号错误与块结构规则见[方言参考](./dialect.md)。块形式中的 `url`、`ua` 和 `interval` 解析不变。
 
 ## 内部模型
 

@@ -23,15 +23,20 @@ The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append 
 
 Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
+The link suffix is parsed before embedded-tag normalization: `'paid:https://example.com/sub'(agent)` and `'paid:https://example.com/sub'#note` retain tag `paid`. Diagnostic entry ordinals count both block and inline declarations in source order, including skipped entries.
+For a quoted head, only a colon immediately after the closing quote (allowing whitespace) declares an explicit tag. Colons in an unquoted User-Agent or glued comment suffix remain suffix data: `'https://example.com/sub'(agent:1)` is still tagless.
+
 A tagless entry uses its URL host as its name: `'https://example.com/sub'` becomes `example.com`. A URL without a parseable host leaves the name empty and fails validation. Name uniqueness is not enforced: an explicit `example.com` tag and a tagless URL on that host share the same `subtag(example.com)` filter, which selects nodes from both subscriptions. Host-derived naming applies only to dae; JSON, YAML, and TOML still require `name`.
 
 Tagless text without `://` is ignored. Explicitly tagged entries still reach validation, which requires a non-empty name and an HTTP(S) URL. `file://`, `http-file://`, and `https-file://` remain unsupported.
 
-On entry lines, `#` starts a comment outside matching quotes at the start of the statement or immediately after an ASCII space or tab. In a bare URL, a glued `#` remains data, including after parentheses: `https://example.com/sub?filter=(hk)#token`. An unmatched quote is ordinary text. Quote a User-Agent containing a spaced `#`: `'https://example.com/sub'('agent # build')`; without UA quotes, the comment cuts off the suffix.
+On entry lines, `#` starts a comment outside matching quotes at the start of the statement or immediately after an ASCII space or tab. In a bare URL, a glued `#` remains data, including after parentheses: `https://example.com/sub?filter=(hk)#token`. Quote a User-Agent containing a spaced `#`: `'https://example.com/sub'('agent # build')`; without UA quotes, the comment cuts off the suffix.
 
-After a quoted URL, `#` also starts a comment immediately after the closing quote or the `)` that brings the `(UA)` suffix's nesting depth back to zero: `'http://q'#c` and `'http://q'(ua)#c` keep URL `http://q`, with UA `ua` only in the second form. Parentheses inside matching quotes do not affect that depth. A glued `#` inside the suffix remains UA data, including in `(Mozilla/5.0 (X11; (Linux)#build))`. The existing first-`(`/last-`)` UA slice is unchanged: `(ua)(x)` gives `ua)(x`. Other trailing text, such as `(agent) junk`, keeps the whole value as the URL.
+After a quoted URL, a glued `#` immediately after the closing quote or one balanced `(UA)` suffix is accepted as a comment, with `legacy-glued-hash` at that byte and the guidance “put whitespace before a comment”. `'http://q'#c` and `'http://q'(ua)#c` keep URL `http://q`, with UA `ua` only in the second form. Parentheses inside matching quotes do not affect nesting. A glued `#` inside the suffix remains UA data, including in `(Mozilla/5.0 (X11; (Linux)#build))`. Other trailing text, including `(ua)(x)` or `(agent) junk`, skips the entry with `trailing-entry-text` or `legacy-ua-boundary`.
 
-This rule runs after block scanning. Unquoted braces in a trailing comment remain structural: `tag: 'https://h/p' # {` still causes an unclosed-block error. Keep such comments on separate lines. The block form's `url`, `ua`, and `interval` parsing is unchanged.
+This glued-tail compatibility runs after block recognition; it is not a lexical comment. In `sub: 'http://q'(ua)# }`, the separated `}` still closes the subscription block, so subsequent entries can fall outside it. Write `(ua) # }` to make the brace comment data instead.
+
+Quote-error and block rules are listed in the [dialect reference](./dialect.md). The block form's `url`, `ua`, and `interval` parsing is unchanged.
 
 ## Internal model
 

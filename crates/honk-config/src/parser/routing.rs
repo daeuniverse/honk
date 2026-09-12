@@ -1,115 +1,277 @@
-use super::{
-    Block, ParserDiagnostics, extract_fn_args, find_unquoted, normalize_geosite_code,
-    split_unquoted, strip_tag_arg,
-};
-use crate::routing::RoutingConfig;
+use super::cursor::Segment;
+use super::lexer::Span;
+use super::read::Text;
+use super::{ParserDiagnostics, normalize_geosite_code, read};
+use crate::diagnostic::{SettingPath, Severity};
+use crate::error::{DetailedConfigError, ErrorCategory};
+use crate::routing::{RoutingCondition, RoutingConfig, RoutingRule};
 
-fn split_routing_statements<'a>(
-    lines: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<(String, &'a str)>, crate::ConfigError> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut parenthesis_depth = 0usize;
-    let mut first_line = None;
-
-    for (line_index, line) in lines.into_iter().enumerate() {
-        let mut chunk = String::new();
-        let mut quote = None;
-        let mut escaped = false;
-
-        for ch in line.chars() {
-            if let Some(delimiter) = quote {
-                chunk.push(ch);
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == delimiter {
-                    quote = None;
-                }
-                continue;
-            }
-
-            match ch {
-                '#' => break,
-                '\'' | '"' => {
-                    quote = Some(ch);
-                    chunk.push(ch);
-                }
-                '(' => {
-                    parenthesis_depth += 1;
-                    chunk.push(ch);
-                }
-                ')' => {
-                    if parenthesis_depth == 0 {
-                        return Err(crate::ConfigError::Parse(format!(
-                            "routing line {}: unmatched ')'",
-                            line_index + 1
-                        )));
-                    }
-                    parenthesis_depth -= 1;
-                    chunk.push(ch);
-                }
-                _ => chunk.push(ch),
-            }
-        }
-
-        if quote.is_some() {
-            return Err(crate::ConfigError::Parse(format!(
-                "routing line {}: unterminated quote",
-                line_index + 1
-            )));
-        }
-
-        let chunk = chunk.trim();
-        if !chunk.is_empty() {
-            first_line.get_or_insert(line);
-            if !current.is_empty() && !chunk.starts_with([')', ',']) {
-                current.push(' ');
-            }
-            current.push_str(chunk);
-        }
-
-        if parenthesis_depth == 0 && !current.is_empty() {
-            statements.push((std::mem::take(&mut current), first_line.take().unwrap()));
-        }
-    }
-
-    if parenthesis_depth != 0 {
-        return Err(crate::ConfigError::Parse(
-            "routing section: unterminated parenthesized rule".into(),
-        ));
-    }
-
-    Ok(statements)
+/// A window over physical source pieces, including gaps owned by comments.
+#[derive(Clone, Copy)]
+struct Expression<'p, 'd, 'a> {
+    pieces: &'p [Text<'d, 'a>],
+    span: Span,
 }
 
-fn parse_default_outbound(statement: &str) -> Option<String> {
-    ["fallback:", "default:"]
-        .into_iter()
-        .find_map(|prefix| statement.strip_prefix(prefix))
-        .map(str::trim)
-        .map(str::to_owned)
+impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
+    fn new(pieces: &'p [Text<'d, 'a>]) -> Self {
+        Self {
+            pieces,
+            span: Span {
+                end: pieces.last().unwrap().span.end,
+                ..pieces[0].span
+            },
+        }
+    }
+
+    fn sub(self, start: usize, end: usize) -> Self {
+        let first = self.pieces.partition_point(|piece| piece.span.end <= start);
+        let last = if start == end {
+            first
+        } else {
+            self.pieces.partition_point(|piece| piece.span.start < end)
+        };
+        Self {
+            pieces: &self.pieces[first..last],
+            span: Span {
+                start,
+                end,
+                ..self.span
+            },
+        }
+    }
+
+    fn parts(self) -> impl DoubleEndedIterator<Item = Text<'d, 'a>> + 'p {
+        self.pieces.iter().filter_map(move |piece| {
+            let start = piece.span.start.max(self.span.start);
+            let end = piece.span.end.min(self.span.end);
+            (start < end).then(|| piece.sub(start - piece.span.start, end - piece.span.start))
+        })
+    }
+
+    fn trim(self) -> Self {
+        let mut parts = self
+            .parts()
+            .map(Text::trim)
+            .filter(|part| !part.raw().is_empty());
+        if let Some(first) = parts.next() {
+            let end = parts.next_back().unwrap_or(first).span.end;
+            self.sub(first.span.start, end)
+        } else {
+            self.sub(self.span.start, self.span.start)
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.span.start == self.span.end
+    }
+
+    fn starts_with(self, prefix: &str) -> bool {
+        self.parts()
+            .next()
+            .is_some_and(|part| part.raw().starts_with(prefix))
+    }
+
+    fn find(self, delimiter: &str) -> Option<usize> {
+        self.parts()
+            .find_map(|part| part.find(delimiter).map(|offset| part.span.start + offset))
+    }
+
+    fn split<'s>(self, delimiter: &'s str) -> impl Iterator<Item = Self> + 's
+    where
+        'p: 's,
+        'd: 's,
+    {
+        let mut delimiters = self
+            .parts()
+            .flat_map(move |part| part.delimiter_positions(delimiter));
+        let mut start = self.span.start;
+        let mut done = false;
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            if let Some(end) = delimiters.next() {
+                let part = self.sub(start, end).trim();
+                start = end + delimiter.len();
+                Some(part)
+            } else {
+                done = true;
+                Some(self.sub(start, self.span.end).trim())
+            }
+        })
+    }
+
+    fn parentheses(self) -> impl Iterator<Item = (usize, u8)> + 'p
+    where
+        'd: 'p,
+    {
+        self.parts().flat_map(Text::parentheses)
+    }
+
+    fn display(self) -> String {
+        let mut output = String::new();
+        for part in self
+            .parts()
+            .map(Text::trim)
+            .filter(|part| !part.raw().is_empty())
+        {
+            let raw = part.raw();
+            // Preserve the existing complex-rule display across continuation lines.
+            if !output.is_empty() && !raw.starts_with([')', ',']) {
+                output.push(' ');
+            }
+            output.push_str(raw);
+        }
+        output
+    }
+
+    fn unquote(self) -> Self {
+        let text = self.trim();
+        let mut parts = text.parts();
+        match (parts.next(), parts.next()) {
+            (Some(part), None) => {
+                let part = part.unquote();
+                text.sub(part.span.start, part.span.end)
+            }
+            _ => text,
+        }
+    }
+
+    fn value(self) -> std::borrow::Cow<'d, str> {
+        let mut parts = self.parts();
+        match (parts.next(), parts.next()) {
+            (Some(part), None) => std::borrow::Cow::Borrowed(part.raw()),
+            _ => std::borrow::Cow::Owned(self.display()),
+        }
+    }
+
+    fn warn_glued_hash(self, diagnostics: &mut ParserDiagnostics<'_>) {
+        for part in self.parts() {
+            part.warn_glued_hash(diagnostics);
+        }
+    }
+
+    fn error(self, code: &'static str, message: &'static str, index: usize) -> DetailedConfigError {
+        let mut diagnostic =
+            self.pieces[0]
+                .source
+                .diagnostic(self.span, Severity::Error, code, message);
+        diagnostic.setting = SettingPath::new("routing").field("rules").index(index);
+        diagnostic.entry_index = Some(index);
+        diagnostic.terminal = true;
+        DetailedConfigError {
+            category: ErrorCategory::Parse,
+            diagnostic: Box::new(diagnostic),
+        }
+    }
+}
+
+pub(super) fn parse_section(
+    section: &[Segment<'_, '_>],
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<RoutingConfig, super::ParseFailure> {
+    let mut config = RoutingConfig::default();
+    let lines = read::statements(section, diagnostics);
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut ordinal = 0;
+    for end in 0..lines.len() {
+        if start < end && lines[start].span.source != lines[end].span.source {
+            return Err(crate::ConfigError::Parse(
+                "routing: unterminated parenthesized rule at source boundary".into(),
+            )
+            .into());
+        }
+        for (_, byte) in Expression::new(&lines[end..=end]).parentheses() {
+            if byte == b'(' {
+                depth += 1;
+            } else {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    crate::ConfigError::Parse("routing: unmatched closing parenthesis".into())
+                })?;
+            }
+        }
+        if depth != 0 {
+            continue;
+        }
+        ordinal += 1;
+        let statement = Expression::new(&lines[start..=end]).trim();
+        start = end + 1;
+        diagnostics.entry_text(statement.parts().next().unwrap(), ordinal);
+        if let Some(prefix) = ["fallback:", "default:"]
+            .into_iter()
+            .find(|prefix| statement.starts_with(prefix))
+        {
+            let value = statement
+                .sub(statement.span.start + prefix.len(), statement.span.end)
+                .trim();
+            value.warn_glued_hash(diagnostics);
+            config.default_outbound = value.display();
+        } else {
+            match parse_routing_rule(statement, config.rules.len(), ordinal, diagnostics) {
+                Ok(Some((rule, source))) => {
+                    if let Some(source) = source {
+                        config.record_complex_rule_source(rule.name.clone(), source);
+                    }
+                    config.rules.push(rule);
+                }
+                Ok(None) => statement.parts().next().unwrap().notice(
+                    diagnostics,
+                    Severity::Warning,
+                    "unknown-statement",
+                    "traffic statement without an arrow ignored",
+                ),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    if depth != 0 {
+        return Err(
+            crate::ConfigError::Parse("routing: unterminated parenthesized rule".into()).into(),
+        );
+    }
+    Ok(config)
 }
 
 fn parse_routing_rule(
-    statement: String,
+    statement: Expression<'_, '_, '_>,
     index: usize,
-) -> Result<Option<(crate::routing::RoutingRule, Option<String>)>, crate::ConfigError> {
-    let Some(arrow) = find_unquoted(&statement, "->") else {
+    ordinal: usize,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<Option<(RoutingRule, Option<String>)>, DetailedConfigError> {
+    let Some(arrow) = statement.find("->") else {
         return Ok(None);
     };
-    let (left, right) = (&statement[..arrow], &statement[arrow + 2..]);
-    let left = left.trim();
-    let right = right.trim();
-    let (outbound, must) = right.strip_suffix("(must)").map_or_else(
-        || (right.to_owned(), false),
-        |name| (name.trim().to_owned(), true),
-    );
-    let condition = parse_route_condition(left)?;
-    let is_complex =
-        must || find_unquoted(left, "&&").is_some() || condition.needs_complex_display();
-    let rule = crate::routing::RoutingRule {
+    let left = statement.sub(statement.span.start, arrow).trim();
+    let right = statement.sub(arrow + 2, statement.span.end).trim();
+    left.warn_glued_hash(diagnostics);
+    right.warn_glued_hash(diagnostics);
+    if let Some(offset) = right.find("->") {
+        right
+            .sub(offset, offset + 2)
+            .parts()
+            .next()
+            .unwrap()
+            .notice(
+                diagnostics,
+                Severity::Warning,
+                "legacy-arrow-target",
+                "additional arrows remain literal outbound data",
+            );
+    }
+    let mut outbound = right.display();
+    let must = outbound.ends_with("(must)");
+    if must {
+        outbound.truncate(outbound.len() - "(must)".len());
+        outbound.truncate(outbound.trim_end().len());
+    }
+    let mut condition = RoutingCondition::default();
+    for matcher in left.split("&&").filter(|matcher| !matcher.is_empty()) {
+        parse_route_matcher(&mut condition, matcher, ordinal)?;
+    }
+    let complex = must || left.find("&&").is_some() || condition.needs_complex_display();
+    let rule = RoutingRule {
         name: format!("rule-{index}"),
         condition,
         outbound: crate::routing::RoutingOutbound::Simple(outbound),
@@ -117,134 +279,165 @@ fn parse_routing_rule(
         must,
         mark: 0,
     };
-
-    Ok(Some((rule, is_complex.then_some(statement))))
-}
-
-pub(super) fn parse_section(
-    section: &Block,
-    diagnostics: &mut ParserDiagnostics<'_>,
-) -> Result<RoutingConfig, crate::ConfigError> {
-    let mut config = RoutingConfig::default();
-    for (index, (statement, line)) in split_routing_statements(section.lines_except(&[]))?
-        .into_iter()
-        .enumerate()
-    {
-        diagnostics.entry(line, index + 1);
-        if let Some(outbound) = parse_default_outbound(&statement) {
-            config.default_outbound = outbound;
-        } else if let Some((rule, complex_source)) =
-            parse_routing_rule(statement, config.rules.len())?
-        {
-            if let Some(source) = complex_source {
-                config.record_complex_rule_source(rule.name.clone(), source);
-            }
-            config.rules.push(rule);
-        }
-    }
-    Ok(config)
+    Ok(Some((rule, complex.then(|| statement.display()))))
 }
 
 fn parse_route_matcher(
-    condition: &mut crate::routing::RoutingCondition,
-    matcher: &str,
-) -> Result<(), crate::ConfigError> {
-    let (negated, matcher) = matcher
-        .strip_prefix('!')
-        .map_or((false, matcher), |rest| (true, rest.trim()));
+    condition: &mut RoutingCondition,
+    matcher: Expression<'_, '_, '_>,
+    ordinal: usize,
+) -> Result<(), DetailedConfigError> {
+    let negated = matcher.starts_with("!");
+    let matcher = if negated {
+        matcher.sub(matcher.span.start + 1, matcher.span.end).trim()
+    } else {
+        matcher
+    };
     if matcher.is_empty() {
         return Ok(());
     }
-
     let mut target = if negated {
         condition.not.fields_mut()
     } else {
         condition.fields_mut()
     };
-    if let Some(args) = extract_fn_args(matcher, "pname") {
-        target.process_name.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "dip") {
-        parse_ip_args(&args, &mut target);
-    } else if let Some(args) = extract_fn_args(matcher, "sip") {
-        target.source_ip.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "domain") {
-        parse_domain_args(&args, &mut target);
-    } else if let Some(args) = extract_fn_args(matcher, "dport") {
-        target.port.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "sport") {
-        target.source_port.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "l4proto") {
-        target.protocol.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "ipversion") {
-        target.ip_version.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "mac") {
-        target.mac.extend(args);
-    } else if let Some(args) = extract_fn_args(matcher, "dscp") {
-        target.dscp.extend(args);
-    } else if let Some(value) = strip_tag_arg(matcher, "geosite:") {
-        target.geosite.push(normalize_geosite_code(&value));
-    } else if let Some(value) = strip_tag_arg(matcher, "geoip:") {
-        target.geo_ip.push(normalize_geosite_code(&value));
-    } else if let Some(value) = strip_tag_arg(matcher, "domain:") {
-        target.domain_suffix.push(value);
-    } else if let Some(value) = strip_tag_arg(matcher, "suffix:") {
-        target.domain_suffix.push(value);
-    } else if let Some(value) = strip_tag_arg(matcher, "keyword:") {
-        target.domain_keyword.push(value);
-    } else if let Some(value) = strip_tag_arg(matcher, "full:") {
-        target.domain.push(value);
-    } else if let Some(value) = strip_tag_arg(matcher, "regex:") {
-        target.domain_regex.push(value);
-    } else {
-        return Err(crate::ConfigError::Parse(
-            "unknown traffic predicate".into(),
-        ));
+    for name in [
+        "pname",
+        "dip",
+        "sip",
+        "domain",
+        "dport",
+        "sport",
+        "l4proto",
+        "ipversion",
+        "mac",
+        "dscp",
+    ] {
+        if let Some(args) = parse_call(matcher, name, ordinal)? {
+            match name {
+                "dip" => parse_ip_args(&args, &mut target),
+                "domain" => parse_domain_args(&args, &mut target),
+                _ => {
+                    let field = match name {
+                        "pname" => target.process_name,
+                        "sip" => target.source_ip,
+                        "dport" => target.port,
+                        "sport" => target.source_port,
+                        "l4proto" => target.protocol,
+                        "ipversion" => target.ip_version,
+                        "mac" => target.mac,
+                        "dscp" => target.dscp,
+                        _ => unreachable!(),
+                    };
+                    field.extend(
+                        args.into_iter()
+                            .map(|argument| argument.value().into_owned()),
+                    );
+                }
+            }
+            return Ok(());
+        }
     }
-    Ok(())
+    for prefix in [
+        "geosite:", "geoip:", "domain:", "suffix:", "keyword:", "full:", "regex:",
+    ] {
+        if matcher.starts_with(prefix) {
+            let value = matcher
+                .sub(matcher.span.start + prefix.len(), matcher.span.end)
+                .unquote()
+                .value();
+            match prefix {
+                "geosite:" => target.geosite.push(normalize_geosite_code(&value)),
+                "geoip:" => target.geo_ip.push(normalize_geosite_code(&value)),
+                "domain:" | "suffix:" => target.domain_suffix.push(value.into_owned()),
+                "keyword:" => target.domain_keyword.push(value.into_owned()),
+                "full:" => target.domain.push(value.into_owned()),
+                "regex:" => target.domain_regex.push(value.into_owned()),
+                _ => unreachable!(),
+            }
+            return Ok(());
+        }
+    }
+    Err(matcher.error(
+        "unknown-traffic-predicate",
+        "unknown traffic predicate",
+        ordinal,
+    ))
 }
 
-fn parse_route_condition(
-    expr: &str,
-) -> Result<crate::routing::RoutingCondition, crate::ConfigError> {
-    let mut condition = crate::routing::RoutingCondition::default();
-    for matcher in split_unquoted(expr, "&&")
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        parse_route_matcher(&mut condition, matcher)?;
+fn parse_call<'p, 'd, 'a>(
+    matcher: Expression<'p, 'd, 'a>,
+    name: &str,
+    ordinal: usize,
+) -> Result<Option<Vec<Expression<'p, 'd, 'a>>>, DetailedConfigError> {
+    if !matcher.parts().next().is_some_and(|part| {
+        part.raw()
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('('))
+    }) {
+        return Ok(None);
     }
-    Ok(condition)
+    let call = matcher.sub(matcher.span.start + name.len(), matcher.span.end);
+    let Some((position, _)) = call.parentheses().find(|(_, byte)| *byte == b')') else {
+        return Ok(None);
+    };
+    let trailing = call.sub(position + 1, call.span.end);
+    if !trailing.trim().is_empty() {
+        if trailing.span.start == trailing.trim().span.start {
+            return Err(trailing.trim().error(
+                "trailing-matcher-text",
+                "matcher call has trailing text",
+                ordinal,
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(
+        call.sub(call.span.start + 1, position)
+            .split(",")
+            .map(Expression::unquote)
+            .filter(|value| !value.is_empty())
+            .collect(),
+    ))
 }
 
-/// Dispatch `domain(...)` arguments to the correct condition fields.
-/// Supports `suffix:`, `keyword:`, `full:`, `regex:`, and `geosite:`.
-fn parse_domain_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>) {
+fn parse_domain_args(
+    args: &[Expression<'_, '_, '_>],
+    cond: &mut crate::routing::ConditionFields<'_>,
+) {
     for a in args {
-        if let Some(v) = strip_tag_arg(a, "geosite:") {
-            cond.geosite.push(normalize_geosite_code(&v));
-        } else if let Some(v) = strip_tag_arg(a, "keyword:") {
-            cond.domain_keyword.push(v);
-        } else if let Some(v) = strip_tag_arg(a, "full:") {
-            cond.domain.push(v);
-        } else if let Some(v) = strip_tag_arg(a, "regex:") {
-            cond.domain_regex.push(v);
-        } else if let Some(v) = strip_tag_arg(a, "suffix:") {
-            cond.domain_suffix.push(v);
+        let prefix = ["geosite:", "keyword:", "full:", "regex:", "suffix:"]
+            .into_iter()
+            .find(|prefix| a.starts_with(prefix));
+        if let Some(prefix) = prefix {
+            let value = a
+                .sub(a.span.start + prefix.len(), a.span.end)
+                .unquote()
+                .value();
+            match prefix {
+                "geosite:" => cond.geosite.push(normalize_geosite_code(&value)),
+                "keyword:" => cond.domain_keyword.push(value.into_owned()),
+                "full:" => cond.domain.push(value.into_owned()),
+                "regex:" => cond.domain_regex.push(value.into_owned()),
+                "suffix:" => cond.domain_suffix.push(value.into_owned()),
+                _ => unreachable!(),
+            }
         } else {
-            // Bare domain argument defaults to suffix matching, mirroring dae.
-            cond.domain_suffix.push(a.trim().to_string());
+            cond.domain_suffix.push(a.value().into_owned());
         }
     }
 }
 
-/// Dispatch `dip(...)` arguments to the correct condition fields.
-/// Supports `geoip:` and plain CIDRs.
-fn parse_ip_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>) {
+fn parse_ip_args(args: &[Expression<'_, '_, '_>], cond: &mut crate::routing::ConditionFields<'_>) {
     for a in args {
-        if let Some(v) = strip_tag_arg(a, "geoip:") {
-            cond.geo_ip.push(normalize_geosite_code(&v));
+        if a.starts_with("geoip:") {
+            let value = a
+                .sub(a.span.start + "geoip:".len(), a.span.end)
+                .unquote()
+                .value();
+            cond.geo_ip.push(normalize_geosite_code(&value));
         } else {
-            cond.ip.push(a.trim().to_string());
+            cond.ip.push(a.value().into_owned());
         }
     }
 }

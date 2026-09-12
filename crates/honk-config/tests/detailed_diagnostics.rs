@@ -198,6 +198,15 @@ fn node_entry_diagnostics_keep_coordinates_before_intrinsic_validation() {
         assert_eq!(error.diagnostic.line, Some(if included { 3 } else { 4 }));
         assert_eq!(error.diagnostic.entry_index, Some(3));
         assert_eq!(error.diagnostic.setting.to_string(), "nodes[3]");
+        let source_text = if included {
+            format!("node {{\n{remaining}}}\n")
+        } else {
+            format!("node {{\n{first}{remaining}}}\n")
+        };
+        assert_eq!(
+            &source_text[error.diagnostic.span.clone().unwrap()],
+            "bad: 'ssr://PRIVATE@example.invalid:443'"
+        );
         let warning = diagnostics
             .iter()
             .find(|d| d.code == "legacy-config-warning")
@@ -205,7 +214,12 @@ fn node_entry_diagnostics_keep_coordinates_before_intrinsic_validation() {
         assert_eq!(warning.line, Some(if included { 2 } else { 3 }));
         assert_eq!(warning.entry_index, Some(2));
         assert_eq!(warning.setting.to_string(), "nodes[2].skip_cert_verify");
+        assert_eq!(
+            &source_text[warning.span.clone().unwrap()],
+            "warning: 'trojan://PRIVATE@example.invalid:443?insecure=yes'"
+        );
         for diagnostic in [warning, error.diagnostic.as_ref()] {
+            assert_eq!(diagnostic.byte_column, Some(2));
             let source = &diagnostic.source;
             assert_eq!(
                 source.sources().metadata()[source.index()].path.as_ref(),

@@ -1,0 +1,8 @@
+node {
+    'a } b': 'socks5://127.0.0.1:1080'
+}
+group {
+    selected {
+        filter: name('a } b')
+    }
+}

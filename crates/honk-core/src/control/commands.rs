@@ -8,6 +8,7 @@ pub(crate) enum ControlCommand {
     ReloadConfig {
         request_id: u64,
         config: Box<Config>,
+        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         result: tokio::sync::oneshot::Sender<Option<Vec<AuthorizedSubscription>>>,
     },
     /// Merge freshly fetched subscription nodes into the running config,
@@ -18,6 +19,7 @@ pub(crate) enum ControlCommand {
         subscription_id: uuid::Uuid,
         revision: u64,
         nodes: Vec<Node>,
+        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
     },
     /// Refresh generated gateway-address rules and bypass stale health
     /// backoff after a link, address, route, or interface-role change.

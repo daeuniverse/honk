@@ -5,6 +5,9 @@ use super::reload::{
 };
 use super::*;
 
+#[path = "c14_diagnostics_tests.rs"]
+mod c14_diagnostics;
+
 use crate::control::udp_endpoint::{EndpointReservation, UdpEndpoint};
 use crate::dns;
 use crate::ebpf::mock::MockEbpfBackend;
@@ -400,8 +403,12 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
     let cp = Arc::new(test_cp().await);
     let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new(),)
-            .await
+        cp.apply_runtime_config(
+            score_reload_config(first_revision),
+            Default::default(),
+            &DrainTracker::new(),
+        )
+        .await
     );
     let provider = cp.dns_controller.runtime_provider();
     let before_dns = provider.current_generation();
@@ -441,6 +448,7 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
     let result = cp
         .apply_runtime_config(
             score_reload_config(first_revision + 1),
+            Default::default(),
             &DrainTracker::new(),
         )
         .await;
@@ -463,8 +471,12 @@ async fn failed_reload_keeps_old_score_authority() {
     let cp = test_cp().await;
     let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new())
-            .await
+        cp.apply_runtime_config(
+            score_reload_config(first_revision),
+            Default::default(),
+            &DrainTracker::new(),
+        )
+        .await
     );
     let provider = cp.dns_controller.runtime_provider();
     let before_dns = provider.current_generation();
@@ -472,7 +484,10 @@ async fn failed_reload_keeps_old_score_authority() {
     let mut invalid = score_reload_config(first_revision + 1);
     invalid.dns.upstream[0].address = "://invalid".into();
 
-    assert!(!cp.apply_runtime_config(invalid, &DrainTracker::new()).await);
+    assert!(
+        !cp.apply_runtime_config(invalid, Default::default(), &DrainTracker::new())
+            .await
+    );
 
     assert_eq!(provider.current_generation(), before_dns);
     assert!(Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
@@ -498,8 +513,12 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
     let cp = test_cp_with_nfq(true).await;
     let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new())
-            .await
+        cp.apply_runtime_config(
+            score_reload_config(first_revision),
+            Default::default(),
+            &DrainTracker::new(),
+        )
+        .await
     );
     let provider = cp.dns_controller.runtime_provider();
     let before_dns = provider.current_generation();
@@ -512,7 +531,7 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
     let revision = first_revision + 1;
     let drain = DrainTracker::new();
     assert!(
-        cp.apply_runtime_config(score_reload_config(revision), &drain)
+        cp.apply_runtime_config(score_reload_config(revision), Default::default(), &drain)
             .await
     );
     assert_ne!(provider.current_generation(), before_dns);
@@ -556,8 +575,12 @@ async fn fence_failure_rejects_reload_without_stranding_datapath() {
     assert!(cp.datapath_flags.is_some());
     let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new())
-            .await
+        cp.apply_runtime_config(
+            score_reload_config(first_revision),
+            Default::default(),
+            &DrainTracker::new(),
+        )
+        .await
     );
     let before_route = cp.config.read().await.routing.rules[0].name.clone();
     {
@@ -567,8 +590,12 @@ async fn fence_failure_rejects_reload_without_stranding_datapath() {
     }
     let drain = DrainTracker::new();
     assert!(
-        !cp.apply_runtime_config(score_reload_config(first_revision + 1), &drain)
-            .await,
+        !cp.apply_runtime_config(
+            score_reload_config(first_revision + 1),
+            Default::default(),
+            &drain,
+        )
+        .await,
         "fence failure must reject the reload"
     );
     assert_eq!(
@@ -611,7 +638,7 @@ async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
     let drain = DrainTracker::new();
     let revision = 1;
     assert!(
-        !cp.apply_runtime_config(score_reload_config(revision), &drain)
+        !cp.apply_runtime_config(score_reload_config(revision), Default::default(), &drain)
             .await,
         "quiesce failure must reject the reload"
     );
@@ -640,7 +667,7 @@ async fn empty_subscription_merge_does_not_publish_runtime() {
     let before_generation = provider.current_generation();
     let before_retired = provider.retired_count();
 
-    cp.merge_subscription_nodes(uuid::Uuid::new_v4(), Vec::new())
+    cp.merge_subscription_nodes(uuid::Uuid::new_v4(), Vec::new(), Vec::new())
         .await;
 
     assert_eq!(provider.current_generation(), before_generation);
@@ -665,9 +692,10 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
 
     let mut cp = test_cp().await;
     let mut startup = Config::default();
-    let mut supervisor = crate::subscription::SubscriptionSupervisor::prepare(&mut startup, None)
-        .await
-        .unwrap();
+    let mut supervisor =
+        crate::subscription::SubscriptionSupervisor::prepare(&mut startup, None, Vec::new())
+            .await
+            .unwrap();
     let (command_tx, mut commands) = tokio::sync::mpsc::channel(4);
     supervisor.start(command_tx);
     let supervisor_handle = supervisor.handle();
@@ -690,6 +718,7 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
             ControlCommand::ReloadConfig {
                 request_id: 1,
                 config: Box::new(candidate),
+                diagnostics: Vec::new(),
                 result,
             },
             &drain,
@@ -729,6 +758,7 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
                     subscription_id: Some(subscription_id),
                     ..Default::default()
                 }],
+                diagnostics: Vec::new(),
             },
             &drain,
             &mut authorizations,
@@ -769,6 +799,7 @@ async fn applied_reload_with_dropped_supervisor_handoff_stops_dispatch() {
             ControlCommand::ReloadConfig {
                 request_id: 2,
                 config: Box::new(candidate),
+                diagnostics: Vec::new(),
                 result,
             },
             &DrainTracker::new(),
@@ -791,7 +822,10 @@ async fn runtime_reload_shortcut_rejects_subscription_worker_changes() {
         ..Default::default()
     }];
 
-    assert!(!cp.reload_runtime_config(candidate).await);
+    assert!(
+        !cp.reload_runtime_config(candidate, Default::default())
+            .await
+    );
     assert!(cp.config_handle().read().await.subscriptions.is_empty());
 }
 
@@ -823,7 +857,10 @@ async fn reload_clamps_dials_to_startup_descriptor_reservation() {
     let mut config = cp.config_handle().read().await.as_ref().clone();
     config.global.max_concurrent_dials = usize::MAX;
 
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     assert_eq!(cp.runtime_registry.read().dial_limit(), ceiling);
 }
 
@@ -848,7 +885,8 @@ async fn build_failure_leaves_live_config_untouched() {
     }];
 
     let drain = DrainTracker::new();
-    cp.apply_runtime_config(bad, &drain).await;
+    cp.apply_runtime_config(bad, Default::default(), &drain)
+        .await;
 
     let after = cp.config_handle().read().await.global.check_tolerance_ms;
     assert_eq!(before, after, "failed build must not swap the live config");
@@ -986,7 +1024,7 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
     let drain = DrainTracker::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        cp.apply_runtime_config(new_config, &drain),
+        cp.apply_runtime_config(new_config, Default::default(), &drain),
     )
     .await
     .expect("reload must complete");
@@ -1061,7 +1099,7 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     let reloading_drain = Arc::clone(&drain);
     let reloader = tokio::spawn(async move {
         reloading_cp
-            .apply_runtime_config(next, reloading_drain.as_ref())
+            .apply_runtime_config(next, Default::default(), reloading_drain.as_ref())
             .await;
     });
 
@@ -1114,7 +1152,10 @@ async fn valid_reload_commits() {
 
     let mut good = Config::default();
     good.global.check_tolerance_ms = expected_tolerance;
-    assert!(cp.apply_runtime_config(good, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(good, Default::default(), &DrainTracker::new())
+            .await
+    );
 
     assert_eq!(
         cp.config_handle().read().await.global.check_tolerance_ms,
@@ -1144,7 +1185,7 @@ async fn valid_reload_commits() {
 async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing() {
     let cp = test_cp().await;
     assert!(
-        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+        cp.apply_runtime_config(Config::default(), Default::default(), &DrainTracker::new())
             .await
     );
     let config = cp.config_handle().read().await.as_ref().clone();
@@ -1162,7 +1203,10 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
     cp.ebpf.write().await.clear_datapath_flags_write_log();
     let drain = DrainTracker::new();
 
-    assert!(cp.apply_runtime_config(config, &drain).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &drain)
+            .await
+    );
 
     assert_eq!(
         cp.dns_controller
@@ -1192,7 +1236,7 @@ async fn semantic_domain_reload_replaces_matching_predicates() {
         honk_config::routing::RoutingOutbound::Simple("block".into());
     config.routing.rules[0].condition.domain = vec!["first.example".into()];
     assert!(
-        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
             .await
     );
     let mut connection = crate::routing::ConnectionInfo {
@@ -1209,7 +1253,10 @@ async fn semantic_domain_reload_replaces_matching_predicates() {
     let first = cp.router.read().await.route(&connection).to_owned();
     assert_eq!(first, "block");
     config.routing.rules[0].condition.domain = vec!["second.example".into()];
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     let router = cp.router.read().await;
     assert_eq!(router.route(&connection), router.default_outbound());
     connection.domain = Some("second.example".into());
@@ -1223,7 +1270,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
     config.routing.rules[0].condition.domain = vec!["sniff-only.example".into()];
     config.routing.rules[0].condition.process_name = vec!["abcdefghijklmnop".into()];
     assert!(
-        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
             .await
     );
     let positive = crate::ebpf::maps::ip_addr_to_lpm_key("192.0.2.31".parse().unwrap());
@@ -1256,7 +1303,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
 
     config.routing.rules[0].condition.process_name = vec!["abcdefghijklmnoX".into()];
     assert!(
-        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
             .await
     );
     assert_eq!(
@@ -1272,7 +1319,10 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
     }
 
     config.routing.rules[0].condition.domain = vec!["changed.example".into()];
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     let backend = cp.ebpf.read().await;
     assert_ne!(backend.active_routing_generation().unwrap(), active_slot);
     assert!(backend.projection_map_snapshot().is_empty());
@@ -1295,7 +1345,10 @@ async fn identical_subscription_merge_skips_runtime_generation() {
     let cp = test_cp().await;
     let mut initial = Config::default();
     initial.nodes.push(node.clone());
-    assert!(cp.apply_runtime_config(initial, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(initial, Default::default(), &DrainTracker::new())
+            .await
+    );
     let before = cp
         .dns_controller
         .runtime_provider()
@@ -1305,7 +1358,7 @@ async fn identical_subscription_merge_skips_runtime_generation() {
     let mut fetched = node;
     fetched.created_at += chrono::Duration::seconds(1);
     fetched.updated_at += chrono::Duration::seconds(1);
-    cp.merge_subscription_nodes(subscription_id, vec![fetched])
+    cp.merge_subscription_nodes(subscription_id, vec![fetched], Vec::new())
         .await;
 
     assert_eq!(
@@ -1328,7 +1381,7 @@ async fn changed_hosts_file_rebuilds_reload_snapshot() {
     config.dns.hosts = vec![path.to_string_lossy().into_owned()];
 
     assert!(
-        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
             .await
     );
     let first_forwarder = cp.dns_controller.forwarder();
@@ -1338,7 +1391,10 @@ async fn changed_hosts_file_rebuilds_reload_snapshot() {
     let cache = first_forwarder.cache();
 
     std::fs::write(&path, "full:reload.invalid 192.0.2.2\n").unwrap();
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     let second_forwarder = cp.dns_controller.forwarder();
     let second = second_forwarder.hosts_snapshot();
 
@@ -1358,7 +1414,7 @@ async fn client_subnet_reload_injects_upstream_query() {
     replacement.dns.upstream[0].address = upstream.local_addr().unwrap().to_string();
 
     assert!(
-        cp.apply_runtime_config(replacement, &DrainTracker::new())
+        cp.apply_runtime_config(replacement, Default::default(), &DrainTracker::new())
             .await
     );
     let config = cp.config_handle().read().await.clone();
@@ -1412,7 +1468,7 @@ async fn routing_push_failure_keeps_active_policy_and_userspace_generation() {
     let mut replacement = changed_routing_config();
     replacement.global.check_tolerance_ms += 1;
 
-    cp.apply_runtime_config(replacement, &DrainTracker::new())
+    cp.apply_runtime_config(replacement, Default::default(), &DrainTracker::new())
         .await;
 
     assert_eq!(
@@ -1435,7 +1491,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
     let mut replacement = changed_routing_config();
     replacement.global.check_tolerance_ms += 1;
 
-    cp.apply_runtime_config(replacement, &DrainTracker::new())
+    cp.apply_runtime_config(replacement, Default::default(), &DrainTracker::new())
         .await;
     assert_eq!(
         cp.ebpf.read().await.active_routing_generation().unwrap(),
@@ -1462,7 +1518,10 @@ async fn repeated_publication_failures_preserve_serving_generation() {
     replacement.global.check_tolerance_ms += 1;
     for _ in 0..2 {
         let drain = DrainTracker::new();
-        assert!(!cp.apply_runtime_config(replacement.clone(), &drain).await);
+        assert!(
+            !cp.apply_runtime_config(replacement.clone(), Default::default(), &drain)
+                .await
+        );
         assert!(cp.is_datapath_healthy());
         assert!(!drain.should_reject());
         assert!(!cp.drain_tracker.should_reject());
@@ -1476,8 +1535,12 @@ async fn repeated_publication_failures_preserve_serving_generation() {
         );
     }
     assert!(
-        cp.apply_runtime_config(replacement.clone(), &DrainTracker::new())
-            .await
+        cp.apply_runtime_config(
+            replacement.clone(),
+            Default::default(),
+            &DrainTracker::new()
+        )
+        .await
     );
     assert_ne!(
         cp.ebpf.read().await.active_routing_generation().unwrap(),
@@ -2315,11 +2378,13 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
         tls_server_name: None,
         outbound: None,
     }];
-    cp.apply_runtime_config(bad, &DrainTracker::new()).await;
+    cp.apply_runtime_config(bad, Default::default(), &DrainTracker::new())
+        .await;
     assert!(!old_generation.is_shutdown());
     assert_eq!(cancelled.load(Ordering::SeqCst), 0);
 
-    cp.apply_runtime_config(config, &DrainTracker::new()).await;
+    cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+        .await;
     let new_runtime = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
         .await
         .expect("new warm must start after reload")
@@ -2357,7 +2422,7 @@ async fn ready_pool_reload_fixture() -> (
     let mut config = Config::default();
     config.nodes.push(node.clone());
     assert!(
-        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
             .await
     );
     let generation = cp.runtime_registry.read().clone();
@@ -2408,7 +2473,10 @@ async fn ready_pool_reload_recredentials_retire_old_stream() {
     socks.username = Some("b".into());
     socks.password = Some("b".into());
     node.id = node.derive_id();
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     assert_ne!(
         generation.generation(),
         cp.runtime_registry.read().generation()
@@ -2428,7 +2496,10 @@ async fn ready_pool_reload_protocol_replacement_retires_old_stream() {
         node.port,
     ))
     .unwrap();
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     assert_ne!(
         generation.generation(),
         cp.runtime_registry.read().generation()
@@ -2442,7 +2513,10 @@ async fn ready_pool_reload_protocol_replacement_retires_old_stream() {
 async fn ready_pool_reload_routing_change_retires_unchanged_node_stream() {
     let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
     config.routing = changed_routing_config().routing;
-    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+    );
     assert_ne!(
         generation.generation(),
         cp.runtime_registry.read().generation()
@@ -2456,7 +2530,7 @@ async fn ready_pool_reload_routing_change_retires_unchanged_node_stream() {
 async fn ready_pool_reload_rejection_preserves_stream() {
     let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
     config.nodes[0].name = "direct".into();
-    assert!(!cp.reload_runtime_config(config).await);
+    assert!(!cp.reload_runtime_config(config, Default::default()).await);
     assert_eq!(
         generation.generation(),
         cp.runtime_registry.read().generation()
@@ -2490,6 +2564,7 @@ async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection()
         subscription_id: subscription.id,
         revision: authorizations.revision(subscription.id).unwrap(),
         nodes,
+        diagnostics: Vec::new(),
     };
     let log = capture_runtime_admission(cp.dispatch_control_command(
         command,
@@ -2521,8 +2596,12 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
     let cp = super::c20_tests::control_plane(current.clone()).await;
     let mut stale = node;
     stale.address = "192.0.2.11".into();
-    let log =
-        capture_runtime_admission(cp.merge_subscription_nodes(subscription.id, vec![stale])).await;
+    let log = capture_runtime_admission(cp.merge_subscription_nodes(
+        subscription.id,
+        vec![stale],
+        Vec::new(),
+    ))
+    .await;
     assert_eq!(cp.config_handle().read().await.as_ref(), &current);
     assert_eq!(log.matches("noncanonical-node-id").count(), 1, "{log}");
     assert!(!log.contains("192.0.2.11"), "{log}");

@@ -1,0 +1,7 @@
+node {
+    edge : 'socks5://127.0.0.1:1080'
+    'edge west': 'socks5://127.0.0.1:1081'
+}
+routing {
+    fallback: direct
+}

@@ -1,8 +1,8 @@
+use crate::config_diagnostics::DiagnosticBuckets;
+use honk_config::{Config, node::Node, subscription::Subscription};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-
-use honk_config::{Config, node::Node, subscription::Subscription};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
@@ -118,6 +118,7 @@ pub(crate) fn validate_subscription_ids(subscriptions: &[Subscription]) -> anyho
 struct FetchCompletion {
     authorized: AuthorizedSubscription,
     result: anyhow::Result<Vec<Node>>,
+    diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
 }
 
 async fn fetch_once(
@@ -125,12 +126,21 @@ async fn fetch_once(
     store: Option<SubscriptionStore>,
     authorized: AuthorizedSubscription,
 ) -> FetchCompletion {
+    let mut diagnostics = Vec::new();
     let result = manager
-        .fetch_and_store(&authorized.subscription, store.as_ref())
+        .fetch_and_store_with_diagnostics(
+            &authorized.subscription,
+            store.as_ref(),
+            &mut diagnostics,
+        )
         .await;
-    FetchCompletion { authorized, result }
+    honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
+    FetchCompletion {
+        authorized,
+        result,
+        diagnostics,
+    }
 }
-
 async fn deliver_fetch(completion: FetchCompletion, command_tx: &mpsc::Sender<ControlCommand>) {
     let subscription = completion.authorized.subscription;
     match completion.result {
@@ -144,6 +154,7 @@ async fn deliver_fetch(completion: FetchCompletion, command_tx: &mpsc::Sender<Co
                     subscription_id: subscription.id,
                     revision: completion.authorized.revision,
                     nodes,
+                    diagnostics: completion.diagnostics,
                 })
                 .await;
         }
@@ -329,6 +340,7 @@ pub(crate) struct SubscriptionSupervisor {
     manager: Option<Arc<SubscriptionManager>>,
     store: Option<SubscriptionStore>,
     initial: Vec<AuthorizedSubscription>,
+    startup_diagnostics: Option<DiagnosticBuckets>,
     startup: Option<JoinSet<FetchCompletion>>,
     command_tx: Option<mpsc::Sender<SupervisorCommand>>,
     task: Option<JoinHandle<()>>,
@@ -338,10 +350,15 @@ impl SubscriptionSupervisor {
     pub(crate) async fn prepare(
         config: &mut Config,
         store: Option<SubscriptionStore>,
+        static_diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
     ) -> anyhow::Result<Self> {
         let authorizations = SubscriptionAuthorizations::new(&config.subscriptions)?;
         let initial = authorizations.committed(&config.subscriptions);
         let manager = Arc::new(SubscriptionManager::new()?);
+        let mut startup_diagnostics = DiagnosticBuckets {
+            static_diagnostics,
+            providers: Vec::new(),
+        };
         let mut requires_network = HashSet::new();
 
         for authorized in &initial {
@@ -350,8 +367,14 @@ impl SubscriptionSupervisor {
                 requires_network.insert(subscription.id);
                 continue;
             };
-            match store.load_nodes(subscription).await {
+            let mut diagnostics = Vec::new();
+            match store
+                .load_nodes_with_diagnostics(subscription, &mut diagnostics)
+                .await
+            {
                 Ok(Some(nodes)) => {
+                    honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
+                    startup_diagnostics.replace_provider(subscription.id, diagnostics);
                     info!(
                         subscription = %subscription.name,
                         nodes = nodes.len(),
@@ -366,6 +389,7 @@ impl SubscriptionSupervisor {
                     requires_network.insert(subscription.id);
                 }
                 Err(error) => {
+                    honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
                     warn!(
                         subscription = %subscription.name,
                         %error,
@@ -393,9 +417,16 @@ impl SubscriptionSupervisor {
                 result = startup.join_next() => match result {
                     Some(Ok(completion)) => {
                         received += 1;
-                        let subscription = completion.authorized.subscription;
-                        match completion.result {
+                        let FetchCompletion {
+                            authorized,
+                            result,
+                            diagnostics,
+                        } = completion;
+                        let subscription = authorized.subscription;
+                        match result {
                             Ok(nodes) => {
+                                startup_diagnostics
+                                    .replace_provider(subscription.id, diagnostics);
                                 info!(
                                     nodes = nodes.len(),
                                     "Subscription body accepted; startup publication pending"
@@ -437,10 +468,16 @@ impl SubscriptionSupervisor {
             manager: Some(manager),
             store,
             initial,
+            startup_diagnostics: Some(startup_diagnostics),
             startup: Some(startup),
             command_tx: None,
             task: None,
         })
+    }
+    pub(crate) fn take_startup_diagnostics(&mut self) -> DiagnosticBuckets {
+        self.startup_diagnostics
+            .take()
+            .expect("startup diagnostics already taken")
     }
 
     pub(crate) fn start(&mut self, merge_tx: mpsc::Sender<ControlCommand>) {

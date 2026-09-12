@@ -1,0 +1,6 @@
+group {
+    g { filter: name('unterminated) }
+}
+routing {
+    fallback: direct
+}

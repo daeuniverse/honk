@@ -26,7 +26,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | --- | --- | --- |
 | GET | `/` | 返回 Clash hello 文档；启用外部 UI hosting 时，将非 JSON 客户端重定向到 `/ui/`。 |
 | GET | `/version` | 返回 `honk <build-version>`（包含发布 tag，与 CLI 共用构建版本）及 Clash premium/meta capability flag。 |
-| GET | `/configs` | 返回当前模式及已实现的 Clash 兼容配置快照。 |
+| GET | `/configs` | 返回当前模式、已实现的 Clash 兼容配置快照，以及 `honk-diagnostics` 下当前配置的安全诊断。 |
 | PUT | `/configs` | 兼容性 no-op；接受请求并返回 `204 No Content`。 |
 | PATCH | `/configs` | 将 `mode` 设为 `Rule`、`Global` 或 `Direct`；匹配不区分大小写。 |
 | GET | `/proxies` | 返回所有节点和组，以及合成的 `GLOBAL` Selector。 |
@@ -50,6 +50,46 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/ui`, `/ui/*` | 将 `/ui` 重定向到 `/ui/`，并提供已配置的外部 UI 目录。 |
 
 对普通 HTTP GET，`/traffic`、`/memory` 和 `/logs` 每行发送一个 JSON 文档。`/logs` 只在存在订阅者时启用动态 `tracing` 事件过滤；无订阅者时，Clash 日志层不格式化事件。每个订阅者的级别过滤发生在共享队列之后。订阅者落后时会跳过被覆盖的事件，且不会收到事件丢失标记。
+
+### `/configs` 中的诊断信息
+
+`GET /configs` 保留现有 Clash 字段，并新增 `honk-diagnostics`。
+配置项和诊断信息来自同一份已提交的配置快照。启动时只发布通过准入检查的
+文件和订阅诊断。重载失败或订阅刷新被拒绝时，当前诊断列表保持不变；
+接口不缓存最近一次失败尝试。
+
+有效配置未变的成功重载可以替换诊断信息而不递增 `generation`。订阅刷新通过授权和
+准入检查后，只替换该订阅的诊断，即使节点未变也是如此；
+静态文件和其他订阅的诊断保持不变。
+
+库调用方须向 `ControlPlane::reload_runtime_config(config, diagnostics)` 传入 `DiagnosticBuckets`，分别保留静态配置与订阅正文的诊断；没有诊断的程序构造输入使用 `DiagnosticBuckets::default()`。`merge_subscription_nodes(provider, nodes, diagnostics)` 接收该订阅的诊断向量，也支持已准入但没有 worker 声明的订阅。完整配置替换会移入候选配置的全部诊断来源信息，订阅替换只影响对应订阅。SIGHUP 仅保留重建候选配置时实际沿用的订阅正文的诊断；自动生成的拓扑/ECS 更新保留原输入来源。所有修改沿用配置写锁的发布屏障，先获取配置锁，再获取诊断锁。
+
+完整替换载荷中的 provider bucket 必须使用唯一 UUID。重复 UUID 会在发布前拒绝整个重载，即使有效配置未变也是如此；当前配置与诊断保持不变。
+
+| 字段 | 含义 |
+| --- | --- |
+| `honk-diagnostics.generation` | 当前配置的 `generation`；启动时为 `0`。 |
+| `honk-diagnostics.sources` | 保留的诊断所引用的来源及这些来源的祖先，仅包含元数据。 |
+| `sources[].id` | 本次快照内的不透明数字来源标识，供 `diagnostics[].source` 引用。 |
+| `sources[].ordinal` | 来源在单次解析尝试的来源表中的原始序号，从 `0` 开始。 |
+| `sources[].parent` | 父来源的 `id`；根来源为 `null`。 |
+| `honk-diagnostics.diagnostics` | 当前配置和已准入订阅保留的安全诊断。 |
+| `diagnostics[].code` | 稳定的诊断代码。 |
+| `diagnostics[].severity` | 小写严重级别：`info`、`warning` 或 `error`。 |
+| `diagnostics[].source` | 对应的 `sources[].id`。 |
+| `diagnostics[].span` | 从 `0` 开始的字节范围 `{start, end}`，不含 `end`；未知时为 `null`。 |
+| `diagnostics[].line` | 原始文本中的行号；未知时为 `null`。 |
+| `diagnostics[].byte_column` | 按字节计数的列号；未知时为 `null`。 |
+| `diagnostics[].setting` | 含原始条目序号的固定配置字段路径，不含用户提供的名称。 |
+| `diagnostics[].value` | 安全值表示；私有值经过脱敏。 |
+| `diagnostics[].message` | 静态诊断消息。 |
+| `diagnostics[].entry_index` | 原始条目序号；未知时为 `null`。 |
+| `diagnostics[].related_indices` | 相关原始条目的序号。 |
+| `diagnostics[].terminal` | 该诊断是否表示本次尝试的终止错误。 |
+
+配置的 `generation` 与当前 DNS 运行时一致。来源标识仅在本次快照内有效，不是文件系统标识。
+来源先按静态文件、再按配置中的订阅声明顺序排列，最后按保留 bucket 的顺序列出已准入的非 worker 订阅；各来源表保留原始顺序。
+仅列出诊断引用的来源及其祖先，不导出文件路径、原始输入、凭据、订阅名称或订阅 ID。
 
 ### 延迟测量
 

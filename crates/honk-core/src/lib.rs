@@ -12,6 +12,7 @@
 pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
+pub mod config_diagnostics;
 pub mod connection_tracker;
 pub mod control;
 pub mod dns;
@@ -80,18 +81,19 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
         .unwrap_or(control::MAX_EFFECTIVE_NOFILE)
         .min(control::MAX_EFFECTIVE_NOFILE))
 }
-
 async fn request_runtime_reload(
     reload_tx: &tokio::sync::mpsc::Sender<control::ControlCommand>,
     subscription_supervisor: &subscription::SubscriptionSupervisorHandle,
     request_id: u64,
     config: Config,
+    diagnostics: Vec<DetailedDiagnostic>,
 ) -> anyhow::Result<()> {
     let (result, applied) = tokio::sync::oneshot::channel();
     reload_tx
         .send(control::ControlCommand::ReloadConfig {
             request_id,
             config: Box::new(config),
+            diagnostics,
             result,
         })
         .await
@@ -771,7 +773,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
     let mut subscription_supervisor =
-        subscription::SubscriptionSupervisor::prepare(&mut config, subscription_store).await?;
+        subscription::SubscriptionSupervisor::prepare(&mut config, subscription_store, diagnostics)
+            .await?;
+    let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
     // Resolve group filters into concrete node IDs. This must run for every
     // config — not just when subscriptions delivered nodes — because groups
@@ -1148,8 +1152,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_upstream_pool.clone(),
         resource_budget,
     )?;
+    control_plane
+        .install_startup_diagnostics(startup_diagnostics)
+        .await;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
-
     #[cfg(feature = "ebpf")]
     let iface_watcher = if !cli.mock_ebpf {
         ebpf::real::IfaceWatcher::spawn(
@@ -1241,6 +1247,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
                 let connection_tracker = control_plane.connection_tracker();
                 let state = std::sync::Arc::new(clash_api::ClashState {
+                    diagnostics: control_plane.diagnostics_handle(),
                     config: control_plane.config_handle(),
                     stats: control_plane.stats_handle(),
                     alive_set: control_plane.alive_set(),
@@ -1312,6 +1319,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         &reload_subscription_supervisor,
                         request_id,
                         new_config,
+                        diagnostics,
                     )
                     .await
                     {

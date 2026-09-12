@@ -701,7 +701,7 @@ protocol = "udp"
         // distinct canonical IDs replace the previous generation.
         let new1 = node("sub-new-1", Some(sub_id));
         let new2 = node("sub-new-2", Some(sub_id));
-        cp.merge_subscription_nodes(sub_id, vec![new1.clone(), new2.clone()])
+        cp.merge_subscription_nodes(sub_id, vec![new1.clone(), new2.clone()], Vec::new())
             .await;
 
         // The merged config replaces only this subscription's nodes.
@@ -753,7 +753,7 @@ protocol = "udp"
         // with the same canonical IDs) replaces instead of duplicating.
         let refresh1 = node("sub-new-1", Some(sub_id));
         let refresh2 = node("sub-new-2", Some(sub_id));
-        cp.merge_subscription_nodes(sub_id, vec![refresh1, refresh2])
+        cp.merge_subscription_nodes(sub_id, vec![refresh1, refresh2], Vec::new())
             .await;
         {
             let config = cp.config_handle();

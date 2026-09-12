@@ -248,11 +248,12 @@ impl ControlPlane {
             ControlCommand::ReloadConfig {
                 request_id,
                 config,
+                diagnostics,
                 result,
             } => {
                 info!("SIGHUP reload request {request_id} started");
                 let applied = match self
-                    .apply_sighup_config(*config, drain, subscription_authorizations)
+                    .apply_sighup_config(*config, diagnostics, drain, subscription_authorizations)
                     .await
                 {
                     Ok(applied) => applied,
@@ -278,6 +279,7 @@ impl ControlPlane {
                 subscription_id,
                 revision,
                 nodes,
+                diagnostics,
             } => {
                 info!(nodes = nodes.len(), "Publishing accepted subscription body");
                 match self
@@ -286,6 +288,7 @@ impl ControlPlane {
                         revision,
                         subscription_authorizations,
                         nodes,
+                        diagnostics,
                         drain,
                     )
                     .await
@@ -317,7 +320,12 @@ impl ControlPlane {
                             client_subnet_changed, "refreshing runtime after network change"
                         );
                         match self
-                            .apply_resolved_runtime_config_locked(new_config, drain)
+                            .apply_resolved_runtime_config_locked(
+                                new_config,
+                                drain,
+                                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                                None,
+                            )
                             .await
                         {
                             Ok(applied) => applied,

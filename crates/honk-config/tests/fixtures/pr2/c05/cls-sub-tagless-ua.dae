@@ -1,0 +1,6 @@
+subscription {
+    'https://example.org/sub'(provider/2.0)
+}
+routing {
+    fallback: direct
+}

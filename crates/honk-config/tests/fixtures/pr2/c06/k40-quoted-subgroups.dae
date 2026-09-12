@@ -1,0 +1,11 @@
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    parent {
+        filter: group('alpha,beta|gamma')
+    }
+    alpha {}
+    beta {}
+    gamma {}
+}

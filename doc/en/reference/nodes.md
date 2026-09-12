@@ -6,7 +6,7 @@
 
 Each non-comment line is one share link. Tags and links may be quoted or bare:
 
-Outside matching quotes, `#` starts a comment at the start of the statement or immediately after an ASCII space or tab. In a bare share link, a glued `#` remains data: `ss://…#hk1 # note` keeps the name `hk1`, while `ss://…#hk2#note` keeps `hk2#note`. An untagged quoted link takes only the quoted interior, so `'ss://…#hk1'#note` also keeps `hk1`. An unmatched quote is ordinary text. Block scanning still treats unquoted braces in trailing comments as structure; keep comments containing braces on separate lines.
+Outside matching quotes, `#` starts a comment at the start of the statement or immediately after an ASCII space or tab. In a bare share link, a glued `#` remains data: `ss://…#hk1 # note` keeps the name `hk1`, while `ss://…#hk2#note` keeps `hk2#note`. A glued `#` after a closing link quote is accepted as a comment, with `legacy-glued-hash` at that byte: `'ss://…#hk1'#note` keeps `hk1`. Put whitespace before a comment. Other text after the closing quote skips the entry with `trailing-entry-text`. Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 
 ```dae
 node {

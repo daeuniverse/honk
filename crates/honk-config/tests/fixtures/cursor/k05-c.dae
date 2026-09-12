@@ -1,0 +1,8 @@
+dns {
+    routing {
+        request { qname('unterminated) -> reject }
+    }
+}
+routing {
+    fallback: direct
+}

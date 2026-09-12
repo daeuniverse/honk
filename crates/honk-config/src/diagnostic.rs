@@ -91,6 +91,13 @@ impl PartialEq for SourceRef {
 }
 impl Eq for SourceRef {}
 
+impl std::hash::Hash for SourceRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&Arc::as_ptr(&self.table.0), state);
+        std::hash::Hash::hash(&self.index, state);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingSegment {
     Field(&'static str),
@@ -215,7 +222,7 @@ impl DetailedDiagnostic {
     }
 }
 
-// The old scanner/readers remain until PR2; only this boundary projects their data.
+// Legacy diagnostic producers cross the redaction boundary here.
 pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> DetailedDiagnostic {
     let setting = [
         "global.tproxy_port",

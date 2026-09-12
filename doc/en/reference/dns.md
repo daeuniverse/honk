@@ -18,6 +18,10 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | `max_cache_size` | `10000` | Maximum cache entries and the input to the retained wire-byte budget. |
 | `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
 
+Scalar values own the remainder of their physical line and split only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` remain intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line; malformed quotes fail the configuration.
+
+For scalar settings, only an unquoted token-head `#` starts a comment. `use_host: /tmp/a#b` selects the literal path `/tmp/a#b` with `legacy-glued-hash`; write `use_host: /tmp/a # comment` for a comment. Repeated `use_host` declarations retain source order and existing deduplication. For `optimistic_cache`, shorthands `t`, `y`, `f`, and `n` still mean false, but emit `legacy-bool-shorthand`; use `true` or `false`.
+
 ## Standalone listener (`bind`)
 
 The standalone listener uses ordinary, unmarked sockets in the host network namespace. Transparent TCP and UDP port-53 interception remains active when the standalone listener is disabled.
@@ -100,7 +104,7 @@ The parameter is removed from the dial address and overrides a hostname-derived 
 
 A trailing `-> tag` forces the upstream through that node or group. Without it, honk resolves the upstream destination and applies the ordinary traffic `routing { ... }` rules; that route can still select a proxy leaf. The legacy same-line form `name: 'uri' outbound: tag` remains accepted.
 
-The upstream-line searches for `->` and `outbound:` are not quote-aware; do not embed these separators in the URI.
+Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI they remain data; a changed legacy split emits `legacy-upstream-separator`. An unquoted token-head `#` starts a trailing comment, with `legacy-upstream-comment` for the changed interpretation. Put comments and outbound suffixes outside URI quotes.
 
 | Protocol | Through a selected node/group |
 | --- | --- |
@@ -115,9 +119,11 @@ The upstream-line searches for `->` and `outbound:` are not quote-aware; do not 
 
 `routing` contains ordered `request` and `response` rules. The first matching rule wins. Arguments inside one condition are OR-ed; conditions joined with `&&` are AND-ed. Prefix a condition with `!` to negate it.
 
-In request and response rules, single or double quotes protect `,`, `)`, `&&`, `->`, `#`, and `//` inside matcher arguments. Outside quotes, `//` takes comment precedence; otherwise only the first `#` is considered, and it starts a comment only after an ASCII space. A quoted QTYPE list such as `qtype('a,aaaa')` still selects both types.
+In request and response rules, single or double quotes protect `,`, `)`, `&&`, `->`, `#`, and `//` inside matcher arguments. Only an unquoted token-head `#` starts a comment, after a space or tab; glued hashes remain data. `//` is not a comment: trailing slash-comment text omits the malformed rule with `legacy-slash-comment`. Replace it with `#`. A quoted QTYPE list such as `qtype('a,aaaa')` still selects both types with `legacy-quoted-list`; prefer bare or individually quoted items.
 
 Unknown or malformed conditions and unsupported predicates omit the whole rule with a located warning, never just one conjunct. Unknown QTYPE names produce `invalid-qtype`, including mixed and negated lists; correct the name or use its numeric code. Explicit `qtype()` remains match-nothing.
+
+Put each complete call and action on one physical line. Incomplete nonblank lines are omitted with located `incomplete-dns-rule`; DNS never joins them. Text after a complete matcher produces `trailing-matcher-text` and omits the whole rule. Leading and argument-position quotes must close on the same line. An unterminated quote produces one lexical diagnostic and omits the line only if every open block has a surviving closer; otherwise the document fails. Required closers hidden by the malformed quote cannot close blocks.
 
 ### Conditions
 
@@ -226,6 +232,8 @@ fixed_domain_ttl {
     nocache.test: 0
 }
 ```
+
+Each fixed TTL requires exactly one unsigned 32-bit decimal scalar. Bare and quoted values are accepted, including `0` and `4294967295`; newly accepted quoted decimals emit `legacy-ttl-quoting`. Invalid or overflowing values emit `invalid-ttl`, and extra tokens emit `trailing-value`; either omits the entry. Put explanations after ` # `, not directly after the number.
 
 ## Example
 

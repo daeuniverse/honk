@@ -69,7 +69,10 @@ async fn c28_health_reload_retains_old_period_after_rejection() {
     observations.recv().await.unwrap();
     let mut candidate = old.clone();
     candidate.global.check_interval_secs = 60;
-    assert!(!cp.reload_runtime_config(candidate).await);
+    assert!(
+        !cp.reload_runtime_config(candidate, Default::default())
+            .await
+    );
     assert_eq!(
         observations.recv().await.unwrap() - first,
         Duration::from_secs(30)
@@ -141,7 +144,10 @@ async fn reject_http_change(change: fn(&mut Config)) {
     let old = cp.config_handle().read().await.clone();
     let mut candidate = old.as_ref().clone();
     change(&mut candidate);
-    assert!(!cp.reload_runtime_config(candidate).await);
+    assert!(
+        !cp.reload_runtime_config(candidate, Default::default())
+            .await
+    );
     cp.alive_set()
         .run_health_check_cycle(Duration::from_secs(1))
         .await;
@@ -193,12 +199,15 @@ async fn c28_effectively_equal_health_inputs_remain_admissible() {
         let cp = control_plane(old.clone()).await;
         let mut candidate = old;
         change(&mut candidate);
-        assert!(cp.reload_runtime_config(candidate.clone()).await);
+        assert!(
+            cp.reload_runtime_config(candidate.clone(), Default::default())
+                .await
+        );
         assert_eq!(cp.config_handle().read().await.as_ref(), &candidate);
     }
     let mut old = health_config(String::new());
     let cp = control_plane(old.clone()).await;
     old.global.tcp_check_url.clear();
     old.global.tcp_check_http_method = "POST".into();
-    assert!(cp.reload_runtime_config(old).await);
+    assert!(cp.reload_runtime_config(old, Default::default()).await);
 }
