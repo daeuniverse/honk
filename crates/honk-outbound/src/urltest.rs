@@ -559,8 +559,14 @@ impl Drop for H2Driver {
 }
 
 fn h2_round_error(error: h2::Error, context: &'static str) -> RoundError {
-    let transport =
-        error.is_io() || (error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR));
+    // A remote REFUSED_STREAM means the request was not processed (RFC 9113
+    // §8.7), so it says nothing about the response; the local refusal h2
+    // raises for an oversized header list is not remote and stays invalid.
+    let refused =
+        error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::REFUSED_STREAM);
+    let transport = error.is_io()
+        || (error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
+        || refused;
     let error = anyhow::Error::new(error).context(context);
     if transport {
         RoundError::Transport(error)
@@ -1663,6 +1669,43 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn h2_falls_back_only_for_remote_refused_stream() {
+        for (reason, healthy) in [
+            (h2::Reason::REFUSED_STREAM, true),
+            (h2::Reason::INTERNAL_ERROR, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(sock).await.unwrap();
+                let mut first = true;
+                while let Some(request) = connection.accept().await {
+                    let (_request, mut respond) = request.unwrap();
+                    if first {
+                        first = false;
+                        respond
+                            .send_response(
+                                http::Response::builder().status(204).body(()).unwrap(),
+                                true,
+                            )
+                            .unwrap();
+                    } else {
+                        respond.send_reset(reason);
+                    }
+                }
+            });
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
+            let result =
+                exchange_http2(stream, &request, &no_feedback(), Duration::from_secs(1)).await;
+            peer.abort();
+            let _ = peer.await;
+            assert_eq!(result.is_ok(), healthy, "RST_STREAM({reason}): {result:?}");
+        }
     }
 
     #[tokio::test]

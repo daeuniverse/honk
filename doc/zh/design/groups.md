@@ -142,7 +142,7 @@ alive→dead 转换会调用控制面死亡回调，清除该节点的池连接�
 
 `honk-outbound/src/urltest.rs` 统一负责 HTTP 请求构造和测量，URL 解释委托给 `honk-config::check` 的规范解码器。core 与 generation URLTest 还共享显式冷 session 预热，并在创建资源或反馈之前保留可失败的节点准入；独立工具调用保留 handler 内部的 setup 和 CLI 外层 deadline。请求使用不含凭据的 authority，仅保留非默认端口，移除 fragment，并保留原始路径、查询串及点段；仅有查询串的 URL 使用 `/?query`。HTTPS 验证证书并协商 `h2,http/1.1`，禁用 server push。第一轮使用 HEAD，第二轮使用配置方法（delay 测试为 HEAD）；两轮最终响应的解码状态都必须为有效的 200–499。HTTP/1 会在同一轮内消费临时响应头后再读取最终响应，但不支持协议切换；每轮响应头累计上限为 16 KiB。HTTP/2 响应头列表使用相同大小上限。
 
-报告值为第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮 I/O 失败或超时可以回退到已验证的第一轮样本；HTTP/1 要求尚未收到响应字节，HTTP/2 还将正常 GOAWAY 视为传输关闭。畸形、截断、过大或部分接收后超时的 HTTP/1 响应头会失败。只复用已经预热或无状态的 generation runtime；冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放。session 准备、拨号、TLS、HTTP/2 启动与每轮请求分别使用阶段预算；core 仍单独保留配置的连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。健康调度与记账仍由 `alive` 负责；只有 delay 包装层写入拨号失败 strike，组 delay 并发上限仍为 10。
+报告值为第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮 I/O 失败或超时可以回退到已验证的第一轮样本；HTTP/1 要求尚未收到响应字节，HTTP/2 还将正常 GOAWAY 和远端 `REFUSED_STREAM` 视为传输失败。畸形、截断、过大或部分接收后超时的 HTTP/1 响应头会失败。只复用已经预热或无状态的 generation runtime；冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放。session 准备、拨号、TLS、HTTP/2 启动与每轮请求分别使用阶段预算；core 仍单独保留配置的连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。健康调度与记账仍由 `alive` 负责；只有 delay 包装层写入拨号失败 strike，组 delay 并发上限仍为 10。
 
 已知上游限制：[`h2` 0.4.19 会把缺少响应 `:status` 的情况默认解码为 200](https://github.com/hyperium/h2/issues/958)。探测器只能检查解码后的状态，无法恢复被遗漏的伪头，因此这种畸形 HTTP/2 响应仍可能被判为健康。该依赖修复已明确延期，等待上游处理，不引入本地 fork 或 vendor 补丁。
 
