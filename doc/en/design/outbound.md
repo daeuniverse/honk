@@ -119,7 +119,7 @@ can reject the flow terminally.
 | --- | --- | --- |
 | `direct` | Native marked target connect | Native marked UDP behind `PacketTransport` |
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association; greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP |
 | `vmess` | VMess stream | Unimplemented |

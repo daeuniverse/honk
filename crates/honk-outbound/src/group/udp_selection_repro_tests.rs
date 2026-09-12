@@ -63,6 +63,112 @@ fn udp_pick_prefers_node_with_udp_latency_over_mirror() {
     );
 }
 
+#[test]
+fn udp_pick_keeps_tcp_mirror_with_only_synthetic_failures() {
+    let (a, b) = (nid("udp-mirror-a"), nid("udp-mirror-b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let child = make_group("udp-mirror-child", GroupPolicy::URLTest, vec![b]);
+    let mut parent = make_group("udp-mirror-parent", GroupPolicy::URLTest, vec![a]);
+    parent.groups = vec![child.name.clone()];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(alive.clone()));
+
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("udp-mirror-parent", ProbeDomain::Tcp, IpVersion::V4)
+            .map(|node| node.name.as_str()),
+        Some("b")
+    );
+
+    for _ in 0..2 {
+        alive.record_dial_failure(b, ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert_eq!(
+            manager
+                .select_node_for_domain("udp-mirror-parent", domain, IpVersion::V4)
+                .map(|node| node.name.as_str()),
+            Some("b"),
+            "synthetic {domain:?} evidence must not disable the nested TCP mirror"
+        );
+    }
+}
+
+#[test]
+fn udp_pick_switches_after_real_evidence_survives_ring_eviction() {
+    let (a, b) = (nid("udp-ring-a"), nid("udp-ring-b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(
+        &[make_group("udp-ring", GroupPolicy::URLTest, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("udp-ring", ProbeDomain::Tcp, IpVersion::V4)
+            .map(|node| node.name.as_str()),
+        Some("b")
+    );
+    for _ in 0..2 {
+        alive.record_dial_failure(b, ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    let synthetic_choice = manager
+        .select_node_for_domain("udp-ring", ProbeDomain::DataUdp, IpVersion::V4)
+        .map(|node| node.name.as_str());
+
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(20),
+    );
+    for _ in 0..11 {
+        alive.record_dial_failure(b, ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    assert!(
+        alive
+            .get_last_real_sample(b, ProbeDomain::DataUdp, IpVersion::V4)
+            .is_none(),
+        "the real sample must be evicted from the ten-entry display ring"
+    );
+    assert!(alive.is_failure_demoted(b, ProbeDomain::DataUdp, IpVersion::V4));
+    let retained_choice = manager
+        .select_node_for_domain("udp-ring", ProbeDomain::DataUdp, IpVersion::V4)
+        .map(|node| node.name.as_str());
+
+    assert_eq!(
+        (synthetic_choice, retained_choice),
+        (Some("b"), Some("a")),
+        "UDP should mirror TCP before real evidence, then demote b after it is retained"
+    );
+}
+
 fn assert_udp_selection(manager: &GroupManager, group: &str, expected: Option<&str>) {
     for ipver in [IpVersion::V4, IpVersion::V6] {
         for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {

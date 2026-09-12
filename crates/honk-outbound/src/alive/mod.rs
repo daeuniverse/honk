@@ -1004,6 +1004,16 @@ impl AliveDialerSet {
         if ma > Duration::ZERO { Some(ma) } else { None }
     }
 
+    /// Real-only ranking evidence survives synthetic eviction from the sample ring.
+    pub(crate) fn has_real_ranking_evidence(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> bool {
+        self.get_moving_average(node_id, domain, ipver).is_some()
+    }
+
     /// Whether the node carries pending failure strikes in this domain.
     /// Selection demotes such nodes below every non-demoted candidate; the
     /// demotion clears only after max(strikes, 2) consecutive real

@@ -102,7 +102,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | --- | --- | --- |
 | `direct` | Native 带 mark 目标连接 | `PacketTransport` 后的 native 带 mark UDP |
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association；协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing |
 | `vmess` | VMess stream | 未实现 |

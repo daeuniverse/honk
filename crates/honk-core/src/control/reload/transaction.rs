@@ -536,6 +536,18 @@ impl ControlPlane {
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.
                 old_registry.mark_moved_out(reused_runtime_ids);
+                install_interrupt_callback(
+                    &new_group_manager,
+                    &self.group_manager,
+                    &self.connection_tracker,
+                );
+                install_selector_warm_callback(&new_group_manager, &self.selector_warm_notify);
+                if let Some(ref db) = self.cache_db {
+                    let db_cb = Arc::clone(db);
+                    new_group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
+                        db_cb.save_selector_choice(group, node);
+                    })));
+                }
                 new_group_manager.publish_score_membership();
                 #[cfg(test)]
                 if let Some(hook) = {
@@ -576,12 +588,6 @@ impl ControlPlane {
 
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);
-        install_interrupt_callback(
-            &new_group_manager,
-            &self.group_manager,
-            &self.connection_tracker,
-        );
-        install_selector_warm_callback(&new_group_manager, &self.selector_warm_notify);
         // No new generation-owned work may start on the old snapshot. Its
         // DNS runtime still owns it until old leases and transports retire;
         // only then do the pools enter graceful session drain.
@@ -594,12 +600,6 @@ impl ControlPlane {
             .await;
         self.start_selector_warm_coordinator(new_runtime_registry)
             .await;
-        if let Some(ref db) = self.cache_db {
-            let db_cb = Arc::clone(db);
-            new_group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
-                db_cb.save_selector_choice(group, node);
-            })));
-        }
         {
             let config = self.config.read().await;
             let _ = sync_health_check_nodes(&self.alive_set, &config);

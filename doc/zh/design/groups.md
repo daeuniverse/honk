@@ -12,7 +12,7 @@
 
 `Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-重载会构建完整的替代 `GroupManager`，迁移组和成员 tag 仍然存在的 Selector 选择，安装回调，再切换内部 `Arc`。因此读者只会看到旧管理器或新管理器，不会看到构建到一半的组图。
+重载会构建完整的替代 `GroupManager`，迁移组和成员 tag 仍然存在的 Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。因此读者只会看到旧管理器或新管理器，不会看到构建到一半的组图。
 
 facade 与内部实现按职责拆分：
 
@@ -71,7 +71,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 第一个样本初始化平均值。这就是 dae `min_moving_avg` 语义：近期变化能较快生效，同时不让单次抖动成为权威值。
 
-`SelectionNetwork::Tcp` 与 `SelectionNetwork::Udp` 分别保留胜者。TCP 使用 TCP 探测平均值；若组配置了自定义目标，则使用 `(member tag, check_url)` 平均值。UDP 先使用 `DataUdp`，再使用 `DnsUdp`；如果所有合格候选都没有 UDP 测量数据，则镜像 TCP 选择，而不是用缺失数据虚构 UDP 排名。因此有效回退顺序是 `DataUdp → DnsUdp → TCP`。
+`SelectionNetwork::Tcp` 与 `SelectionNetwork::Udp` 分别保留胜者。TCP 使用 TCP 探测平均值；若组配置了自定义目标，则使用 `(member tag, check_url)` 平均值。UDP 先使用 `DataUdp`，再使用 `DnsUdp`；如果在当前地址族下，所有合格候选在这两个域保留的移动平均值中都没有真实 UDP 排名依据，则沿用 TCP 选择。仅有拨号失败产生的合成样本不会停用这一回退；真实样本被历史环形缓冲区淘汰后，保留的排名依据仍然有效。因此有效回退顺序是 `DataUdp → DnsUdp → TCP`。
 
 有效 tolerance 为 `max(配置值, 1 ms)`。满足下式时继续保留当前选择：
 

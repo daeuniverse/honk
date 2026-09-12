@@ -68,7 +68,7 @@ The internal body-selector behavior is:
 | --- | --- |
 | Preferred location | `<data_dir>/.sub`; the default `data_dir` is `/var/lib/honk`. |
 | Legacy locations | Prefer an existing `/var/share/honk/.sub` (`LEGACY_DATA_DIR`), then an existing `./.sub` when the configured store is absent. Unusable legacy locations are skipped; a new preferred store is created only when no legacy candidate can be opened. A custom `data_dir` follows the same order. No store is moved or deleted automatically; migrate it explicitly when ready. |
-| Permissions | Directory mode `0700`; file mode `0600`. Symlink store directories are rejected. |
+| Permissions | Directory mode `0700`; file mode `0600`. Symlink store directories are rejected. Every existing store directory, including legacy locations, must be owned by the process's effective UID; otherwise it is refused before permissions are changed. |
 | Filename | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their cache across upgrades. The request identity is not exposed in plaintext. |
 | Write boundary | After HTTP success and body acceptance, persist the complete raw response, including rejected entries. A temporary file is synced, renamed atomically, and followed by a directory sync. |
 | Redirects | At most 5 hops. A redirect from `https` to another scheme fails the fetch, as does one to a loopback, private, link-local, or unspecified literal address that the configured URL did not itself use. A hostname resolving to such an address is not detected. |
@@ -78,7 +78,7 @@ Subscription bodies and the nodes created from them remain runtime state; neithe
 
 Startup parses stored bodies before launching network refreshes. A valid restored body supplies active nodes immediately, so that subscription does not participate in the five-second first-fetch wait. Its network refresh still runs in the background. A missing or invalid stored body is ignored and keeps that subscription in the bounded first-fetch wait until the fetch finishes or the deadline expires; a later valid refresh replaces the corrupt file.
 
-On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + headers) retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, restores a stored body only when no nodes survive for that subscription, commits the rebuilt configuration, and then starts an immediate background refresh.
+On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + headers) retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, commits the rebuilt configuration, and then starts an immediate background refresh. It does not read stored bodies, even when no nodes survive for a subscription; stored-body recovery runs only at startup.
 
 Failure handling preserves a usable runtime rather than clearing it:
 

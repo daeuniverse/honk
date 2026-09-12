@@ -6,7 +6,9 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -466,22 +468,45 @@ fn subscription_filename(sub: &Subscription) -> String {
     )
 }
 
+fn store_directory_needs_chmod(
+    uid: u32,
+    euid: u32,
+    mode: u32,
+    is_dir: bool,
+    is_symlink: bool,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        is_dir && !is_symlink,
+        "subscription store is not a directory"
+    );
+    anyhow::ensure!(
+        uid == euid,
+        "subscription store is not owned by the process"
+    );
+    Ok(mode & 0o7777 != 0o700)
+}
+
 fn ensure_store_directory(root: &Path) -> anyhow::Result<()> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) => {
-            anyhow::ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "subscription store is not a directory: {}",
-                root.display()
-            );
-        }
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let mut builder = DirBuilder::new();
             builder.recursive(true).mode(0o700).create(root)?;
+            fs::symlink_metadata(root)?
         }
         Err(error) => return Err(error.into()),
+    };
+    if store_directory_needs_chmod(
+        metadata.uid(),
+        unsafe { libc::geteuid() },
+        metadata.mode(),
+        metadata.is_dir(),
+        metadata.file_type().is_symlink(),
+    )
+    .with_context(|| format!("unusable subscription store: {}", root.display()))?
+    {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     }
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 

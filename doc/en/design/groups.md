@@ -12,7 +12,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-A reload builds a complete replacement `GroupManager`, migrates Selector choices whose group and member tag still exist via `migrate_selector_choices_from`, installs callbacks, and swaps the inner `Arc`. Readers therefore see either the old or the new manager, never a partially rebuilt graph.
+A reload builds a complete replacement `GroupManager`, migrates Selector choices whose group and member tag still exist via `migrate_selector_choices_from`, installs interrupt, warm-up, and persistence callbacks before publication, and swaps the inner `Arc`. Readers therefore see either the old or the new manager, never a partially rebuilt graph.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -73,7 +73,7 @@ Latency uses a halving moving average:
 
 The first sample initializes the average. This is dae `min_moving_avg` behavior: recent changes matter quickly without making one jitter sample authoritative.
 
-`SelectionNetwork::Tcp` and `SelectionNetwork::Udp` retain separate winners. TCP uses the TCP probe average, or the `(member tag, check_url)` average when the group has a custom target. UDP first uses `DataUdp`, then `DnsUdp`; if no eligible candidate has UDP measurements, it mirrors the TCP selection instead of inventing a UDP ranking from missing data. This gives the effective fallback order `DataUdp → DnsUdp → TCP`.
+`SelectionNetwork::Tcp` and `SelectionNetwork::Udp` retain separate winners. TCP uses the TCP probe average, or the `(member tag, check_url)` average when the group has a custom target. UDP first uses `DataUdp`, then `DnsUdp`; if no eligible candidate has real UDP ranking evidence in either domain's retained moving average for the selected address family, it mirrors the TCP selection. Synthetic dial-failure samples alone do not disable this mirror; evicting real samples from the history ring does not erase retained ranking evidence. This gives the effective fallback order `DataUdp → DnsUdp → TCP`.
 
 The effective tolerance is `max(configured tolerance, 1 ms)` (`group.tolerance.max(1)`). The incumbent stays selected while:
 

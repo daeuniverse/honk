@@ -139,13 +139,15 @@ impl GroupManager {
     ) -> Candidate<'a> {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
 
-        // UDP selection with no UDP-specific measurement data mirrors the
-        // TCP selection (sing-box `Now()` fallback semantics): with nothing
-        // to rank UDP paths by, keep UDP flows on the TCP-chosen member.
+        // Without real UDP ranking evidence, keep the TCP-chosen member.
+        // Synthetic dial failures alone must not disable this mirror.
         if network == SelectionNetwork::Udp
-            && !candidates
-                .iter()
-                .any(|c| self.udp_specific_latency(c.node, ipver).is_some())
+            && !self.alive_set.as_ref().is_some_and(|alive| {
+                candidates.iter().any(|c| {
+                    alive.has_real_ranking_evidence(c.node.id, ProbeDomain::DataUdp, ipver)
+                        || alive.has_real_ranking_evidence(c.node.id, ProbeDomain::DnsUdp, ipver)
+                })
+            })
         {
             let tcp_entry = {
                 let cache = self.urltest_cache.read();
@@ -379,16 +381,6 @@ impl GroupManager {
                 }),
         };
         latency.unwrap_or(Duration::MAX)
-    }
-
-    /// UDP-specific probe latency only: DataUDP first, then DNS-UDP (no
-    /// TCP fallback). Used to decide whether the UDP selection has any
-    /// measurement of its own to rank by.
-    fn udp_specific_latency(&self, node: &Node, ipver: IpVersion) -> Option<Duration> {
-        let alive = self.alive_set.as_ref()?;
-        alive
-            .get_last_latency(node.id, ProbeDomain::DataUdp, ipver)
-            .or_else(|| alive.get_last_latency(node.id, ProbeDomain::DnsUdp, ipver))
     }
 
     /// Order candidates by (network-aware) latency, lowest first.

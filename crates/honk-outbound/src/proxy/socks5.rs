@@ -305,78 +305,85 @@ impl Socks5Handler {
         .await
         .map_err(|_| anyhow::anyhow!("SOCKS5 UDP: negotiation timed out"))??;
 
-        // VER | CMD=0x03 | RSV | ATYP=0x01 | BND.ADDR=0.0.0.0 | BND.PORT=0
-        let request = [
-            SOCKS5_VERSION,
-            CMD_UDP_ASSOCIATE,
-            0x00,
-            ATYP_IPV4,
-            0x00,
-            0x00,
-            0x00,
-            0x00, // 0.0.0.0
-            0x00,
-            0x00, // port 0
-        ];
-        stream.write_all(&request).await?;
+        let relay_addr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // VER | CMD=0x03 | RSV | ATYP=0x01 | BND.ADDR=0.0.0.0 | BND.PORT=0
+            let request = [
+                SOCKS5_VERSION,
+                CMD_UDP_ASSOCIATE,
+                0x00,
+                ATYP_IPV4,
+                0x00,
+                0x00,
+                0x00,
+                0x00, // 0.0.0.0
+                0x00,
+                0x00, // port 0
+            ];
+            stream.write_all(&request).await?;
 
-        let mut reply_header = [0u8; 4];
-        stream.read_exact(&mut reply_header).await?;
+            let mut reply_header = [0u8; 4];
+            stream.read_exact(&mut reply_header).await?;
 
-        if reply_header[0] != SOCKS5_VERSION {
-            anyhow::bail!("SOCKS5 UDP: bad reply version");
-        }
-        if reply_header[1] != REP_SUCCESS {
-            anyhow::bail!(
-                "SOCKS5 UDP: server rejected UDP ASSOCIATE (code 0x{:02x})",
-                reply_header[1]
-            );
-        }
+            if reply_header[0] != SOCKS5_VERSION {
+                anyhow::bail!("SOCKS5 UDP: bad reply version");
+            }
+            if reply_header[1] != REP_SUCCESS {
+                anyhow::bail!(
+                    "SOCKS5 UDP: server rejected UDP ASSOCIATE (code 0x{:02x})",
+                    reply_header[1]
+                );
+            }
 
-        let relay_addr = match reply_header[3] {
-            ATYP_IPV4 => {
-                let mut addr = [0u8; 6];
-                stream.read_exact(&mut addr).await?;
-                let ip = std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
-                let port = u16::from_be_bytes([addr[4], addr[5]]);
-                SocketAddr::new(std::net::IpAddr::V4(ip), port)
-            }
-            ATYP_IPV6 => {
-                let mut addr = [0u8; 18];
-                stream.read_exact(&mut addr).await?;
-                let ip = std::net::Ipv6Addr::from([
-                    ((addr[0] as u16) << 8) | addr[1] as u16,
-                    ((addr[2] as u16) << 8) | addr[3] as u16,
-                    ((addr[4] as u16) << 8) | addr[5] as u16,
-                    ((addr[6] as u16) << 8) | addr[7] as u16,
-                    ((addr[8] as u16) << 8) | addr[9] as u16,
-                    ((addr[10] as u16) << 8) | addr[11] as u16,
-                    ((addr[12] as u16) << 8) | addr[13] as u16,
-                    ((addr[14] as u16) << 8) | addr[15] as u16,
-                ]);
-                let port = u16::from_be_bytes([addr[16], addr[17]]);
-                SocketAddr::new(std::net::IpAddr::V6(ip), port)
-            }
-            ATYP_DOMAIN => {
-                let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf).await?;
-                let domain_len = len_buf[0] as usize;
-                let mut domain_and_port = vec![0u8; domain_len + 2];
-                stream.read_exact(&mut domain_and_port).await?;
-                let port = u16::from_be_bytes([
-                    domain_and_port[domain_len],
-                    domain_and_port[domain_len + 1],
-                ]);
-                let domain = std::str::from_utf8(&domain_and_port[..domain_len])?;
-                let ip = crate::bootstrap::resolve(domain)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty"))?;
-                SocketAddr::new(ip, port)
-            }
-            a => anyhow::bail!("SOCKS5 UDP: unknown address type 0x{:02x}", a),
-        };
+            let relay_addr = match reply_header[3] {
+                ATYP_IPV4 => {
+                    let mut addr = [0u8; 6];
+                    stream.read_exact(&mut addr).await?;
+                    let ip = std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+                    let port = u16::from_be_bytes([addr[4], addr[5]]);
+                    SocketAddr::new(std::net::IpAddr::V4(ip), port)
+                }
+                ATYP_IPV6 => {
+                    let mut addr = [0u8; 18];
+                    stream.read_exact(&mut addr).await?;
+                    let ip = std::net::Ipv6Addr::from([
+                        ((addr[0] as u16) << 8) | addr[1] as u16,
+                        ((addr[2] as u16) << 8) | addr[3] as u16,
+                        ((addr[4] as u16) << 8) | addr[5] as u16,
+                        ((addr[6] as u16) << 8) | addr[7] as u16,
+                        ((addr[8] as u16) << 8) | addr[9] as u16,
+                        ((addr[10] as u16) << 8) | addr[11] as u16,
+                        ((addr[12] as u16) << 8) | addr[13] as u16,
+                        ((addr[14] as u16) << 8) | addr[15] as u16,
+                    ]);
+                    let port = u16::from_be_bytes([addr[16], addr[17]]);
+                    SocketAddr::new(std::net::IpAddr::V6(ip), port)
+                }
+                ATYP_DOMAIN => {
+                    let mut len_buf = [0u8; 1];
+                    stream.read_exact(&mut len_buf).await?;
+                    let domain_len = len_buf[0] as usize;
+                    let mut domain_and_port = vec![0u8; domain_len + 2];
+                    stream.read_exact(&mut domain_and_port).await?;
+                    let port = u16::from_be_bytes([
+                        domain_and_port[domain_len],
+                        domain_and_port[domain_len + 1],
+                    ]);
+                    let domain = std::str::from_utf8(&domain_and_port[..domain_len])?;
+                    let ip = crate::bootstrap::resolve(domain)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty")
+                        })?;
+                    SocketAddr::new(ip, port)
+                }
+                a => anyhow::bail!("SOCKS5 UDP: unknown address type 0x{:02x}", a),
+            };
+            Ok::<_, anyhow::Error>(relay_addr)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("SOCKS5 UDP: associate timed out"))??;
 
         let relay_addr = if relay_addr.ip().is_unspecified() {
             SocketAddr::new(stream.peer_addr()?.ip(), relay_addr.port())
@@ -642,6 +649,44 @@ mod tests {
                 .to_string()
                 .contains("negotiation timed out"),
             "expected the negotiation deadline to fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_associate_gives_up_after_greeting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let client = tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                Socks5Handler::udp_associate(&mut stream, None, None),
+            )
+            .await
+        });
+        let mut greeting = [0; 3];
+        server.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [SOCKS5_VERSION, 1, METHOD_NO_AUTH]);
+        server
+            .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
+            .await
+            .unwrap();
+        let mut request = [0; 10];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(request[1], CMD_UDP_ASSOCIATE);
+
+        // Pause only after real socket I/O completes, so time cannot skip the greeting.
+        tokio::time::pause();
+        let outcome = client.await.unwrap();
+        let error = outcome
+            .expect("UDP ASSOCIATE outlived its own deadline after greeting")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("SOCKS5 UDP: associate timed out")
         );
     }
 

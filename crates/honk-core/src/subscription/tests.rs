@@ -582,6 +582,18 @@ async fn subscription_store_skips_rejected_legacy_candidates() {
 }
 
 #[test]
+fn subscription_store_rejects_foreign_owner_before_chmod() {
+    for mode in [0o700, 0o755] {
+        assert!(
+            store_directory_needs_chmod(1001, 1000, mode, true, false).is_err(),
+            "a foreign-owned store must be refused before changing permissions"
+        );
+    }
+    assert!(!store_directory_needs_chmod(1000, 1000, 0o700, true, false).unwrap());
+    assert!(store_directory_needs_chmod(1000, 1000, 0o755, true, false).unwrap());
+}
+
+#[test]
 fn subscription_store_rejects_symlink_directory() {
     use std::os::unix::fs::symlink;
 

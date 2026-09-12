@@ -396,6 +396,52 @@ fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
 }
 
 #[tokio::test]
+async fn reload_persists_selector_choice_before_manager_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        crate::cachedb::CacheDb::open(&honk_config::experimental::CacheFileConfig {
+            enabled: true,
+            path: temp.path().join("cache.db").to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let mut cp = test_cp().await;
+    cp.cache_db = Some(Arc::clone(&db));
+    let mut config = changed_routing_config();
+    config.nodes = [("a", 9), ("b", 10)]
+        .map(|(name, port)| super::c20_tests::canonical_socks5(name, "127.0.0.1", port, None))
+        .to_vec();
+    config.groups = vec![Group {
+        name: "selector".into(),
+        nodes: config.nodes.iter().map(|node| node.id).collect(),
+        policy: GroupPolicy::Selector,
+        ..Default::default()
+    }];
+    let db_at_hook = Arc::clone(&db);
+    let _hook_guard = cp.set_pre_dns_publication_hook(move |manager| {
+        manager.set_selector_choice("selector", "b");
+        assert_eq!(
+            db_at_hook.load_selector_choice("selector").as_deref(),
+            Some("b"),
+            "a selector write before publication must reach the cache database"
+        );
+    });
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert_eq!(
+        cp.group_manager
+            .read()
+            .select_node("selector")
+            .unwrap()
+            .name,
+        "b"
+    );
+    assert_eq!(db.load_selector_choice("selector").as_deref(), Some("b"));
+    cp.stop_selector_warm_coordinator().await;
+    cp.stop_udp_warm_coordinator().await;
+}
+
+#[tokio::test]
 async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
     let cp = Arc::new(test_cp().await);
     let first_revision = 1;
