@@ -225,9 +225,9 @@ jobs:
             if (has(".github/workflows/")) {
               notes.push("CI workflow files changed.");
             }
-            if (crates.size > 0 && !has("AGENTS.md")) {
+            if (crates.size > 0 && !has("AGENTS.md") && !has(".agents/rules/")) {
               notes.push(
-                "Code changed but `AGENTS.md` was not updated — check whether any documented behavior/convention changed.",
+                "Code changed but neither `AGENTS.md` nor `.agents/rules/` was updated — check whether any documented behavior/convention changed.",
               );
             }
 
