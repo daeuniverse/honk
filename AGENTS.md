@@ -18,6 +18,8 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 | REALITY / xtls interop verification against live servers | `.agents/rules/maintainer-lab.md` (the maintainer's lab; not required for contributions) |
 <!-- task-routing:end -->
 
+Maintaining this guide: a rule that binds every change goes in this file; a subsystem's reference goes in its `.agents/rules/` file, in the section it belongs to. A new rules file gets a row in the routing table, and every file the table sends the reader to must exist. `.agents/tools/` describes the one-time extraction and is not re-run on later edits. The CI mechanical review drops its documentation reminder when either `AGENTS.md` or `.agents/rules/` changes alongside code.
+
 ## Project overview
 
 `honk` is a Rust transparent-proxy engine for Linux, **inspired by** [dae](https://github.com/daeuniverse/dae) (eBPF datapath and configuration surface) and [sing-box](https://github.com/SagerNet/sing-box) (outbound groups, multi-protocol dialers, Clash-compatible API). It is not a line-for-line port of either: the kernel path uses TC hooks with a restricted native-BPF routing policy compiled from userspace, while the userspace outbound/control stack follows sing-box-oriented designs.
@@ -36,6 +38,7 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 ├── Justfile                  # Day-to-day dev tasks (build, test, run, debug via clash API, cleanup)
 ├── README.md / README.zh.md  # Bilingual project overview
 ├── AGENTS.md                 # This file
+├── .agents/                  # rules/ (subsystem reference), skills/ (task skills), tools/ (the split scripts); see Task routing
 ├── LICENSE                   # GPL-3.0-only
 ├── config.dae                # Full-featured example config (production-leaning)
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
