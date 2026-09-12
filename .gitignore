@@ -62,7 +62,10 @@ results
 .sisyphus
 .expect
 .codex
-.agents
+.agents/*
+!.agents/rules/
+!.agents/skills/
+!.agents/tools/
 bench
 .task*
 .qa*

@@ -36,7 +36,7 @@ LLM-generated code is welcome in:
 - Test units, integration tests, fault-injection fixtures
 - Benchmarks and CI gates/scripts
 - Mock backends and test harnesses
-- Documentation and `AGENTS.md` updates
+- Documentation, `AGENTS.md` and `.agents/rules/` updates
 - Mechanical, behavior-preserving refactors outside §2 areas
 
 **Conditions (all mandatory):**
@@ -80,7 +80,7 @@ An unbroken streak of "no findings" from any single reviewer — human or LLM �
 
 - Writing and expanding test matrices, fault injection, and benchmarks
 - CI regression gates that turn performance/correctness claims into executable checks
-- Keeping `AGENTS.md` synchronized with code changes
+- Keeping `AGENTS.md` and `.agents/rules/` synchronized with code changes
 - First-pass review, evidence audit, and adversarial second-pass review under human direction
 - Analysis, translation, summarization — without posting raw output where maintainers are expected to read it unmarked
 
@@ -89,7 +89,7 @@ An unbroken streak of "no findings" from any single reviewer — human or LLM �
 - Originating changes in §2 areas unless the domain-expert exception in §11 applies
 - Substituting for the author's mental model of merged code
 - Producing PR descriptions, issue text, or review replies posted without disclosure
-- Lowering any existing bar: clippy clean, passing the applicable CI and documented validation gates, and `AGENTS.md` synchronization are required of LLM-assisted PRs exactly as of human ones. Use the gates in [CI](.github/workflows/ci.yml), the [Justfile](Justfile), and `AGENTS.md`, including only their explicitly documented temporary test exclusions. Disclosure and human review remain mandatory; LLM assistance is never a reason to skip required validation.
+- Lowering any existing bar: clippy clean, passing the applicable CI and documented validation gates, and `AGENTS.md`/`.agents/rules/` synchronization are required of LLM-assisted PRs exactly as of human ones. Use the gates in [CI](.github/workflows/ci.yml), the [Justfile](Justfile), `AGENTS.md` and `.agents/rules/`, including only their explicitly documented temporary test exclusions. Disclosure and human review remain mandatory; LLM assistance is never a reason to skip required validation.
 
 ## 9. Enforcement and scope notes
 
