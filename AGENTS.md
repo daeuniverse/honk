@@ -9,11 +9,11 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 
 | Doing | Read first |
 |---|---|
-| any change | this file |
-| honk-config, honk-tool, `doc/*/reference`, `dialect.md`, or a core/outbound consumer of `Config`, `Node`, `derive_id`, group filters, DNS routing | `.agents/rules/configuration.md` |
-| real-kernel or eBPF work, `crates/honk-ebpf*`, `crates/honk-core/src/ebpf/`, mock-eBPF development | `.agents/rules/real-ebpf.md` |
+| any change | this file; also `.agents/skills/honk-change/SKILL.md` (the loop every PR here follows) |
+| honk-config, honk-tool, `doc/*/reference`, `dialect.md`, or a core/outbound consumer of `Config`, `Node`, `derive_id`, group filters, DNS routing | `.agents/rules/configuration.md`; skill [`honk-config-change`](.agents/skills/honk-config-change/SKILL.md) |
+| real-kernel or eBPF work, `crates/honk-ebpf*`, `crates/honk-core/src/ebpf/`, mock-eBPF development | `.agents/rules/real-ebpf.md`; skill [`honk-real-ebpf-tests`](.agents/skills/honk-real-ebpf-tests/SKILL.md) |
 | placing or finding tests, benchmarks | `.agents/rules/test-locations.md` |
-| releases, CI workflows | `.agents/rules/release.md` |
+| releases, CI workflows | `.agents/rules/release.md`; skill [`honk-release`](.agents/skills/honk-release/SKILL.md) |
 | deployment, security-sensitive paths | `.agents/rules/deployment.md`, `.agents/rules/security.md` |
 | REALITY / xtls interop verification against live servers | `.agents/rules/maintainer-lab.md` (the maintainer's lab; not required for contributions) |
 <!-- task-routing:end -->
