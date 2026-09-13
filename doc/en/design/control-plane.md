@@ -18,7 +18,7 @@ Module map:
     - `dns_control.rs` — `DnsController`; [query admission and projection](./dns.md#resolution-pipeline).
     - `dns_listener.rs` — `DnsListener`; [standalone ingress lifecycle](./dns.md#ingress-paths).
     - `reload.rs` — `apply_runtime_config`; [runtime publication](#reload-and-runtime-generations).
-    - `routing_matcher.rs` — [atomic routing publication](./routing.md#atomic-routing-publication) and [kernel rule lowering](./routing.md#lpm-and-learned-domain-maps).
+    - `routing_matcher.rs` — [atomic routing publication](./routing.md#synchronous-slots-and-atomic-publication) and [kernel rule lowering](./routing.md#restricted-native-backend).
     - `quic.rs`, `packet_sniffer.rs`, `tcp_sniff.rs` — QUIC decryption/reassembly, per-flow sniff sessions, and TCP negative cache, respectively.
     - `udp_endpoint.rs` — `UdpEndpointPool`; [endpoint transactions](#udp-endpoint-pipeline).
     - `probers.rs` — `ProxyHttpProber`, `ProxyUdpProber`; [health probes](./groups.md#health-state-and-probes).
