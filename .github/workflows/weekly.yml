@@ -1,0 +1,145 @@
+name: Weekly
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  toolchain-preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools
+      - name: Record preview compilers
+        id: versions
+        run: |
+          set -euo pipefail
+          rustc +stable -V | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc +nightly -V | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "stable=$(rustc +stable -V)" >> "$GITHUB_OUTPUT"
+          echo "nightly=$(rustc +nightly -V)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: toolchain-preview-${{ steps.versions.outputs.stable }}-${{ steps.versions.outputs.nightly }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Install geo assets for the geosite tests
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      # Floating selectors deliberately bypass the repository pins to expose drift.
+      - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable clippy --all --all-targets -- -D warnings
+      - run: cargo +stable nextest run --workspace --profile ci
+      - name: Upload preview JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-preview-junit
+          path: target/nextest/ci/junit.xml
+      - name: Build the object with current nightly
+        working-directory: crates/honk-ebpf
+        run: |
+          set -euo pipefail
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
+
+  pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch and verify every pinned download without caches
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          downloads=$(mktemp -d "$RUNNER_TEMP/pins.XXXXXX")
+          trap 'rm -rf "$downloads"' EXIT
+          fetch() {
+            local url=$1 sha256=$2 name=$3
+            curl -fsSL --retry 3 --retry-all-errors -H 'Cache-Control: no-cache' -o "$downloads/$name" "$url"
+            printf '%s  %s\n' "$sha256" "$downloads/$name" | sha256sum -c -
+          }
+          fetch "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat" "$GEOSITE_SHA256" geosite.dat
+          fetch "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat" "$GEOIP_SHA256" geoip.dat
+          fetch "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst" "$BPF_LINKER_SHA256" bpf-linker.tar.zst
+          fetch "$VIRTME_NG_WHEEL_URL" "$VIRTME_NG_SHA256" virtme-ng.whl
+          fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_IMAGE" "$KERNEL_FLOOR_IMAGE_SHA256" "$KERNEL_FLOOR_IMAGE"
+          fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_MODULES" "$KERNEL_FLOOR_MODULES_SHA256" "$KERNEL_FLOOR_MODULES"
+          fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_IMAGE" "$KERNEL_RECENT_IMAGE_SHA256" "$KERNEL_RECENT_IMAGE"
+          fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_MODULES" "$KERNEL_RECENT_MODULES_SHA256" "$KERNEL_RECENT_MODULES"
+
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: advisories-${{ steps.toolchain.outputs.stable }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: cargo-audit
+      - run: cargo audit
