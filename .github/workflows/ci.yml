@@ -99,8 +99,10 @@ jobs:
               (pr && (failed || filters.ebpf === "true" || labels.includes("ci:ebpf") || full));
             const docs = !pr || failed || filters.code === "true" || filters.docs === "true" || full;
             const lanes = ["changes"];
-            if (code) lanes.push("lint", "test");
+            if (code) lanes.push("lint", "test", "ebpf-check");
             if (floor) lanes.push("ebpf");
+            const heavy = push || (dispatch && inputs.full) || (pr && (failed || full));
+            if (heavy) lanes.push("ebpf-recent", "aarch64", "features", "cross-musl");
             if (docs) lanes.push("docs");
             if (pr) lanes.push("review-bot");
             fs.mkdirSync("target/ci-report", { recursive: true });
@@ -378,6 +380,461 @@ jobs:
         with:
           name: vm-tests-floor
           path: target/vm-tests/floor
+
+  ebpf-check:
+    name: eBPF feature compile guard
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - run: cargo check -p honk-core --features ebpf --tests
+
+  ebpf-recent:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    name: eBPF real VM tests (recent kernel)
+    # These tests attach TC/cgroup programs and therefore cannot run in a job container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+          cache-directories: target/honk-ebpf-routing-test
+      - name: Install build and VM dependencies
+        run: |
+          set -euo pipefail
+          echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+      - name: Configure KVM
+        run: |
+          set -euo pipefail
+          if test -e /dev/kvm; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+              sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm || true
+            sudo chmod 666 /dev/kvm || true
+            if test -r /dev/kvm -a -w /dev/kvm; then
+              echo "HONK_CI_VNG_DISABLE_KVM=0" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+          echo "KVM unavailable on this runner; using virtme-ng software emulation"
+          echo "HONK_CI_VNG_DISABLE_KVM=1" >> "$GITHUB_ENV"
+      - name: Install pinned virtme-ng
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          wheel="$RUNNER_TEMP/${VIRTME_NG_WHEEL_URL##*/}"
+          curl -fsSL --retry 3 --retry-all-errors -o "$wheel" "$VIRTME_NG_WHEEL_URL"
+          echo "$VIRTME_NG_SHA256  $wheel" | sha256sum -c -
+          /usr/bin/python3 -m venv --system-site-packages "$RUNNER_TEMP/virtme-ng"
+          "$RUNNER_TEMP/virtme-ng/bin/pip" --disable-pip-version-check install --no-deps \
+            "$wheel"
+          echo "$RUNNER_TEMP/virtme-ng/bin" >> "$GITHUB_PATH"
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - name: Read download cache keys
+        id: pins
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "geo=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+          echo "kernel=$KERNEL_RECENT_IMAGE_SHA256-$KERNEL_RECENT_MODULES_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.pins.outputs.geo }}
+      - name: Install geo assets for eBPF-feature unit tests
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - name: Build eBPF object
+        run: |
+          set -euo pipefail
+          cd crates/honk-ebpf
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+      - name: Build routing-test eBPF object separately
+        run: |
+          set -euo pipefail
+          cd crates/honk-ebpf
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test" \
+            cargo build --release --features routing-test \
+              -Zbuild-std=core --target bpfel-unknown-none
+      # aya refuses objects without BTF ("no BTF parsed for object") — fail
+      # here instead of at runtime on a gateway.
+      - name: Verify eBPF objects have BTF
+        run: |
+          set -euo pipefail
+          readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+          readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
+      - name: Run eBPF-feature unit tests
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
+      - name: Upload eBPF unit-test JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ebpf-recent-unit-junit
+          path: target/nextest/ci/junit.xml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kernel-recent/*.deb
+          key: kernel-recent-${{ steps.pins.outputs.kernel }}
+      - name: Run all real-kernel gates on the recent kernel
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: .github/ci/run-vm-gate.sh recent
+      - name: Upload guest output
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vm-tests-recent
+          path: target/vm-tests/recent
+
+  aarch64:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    name: cargo nextest (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
+      - name: Install boring-sys build deps (cmake + libclang for bindgen)
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+
+      # routing::tests::test_geosite_* need geo assets (locally found at
+      # /etc/dae/geosite.dat; the runner has none).
+      - name: Read geo cache key
+        id: geo-pins
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.geo-pins.outputs.key }}
+      - name: Install geo assets for the geosite tests
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - run: cargo nextest run --workspace --profile ci
+      - name: Upload workspace JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aarch64-junit
+          path: target/nextest/ci/junit.xml
+
+  features:
+    name: Independent feature sets
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - name: Prepare eBPF object
+        working-directory: crates/honk-ebpf
+        env:
+          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
+        run: |
+          set -euo pipefail
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
+          # build.rs requires the compiler identity as well as source freshness.
+          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - run: cargo check -p honk-core --no-default-features
+      - run: cargo check -p honk-core --no-default-features --features clash-api
+      - run: cargo check -p honk-core --no-default-features --features ebpf
+      - run: cargo check -p honk-tool
+
+  cross-musl:
+    name: x86_64 musl release path
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          target: x86_64-unknown-linux-musl
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - name: Prepare eBPF object
+        working-directory: crates/honk-ebpf
+        env:
+          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
+        run: |
+          set -euo pipefail
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
+          # build.rs requires the compiler identity as well as source freshness.
+          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
+      - name: Build core and toolbox through the release wrappers
+        run: |
+          set -euo pipefail
+          export ZIGCC_TARGET=x86_64-linux-musl
+          export CC_x86_64_unknown_linux_musl="$PWD/ci/zigcc"
+          export CXX_x86_64_unknown_linux_musl="$PWD/ci/zigcxx"
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$PWD/ci/zigcc"
+          # Zig supplies the CRT; Rust's self-contained CRT would duplicate _start.
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C link-self-contained=no'
+          export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
+          cargo build --release -p honk-core --no-default-features --features clash-api,ebpf,rprx,mimalloc --target x86_64-unknown-linux-musl
+          cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
+      - name: Start the musl toolbox
+        working-directory: target/x86_64-unknown-linux-musl/release
+        run: ./honk-tool --version
 
   review-bot:
     name: mechanical PR review
