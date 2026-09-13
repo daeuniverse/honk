@@ -34,6 +34,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
 
@@ -42,6 +43,7 @@ jobs:
       - name: Read geo cache key
         id: geo-pins
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -50,6 +52,7 @@ jobs:
           key: geo-${{ steps.geo-pins.outputs.key }}
       - name: Install geo assets for the geosite tests
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
@@ -101,6 +104,7 @@ jobs:
       - name: Read Rust toolchains
         id: toolchain
         run: |
+          set -euo pipefail
           echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
           echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
@@ -126,11 +130,13 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
 
       - name: Install pinned bpf-linker
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
             "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
@@ -142,6 +148,7 @@ jobs:
       # cross builds just pick it up (build.rs locates it when present).
       - name: Build eBPF object
         run: |
+          set -euo pipefail
           cd crates/honk-ebpf
           cargo build --release -Zbuild-std=core --target bpfel-unknown-none
 
@@ -166,6 +173,7 @@ jobs:
       - name: Resolve feature set
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${{ matrix.suffix }}" == "-stock" ]]; then
             echo "FEATURES=--no-default-features --features clash-api,ebpf,rprx" >> "$GITHUB_ENV"
           else
@@ -204,11 +212,23 @@ jobs:
 
       - name: Package artifact
         run: |
+          set -euo pipefail
           name="honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
           tar -czf "$name.tar.gz" -C dist "$name"
+
+      - name: Start the packaged x86_64 artifact
+        if: startsWith(matrix.target, 'x86_64-')
+        env:
+          ARTIFACT_NAME: honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          smoke_dir=$(mktemp -d "$RUNNER_TEMP/release-smoke.XXXXXX")
+          trap 'rm -rf "$smoke_dir"' EXIT
+          tar -xzf "$ARTIFACT_NAME.tar.gz" -C "$smoke_dir"
+          "$smoke_dir/$ARTIFACT_NAME/honk-core" --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

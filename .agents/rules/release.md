@@ -10,6 +10,8 @@ Host suites use `.config/nextest.toml`'s `ci` profile with per-test timeouts and
 
 `.github/workflows/release.yml` on `v*`: `cargo test --workspace --no-fail-fast` (`cmake` + `libclang-dev` required for boring-sys), then `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl`. The legacy routing test is ignored in source as described in `AGENTS.md` (Current validation guidance). Native gnu uses `cargo build`; the other three use **zig cc/c++ `ci/zigcc` / `ci/zigcxx` wrappers**. Cross CMake injects ASM `--target` flags rejected by GCC and, in Rust-triple spelling, zig; wrappers strip/re-anchor on `$ZIGCC_TARGET`. Musl sets `link-self-contained=no` for zig CRT. Each target ships default mimalloc and `-stock` without `mimalloc` (lower RSS high-water on small gateways). The host compiler comes from the root `rust-toolchain.toml`; build eBPF once on the host with `crates/honk-ebpf/rust-toolchain.toml` and pinned prebuilt `bpf-linker`; **verify `.BTF`** before packaging. Publish GitHub Release tarballs; `alpha`/`beta`/`rc` tags are prereleases.
 
+Before upload, every x86_64 matrix entry extracts its packaged tarball into a clean temporary directory and runs the nested `honk-core --version`. This covers the loader and early startup for gnu/musl and both allocators, not configuration or datapath behavior. aarch64 artifacts are not executed. Manual release runs keep the same build checks; publication remains restricted to `v*` tag refs.
+
 ### Release process (standing convention)
 
 - **Tag naming:** `v0.0.1.beta.N` (strictly incrementing; check `git tag -l | sort -V | tail`). Tag the current `main` tip after it is pushed and its branch CI is green.
