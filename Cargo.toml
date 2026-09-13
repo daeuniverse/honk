@@ -72,7 +72,7 @@ clap = { version = "4", features = ["derive", "env"] }
 boring = { version = "=5.2.0", features = ["mlkem"] }
 boring-sys = "=5.2.0"
 tokio-boring = "=5.2.0"
-brotli = "8"
+brotli = "9"
 webpki-root-certs = "1"
 foreign-types = "0.5"
 tokio-rustls = "0.26"
