@@ -1,0 +1,302 @@
+name: CI report
+
+on:
+  workflow_run:
+    workflows: [CI, "Reload benchmark"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: report-${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  report:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out the trusted renderer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Collect selected run data and render
+        id: render
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_NAME: ${{ github.event.workflow_run.name }}
+          SOURCE_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+        run: |
+          set -euo pipefail
+
+          report_root="${RUNNER_TEMP}/ci-report-${RUN_ID}-${RUN_ATTEMPT}"
+          candidate="${report_root}/candidate"
+          baseline="${report_root}/baseline"
+          selection="${report_root}/selection"
+          mkdir -p "${candidate}" "${baseline}" "${selection}"
+
+          download_run_artifacts() {
+            local source_run=$1
+            local destination=$2
+            local selection_destination=$3
+            local metadata="${report_root}/artifacts-${source_run}.json"
+            local selected="${report_root}/selected-artifacts-${source_run}.json"
+            local artifact_id
+            local artifact_size
+            local artifact_name
+            local archive
+            local output_directory
+            local expected_name
+            local index=0
+
+            gh api "repos/${REPO}/actions/runs/${source_run}/artifacts?per_page=100" \
+              --paginate --slurp > "${metadata}"
+            jq '[.[] | .artifacts[]
+                  | select(.name | startswith("ci-report-"))
+                  | select(.expired == false)]
+                | sort_by([.name, .created_at, .id])
+                | group_by(.name)
+                | map(last)' \
+              "${metadata}" > "${selected}"
+            if (( $(jq 'length' "${selected}") > 64 )); then
+              printf '%s\n' '{"artifact_validation_error":"more than 64 report artifacts"}' \
+                > "${destination}/invalid-artifact-count-${source_run}.json"
+              return
+            fi
+            jq -r '.[] | [.id, .size_in_bytes, .name] | @tsv' "${selected}" \
+              > "${report_root}/artifact-list-${source_run}"
+
+            while IFS=$'\t' read -r artifact_id artifact_size artifact_name; do
+              [[ "${artifact_id}" =~ ^[0-9]+$ && "${artifact_size}" =~ ^[0-9]+$ ]]
+              [[ "${artifact_name}" =~ ^ci-report-[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+              if [[ "${artifact_name}" == ci-report-selection ]]; then
+                if [[ -z "${selection_destination}" ]]; then
+                  continue
+                fi
+                output_directory="${selection_destination}"
+                expected_name=selection.json
+              else
+                output_directory="${destination}"
+                expected_name="${artifact_name#ci-report-}.json"
+              fi
+              index=$((index + 1))
+              if ((artifact_size > 1024 * 1024)); then
+                printf '%s\n' '{"artifact_validation_error":"report artifact exceeds 1 MiB"}' \
+                  > "${destination}/invalid-artifact-${source_run}-${index}.json"
+                continue
+              fi
+              archive="${report_root}/artifact-${source_run}-${index}.zip"
+              gh api "repos/${REPO}/actions/artifacts/${artifact_id}/zip" > "${archive}"
+              python3 - "${archive}" "${output_directory}" "${expected_name}" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          expected = sys.argv[3]
+
+          def reject(message: str) -> None:
+              marker = destination / f"invalid-{archive.stem}.json"
+              marker.write_text(json.dumps({"artifact_validation_error": message}) + "\n")
+
+          try:
+              if archive.stat().st_size > 1024 * 1024:
+                  raise ValueError("report artifact archive exceeds 1 MiB")
+              with zipfile.ZipFile(archive) as source:
+                  members = [member for member in source.infolist() if not member.is_dir()]
+                  if len(members) != 1:
+                      raise ValueError("report artifact must contain exactly one file")
+                  member = members[0]
+                  if PurePosixPath(member.filename).name != expected or member.file_size > 256 * 1024:
+                      raise ValueError("report artifact has an invalid member")
+                  payload = source.read(member)
+                  if len(payload) > 256 * 1024:
+                      raise ValueError("report JSON expands beyond 256 KiB")
+                  with (destination / expected).open("xb") as output:
+                      output.write(payload)
+          except (FileExistsError, OSError, ValueError, zipfile.BadZipFile) as error:
+              reject(str(error))
+          PY
+            done < "${report_root}/artifact-list-${source_run}"
+          }
+
+          download_run_artifacts "${RUN_ID}" "${candidate}" "${selection}"
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?filter=all&per_page=100" \
+            --paginate --slurp > "${report_root}/jobs-trigger.json"
+
+          if [[ "${SOURCE_NAME}" == CI ]]; then
+            other_workflow=reload-benchmark.yml
+            other_name='Reload benchmark'
+          else
+            other_workflow=ci.yml
+            other_name=CI
+          fi
+          gh api "repos/${REPO}/actions/workflows/${other_workflow}/runs?head_sha=${HEAD_SHA}&event=pull_request&status=completed&per_page=100" \
+            --paginate --slurp > "${report_root}/other-runs.json"
+          jq --arg sha "${HEAD_SHA}" '
+            [.[] | .workflow_runs[]
+              | select(.head_sha == $sha and .event == "pull_request" and .status == "completed")]
+            | sort_by(.created_at) | reverse | .[0] // null
+          ' "${report_root}/other-runs.json" > "${report_root}/other-run.json"
+          other_id=$(jq -r '.id // empty' "${report_root}/other-run.json")
+          other_attempt=$(jq -r '.run_attempt // empty' "${report_root}/other-run.json")
+          if [[ -n "${other_id}" ]]; then
+            [[ "${other_id}" =~ ^[0-9]+$ && "${other_attempt}" =~ ^[0-9]+$ ]]
+            download_run_artifacts "${other_id}" "${candidate}" "${selection}"
+            gh api "repos/${REPO}/actions/runs/${other_id}/jobs?filter=all&per_page=100" \
+              --paginate --slurp > "${report_root}/jobs-other.json"
+          fi
+
+          gh api "repos/${REPO}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100" \
+            --paginate --slurp > "${report_root}/baseline-runs.json"
+          jq --argjson trigger_id "${RUN_ID}" --arg created "${SOURCE_CREATED_AT}" '
+            [.[] | .workflow_runs[] | select(.id != $trigger_id and .created_at < $created)]
+            | sort_by(.created_at) | reverse | .[0] // null
+          ' "${report_root}/baseline-runs.json" > "${report_root}/baseline-run.json"
+          baseline_id=$(jq -r '.id // empty' "${report_root}/baseline-run.json")
+          if [[ -n "${baseline_id}" ]]; then
+            [[ "${baseline_id}" =~ ^[0-9]+$ ]]
+            download_run_artifacts "${baseline_id}" "${baseline}" ""
+          fi
+
+          if [[ ! -f "${selection}/selection.json" ]]; then
+            printf '{}\n' > "${selection}/selection.json"
+          fi
+
+          OTHER_ID="${other_id}" OTHER_ATTEMPT="${other_attempt}" OTHER_NAME="${other_name}" \
+            python3 - "${report_root}" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          def jobs_from(path: Path, workflow: str, run_id: int, attempt: int) -> list[dict]:
+              if not path.is_file():
+                  return []
+              pages = json.loads(path.read_text())
+              newest = {}
+              for page in pages:
+                  for job in page.get("jobs", []):
+                      job_attempt = job.get("run_attempt")
+                      name = job.get("name")
+                      if not isinstance(job_attempt, int) or not isinstance(name, str):
+                          continue
+                      if not 1 <= job_attempt <= attempt:
+                          continue
+                      previous = newest.get(name)
+                      if previous is None or job_attempt > previous[0]:
+                          newest[name] = (job_attempt, {
+                      "workflow": workflow,
+                      "run_id": run_id,
+                      "run_attempt": job_attempt,
+                      "name": name,
+                      "conclusion": job.get("conclusion"),
+                          })
+              return [item[1] for item in newest.values()]
+
+          run_id = int(os.environ["RUN_ID"])
+          attempt = int(os.environ["RUN_ATTEMPT"])
+          head_sha = os.environ["HEAD_SHA"]
+          source_runs = [{
+              "workflow": os.environ["SOURCE_NAME"],
+              "run_id": run_id,
+              "run_attempt": attempt,
+              "sha": head_sha,
+          }]
+          jobs = jobs_from(root / "jobs-trigger.json", os.environ["SOURCE_NAME"], run_id, attempt)
+          if os.environ["OTHER_ID"]:
+              other_id = int(os.environ["OTHER_ID"])
+              other_attempt = int(os.environ["OTHER_ATTEMPT"])
+              source_runs.append({
+                  "workflow": os.environ["OTHER_NAME"],
+                  "run_id": other_id,
+                  "run_attempt": other_attempt,
+                  "sha": head_sha,
+              })
+              jobs.extend(jobs_from(root / "jobs-other.json", os.environ["OTHER_NAME"], other_id, other_attempt))
+
+          baseline_run = json.loads((root / "baseline-run.json").read_text())
+          if baseline_run is None:
+              baseline = {"reason": "no preceding successful main push report"}
+          elif not any((root / "baseline").glob("*.json")):
+              baseline = {"reason": "the preceding main report is missing or expired"}
+          else:
+              baseline = {
+                  "run_id": baseline_run["id"],
+                  "run_attempt": baseline_run["run_attempt"],
+                  "sha": baseline_run["head_sha"],
+              }
+          (root / "jobs.json").write_text(json.dumps({
+              "head_sha": head_sha,
+              "source_runs": source_runs,
+              "baseline": baseline,
+              "jobs": jobs,
+          }, indent=2) + "\n")
+          PY
+
+          python3 .github/ci/report/render.py \
+            --candidate "${candidate}" \
+            --baseline "${baseline}" \
+            --selection "${selection}/selection.json" \
+            --jobs "${report_root}/jobs.json" \
+            --out "${report_root}/body.md"
+          body_bytes=$(wc -c < "${report_root}/body.md")
+          ((body_bytes <= 60000))
+          echo "root=${report_root}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upsert the report on every matching open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPORT_ROOT: ${{ steps.render.outputs.root }}
+        run: |
+          set -euo pipefail
+
+          marker='<!-- ci-report -->'
+          body_bytes=$(wc -c < "${REPORT_ROOT}/body.md")
+          ((body_bytes <= 60000))
+          gh api "repos/${REPO}/pulls?state=open&per_page=100" \
+            --paginate --slurp > "${REPORT_ROOT}/pulls.json"
+          jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" '
+            .[][] | select(.head.sha == $sha and .base.repo.full_name == $repo) | .number
+          ' "${REPORT_ROOT}/pulls.json" > "${REPORT_ROOT}/pull-numbers"
+
+          while read -r pr; do
+            [[ "${pr}" =~ ^[0-9]+$ ]]
+            gh api "repos/${REPO}/pulls/${pr}" > "${REPORT_ROOT}/pull-${pr}.json"
+            if ! jq -e --arg sha "${HEAD_SHA}" --arg repo "${REPO}" '
+              .state == "open" and .head.sha == $sha and .base.repo.full_name == $repo
+            ' "${REPORT_ROOT}/pull-${pr}.json" > /dev/null; then
+              continue
+            fi
+            gh api "repos/${REPO}/issues/${pr}/comments?per_page=100" \
+              --paginate --slurp > "${REPORT_ROOT}/comments-${pr}.json"
+            comment_id=$(jq -r --arg marker "${marker}" '
+              [.[][]
+                | select(.user.login == "github-actions[bot]")
+                | select(.body | contains($marker))]
+              | .[0].id // empty
+            ' "${REPORT_ROOT}/comments-${pr}.json")
+            if [[ -n "${comment_id}" ]]; then
+              gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
+                -F body=@"${REPORT_ROOT}/body.md" > /dev/null
+            else
+              gh api "repos/${REPO}/issues/${pr}/comments" \
+                -F body=@"${REPORT_ROOT}/body.md" > /dev/null
+            fi
+          done < "${REPORT_ROOT}/pull-numbers"

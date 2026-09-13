@@ -1,0 +1,1 @@
+{"schema_version":1,"run_id":301,"run_attempt":2,"lane":"lint","matrix":{"target":"x86_64-unknown-linux-gnu"},"measured_sha":"1111aaaa","baseline_sha":null,"units":{},"values":{},"signals":[],"failure":{"summary":"cargo fmt found a difference","detail_lines":["Diff in crates/example.rs:7:","-old +new"]}}

@@ -1,0 +1,1 @@
+{"head_sha":"1111aaaa","source_runs":[{"workflow":"CI","run_id":301,"run_attempt":2,"sha":"1111aaaa"},{"workflow":"Reload benchmark","run_id":302,"run_attempt":1,"sha":"1111aaaa"}],"baseline":{"run_id":290,"run_attempt":1,"sha":"2222bbbb"},"jobs":[{"name":"fmt + clippy","conclusion":"failure"}]}

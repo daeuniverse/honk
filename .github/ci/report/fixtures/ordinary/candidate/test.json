@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "run_id": 101,
+  "run_attempt": 1,
+  "lane": "test",
+  "matrix": {"target": "x86_64-unknown-linux-gnu", "toolchain": "pinned-stable"},
+  "measured_sha": "776f2f0f",
+  "baseline_sha": null,
+  "units": {
+    "test_inventory": "test-names",
+    "slowest_test": "seconds",
+    "dns_smoke": "queries-and-names",
+    "smoke_memory": "MiB",
+    "smoke_cpu": "seconds",
+    "toolchain": "rustc-cache"
+  },
+  "values": {
+    "test_inventory": {"value": {"total": 5, "names": ["udp_associate_gives_up_after_greeting", "reload_persists_selector_choice_before_manager_publication", "subscription_store_rejects_foreign_owner_before_chmod", "udp_pick_keeps_tcp_mirror_with_only_synthetic_failures", "udp_pick_switches_after_real_evidence_survives_ring_eviction"]}, "unit": "test-names", "available": true},
+    "slowest_test": {"value": {"name": "c28_health_tests::warm_then_measure", "seconds": 61}, "unit": "seconds", "available": true},
+    "dns_smoke": {"value": {"queries": 4, "upstream_names": ["udp.smoke.test.", "tcp-one.smoke.test.", "tcp-two.smoke.test.", "reload.smoke.test."]}, "unit": "queries-and-names", "available": true},
+    "smoke_memory": {"value": 108, "unit": "MiB", "available": true},
+    "smoke_cpu": {"value": 0.31, "unit": "seconds", "available": true},
+    "toolchain": {"value": {"rustc": "1.98.1", "cache_hit": true}, "unit": "rustc-cache", "available": true}
+  },
+  "signals": [{"kind": "new_warn_lines", "detail": "reload::transaction: persist callback installed before publication (reload_persists_selector_choice_before_manager_publication)\nreload::transaction: persist callback installed before publication (reload_rebases_static_diagnostics)"}],
+  "failure": null
+}

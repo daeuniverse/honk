@@ -1,0 +1,1 @@
+{"head_sha":"7777aaaa","source_runs":[{"workflow":"CI","run_id":701,"run_attempt":1,"sha":"7777aaaa"},{"workflow":"Reload benchmark","run_id":702,"run_attempt":1,"sha":"7777aaaa"}],"baseline":{"reason":"no baseline"},"jobs":[{"name":"mechanical PR review","conclusion":"success"}]}

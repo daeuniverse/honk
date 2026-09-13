@@ -1,0 +1,1 @@
+{"head_sha":"5555aaaa","source_runs":[{"workflow":"CI","run_id":501,"run_attempt":1,"sha":"5555aaaa"},{"workflow":"Reload benchmark","run_id":502,"run_attempt":1,"sha":"5555aaaa"}],"baseline":{"reason":"no preceding successful main push report"},"jobs":[{"name":"cargo nextest (workspace)","conclusion":"success"}]}

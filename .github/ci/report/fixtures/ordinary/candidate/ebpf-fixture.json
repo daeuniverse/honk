@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "run_id": 101,
+  "run_attempt": 1,
+  "lane": "ebpf-fixture",
+  "matrix": {"target": "bpfel-unknown-none"},
+  "measured_sha": "776f2f0f",
+  "baseline_sha": null,
+  "units": {"ebpf_instructions": "instructions"},
+  "values": {"ebpf_instructions": {"value": 1842, "unit": "instructions", "available": true}},
+  "signals": [],
+  "failure": null
+}

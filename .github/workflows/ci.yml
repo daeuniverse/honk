@@ -77,7 +77,7 @@ jobs:
               - '.github/ci/**'
               - '.github/workflows/ci.yml'
       - name: Record lane selection
-        if: ${{ !cancelled() }}
+        if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           FILTER_OUTPUTS: ${{ toJSON(steps.filter.outputs) }}
@@ -113,7 +113,7 @@ jobs:
               intended_lanes: lanes, run_id: context.runId, run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
             }, null, 2) + "\n");
       - name: Upload lane selection
-        if: ${{ !cancelled() }}
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-report-selection
@@ -149,6 +149,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.stable }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -162,6 +163,45 @@ jobs:
           sudo apt-get install -y cmake libclang-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all --all-targets -- -D warnings
+      - name: Write lint CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            let rustc = null;
+            try { rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim(); } catch {}
+            const cache = process.env.CACHE_HIT === "true" ? true :
+              process.env.CACHE_HIT === "false" ? false : null;
+            const values = {};
+            const units = {};
+            if (rustc) {
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            }
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/lint.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "lint",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `lint lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload lint CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-lint
+          path: target/ci-report/lint.json
+          retention-days: 30
+          if-no-files-found: error
 
   test:
     needs: [changes]
@@ -178,6 +218,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -221,13 +262,145 @@ jobs:
           echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
           sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - name: List workspace tests
+        run: |
+          set -euo pipefail
+          mkdir -p target/ci-report
+          cargo nextest list --workspace --profile ci --message-format json \
+            > target/ci-report/nextest-list.json
       - run: cargo nextest run --workspace --profile ci
+      - name: Run DNS smoke
+        env:
+          HONK_SMOKE_REPORT: target/ci-report/dns-smoke.json
+        run: |
+          set -euo pipefail
+          python3 ci/dns-smoke.py
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: workspace-junit
           path: target/nextest/ci/junit.xml
+      - name: Write test CI report
+        if: always()
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          values = {}
+          units = {}
+
+          def unavailable(name, unit, reason):
+              units[name] = unit
+              values[name] = {"value": None, "unit": unit, "available": False, "reason": reason}
+
+          try:
+              listing = json.loads(Path("target/ci-report/nextest-list.json").read_text())
+              names = []
+              ignored = 0
+              for suite in listing.get("rust-suites", {}).values():
+                  for name, case in suite.get("testcases", {}).items():
+                      names.append(name)
+                      ignored += int(case.get("ignored") is True)
+              units["test_inventory"] = "test-names"
+              values["test_inventory"] = {
+                  "value": {"total": len(names), "names": names},
+                  "unit": "test-names", "available": True,
+              }
+              units["ignored_tests"] = "tests"
+              values["ignored_tests"] = {"value": ignored, "unit": "tests", "available": True}
+          except (OSError, TypeError, ValueError):
+              unavailable("test_inventory", "test-names", "nextest list is unavailable")
+              unavailable("ignored_tests", "tests", "nextest list is unavailable")
+
+          try:
+              cases = list(ET.parse("target/nextest/ci/junit.xml").iter("testcase"))
+              slowest = max(cases, key=lambda case: float(case.get("time", "0")))
+              name = slowest.get("name", "unknown")
+              class_name = slowest.get("classname")
+              if class_name and not name.startswith(class_name):
+                  name = f"{class_name}::{name}"
+              units["slowest_test"] = "seconds"
+              values["slowest_test"] = {
+                  "value": {"name": name, "seconds": float(slowest.get("time", "0"))},
+                  "unit": "seconds", "available": True,
+              }
+          except (OSError, TypeError, ValueError, ET.ParseError):
+              unavailable("slowest_test", "seconds", "nextest JUnit is unavailable")
+
+          try:
+              smoke = json.loads(Path("target/ci-report/dns-smoke.json").read_text())
+              units["dns_smoke"] = "queries-and-names"
+              values["dns_smoke"] = {
+                  "value": {"queries": smoke["queries"], "upstream_names": smoke["upstream_names"]},
+                  "unit": "queries-and-names", "available": True,
+              }
+              units["smoke_memory"] = "MiB"
+              values["smoke_memory"] = {
+                  "value": smoke["vmhwm_kib"] / 1024, "unit": "MiB", "available": True,
+              }
+              units["smoke_cpu"] = "seconds"
+              values["smoke_cpu"] = {
+                  "value": smoke["cpu_seconds"], "unit": "seconds", "available": True,
+              }
+          except (KeyError, OSError, TypeError, ValueError):
+              unavailable("dns_smoke", "queries-and-names", "DNS smoke report is unavailable")
+              unavailable("smoke_memory", "MiB", "DNS smoke report is unavailable")
+              unavailable("smoke_cpu", "seconds", "DNS smoke report is unavailable")
+
+          try:
+              rustc = subprocess.run(
+                  ["rustc", "-V"], check=True, capture_output=True, text=True,
+              ).stdout.strip()
+              raw_cache = os.environ.get("CACHE_HIT")
+              cache_hit = True if raw_cache == "true" else False if raw_cache == "false" else None
+              units["toolchain"] = "rustc-cache"
+              values["toolchain"] = {
+                  "value": {"rustc": rustc, "cache_hit": cache_hit},
+                  "unit": "rustc-cache", "available": True,
+              }
+          except (OSError, subprocess.CalledProcessError):
+              unavailable("toolchain", "rustc-cache", "rustc is unavailable")
+
+          status = os.environ["JOB_STATUS"]
+          report = {
+              "schema_version": 1,
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "lane": "test",
+              "matrix": {
+                  "target": "x86_64-unknown-linux-gnu",
+                  "toolchain": os.environ["TOOLCHAIN"],
+              },
+              "measured_sha": os.environ["MEASURED_SHA"],
+              "baseline_sha": None,
+              "units": units,
+              "values": values,
+              "signals": [],
+              "failure": None if status == "success" else {
+                  "summary": f"test lane {status}", "detail_lines": [],
+              },
+          }
+          Path("target/ci-report/test.json").write_text(json.dumps(report, indent=2) + "\n")
+          PY
+      - name: Upload test CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-test
+          path: target/ci-report/test.json
+          retention-days: 30
+          if-no-files-found: error
 
   ebpf:
     needs: [changes]
@@ -252,6 +425,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -380,6 +554,55 @@ jobs:
         with:
           name: vm-tests-floor
           path: target/vm-tests/floor
+      - name: Write floor-VM CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            try {
+              const summary = fs.readFileSync("target/vm-tests/floor/summary.md", "utf8");
+              const kernel = summary.match(/^Guest uname -r: (.+)$/m)?.[1];
+              if (kernel) {
+                units.vm_environment = "kernel-accelerator";
+                values.vm_environment = {
+                  value: {kernel, accelerator: process.env.HONK_CI_VNG_DISABLE_KVM === "1" ? "TCG" : "KVM"},
+                  unit: "kernel-accelerator", available: true,
+                };
+              }
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/ebpf.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, kernel: "floor"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `ebpf lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload floor-VM CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-ebpf
+          path: target/ci-report/ebpf.json
+          retention-days: 30
+          if-no-files-found: error
 
   ebpf-check:
     name: eBPF feature compile guard
@@ -403,6 +626,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
@@ -440,6 +664,44 @@ jobs:
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
       - run: cargo check -p honk-core --features ebpf --tests
+      - name: Write eBPF compile-guard CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/ebpf-check.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf-check",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "ebpf-tests"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `ebpf-check lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload eBPF compile-guard CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-ebpf-check
+          path: target/ci-report/ebpf-check.json
+          retention-days: 30
+          if-no-files-found: error
 
   ebpf-recent:
     needs: [changes]
@@ -464,6 +726,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
@@ -607,6 +870,55 @@ jobs:
         with:
           name: vm-tests-recent
           path: target/vm-tests/recent
+      - name: Write recent-VM CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            try {
+              const summary = fs.readFileSync("target/vm-tests/recent/summary.md", "utf8");
+              const kernel = summary.match(/^Guest uname -r: (.+)$/m)?.[1];
+              if (kernel) {
+                units.vm_environment = "kernel-accelerator";
+                values.vm_environment = {
+                  value: {kernel, accelerator: process.env.HONK_CI_VNG_DISABLE_KVM === "1" ? "TCG" : "KVM"},
+                  unit: "kernel-accelerator", available: true,
+                };
+              }
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/ebpf-recent.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf-recent",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, kernel: "recent"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `ebpf-recent lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload recent-VM CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-ebpf-recent
+          path: target/ci-report/ebpf-recent.json
+          retention-days: 30
+          if-no-files-found: error
 
   aarch64:
     needs: [changes]
@@ -623,6 +935,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
@@ -674,6 +987,44 @@ jobs:
         with:
           name: aarch64-junit
           path: target/nextest/ci/junit.xml
+      - name: Write aarch64 CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/aarch64.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "aarch64",
+              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `aarch64 lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload aarch64 CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-aarch64
+          path: target/ci-report/aarch64.json
+          retention-days: 30
+          if-no-files-found: error
 
   features:
     name: Independent feature sets
@@ -697,6 +1048,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
@@ -747,6 +1099,44 @@ jobs:
       - run: cargo check -p honk-core --no-default-features --features clash-api
       - run: cargo check -p honk-core --no-default-features --features ebpf
       - run: cargo check -p honk-tool
+      - name: Write feature-set CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/features.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "features",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "independent"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `features lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload feature-set CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-features
+          path: target/ci-report/features.json
+          retention-days: 30
+          if-no-files-found: error
 
   cross-musl:
     name: x86_64 musl release path
@@ -771,6 +1161,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
@@ -835,6 +1226,44 @@ jobs:
       - name: Start the musl toolbox
         working-directory: target/x86_64-unknown-linux-musl/release
         run: ./honk-tool --version
+      - name: Write musl CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/cross-musl.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "cross-musl",
+              matrix: {target: "x86_64-unknown-linux-musl", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `cross-musl lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload musl CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-cross-musl
+          path: target/ci-report/cross-musl.json
+          retention-days: 30
+          if-no-files-found: error
 
   review-bot:
     name: mechanical PR review
@@ -842,10 +1271,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
-      pull-requests: write
+      pull-requests: read
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        id: review
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -865,6 +1294,7 @@ jobs:
 
             const warnings = [];
             const notes = [];
+            const signals = [];
 
             // AGENTS.md invariant: honk-ebpf-common layout changes must move
             // together with the eBPF program and the userspace map writers.
@@ -874,17 +1304,19 @@ jobs:
               !has("crates/honk-ebpf/") &&
               !has("crates/honk-core/src/ebpf/")
             ) {
-              warnings.push(
-                "`crates/honk-ebpf-common` changed without matching changes in `crates/honk-ebpf` or `crates/honk-core/src/ebpf` — shared kernel/userspace layouts must move together.",
-              );
+              const detail = "`crates/honk-ebpf-common` changed without matching changes in `crates/honk-ebpf` or `crates/honk-core/src/ebpf` — shared kernel/userspace layouts must move together.";
+              warnings.push(detail);
+              signals.push({kind: "shared_layout_changed", detail});
             }
             if (has(".github/workflows/")) {
-              notes.push("CI workflow files changed.");
+              const detail = "CI workflow files changed.";
+              notes.push(detail);
+              signals.push({kind: "workflow_changed", detail});
             }
             if (crates.size > 0 && !has("AGENTS.md") && !has(".agents/rules/")) {
-              notes.push(
-                "Code changed but neither `AGENTS.md` nor `.agents/rules/` was updated — check whether any documented behavior/convention changed.",
-              );
+              const detail = "Code changed but neither `AGENTS.md` nor `.agents/rules/` was updated — check whether any documented behavior/convention changed.";
+              notes.push(detail);
+              signals.push({kind: "rules_not_updated", detail});
             }
             const changedPaths = new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)));
             const unpaired = [];
@@ -896,8 +1328,10 @@ jobs:
               if (peer && !changedPaths.has(peer)) unpaired.push(path);
             }
             if (unpaired.length) {
-              notes.push("English/Chinese documentation changed without its paired page — check translation parity: " +
-                unpaired.map(path => `\`${path}\``).join(", ") + ".");
+              const detail = "English/Chinese documentation changed without its paired page — check translation parity: " +
+                unpaired.map(path => `\`${path}\``).join(", ") + ".";
+              notes.push(detail);
+              signals.push({kind: "docs_language_mismatch", detail});
             }
 
             const additions = files.reduce((s, f) => s + f.additions, 0);
@@ -918,19 +1352,33 @@ jobs:
 
             const body = lines.join("\n");
             await core.summary.addRaw(body).write();
-
-            // A pull_request run from a fork gets a read-only token whatever
-            // `permissions:` asks for, so commenting there fails the job and
-            // hides the review that was just written to the step summary.
-            const head = pr.head.repo?.full_name;
-            if (head !== `${context.repo.owner}/${context.repo.repo}`) {
-              core.info("fork pull request: review written to the step summary");
-              return;
-            }
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              body,
-            });
+            core.setOutput("signals", JSON.stringify(signals));
+      - name: Write review CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REVIEW_SIGNALS: ${{ steps.review.outputs.signals }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            let signals = [];
+            try { signals = JSON.parse(process.env.REVIEW_SIGNALS || "[]"); } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/review.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "review",
+              matrix: {}, measured_sha: process.env.MEASURED_SHA, baseline_sha: null,
+              units: {}, values: {}, signals,
+              failure: status === "success" ? null : {summary: `review lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload review CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-review
+          path: target/ci-report/review.json
+          retention-days: 30
+          if-no-files-found: error

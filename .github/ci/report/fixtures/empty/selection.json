@@ -1,0 +1,19 @@
+{
+  "event": "pull_request",
+  "inputs": {},
+  "labels": [
+    "ci:full",
+    "ci:ebpf"
+  ],
+  "filters": {
+    "code": "true",
+    "docs": "true",
+    "ebpf": "true"
+  },
+  "filter_outcome": "success",
+  "intended_lanes": [
+    "changes"
+  ],
+  "run_id": 801,
+  "run_attempt": 1
+}

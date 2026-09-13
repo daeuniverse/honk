@@ -1,0 +1,9 @@
+{
+  "head_sha": "776f2f0f",
+  "source_runs": [
+    {"workflow": "CI", "run_id": 101, "run_attempt": 1, "sha": "776f2f0f"},
+    {"workflow": "Reload benchmark", "run_id": 102, "run_attempt": 1, "sha": "776f2f0f"}
+  ],
+  "baseline": {"run_id": 90, "run_attempt": 1, "sha": "346e667d"},
+  "jobs": [{"name": "cargo nextest (workspace)", "conclusion": "success"}]
+}

@@ -1,0 +1,1 @@
+{"schema_version":1,"run_id":202,"run_attempt":1,"lane":"reload","matrix":{"workload":"identical-config"},"measured_sha":"aaaabbbb","baseline_sha":"12345678","units":{},"values":{},"signals":[],"failure":null}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import collections
+import json
 import os
 import signal
 import socket
@@ -427,6 +428,56 @@ def _cleanup_process(process: subprocess.Popen[bytes]) -> None:
         _kill_process_group(process)
 
 
+def _process_usage(pid: int) -> tuple[int, int, float]:
+    status = {}
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key in {"VmHWM", "VmRSS"}:
+            fields = value.split()
+            if len(fields) != 2 or fields[1] != "kB":
+                raise SmokeFailure(f"unexpected /proc status value for {key}")
+            status[key] = int(fields[0])
+    if set(status) != {"VmHWM", "VmRSS"}:
+        raise SmokeFailure("/proc status did not contain VmHWM and VmRSS")
+
+    stat_fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    if len(stat_fields) <= 12:
+        raise SmokeFailure("/proc stat did not contain process CPU counters")
+    ticks = int(stat_fields[11]) + int(stat_fields[12])
+    cpu_seconds = ticks / os.sysconf("SC_CLK_TCK")
+    return status["VmHWM"], status["VmRSS"], cpu_seconds
+
+
+def _write_smoke_report(path: Path, process: subprocess.Popen[bytes], names: list[str]) -> None:
+    vmhwm_kib, vmrss_kib, cpu_seconds = _process_usage(process.pid)
+    payload = {
+        "queries": len(names),
+        "upstream_names": names,
+        "vmhwm_kib": vmhwm_kib,
+        "vmrss_kib": vmrss_kib,
+        "cpu_seconds": cpu_seconds,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            json.dump(payload, output, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _run_smoke(project_root: Path) -> None:
     binary = _build_debug_binary(project_root)
     capture: ProcessOutput | None = None
@@ -502,6 +553,9 @@ def _run_smoke(project_root: Path) -> None:
         _validate_answer(reload_query, _udp_exchange(dns_port, reload_query))
         expected_queries.append("reload.smoke.test.")
         upstream.assert_queries(expected_queries)
+
+        if report_path := os.environ.get("HONK_SMOKE_REPORT"):
+            _write_smoke_report(Path(report_path), process, expected_queries)
 
         process.send_signal(signal.SIGTERM)
         try:

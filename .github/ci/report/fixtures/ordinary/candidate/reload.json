@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "run_id": 102,
+  "run_attempt": 1,
+  "lane": "reload",
+  "matrix": {"target": "x86_64-unknown-linux-gnu", "workload": "identical-config"},
+  "measured_sha": "776f2f0f",
+  "baseline_sha": "11223344",
+  "units": {"reload_benchmark": "ratios"},
+  "values": {"reload_benchmark": {"value": {"wall_ratio": 0.98, "cpu_ratio": 1.01, "allocations_ratio": 1.0, "allocations": 10, "baseline_allocations": 10}, "unit": "ratios", "available": true}},
+  "signals": [],
+  "failure": null
+}
