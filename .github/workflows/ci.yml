@@ -5,6 +5,17 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ebpf:
+        description: Run the floor-kernel eBPF gate
+        type: boolean
+        default: true
+      full:
+        description: Run all lanes
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -17,7 +28,112 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ebpf: ${{ steps.filter.outputs.ebpf }}
+      full: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+      ebpf_label: ${{ contains(github.event.pull_request.labels.*.name, 'ci:ebpf') }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'config.dae'
+              - 'config.min.dae'
+              - 'example.dae'
+              - 'ci/**'
+              - '.github/ci/**'
+              - '.github/workflows/**'
+              - 'Justfile'
+              - '.config/**'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+            docs:
+              - '*.md'
+              - '.agents/**'
+              - 'doc/**'
+            ebpf:
+              - 'crates/honk-ebpf*/**'
+              - 'crates/honk-core/src/ebpf/**'
+              - 'crates/honk-core/src/control/routing_matcher/**'
+              - 'crates/honk-core/src/control/routing_matcher.rs'
+              - 'crates/honk-core/build.rs'
+              - 'crates/honk-core/tests/**'
+              - 'crates/honk-nfqueue/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/ci/**'
+              - '.github/workflows/ci.yml'
+      - name: Record lane selection
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FILTER_OUTPUTS: ${{ toJSON(steps.filter.outputs) }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          DISPATCH_INPUTS: ${{ toJSON(inputs) }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const filters = JSON.parse(process.env.FILTER_OUTPUTS);
+            const inputs = JSON.parse(process.env.DISPATCH_INPUTS);
+            const labels = (context.payload.pull_request?.labels ?? []).map(label => label.name);
+            const pr = context.eventName === "pull_request";
+            const push = context.eventName === "push";
+            const dispatch = context.eventName === "workflow_dispatch";
+            const failed = pr && process.env.FILTER_OUTCOME !== "success";
+            const full = labels.includes("ci:full");
+            const code = !pr || failed || filters.code === "true" || full;
+            const floor = push || (dispatch && (inputs.ebpf || inputs.full)) ||
+              (pr && (failed || filters.ebpf === "true" || labels.includes("ci:ebpf") || full));
+            const docs = !pr || failed || filters.code === "true" || filters.docs === "true" || full;
+            const lanes = ["changes"];
+            if (code) lanes.push("lint", "test");
+            if (floor) lanes.push("ebpf");
+            if (docs) lanes.push("docs");
+            if (pr) lanes.push("review-bot");
+            fs.mkdirSync("target/ci-report", { recursive: true });
+            fs.writeFileSync("target/ci-report/selection.json", JSON.stringify({
+              event: context.eventName, inputs, labels,
+              filters: { code: filters.code ?? null, docs: filters.docs ?? null, ebpf: filters.ebpf ?? null },
+              filter_outcome: process.env.FILTER_OUTCOME,
+              intended_lanes: lanes, run_id: context.runId, run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            }, null, 2) + "\n");
+      - name: Upload lane selection
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-selection
+          path: target/ci-report/selection.json
+          retention-days: 30
+          if-no-files-found: error
+
+  docs:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.docs == 'true' || needs.changes.outputs.full == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --include-fragments --hidden '*.md' '.agents/**/*.md' 'doc/**/*.md'
+          fail: true
+
   lint:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
     name: fmt + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -36,6 +152,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          set -euo pipefail
           # The runner image ships Chrome and Microsoft apt sources; a Hash Sum mismatch
           # at either fails apt-get update, and the jobs install nothing from them.
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
@@ -45,6 +162,8 @@ jobs:
       - run: cargo clippy --all --all-targets -- -D warnings
 
   test:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
     name: cargo nextest (workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -65,6 +184,7 @@ jobs:
           tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
@@ -74,6 +194,7 @@ jobs:
       - name: Read geo cache key
         id: geo-pins
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -82,6 +203,7 @@ jobs:
           key: geo-${{ steps.geo-pins.outputs.key }}
       - name: Install geo assets for the geosite tests
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
@@ -106,6 +228,8 @@ jobs:
           path: target/nextest/ci/junit.xml
 
   ebpf:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.ebpf || inputs.full)) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.ebpf == 'true' || needs.changes.outputs.ebpf_label == 'true' || needs.changes.outputs.full == 'true'))) }}
     name: eBPF object + real VM kernel tests
     # These tests attach TC/cgroup programs and therefore cannot run in a job container.
     runs-on: ubuntu-24.04
@@ -115,6 +239,7 @@ jobs:
       - name: Read Rust toolchains
         id: toolchain
         run: |
+          set -euo pipefail
           echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
           echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -134,6 +259,7 @@ jobs:
           cache-directories: target/honk-ebpf-routing-test
       - name: Install build and VM dependencies
         run: |
+          set -euo pipefail
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
@@ -143,6 +269,7 @@ jobs:
             python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
       - name: Configure KVM
         run: |
+          set -euo pipefail
           if test -e /dev/kvm; then
             echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
               sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -158,6 +285,7 @@ jobs:
           echo "HONK_CI_VNG_DISABLE_KVM=1" >> "$GITHUB_ENV"
       - name: Install pinned virtme-ng
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           wheel="$RUNNER_TEMP/${VIRTME_NG_WHEEL_URL##*/}"
           curl -fsSL --retry 3 --retry-all-errors -o "$wheel" "$VIRTME_NG_WHEEL_URL"
@@ -168,6 +296,7 @@ jobs:
           echo "$RUNNER_TEMP/virtme-ng/bin" >> "$GITHUB_PATH"
       - name: Install pinned bpf-linker
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
             "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
@@ -177,6 +306,7 @@ jobs:
       - name: Read download cache keys
         id: pins
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           echo "geo=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
           echo "kernel=$KERNEL_FLOOR_IMAGE_SHA256-$KERNEL_FLOOR_MODULES_SHA256" >> "$GITHUB_OUTPUT"
@@ -186,6 +316,7 @@ jobs:
           key: geo-${{ steps.pins.outputs.geo }}
       - name: Install geo assets for eBPF-feature unit tests
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
@@ -203,10 +334,12 @@ jobs:
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
       - name: Build eBPF object
         run: |
+          set -euo pipefail
           cd crates/honk-ebpf
           cargo build --release -Zbuild-std=core --target bpfel-unknown-none
       - name: Build routing-test eBPF object separately
         run: |
+          set -euo pipefail
           cd crates/honk-ebpf
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test" \
             cargo build --release --features routing-test \
@@ -215,6 +348,7 @@ jobs:
       # here instead of at runtime on a gateway.
       - name: Verify eBPF objects have BTF
         run: |
+          set -euo pipefail
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
@@ -294,6 +428,19 @@ jobs:
               notes.push(
                 "Code changed but neither `AGENTS.md` nor `.agents/rules/` was updated — check whether any documented behavior/convention changed.",
               );
+            }
+            const changedPaths = new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)));
+            const unpaired = [];
+            for (const path of changedPaths) {
+              const peer = path === "README.md" ? "README.zh.md" :
+                path === "README.zh.md" ? "README.md" :
+                path.startsWith("doc/en/") ? path.replace("doc/en/", "doc/zh/") :
+                path.startsWith("doc/zh/") ? path.replace("doc/zh/", "doc/en/") : null;
+              if (peer && !changedPaths.has(peer)) unpaired.push(path);
+            }
+            if (unpaired.length) {
+              notes.push("English/Chinese documentation changed without its paired page — check translation parity: " +
+                unpaired.map(path => `\`${path}\``).join(", ") + ".");
             }
 
             const additions = files.reduce((s, f) => s + f.additions, 0);
