@@ -141,6 +141,8 @@ alive→dead 转换会调用控制面死亡回调，清除该节点的池连接�
 每个节点最近一次真实 TCP 延迟样本每 60 秒写入 `cache.db`；启动时只恢复不超过 24 小时的样本。存活性从不由缓存恢复。合成 10 秒占位样本带有标记，不显示在历史中，不进入移动平均，也不会作为最近真实样本持久化；选择降级由失败 strike 计数承担，与占位样本无关。
 
 `honk-outbound/src/urltest.rs` 统一负责 HTTP 请求构造和测量，URL 解释委托给 `honk-config::check` 的规范解码器。core 与 generation URLTest 还共享显式冷 session 预热，并在创建资源或反馈之前保留可失败的节点准入；独立工具调用保留 handler 内部的 setup 和 CLI 外层 deadline。请求使用不含凭据的 authority，仅保留非默认端口，移除 fragment，并保留原始路径、查询串及点段；仅有查询串的 URL 使用 `/?query`。HTTPS 验证证书并协商 `h2,http/1.1`，禁用 server push。第一轮使用 HEAD，第二轮使用配置方法（delay 测试为 HEAD）；两轮最终响应的解码状态都必须为有效的 200–499。HTTP/1 会在同一轮内消费临时响应头后再读取最终响应，但不支持协议切换；每轮响应头累计上限为 16 KiB。HTTP/2 响应头列表使用相同大小上限。
+HTTP/2 探测连接在首个本地检测到的协议错误时终止，避免后续远端 reset 覆盖已经拒绝的响应头错误并触发首轮样本回退。
+已取消流的记录保留窗口设为每轮超时的两倍，覆盖两轮请求预算，使迟到的合法 warm 流帧仍可被忽略。每次探测最多保留两条流记录；完成或取消时随连接释放，不等待记录过期。
 
 报告值为第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮 I/O 失败或超时可以回退到已验证的第一轮样本；HTTP/1 要求尚未收到响应字节，HTTP/2 还将正常 GOAWAY 和远端 `REFUSED_STREAM` 视为传输失败。畸形、截断、过大或部分接收后超时的 HTTP/1 响应头会失败。只复用已经预热或无状态的 generation runtime；冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放。session 准备、拨号、TLS、HTTP/2 启动与每轮请求分别使用阶段预算；core 仍单独保留配置的连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。健康调度与记账仍由 `alive` 负责；只有 delay 包装层写入拨号失败 strike，组 delay 并发上限仍为 10。
 

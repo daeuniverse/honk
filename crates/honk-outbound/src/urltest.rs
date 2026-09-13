@@ -559,9 +559,7 @@ impl Drop for H2Driver {
 }
 
 fn h2_round_error(error: h2::Error, context: &'static str) -> RoundError {
-    // A remote REFUSED_STREAM means the request was not processed (RFC 9113
-    // §8.7), so it says nothing about the response; the local refusal h2
-    // raises for an oversized header list is not remote and stays invalid.
+    // A remote REFUSED_STREAM means the request was not processed (RFC 9113 §8.7).
     let refused =
         error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::REFUSED_STREAM);
     let transport = error.is_io()
@@ -635,6 +633,11 @@ where
         timeout,
         h2::client::Builder::new()
             .enable_push(false)
+            // Fail this disposable connection on its first local protocol rejection,
+            // before a remote reset can overwrite the error.
+            .max_local_error_reset_streams(Some(0))
+            // Cover both request budgets so late warm-stream frames stay ignorable.
+            .reset_stream_duration(timeout.saturating_mul(2))
             .max_header_list_size(MAX_HTTP_RESPONSE_HEAD as u32)
             .handshake(stream),
     )
@@ -1057,6 +1060,8 @@ mod resolver_hook_tests {
 
 #[cfg(test)]
 mod tests {
+    mod http2;
+
     use super::*;
     use crate::proxy::ProxyStream;
     use honk_config::types::NodeProtocol;
@@ -1598,255 +1603,6 @@ mod tests {
                 .is_err()
             );
         }
-    }
-
-    #[tokio::test]
-    async fn h2_uses_configured_method_target_and_authority() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (observed, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let mut connection = h2::server::handshake(sock).await.unwrap();
-            while let Some(result) = connection.accept().await {
-                let (request, mut respond) = result.unwrap();
-                let push = http::Request::builder()
-                    .uri("http://probe.example/pushed")
-                    .body(())
-                    .unwrap();
-                assert!(
-                    respond.push_request(push).is_err(),
-                    "probes must refuse server push"
-                );
-                observed
-                    .send((request.method().clone(), request.uri().clone()))
-                    .unwrap();
-                let response = http::Response::builder().status(204).body(()).unwrap();
-                respond.send_response(response, true).unwrap();
-            }
-        });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let request =
-            http_probe_request("http://probe.example:8080?source=urltest", "GET").unwrap();
-        exchange_http2(stream, &request, &no_feedback(), Duration::from_secs(5))
-            .await
-            .expect("HTTP/2 exchange must succeed");
-
-        let first = requests.recv().await.unwrap();
-        let second = requests.recv().await.unwrap();
-        assert_eq!(first.0, http::Method::HEAD);
-        assert_eq!(second.0, http::Method::GET);
-        for (_, uri) in [first, second] {
-            assert_eq!(uri.authority().unwrap().as_str(), "probe.example:8080");
-            assert_eq!(uri.path_and_query().unwrap().as_str(), "/?source=urltest");
-        }
-    }
-
-    #[tokio::test]
-    async fn h2_rejects_bad_warm_status() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let mut connection = h2::server::handshake(sock).await.unwrap();
-            let mut first = true;
-            while let Some(request) = connection.accept().await {
-                let (_request, mut respond) = request.unwrap();
-                let status = if first { 500 } else { 204 };
-                first = false;
-                respond
-                    .send_response(
-                        http::Response::builder().status(status).body(()).unwrap(),
-                        true,
-                    )
-                    .unwrap();
-            }
-        });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-        assert!(
-            exchange_http2(stream, &request, &no_feedback(), Duration::from_secs(1))
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn h2_falls_back_only_for_remote_refused_stream() {
-        for (reason, healthy) in [
-            (h2::Reason::REFUSED_STREAM, true),
-            (h2::Reason::INTERNAL_ERROR, false),
-        ] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let peer = tokio::spawn(async move {
-                let (sock, _) = listener.accept().await.unwrap();
-                let mut connection = h2::server::handshake(sock).await.unwrap();
-                let mut first = true;
-                while let Some(request) = connection.accept().await {
-                    let (_request, mut respond) = request.unwrap();
-                    if first {
-                        first = false;
-                        respond
-                            .send_response(
-                                http::Response::builder().status(204).body(()).unwrap(),
-                                true,
-                            )
-                            .unwrap();
-                    } else {
-                        respond.send_reset(reason);
-                    }
-                }
-            });
-            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-            let result =
-                exchange_http2(stream, &request, &no_feedback(), Duration::from_secs(1)).await;
-            peer.abort();
-            let _ = peer.await;
-            assert_eq!(result.is_ok(), healthy, "RST_STREAM({reason}): {result:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn h2_falls_back_only_for_graceful_goaway() {
-        for (reason, healthy) in [(0_u32, true), (1, false)] {
-            let (client, mut server) = tokio::io::duplex(4096);
-            let peer = tokio::spawn(async move {
-                let mut preface = [0; 24];
-                server.read_exact(&mut preface).await.unwrap();
-                server
-                    .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
-                    .await
-                    .unwrap();
-                loop {
-                    let mut header = [0; 9];
-                    server.read_exact(&mut header).await.unwrap();
-                    let length = ((header[0] as usize) << 16)
-                        | ((header[1] as usize) << 8)
-                        | header[2] as usize;
-                    let mut payload = vec![0; length];
-                    server.read_exact(&mut payload).await.unwrap();
-                    if header[3] == 4 && header[4] == 0 {
-                        server
-                            .write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0])
-                            .await
-                            .unwrap();
-                    }
-                    if header[3] == 1 {
-                        // Deliver :status 204 and GOAWAY together, before stream 3 can open.
-                        let mut frames = vec![
-                            0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89, 0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                        ];
-                        frames.extend_from_slice(&reason.to_be_bytes());
-                        server.write_all(&frames).await.unwrap();
-                        std::future::pending::<()>().await;
-                    }
-                }
-            });
-            let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-            let result =
-                exchange_http2(client, &request, &no_feedback(), Duration::from_secs(1)).await;
-            peer.abort();
-            let _ = peer.await;
-            assert_eq!(result.is_ok(), healthy, "GOAWAY({reason}): {result:?}");
-        }
-    }
-
-    struct DropWatch<S> {
-        stream: S,
-        dropped: Arc<std::sync::atomic::AtomicBool>,
-        block_writes: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl<S> Drop for DropWatch<S> {
-        fn drop(&mut self) {
-            self.dropped
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    impl<S: AsyncRead + Unpin> AsyncRead for DropWatch<S> {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            context: &mut std::task::Context<'_>,
-            buffer: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.get_mut().stream).poll_read(context, buffer)
-        }
-    }
-
-    impl<S: AsyncWrite + Unpin> AsyncWrite for DropWatch<S> {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            context: &mut std::task::Context<'_>,
-            buffer: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            if self.block_writes.load(std::sync::atomic::Ordering::Acquire) {
-                return std::task::Poll::Pending;
-            }
-            std::pin::Pin::new(&mut self.get_mut().stream).poll_write(context, buffer)
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            if self.block_writes.load(std::sync::atomic::Ordering::Acquire) {
-                return std::task::Poll::Pending;
-            }
-            std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(context)
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            if self.block_writes.load(std::sync::atomic::Ordering::Acquire) {
-                return std::task::Poll::Pending;
-            }
-            std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelling_stalled_h2_probe_drops_its_driver_stream() {
-        let (client, server) = tokio::io::duplex(4096);
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let block_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watched = DropWatch {
-            stream: client,
-            dropped: Arc::clone(&dropped),
-            block_writes: Arc::clone(&block_writes),
-        };
-        let (accepted, accepted_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut connection = h2::server::handshake(server).await.unwrap();
-            let (_request, _respond) = connection.accept().await.unwrap().unwrap();
-            let _ = accepted.send(());
-            let _held = (connection, _request, _respond);
-            std::future::pending::<()>().await;
-        });
-        let probe = tokio::spawn(async move {
-            let request = http_probe_request("http://probe.example/stall", "HEAD").unwrap();
-            exchange_http2(watched, &request, &no_feedback(), Duration::from_secs(5)).await
-        });
-        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        block_writes.store(true, std::sync::atomic::Ordering::Release);
-        probe.abort();
-        let _ = probe.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled HTTP/2 driver must release its stream");
-        server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
