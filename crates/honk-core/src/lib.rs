@@ -1093,6 +1093,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config.dns,
         &geo_sources,
     )?);
+    drop(geo_sources);
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(

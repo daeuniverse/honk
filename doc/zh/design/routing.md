@@ -64,6 +64,8 @@ native-direct 与已有流缓存路径保持原生执行。
   以及 `BinaryLpmTrie`/Geo 资源辅助代码。`geo.rs` 在每次构建 `Router` 时只解析
   一次 `geoip.dat`/`geosite.dat`，且只解码被引用的类别。`category@attr` 在首个
   `@` 处分隔，并以不区分大小写的方式筛选属性键。
+  启动时，流量路由与 DNS 路由共用同一份 Geo 资源快照；两者完成编译后即释放
+  原始资源快照，已编译的 matcher 与指纹仍由各自的 router 持有。
 - [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs)
   把 IR 编译为 `RoutingPushPlan`，不修改 map。
   [`crates/honk-core/src/ebpf/real/routing.rs`](../../../crates/honk-core/src/ebpf/real/routing.rs)

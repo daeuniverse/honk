@@ -77,6 +77,9 @@ predicate ID within one policy.
   `geoip.dat`/`geosite.dat` once per `Router` build and decodes only referenced
   codes; `category@attr` splits at the first `@` and filters attribute keys
   case-insensitively.
+  Startup uses one captured Geo source set for both traffic and DNS compilation
+  and drops it after both routers are built; compiled matchers and fingerprints
+  remain owned by the routers.
 - [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs) —
   compiles the IR into `RoutingPushPlan` and has no map side effects.
   [`crates/honk-core/src/ebpf/real/routing.rs`](../../../crates/honk-core/src/ebpf/real/routing.rs)
