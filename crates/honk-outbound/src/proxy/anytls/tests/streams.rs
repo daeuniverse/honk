@@ -387,6 +387,106 @@ async fn test_poll_write_cancel_safety() {
     assert_eq!(echoed, want);
 }
 
+/// The writer queue is bounded in payload bytes as well as frames: with the
+/// byte budget spent, a write waits even though frame slots are free, and
+/// resumes once enough bytes are released.
+#[tokio::test]
+async fn test_writer_queue_byte_budget_backpressures_writes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (session, mut server) = establish_test_session("127.0.0.1:445").await;
+    expect_handshake(&mut server).await;
+    let mut addr_rx = spawn_echo_server(server);
+    let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
+    let permit = session.try_reserve().unwrap();
+    let mut stream = session.open_stream_direct(target, permit).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+        .await
+        .unwrap();
+
+    let payload = vec![0x5a; 4096];
+    let bytes = Arc::clone(&session.writer_q.data_bytes);
+    // Leave fewer bytes than one payload; frame slots stay untouched.
+    let hog = Arc::clone(&bytes)
+        .acquire_many_owned((WRITER_DATA_BYTES_CAP - payload.len() + 1) as u32)
+        .await
+        .unwrap();
+    assert!(session.writer_q.data_permits.available_permits() > 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.write(&payload))
+            .await
+            .is_err()
+    );
+
+    drop(hog);
+    tokio::time::timeout(Duration::from_secs(2), stream.write_all(&payload))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed, payload);
+}
+
+/// A write that waited for bytes and then got in through the fast path must
+/// not keep its waiter's reservation: once the frame has flushed, the whole
+/// byte budget is available again without the stream flushing or closing.
+#[tokio::test]
+async fn test_fast_path_retry_releases_the_waiters_reservation() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (session, mut server) = establish_test_session("127.0.0.1:446").await;
+    expect_handshake(&mut server).await;
+    let mut addr_rx = spawn_echo_server(server);
+    let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
+    let permit = session.try_reserve().unwrap();
+    let mut stream = session.open_stream_direct(target, permit).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+        .await
+        .unwrap();
+
+    let payload = vec![0x3c; 4096];
+    let bytes = Arc::clone(&session.writer_q.data_bytes);
+    let hog = Arc::clone(&bytes)
+        .acquire_many_owned((WRITER_DATA_BYTES_CAP - payload.len() + 1) as u32)
+        .await
+        .unwrap();
+    // The write parks a waiter for the payload's bytes.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.write(&payload))
+            .await
+            .is_err()
+    );
+    // Releasing everything lets the waiter be served and leaves room for the
+    // retry's own fast-path acquisition.
+    drop(hog);
+    tokio::time::timeout(Duration::from_secs(2), stream.write_all(&payload))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed, payload);
+
+    // The frame has flushed; nothing on this idle stream may still hold bytes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while bytes.available_permits() != WRITER_DATA_BYTES_CAP {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} of {} bytes still reserved after the flush",
+            WRITER_DATA_BYTES_CAP - bytes.available_permits(),
+            WRITER_DATA_BYTES_CAP
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_cancelled_write_does_not_send_or_count_its_bytes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

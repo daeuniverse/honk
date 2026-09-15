@@ -146,6 +146,13 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadCounter<S> 
 /// [`splice::DRAIN_DEADLINE`] for why the drain must be bounded.
 const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 
+/// Upper bound of one relay read. Framed writers cap a frame at `u16::MAX`
+/// bytes (AnyTLS, `AnyTlsStream::poll_write`), and `copy_buf` hands the
+/// whole buffer to `poll_write`: a 65,536-byte buffer therefore became a
+/// 65,535-byte frame plus a 1-byte frame on every full read — half of all
+/// frames one byte, each with its own allocation, queue slot and header.
+pub(crate) const RELAY_BUF_SIZE: usize = u16::MAX as usize;
+
 /// Copy one direction until EOF, then half-close the destination's write
 /// side (same contract as `copy_bidirectional`). Bytes read are counted
 /// into `progress` so the drain supervisor can tell a stalled survivor
@@ -159,7 +166,6 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    const RELAY_BUF_SIZE: usize = 64 * 1024;
     let mut br =
         tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, ReadCounter::wrap(rd, progress, None));
     let n = tokio::io::copy_buf(&mut br, wr).await?;
@@ -284,6 +290,63 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// A writer that frames at `u16::MAX`, the way `AnyTlsStream` does.
+    struct FrameSink(Vec<usize>);
+
+    impl AsyncWrite for FrameSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let chunk = buf.len().min(u16::MAX as usize);
+            self.0.push(chunk);
+            std::task::Poll::Ready(Ok(chunk))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A saturated source fills the relay buffer on every read; with a
+    /// 64 KiB buffer that produced a 65,535-byte frame and a 1-byte frame
+    /// per read (half of all frames one byte). One relay read is now at
+    /// most one frame.
+    #[tokio::test]
+    async fn saturated_relay_reads_do_not_split_into_one_byte_frames() {
+        let (mut tx, rx) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            let block = vec![0u8; 1 << 20];
+            for _ in 0..4 {
+                tx.write_all(&block).await.unwrap();
+            }
+        });
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sink = FrameSink(Vec::new());
+        let mut rx = rx;
+        let n = copy_way(&mut rx, &mut sink, progress).await.unwrap();
+        assert_eq!(n, 4 << 20);
+        // The duplex source writes 1 MiB blocks, so a short read can still
+        // happen at a block boundary; before the fix half of all frames were
+        // one byte (64 of 128 here).
+        let tiny = sink.0.iter().filter(|&&s| s <= 64).count();
+        assert!(
+            tiny * 10 < sink.0.len(),
+            "{tiny} tiny frames of {}: {:?}",
+            sink.0.len(),
+            &sink.0[..8.min(sink.0.len())]
+        );
+    }
 
     /// Test that relay_tcp correctly passes data bidirectionally.
     #[tokio::test]

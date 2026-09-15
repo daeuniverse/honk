@@ -610,9 +610,17 @@ last owner release drains future reuse without terminating live streams.
 ### Ordered write path
 
 Every frame crosses one `WriterQueue` and one physical writer task. Data uses
-bounded permits, control frames retain reserved headroom, and the whole queue is
-capped at 1,024 frames. Queue exhaustion or push-after-close makes the session terminal instead of
-growing memory. A stream's SYN and first PSH are inserted as one atomic batch,
+bounded permits in two units — 896 frames and 8 MiB of queued or in-flight
+payload per session, whichever fills first; a full budget backpressures the
+writing stream — control frames retain reserved headroom, and the whole queue
+is capped at 1,024 commands. The byte budget is what bounds queued payload: a
+frame carries up to 65,535 bytes, so frames alone allowed 56 MiB per session,
+which a line-rate upload fills. It does not count a stream's unqueued slot,
+a UoT packet before its permit, or the encoded batch buffer. Exhausting the
+1,024-command queue or a push after close makes the session terminal instead
+of growing memory. The relay reads at most 65,535 bytes at a time, so one
+nonempty read is at most one AnyTLS frame; a 64 KiB read became a
+65,535-byte frame and a 1-byte frame. A stream's SYN and first PSH are inserted as one atomic batch,
 so another stream cannot interleave between them.
 Abandoned mid-open registrations send FIN rather than killing the session.
 

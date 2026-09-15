@@ -169,8 +169,15 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
 async fn test_writer_batch_encoding_matches_sequential_frames() {
     let q = WriterQueue::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(2));
-    let p1 = sem.clone().acquire_owned().await.unwrap();
-    let p2 = sem.clone().acquire_owned().await.unwrap();
+    let bytes = Arc::new(tokio::sync::Semaphore::new(16));
+    let p1 = DataPermit {
+        _frame: sem.clone().acquire_owned().await.unwrap(),
+        _bytes: bytes.clone().acquire_many_owned(5).await.unwrap(),
+    };
+    let p2 = DataPermit {
+        _frame: sem.clone().acquire_owned().await.unwrap(),
+        _bytes: bytes.clone().acquire_many_owned(5).await.unwrap(),
+    };
     assert!(
         q.push_batch([
             FrameCommand::Control {

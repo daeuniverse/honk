@@ -508,9 +508,17 @@ UDP warm 所有权分别提高有效保留值；最后一个所有者释放时�
 
 ### 有序 write 路径
 
-所有 frame 都通过一个 `WriterQueue` 与一个物理 writer task。Data 使用有界
-permit，control frame 保留 queue headroom，整个 queue 封顶 1,024 个 frame。
-queue 耗尽时 session 会转为 terminal，而不会继续增长内存。stream 的 SYN 与
+所有 frame 都通过一个 `WriterQueue` 与一个物理 writer task。Data 使用两种单位的有界
+permit：每个 session 896 个 frame 与 8 MiB 已排队或在途的 payload，先满者生效，预算
+用尽时写入的 stream 被反压；control frame 保留 queue headroom，整个 queue 封顶
+1,024 条命令。1,024 条命令的 queue 耗尽或关闭后再 push 时 session 会转为 terminal，
+而不会继续增长内存。
+
+限制排队 payload 的是字节预算：一个 frame 最多 65,535 字节，只按 frame 计数时一个
+session 可以排队 56 MiB，线速上传会把它填满。预算不计 stream 尚未入队的 slot、取得
+permit 之前的 UoT 包与编码后的 batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
+最多对应一个 AnyTLS frame；原先读 64 KiB 会变成一个 65,535 字节的 frame 加一个
+1 字节的 frame。stream 的 SYN 与
 第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。
 
 完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 63

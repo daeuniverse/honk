@@ -179,7 +179,10 @@ impl AnyTlsUotTransport {
             };
         };
 
-        let permit = self.session.acquire_data_permit().await?;
+        let permit = self
+            .session
+            .acquire_data_permit(request.len() + packet.len())
+            .await?;
         self.session.ensure_stream_registered(self.sid)?;
         let mut payload = bytes::BytesMut::with_capacity(request.len() + packet.len());
         payload.extend_from_slice(request);
