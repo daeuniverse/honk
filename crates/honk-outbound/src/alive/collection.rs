@@ -1,8 +1,8 @@
-//! Per-node-per-domain health tracking: Latencies10 + MovingAverage + Alive.
+//! Per-node-per-domain latency and dial-failure tracking.
 
 use super::latencies::{LatencySample, SyncLatencies10};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) const TIMEOUT_LATENCY: Duration = Duration::from_secs(10);
@@ -66,7 +66,6 @@ impl FailureState {
 pub(crate) struct DialerCollection {
     pub latencies: SyncLatencies10,
     pub moving_average: Mutex<Duration>,
-    pub alive: AtomicBool,
     failure_state: Mutex<FailureState>,
     traffic_ema_nanos: AtomicU64,
     traffic_samples: AtomicU8,
@@ -78,7 +77,6 @@ impl DialerCollection {
         Self {
             latencies: SyncLatencies10::new(10),
             moving_average: Mutex::new(Duration::ZERO),
-            alive: AtomicBool::new(true),
             failure_state: Mutex::new(FailureState::default()),
             traffic_ema_nanos: AtomicU64::new(0),
             traffic_samples: AtomicU8::new(0),
@@ -99,7 +97,6 @@ impl DialerCollection {
         let mut failure = self.failure_state.lock();
         self.latencies.append(LatencySample::real(latency));
         self.update_moving_average(latency);
-        self.alive.store(true, Ordering::Release);
         // Demotion clears only after max(strikes, STRIKE_CLEAR_SUCCESSES)
         // consecutive real successes — a fast-but-flaky node cannot reclaim
         // rank with one lucky probe.
@@ -112,7 +109,6 @@ impl DialerCollection {
         // average; the failure strike owns ranking demotion.
         self.latencies
             .append(LatencySample::synthetic(TIMEOUT_LATENCY));
-        self.alive.store(false, Ordering::Release);
     }
 
     pub(crate) fn mark_unavailable(&self) {
@@ -124,7 +120,6 @@ impl DialerCollection {
     /// liveness counters own exclusion; dial failures alone own demotion.
     pub(crate) fn mark_probe_unavailable(&self) {
         let mut failure = self.failure_state.lock();
-        self.alive.store(false, Ordering::Release);
         failure.clear_progress = 0;
     }
 

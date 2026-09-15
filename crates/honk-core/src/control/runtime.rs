@@ -691,16 +691,22 @@ impl ControlPlane {
                     Arc::new(move |host: String, port: u16| {
                         let controller = controller.clone();
                         Box::pin(async move {
-                            controller
-                                .resolve_domain(&host)
-                                .await
-                                .into_iter()
-                                .map(|ip| std::net::SocketAddr::new(ip, port))
-                                .collect()
+                            controller.resolve_domain(&host).await.map(|addresses| {
+                                addresses
+                                    .into_iter()
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
+                            })
                         })
                     })
                 };
-                let dns_target = resolve_udp_check_target(&dns_raw, Some(resolver.clone())).await;
+                let dns_probe = UdpDnsProbeTarget::new(dns_raw, Some(resolver.clone()));
+                match tokio::time::timeout(check_timeout, dns_probe.resolve()).await {
+                    Ok(Ok((target, _))) => info!("UDP health check enabled (dns={})", target),
+                    _ => info!(
+                        "UDP DNS health target initialization deferred to later health checks"
+                    ),
+                }
                 let quic_score_target = if quic_url.is_empty() {
                     None
                 } else {
@@ -711,12 +717,10 @@ impl ControlPlane {
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
                     self.stats.clone(),
-                    dns_target,
-                    udp_probe_identity(&dns_raw, dns_target),
+                    dns_probe,
                     quic_score_target,
                     self.group_manager.clone(),
                 )));
-                info!("UDP health check enabled (dns={})", dns_target);
             }
 
             info!(
@@ -771,10 +775,10 @@ impl ControlPlane {
                     interval.tick().await;
                     let generation = runtime_registry.read().clone();
                     let now = std::time::Instant::now();
-                    let evicted = generation.reap_tls_connectors(now)
-                        + dns_runtime.acquire().runtime().reap_tls_connectors(now);
+                    let evicted = generation.reap_idle_resources(now)
+                        + dns_runtime.acquire().runtime().reap_idle_resources(now);
                     if evicted > 0 {
-                        debug!(evicted, "released idle outbound TLS connectors");
+                        debug!(evicted, "released idle outbound resources");
                     }
                 }
             });

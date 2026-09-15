@@ -2,9 +2,10 @@
 //!
 //! Two entry kinds, both capped at 8 per key and 300s max age:
 //!
-//! - **Bare** — a pre-handshake `TcpStream` to the proxy server (60s idle
-//!   TTL), keyed by the server's `"host:port"` and reused via
-//!   `TcpOutbound::dial_with_tcp`. Saves the TCP connect RTT only.
+//! - **Bare** — a silent pre-handshake `TcpStream` to the proxy server (60s
+//!   idle TTL), keyed by the server's `"host:port"` and reused via
+//!   `TcpOutbound::dial_with_tcp`. Saves the TCP connect RTT only; any queued
+//!   server byte makes it unsafe to present as a fresh protocol transport.
 //! - **Ready** — a fully-dialed `ProxyStream` whose protocol handshake is
 //!   complete (SOCKS5 CONNECT done, Trojan TLS + request header written),
 //!   reused *directly* as the data channel with no handshake at all.
@@ -182,7 +183,7 @@ pub struct ReadyPoolMetrics {
     pub entries: u64,
 }
 
-pub(crate) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
+fn is_bare_tcp_stream_usable(stream: &TcpStream) -> bool {
     if !matches!(
         nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::SocketError),
         Ok(0)
@@ -195,10 +196,8 @@ pub(crate) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
         &mut buf,
         nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT,
     ) {
-        Ok(0) => false,
-        Ok(_) => true,
-        Err(nix::errno::Errno::ECONNRESET | nix::errno::Errno::ENOTCONN) => false,
-        Err(_) => true,
+        Err(nix::errno::Errno::EWOULDBLOCK) => true,
+        Ok(_) | Err(_) => false,
     }
 }
 
@@ -376,9 +375,17 @@ impl ConnectionPool {
         acquired
     }
 
-    pub(crate) async fn deposit_tcp(&self, addr: &str, stream: TcpStream) {
+    /// Pool a silent pre-handshake socket. Any queued server bytes make the
+    /// socket unusable as a fresh protocol transport and are left unconsumed.
+    /// Returns whether the socket satisfied that invariant; capacity refusal
+    /// retains the historical successful-connect accounting at callers.
+    pub(crate) async fn deposit_tcp(&self, addr: &str, stream: TcpStream) -> bool {
+        if !is_bare_tcp_stream_usable(&stream) {
+            return false;
+        }
         self.deposit_entry(addr, PooledStream::Bare(stream), None)
             .await;
+        true
     }
 
     /// Whether a live, unexpired bare-TCP entry exists for `addr`
@@ -612,7 +619,7 @@ impl ConnectionPool {
 
     fn is_entry_alive(entry: &TimedStream) -> bool {
         match &entry.stream {
-            PooledStream::Bare(tcp) => is_tcp_stream_alive(tcp),
+            PooledStream::Bare(tcp) => is_bare_tcp_stream_usable(tcp),
             PooledStream::Ready(stream) => Self::is_ready_stream_alive(stream),
         }
     }
@@ -739,6 +746,37 @@ mod tests {
             }
         });
         addr
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    async fn wait_for_queued_byte(fd: std::os::fd::RawFd) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut byte = [0u8; 1];
+                if matches!(
+                    nix::sys::socket::recv(
+                        fd,
+                        &mut byte,
+                        nix::sys::socket::MsgFlags::MSG_PEEK
+                            | nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+                    ),
+                    Ok(1)
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer byte did not reach the pooled socket");
     }
 
     #[tokio::test]
@@ -1192,6 +1230,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bare_pool_rejects_unsolicited_bytes_at_admission_checkout_and_warm_gauge() {
+        const TLS_FATAL_ALERT: &[u8] = &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x50];
+        let pool = ConnectionPool::new();
+
+        let (checkout, mut checkout_server) = tcp_pair().await;
+        let checkout_fd = checkout.as_raw_fd();
+        assert!(pool.deposit_tcp("checkout", checkout).await);
+        checkout_server.write_all(TLS_FATAL_ALERT).await.unwrap();
+        // The peer remains open: rejection must come from the queued bytes,
+        // not an orderly shutdown.
+        wait_for_queued_byte(checkout_fd).await;
+        assert!(
+            pool.acquire_tcp("checkout").await.is_none(),
+            "checkout must not expose a bare socket with queued bytes"
+        );
+
+        let (warm, mut warm_server) = tcp_pair().await;
+        let warm_fd = warm.as_raw_fd();
+        assert!(pool.deposit_tcp("warm", warm).await);
+        warm_server.write_all(TLS_FATAL_ALERT).await.unwrap();
+        wait_for_queued_byte(warm_fd).await;
+        assert!(
+            !pool.has_live_bare_entry("warm"),
+            "the warm gauge must purge a bare socket with queued bytes"
+        );
+
+        let (admission, mut admission_server) = tcp_pair().await;
+        let admission_fd = admission.as_raw_fd();
+        admission_server.write_all(TLS_FATAL_ALERT).await.unwrap();
+        wait_for_queued_byte(admission_fd).await;
+        assert!(
+            !pool.deposit_tcp("admission", admission).await,
+            "pool admission must reject a bare socket with queued bytes"
+        );
+
+        let (ready, mut ready_server) = tcp_pair().await;
+        let ready_fd = ready.as_raw_fd();
+        let target = "192.0.2.1:443".parse().unwrap();
+        let key = ConnectionPool::ready_key(1, Uuid::from_u128(1), target, None);
+        pool.deposit_ready(1, &key, make_ready_stream(ready, target))
+            .await;
+        ready_server.write_all(b"READY").await.unwrap();
+        wait_for_queued_byte(ready_fd).await;
+        let mut ready = pool
+            .acquire_ready(&key)
+            .await
+            .expect("ready streams may carry buffered target data");
+        let mut payload = [0u8; 5];
+        ready.stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"READY");
+
+        assert_eq!(pool.ready_metrics().entries, 0);
+        pool.check_invariants();
+    }
+
+    #[tokio::test]
     async fn test_pool_bare_dead_fin_evicted() {
         let pool = ConnectionPool::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1203,13 +1297,13 @@ mod tests {
         let tcp = TcpStream::connect(server_addr).await.unwrap();
 
         for _ in 0..100 {
-            if !is_tcp_stream_alive(&tcp) {
+            if !is_bare_tcp_stream_usable(&tcp) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !is_tcp_stream_alive(&tcp),
+            !is_bare_tcp_stream_usable(&tcp),
             "MSG_PEEK never observed the peer FIN"
         );
         pool.deposit_tcp("proxy.example:1080", tcp).await;

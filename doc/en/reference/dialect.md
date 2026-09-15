@@ -40,6 +40,8 @@ honk reads dae configuration syntax as a dialect: where honk and dae interpret t
 | `'url'(User-Agent)` after a subscription link | not in the grammar | honk extension: the parenthesised text is the User-Agent; a `#` after a space inside unquoted parentheses ends the line, so quote such a User-Agent. |
 | A subscription block, `paid: {` followed by `url: …`, `ua: …`, `interval: …` on their own lines and `}` | `ID ':' '{'` is not a declaration | honk extension: the block form of a subscription; its settings are one per line like any block. |
 | A bare tag with a space before the colon in `node`, `edge : 'socks5://…'` | tag `edge` | Whitespace around the colon is normalized: the node is retained with tag `edge` and an `entry-tag-normalized` informational diagnostic. `edge: …` and quoted tags remain accepted. |
+| `vless_mode` in a VLESS share link or flattened serialized VLESS node | legacy VLESS mode selector | Removed, not an accepted alias. Share links must use independent `udp=`, `packetEncoding=`, and `mux=` queries. A flattened VLESS node rejects any `vless_mode` presence, including `null`, and uses `network`, `packet_encoding`, and `multiplex` instead. |
+| `vless_mode: legacy` on a flattened serialized non-VLESS node | legacy VLESS field outside VLESS | Compatibility placeholder emitted and consumed by the wire adapter only; it does not select behavior. It is the sole non-VLESS serialization exception, not documented dae or share-link syntax. |
 
 ## Routing
 

@@ -279,6 +279,59 @@ mod node_collection_admission {
     }
 
     #[test]
+    fn incompatible_vless_fields_report_once_without_changing_node_identity() {
+        use honk_config::diagnostic::{DiagnosticSources, SettingPath};
+        use honk_config::node::NodeSeed;
+        use serde::de::DeserializeSeed as _;
+        use serde_json::json;
+
+        let canonical = canonical_socks5_node();
+        let base = serde_json::to_value(&canonical).unwrap();
+        for (fields, expected) in [
+            (json!({}), vec![]),
+            (json!({"packet_encoding": null, "multiplex": null}), vec![]),
+            (
+                json!({"packet_encoding": "auto", "multiplex": {"protocol": "off"}}),
+                vec![],
+            ),
+            (
+                json!({"packet_encoding": "xudp", "multiplex": {"protocol": "xray", "tcp": 8}, "tls": true}),
+                vec!["multiplex", "packet_encoding", "tls"],
+            ),
+        ] {
+            let mut input = base.clone();
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let mut diagnostics = Vec::new();
+            let node = NodeSeed {
+                diagnostics: &mut diagnostics,
+                source: DiagnosticSources::new(None).root(),
+                setting: SettingPath::new("nodes").index(1),
+            }
+            .deserialize(input)
+            .unwrap();
+            assert_eq!(node.id, canonical.id);
+            assert_eq!(node.outbound, canonical.outbound);
+            if expected.is_empty() {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            } else {
+                assert_eq!(diagnostics.len(), 1);
+                let diagnostic = &diagnostics[0];
+                assert_eq!(diagnostic.code, "incompatible-node-fields");
+                assert_eq!(diagnostic.setting.to_string(), "nodes[1]");
+                assert!(!diagnostic.terminal);
+                let SafeValue::Fields(mut fields) = diagnostic.value.clone() else {
+                    panic!("discarded fields must be safe schema names");
+                };
+                fields.sort_unstable();
+                assert_eq!(fields, expected);
+            }
+        }
+    }
+
+    #[test]
     fn c20_config_admission_preserves_canonical_identity() {
         let canonical = canonical_socks5_node();
         let config = Config {

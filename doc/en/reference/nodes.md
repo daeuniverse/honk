@@ -23,7 +23,7 @@ An absent or empty VMess JSON `ps` remark uses `vmess-{host}` before validation.
 
 In quoted tags and links, a backslash escapes the next character when locating the closing quote; the source escape is retained in the parsed text.
 
-A malformed recognized link is dropped with an `invalid-node-entry` diagnostic using the original node-entry ordinal, never the link or node name. Data entrypoints return it without logging; plain entrypoints report it once. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
+A malformed recognized link is dropped with a warning. Known invalid fields retain a specific safe reason and schema path; unknown parse failures use `invalid-node-entry`. Diagnostics carry the original node-entry ordinal and source location, never the raw link, value, or node name. Data entrypoints return them without logging; plain entrypoints report them once. An unknown scheme or removed VLESS `vless_mode` is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS packet and carrier choices belong in that link's exact `packetEncoding=`, `mux=`, and `udp=` query parameters.
 
 In the legacy `ss://base64(method:password@host:port)` form, decoded credentials are literal text, not URL-decoded: `%20` stays `%20`, and `?`, `/`, `#`, `:` and `@` remain password characters. The last `@` separates the endpoint; the userinfo may itself be `base64(method:password)`. A decoded payload without `@`, or credentials that cannot supply a method and password, is rejected. URL userinfo forms still percent-decode their credentials. The endpoint, path, query (including `/?plugin=...`) and fragment keep the usual URL handling.
 
@@ -35,13 +35,15 @@ In the legacy `ss://base64(method:password@host:port)` form, decoded credentials
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-The credential fingerprint follows each handler's field precedence. The legacy dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and every non-`legacy` VLESS mode. Nonempty structured `tls_alpn` derives a child UUID v5 using the legacy ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains legacy IDs. Tuning and display metadata do not participate.
+The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and the effective VLESS UDP permission, fallback encoding, and multiplex paths. Nonempty structured `tls_alpn` derives a child UUID v5 using the base ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains the base ID. Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
 
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
-At this upgrade, a node with `|` or `\` in one of these pipe-joined identity fields receives a new ID once; its ID-keyed health and warm state starts fresh. Nodes without either character in those fields retain their IDs. ALPN uses the separate JSON child-UUID step, so `|` or `\` in ALPN alone does not change an existing ID at this upgrade. Selector choices migrate by member name, pooled ready streams already retire per generation, and `name`/`subtag` filters are unaffected.
+**Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. Other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
 
-Identity is therefore stable across rename, reload, and subscription refresh when the dialable endpoint is unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
+Do not delete the cache to migrate IDs. With persistence enabled and readable, unchanged group/member names can restore Selector choices, and valid TCP-v4 delay samples no older than 24 hours are re-keyed by node name at startup. These samples seed ranking, not liveness; renamed or ambiguous duplicate names do not guarantee the same leaf. Ready streams already retire with their generation, and `name`/`subtag` filter semantics are unchanged.
+
+Identity is stable across rename, reload, and subscription refresh when the dialable endpoint and dial shape are unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
 
 ## Node fields
 
@@ -57,7 +59,8 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `port` | u16 | `0` | Server port; URL-shaped links use `443` when omitted |
 | `username` / `password` | string? | null | Authentication, UUID, or secret from userinfo |
 | `encryption` | string? | null | SS/VMess cipher or VLESS Encryption client string |
-| `vless_mode` | `WireMode` | `legacy` | `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, or `mux-cool` |
+| `packet_encoding` | `VlessUdpEncoding` | `auto` for VLESS | Structured VLESS fallback encoding: `auto`, `native`, `xudp`, or `uot-v2`; canonical URI `packetEncoding=none` maps to `native` |
+| `multiplex` | `VlessMultiplex` | `{"protocol":"off"}` for VLESS | Structured VLESS carrier selection: `off`, `h2`, or `xray`; exact shapes are documented below |
 | `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
@@ -70,7 +73,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_public_key` | string? | null | REALITY X25519 public key from `pbk` |
 | `reality_short_id` | string? | null | REALITY short ID from `sid` |
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
-| `flow` | string? | null | VLESS flow from nonempty `flow` or Shadowrocket `xtls=2`; only `xtls-rprx-vision` is supported |
+| `flow` | string? | null | VLESS `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; Shadowrocket `xtls=2` selects the base flow |
 | `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
@@ -99,6 +102,8 @@ Intrinsic validation requires a nonempty node name, effective host, and explicit
 ### Structured-loader compatibility
 
 TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol`; non-default fields left over from other protocols are stripped without rejecting the node, and one warning lists the stripped field names. For example, `tls: true` on an `ss` node is ignored with a warning rather than enabling TLS. `username` is not a credential alias for Trojan, VLESS, Hysteria2, or AnyTLS; when supplied without that protocol's effective credential field, it is stripped with a targeted warning, preserving legacy behavior and IDs. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
+
+`vless_mode` has been removed from VLESS flat input. Its raw presence rejects the node even when its value is `null` or an old recognized spelling; use `network` for packet permission, `packet_encoding` for fallback, and `multiplex` for carrier selection. The only remaining `vless_mode: "legacy"` field is a non-VLESS serialization placeholder retained for flat-format compatibility. It does not configure VLESS, and non-VLESS behavior and identity are unchanged.
 
 Flat credential aliases are compared before incompatible fields are stripped: Hysteria2 `hy2_auth`/`password`, TUIC and Juicity dedicated UUID/`username` and dedicated password/`password`, and AnyTLS `password`/`anytls_password`. Missing or null claims are absent; supplied strings must agree byte for byte, including empty strings and surrounding spaces. An empty credential remains subject to its protocol's requirements. Flat credential fields remain strings; numeric coercion applies only to subscription feeds.
 
@@ -131,7 +136,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `ss` | `shadowsocks` | Yes | Yes | AEAD and Shadowsocks 2022 |
 | `trojan` | — | Yes | Yes* | TLS; TCP/WS/gRPC transport |
 | `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC and REALITY; handler requires `rprx` |
-| `vless` | — | Yes | Mode-dependent* | Legacy, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
+| `vless` | — | Yes | Configurable* | Native UDP, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
 | `socks5` | — | Yes | Yes | CONNECT and UDP ASSOCIATE |
 | `hysteria2` | — | Yes | Yes | QUIC/H3, salamander, brutal/BBR, and port hopping |
 | `tuic` | — | Yes | Yes | TUIC v5 over QUIC |
@@ -140,7 +145,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `direct` | — | Yes | Yes | Reserved built-in bypass outbound; no share-link scheme |
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
 
-`network` may further disable packet dialing for Trojan, AnyTLS, and non-legacy VLESS. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Legacy VLESS has no UDP, and VMess UDP is not implemented.
+`network` may disable packet dialing for Trojan, AnyTLS, and VLESS independently of their stream transport. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. VMess UDP is not implemented.
 
 For protocols that own `network`, flat structured input accepts comma-separated `tcp`/`udp` tokens, ignoring token whitespace and ASCII case. `tcp` disables UDP; `udp` and `tcp,udp` both permit UDP. Empty or whitespace-only text becomes absent and retains the protocol's default capability. Unknown tokens such as `quic`, or empty tokens inside a nonempty list, reject the node. This controls UDP admission only: `udp` does not add a TCP rejection policy.
 
@@ -160,6 +165,11 @@ VMess and VLESS nodes still parse without the `rprx` Cargo feature, but no handl
 
 An incorrect or non-base64 key fails handler construction.
 
+UDP replay protection retains separate current and previous server-session
+windows. A third session is admitted only after the previous session has been
+inactive for 60 seconds. Authentication and response-header validation precede
+all receive-session state changes, so an invalid packet cannot reset replay history.
+
 ### Stream transports
 
 Stream-capable share links select transport with `type=` or its `network=` alias. Empty text and `tcp` mean raw TCP; `ws` and `grpc` select WebSocket and gRPC. All supplied aliases, including compatible `obfs` declarations and repeated query keys, must agree before assignment. Unsupported names such as `h2` and `kcp` reject the link during parsing. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. `alpn` is accepted for compatibility but not stored.
@@ -175,7 +185,7 @@ VMess accepts v2rayN Base64 JSON (`net`, `host`, `path`, `sni`) and Shadowrocket
 
 VMess JSON `net` and Shadowrocket transport parameters select only the stream transport. They no longer populate packet-network capability; an omitted packet restriction retains the existing default UDP allowance. Valid empty transport spelling is preserved where already used.
 
-Live interoperability has been verified for VLESS TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Vision's supported direct-copy combination is raw TCP with TLS or REALITY, not WS/gRPC.
+VLESS supports TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Unencrypted Vision's direct-copy path is raw TCP with TLS 1.3 or REALITY, not WS/gRPC; encrypted Vision follows the composition rules below.
 
 ### Shadowrocket VLESS
 
@@ -193,7 +203,7 @@ The query mapping follows the [Shadowrocket exporter](https://github.com/cedar20
 | `obfs=websocket`, `obfsParam`, `path` | WebSocket transport, Host header fallback, and path. |
 | `obfs=grpc`, `path` | gRPC transport and service-name fallback. |
 
-Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host` and `serviceName`/`service_name` fields retain their existing fallback precedence. Explicit SNI aliases are compared before assignment; equal bytes coalesce, unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. Nonempty flow must be exactly `xtls-rprx-vision`.
+Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host` and `serviceName`/`service_name` fields retain their existing fallback precedence. Explicit SNI aliases are compared before assignment; equal bytes coalesce, unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. Nonempty flow must be `xtls-rprx-vision` or `xtls-rprx-vision-udp443`.
 
 Clash imports compare `servername`, `server-name`, and `sni`; record imports additionally compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is only the Host header; outside WebSocket it is a lower-priority SNI fallback. The endpoint hostname remains the final TLS consumer fallback.
 
@@ -244,26 +254,69 @@ Durations accept bare seconds plus `ms`, `s`, `m`, and `h` suffixes.
 
 ## VLESS
 
-### Modes
+<a id="vless-udp-and-multiplexing"></a>
 
-`vless_mode` is one normalized, mutually exclusive mode. It is never negotiated.
+### UDP and multiplexing
 
-| Mode | TCP | UDP | Behavior |
-| --- | --- | --- | --- |
-| `legacy` | Ordinary VLESS stream | No | Backward-compatible default; omission preserves legacy identity |
-| `uot-v2` | Ordinary VLESS stream | Direct UoT v2 | One connected UoT stream per UDP transport |
-| `h2mux` | H2MUX logical stream | Native connected sing-mux UDP | TCP and UDP share a node-owned HTTP/2 carrier pool |
-| `h2mux-padded` | H2MUX logical stream | Native connected sing-mux UDP | `h2mux` with sing-mux v1 padding |
-| `xudp` | Ordinary VLESS stream | Single XUDP | One unpooled mux-command carrier per UDP transport, session ID 0 |
-| `mux-cool` | Mux.Cool logical stream | Pooled XUDP | TCP and UDP share a node-owned Xray Mux.Cool carrier pool |
+VLESS has three independent choices. `udp=0|1` controls whether packet dialing is permitted, `packetEncoding=auto|none|xudp|uot-v2` selects the fallback packet protocol, and `mux=off|h2mux|xray` selects the TCP/UDP carrier paths. These choices are not negotiated.
 
-The canonical query is `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. The legacy alias `packetEncoding=xudp` maps to `xudp`. Duplicate mode representations are rejected.
+| Canonical URI query | Default | Accepted values and effect |
+| --- | --- | --- |
+| `udp` | enabled | `1`/`true` permits packet dialing; `0`/`false` disables it without disabling TCP. Text booleans are ASCII-case-insensitive; repeated claims must agree. |
+| `packetEncoding` | `auto` | `auto`, `none` (native VLESS command-UDP), `xudp` (Single XUDP), or `uot-v2`. This is the fallback whenever mux does not own the UDP path. |
+| `mux` | `off` | `off`, `h2mux`, or `xray`. |
+| `padding` | `false` | Boolean, valid only with `mux=h2mux`; selects sing-mux v1 padding. |
+| `concurrency` | `0` | Signed `i16`, valid only with `mux=xray`: negative disables TCP mux, zero allows 8 concurrent logical children per TCP carrier, and a positive value sets that per-carrier concurrency, capped at 128. It does not set the number of physical carriers. |
+| `xudpConcurrency` | `0` | Signed `i16`, valid only with `mux=xray`: negative uses the protocol fallback; zero shares the TCP pool and its per-carrier concurrency when TCP mux is enabled (otherwise the protocol fallback); a positive value creates a separate UDP pool with that many concurrent logical children per carrier, capped at 128. |
+| `xudpProxyUDP443` | `reject` | `reject`, `skip`, or `allow`, valid only with `mux=xray`; the exact UDP/443 precedence is below. |
 
-Every non-`legacy` mode rejects non-empty, non-`none` VLESS Encryption. Vision is supported only with `legacy` or `xudp`, TLS or REALITY, and raw TCP transport. No mode negotiation, fallback, or first-packet replay occurs.
+`packetEncoding`, `mux`, and each mux control may occur at most once. Repeated `udp` claims are accepted only when all values agree.
 
-Ambiguous third-party query forms are rejected instead of guessed: `mux`, `smux`, `multiplex`, `udp-over-tcp`, `udp_over_tcp`, `packet-encoding`, `packet_encoding`, `packet-addr`, `packet_addr`, `xudp`, `only-tcp`, `only_tcp`, `brutal`, `brutal-opts`, `brutal_opts`, `max-connections`, `max_connections`, `min-streams`, `min_streams`, `max-streams`, and `max_streams`.
+`mux=off` keeps ordinary VLESS TCP and uses `packetEncoding` for UDP; `uot-v2` opens one connected UoT v2 stream per UDP transport. `mux=h2mux` carries logical TCP and native connected sing-mux UDP through the same node-owned HTTP/2 carrier pool; `padding=true` retains the existing padded H2MUX wire format. H2MUX owns both paths, so the fallback encoding does not replace its UDP path. It retains its existing pool policy and does not inherit Mux.Cool's 128-child carrier rollover. `mux=xray` uses Xray Mux.Cool for each pool enabled by the two concurrency settings. TCP and UDP pooling are therefore independent.
 
-This reference describes the configuration surface. See [Outbound design](../design/outbound.md) for carrier ownership and wire framing.
+Canonical examples (with a synthetic UUID) are:
+
+```dae
+node {
+    auto: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#auto'
+    h2_padded: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=h2mux&padding=true&udp=1#h2-padded'
+    xray_shared: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=xray&concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip&udp=1#xray-shared'
+    vision_udp_pool: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&flow=xtls-rprx-vision&packetEncoding=auto&mux=xray&concurrency=-1&xudpConcurrency=8&xudpProxyUDP443=skip&udp=1#vision-udp-pool'
+}
+```
+
+Structured TOML/YAML/JSON uses `network` for packet permission (`tcp` disables UDP; omission, `udp`, or `tcp,udp` permits it), `packet_encoding` (`auto`, `native`, `xudp`, `uot-v2`) for fallback, and a tagged `multiplex` value. Multiplex shapes are `{"protocol":"off"}`, `{"protocol":"h2","padding":true|false}`, and `{"protocol":"xray","tcp":N|null,"udp":"protocol"|"shared-tcp"|{"separate":N},"udp443":"reject"|"skip"|"allow"}`. `tcp` and every `separate` value are positive per-carrier logical-child concurrency limits of at most 128; omission/null disables the TCP mux pool.
+
+#### Migration from `vless_mode`
+
+**Breaking configuration change:** `vless_mode` is removed, not a deprecated alias. Migrate static links and provider content before upgrading. A static `node {}` entry containing it rejects the candidate configuration; a subscription drops that entry while keeping other valid nodes. An all-old-mode cached subscription body cannot restore nodes offline. Ensure a migrated body is available locally before an offline upgrade; do not delete usable Selector or delay state. Failure to restore one provider does not itself abort startup, though the assembled configuration must still validate.
+
+Every old mode has a direct capability-preserving replacement:
+
+| Removed `vless_mode` | `packetEncoding` | `mux` | `udp` | Additional query |
+| --- | --- | --- | --- | --- |
+| `auto` | `auto` | `off` | `1` | — |
+| `native` | `none` | `off` | `1` | — |
+| `legacy` | `auto` | `off` | `0` | Preserves TCP-only behavior; the old identity is not retained. |
+| `uot-v2` | `uot-v2` | `off` | `1` | — |
+| `h2mux` | `auto` | `h2mux` | `1` | `padding=false` |
+| `h2mux-padded` | `auto` | `h2mux` | `1` | `padding=true` |
+| `xudp` | `xudp` | `off` | `1` | — |
+| `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
+
+The last row preserves TCP/UDP availability and the former Vision UDP/443 gate. It may use the protocol fallback rather than pooled XUDP for a skipped non-Vision UDP/443 target. Every admitted VLESS node uses the new identity derivation at this upgrade, as described under [Node identity](#node-identity).
+
+Old `vless_mode` URI syntax is rejected. The parser also rejects ambiguous third-party URI spellings such as `smux`, `multiplex`, `udp-over-tcp`, `packet-encoding`, `packet_encoding`, `packet-addr`, `xudp`, `only-tcp`, Brutal controls, and H2 stream-count tuning; only the exact canonical parameters in the table above configure these choices.
+
+#### Target selection and composition
+
+Without Vision, `packetEncoding=auto` uses native VLESS UDP for destination ports 53 and 443 and Single XUDP elsewhere. With Vision, permitted targets use Single XUDP. Native sends accept 1–8190 bytes and Single XUDP sends 1–7526 bytes; empty or oversized sends are packet-local refusals, while a received zero-length frame is still a datagram.
+
+For `mux=xray`, UDP/443 policy is applied first. `reject` refuses UDP/443 even if both mux pools are disabled. `skip` selects `packetEncoding` and then applies the ordinary Vision gate. `allow` bypasses the Vision UDP/443 gate only when that target actually uses an Xray UDP mux pool; a protocol-fallback target still follows the normal gate. Outside Xray mux, base `xtls-rprx-vision` rejects UDP/443 and `xtls-rprx-vision-udp443` permits it while sending the base flow on the wire. Policy and capacity refusals are terminal for that attempt and health/Score-neutral; they never trigger another-node/direct fallback or automatic packet replay.
+
+Vision always requires a direct TCP path: `mux=off`, or `mux=xray` with TCP mux disabled. Every H2MUX TCP composition is invalid, including with Encryption. An Xray UDP-only pool is legal with Vision; with `concurrency=-1`, use a positive `xudpConcurrency` to create it. Unencrypted Vision additionally requires raw TCP over negotiated TLS 1.3 or REALITY. Encrypted Vision may retain its selected outer stream transport and random-XOR handling, but it still cannot enable TCP mux, H2MUX UDP, native UDP, or UoT v2; XUDP/Xray UDP or disabled UDP are valid.
+
+VLESS carrier slots come from the process-wide file-descriptor budget and are carved out before UDP endpoint slots, trading endpoint count for reusable carrier capacity. Exhaustion is reported as local capacity rather than a remote protocol failure. Honk also scopes XUDP Global IDs to its reusable source/session ownership and per-destination routing semantics; they are not Xray's source-only identity and do not promise collision-free NAT identity. See [source/session ownership and capacity](../design/outbound.md#sourcesession-ownership-and-capacity) for the canonical lifecycle and scope definition.
 
 ### Encryption
 
@@ -273,7 +326,7 @@ The base client-string form accepted in `encryption=` is:
 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 ```
 
-A key decodes to either a 32-byte X25519 key or a 1184-byte ML-KEM-768 key; chained authentication keys are accepted. `0rtt` uses a cached ticket and takes the 1-RTT path while cold. VLESS Encryption runs inside the selected TCP/TLS/REALITY/WS/gRPC transport, but requires `legacy` mode and cannot combine with `flow`.
+A key decodes to either a 32-byte X25519 key or a 1184-byte ML-KEM-768 key; chained authentication keys are accepted. `0rtt` uses a cached ticket and takes the 1-RTT path while cold. VLESS Encryption runs inside the selected outer TCP/TLS/REALITY/WS/gRPC transport. It supports native or XUDP fallback and Xray UDP pools, but not H2MUX TCP/UDP or UoT v2. Encryption and Vision may be combined under the direct-TCP-path rules above.
 
 ### REALITY and Vision
 
@@ -281,16 +334,21 @@ For VLESS URL links, `security=reality` enables TLS and maps the REALITY query f
 
 | Query | Meaning |
 | --- | --- |
-| `security=reality` | Select REALITY and enable TLS. A node that selects REALITY without `pbk` is rejected at validation rather than degraded to plain TLS |
-| `pbk` | Base64url 32-byte X25519 server public key; invalid input fails closed |
-| `sid` | Even-length hexadecimal short ID, at most 8 bytes; empty is valid |
-| `spx` | Stored spider path; defaults to `/` when REALITY is selected |
-| `flow=xtls-rprx-vision` | Enable the supported Vision flow |
-| `fp` | Accepted but ignored; global TLS mode owns the ClientHello fingerprint |
+| `security=reality` | Select REALITY and enable TLS. A node that selects REALITY without `pbk` is rejected at validation rather than degraded to plain TLS. |
+| `pbk` | Base64url 32-byte X25519 server public key; invalid input fails closed. |
+| `sid` | Even-length hexadecimal short ID, at most 8 bytes; empty is valid. |
+| `spx` | Stored spider path; defaults to `/` when REALITY is selected. |
+| `flow=xtls-rprx-vision` | Enable Vision with the UDP/443 rules above. |
+| `flow=xtls-rprx-vision-udp443` | Enable Vision's ordinary UDP/443 exception; the wire addon remains the base flow. |
+| `fp` | Accepted but ignored; global TLS mode owns the ClientHello fingerprint. |
 
 An explicit `security=` overrides the historical VLESS default: `none` disables TLS; any other value enables it. Without `security`, VLESS defaults TLS on. Standard VMess links use their v2rayN JSON `tls` field instead.
 
-REALITY authenticates the peer against its REALITY key and fails closed; it does not need CA verification or `skip_cert_verify`. Choose a server-side REALITY `dest`/client SNI whose TLS Certificate message remains under 8 KiB, because sing-box REALITY buffers 8192 bytes; `dl.google.com` is known to fit while `www.microsoft.com` does not.
+REALITY is TLS-1.3-only and advertises the hybrid `X25519MLKEM768` key share first and the preset classic `X25519` share second. Client authentication derives from that preset classic share and binds the complete ClientHello; server authentication checks the REALITY key/HMAC and fails closed. A ClientHello is sealed exactly once. A HelloRetryRequest that invokes the callback again aborts before key/nonce reuse; honk does not retry that REALITY handshake.
+
+The bare-TCP pool admits a pre-handshake socket only while it is silent. Any queued server byte, including a fatal TLS alert, rejects that bare entry at admission or checkout; there is no SNI/alert exception and no handshake retry. This does not reject a fully prepared ready stream merely because it has valid buffered application data.
+
+REALITY does not need CA verification or `skip_cert_verify`. Choose a server-side REALITY `dest`/client SNI whose TLS Certificate message remains under 8 KiB, because sing-box REALITY buffers 8192 bytes; `dl.google.com` is known to fit while `www.microsoft.com` does not.
 
 ## TLS fingerprint and ECH
 
@@ -317,7 +375,7 @@ A static config offers real ECH and ECH rejection fails the handshake closed. Di
 | --- | --- |
 | `ss://` | SIP002 userinfo/full-authority base64 forms, plus `plugin` |
 | `vmess://` | Flexible-base64 v2rayN JSON (`add`, `port`, `id`, `scy`, `net`, `host`, `path`, `tls`, `sni`, `ps`) |
-| `vless://` | URL userinfo UUID plus transport, TLS/REALITY, flow, Encryption, and canonical mode queries |
+| `vless://` | URL userinfo UUID plus stream transport, TLS/REALITY, flow, Encryption, and the canonical UDP/mux queries above |
 | `trojan://` | URL userinfo secret plus transport and TLS queries |
 | `anytls://` | URL userinfo secret plus TLS and pool queries |
 | `hysteria2://` | Hysteria2 query mapping above; `hysteria://` is also accepted |

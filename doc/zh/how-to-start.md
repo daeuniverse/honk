@@ -327,7 +327,7 @@ cargo run --release -p honk-core -- \
 ## 当前能力和限制
 
 - 出站支持 Direct、Block、SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess 和 VLESS。
-- UDP 支持 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，以及非 legacy 模式的 VLESS；VMess 和 legacy VLESS 仅支持 TCP。
+- UDP 支持 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，以及独立 packet 权限已开启的 VLESS。VLESS 的回退 encoding 与 multiplex carrier 是另外两个独立选择；VMess 仍仅支持 TCP。见 [VLESS 节点参考](reference/nodes.md#vless-udp-and-multiplexing)。
 - group 支持 Selector、URLTest、LoadBalance、Fallback 和 Score。
 - DNS 上游支持 UDP、TCP、DoT、DoH、DoH3 和 DoQ，也可经 node/group 出站。
 - `direct` 和 `block` 是内建节点，不要在配置中重复声明。

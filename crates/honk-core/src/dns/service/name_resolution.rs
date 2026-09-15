@@ -49,6 +49,21 @@ impl FamilyResponses {
                 })
             })
     }
+
+    fn fail_on_packet_rejection(mut self) -> anyhow::Result<Self> {
+        for response in [&mut self.ipv4, &mut self.ipv6] {
+            let Some(Err(error)) = response.as_ref() else {
+                continue;
+            };
+            if honk_outbound::proxy::is_packet_rejection(error) {
+                let Some(Err(error)) = response.take() else {
+                    unreachable!("checked family response error")
+                };
+                return Err(error);
+            }
+        }
+        Ok(self)
+    }
 }
 
 impl DnsService {
@@ -175,7 +190,7 @@ impl DnsService {
                 resolve_with_forwarder(&mut operation, forwarder, domain, metadata).await?
             }
         };
-        Ok(responses)
+        responses.fail_on_packet_rejection()
     }
 }
 

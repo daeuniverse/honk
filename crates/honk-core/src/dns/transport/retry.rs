@@ -16,6 +16,7 @@ where
     let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
     let result = match once(reporter.clone()).await {
         Ok(response) => Ok(response),
+        Err(first) if honk_outbound::proxy::is_packet_rejection(&first) => Err(first),
         Err(first) => {
             record_reset(label);
             reset().await;
@@ -201,5 +202,33 @@ mod tests {
             .node
             .id;
         assert_eq!(selected, incumbent);
+    }
+
+    #[tokio::test]
+    async fn packet_rejection_does_not_reset_or_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+        let reset_count = Arc::clone(&resets);
+
+        let error = super::exchange_with_retry(
+            "test",
+            &[0; 12],
+            move |_| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                async { Err::<Vec<u8>, _>(honk_outbound::proxy::PacketRejection::Policy.into()) }
+            },
+            move || {
+                reset_count.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(honk_outbound::proxy::is_packet_rejection(&error));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
     }
 }

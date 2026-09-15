@@ -183,6 +183,68 @@ impl ProxyStream {
     }
 }
 
+/// A local packet refusal that must not be treated as transport health.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+pub enum PacketRejection {
+    #[error("UDP target rejected by policy")]
+    Policy,
+    #[error("UDP packet size is invalid")]
+    InvalidSize,
+    #[error("UDP transport capacity is exhausted")]
+    Capacity,
+    #[error("UDP transport preparation was cancelled")]
+    Cancelled,
+}
+
+impl From<PacketRejection> for std::io::Error {
+    fn from(rejection: PacketRejection) -> Self {
+        let kind = match rejection {
+            PacketRejection::Policy => std::io::ErrorKind::PermissionDenied,
+            PacketRejection::InvalidSize => std::io::ErrorKind::InvalidInput,
+            PacketRejection::Capacity => std::io::ErrorKind::WouldBlock,
+            PacketRejection::Cancelled => std::io::ErrorKind::ConnectionAborted,
+        };
+        Self::new(kind, rejection)
+    }
+}
+
+/// Whether an error contains a terminal, health-neutral local refusal.
+pub fn is_packet_rejection(error: &anyhow::Error) -> bool {
+    packet_rejection(error).is_some()
+}
+
+/// Recover local refusal details without losing them through error wrappers.
+pub fn packet_rejection(error: &anyhow::Error) -> Option<PacketRejection> {
+    error.chain().find_map(|source| {
+        source
+            .downcast_ref::<PacketRejection>()
+            .copied()
+            .or_else(|| {
+                source
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(io_packet_rejection)
+            })
+    })
+}
+
+/// Recover a typed packet rejection retained inside an I/O error chain.
+pub(crate) fn io_packet_rejection(error: &std::io::Error) -> Option<PacketRejection> {
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(rejection) = current.downcast_ref::<PacketRejection>() {
+            return Some(*rejection);
+        }
+        source = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(|error| error.get_ref())
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| current.source());
+    }
+    None
+}
+
 /// Coarse classification for packet-send failures shared with the control plane.
 ///
 /// Congestion is deliberately separate from a dead tunnel: dropping one UDP
@@ -190,12 +252,16 @@ impl ProxyStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketErrorClass {
     Congestion,
+    Rejected,
     ConnectionDead,
     Other,
 }
 
 /// Classify an error returned by a [`PacketTransport`] operation.
 pub fn packet_error_class(error: &std::io::Error) -> PacketErrorClass {
+    if io_packet_rejection(error).is_some() {
+        return PacketErrorClass::Rejected;
+    }
     if matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
@@ -473,50 +539,42 @@ where
     })
 }
 
-type PreparedUdpCommitFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
-type PreparedUdpCommit = Box<dyn FnOnce() -> PreparedUdpCommitFuture + Send>;
-
 /// A prepared UDP transport that is usable only after its final side effects
 /// have been committed. Dropping it without [`Self::commit`] abandons the
 /// preparation; protocol-specific resources then clean themselves up via
 /// normal RAII. Commit failure drops the transport and returns no value.
-pub struct PreparedUdpTransport {
-    transport: Arc<dyn PacketTransport>,
-    commit: PreparedUdpCommit,
+pub struct PreparedUdpTransport<T: ?Sized = dyn PacketTransport> {
+    commit: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Arc<T>>> + Send>>,
 }
 
-impl std::fmt::Debug for PreparedUdpTransport {
+impl<T: ?Sized> std::fmt::Debug for PreparedUdpTransport<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedUdpTransport")
             .finish_non_exhaustive()
     }
 }
 
-impl PreparedUdpTransport {
-    pub fn new<F, Fut>(transport: Arc<dyn PacketTransport>, commit: F) -> Self
+impl<T: ?Sized + Send + Sync + 'static> PreparedUdpTransport<T> {
+    pub fn new<Fut>(commit: Fut) -> Self
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+        Fut: Future<Output = anyhow::Result<Arc<T>>> + Send + 'static,
     {
         Self {
-            transport,
-            commit: Box::new(move || Box::pin(commit())),
+            commit: Box::pin(commit),
         }
     }
     /// Wrap an already-authoritative ordinary transport. This deliberately
     /// preserves `dial_udp_transport` semantics for protocols with no
     /// speculative ownership to promote.
-    pub fn ready(transport: Arc<dyn PacketTransport>) -> Self {
-        Self::new(transport, || async { Ok(()) })
+    pub fn ready(transport: Arc<T>) -> Self {
+        Self::new(async move { Ok(transport) })
     }
 
     /// Consume the preparation, run its one-shot promotion, then expose the
     /// transport. A failed promotion is fail-closed: the transport is dropped
     /// and cannot be sent on by a caller.
-    pub async fn commit(self) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        (self.commit)().await?;
-        Ok(self.transport)
+    pub async fn commit(self) -> anyhow::Result<Arc<T>> {
+        self.commit.await
     }
 }
 async fn prepare_detached_quic_transport<T, F, Fut>(
@@ -533,11 +591,12 @@ where
         anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
     }
     let transport = prepare(Arc::clone(&client)).await?;
-    Ok(PreparedUdpTransport::new(transport, move || async move {
+    Ok(PreparedUdpTransport::new(async move {
         let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
             anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
         };
-        quic.publish_client(client).await
+        quic.publish_client(client).await?;
+        Ok(transport)
     }))
 }
 
@@ -767,8 +826,7 @@ impl ProtocolEntry {
                 protocol.as_str()
             );
         }
-        if self.descriptor.generation_runtime(&default_node)
-            != crate::runtime::GenerationRuntime::None
+        if self.descriptor.generation_runtime != crate::runtime::GenerationRuntime::None
             && self.warmable.is_none()
         {
             panic!(
@@ -959,21 +1017,16 @@ impl ProxyRegistry {
         let entry = self
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
-        if entry.descriptor.generation_runtime(&runtime.node)
-            == crate::runtime::GenerationRuntime::None
-        {
-            return Ok(WarmOutcome::NotApplicable);
-        }
         let Some(warmable) = entry.warmable.as_ref() else {
             return Ok(WarmOutcome::NotApplicable);
         };
-        if reason == crate::runtime::WarmRetention::Udp && !runtime.udp_capable {
-            return Ok(WarmOutcome::NotApplicable);
-        }
         let requirement = match reason {
             crate::runtime::WarmRetention::Selector => WarmRequirement::Session,
             crate::runtime::WarmRetention::Udp => WarmRequirement::Udp,
         };
+        if !entry.descriptor.supports_warm(&runtime.node, requirement) {
+            return Ok(WarmOutcome::NotApplicable);
+        }
         let attempt = runtime.retain_warm(reason).await;
         if let Err(error) = generation
             .scope_dials(warmable.warm(Arc::clone(&runtime), connect_timeout, requirement))
@@ -1035,6 +1088,11 @@ impl ProxyRegistry {
         let entry = self
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+        if protocol != NodeProtocol::Block
+            && !crate::descriptor::udp_target_allowed(node, target.port())
+        {
+            return Err(PacketRejection::Policy.into());
+        }
         if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
@@ -1058,7 +1116,7 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let (runtime, packet) = self.packet_runtime(&generation, node_id)?;
+        let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let transport = generation
             .scope_dials(packet.dial_udp_transport_runtime(
                 runtime,
@@ -1084,7 +1142,7 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        let (runtime, packet) = self.packet_runtime(&generation, node_id)?;
+        let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let prepared = generation
             .scope_dials(packet.dial_udp_transport_speculative_runtime(
                 runtime,
@@ -1103,6 +1161,7 @@ impl ProxyRegistry {
         &self,
         generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
         node_id: uuid::Uuid,
+        target_port: u16,
     ) -> anyhow::Result<(Arc<crate::runtime::NodeRuntime>, &Arc<dyn PacketOutbound>)> {
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation is shut down");
@@ -1111,12 +1170,17 @@ impl ProxyRegistry {
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
         let protocol = runtime.node.protocol();
-        if protocol != NodeProtocol::Block && !runtime.udp_capable {
-            anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
-        }
         let entry = self
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+        if protocol != NodeProtocol::Block
+            && !crate::descriptor::udp_target_allowed(&runtime.node, target_port)
+        {
+            return Err(PacketRejection::Policy.into());
+        }
+        if protocol != NodeProtocol::Block && !runtime.udp_capable {
+            anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
+        }
         let packet = entry.packet.as_ref().ok_or_else(|| {
             anyhow::anyhow!("UDP not supported for protocol {}", protocol.as_str())
         })?;
@@ -1228,6 +1292,48 @@ mod tests {
         assert_eq!(packet_error_class(&too_large), PacketErrorClass::Congestion);
     }
 
+    #[test]
+    fn typed_packet_rejections_survive_io_and_anyhow_context() {
+        for (rejection, kind) in [
+            (
+                PacketRejection::Policy,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+            (
+                PacketRejection::InvalidSize,
+                std::io::ErrorKind::InvalidInput,
+            ),
+        ] {
+            let io_error = std::io::Error::from(rejection);
+            assert_eq!(io_error.kind(), kind);
+            assert_eq!(packet_error_class(&io_error), PacketErrorClass::Rejected);
+            assert!(is_packet_rejection(
+                &anyhow::Error::new(io_error).context("outer context")
+            ));
+            assert!(is_packet_rejection(
+                &anyhow::Error::new(rejection).context("outer context")
+            ));
+            let nested = std::io::Error::other(std::io::Error::from(rejection));
+            assert_eq!(packet_error_class(&nested), PacketErrorClass::Rejected);
+            assert!(is_packet_rejection(&anyhow::Error::new(nested)));
+        }
+        assert_eq!(
+            packet_error_class(&std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                PacketRejection::Policy,
+            )),
+            PacketErrorClass::Rejected
+        );
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let io_error = std::io::Error::new(kind, "untyped refusal");
+            assert_eq!(packet_error_class(&io_error), PacketErrorClass::Other);
+            assert!(!is_packet_rejection(&anyhow::Error::new(io_error)));
+        }
+    }
+
     /// Without the `rprx` feature a parsed VLESS/VMess node must hit the
     /// ordinary no-handler refusal, never a panic.
     #[cfg(not(feature = "rprx"))]
@@ -1271,34 +1377,45 @@ mod tests {
 
     #[cfg(feature = "rprx")]
     #[tokio::test]
-    async fn vless_capabilities_follow_the_concrete_node() {
+    async fn vless_target_policy_is_checked_by_every_packet_registry_path() {
         let registry = ProxyRegistry::default_resolver().unwrap();
-        let entry = registry.find(NodeProtocol::VLess).unwrap();
-        assert!(entry.packet.is_some());
-        assert!(entry.warmable.is_some());
+        let mut node = registry_test_node("udp-disabled", NodeProtocol::VLess);
+        let vless = node.vless_mut().unwrap();
+        vless.network = Some("tcp".into());
+        node.id = node.derive_id();
+        let target = "8.8.8.8:443".parse().unwrap();
 
-        let node = registry_test_node("legacy-vless", NodeProtocol::VLess);
+        let error = registry
+            .dial_udp_transport(&node, target, None, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(is_packet_rejection(&error));
+
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
-        assert_eq!(
-            registry
-                .warm_session(Arc::clone(&generation), node.id, Duration::from_millis(10),)
-                .await
-                .unwrap(),
-            WarmOutcome::NotApplicable
-        );
         let error = registry
             .dial_udp_transport_runtime(
-                generation,
+                Arc::clone(&generation),
                 node.id,
-                "8.8.8.8:53".parse().unwrap(),
+                target,
                 None,
                 Duration::from_millis(10),
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("UDP not supported"));
+        assert!(is_packet_rejection(&error));
+        let error = registry
+            .dial_udp_transport_speculative(
+                generation,
+                node.id,
+                target,
+                None,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_packet_rejection(&error));
     }
 
     /// The built-in block node carries NodeProtocol::Block; the registry must
@@ -1567,27 +1684,5 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn prepared_udp_transport_defers_transport_exposure_until_commit() {
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let relay_addr = socket.local_addr().unwrap();
-        let transport: Arc<dyn PacketTransport> =
-            Arc::new(UdpSocketTransport::new(Arc::clone(&socket), relay_addr));
-        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prepared = PreparedUdpTransport::new(Arc::clone(&transport), {
-            let commits = Arc::clone(&commits);
-            move || async move {
-                commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-        });
-        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
-
-        let committed = prepared.commit().await.unwrap();
-
-        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(Arc::ptr_eq(&transport, &committed));
     }
 }

@@ -145,13 +145,25 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 
 Remote subscriptions and local files share the engine's automatic format detection: encoded/raw share links, Clash YAML/JSON, SIP008, sing-box JSON, and supported Surge/Surfboard/Loon/Quantumult X records. Unsupported nodes are skipped without printing their raw input. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
 
-For each node, the command reports server address families, full proxied IPv4 and IPv6 exchanges, proxied URLTest latency, a DNS query through the packet handler, and a real QUIC handshake through that handler. VMess, legacy VLESS, and nodes whose `network` excludes UDP show `n/a` for UDP; non-legacy VLESS modes use their configured packet transport.
+For each node, the command reports server address families, full proxied IPv4 and IPv6 exchanges, proxied URLTest latency, a DNS query through the packet handler, and a real QUIC handshake through that handler. VLESS rows carry this redacted shape, with no endpoint, UUID, REALITY key, SNI, or URL query:
+
+```text
+vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision|/vision-udp443]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
+```
+
+`tcp=` reports the effective TCP path. `udp-fallback=` reports the normalized fallback field even when H2MUX or Xray mux currently owns the target UDP path; `udp=disabled` means packet dialing is forbidden. `padding=` is present only for H2MUX. For Xray mux, `TCP` is the effective per-carrier TCP logical-child concurrency (`0` means disabled), `UDP` is `protocol`, `shared`, or the per-carrier logical-child concurrency of a separate UDP pool, and `POLICY` is `reject`, `skip`, or `allow` for UDP/443. Example shapes include `vless/tls/tcp/tcp=plain/udp-fallback=native`, `vless/reality/grpc/tcp=h2mux/udp-fallback=auto/padding=true`, and `vless/tls/tcp/vision-udp443/tcp=mux-cool/udp-fallback=auto/mux=8:shared:allow`.
+
+Probe eligibility is `supported`, `invalid-uuid`, `invalid-reality`, `invalid-config`, `unsupported-transport`, `unsupported-flow`, or `vision-without-tls`/`vision-non-tcp`; invalid and intentionally unsupported entries remain visible but perform no network work. Vision may use TCP only with an eligible direct carrier, while UDP-only Xray mux remains valid. VLESS Encryption can combine with Vision; only unencrypted Vision additionally requires TLS 1.3 or REALITY on raw TCP.
+
+`n/a` means a probe was not applicable—for example, packet dialing is disabled or UDP/443 policy rejects that target. A local carrier-capacity refusal is an attempted terminal failure and appears as `FAIL(...)`, not `n/a`; it remains neutral to remote endpoint health. This distinction matters because the shared global file-descriptor budget can admit fewer physical VLESS carriers than the per-node mux limits request.
 
 UDP DNS target resolution, packet-transport setup, send, and receive share one `--timeout` budget. A resolution failure or timeout is reported only in the DNS column; TCP, URLTest, and QUIC probes continue. Unsupported UDP nodes skip this resolution, and a failed hostname is never replaced with another target.
 
 UDP DNS hostname targets use a shared asynchronous resolver with the first numeric nameserver in `/etc/resolv.conf` (UDP port `53`) and `/etc/hosts` when present, rather than blocking NSS lookup. This path does not apply NSS plugins or resolver search suffixes. An unavailable resolver is a DNS-column `resolve` failure, not a fallback to a public resolver; literal targets need no resolver.
 
-VLESS output is deliberately bounded to the display name and normalized carrier/transport/wire shape. Eligibility codes are `supported`, `invalid-uuid`, `invalid-reality`, `invalid-config`, `unsupported-transport`, `unsupported-flow`, `vision-without-tls`, and `vision-non-tcp`; probe failure codes are only `resolve`, `timeout`, `exchange`, and `handler`. Credentials, endpoint details, SNI, REALITY keys, URL query data, and raw errors are never rendered.
+VLESS carrier/session reuse follows the runtime and normalized wire shape, so changing the canonical UDP/mux queries can change node identity and pool reuse. Shared physical-carrier capacity is global, while XUDP's 8-byte Global ID is scoped by honk's runtime/client/path/destination source identity rather than treated as a process-wide collision-free NAT key. See the [node reference](./nodes.md#vless-udp-and-multiplexing) and canonical [VLESS outbound design](../design/outbound.md#sourcesession-ownership-and-capacity).
+
+Probe failure codes are `resolve`, `timeout`, `exchange`, `handler`, and `admission`. Credentials, endpoint details, SNI, REALITY keys, URL query data, and raw errors are never rendered.
 
 ### `bpf`
 

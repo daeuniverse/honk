@@ -15,5 +15,5 @@ REALITY / xtls-rprx-vision interop uses two live servers, not the unprivileged s
 - Public `103.238.129.118`: Xray 26.3.27, same ports, `xray-rprx.service`, degraded
   ~75 ms / ~15% loss.
 JA4 was verified on .70 with `/usr/local/bin/ja4probe` (`ja4probe`, source
-`/root/code/ja4probe`). Lab drivers: `honk-outbound/examples/`
-(`reality_hook_spike.rs`, `reality_lab59.rs`).
+`/root/code/ja4probe`). The manual lab driver is `honk-outbound/examples/reality_lab59.rs`;
+production ClientHello/authentication checks live in `honk-outbound/src/reality/wire_tests.rs`.

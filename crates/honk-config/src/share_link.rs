@@ -21,7 +21,8 @@ use std::borrow::Cow;
 
 use base64::Engine as _;
 
-use crate::error::ConfigError;
+use crate::diagnostic::{SettingPath, SourceRef};
+use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
 use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
 use crate::options::vocab::{optional_text, stream_transport, vmess_cipher};
 
@@ -79,9 +80,10 @@ impl Node {
         source: &crate::diagnostic::SourceRef,
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, crate::error::DetailedConfigError> {
-        let mut node = Self::decode_share_link(link, source, emit).map_err(|error| {
-            crate::error::DetailedConfigError::from_legacy(error, source.clone())
-        })?;
+        let mut node = Self::decode_share_link(link, source, emit)?;
+        if let Some(config) = node.vless_mut() {
+            config.normalize();
+        }
         node.validate_detailed().map_err(|mut error| {
             error.diagnostic.source = source.clone();
             error
@@ -94,23 +96,24 @@ impl Node {
         link: &str,
         source: &crate::diagnostic::SourceRef,
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
-    ) -> Result<Node, ConfigError> {
+    ) -> Result<Node, DetailedConfigError> {
+        let legacy = |error| DetailedConfigError::from_legacy(error, source.clone());
         let first = link.split("->").next().unwrap_or("").trim();
         let mut ss_config = None;
         let (decoded, shadowrocket) = match first.split_once("://") {
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vmess") => {
-                let Some(decoded) = decode_full_base64_vmess_link(payload)? else {
-                    return parse_vmess_link(payload);
+                let Some(decoded) = decode_full_base64_vmess_link(payload, source)? else {
+                    return parse_vmess_link(payload).map_err(legacy);
                 };
                 (Some(decoded), true)
             }
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vless") => {
-                let decoded = decode_full_base64_vless_link(payload)?;
+                let decoded = decode_full_base64_vless_link(payload, source)?;
                 let shadowrocket = decoded.is_some();
                 (decoded, shadowrocket)
             }
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("ss") => {
-                if let Some((link, config)) = decode_full_base64_ss_link(payload)? {
+                if let Some((link, config)) = decode_full_base64_ss_link(payload).map_err(legacy)? {
                     ss_config = Some(config);
                     (Some(link), false)
                 } else {
@@ -120,14 +123,13 @@ impl Node {
             _ => (None, false),
         };
         let first = decoded.as_deref().unwrap_or(first);
-        let (first, embedded_hop_ports) = extract_hy2_hop_ports(first)?;
-        let url = url::Url::parse(first.as_ref())
-            .map_err(|_| ConfigError::Parse("invalid share link syntax".into()))?;
-        let mut node = node_from_url(&url)?;
+        let (first, embedded_hop_ports) = extract_hy2_hop_ports(first).map_err(legacy)?;
+        let url = url::Url::parse(first.as_ref()).map_err(|_| invalid_link(source))?;
+        let mut node = node_from_url(&url, source)?;
         if let Some(config) = ss_config {
             node.outbound = OutboundConfig::Shadowsocks(config);
         }
-        let query = options::parse_query(&url, node.protocol(), shadowrocket)?;
+        let query = options::parse_query(&url, node.protocol(), shadowrocket, source)?;
         node.name = url
             .fragment()
             .map(percent_decode_str)
@@ -136,7 +138,7 @@ impl Node {
             .unwrap_or_else(|| format!("{}-{}", url.scheme(), node.host));
 
         options::apply_tls(&mut node, &query, shadowrocket, source, emit)?;
-        options::apply_transport(&mut node, &query)?;
+        options::apply_transport(&mut node, &query, source)?;
         options::apply_protocol(
             &mut node,
             &query,
@@ -149,7 +151,17 @@ impl Node {
     }
 }
 
-fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
+fn invalid_link(source: &SourceRef) -> DetailedConfigError {
+    DetailedConfigError::new(
+        ErrorCategory::Parse,
+        "config-parse",
+        source.clone(),
+        SettingPath::new("config"),
+        "invalid configuration",
+    )
+}
+
+fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedConfigError> {
     let outbound = match url.scheme() {
         "socks5" | "socks4" | "socks4a" => OutboundConfig::Socks5(Default::default()),
         "ss" => OutboundConfig::Shadowsocks(Default::default()),
@@ -160,14 +172,22 @@ fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
         "hysteria2" | "hysteria" | "hy2" => OutboundConfig::Hysteria2(Default::default()),
         "tuic" => OutboundConfig::Tuic(Default::default()),
         "juicity" => OutboundConfig::Juicity(Default::default()),
-        scheme => return Err(ConfigError::UnknownProtocol(scheme.to_string())),
+        _ => {
+            return Err(DetailedConfigError::new(
+                ErrorCategory::UnknownProtocol,
+                "unknown-protocol",
+                source.clone(),
+                SettingPath::new("config"),
+                "unknown node protocol",
+            ));
+        }
     };
     let host = url
         .host_str()
-        .ok_or_else(|| ConfigError::Parse("missing host in share link".into()))?
+        .ok_or_else(|| invalid_link(source))?
         .to_string();
     let port = match url.port() {
-        Some(0) => return Err(ConfigError::Parse("invalid share link port".into())),
+        Some(0) => return Err(invalid_link(source)),
         Some(port) => port,
         None => 443,
     };
@@ -179,23 +199,23 @@ fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
         ..Default::default()
     };
     if let Some(config) = node.shadowsocks_mut() {
-        apply_ss_userinfo(config, url)?;
+        apply_ss_userinfo(config, url, source)?;
     } else {
         // Decode only the components a protocol keeps: `password.or(username)`
         // discards the other one, and a discarded component must not decide
         // whether the link loads.
         let raw_username = (!url.username().is_empty()).then(|| url.username());
         let raw_password = url.password();
-        let username = || percent_decode_credential(raw_username, "username");
-        let password = || percent_decode_credential(raw_password, "password");
-        let single = |field| percent_decode_credential(raw_password.or(raw_username), field);
+        let username = || percent_decode_credential(raw_username, source);
+        let password = || percent_decode_credential(raw_password, source);
+        let single = || percent_decode_credential(raw_password.or(raw_username), source);
         match &mut node.outbound {
             OutboundConfig::Socks5(config) => {
                 config.username = username()?;
                 config.password = password()?;
             }
-            OutboundConfig::Trojan(config) => config.password = single("password")?,
-            OutboundConfig::Vless(config) => config.uuid = single("uuid")?,
+            OutboundConfig::Trojan(config) => config.password = single()?,
+            OutboundConfig::Vless(config) => config.uuid = single()?,
             OutboundConfig::Hysteria2(config) => {
                 config.auth = match (username()?, password()?) {
                     (Some(username), Some(password)) => Some(format!("{username}:{password}")),
@@ -211,9 +231,9 @@ fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
                 config.uuid = username()?;
                 config.password = password()?;
             }
-            OutboundConfig::AnyTls(config) => config.password = single("password")?,
+            OutboundConfig::AnyTls(config) => config.password = single()?,
             OutboundConfig::Vmess(config) => {
-                config.uuid = single("uuid")?;
+                config.uuid = single()?;
                 config.encryption = Some("auto".into());
             }
             OutboundConfig::Shadowsocks(_) | OutboundConfig::Direct | OutboundConfig::Block => {}
@@ -363,14 +383,15 @@ fn json_port(value: Option<serde_json::Value>) -> Option<u16> {
 fn apply_ss_userinfo(
     config: &mut crate::node::ShadowsocksConfig,
     url: &url::Url,
-) -> Result<(), ConfigError> {
+    source: &SourceRef,
+) -> Result<(), DetailedConfigError> {
     let userinfo = match url.password() {
         Some(pw) => format!(
             "{}:{}",
-            percent_decode_credential(Some(url.username()), "username")?.unwrap_or_default(),
-            percent_decode_credential(Some(pw), "password")?.unwrap_or_default()
+            percent_decode_credential(Some(url.username()), source)?.unwrap_or_default(),
+            percent_decode_credential(Some(pw), source)?.unwrap_or_default()
         ),
-        None => percent_decode_credential(Some(url.username()), "username")?.unwrap_or_default(),
+        None => percent_decode_credential(Some(url.username()), source)?.unwrap_or_default(),
     };
     if userinfo.is_empty() {
         return Ok(());
@@ -490,25 +511,32 @@ fn decode_full_base64_ss_link(
     }
 }
 
-fn decode_full_base64_vless_link(rest: &str) -> Result<Option<String>, ConfigError> {
-    decode_full_base64_authority(rest, "VLESS", false)
+fn decode_full_base64_vless_link(
+    rest: &str,
+    source: &SourceRef,
+) -> Result<Option<String>, DetailedConfigError> {
+    decode_full_base64_authority(rest, "VLESS", false, source)
 }
 
-fn decode_full_base64_vmess_link(rest: &str) -> Result<Option<String>, ConfigError> {
-    decode_full_base64_authority(rest, "VMess", true)
+fn decode_full_base64_vmess_link(
+    rest: &str,
+    source: &SourceRef,
+) -> Result<Option<String>, DetailedConfigError> {
+    decode_full_base64_authority(rest, "VMess", true, source)
 }
 
 fn decode_full_base64_authority(
     rest: &str,
     protocol: &str,
     allow_json: bool,
-) -> Result<Option<String>, ConfigError> {
+    source: &SourceRef,
+) -> Result<Option<String>, DetailedConfigError> {
     let end = rest.find(['?', '#']).unwrap_or(rest.len());
     let authority = &rest[..end];
     if authority.contains('@') {
         return Ok(None);
     }
-    let invalid = || ConfigError::Parse(format!("invalid {protocol} encoded authority"));
+    let invalid = || invalid_link(source);
     let decoded = base64_decode_flexible(authority)
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .ok_or_else(invalid)?;
@@ -615,15 +643,12 @@ fn percent_decode_str(s: &str) -> String {
 /// RFC 1929 makes the SOCKS5 username and password byte strings. Substituting
 /// U+FFFD for an undecodable byte sends a credential the operator never wrote,
 /// and the substitution is invisible in the loaded configuration.
-fn percent_decode_credential(s: Option<&str>, field: &str) -> Result<Option<String>, ConfigError> {
-    s.map(|s| {
-        String::from_utf8(percent_decode_bytes(s)).map_err(|_| {
-            ConfigError::Parse(format!(
-                "share link {field} is not UTF-8 after percent-decoding"
-            ))
-        })
-    })
-    .transpose()
+fn percent_decode_credential(
+    s: Option<&str>,
+    source: &SourceRef,
+) -> Result<Option<String>, DetailedConfigError> {
+    s.map(|s| String::from_utf8(percent_decode_bytes(s)).map_err(|_| invalid_link(source)))
+        .transpose()
 }
 
 fn percent_decode_bytes(s: &str) -> Vec<u8> {

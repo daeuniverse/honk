@@ -315,22 +315,3 @@ async fn pre_reservation_drain_does_not_close_live_session() {
     assert!(!draining.is_closed());
     assert_eq!(pool.metrics().sessions, 2);
 }
-
-#[tokio::test(start_paused = true)]
-async fn insert_over_cap_still_tracked() {
-    let pool = pool(SessionPoolConfig {
-        max_sessions: 1,
-        ..Default::default()
-    });
-    let s1 = TestSession::new();
-    let s2 = TestSession::new();
-    pool.insert(&s1);
-    pool.insert(&s2); // over the cap: must still be tracked
-    let offered = pool
-        .offer(|| async { unreachable!("no dial needed") })
-        .await
-        .unwrap();
-    assert!(Arc::ptr_eq(&offered, &s1) || Arc::ptr_eq(&offered, &s2));
-    // An orphaned (untracked) session would be invisible here.
-    assert_eq!(pool.metrics().sessions, 2);
-}

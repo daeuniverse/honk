@@ -33,7 +33,6 @@ use sha2::{Sha256, Sha512};
 
 use crate::tls::TlsStream;
 
-const SSL_GROUP_X25519: u16 = 29;
 const HKDF_INFO: &[u8] = b"REALITY";
 const SESSION_ID_OFFSET: usize = 39;
 const SESSION_ID_LEN: usize = 32;
@@ -195,15 +194,14 @@ fn reality_session_id(
     Some((session_id, auth_key))
 }
 
-/// Per-connection state shared with the ClientHello fixup callback. Owned
-/// by the SSL object via ex_data (`reality_state_free` drops it), so it
-/// stays valid for a HelloRetryRequest second ClientHello without any
-/// lifetime coupling to the async connect future.
+/// Per-connection authentication state owned by the SSL object. REALITY seals
+/// exactly one ClientHello: resealing after HRR would reuse the GCM key/nonce.
 struct RealityHandshake {
     eph_priv: [u8; 32],
     server_pub: [u8; 32],
     short_id: [u8; 8],
     auth_key: [u8; 32],
+    sealed: bool,
 }
 
 fn reality_ex_index() -> c_int {
@@ -232,8 +230,8 @@ unsafe extern "C" fn reality_state_free(
     }
 }
 
-/// Rewrites the serialized ClientHello in place (patched BoringSSL hook,
-/// see examples/reality_hook_spike.rs for the verified message layout):
+/// Rewrites the serialized ClientHello in place (patched BoringSSL hook;
+/// `reality/wire_tests.rs` verifies the production wire layout):
 /// [0..4] handshake header, [4..6] legacy_version, [6..38] client_random,
 /// [38] session_id_len, [39..71] session_id. Returning 0 aborts the
 /// handshake — a REALITY ClientHello must never go out unauthenticated.
@@ -244,6 +242,9 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
             return 0;
         }
         let state = &mut *state;
+        if state.sealed {
+            return 0;
+        }
         let msg = std::slice::from_raw_parts_mut(msg, msg_len);
         if msg[0] != 1 || msg[38] != SESSION_ID_LEN as u8 {
             return 0;
@@ -267,6 +268,7 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
                 msg[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]
                     .copy_from_slice(&session_id);
                 state.auth_key = auth_key;
+                state.sealed = true;
                 1
             }
             None => 0,
@@ -293,6 +295,7 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
         server_pub: config.public_key,
         short_id: config.short_id,
         auth_key: [0u8; 32],
+        sealed: false,
     });
     let ok = unsafe { boring_sys::RAND_bytes(state.eph_priv.as_mut_ptr(), state.eph_priv.len()) };
     if ok != 1 {
@@ -306,20 +309,14 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_client_x25519_private_key");
     }
-    // X25519 only: the server scans key_share for X25519, and an MLKEM
-    // hybrid share would bloat the ClientHello for nothing.
-    let groups = c"X25519";
+    // New REALITY servers require the hybrid share first, but authenticate
+    // against the preset standalone X25519 share when both are present.
+    let groups = c"X25519MLKEM768:X25519";
     let ok = unsafe { boring_sys::SSL_set1_groups_list(ssl.as_ptr(), groups.as_ptr()) };
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_groups_list");
     }
-    let shares = [SSL_GROUP_X25519];
-    let ok = unsafe {
-        boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
-    };
-    if ok != 1 {
-        return Err(ErrorStack::get()).context("SSL_set1_client_key_shares");
-    }
+    crate::tls::set_chrome_key_shares_ssl_ref(ssl)?;
     let ok = unsafe {
         boring_sys::SSL_set_ex_data(
             ssl.as_ptr(),
@@ -513,3 +510,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

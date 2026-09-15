@@ -34,6 +34,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         Ok(response) => (response, context.logical_upstream.clone()),
         Err(source) => {
             if context.reuse_eligible
+                && !honk_outbound::proxy::is_packet_rejection(&source)
                 && let Some(stale) = stale_outcome(
                     context,
                     &context.logical_upstream,

@@ -13,11 +13,12 @@ It does not define the node configuration surface; see
 [Node reference](../reference/nodes.md). It also does not choose a group
 member or define health policy; see [Group design](./groups.md).
 
-The boundary returned to the caller is one of:
+The boundary returned to an ordinary caller is one of:
 
 - `ProxyStream`, an established target-bound TCP byte stream; or
-- `Arc<dyn PacketTransport>`, an established framed packet path for one UDP
-  target.
+- `Arc<dyn PacketTransport>`, an established framed packet path for one UDP target.
+
+Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. The source-shared VLESS path commits the typed `VlessXudpTransport` into a core-owned source attachment so several five-tuple endpoints can share its receiver.
 
 `direct` reaches the target without a proxy protocol. `block` terminates the
 request. Every other handler turns the selected node into bytes understood by
@@ -48,25 +49,27 @@ optional packet, warm, and probe capability slots. A `None` slot means that the
 protocol does not implement that capability; dispatch is refused rather than
 silently substituted.
 
-- `src/proxy/mod.rs`: `ProxyStream::into_tcp_stream` preserves the zero-copy splice downcast invariant.
-  `WarmAttempt` holds the retention lock across establishment. Failure or cancellation rolls back only its inserted bit, including a failed first warm attempt. Cancellation-driven QUIC cleanup reacquires the bitmap and releases the client only if no successor owner appeared.
+- `src/proxy/mod.rs`: `ProxyStream::into_tcp_stream` preserves the zero-copy splice downcast invariant. `PreparedUdpTransport<T>` keeps speculative publication behind one consuming commit and returns the exact selected `Arc<T>`. `WarmAttempt` holds the retention lock across establishment; failure or cancellation rolls back only its inserted bit.
 
 ### Capability traits
 
-`WarmRequirement::Session|Udp` selects the reusable state to establish.
+`WarmRequirement::Session|Udp` selects the reusable state to establish. VLESS
+resolves the two requirements independently from its TCP and UDP paths; a
+UDP-only Xray pool therefore does not make Selector warming open that pool.
 
 | Trait | Operations | Contract |
 | --- | --- | --- |
 | `TcpOutbound` | `dial`, `dial_with_tcp`, `dial_runtime` | Opens a target-bound `ProxyStream`. `dial_with_tcp` may consume an already connected bare server socket. `dial_runtime` pins session-owning work to the captured generation. |
-| `PacketOutbound` | `dial_udp_transport`, `dial_udp_transport_runtime`, `dial_udp_transport_speculative_runtime` | Opens the only production UDP contract, `PacketTransport`. Runtime and speculative variants prevent reload or cold-race work from consulting mutable current state. |
-| `WarmableOutbound` | `warm(runtime, timeout, WarmRequirement)` | Hysteria2 alone distinguishes `WarmRequirement::Udp` to verify that the server admitted UDP. |
+| `PacketOutbound` | `dial_udp_transport`, `dial_udp_transport_runtime`, `dial_udp_transport_speculative_runtime` | Opens or prepares the ordinary `PacketTransport` contract. Runtime and speculative variants prevent reload or cold-race work from consulting mutable current state. |
+| `WarmableOutbound` | `warm(runtime, timeout, WarmRequirement)` | Establishes only the reusable state named by the requirement. Hysteria2 uses `Udp` to verify server admission; VLESS may map `Session` and `Udp` to different pools. |
 | `ProbeableOutbound` | `test_connectivity` | Tests raw proxy-server reachability. Protocols may override the default marked TCP connect. |
 
 `PacketTransport` exposes the relay target, `send_packet`,
 `send_packet_confirmed`, and `recv_packet`. `send_packet_confirmed` is the
 stronger first-packet admission point for queue-backed tunnels. Full-cone
 protocols can additionally declare that server metadata authoritatively names
-the reply source.
+the reply source. Source-shared VLESS uses the same framing transport internally,
+but core serializes sends from endpoint views and owns its single receive loop.
 
 No production UDP handler returns a raw socket or a loopback bridge. Direct and
 SOCKS5 wrap native sockets behind `PacketTransport`; tunnel protocols implement
@@ -75,8 +78,8 @@ framing on their actual transport.
 ### Protocol descriptors
 
 `src/descriptor.rs` owns `ProtocolDescriptor`, the single per-protocol facts table.
-Predicates accept the concrete node because VLESS `vless_mode`, `network`, and
-Trojan transport affect capability or pooling. `network_allows_udp` is shared by
+Predicates accept the concrete node because VLESS `network` and TCP path, and
+Trojan transport, affect capability or pooling. `network_allows_udp` is shared by
 Trojan, AnyTLS, and VLESS.
 
 | Protocol | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | Share-link schemes |
@@ -84,7 +87,7 @@ Trojan, AnyTLS, and VLESS.
 | Shadowsocks, including 2022 | yes | no | yes | `None` | `ss` |
 | Trojan | when `network` is absent or contains `udp` | only `tcp`/empty transport | yes | `None` | `trojan` |
 | VMess | no | no | yes | `None` | `vmess` |
-| VLESS | non-`legacy` mode and UDP allowed by `network` | no | `legacy`, `uot-v2`, `xudp` only | H2MUX, Mux.Cool, or `None`, by mode | `vless` |
+| VLESS | when `network` allows UDP | no | when the TCP path is direct | `Vless` | `vless` |
 | SOCKS5 | yes | yes | yes | `None` | `socks5`, `socks4`, `socks4a` |
 | Hysteria2 | yes | no | no | `Quic` | `hysteria2`, `hysteria` |
 | TUIC | yes | no | no | `Quic` | `tuic` |
@@ -95,8 +98,9 @@ Trojan, AnyTLS, and VLESS.
 
 Ready-stream pooling stores a completed target-bound handshake. Bare-TCP
 pooling stores only a connected proxy-server socket and lets `dial_with_tcp`
-perform the per-target protocol handshake. Multiplexed and QUIC protocols
-exclude both because their generation runtime is the sole reusable-state owner.
+perform the per-target protocol handshake. TCP-multiplexed and QUIC protocols
+exclude both because their generation runtime owns reuse. VLESS with direct TCP
+remains bare-poolable even when an independent UDP-only Xray pool exists.
 
 Ready streams are keyed by runtime generation, node identity, and target; only
 flows using the generation that dialed them may acquire them. After a reload
@@ -106,6 +110,13 @@ ready deposits, hotness updates, and warm claims for it. The successor starts
 with an empty ready namespace. A rejected reload keeps the active pool state.
 Bare-TCP keys remain proxy-server addresses; health purges remove that address's
 bare entries and only the current generation's matching identity's ready entries.
+
+A bare entry has completed only the proxy-server TCP connect. Before reuse,
+the pool rejects any queued inbound byte—including a fatal TLS alert—because
+protocol/TLS setup has not started and no server byte can be valid yet. There is
+no SNI/alert special case and no handshake retry on that socket. A Ready entry
+has completed its target-bound protocol handshake, so already buffered target
+data remains valid and does not make it stale.
 
 Registry assembly checks that descriptor capabilities, populated slots, and runtime kinds agree.
 Node-dependent entries may carry a packet slot even when the default node lacks
@@ -123,7 +134,7 @@ can reject the flow terminally.
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP |
 | `vmess` | VMess stream | Unimplemented |
-| `vless` | Mode-dependent | Available only when `vless_mode != legacy` and `node.network` allows UDP |
+| `vless` | Direct, H2, or Mux.Cool from the independent multiplex policy | Available when `network` allows UDP; encoding and optional UDP multiplexing select the path |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagrams |
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
@@ -146,11 +157,13 @@ outbound state for one immutable configuration generation. It maps `Node.id` to
 - the node-aware `udp_capable` result; and
 - one `ProtocolRuntime` selected by the descriptor.
 
-`ProtocolRuntime` is `None`, an AnyTLS `SessionPool`, a VLESS H2MUX or Mux.Cool
-`SessionPool`, or one type-erased QUIC client slot. Handlers remain stateless
-with respect to generation-owned sessions.
+`ProtocolRuntime` is `None`, AnyTLS state, `VlessRuntime`, or one type-erased
+QUIC client slot. Every VLESS node owns a `VlessRuntime`; it contains only the
+H2/shared-Cool/separate-Cool pools selected by configuration plus the lazy
+private source-ID key. Handlers remain stateless with respect to these
+generation-owned resources.
 
-- Structured/imported raw TCP TLS ALPN lives in `TlsOptions.alpn` (flat serde `tls_alpn`, omitted when empty). `Node::validate_protocol` requires enabled ordinary TLS on AnyTLS or TCP Trojan/VMess/VLESS, rejects REALITY/WS/gRPC/QUIC overrides, and bounds names to 1–255 bytes plus the encoded list to 65,533 bytes. Nonempty ALPN derives a child UUID v5 using the legacy ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name, separating it from arbitrary credential text; empty lists keep all legacy IDs. URI/v2rayN ALPN compatibility and TUIC's separate `tuic_alpn` remain unchanged.
+- Structured/imported raw TCP TLS ALPN lives in `TlsOptions.alpn` (flat serde `tls_alpn`, omitted when empty). `Node::validate_protocol` requires enabled ordinary TLS on AnyTLS or TCP Trojan/VMess/VLESS, rejects REALITY/WS/gRPC/QUIC overrides, and bounds names to 1–255 bytes plus the encoded list to 65,533 bytes. Nonempty ALPN derives a child UUID v5 using the base ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name, separating it from arbitrary credential text; empty lists retain that base ID, including VLESS's re-derived identity. URI/v2rayN ALPN compatibility and TUIC's separate `tuic_alpn` remain unchanged.
 
 Admission-scoped TCP feedback starts once at the first admitted physical attempt or before logical open on a reused session/QUIC connection; cold admission waiting remains unstarted, while completed paths without either boundary retain the completion fallback.
 
@@ -166,9 +179,8 @@ Transfer occurs at the reload commit point. The old generation records moved
 runtimes during drain and shutdown. Consequently, unchanged nodes keep:
 
 - TUIC, Juicity, and Hysteria2 QUIC clients and connections;
-- AnyTLS physical sessions;
-- VLESS H2MUX carriers; and
-- VLESS Mux.Cool carriers.
+- AnyTLS physical sessions; and
+- the complete VLESS runtime, including H2/Mux.Cool carriers and its source-ID key.
 
 A retiring generation first becomes terminal to new work. Non-transferred
 AnyTLS and VLESS pools enter draining: no new logical streams are admitted, but
@@ -181,7 +193,8 @@ Generation-free callers such as standalone probes use
 `EphemeralRuntimeGuard`. AnyTLS or VLESS streams and packet transports retain
 the guard for their whole lifetime. Normal completion can await `close`; drop
 also starts deterministic teardown, so a throwaway pool cannot survive an
-aborted caller. Single XUDP has no generation runtime.
+aborted caller. Single XUDP also uses its VLESS runtime for the per-source key,
+even though its private carrier is not in a reusable session pool.
 
 ### Dial admission
 
@@ -201,7 +214,14 @@ Session pools bind autonomous replacement dials only to the published owner's
 admission. Reload publication atomically rebinds transferred pools before
 predecessor retirement; a late speculative commit cannot restore its predecessor's
 gate. Retirement clears the stored admission immediately, and an uncommitted
-`PreparedUdpTransport` retains neither gate nor successful dial permit.
+`PreparedUdpTransport` retains neither generation nor process dial-admission permit.
+
+VLESS physical carriers additionally hold one permit from the immutable
+process-wide VLESS-carrier gate. The startup resource budget computes
+`min(after_dials / 8, 8192)` before sizing UDP endpoints; zero remains zero.
+Reloaded traffic and DNS runtime forks share the same gate. A permit stays with
+actual carrier I/O through provisional, active, draining, and idle task
+teardown, so it—not a sum of node-local pool caps—is the authoritative descriptor bound.
 
 ## Shared stream, socket, and bootstrap layers
 
@@ -218,10 +238,18 @@ When REALITY parameters are present, it dispatches to `reality::reality_connect`
 of ordinary TLS. The same shared path therefore gives Trojan, VMess, and VLESS
 consistent TLS, REALITY, WS, and gRPC setup.
 
+Cold and pooled-bare Trojan streams use that same complete transport stack.
+TLS batching returns bytes already read before surfacing a later I/O error on
+the next non-empty read; it never converts that error into EOF.
+
 The gRPC transport is a hand-written minimal gRPC-over-HTTP/2 client that interoperates with official sing-box Trojan+gRPC. The
 opening HEADERS frame does not set `END_STREAM`, and TLS requests use
 `:scheme: https`. DATA carries gRPC length prefixes and the protobuf
 single-bytes-field envelope expected by gun-style servers.
+gRPC over TLS always negotiates `h2`, independent of the fingerprint profile.
+Its bounded write queue reports bytes once it owns them; cancellation cannot
+attribute those bytes to a later caller buffer. Positive HTTP/2 windows are
+usable whenever one payload byte and its envelope fit.
 
 ### Marked sockets and name resolution
 
@@ -272,25 +300,26 @@ store is built from `webpki-root-certs`. Explicit no-verify connectors exist for
 configured insecure operation and for REALITY, whose own post-handshake check
 replaces PKI.
 
-- `src/tls.rs` — **BoringSSL TLS client** with webpki/no-verify stores. Process-wide `set_tls_mode` (`tls_implementation = "utls"`) selects a **real Chrome fingerprint**: GREASE, permuted extensions, X25519MLKEM768+X25519 key shares (`mlkem`), Chrome sigalgs/curves, brotli cert compression, ALPS-h2, ECH GREASE. Per-node **ECH** uses `ech_config` / `ech_config_path` and `SSL_set1_ech_config_list`. Rejection fails closed per RFC and logs retry configs. Without static config, `ech_enabled` triggers connect-time **DNS HTTPS-RR discovery** (`discover_ech_config`, RFC 9460, bootstrap resolver or first system nameserver, per-domain cache, fail-open). `set_utls_imitate` accepts only `chrome*`; other values warn and fall back to the sole Chrome profile.
-  Connectors: `build_connector(node)` for proxies, `build_dns_connector()` for DoT/DoH, `build_reality_connector(chrome)` with accept-all verification, replaced by post-handshake ed25519 auth in `reality.rs`; never offer REALITY resumption. Chrome pins old ALPS `0x4469` via `SSL_set_alps_use_new_codepoint(ssl, 0)`; BoringSSL's new default is JA4-distinguishable. REALITY Chrome JA4: `t13d1516h2_8daaf6152771_01adaf6b9c20`; ja4_a/ja4_b match Chrome, ja4_c differs only by added ed25519.
+- `src/tls.rs` — **BoringSSL TLS client** with webpki/no-verify stores. Process-wide `set_tls_mode` (`tls_implementation = "utls"`) selects a Chrome-oriented ClientHello profile: GREASE, permuted extensions, hybrid then classic X25519 shares, Chrome-derived sigalgs/curves/ciphers, brotli certificate compression, ALPS-h2, and ECH GREASE. This is protocol emulation, not a claim of complete Chrome identity. Per-node **ECH** uses `ech_config` / `ech_config_path`; discovery uses DNS HTTPS records and remains best-effort/fail-open, while an explicit server ECH rejection fails closed.
+  `build_reality_connector(chrome)` replaces PKI with post-handshake ed25519 authentication in `reality.rs`, permits TLS 1.3 only, and never offers REALITY resumption. REALITY necessarily adds ed25519 to the signature list, another reason not to describe it as a full browser fingerprint.
   Explicit structured TCP ALPN reaches `build_connector` in both tls/utls modes; empty lists retain existing profile defaults. Chrome ALPS follows exact `h2` membership. Registry publication and direct connector construction validate nonempty overrides; shared stream dispatch validates before choosing plaintext or REALITY, and direct QUIC configuration rejects TCP ALPN rather than ignoring it.
 
 ### Process-wide TLS profile
 
-`tls_implementation = "utls"` enables the one implemented impersonation profile,
-Chrome, process-wide. The profile configures:
+`tls_implementation = "utls"` enables the one implemented Chrome-oriented
+emulation profile process-wide. It configures:
 
 - GREASE and per-connection extension permutation;
 - `X25519MLKEM768` followed by `X25519` key shares;
-- Chrome signature algorithms, curves, cipher set, and ALPN;
+- Chrome-derived signature algorithms, curves, cipher set, and ALPN;
 - brotli certificate compression;
 - ALPS for h2, pinned to Chrome's old `0x4469` codepoint rather than
   BoringSSL's newer `0x44cd`; and
 - ECH GREASE when no real ECHConfigList is available.
 
-Other `utls_imitate` names warn and use Chrome. `tls_implementation = "tls"`
-keeps the ordinary BoringSSL ClientHello.
+Other `utls_imitate` names warn and use this profile. `tls_implementation = "tls"`
+keeps the ordinary BoringSSL ClientHello. Neither setting promises complete
+browser identity.
 
 ### ECH and certificate pins
 
@@ -310,48 +339,48 @@ The same rule is implemented in TCP `tls.rs` and the QUIC crypto backend.
 
 ## REALITY client
 
-`src/reality.rs` implements the specialized REALITY BoringSSL handshake through
-`RealityConfig`, `parse_reality_config`, and `reality_connect`, byte-compatible
-with Xray `reality.go`. The workspace's patched `boring-sys` supplies two client
+`src/reality.rs` implements the specialized TLS-1.3-only REALITY BoringSSL
+handshake through `RealityConfig`, `parse_reality_config`, and
+`reality_connect`. The workspace's patched `boring-sys` supplies two client
 hooks ([Technology stack](../../../AGENTS.md#technology-stack)):
 
-- `SSL_set1_client_x25519_private_key` places honk's ephemeral private key into
-  the serialized X25519 `key_share`; and
+- `SSL_set1_client_x25519_private_key` presets honk's ephemeral private key for
+  the standalone X25519 share; and
 - `SSL_set_client_hello_fixup_cb` rewrites the serialized ClientHello before it
   enters the handshake transcript.
 
 ### ClientHello authentication
 
-REALITY forces X25519-only groups and key shares. The fixup callback zeros the
-32-byte legacy `session_id` slot in the complete ClientHello and computes:
+The ClientHello advertises `X25519MLKEM768` first and standalone `X25519`
+second. REALITY authentication deliberately derives from the preset classic
+X25519 private key/share even when the peer negotiates the hybrid share. The
+fixup callback zeros the 32-byte legacy `session_id` slot and computes:
 
-- `authKey = HKDF-SHA256(X25519(eph, pbk), salt=clientRandom[:20], "REALITY")`,
-  where `eph` is the client ephemeral private key and `pbk` the server public key;
+- `authKey = HKDF-SHA256(X25519(eph, pbk), salt=clientRandom[:20], "REALITY")`;
 - nonce `clientRandom[20:32]`; and
-- `AES-256-GCM(authKey).Seal([ver:3][0][ts:4][shortId:8])`, with version bytes
-  `1,3,3`, reserved byte `0`, a big-endian u32 timestamp, and an eight-byte short
-  ID. The AAD is the whole ClientHello with `session_id` zeroed.
+- `AES-256-GCM(authKey).Seal([ver:3][0][ts:4][shortId:8])`, with unchanged
+  version bytes `1,3,3`, reserved byte `0`, a big-endian u32 timestamp, and an
+  eight-byte short ID. The AAD is the whole zero-session-ID ClientHello.
 
-The 16-byte encrypted plaintext plus 16-byte GCM tag exactly fills the legacy
-32-byte session ID. An empty short ID is eight zero bytes; a configured value is
-even-length hex of at most eight bytes and is right-zero-padded. Unparseable
-`reality_public_key`/`reality_short_id` or fixup failure aborts the handshake;
-no unauthenticated ClientHello is sent.
+The 16-byte encrypted plaintext and 16-byte tag fill the session ID. An empty
+short ID is eight zero bytes; a configured value is even-length hex of at most
+eight bytes and is right-zero-padded. Parse or fixup failure aborts before an
+unauthenticated ClientHello is sent. The callback seals exactly once: a second
+invocation, including an HRR second ClientHello, aborts before GCM key/nonce
+reuse. The client therefore does not claim HRR support.
 
 ### Server authentication and fingerprint constraints
 
 REALITY replaces ordinary certificate verification: the peer leaf must be an
 ephemeral ed25519 certificate whose signature is exactly
-`HMAC-SHA512(authKey, raw ed25519 public key)`.
+`HMAC-SHA512(authKey, raw ed25519 public key)`. A mismatch, an ordinary
+mask-target certificate, or any other authentication failure is fail-closed;
+the client does not infer a unique remote cause. There is no PKI fallback or
+session resumption.
 
-A relayed mask-target certificate, wrong key, redirection, or MITM fails closed.
-There is no fallback to PKI and no session resumption.
-
-The REALITY profile adds ed25519 to the Chrome signature-algorithm list because
-BoringSSL otherwise rejects the ephemeral leaf before the custom check.
-The widened signature list is the one known
-`JA4_c` difference from Chrome; the verified REALITY Chrome JA4 is
-`t13d1516h2_8daaf6152771_01adaf6b9c20`.
+The profile must add ed25519 to the Chrome-derived signature list because
+BoringSSL otherwise rejects the ephemeral leaf before the custom check. This
+is an explicit fingerprint divergence, so no full Chrome-identity claim is made.
 
 The REALITY `dest` must return a TLS Certificate message smaller than 8 KiB,
 because compatible sing-box servers buffer 8192 bytes. A larger certificate
@@ -359,106 +388,155 @@ flight cannot complete this handshake.
 
 ## VLESS wire contracts
 
-`WireMode` selects one of six explicit contracts. It is configuration, not
-negotiation.
+Canonical configuration is `VlessConfig` in `honk-config/src/node/vless.rs`.
+UDP permission, protocol packet encoding, and multiplexing are independent axes:
 
-| Mode | TCP path | UDP path | Reusable shape |
-| --- | --- | --- | --- |
-| `legacy` | Ordinary VLESS stream | none | No generation runtime; bare proxy TCP may be pooled |
-| `uot-v2` | Ordinary VLESS stream | One connected direct UoT v2 stream per packet transport | No generation runtime; bare proxy TCP may be pooled |
-| `h2mux` | H2MUX logical TCP stream | Native connected H2MUX UDP using UoT length framing | Node-owned H2MUX pool, at most 2 reusable/dialing carriers × 128 streams |
-| `h2mux-padded` | H2MUX logical TCP stream with sing-mux v1 padding | Same native connected UDP with padding | Same node-owned 2 × 128 H2MUX pool |
-| `xudp` | Ordinary VLESS stream | Single XUDP on a dedicated mux-command carrier, reserved ID 0 | Unpooled; bare proxy TCP may be pooled |
-| `mux-cool` | Mux.Cool logical TCP stream | Pooled XUDP | Node-owned Mux.Cool pool, at most 2 active carriers × 128 children |
+| Axis | Values | Path effect |
+| --- | --- | --- |
+| `network` | TCP-only or UDP-enabled | Sole UDP capability gate; disabling UDP does not select an encoding. |
+| `udp_encoding` | `auto`, `native`, `xudp`, `uot-v2` | Selects the non-multiplexed packet protocol. `auto` uses native command-UDP on 53/443 without Vision and Single XUDP otherwise. |
+| `multiplex` | `off`, H2, Xray | Independently selects direct/H2/Mux.Cool TCP and protocol/H2/Mux.Cool UDP paths. H2 alone owns its padding flag. |
 
-The client never probes the server for a mode, falls back to another mode, or
-replays a first UDP packet. A mismatch is a protocol failure. This keeps packet
-admission and side effects single-commit.
+Xray TCP concurrency zero means 8 and a negative value disables TCP mux. XUDP
+concurrency zero follows the TCP pool, negative returns UDP to its protocol
+encoding, and a positive value creates a separate UDP pool. Positive values
+normalize to `1..=128`. Its UDP/443 policy defaults to `reject`; that rejection
+still applies when Xray is enabled but both pools are disabled. `skip` uses the
+protocol encoding and then the ordinary Vision gate. `allow` bypasses Vision's
+port-443 gate only when the selected UDP path actually uses Mux.Cool.
+
+The client never probes the server for another path, retries with another
+framing, or replays a first UDP packet. Native VLESS uses u16-framed connected
+command-UDP without the UoT magic destination or setup preamble. Sends accept
+1–8190 bytes; received zero-length frames are datagrams, not EOF. The writer is
+flush-confirmed and a cancelled ambiguous write is not replayed.
+
+Typed policy, size, and carrier-capacity refusals are terminal local results,
+distinct from congestion or transport failure. They do not demote health or
+Score. Candidate admission checks policy before committing protocol state;
+DNS, health, and CLI callers preserve the rejection rather than selecting a
+fallback or reporting the path as not applicable.
 
 ### H2MUX
 
 `src/proxy/uot.rs` and `src/proxy/vless_mux.rs` implement shared UoT v2 framing
 and sing-box H2MUX. H2MUX sends the physical VLESS request to
 `sp.mux.sing-box.arpa:444`, selects backend `2`, then runs HTTP/2 over that
-carrier. Logical streams carry either TCP or native connected UDP. UDP uses the
-shared UoT length codec rather than a loopback bridge.
+carrier. Logical streams carry TCP or native connected UDP. UDP uses the shared
+UoT length codec rather than a loopback bridge.
 
-`h2mux-padded` adds the sing-mux v1 randomized preface and record framing for
-the first 16 records in each direction. Each carrier admits at most 128 logical
-streams. At most two reusable or currently dialing carriers count toward the
-pool cap; a draining carrier may overlap its replacement until its final live
-stream exits.
+Optional H2 padding adds the sing-mux v1 randomized preface and record framing
+for the first 16 records in each direction. A node has at most two reusable or
+dialing H2 carriers, and each carrier admits at most 128 concurrent streams; a
+draining carrier may overlap its replacement. The 128 value is a concurrency
+limit, not a carrier-lifetime/open-count rollover.
 
 HTTP/2 flow control drives backpressure. GOAWAY makes the carrier draining and
 rolls new work to a replacement. Driver failure fans out to its children;
 half-close, reset, receive-window release, and lazy response errors remain
-per-stream.
-
-Receive credit is fixed at 2 MiB per stream. Connection credit covers one
-maximum UoT response frame for each of the 128 admitted streams
-(8 MiB + 256 bytes). The larger stream window removes the old
-one-datagram-per-RTT ceiling on long-fat TCP paths. The per-stream cap prevents
-one unread child from consuming all connection credit, while the aggregate
-bound lets interleaved maximum UDP frames always complete.
+per-stream. Receive credit stays 2 MiB per stream and connection credit remains
+large enough for one maximum UoT response frame for each admitted stream.
 
 ### Mux.Cool and XUDP
 
-`src/proxy/vless_cool.rs` implements Mux.Cool: it sends the Xray VLESS mux command and multiplexes child TCP and XUDP
-records. One ordered writer serializes every child frame. Session IDs increase
-monotonically and are not reused; an exhausted carrier drains while a
-replacement accepts new children.
-
-The pool admits no more than two active carriers and 128 children per carrier.
-Draining carriers do not consume the active cap but remain alive for existing
-children. Saturation waits for capacity instead of bypassing the pool.
+`src/proxy/vless_cool.rs` and its `codec`/`child` modules implement the Xray mux
+command, child TCP, and XUDP records. One ordered writer serializes every child
+frame. Each carrier's effective concurrency is the configured positive limit
+capped at 128. Session IDs increase monotonically and are not reused; issuing
+ID 128 drains the carrier and a replacement takes new work. There is no
+per-node two-carrier cap: the process VLESS-carrier FD gate is authoritative.
 
 Receive payloads share an 8 MiB carrier budget. TCP delivery allows 100 ms for
 transient budget or queue pressure before resetting only the stalled child;
-UDP remains drop-on-full. This tolerates line-rate scheduler bursts without
-letting an unread child pin the carrier indefinitely.
+UDP remains drop-on-full. Pooled Mux.Cool packets retain their 8 KiB cap;
+Single XUDP retains its 7,526-byte cap.
 
-XUDP reply metadata can change the logical peer and therefore enables full-cone
-reply sources. Pooled Mux.Cool packets are capped at 8 KiB. Single XUDP reuses
-the codec on a dedicated unpooled carrier with global ID `0` and a 7,526-byte
-packet cap.
+### Source/session ownership and capacity
 
-### Vision
+For Single XUDP and shared/separate Mux.Cool, `honk-core` indexes a source owner
+by reused `NodeRuntime` identity, normalized client address, selected UDP path,
+and reply projection (`ActualPeer` or `RewriteTo(original destination)`). One
+owner holds one XUDP session and one receiver while multiple canonical
+five-tuple endpoint entries expose serialized send views. Single XUDP uses one
+private unpooled SID 0 per scope; Mux.Cool gives scopes separate child SIDs that
+may share physical pools.
 
-`xtls-rprx-vision` carries the flow in the VLESS addons. The response header is
-stripped lazily on the first read because servers commonly send it with the
-target's first downstream bytes; eager reading can deadlock a request whose
-target waits for client data.
+The full `(client, destination)` endpoint map remains authoritative for route,
+decision token, and per-flow Score. A reply for a Ready entry is delivered only
+when that endpoint belongs to the source owner. A wrong owner or an
+`Initializing`/`Retiring` entry is dropped, never reclassified as foreign. Only
+an absent key in an `ActualPeer` scope is eligible for a foreign full-cone reply,
+which updates source transport accounting but has no flow Score owner. Domain
+routes use `RewriteTo(original)` and never become foreign replies.
 
-Vision removes response padding. Command `2` is direct-copy: the server abandons
-the outer TLS session and the read side switches to the raw TCP socket. The
-write side remains on the outer stream unless the client itself sends a direct
-command, which honk does not.
+The runtime lazily creates a private keyed source-ID hash from this scope.
+Carrier replacement under a reused runtime preserves the ID; runtime
+replacement or process restart creates a new key. This intentionally preserves
+honk's per-source behavior, not Xray's source-only global identity and not a
+collision-free NAT guarantee. Late callbacks recheck source owner and endpoint
+token/generation before acting; ambiguous sends are never automatically replayed.
 
-The supported carrier is TCP with TLS or REALITY, and the supported wire modes
-are `legacy` and Single `xudp`. H2MUX, padded H2MUX, Mux.Cool, and UoT own
-incompatible inner framing.
+The source owner reports shared DataUdp transport health. Each bound endpoint
+retains its own Score reporter; matched replies and a shared terminal outcome
+settle those flows separately. Foreign replies have no per-flow Score. Source
+capacity exhaustion is `PacketRejection::Capacity`, terminal for that candidate
+but health- and Score-neutral.
 
-### VLESS Encryption
+Selector and UDP warm retention resolve independently: the TCP-selected pool
+answers `WarmRequirement::Session`, while the UDP-selected pool answers
+`WarmRequirement::Udp`. A UDP-only Xray pool therefore remains eligible for UDP
+warming while direct TCP remains bare-poolable. The existing outbound
+maintenance pass reaps unretained idle VLESS sessions; there is no VLESS-only
+timer. Active, provisional, draining, and idle carriers all hold the process
+carrier permit until their actual I/O task tears down.
+Synchronizing unchanged retention does not drain either pool. Only an actual
+unpin drains that pool's excess carriers; existing children continue to finish.
+Only Active carriers count toward the reusable warm/standby floor. Draining
+carriers with live children remain independently and cannot displace the idle
+replacement; idle reaping and unpin removal traverse the pool linearly.
 
-`src/proxy/vless_encryption.rs` implements Xray-compatible VLESS Encryption, wrapping the selected stream transport before the ordinary VLESS
-request. The only implemented protocol name is `mlkem768x25519plus`, with
-`native`, `xorpub`, and `random` wire modes.
+The descriptor partition is fixed at process startup and shared across reloads
+and DNS forks, even when the initial configuration has no VLESS nodes. It reserves
+`min(after_dials / 8, 8192)` carrier slots before sizing UDP endpoints; native
+VLESS UDP, UoT, and Single XUDP consume this gate too, not just multiplexed paths.
+Exhaustion returns an immediate typed Capacity refusal, not a wait queue.
 
-The prologue accepts X25519 or ML-KEM-768 server authentication keys, including
-chained relay keys. Every new 1-RTT connection performs ML-KEM-768 plus X25519
-forward secrecy. Payload records use AES-256-GCM when hardware acceleration is
-available and ChaCha20-Poly1305 otherwise.
+| Effective `nofile` | UDP endpoints without carrier reserve | UDP endpoints with carrier reserve | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 50 | 44 | 12.00% |
+| 4,096 | 216 | 189 | 12.50% |
+| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,048,576 | 8,192 | 8,192 | 0% (endpoint cap) |
 
-A `0rtt` configuration caches the server ticket and PFS key in the handler's
-`Node.id`-keyed client config. A cold or expired cache takes the 1-RTT path. Any
-record-authentication failure while using a ticket invalidates it, so the next
-connection cannot repeat a rejected cached path.
+These are descriptor-derived limits, not preallocated endpoint memory. Reload
+does not recompute or enlarge the startup partition.
 
-VLESS Encryption is legacy-only. Configuration rejects it with Vision and with
-every non-`legacy` wire mode because each combination would give two layers
-ownership of the same inner framing.
+### Vision and VLESS Encryption
 
-Raw-TCP interop is verified against Xray 26.7.28 across all modes, both auth-key types, chained X25519 keys, and 1-RTT→0-RTT.
+`xtls-rprx-vision` is carried in the VLESS addons. The response header is
+stripped lazily on first read because it may arrive with target bytes. Vision
+removes response padding. Without VLESS Encryption it requires raw TCP with
+TLS 1.3 or REALITY; TCP multiplexing is always invalid, even when Encryption is
+enabled. UDP-only Xray multiplexing is legal. Vision rejects native, UoT, and H2
+UDP paths. Base `xtls-rprx-vision` rejects UDP/443 on the protocol fallback;
+`xtls-rprx-vision-udp443` permits that target over Single XUDP even with `mux=off`.
+For enabled Xray mux, `reject` remains terminal for either flow; `skip` uses the
+protocol fallback and its flow gate, while `allow` bypasses the base-flow gate
+only on an actual UDP mux path. The wire addon remains the base Vision flow.
+
+`src/proxy/vless_encryption.rs` wraps the selected transport before the VLESS
+request. The implemented protocol is `mlkem768x25519plus`, with `native`,
+`xorpub`, and `random` wire modes. It accepts X25519 or ML-KEM-768 server keys,
+including chained relay keys; new 1-RTT connections combine ML-KEM-768 and
+X25519, and authenticated records use the selected AEAD. The optional 0-RTT
+cache remains keyed by normalized node identity and invalidates a rejected
+ticket path.
+
+Encryption can wrap direct and Xray/Mux.Cool paths, including supported Vision
+combinations, but not H2 or UoT framing. On a Vision direct-copy response, only
+the AEAD read layer is removed; the outer transport and random-XOR layer remain.
+The write side retains its existing outer stack. This is not a raw-socket
+cutover claim for encrypted Vision.
 
 ## QUIC stack
 
@@ -551,6 +629,12 @@ protocol heartbeat datagrams are unavailable.
 | Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows |
 | Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | `hy2_up_mbps` selects `quic::BrutalConfig` (window = rate×RTT, ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
 
+The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
+its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed
+packets are truncated by the server. Interop observed 8,192-byte payloads returning
+2,048 bytes; 2,048-byte echoes passed. This is not a Juicity wire limit, so honk
+does not impose an arbitrary 2,048-byte cap on other servers.
+
 Hysteria2's HTTP/3 layer is deliberately local and minimal: control/QPACK
 unidirectional streams, static-table QPACK, and enough HEADERS handling for
 authentication. It must not advertise `SETTINGS_H3_DATAGRAM`; doing so starts a
@@ -586,6 +670,9 @@ waits, least-loaded selection, and pool-owned single-flight physical dials.
 Draining sessions are excluded from the reusable cap and can overlap
 replacements while live streams finish. The pool also owns bounded retry
 classification, backoff, retirement, and idempotent force shutdown.
+Initialization waiters receive one `SharedError`, which clones the original
+`anyhow::Error` through an `Arc` and preserves its source chain. The pool never
+flattens a builder failure to display text before broadcasting it.
 
 AnyTLS configures two reusable physical sessions and 128 streams per session.
 It spreads work: after the first session becomes busy, the pool establishes the
@@ -635,16 +722,12 @@ Each TCP child has a bounded delivery queue, demultiplexed by `sid`. When it fil
 parks frames in a per-SID ordered overflow instead of waiting, preserving
 sibling progress and exact frame/byte accounting.
 
-Soft limits are:
-
-- 512 parked frames and 8 MiB per session; and
-- 2 MiB per stream.
-
-Crossing a soft limit does not kill the stream. The first parked frame starts a
-watchdog ticking every 250 ms; it retires on overflow drain and is aborted on close. Only a stream with no successful overflow flush
+The first parked frame starts a watchdog ticking every 250 ms; it retires on
+overflow drain and is aborted on close. Only a stream with no successful overflow flush
 for a full 3 seconds is reset; queued bytes alone are not evidence of a stall.
 
-Emergency hard limits are 768 frames or 12 MiB per session. If a stream is
+The emergency hard limit is 768 parked frames per session. Retained payload bytes
+are bounded separately by the pool-wide budgets below. If a stream is
 already past the 3-second grace, admission reaps that stream immediately.
 Otherwise the demultiplexer waits in bounded 100 ms
 `OVERFLOW_EMERGENCY_WAIT` rounds, shortened to the nearest grace expiry, and

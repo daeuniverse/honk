@@ -15,6 +15,9 @@ impl RecordOptions {
         self.occurrences.push((key, value));
     }
 
+    pub(super) fn contains(&self, key: &str) -> bool {
+        self.occurrences.iter().any(|(name, _)| name == key)
+    }
     pub(super) fn remove(&mut self, key: &str) -> Option<String> {
         let index = self.occurrences.iter().rposition(|(name, _)| name == key)?;
         let value = self.occurrences.remove(index).1;
@@ -152,6 +155,24 @@ pub(super) fn take_packet_network(options: &mut RecordOptions) -> RecordResult<O
         packet_network,
     )?;
     Ok(options.take_first_nonempty(&["network"]))
+}
+
+pub(super) fn take_vless_packet_encoding_alias(
+    options: &mut RecordOptions,
+) -> RecordResult<Option<&'static str>> {
+    let keys = &["packet-encoding", "packet_encoding", "packetencoding"];
+    let encoding =
+        options.coalesce(
+            keys,
+            "record packet encoding aliases conflict",
+            |value| match value {
+                "" | "none" => Ok(Some("none")),
+                "xudp" => Ok(Some("xudp")),
+                _ => Err("VLESS packet encoding is unsupported"),
+            },
+        )?;
+    options.clear_aliases(keys);
+    Ok(encoding)
 }
 
 pub(super) fn take_option(options: &mut RecordOptions, keys: &[&str]) -> Option<String> {

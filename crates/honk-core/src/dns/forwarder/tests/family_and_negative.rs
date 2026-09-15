@@ -2,8 +2,8 @@ use super::*;
 use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
 /// Mock upstream answering per query qtype.
 struct QtypeMock {
-    a: Vec<u8>,
-    aaaa: Vec<u8>,
+    a: Result<Vec<u8>, honk_outbound::SharedError>,
+    aaaa: Result<Vec<u8>, honk_outbound::SharedError>,
     call_count: AtomicUsize,
 }
 
@@ -12,22 +12,23 @@ impl DnsUpstreamPool for QtypeMock {
     async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let (_, qtype) = parse_dns_question(raw_query).expect("question");
-        Ok(match qtype {
+        match qtype {
             1 => self.a.clone(),
             28 => self.aaaa.clone(),
             _ => {
                 let context =
                     crate::dns::query::QueryContext::parse(raw_query).expect("query context");
-                make_empty_response(raw_query, &context)
+                Ok(make_empty_response(raw_query, &context))
             }
-        })
+        }
+        .map_err(anyhow::Error::new)
     }
 }
 
 fn qtype_mock(a: Vec<u8>, aaaa: Vec<u8>) -> Arc<QtypeMock> {
     Arc::new(QtypeMock {
-        a,
-        aaaa,
+        a: Ok(a),
+        aaaa: Ok(aaaa),
         call_count: AtomicUsize::new(0),
     })
 }
@@ -176,6 +177,80 @@ async fn test_prefer_ipv6_suppresses_a_when_aaaa_exists() {
         0,
         "A must be suppressed when AAAA answers exist"
     );
+}
+
+#[tokio::test]
+async fn preferred_family_packet_rejection_is_terminal_but_offline_falls_back() {
+    use honk_outbound::proxy::{PacketRejection, packet_rejection};
+
+    for (strategy, qtype, answer, expected_ip) in [
+        (
+            DnsStrategy::PreferIpv4,
+            28,
+            make_aaaa_response(TEST_V6, 300),
+            IpAddr::from(TEST_V6),
+        ),
+        (
+            DnsStrategy::PreferIpv6,
+            1,
+            make_a_response([10, 0, 0, 1], 300),
+            IpAddr::from([10, 0, 0, 1]),
+        ),
+    ] {
+        for strict in [true, false] {
+            for rejection in [Some(PacketRejection::Capacity), None] {
+                let source = match rejection {
+                    Some(rejection) => std::io::Error::from(rejection),
+                    None => std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                };
+                let failure = honk_outbound::SharedError::new(
+                    DnsForwardError::Shared(Arc::new(DnsForwardError::Exchange {
+                        upstream: "preferred".into(),
+                        source: anyhow::Error::new(source).context("upstream dial"),
+                    }))
+                    .into(),
+                );
+                let (a, aaaa) = if qtype == 28 {
+                    (Err(failure), Ok(answer.clone()))
+                } else {
+                    (Ok(answer.clone()), Err(failure))
+                };
+                let forwarder = DnsForwarder::new(
+                    Arc::new(QtypeMock {
+                        a,
+                        aaaa,
+                        call_count: AtomicUsize::new(0),
+                    }),
+                    test_cache(),
+                    test_router(),
+                )
+                .with_strategy(strategy);
+                let query = build_dns_query("example.com", qtype);
+                let result = if strict {
+                    forwarder
+                        .resolve_outcome(&query)
+                        .await
+                        .map(|outcome| outcome.into_rendered())
+                        .map_err(anyhow::Error::from)
+                } else {
+                    forwarder.resolve(&query).await
+                };
+                if let Some(rejection) = rejection {
+                    let error = result.expect_err("terminal preferred-family refusal");
+                    assert_eq!(packet_rejection(&error), Some(rejection));
+                    assert!(error.chain().any(|cause| matches!(
+                        cause.downcast_ref::<DnsForwardError>().map(DnsForwardError::unshared),
+                        Some(DnsForwardError::Exchange { upstream, .. }) if upstream == "preferred"
+                    )));
+                } else {
+                    assert_eq!(
+                        extract_answer_ips(&result.expect("ordinary failure keeps other family")),
+                        vec![expected_ip]
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A cached NXDOMAIN must be answered as NXDOMAIN (rcode 3), never

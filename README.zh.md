@@ -32,11 +32,13 @@ global {
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器必须保持这些对象不变。Direct 释放被保留的 skb，proxy 把一份保留的 payload 提交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄，以及明确的内核统计可用状态和读取失败数。完整不变量与指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)和 [API 参考](doc/zh/reference/api.md)。
 
-## VLESS UDP、H2MUX 与 XUDP
+## VLESS UDP 与多路复用
 
-VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool` 选择一个明确模式。`legacy` 是向后兼容的 TCP-only 默认值。`uot-v2` 保留该 TCP 路径，并为 UDP 增加直连 UoT v2。`h2mux` 在共享 HTTP/2 carrier 上承载逻辑 TCP 与原生 connected sing-mux UDP；`h2mux-padded` 再增加 sing-mux v1 padding。`xudp` 保留普通 VLESS TCP，并为每个 UDP transport 打开一条 Single XUDP carrier。`mux-cool` 让逻辑 TCP 与 XUDP 共用节点所有的 Xray Mux.Cool carrier。
+VLESS 现由三个独立选项组合：`udp=0|1` 控制 packet 权限，`packetEncoding=auto|none|xudp|uot-v2` 选择非复用 UDP 回退路径，`mux=off|h2mux|xray` 选择 carrier 多路复用。规范链接默认允许 UDP、使用 `packetEncoding=auto` 和 `mux=off`；例如 `vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#edge`。未启用 Vision 时，Auto 对 53/443 使用原生 VLESS UDP；其他获准目标使用 Single XUDP。
 
-这些模式不协商，绝不降级或重放 UDP 首包。非 legacy 模式不能使用 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。官方互通套件覆盖 sing-box 与 Xray：全部六种明文模式、TLS 和 REALITY 上的 H2MUX、padding，以及 XUDP Vision。wire、生命周期和导入规则见[节点参考](doc/zh/reference/nodes.md#mode)。
+Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。基础 Vision 会在协议回退路径拒绝 UDP/443；实际 Xray UDP mux 只有 `allow` 策略能绕过该门槛。VLESS Encryption 可在 direct-TCP 与合法 XUDP/关闭 UDP 的路径规则下和 Vision 组合。Carrier 容量来自进程级文件描述符预算；容量耗尽属于本地且不影响健康的拒绝，不会触发回退或 packet 重放。XUDP Global ID 使用有作用域的所有权边界，不具备进程级无碰撞 NAT 语义。规范链接、迁移、组合及 REALITY 握手/pool 行为见[节点参考](doc/zh/reference/nodes.md#vless-udp-and-multiplexing)，生命周期及所有权见规范的 [VLESS 出站设计](doc/zh/design/outbound.md#sourcesession-ownership-and-capacity)。
+
+**升级注意：**`vless_mode` 已删除，所有 VLESS 节点 ID 都会重新派生。升级前请迁移静态链接与缓存/provider 内容，尤其是离线升级。按名称保存的 Selector 选择及近期持久化延迟样本可继续使用，不要删除它们。见[迁移说明](doc/zh/reference/nodes.md#从-vless_mode-迁移)。
 
 ## 使用本仓库前
 

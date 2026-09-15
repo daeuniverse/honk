@@ -1,11 +1,7 @@
 use super::support::{
     UdpTestHandler, UdpTestMode, canonical_socks5, control_plane, score_reload_config,
 };
-use crate::control::{
-    ControlPlane,
-    drain::DrainTracker,
-    probers::{resolve_udp_check_target, udp_probe_identity},
-};
+use crate::control::{ControlPlane, drain::DrainTracker, probers::UdpDnsProbeTarget};
 use honk_config::{Config, node::Node, parser::parse_dae_config, types::NodeProtocol};
 use honk_outbound::alive::{HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber};
 use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
@@ -264,16 +260,16 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         let calls = Arc::clone(&resolver_calls);
         let resolver: crate::outbound::ResolveHook = Arc::new(move |_host, port| {
             calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+            Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
         });
         let node = canonical_socks5("c28-udp", "127.0.0.1", 9, None);
         let mut config = Config::default();
         config.global.nfqueue_enable = false;
         config.global.udp_check_dns = vec![old_raw.into()];
         config.nodes = vec![node.clone()];
-        let target =
-            resolve_udp_check_target(&config.global.udp_check_dns, Some(resolver.clone())).await;
-        let identity = udp_probe_identity(&config.global.udp_check_dns, target);
+        let dns_probe =
+            UdpDnsProbeTarget::new(config.global.udp_check_dns.clone(), Some(resolver.clone()));
+        dns_probe.resolve().await.unwrap();
         let cp = control_plane(config.clone());
         cp.alive_set().set_resolver(resolver);
         let calls_before = resolver_calls.load(Ordering::SeqCst);
@@ -291,8 +287,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
             Arc::new(registry),
             cp.runtime_registry(),
             cp.stats_handle(),
-            target,
-            identity,
+            dns_probe,
             None,
             cp.group_manager(),
         );
@@ -303,7 +298,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
             .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
             .await;
         let outcome = UdpProber::probe_udp(&prober, &node.name, Duration::from_secs(1)).await;
-        assert!(outcome.dns.is_ok(), "{outcome:?}");
+        assert!(matches!(outcome.dns, Some(Ok(_))), "{outcome:?}");
         assert_eq!(
             *capture.lock(),
             Some(expected_target.parse::<SocketAddr>().unwrap()),
@@ -318,6 +313,196 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
             assert_eq!(cp.runtime_registry().read().generation(), generation);
         }
     }
+}
+
+fn udp_dns_prober(
+    cp: &ControlPlane,
+    node: &Node,
+    dns_probe: UdpDnsProbeTarget,
+    mode: UdpTestMode,
+) -> Arc<crate::control::probers::ProxyUdpProber> {
+    let handler = Arc::new(UdpTestHandler { mode });
+    let mut registry = ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(node.protocol(), handler.clone()).with_packet(handler));
+    Arc::new(crate::control::probers::ProxyUdpProber::new(
+        cp.config_handle(),
+        Arc::new(registry),
+        cp.runtime_registry(),
+        cp.stats_handle(),
+        dns_probe,
+        None,
+        cp.group_manager(),
+    ))
+}
+
+#[tokio::test]
+async fn udp_dns_target_recovers_after_capacity_refusal_and_pins_success() {
+    let node = canonical_socks5("udp-resolver-recovery", "127.0.0.1", 9, None);
+    let mut config = Config::default();
+    config.global.nfqueue_enable = false;
+    config.global.udp_check_dns = vec!["resolver.example:5301".into()];
+    config.nodes = vec![node.clone()];
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let held = capacity.clone().acquire_owned().await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver: crate::outbound::ResolveHook = {
+        let capacity = capacity.clone();
+        let calls = calls.clone();
+        Arc::new(move |host, port| {
+            assert_eq!(host, "resolver.example");
+            calls.fetch_add(1, Ordering::SeqCst);
+            let capacity = capacity.clone();
+            Box::pin(async move {
+                let _permit = capacity.try_acquire_owned().map_err(|_| {
+                    anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
+                })?;
+                Ok(vec![SocketAddr::from(([127, 0, 0, 2], port))])
+            })
+        })
+    };
+    let dns_probe = UdpDnsProbeTarget::new(config.global.udp_check_dns.clone(), Some(resolver));
+    let startup_error = dns_probe.resolve().await.unwrap_err();
+    assert!(honk_outbound::proxy::is_packet_rejection(&startup_error));
+    let cp = control_plane(config);
+    let capture = Arc::new(Mutex::new(None));
+    let prober = udp_dns_prober(
+        &cp,
+        &node,
+        dns_probe,
+        UdpTestMode::DnsResponseCaptureTarget(capture.clone()),
+    );
+    let alive = cp.alive_set();
+    alive.register_node(node.id, node.name.clone(), "127.0.0.1:9".into());
+    alive.set_udp_probe(prober);
+
+    assert!(!alive.probe_node_udp(node.id, Duration::from_secs(1)).await);
+    assert!(
+        !alive.has_udp_state(node.id),
+        "local refusal is not node evidence"
+    );
+    assert_eq!(
+        *capture.lock(),
+        None,
+        "refusal must not dial a default target"
+    );
+
+    drop(held);
+    assert!(alive.probe_node_udp(node.id, Duration::from_secs(1)).await);
+    let expected = Some("127.0.0.2:5301".parse::<SocketAddr>().unwrap());
+    assert_eq!(*capture.lock(), expected);
+    for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+        assert!(alive.is_alive_for(node.id, domain, IpVersion::V4));
+    }
+
+    let _held_again = capacity.acquire_owned().await.unwrap();
+    *capture.lock() = None;
+    assert!(alive.probe_node_udp(node.id, Duration::from_secs(1)).await);
+    assert_eq!(*capture.lock(), expected);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "successful target stays pinned"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_dns_initialization_timeout_is_neutral_and_retryable() {
+    let node = canonical_socks5("udp-resolver-timeout", "127.0.0.1", 9, None);
+    let mut config = Config::default();
+    config.global.nfqueue_enable = false;
+    config.nodes = vec![node.clone()];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let resolver: crate::outbound::ResolveHook = {
+        let calls = calls.clone();
+        let capacity = capacity.clone();
+        Arc::new(move |_, port| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            let capacity = capacity.clone();
+            Box::pin(async move {
+                let _permit = capacity.acquire_owned().await.unwrap();
+                if attempt == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(vec![SocketAddr::from(([127, 0, 0, 3], port))])
+            })
+        })
+    };
+    let cp = control_plane(config);
+    let capture = Arc::new(Mutex::new(None));
+    let prober = udp_dns_prober(
+        &cp,
+        &node,
+        UdpDnsProbeTarget::new(vec!["resolver.example:5301".into()], Some(resolver)),
+        UdpTestMode::DnsResponseCaptureTarget(capture.clone()),
+    );
+    let alive = cp.alive_set();
+    alive.register_node(node.id, node.name.clone(), "127.0.0.1:9".into());
+    alive.set_udp_probe(prober);
+    assert!(
+        !tokio::time::timeout(
+            Duration::from_secs(1),
+            alive.probe_node_udp(node.id, Duration::from_millis(50)),
+        )
+        .await
+        .expect("DNS initialization must honor the probe deadline")
+    );
+    assert!(
+        !alive.has_udp_state(node.id),
+        "local resolution timeout is neutral"
+    );
+    assert_eq!(*capture.lock(), None);
+    assert_eq!(
+        capacity.available_permits(),
+        1,
+        "timed-out resolver was cancelled"
+    );
+
+    assert!(
+        alive
+            .probe_node_udp(node.id, Duration::from_millis(50))
+            .await
+    );
+    assert_eq!(*capture.lock(), Some("127.0.0.3:5301".parse().unwrap()));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_dns_resolution_and_transport_share_one_deadline() {
+    let node = canonical_socks5("udp-shared-deadline", "127.0.0.1", 9, None);
+    let mut config = Config::default();
+    config.global.nfqueue_enable = false;
+    config.nodes = vec![node.clone()];
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_, port| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+        })
+    });
+    let cp = control_plane(config);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let prober = udp_dns_prober(
+        &cp,
+        &node,
+        UdpDnsProbeTarget::new(vec!["resolver.example:5301".into()], Some(resolver)),
+        UdpTestMode::Hold {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+    let start = tokio::time::Instant::now();
+    let outcome = prober
+        .probe_udp(&node.name, Duration::from_millis(50))
+        .await;
+    assert!(matches!(outcome.dns, Some(Err(_))), "{outcome:?}");
+    assert!(outcome.data_path.is_none());
+    assert!(
+        start.elapsed() <= Duration::from_millis(51),
+        "DNS setup reset the transport budget"
+    );
+    tokio::time::timeout(Duration::from_millis(1), entered.notified())
+        .await
+        .expect("transport must start after resolution");
 }
 
 fn dae_urltest_config(tolerance_ms: u64) -> Config {

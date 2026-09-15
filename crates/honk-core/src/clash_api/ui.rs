@@ -410,7 +410,11 @@ async fn fetch_proxied(
         None => (Some(host), std::net::SocketAddr::from(([0, 0, 0, 0], port))),
     };
     let generation = ctx.runtime_registry.read().clone();
-    let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(&generation, node)?;
+    let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(
+        &generation,
+        node,
+        honk_outbound::proxy::WarmRequirement::Session,
+    )?;
     let reporter = feedback.as_ref().map(ScoreFeedback::start);
     let result = match generation
         .scope_dials(

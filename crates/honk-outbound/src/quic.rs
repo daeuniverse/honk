@@ -2455,11 +2455,6 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             }
         };
         let ctx = Arc::new(ctx);
-        // The single-flight mutex makes this unreachable today; keep the
-        // freshly dialed connection out of a closed client if that changes.
-        if state.closed {
-            anyhow::bail!("QUIC client closed during dial");
-        }
         if state.metrics_enabled {
             on_publish(ctx.as_ref(), &conn);
         }

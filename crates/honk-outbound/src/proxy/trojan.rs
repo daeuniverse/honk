@@ -41,23 +41,6 @@ impl TrojanHandler {
         header.extend_from_slice(CRLF);
         Ok(header)
     }
-
-    /// Connect to the server and optionally wrap with WebSocket or gRPC
-    /// transport based on `node.transport`. TLS is applied before the
-    /// transport wrapping when `node.tls` is true.
-    async fn connect_server(
-        node: &Node,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Box<dyn super::AsyncReadWrite>> {
-        super::transport::connect_transport(node, connect_timeout).await
-    }
-
-    async fn maybe_tls_wrap(
-        node: &Node,
-        stream: TcpStream,
-    ) -> anyhow::Result<Box<dyn super::AsyncReadWrite>> {
-        super::transport::maybe_tls_wrap(node, stream).await
-    }
 }
 
 #[async_trait]
@@ -69,15 +52,10 @@ impl TcpOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let header = Self::build_request_header(password, target, target_domain)?;
-        let mut stream = Self::connect_server(node, connect_timeout).await?;
-        stream.write_all(&header).await?;
-        Ok(ProxyStream {
-            stream,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+        let addr = format!("{}:{}", node.host(), node.port);
+        let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        self.dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
+            .await
     }
 
     async fn dial_with_tcp(
@@ -90,8 +68,9 @@ impl TcpOutbound for TrojanHandler {
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
-        let mut stream = Self::maybe_tls_wrap(node, tcp).await?;
+        let mut stream = super::transport::wrap_transport(node, tcp).await?;
         stream.write_all(&header).await?;
+        stream.flush().await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -116,7 +95,7 @@ impl PacketOutbound for TrojanHandler {
             );
         }
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let mut control = Self::connect_server(node, connect_timeout).await?;
+        let mut control = super::transport::connect_transport(node, connect_timeout).await?;
         let addr_header = addr::encode_address(target, target_domain)?;
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
         header.extend_from_slice(hex_sha224(password).as_bytes());
@@ -125,6 +104,7 @@ impl PacketOutbound for TrojanHandler {
         header.extend_from_slice(&addr_header);
         header.extend_from_slice(CRLF);
         control.write_all(&header).await?;
+        control.flush().await?;
 
         let (rd, wr) = tokio::io::split(control);
         Ok(Arc::new(TrojanUdpTransport {
@@ -230,6 +210,81 @@ mod tests {
         node.transport_mut().unwrap().transport = "grpc".into();
         assert!(!pool_ready_streams(&node));
     }
+
+    /// A pooled bare server socket must complete and flush the configured
+    /// gRPC transport before returning the target-bound Trojan stream.
+    #[tokio::test]
+    async fn bare_tcp_grpc_flushes_trojan_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let password = "pooled-secret";
+        let expected = TrojanHandler::build_request_header(password, target, None).unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(tcp).await.unwrap();
+            let (request, _respond) = connection
+                .accept()
+                .await
+                .expect("gRPC request must arrive")
+                .expect("gRPC headers must be valid");
+            assert_eq!(request.uri().path(), "/pooled/Tun");
+            let mut body = request.into_body();
+            let driver = tokio::spawn(async move {
+                while let Some(request) = connection.accept().await {
+                    request.expect("subsequent gRPC request must be valid");
+                }
+            });
+
+            let mut received = Vec::new();
+            loop {
+                let data = tokio::time::timeout(std::time::Duration::from_secs(5), body.data())
+                    .await
+                    .expect("flushed Trojan header must arrive")
+                    .expect("gRPC request body must remain open")
+                    .expect("gRPC DATA must be valid");
+                received.extend_from_slice(&data);
+                if received.len() >= 5 {
+                    let message_len =
+                        u32::from_be_bytes(received[1..5].try_into().unwrap()) as usize;
+                    if received.len() >= 5 + message_len {
+                        break;
+                    }
+                }
+            }
+            driver.abort();
+
+            assert_eq!(received[0], 0, "gRPC message must be uncompressed");
+            assert_eq!(
+                u32::from_be_bytes(received[1..5].try_into().unwrap()) as usize,
+                expected.len() + 2
+            );
+            assert_eq!(received[5], 0x0a, "protobuf payload must be bytes field 1");
+            assert_eq!(received[6] as usize, expected.len());
+            assert_eq!(&received[7..], expected.as_slice());
+        });
+
+        let mut node = Node {
+            name: "trojan-grpc".into(),
+            address: server_addr.ip().to_string(),
+            port: server_addr.port(),
+            outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                password: Some(password.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "grpc".into();
+        transport.grpc_service = Some("pooled".into());
+
+        let tcp = TcpStream::connect(server_addr).await.unwrap();
+        let _stream = TrojanHandler::new()
+            .dial_with_tcp(&node, target, None, tcp, std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
 }
 
 /// Framed UDP-associate transport over the Trojan control stream: packets
@@ -276,7 +331,8 @@ impl PacketTransport for TrojanUdpTransport {
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
-        writer.write_all(&frame).await
+        writer.write_all(&frame).await?;
+        writer.flush().await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {

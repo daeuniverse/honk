@@ -153,11 +153,11 @@ VLESS 字段会在派生节点身份前应用：
 
 | Clash 输入 | 映射 |
 | --- | --- |
-| `uuid`, then `password` | 凭据；`uuid` 优先，旧 `password` 作为回退。 |
+| `uuid`, then `password` | 凭据；`uuid` 优先，`password` 作为回退。 |
 | `encryption`, then `cipher` | VLESS Encryption；`encryption` 优先。 |
-| `flow` | 空值或纯空白视为未指定；否则必须为 `xtls-rprx-vision`。 |
-| `network` | Transport。 |
-| `reality-opts.public-key` | 启用 REALITY TLS 承载；必须是非空 string。 |
+| `flow` | 空值或纯空白视为未指定；否则必须为 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。 |
+| `network` | 流 transport；packet 权限仍由独立的 `udp` 声明控制。 |
+| `reality-opts.public-key` | 启用 REALITY TLS carrier；必须是非空 string。 |
 | `reality-opts.short-id` | 可选 REALITY short ID。 |
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
@@ -165,46 +165,42 @@ VLESS 字段会在派生节点身份前应用：
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
-嵌套 WS/gRPC 值优先于其扁平别名。启用的 `reality-opts` 必须是 mapping 且含非空 `public-key`；无效的启用声明绝不会降级成普通 TLS。空 block 或显式禁用的功能 block 会被忽略。
+嵌套 WS/gRPC 值优先于其扁平别名。启用的 `reality-opts` 必须是 mapping 且含非空 `public-key`；无效的启用声明绝不会降级成普通 TLS。空 block 或显式禁用的功能 block 会被忽略。导入的 REALITY 与规范分享链接使用相同的仅 TLS 1.3、先 hybrid 后 classic key share 及 fail-closed 单 ClientHello 行为；见[节点参考](./nodes.md#vless-udp-and-multiplexing)。
 
-#### VLESS packet mode
+#### VLESS UDP 与多路复用
 
-| Clash 表示 | 规范化 mode | 条件 |
-| --- | --- | --- |
-| 没有启用 packet/multiplex 选项，也没有 `udp: true` | `legacy` | 禁用的 block 与 `xudp: false` 不选择 mode。 |
-| `smux` 或 `multiplex` 且 `enabled: true` | `h2mux` 或 `h2mux-padded` | 必须有 `protocol: h2mux` 或显式 bool `padding`。`padding: true` 选择 `h2mux-padded`，否则选择 `h2mux`。 |
-| `udp-over-tcp: true` | `uot-v2` | Boolean 简写。 |
-| `udp-over-tcp: { enabled: true, version: 0|2 }` | `uot-v2` | 缺失 `version` 按 `0` 处理；也接受 `_` 别名。 |
-| `packet-encoding: xudp` | `xudp` | `packet_encoding` 是扁平别名。 |
-| `xudp: true` | `xudp` | 以布尔值显式选择 XUDP。 |
-| 未声明其他 packet 设置时的 `udp: true` | `xudp` | 对齐常见 Clash VLESS UDP 默认行为；显式 mode 优先。 |
-| 规范分享链接 `vless_mode=mux-cool` | `mux-cool` | Clash packet/mux 别名不接受 `mux-cool`。 |
+导入默认值取决于来源格式；它们并不都表示 honk 规范的 `packetEncoding=auto` 默认值。
 
-VLESS Clash 条目出现下列任一情况时会被拒绝：
+| Clash 表示 | Packet 回退 | Multiplex | UDP 权限 |
+| --- | --- | --- | --- |
+| 没有 packet 声明且没有启用的 wrapper | `auto` | off | 关闭 |
+| 只有空/null packet encoding | `auto` | off | 关闭 |
+| `packet-encoding: none`/`legacy`，或 `xudp: false` | 原生 | off | 除非 `udp: false`，否则开启 |
+| `packet-encoding: xudp`，或 `xudp: true` | Single XUDP | off | 除非 `udp: false`，否则开启 |
+| 未声明其他 packet 设置时的 `udp: true` | Single XUDP | off | 开启 |
+| `udp-over-tcp: true`，或 version 为 `0`/`2` 的启用 object | UoT v2 | off | 除非 `udp: false`，否则开启 |
+| 启用 `smux`/`multiplex`，并指定 `protocol: h2mux` 或显式 `padding` | auto（被 wrapper 接管时不生效） | H2MUX | 除非 `udp: false`，否则开启 |
+| `mux: { enabled: true, ... }` | `auto`，除非显式 packet encoding 仍能通过 protocol 回退或 `skip` 生效 | Xray Mux.Cool | 除非 `udp: false`，否则开启 |
 
-- 别名值相互冲突或重复 XUDP 表示；
-- H2MUX、UoT 与 XUDP 中启用多个 mode；
-- 启用 `packet-addr`/`packet_addr` 或顶层 `mux`；
-- 已启用的 `smux`/`multiplex` block 既没有 `protocol: h2mux`，也没有显式 `padding` bool；
-- multiplex 协议不是 `h2mux`、`only-tcp: true`、启用 Brutal 设置，或 `max-connections`、`min-streams`、`max-streams` 调优值非零；
-- `udp-over-tcp` version 不是 `0` 或 `2`；
-- `udp: true` 与显式禁用的 packet mode 冲突，或非 `legacy` mode 搭配 `udp: false`；
-- 未支持的 packet encoding（接受空值、`none`、`legacy` 与 `xudp`）；packetaddr 和 `mux-cool` 别名仍不支持；
-- 非 `legacy` mode 与 VLESS Encryption 组合，或与受支持的 `xudp` + `xtls-rprx-vision` 之外的 `flow` 组合。
+对 H2MUX，`padding: true` 选择现有 padded wire 格式，false 选择无 padding 的 H2MUX。现有 `only-tcp`、Brutal 和非零 `max-connections`/`min-streams`/`max-streams` 限制不变。启用 H2MUX 与 Xray mux、UoT 互斥；启用 UoT 也与 Xray mux 互斥。显式 XUDP 与 H2MUX 或 UoT 冲突；原生/auto 声明只会在 wrapper 接管时不生效。
 
-规范 VLESS 分享链接使用 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`。`smux`、`udp-over-tcp`、`packet-encoding` 等含义模糊的第三方分享链接 key 会被拒绝，不会猜测其语义。
+启用的 Clash `mux` block 只接受名为 `enabled`、有符号 `i16` `concurrency`、有符号 `i16` `xudpConcurrency` 与 `xudpProxyUDP443` 的有效设置；非 active 的额外设置会被忽略。TCP concurrency 为零时允许每条 carrier 同时承载 8 个逻辑 child，负值关闭 TCP mux，正值设置最多 128 的逐 carrier 并发；它绝不表示物理 carrier 数量。XUDP concurrency 为零时共享已启用的 TCP pool 及其逐 carrier 并发；若 TCP mux 关闭，则使用 packet 回退；负值始终回退，正值建立独立 UDP pool，并以该值作为每条 carrier 的逻辑 child 并发（最多 128）。UDP/443 策略默认 `reject`，也接受 `skip` 或 `allow`；优先级见[节点参考](./nodes.md#vless-udp-and-multiplexing)。
+
+`udp: false` 独立关闭 packet 拨号，不会关闭仍符合条件的裸 TCP 路径。别名冲突、重复 XUDP 表示、启用 packet-address、未支持的 packet encoding、未支持的 UoT version，或启用的 Xray mux 中无效/未支持的设置，也会使 VLESS Clash 条目被拒绝。
+
+规范 VLESS 分享链接使用精确的 `packetEncoding=auto|none|xudp|uot-v2`、`mux=off|h2mux|xray` 和 `udp=0|1` query。已移除的 `vless_mode` query，以及 `smux`、`udp-over-tcp`、`packet-encoding` 等含义不明确的第三方分享链接拼写会被拒绝，不会猜测其语义。
 
 ### SIP008 与 sing-box JSON
 
 SIP008 version 1/2 wrapper（`{"servers":[...]}`）及裸服务器数组会导入 Shadowsocks 的 `server`、`server_port`、`method`、`password` 和 `remarks`。空插件字段不会导致拒绝；有效的插件配置仍不受支持。
 
-sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet mode 和受支持的协议调优会通过共同的节点构建逻辑规范化。只有未启用 multiplex/UoT、未限制为仅 TCP 且没有显式 packet encoding 时，VLESS 才默认使用 XUDP。gRPC service name 为空或省略时保留 sing-box 的空 service，不套用 honk 的 `GunService` 默认值。Hysteria2 可以只提供 `server_ports`，以第一个跳跃端口作为名义端点。不支持的链式代理、线协议功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
+sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet 选择和受支持的协议调优会通过共同的节点构建逻辑规范化。未启用 H2MUX/UoT wrapper 且没有显式 `packet_encoding` 选择其他路径时，sing-box VLESS 条目特定地默认使用 Single XUDP 并允许 UDP；这是 sing-box 导入默认值，不是 Auto 的全局含义。gRPC service name 为空或省略时保留 sing-box 的空 service，不套用 honk 的 `GunService` 默认值。Hysteria2 可以只提供 `server_ports`，以第一个跳跃端口作为名义端点。不支持的链式代理、wire 功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
 
 在 sing-box 输入中，`network` 表示数据包网络能力，不是流传输类型；`transport.type` 选择流传输方式。`h2` 等不支持的名称会使条目被拒绝，不会被当作裸 TCP。
 
-在支持数据包限制的 sing-box 映射中，`network: udp` 与 `network: tcp,udp` 允许 UDP，`network: tcp` 则关闭 UDP。这些值不会额外禁止 TCP。现有 VLESS 数据包模式要求，以及无法表示网络限制的协议约束，仍然适用。
+在支持数据包限制的 sing-box 映射中，`network: udp` 与 `network: tcp,udp` 允许 UDP，`network: tcp` 则关闭 UDP。这些值不会额外禁止 TCP。`network` 与 VLESS 回退 encoding 和 H2MUX/UoT carrier 选择保持独立。
 
-显式 sing-box 原生 VLESS UDP（`packet_encoding: ""` 且未限制为仅 TCP、未启用 wrapper）尚不支持，会跳过；启用 H2MUX 时由它承载 packet 路径，即使来源同时显式写出 `packet_encoding: "xudp"`。
+显式 sing-box 原生 VLESS UDP（`packet_encoding: ""`）映射为原生路径。启用 H2MUX 或 UoT v2 时由 wrapper 承载 packet 路径，即使来源同时显式指定 `packet_encoding`（包括 `"xudp"`）；禁用 wrapper 不会关闭 sing-box 的 Single-XUDP 默认值。sing-box multiplex 导入仍只支持 H2MUX，不会合成 Xray Mux.Cool 控制项。
 
 ### Surge、Surfboard、Loon 与 Quantumult X
 
@@ -217,6 +213,8 @@ sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess�
 记录中的 `transport`/`network` 流传输声明在赋值前比较，包括重复键。空文本与 `tcp` 都表示裸 TCP；声明冲突或包含不支持的传输方式时，拒绝该条目。
 
 AnyTLS 记录中的 `network` 表示数据包能力，不是流传输方式。所有重复的 `network`、`udp` 和 `udp-relay` 值都会在选择前校验。等价声明保留第一个显式网络值的写法；任一值无效或冲突时，拒绝该记录。
+
+VLESS 记录的 `packet-encoding`/`packet_encoding`/`packetencoding` 值为 `none` 或空时选择原生 UDP，`xudp` 选择 Single XUDP。重复别名必须一致，包括显式空赋值；`udp`/`udp-relay` 独立控制 packet 权限。既没有 packet encoding 也没有 `udp: true` 时，记录保持关闭 UDP；仅有 `udp: true` 时选择 Single XUDP。记录格式中有效的 `mux` 与 UoT 声明仍不受支持，不会被重新解释。
 
 受支持的记录把凭据、TLS/SNI、WebSocket/gRPC、REALITY 和已实现的协议选项映射到同一节点模型。Quantumult X 的 `obfs=wss` 同时使用 `obfs-host` 作为 WebSocket Host 和默认 TLS SNI；显式 TLS 主机名优先。SSR、不支持的插件/混淆及传输方式会被跳过，不会冒充另一种协议导入。
 

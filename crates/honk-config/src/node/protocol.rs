@@ -1,7 +1,7 @@
 use super::validation::ValidationFailure;
 use crate::types::NodeProtocol;
 
-use super::{WireMode, identity_field};
+use super::{VlessConfig, identity_field};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TlsOptions {
@@ -95,77 +95,6 @@ pub struct VmessConfig {
     pub network: Option<String>,
     pub transport: StreamTransportOptions,
     pub tls: TlsOptions,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct VlessConfig {
-    pub uuid: Option<String>,
-    pub encryption: Option<String>,
-    pub mode: WireMode,
-    pub flow: Option<String>,
-    pub network: Option<String>,
-    pub transport: StreamTransportOptions,
-    pub tls: TlsOptions,
-}
-
-impl VlessConfig {
-    pub fn validate(&self, _name: &str) -> Result<(), crate::ConfigError> {
-        self.validate_fields()
-            .map_err(ValidationFailure::into_legacy)
-    }
-
-    pub(super) fn validate_fields(&self) -> Result<(), ValidationFailure> {
-        if self
-            .encryption
-            .as_deref()
-            .is_some_and(|value| !value.is_empty() && value != "none")
-            && self.flow.as_deref().is_some_and(|flow| !flow.is_empty())
-        {
-            return Err(ValidationFailure::new(
-                Some("flow"),
-                "VLESS Encryption cannot be combined with flow",
-            ));
-        }
-        if self.mode != WireMode::Legacy {
-            if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
-                && !(self.mode == WireMode::Xudp && flow == "xtls-rprx-vision")
-            {
-                return Err(ValidationFailure::new(
-                    Some("flow"),
-                    "VLESS mode cannot be combined with this flow",
-                ));
-            }
-            if self
-                .encryption
-                .as_deref()
-                .is_some_and(|value| !value.is_empty() && value != "none")
-            {
-                return Err(ValidationFailure::new(
-                    Some("encryption"),
-                    "VLESS mode cannot be combined with VLESS Encryption",
-                ));
-            }
-        }
-        // A REALITY node without a usable public key falls back to ordinary TLS with the
-        // configured SNI, which is the opposite of what selecting REALITY asked for.
-        let has_key = self
-            .tls
-            .reality_public_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
-        // Presence is the intent, not a non-empty value: an empty short id is documented as
-        // valid, and an empty key is exactly what parse_reality_config reads as "no REALITY".
-        let wants_reality = self.tls.reality_public_key.is_some()
-            || self.tls.reality_short_id.is_some()
-            || self.tls.reality_spider_x.is_some();
-        if wants_reality && !has_key {
-            return Err(ValidationFailure::new(
-                Some("reality_public_key"),
-                "REALITY requires reality_public_key",
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -340,17 +269,10 @@ impl OutboundConfig {
             ]),
             Self::Trojan(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
             Self::Vmess(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
-            Self::Vless(config)
-                if config
-                    .encryption
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty() && value != "none") =>
-            {
-                identity_join(&[
-                    config.encryption.as_deref().unwrap_or_default(),
-                    config.uuid.as_deref().unwrap_or(""),
-                ])
-            }
+            Self::Vless(config) if config.is_encrypted() => identity_join(&[
+                config.encryption.as_deref().unwrap_or_default(),
+                config.uuid.as_deref().unwrap_or(""),
+            ]),
             Self::Vless(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
             Self::Socks5(config) => identity_join(&[
                 config.username.as_deref().unwrap_or(""),
@@ -402,11 +324,9 @@ impl OutboundConfig {
         ]
         .map(identity_field)
         .join("|");
-        if let Self::Vless(config) = self
-            && config.mode != WireMode::Legacy
-        {
+        if let Self::Vless(config) = self {
             fingerprint.push('|');
-            fingerprint.push_str(&identity_field(config.mode.as_str()));
+            fingerprint.push_str(&config.identity_fingerprint());
         }
         fingerprint
     }

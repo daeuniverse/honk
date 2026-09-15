@@ -1223,6 +1223,8 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
         "password" => "password",
         "encryption" => "encryption",
         "vless_mode" => "vless_mode",
+        "packet_encoding" => "packet_encoding",
+        "multiplex" => "multiplex",
         "plugin" => "plugin",
         "plugin_opts" => "plugin_opts",
         "transport" => "transport",
@@ -1482,41 +1484,41 @@ mod builtin_nodes_tests {
     }
 
     #[test]
-    fn test_validate_rejects_vless_mode_conflicts() {
+    fn test_validate_rejects_incompatible_vless_selected_paths() {
+        use crate::node::{Udp443Policy, VlessMultiplex, VlessUdpEncoding};
+
         let base = crate::node::Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=h2mux#vless",
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443#vless",
         )
         .unwrap();
-
         let mut config = Config::default();
         config.nodes.push(base.clone());
-        assert!(config.validate().is_ok());
 
-        for mode in [
-            crate::node::WireMode::UotV2,
-            crate::node::WireMode::H2mux,
-            crate::node::WireMode::H2muxPadded,
-            crate::node::WireMode::MuxCool,
+        for configure in [
+            |vless: &mut crate::node::VlessConfig| {
+                vless.udp_encoding = VlessUdpEncoding::UotV2;
+            },
+            |vless: &mut crate::node::VlessConfig| {
+                vless.multiplex = VlessMultiplex::H2 { padding: false };
+            },
+            |vless: &mut crate::node::VlessConfig| {
+                vless.multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Allow);
+            },
         ] {
             config.nodes[0] = base.clone();
             let vless = config.nodes[0].vless_mut().unwrap();
-            vless.mode = mode;
             vless.flow = Some("xtls-rprx-vision".into());
+            configure(vless);
             config.nodes[0].id = config.nodes[0].derive_id();
             assert!(config.validate().is_err());
         }
-        config.nodes[0] = base.clone();
-        let vless = config.nodes[0].vless_mut().unwrap();
-        vless.mode = crate::node::WireMode::Xudp;
-        vless.flow = Some("xtls-rprx-vision".into());
-        config.nodes[0].id = config.nodes[0].derive_id();
-        assert!(config.validate().is_ok());
 
         config.nodes[0] = base;
-        config.nodes[0].vless_mut().unwrap().encryption =
-            Some("mlkem768x25519plus.native.1rtt.key".into());
+        let vless = config.nodes[0].vless_mut().unwrap();
+        vless.flow = Some("xtls-rprx-vision".into());
+        vless.multiplex = VlessMultiplex::xray(-1, 8, Udp443Policy::Allow);
         config.nodes[0].id = config.nodes[0].derive_id();
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -14,6 +14,15 @@ pub(super) enum UdpCheckTarget {
     Host { host: String, port: u16 },
 }
 
+impl UdpCheckTarget {
+    pub(super) fn port(&self) -> u16 {
+        match self {
+            Self::Literal(address) => address.port(),
+            Self::Host { port, .. } => *port,
+        }
+    }
+}
+
 pub(super) fn parse_udp_check_target(targets: &[String]) -> anyhow::Result<UdpCheckTarget> {
     for target in targets {
         if let Ok(endpoint) = honk_core::dns::endpoint::DnsEndpoint::parse(
@@ -137,6 +146,9 @@ pub(super) async fn probe_udp_dns(
     if !(entry.descriptor.supports_udp)(node) {
         return None;
     }
+    if !honk_outbound::descriptor::udp_target_allowed(node, target.port()) {
+        return None;
+    }
     let packet = entry.packet.as_ref()?;
     let result = tokio::time::timeout(timeout, async {
         let dns_server = resolve_udp_check_target(target, resolver).await?;
@@ -182,6 +194,9 @@ pub(super) async fn probe_udp_quic(
         return Some(Err(ProbeFailureKind::Handler));
     };
     if !(entry.descriptor.supports_udp)(node) {
+        return None;
+    }
+    if !honk_outbound::descriptor::udp_target_allowed(node, url_port) {
         return None;
     }
     let packet = entry.packet.as_ref()?;

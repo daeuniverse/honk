@@ -123,6 +123,7 @@ impl ControlPlane {
                 &config.nodes,
                 dial_limit,
                 resource_budget.transient_dials,
+                resource_budget.vless_carriers,
                 None,
             )
             .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
@@ -136,6 +137,7 @@ impl ControlPlane {
             tcp_pool = resource_budget.tcp_pool_entries,
             dials = dial_limit,
             dial_ceiling = resource_budget.transient_dials,
+            vless_carriers = resource_budget.vless_carriers,
             udp_endpoints = resource_budget.udp_endpoints,
             udp_slow = resource_budget.udp_slow_path,
             dns_slow = resource_budget.dns_slow_path,
@@ -196,26 +198,20 @@ impl ControlPlane {
         // urltest (clash delay) measurements.
         {
             let controller = dns_controller.clone();
-            type HookFn = dyn Fn(
-                    String,
-                    u16,
-                ) -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Vec<std::net::SocketAddr>> + Send>,
-                > + Send
-                + Sync;
             let make_hook =
                 move |controller: std::sync::Arc<crate::control::dns_control::DnsController>| {
-                    let hook: Arc<HookFn> = Arc::new(move |host: String, port: u16| {
-                        let controller = controller.clone();
-                        Box::pin(async move {
-                            controller
-                                .resolve_domain(&host)
-                                .await
-                                .into_iter()
-                                .map(|ip| std::net::SocketAddr::new(ip, port))
-                                .collect()
-                        })
-                    });
+                    let hook: crate::outbound::ResolveHook =
+                        Arc::new(move |host: String, port: u16| {
+                            let controller = controller.clone();
+                            Box::pin(async move {
+                                controller.resolve_domain(&host).await.map(|addresses| {
+                                    addresses
+                                        .into_iter()
+                                        .map(|ip| std::net::SocketAddr::new(ip, port))
+                                        .collect()
+                                })
+                            })
+                        });
                     hook
                 };
             alive_set.set_resolver(make_hook(controller.clone()));

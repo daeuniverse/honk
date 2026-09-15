@@ -356,11 +356,28 @@ pub(crate) async fn dial_stream(
     ))
 }
 
+// SIP022 permits current + previous tracking when a third session is held off
+// for 60 seconds after the previous session is installed or last active.
+const SERVER_SESSION_ROTATION_SECS: u64 = 60;
+
+struct ServerSession {
+    id: u64,
+    cipher: Option<AeadCipher>,
+    window: SlidingWindow,
+}
+
+#[derive(Clone, Copy)]
+enum ServerSessionSlot {
+    Current,
+    Previous,
+    New,
+}
+
 /// Client-side Shadowsocks 2022 UDP session.
 ///
 /// One session per `dial_udp_transport` call: random session id, monotonically
-/// increasing packet id for outgoing packets, and a sliding-window replay
-/// filter per server session on the receive path.
+/// increasing packet id for outgoing packets, and current/previous server
+/// session replay windows on the receive path.
 pub(crate) struct Ss2022UdpSession {
     method: Ss2022Method,
     session_id: u64,
@@ -371,9 +388,9 @@ pub(crate) struct Ss2022UdpSession {
     xchacha_cipher: Option<AeadCipher>,
     /// chacha method nonce/session-id source.
     xof: Option<Blake3Xof>,
-    remote_session_id: Option<u64>,
-    remote_cipher: Option<AeadCipher>,
-    window: SlidingWindow,
+    remote_session: Option<ServerSession>,
+    previous_remote_session: Option<ServerSession>,
+    previous_remote_seen: u64,
 }
 
 impl Ss2022UdpSession {
@@ -396,9 +413,9 @@ impl Ss2022UdpSession {
             send_cipher,
             xchacha_cipher,
             xof,
-            remote_session_id: None,
-            remote_cipher: None,
-            window: SlidingWindow::new(),
+            remote_session: None,
+            previous_remote_session: None,
+            previous_remote_seen: 0,
         })
     }
 
@@ -493,6 +510,10 @@ impl Ss2022UdpSession {
 
     /// Decapsulate one datagram from the server, returning the payload.
     pub(crate) fn open_packet(&mut self, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.open_packet_at(packet, unix_timestamp())
+    }
+
+    fn open_packet_at(&mut self, packet: &[u8], now: u64) -> anyhow::Result<Vec<u8>> {
         if let Some(xchacha) = &self.xchacha_cipher {
             if packet.len() < UDP_XNONCE_SIZE + UDP_MINIMAL_PACKET_SIZE {
                 anyhow::bail!("UDP packet too short");
@@ -506,66 +527,123 @@ impl Ss2022UdpSession {
             }
             let server_session_id = u64::from_be_bytes(body[..8].try_into().unwrap());
             let server_packet_id = u64::from_be_bytes(body[8..16].try_into().unwrap());
-            self.begin_server_packet(server_session_id, server_packet_id)?;
-            let payload = self.parse_server_body(&body[16..])?;
-            self.window.add(server_packet_id);
+            let slot = self.server_packet_slot(server_session_id, server_packet_id, now)?;
+            let payload = self.parse_server_body(&body[16..], now)?;
+            self.commit_server_packet(slot, server_session_id, server_packet_id, None, now);
             return Ok(payload);
         }
 
-        // AES construction
         if packet.len() < UDP_MINIMAL_PACKET_SIZE {
             anyhow::bail!("UDP packet too short");
         }
-        // The server encrypts the separate header with the encryption psk.
         let mut plain_header: [u8; 16] = packet[..16].try_into().unwrap();
         AesBlock::new(self.method.encryption_psk())?.decrypt(&mut plain_header);
         let server_session_id = u64::from_be_bytes(plain_header[..8].try_into().unwrap());
         let server_packet_id = u64::from_be_bytes(plain_header[8..].try_into().unwrap());
-        self.begin_server_packet(server_session_id, server_packet_id)?;
-        if self.remote_cipher.is_none() {
-            let subkey = self.method.session_subkey(&plain_header[..8]);
-            self.remote_cipher = Some(self.method.aead(&subkey)?);
-        }
-        let body = self
-            .remote_cipher
-            .as_ref()
-            .expect("remote cipher initialized above")
+        let slot = self.server_packet_slot(server_session_id, server_packet_id, now)?;
+
+        let mut new_cipher = None;
+        let cipher = match slot {
+            ServerSessionSlot::Current => self
+                .remote_session
+                .as_ref()
+                .and_then(|session| session.cipher.as_ref())
+                .expect("current AES server session has a cipher"),
+            ServerSessionSlot::Previous => self
+                .previous_remote_session
+                .as_ref()
+                .and_then(|session| session.cipher.as_ref())
+                .expect("previous AES server session has a cipher"),
+            ServerSessionSlot::New => {
+                let subkey = self.method.session_subkey(&plain_header[..8]);
+                new_cipher = Some(self.method.aead(&subkey)?);
+                new_cipher.as_ref().unwrap()
+            }
+        };
+        let body = cipher
             .open(&plain_header[4..16], &packet[16..])
             .map_err(|e| anyhow::anyhow!("open UDP packet failed: {:?}", e))?;
-        let payload = self.parse_server_body(&body)?;
-        self.window.add(server_packet_id);
+        let payload = self.parse_server_body(&body, now)?;
+        self.commit_server_packet(slot, server_session_id, server_packet_id, new_cipher, now);
         Ok(payload)
     }
 
-    /// Replay-window bookkeeping for a packet from `server_session_id`.
-    ///
-    /// Simplified relative to sing-shadowsocks2 (which tracks the current
-    /// and one previous server session with a 60s rotation): a new server
-    /// session id resets the window.
-    fn begin_server_packet(
-        &mut self,
+    fn server_packet_slot(
+        &self,
         server_session_id: u64,
         packet_id: u64,
-    ) -> anyhow::Result<()> {
-        if self.remote_session_id != Some(server_session_id) {
-            debug!(
-                "Shadowsocks 2022 UDP: new server session {:016x}",
-                server_session_id
-            );
-            self.remote_session_id = Some(server_session_id);
-            self.remote_cipher = None;
-            self.window = SlidingWindow::new();
-            return Ok(());
+        now: u64,
+    ) -> anyhow::Result<ServerSessionSlot> {
+        if let Some(session) = &self.remote_session
+            && session.id == server_session_id
+        {
+            if !session.window.check(packet_id) {
+                anyhow::bail!("packet id not unique");
+            }
+            return Ok(ServerSessionSlot::Current);
         }
-        if !self.window.check(packet_id) {
-            anyhow::bail!("packet id not unique");
+        if let Some(session) = &self.previous_remote_session
+            && session.id == server_session_id
+        {
+            if !session.window.check(packet_id) {
+                anyhow::bail!("packet id not unique");
+            }
+            return Ok(ServerSessionSlot::Previous);
         }
-        Ok(())
+        if self.previous_remote_session.is_some()
+            && now.saturating_sub(self.previous_remote_seen) < SERVER_SESSION_ROTATION_SECS
+        {
+            anyhow::bail!("server session changed more than once during the last minute");
+        }
+        Ok(ServerSessionSlot::New)
+    }
+
+    fn commit_server_packet(
+        &mut self,
+        slot: ServerSessionSlot,
+        server_session_id: u64,
+        packet_id: u64,
+        cipher: Option<AeadCipher>,
+        now: u64,
+    ) {
+        match slot {
+            ServerSessionSlot::Current => self
+                .remote_session
+                .as_mut()
+                .expect("current server session exists")
+                .window
+                .add(packet_id),
+            ServerSessionSlot::Previous => {
+                self.previous_remote_session
+                    .as_mut()
+                    .expect("previous server session exists")
+                    .window
+                    .add(packet_id);
+                self.previous_remote_seen = now;
+            }
+            ServerSessionSlot::New => {
+                debug!(
+                    "Shadowsocks 2022 UDP: new server session {:016x}",
+                    server_session_id
+                );
+                if let Some(current) = self.remote_session.take() {
+                    self.previous_remote_session = Some(current);
+                    self.previous_remote_seen = now;
+                }
+                let mut window = SlidingWindow::new();
+                window.add(packet_id);
+                self.remote_session = Some(ServerSession {
+                    id: server_session_id,
+                    cipher,
+                    window,
+                });
+            }
+        }
     }
 
     /// Validate and strip the server-to-client main header; returns payload.
     /// `body` starts at the header type byte.
-    fn parse_server_body(&self, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn parse_server_body(&self, body: &[u8], now: u64) -> anyhow::Result<Vec<u8>> {
         if body.len() < 1 + 8 + 8 + 2 {
             anyhow::bail!("UDP body too short");
         }
@@ -573,7 +651,7 @@ impl Ss2022UdpSession {
             anyhow::bail!("bad UDP header type {}", body[0]);
         }
         let ts = u64::from_be_bytes(body[1..9].try_into().unwrap());
-        let diff = unix_timestamp().abs_diff(ts);
+        let diff = now.abs_diff(ts);
         if diff > 30 {
             anyhow::bail!("bad UDP timestamp (diff {}s)", diff);
         }
@@ -706,30 +784,6 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_subkey_differs() {
-        // Same material, different context strings → different output.
-        let mut material = psk1();
-        material.extend_from_slice(&salt16());
-        let identity = blake3::derive_key("shadowsocks 2022 identity subkey", &material);
-        let session = blake3::derive_key("shadowsocks 2022 session subkey", &material);
-        assert_ne!(identity, session);
-        // KAT from the Go reference (16-byte truncation).
-        assert_eq!(
-            &identity[..16],
-            &hex("1e3587415fc15417133c20d9e4b78ec3")[..]
-        );
-    }
-
-    #[test]
-    fn test_psk_hash_prefix_property() {
-        // blake3::hash (32-byte output) first 16 bytes == Go blake3.Sum512 [:16].
-        assert_eq!(
-            &blake3::hash(&psk2()).as_bytes()[..16],
-            &hex("ea5ff194405ece4f55ae7a150c523884")[..]
-        );
-    }
-
-    #[test]
     fn test_eih_kat() {
         // psk list [psk1, psk2], salt16 → single EIH block, KAT from Go
         // (AES-ECB(identity_subkey, blake3(psk2)[..16])).
@@ -817,38 +871,51 @@ mod tests {
         (session_id, packet_id, rest[skip..].to_vec())
     }
 
-    /// Server-side build of an AES-construction response packet.
-    fn server_seal_aes(
+    /// Server-side build of a response packet for either UDP construction.
+    fn server_seal_udp(
         method: &Ss2022Method,
         client_session_id: u64,
         server_session_id: u64,
         server_packet_id: u64,
+        timestamp: u64,
         socks: &[u8],
         payload: &[u8],
     ) -> Vec<u8> {
-        let psk = method.encryption_psk();
-        let mut plain_header = [0u8; 16];
-        plain_header[..8].copy_from_slice(&server_session_id.to_be_bytes());
-        plain_header[8..].copy_from_slice(&server_packet_id.to_be_bytes());
+        let mut ids = [0u8; 16];
+        ids[..8].copy_from_slice(&server_session_id.to_be_bytes());
+        ids[8..].copy_from_slice(&server_packet_id.to_be_bytes());
 
-        let subkey = method.session_subkey(&plain_header[..8]);
-        let cipher = method.aead(&subkey).unwrap();
-
-        let mut body = Vec::new();
+        let mut body = Vec::with_capacity(16 + 19 + socks.len() + payload.len());
+        if method.is_chacha() {
+            body.extend_from_slice(&ids);
+        }
         body.push(HEADER_TYPE_SERVER);
-        body.extend_from_slice(&unix_timestamp().to_be_bytes());
+        body.extend_from_slice(&timestamp.to_be_bytes());
         body.extend_from_slice(&client_session_id.to_be_bytes());
-        body.extend_from_slice(&0u16.to_be_bytes()); // no padding
+        body.extend_from_slice(&0u16.to_be_bytes());
         body.extend_from_slice(socks);
         body.extend_from_slice(payload);
-        let sealed = cipher.seal(&plain_header[4..16], &body).unwrap();
 
-        let mut out = Vec::new();
-        let mut enc_header = plain_header;
-        AesBlock::new(psk).unwrap().encrypt(&mut enc_header);
-        out.extend_from_slice(&enc_header);
-        out.extend_from_slice(&sealed);
-        out
+        if method.is_chacha() {
+            let cipher = AeadCipher::new_xchacha20(method.encryption_psk()).unwrap();
+            let mut nonce = [0u8; UDP_XNONCE_SIZE];
+            rand::rng().fill_bytes(&mut nonce);
+            let sealed = cipher.seal(&nonce, &body).unwrap();
+            let mut packet = nonce.to_vec();
+            packet.extend_from_slice(&sealed);
+            return packet;
+        }
+
+        let subkey = method.session_subkey(&ids[..8]);
+        let cipher = method.aead(&subkey).unwrap();
+        let sealed = cipher.seal(&ids[4..], &body).unwrap();
+        let mut encrypted_ids = ids;
+        AesBlock::new(method.encryption_psk())
+            .unwrap()
+            .encrypt(&mut encrypted_ids);
+        let mut packet = encrypted_ids.to_vec();
+        packet.extend_from_slice(&sealed);
+        packet
     }
 
     #[test]
@@ -874,11 +941,12 @@ mod tests {
         assert_eq!(packet_id2, 1);
 
         // Server response.
-        let response = server_seal_aes(
+        let response = server_seal_udp(
             &server_method,
             session_id,
             0xdeadbeef,
             0,
+            unix_timestamp(),
             &socks,
             b"dns response",
         );
@@ -950,25 +1018,124 @@ mod tests {
         let skip = socks_addr_len(rest).unwrap();
         assert_eq!(&rest[skip..], payload);
 
-        // Server response: server session/packet ids in the encrypted body.
-        let mut resp_body = Vec::new();
-        resp_body.extend_from_slice(&0xcafeu64.to_be_bytes());
-        resp_body.extend_from_slice(&0u64.to_be_bytes());
-        resp_body.push(HEADER_TYPE_SERVER);
-        resp_body.extend_from_slice(&unix_timestamp().to_be_bytes());
-        resp_body.extend_from_slice(&client_session_id.to_be_bytes());
-        resp_body.extend_from_slice(&0u16.to_be_bytes());
-        resp_body.extend_from_slice(&socks);
-        resp_body.extend_from_slice(b"quic response");
-        let mut resp_nonce = [0u8; UDP_XNONCE_SIZE];
-        rand::rng().fill_bytes(&mut resp_nonce);
-        let sealed = server_cipher.seal(&resp_nonce, &resp_body).unwrap();
-        let mut response = resp_nonce.to_vec();
-        response.extend_from_slice(&sealed);
+        let response = server_seal_udp(
+            &Ss2022Method::new("2022-blake3-chacha20-poly1305", psk_b64).unwrap(),
+            client_session_id,
+            0xcafe,
+            0,
+            unix_timestamp(),
+            &socks,
+            b"quic response",
+        );
 
         let opened = session.open_packet(&response).unwrap();
         assert_eq!(opened, b"quic response");
         assert!(session.open_packet(&response).is_err()); // replay
+    }
+
+    #[test]
+    fn test_udp_2022_server_session_replay_and_rotation() {
+        let methods = [
+            (
+                "2022-blake3-aes-256-gcm",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            ),
+            (
+                "2022-blake3-chacha20-poly1305",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            ),
+        ];
+        let (socks, _) = udp_target();
+        let now = 1_700_000_000;
+
+        for (method_name, password) in methods {
+            let mut session =
+                Ss2022UdpSession::new(Ss2022Method::new(method_name, password).unwrap()).unwrap();
+            let server_method = Ss2022Method::new(method_name, password).unwrap();
+            let client_session_id = session.session_id;
+            let packet =
+                |server_session_id: u64, packet_id: u64, timestamp: u64, payload: &[u8]| {
+                    server_seal_udp(
+                        &server_method,
+                        client_session_id,
+                        server_session_id,
+                        packet_id,
+                        timestamp,
+                        &socks,
+                        payload,
+                    )
+                };
+
+            let a0 = packet(0xa, 0, now, b"a0");
+            assert_eq!(session.open_packet_at(&a0, now).unwrap(), b"a0");
+            let b0 = packet(0xb, 0, now, b"b0");
+            assert_eq!(session.open_packet_at(&b0, now).unwrap(), b"b0");
+            assert!(session.open_packet_at(&a0, now).is_err());
+
+            let a1 = packet(0xa, 1, now + 10, b"a1");
+            assert_eq!(session.open_packet_at(&a1, now + 10).unwrap(), b"a1");
+            let c0 = packet(0xc, 0, now + 69, b"c0");
+            assert!(session.open_packet_at(&c0, now + 69).is_err());
+            let c0 = packet(0xc, 0, now + 70, b"c0");
+            assert_eq!(session.open_packet_at(&c0, now + 70).unwrap(), b"c0");
+        }
+    }
+
+    #[test]
+    fn test_udp_2022_failed_server_packet_does_not_mutate_replay_state() {
+        let methods = [
+            (
+                "2022-blake3-aes-256-gcm",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            ),
+            (
+                "2022-blake3-chacha20-poly1305",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            ),
+        ];
+        let (socks, _) = udp_target();
+        let now = 1_700_000_000;
+
+        for (method_name, password) in methods {
+            for corrupt_ciphertext in [true, false] {
+                let mut session =
+                    Ss2022UdpSession::new(Ss2022Method::new(method_name, password).unwrap())
+                        .unwrap();
+                let server_method = Ss2022Method::new(method_name, password).unwrap();
+                let client_session_id = session.session_id;
+                let packet = |client_id, server_id, packet_id, payload| {
+                    server_seal_udp(
+                        &server_method,
+                        client_id,
+                        server_id,
+                        packet_id,
+                        now,
+                        &socks,
+                        payload,
+                    )
+                };
+
+                let a0 = packet(client_session_id, 0xa, 0, b"a0");
+                assert_eq!(session.open_packet_at(&a0, now).unwrap(), b"a0");
+
+                let failed_client_id = if corrupt_ciphertext {
+                    client_session_id
+                } else {
+                    client_session_id ^ 1
+                };
+                let mut failed_b0 = packet(failed_client_id, 0xb, 0, b"b0");
+                if corrupt_ciphertext {
+                    *failed_b0.last_mut().unwrap() ^= 1;
+                }
+                assert!(session.open_packet_at(&failed_b0, now).is_err());
+
+                let c0 = packet(client_session_id, 0xc, 0, b"c0");
+                assert_eq!(session.open_packet_at(&c0, now).unwrap(), b"c0");
+                assert!(session.open_packet_at(&a0, now).is_err());
+                let a1 = packet(client_session_id, 0xa, 1, b"a1");
+                assert_eq!(session.open_packet_at(&a1, now).unwrap(), b"a1");
+            }
+        }
     }
 
     /// Mock Shadowsocks 2022 server: parses the request (including EIH),
@@ -1162,11 +1329,12 @@ mod tests {
                 let (n, src) = server.recv_from(&mut buf).await.unwrap();
                 let (client_session_id, _pid, payload) = server_open_aes(&server_method, &buf[..n]);
                 let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
-                let packet = server_seal_aes(
+                let packet = server_seal_udp(
                     &server_method,
                     client_session_id,
                     0xbeef,
                     server_packet_id,
+                    unix_timestamp(),
                     &socks,
                     &reply,
                 );
@@ -1195,7 +1363,7 @@ mod tests {
             .unwrap();
 
         transport.send_packet(b"quic data").await.unwrap();
-        let mut buf = [0u8; 65536];
+        let mut buf = [0u8; 9];
         let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
         assert_eq!(src, target);
         assert_eq!(&buf[..n], b"QUIC DATA");

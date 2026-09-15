@@ -222,7 +222,7 @@ pub(super) struct ReadyEndpoint {
     pub(super) endpoint: Arc<UdpEndpoint>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) flow_slots: Arc<Semaphore>,
-    pub(super) _endpoint_permit: OwnedSemaphorePermit,
+    pub(super) _endpoint_permit: Option<OwnedSemaphorePermit>,
     pub(super) _connection_guard: Option<ActiveConnectionGuard>,
     pub(super) alive: AtomicBool,
 }
@@ -470,6 +470,14 @@ impl UdpInitLease {
         };
         let Some(endpoint_permit) = initializing.take_endpoint_permit() else {
             return false;
+        };
+        let endpoint_permit = if endpoint.is_source() {
+            if !endpoint.commit_source_binding(endpoint_permit) {
+                return false;
+            }
+            None
+        } else {
+            Some(endpoint_permit)
         };
         occupied.insert(EndpointEntry::Ready(Arc::new(ReadyEndpoint {
             generation: self.generation,

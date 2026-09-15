@@ -1,5 +1,4 @@
 use serde::de::{DeserializeSeed, Error as _};
-use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::validation::ValidationFailure;
@@ -13,7 +12,7 @@ use crate::types::NodeProtocol;
 use super::{
     AnyTlsConfig, Hysteria2Config, JuicityConfig, Node, OutboundConfig, QuicOptions,
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
-    VlessConfig, VmessConfig, WireMode,
+    VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig,
 };
 fn semantic_error(
     source: &SourceRef,
@@ -29,7 +28,61 @@ fn semantic_error(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RawVlessMode {
+    #[default]
+    Missing,
+    Null,
+    Legacy,
+    Incompatible,
+}
+
+impl<'de> Deserialize<'de> for RawVlessMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'value> serde::de::Visitor<'value> for Visitor {
+            type Value = RawVlessMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy VLESS mode string or null")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "legacy" => Ok(RawVlessMode::Legacy),
+                    "auto" | "native" | "uot-v2" | "h2mux" | "h2mux-padded" | "xudp"
+                    | "mux-cool" => Ok(RawVlessMode::Incompatible),
+                    _ => Err(E::unknown_variant(
+                        value,
+                        &[
+                            "legacy",
+                            "auto",
+                            "native",
+                            "uot-v2",
+                            "h2mux",
+                            "h2mux-padded",
+                            "xudp",
+                            "mux-cool",
+                        ],
+                    )),
+                }
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawVlessMode::Null)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawVlessMode::Null)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FlatNode {
     #[serde(default)]
     id: uuid::Uuid,
@@ -46,7 +99,11 @@ struct FlatNode {
     #[serde(default)]
     encryption: Option<String>,
     #[serde(default)]
-    vless_mode: WireMode,
+    vless_mode: RawVlessMode,
+    #[serde(default)]
+    packet_encoding: Option<VlessUdpEncoding>,
+    #[serde(default)]
+    multiplex: Option<VlessMultiplex>,
     #[serde(default)]
     plugin: Option<String>,
     #[serde(default)]
@@ -286,8 +343,22 @@ impl FlatNode {
             encryption
         );
         strip!(
-            self.vless_mode != WireMode::Legacy && self.protocol != NodeProtocol::VLess,
+            self.vless_mode == RawVlessMode::Incompatible && self.protocol != NodeProtocol::VLess,
             vless_mode
+        );
+        strip!(
+            self.protocol != NodeProtocol::VLess
+                && self
+                    .packet_encoding
+                    .is_some_and(|encoding| encoding != VlessUdpEncoding::Auto),
+            packet_encoding
+        );
+        strip!(
+            self.protocol != NodeProtocol::VLess
+                && self
+                    .multiplex
+                    .is_some_and(|multiplex| multiplex != VlessMultiplex::Off),
+            multiplex
         );
         strip!(
             self.plugin.is_some() && self.protocol != NodeProtocol::SS,
@@ -448,6 +519,15 @@ impl FlatNode {
     ) -> Result<Node, crate::error::DetailedConfigError> {
         self.resolve_credential_aliases()
             .map_err(|error| error.into_detailed(source.clone(), setting.clone()))?;
+        if self.protocol == NodeProtocol::VLess && self.vless_mode != RawVlessMode::Missing {
+            return Err(crate::error::DetailedConfigError::new(
+                crate::error::ErrorCategory::Validation,
+                "removed-vless-mode",
+                source.clone(),
+                setting.clone().field("vless_mode"),
+                "VLESS vless_mode was removed; use packet_encoding and multiplex",
+            ));
+        }
         self.strip_protocol_incompatible_fields(diagnostics, source, setting);
         if self.protocol == NodeProtocol::VMess {
             self.encryption = crate::options::vocab::vmess_cipher(self.encryption.as_deref())
@@ -479,7 +559,7 @@ impl FlatNode {
                     semantic_error(
                         source,
                         setting.clone().field("flow"),
-                        "VLESS flow must be absent or exactly xtls-rprx-vision; aliases must agree",
+                        "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
                     )
                 })?
                 .is_none()
@@ -519,15 +599,18 @@ impl FlatNode {
             NodeProtocol::VLess => {
                 let transport = flat.take_transport();
                 let tls = flat.take_tls();
-                OutboundConfig::Vless(VlessConfig {
+                let mut config = VlessConfig {
                     uuid: flat.password.take(),
                     encryption: flat.encryption.take(),
-                    mode: flat.vless_mode,
+                    udp_encoding: flat.packet_encoding.take().unwrap_or_default(),
+                    multiplex: flat.multiplex.take().unwrap_or_default(),
                     flow: flat.flow.take(),
                     network: flat.network.take(),
                     transport,
                     tls,
-                })
+                };
+                config.normalize();
+                OutboundConfig::Vless(config)
             }
             NodeProtocol::Socks5 => OutboundConfig::Socks5(Socks5Config {
                 username: flat.username.take(),
@@ -617,17 +700,30 @@ impl FlatNode {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
+#[serde(rename = "Node")]
 struct WireOptions<'a> {
+    id: uuid::Uuid,
+    name: &'a str,
+    protocol: NodeProtocol,
+    address: &'a str,
+    host: &'a str,
+    port: u16,
     username: Option<&'a str>,
     password: Option<&'a str>,
     encryption: Option<&'a str>,
-    vless_mode: WireMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vless_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packet_encoding: Option<VlessUdpEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multiplex: Option<&'a VlessMultiplex>,
     plugin: Option<&'a str>,
     plugin_opts: Option<&'a str>,
     transport: &'a str,
     tls: bool,
     sni: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tls_alpn: Option<&'a [String]>,
     skip_cert_verify: bool,
     ech_enabled: bool,
@@ -664,6 +760,12 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    mark: Option<u32>,
+    tags: &'a [String],
+    subscription_id: Option<uuid::Uuid>,
+    group_id: Option<uuid::Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl<'a> WireOptions<'a> {
@@ -690,7 +792,20 @@ impl<'a> WireOptions<'a> {
 
     fn from_node(node: &'a Node) -> Self {
         let mut wire = Self {
+            id: node.id,
+            name: &node.name,
+            protocol: node.protocol(),
+            address: &node.address,
+            host: &node.host,
+            port: node.port,
+            vless_mode: (node.protocol() != NodeProtocol::VLess).then_some("legacy"),
             transport: "tcp",
+            mark: node.mark,
+            tags: &node.tags,
+            subscription_id: node.subscription_id,
+            group_id: node.group_id,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
             ..Self::default()
         };
         match &node.outbound {
@@ -718,7 +833,8 @@ impl<'a> WireOptions<'a> {
                 wire.username = config.uuid.as_deref();
                 wire.password = config.uuid.as_deref();
                 wire.encryption = config.encryption.as_deref();
-                wire.vless_mode = config.mode;
+                wire.packet_encoding = Some(config.udp_encoding);
+                wire.multiplex = Some(&config.multiplex);
                 wire.flow = config.flow.as_deref();
                 wire.network = config.network.as_deref();
                 wire.set_transport(&config.transport);
@@ -784,84 +900,7 @@ impl Serialize for Node {
     where
         S: Serializer,
     {
-        let wire = WireOptions::from_node(self);
-        let mut state =
-            serializer.serialize_struct("Node", 56 + usize::from(wire.tls_alpn.is_some()))?;
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("protocol", &self.protocol())?;
-        state.serialize_field("address", &self.address)?;
-        state.serialize_field("host", &self.host)?;
-        state.serialize_field("port", &self.port)?;
-        state.serialize_field("username", &wire.username)?;
-        state.serialize_field("password", &wire.password)?;
-        state.serialize_field("encryption", &wire.encryption)?;
-        state.serialize_field("vless_mode", &wire.vless_mode)?;
-        state.serialize_field("plugin", &wire.plugin)?;
-        state.serialize_field("plugin_opts", &wire.plugin_opts)?;
-        state.serialize_field("transport", wire.transport)?;
-        state.serialize_field("tls", &wire.tls)?;
-        state.serialize_field("sni", &wire.sni)?;
-        if let Some(tls_alpn) = wire.tls_alpn {
-            state.serialize_field("tls_alpn", tls_alpn)?;
-        }
-        state.serialize_field("skip_cert_verify", &wire.skip_cert_verify)?;
-        state.serialize_field("ech_enabled", &wire.ech_enabled)?;
-        state.serialize_field("ech_config", &wire.ech_config)?;
-        state.serialize_field("ech_config_path", &wire.ech_config_path)?;
-        state.serialize_field("reality_public_key", &wire.reality_public_key)?;
-        state.serialize_field("reality_short_id", &wire.reality_short_id)?;
-        state.serialize_field("reality_spider_x", &wire.reality_spider_x)?;
-        state.serialize_field("flow", &wire.flow)?;
-        state.serialize_field("network", &wire.network)?;
-        state.serialize_field("ws_path", &wire.ws_path)?;
-        state.serialize_field("ws_host", &wire.ws_host)?;
-        state.serialize_field("grpc_service", &wire.grpc_service)?;
-        state.serialize_field("hy2_auth", &wire.hy2_auth)?;
-        state.serialize_field("hy2_obfs", &wire.hy2_obfs)?;
-        state.serialize_field("hy2_up_mbps", &wire.hy2_up_mbps)?;
-        state.serialize_field("hy2_down_mbps", &wire.hy2_down_mbps)?;
-        state.serialize_field("hy2_port_hopping", &wire.hy2_port_hopping)?;
-        state.serialize_field("hy2_hop_interval", &wire.hy2_hop_interval)?;
-        state.serialize_field("tls_pin_sha256", &wire.tls_pin_sha256)?;
-        state.serialize_field(
-            "hy2_init_stream_recv_window",
-            &wire.hy2_init_stream_recv_window,
-        )?;
-        state.serialize_field("hy2_init_conn_recv_window", &wire.hy2_init_conn_recv_window)?;
-        state.serialize_field("hy2_disable_mtu_discovery", &wire.hy2_disable_mtu_discovery)?;
-        state.serialize_field("quic_mtu", &wire.quic_mtu)?;
-        state.serialize_field("tuic_uuid", &wire.tuic_uuid)?;
-        state.serialize_field("tuic_password", &wire.tuic_password)?;
-        state.serialize_field("tuic_congestion", &wire.tuic_congestion)?;
-        state.serialize_field("tuic_alpn", &wire.tuic_alpn)?;
-        state.serialize_field(
-            "tuic_init_stream_recv_window",
-            &wire.tuic_init_stream_recv_window,
-        )?;
-        state.serialize_field(
-            "tuic_init_conn_recv_window",
-            &wire.tuic_init_conn_recv_window,
-        )?;
-        state.serialize_field("juicity_uuid", &wire.juicity_uuid)?;
-        state.serialize_field("juicity_password", &wire.juicity_password)?;
-        state.serialize_field("anytls_password", &wire.anytls_password)?;
-        state.serialize_field("anytls_min_idle_session", &wire.anytls_min_idle_session)?;
-        state.serialize_field(
-            "anytls_idle_session_check_interval",
-            &wire.anytls_idle_session_check_interval,
-        )?;
-        state.serialize_field(
-            "anytls_idle_session_timeout",
-            &wire.anytls_idle_session_timeout,
-        )?;
-        state.serialize_field("mark", &self.mark)?;
-        state.serialize_field("tags", &self.tags)?;
-        state.serialize_field("subscription_id", &self.subscription_id)?;
-        state.serialize_field("group_id", &self.group_id)?;
-        state.serialize_field("created_at", &self.created_at)?;
-        state.serialize_field("updated_at", &self.updated_at)?;
-        state.end()
+        WireOptions::from_node(self).serialize(serializer)
     }
 }
 

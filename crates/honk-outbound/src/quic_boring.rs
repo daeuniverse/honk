@@ -682,7 +682,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
 
         if self.chrome {
             ssl.set_permute_extensions(true);
-            crate::tls::set_chrome_key_shares_ssl(&ssl).expect("SSL_set1_client_key_shares");
+            crate::tls::set_chrome_key_shares_ssl_ref(&ssl).expect("SSL_set1_client_key_shares");
         }
         match &self.ech_config_list {
             Some(list) => ssl
@@ -1594,14 +1594,13 @@ mod tests {
         // parses to defaults (only initial keys matter here anyway).
         let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
 
-        // rustls client session (dangerous no-verify; only initial keys used).
+        // rustls client session (only initial keys are used).
         let mut rustls_cfg = tokio_rustls::rustls::ClientConfig::builder_with_provider(
             tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().into(),
         )
         .with_safe_default_protocol_versions()
         .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_root_certificates(tokio_rustls::rustls::RootCertStore::empty())
         .with_no_client_auth();
         rustls_cfg.alpn_protocols = vec![b"h3".to_vec()];
         let rustls_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
@@ -1684,53 +1683,6 @@ mod tests {
             enc.encrypt(18, &mut buf);
             dec.decrypt(18, &mut buf);
             assert_eq!(buf, original, "{name} HP roundtrip");
-        }
-    }
-
-    /// No-op cert verifier for the rustls side of the cross test.
-    #[derive(Debug)]
-    struct NoVerifier;
-    impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
-        fn verify_server_cert(
-            &self,
-            _: &tokio_rustls::rustls::pki_types::CertificateDer,
-            _: &[tokio_rustls::rustls::pki_types::CertificateDer],
-            _: &tokio_rustls::rustls::pki_types::ServerName,
-            _: &[u8],
-            _: tokio_rustls::rustls::pki_types::UnixTime,
-        ) -> Result<
-            tokio_rustls::rustls::client::danger::ServerCertVerified,
-            tokio_rustls::rustls::Error,
-        > {
-            Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _: &[u8],
-            _: &tokio_rustls::rustls::pki_types::CertificateDer,
-            _: &tokio_rustls::rustls::DigitallySignedStruct,
-        ) -> Result<
-            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
-            tokio_rustls::rustls::Error,
-        > {
-            Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _: &[u8],
-            _: &tokio_rustls::rustls::pki_types::CertificateDer,
-            _: &tokio_rustls::rustls::DigitallySignedStruct,
-        ) -> Result<
-            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
-            tokio_rustls::rustls::Error,
-        > {
-            Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-            vec![tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
         }
     }
 

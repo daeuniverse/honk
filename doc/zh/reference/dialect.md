@@ -40,6 +40,8 @@ honk 读取 dae 配置语法，形成自己的方言：两者对同一段文本�
 | 订阅链接后的 `'url'(User-Agent)` | 不在文法内 | honk 扩展：括号内文本是 User-Agent；未加引号的括号内前有空格的 `#` 会结束该行，这类 User-Agent 请加引号。 |
 | 订阅块：`paid: {` 之后各占一行的 `url: …`、`ua: …`、`interval: …` 与 `}` | `ID ':' '{'` 不是声明 | honk 扩展：订阅的块形式；其设置与其他块一样每行一条。 |
 | `node` 里冒号前带空格的裸标签，`edge : 'socks5://…'` | 标签为 `edge` | 冒号两侧的空白会被规范化：保留节点，标签为 `edge`，并产生 `entry-tag-normalized` 信息级诊断。仍接受 `edge: …` 和带引号的标签。 |
+| VLESS 分享链接或扁平序列化 VLESS 节点中的 `vless_mode` | 旧 VLESS mode 选择器 | 已移除，不作为别名接受。分享链接须使用独立的 `udp=`、`packetEncoding=` 与 `mux=` query。扁平 VLESS 节点会拒绝 `vless_mode` 的任何存在形式（包括 `null`），改用 `network`、`packet_encoding` 与 `multiplex`。 |
+| 扁平序列化非 VLESS 节点上的 `vless_mode: legacy` | VLESS 之外的旧字段 | 仅作为 wire adapter 输出并读取的兼容 placeholder，不选择任何行为。这是唯一的非 VLESS 序列化例外，不是文档支持的 dae 或分享链接语法。 |
 
 ## 路由
 

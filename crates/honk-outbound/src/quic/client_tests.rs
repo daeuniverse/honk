@@ -500,7 +500,7 @@ fn tuic_test_node() -> honk_config::node::Node {
 }
 
 fn tuic_ephemeral() -> Arc<crate::runtime::NodeRuntime> {
-    crate::runtime::NodeRuntime::ephemeral(&tuic_test_node())
+    crate::runtime::NodeRuntime::try_ephemeral(&tuic_test_node()).unwrap()
 }
 
 async fn probe_client(
@@ -531,7 +531,7 @@ async fn ephemeral_runtime_close_shuts_quic_client() {
     let runtime = tuic_ephemeral();
     let (_client, conn) = probe_client(&runtime, addr.port()).await;
     assert!(conn.close_reason().is_none());
-    assert!(runtime.is_warm_or_stateless());
+    assert!(runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
 
     runtime.close().await;
     assert!(
@@ -539,7 +539,7 @@ async fn ephemeral_runtime_close_shuts_quic_client() {
         "closing the ephemeral runtime must close the probe connection"
     );
     assert!(
-        !runtime.is_warm_or_stateless(),
+        !runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session),
         "a closed runtime no longer reports warm clients"
     );
 }
@@ -555,7 +555,7 @@ async fn ephemeral_guard_releases_quic_client_when_probe_is_aborted() {
     spawn_accept_loop(endpoint);
     let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
     let probe = tokio::spawn(async move {
-        let guard = NodeRuntime::ephemeral_guarded(&tuic_test_node());
+        let guard = NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
         let runtime = guard.runtime();
         let (_client, conn) = probe_client(&runtime, addr.port()).await;
         let _ = conn_tx.send(conn);

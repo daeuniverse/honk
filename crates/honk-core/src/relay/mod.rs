@@ -2,7 +2,7 @@
 //!
 //! Handles bidirectional data relay between a client connection and a
 //! proxy connection. Wrapped streams (TLS/protocol) use async I/O with
-//! `tokio::io::copy_bidirectional`; when both ends are plain `TcpStream`s
+//! a pair of `tokio::io::copy` pumps; when both ends are plain `TcpStream`s
 //! (direct connections), the `splice` module relays them zero-copy via
 //! `splice(2)` with automatic fallback to the copy path.
 //!
@@ -159,10 +159,11 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    const RELAY_BUF_SIZE: usize = 64 * 1024;
-    let mut br =
-        tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, ReadCounter::wrap(rd, progress, None));
-    let n = tokio::io::copy_buf(&mut br, wr).await?;
+    // Sniffing or protocol setup may already have buffered bytes before the
+    // copier starts; copy only flushes writes it performs itself.
+    wr.flush().await?;
+    let mut rd = ReadCounter::wrap(rd, progress, None);
+    let n = tokio::io::copy(&mut rd, wr).await?;
     wr.shutdown().await?;
     Ok(n)
 }
@@ -282,47 +283,168 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
     use tokio::net::{TcpListener, TcpStream};
 
-    /// Test that relay_tcp correctly passes data bidirectionally.
     #[tokio::test]
-    async fn test_relay_tcp_bidirectional() {
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_addr = echo_listener.local_addr().unwrap();
+    async fn relay_tcp_flushes_buffered_request_without_client_eof() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut client, relay_client) = tokio::io::duplex(64);
+            let (relay_proxy, mut peer) = tokio::io::duplex(64);
+            let address = "127.0.0.1:1".parse().unwrap();
+            let (stats, (), ()) = tokio::join!(
+                relay_tcp(
+                    BufWriter::new(relay_client),
+                    BufWriter::new(relay_proxy),
+                    address,
+                    address,
+                ),
+                async move {
+                    client.write_all(b"ping").await.unwrap();
+                    let mut reply = [0; 4];
+                    client.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, b"pong");
+                    client.shutdown().await.unwrap();
+                },
+                async move {
+                    let mut request = [0; 4];
+                    peer.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request, b"ping");
+                    peer.write_all(b"pong").await.unwrap();
+                    peer.shutdown().await.unwrap();
+                },
+            );
+            let stats = stats.unwrap();
+            assert_eq!(stats.client_to_proxy, 4);
+            assert_eq!(stats.proxy_to_client, 4);
+        })
+        .await
+        .expect("buffered request/response stalled before client EOF");
+    }
 
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = echo_listener.accept().await {
-                let mut buf = [0u8; 1024];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            stream.write_all(&buf[..n]).await.ok();
-                        }
+    async fn trojan_grpc_request_response(sniffed: bool) {
+        use honk_config::node::{Node, OutboundConfig, TrojanConfig};
+        use honk_outbound::proxy::{TcpOutbound, trojan::TrojanHandler};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(tcp).await.unwrap();
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut response = respond.send_response(response, false).unwrap();
+                response
+                    .send_data(bytes::Bytes::from_static(b"\0\0\0\0\x07\x0a\x05ready"), false)
+                    .unwrap();
+                let exchange = async move {
+                    // Empty-password Trojan CONNECT to 1.2.3.4:53, then one request.
+                    let expected = b"\0\0\0\0\x46\x0a\x44d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f\r\n\x01\x01\x01\x02\x03\x04\0\x35\r\n\0\0\0\0\x06\x0a\x04ping";
+                    let mut body = request.into_body();
+                    let mut received = Vec::new();
+                    while received.len() < expected.len() {
+                        let data = body.data().await.unwrap().unwrap();
+                        received.extend_from_slice(&data);
+                        body.flow_control().release_capacity(data.len()).unwrap();
                     }
+                    assert_eq!(received, expected);
+                    assert!(!body.is_end_stream(), "request must arrive before client EOF");
+                    response
+                        .send_data(bytes::Bytes::from_static(b"\0\0\0\0\x06\x0a\x04pong"), true)
+                        .unwrap();
+                    drop(response);
+                    while let Some(data) = body.data().await {
+                        assert!(data.unwrap().is_empty(), "request must not be replayed");
+                    }
+                };
+                tokio::join!(exchange, async move {
+                    while connection.accept().await.is_some() {}
+                });
+            };
+            let client = async move {
+                let mut node = Node {
+                    address: address.ip().to_string(),
+                    port: address.port(),
+                    outbound: OutboundConfig::Trojan(TrojanConfig::default()),
+                    ..Default::default()
+                };
+                node.transport_mut().unwrap().transport = "grpc".into();
+                let target = "1.2.3.4:53".parse().unwrap();
+                let tcp = TcpStream::connect(address).await.unwrap();
+                let mut proxy = TrojanHandler::new()
+                    .dial_with_tcp(&node, target, None, tcp, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+                // Consume startup SETTINGS before queuing the request: its ACK
+                // must not accidentally flush application bytes for the relay.
+                let mut ready = [0; 5];
+                proxy.stream.read_exact(&mut ready).await.unwrap();
+                assert_eq!(&ready, b"ready");
+
+                let (mut client, mut relay_client) = tokio::io::duplex(64);
+                client.write_all(b"ping").await.unwrap();
+                if sniffed {
+                    let mut prefix = [0; 4];
+                    relay_client.read_exact(&mut prefix).await.unwrap();
+                    proxy.stream.write_all(&prefix).await.unwrap();
                 }
-            }
-        });
+                let upload = Arc::new(AtomicU64::new(0));
+                let download = Arc::new(AtomicU64::new(0));
+                let responses = Arc::new(AtomicUsize::new(0));
+                let first_response = responses.clone();
+                let (stats, ()) = tokio::join!(
+                    splice::relay_auto(
+                        relay_client,
+                        proxy.stream,
+                        address,
+                        target,
+                        Some(RelayProgress {
+                            upload: upload.clone(),
+                            download: download.clone(),
+                            first_response: Some(Arc::new(move || {
+                                first_response.fetch_add(1, Ordering::Relaxed);
+                            })),
+                        }),
+                    ),
+                    async move {
+                        let mut reply = [0; 4];
+                        client.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(&reply, b"pong");
+                        client.shutdown().await.unwrap();
+                    },
+                );
+                let stats = stats.unwrap();
+                let copied_upload = if sniffed { 0 } else { 4 };
+                assert_eq!(stats.client_to_proxy, copied_upload);
+                assert_eq!(stats.proxy_to_client, 4);
+                assert_eq!(upload.load(Ordering::Relaxed), copied_upload);
+                assert_eq!(download.load(Ordering::Relaxed), 4);
+                assert_eq!(responses.load(Ordering::Relaxed), 1);
+            };
+            tokio::join!(server, client);
+        })
+        .await
+        .expect("Trojan gRPC request stalled before client EOF");
+    }
 
-        // Set up a "client" that connects and sends data
-        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_addr = client_listener.local_addr().unwrap();
+    #[tokio::test]
+    async fn relay_auto_flushes_trojan_grpc_request_without_client_eof() {
+        trojan_grpc_request_response(false).await;
+    }
 
-        let echo_addr_clone = echo_addr;
-        let _handle = tokio::spawn(async move {
-            let client = TcpStream::connect(echo_addr_clone).await.unwrap();
-            let _buf = [0u8; 1024];
-
-            let (_read_half, _write_half) = client.into_split();
-            true
-        });
-
-        let _proxy = TcpStream::connect(echo_addr).await.unwrap();
-        let _client = TcpStream::connect(client_addr).await.unwrap();
-
-        // This test validates the structure - real relay testing needs
-        // actual bidirectional data flow
+    #[tokio::test]
+    async fn relay_auto_flushes_trojan_grpc_sniff_prefix_without_more_input() {
+        trojan_grpc_request_response(true).await;
     }
 
     /// A silent peer must not pin the copy relay forever either: after the
@@ -431,32 +553,5 @@ mod tests {
             .expect("relay pinned by stalled survivor")
             .unwrap();
         assert_eq!(stats.proxy_to_client, 4096);
-    }
-
-    #[tokio::test]
-    async fn test_relay_tcp_simple_transfer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let (mut r, mut w) = stream.split();
-                tokio::io::copy(&mut r, &mut w).await.ok();
-            }
-        });
-
-        // Client and proxy connected to the same server, simulating TPROXY relay
-        let client = TcpStream::connect(addr).await.unwrap();
-        let proxy = TcpStream::connect(addr).await.unwrap();
-
-        let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-        let handle = tokio::spawn(async move { relay_tcp(client, proxy, client_addr, addr).await });
-
-        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), handle).await;
-
-        // Timeout is expected since nobody writes data; relay correctness
-        // is verified by the bidirectional test above
-        assert!(result.is_err() || result.unwrap().is_ok());
     }
 }

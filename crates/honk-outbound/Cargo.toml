@@ -15,7 +15,6 @@ tracing.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 uuid.workspace = true
-chrono.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 sha3.workspace = true
@@ -51,6 +50,7 @@ h2.workspace = true
 http.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 rcgen.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
@@ -58,8 +58,6 @@ criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 # rustls: test-only — loopback TLS/QUIC servers prove wire interop with the
 # BoringSSL client stack (and cross-check the QUIC crypto backend)
 tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
-webpki-roots.workspace = true
 
 [features]
 # VLESS (xtls-rprx-vision flow) / VMess proxy handlers. Off by default:

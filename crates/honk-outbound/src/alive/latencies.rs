@@ -1,4 +1,4 @@
-//! Ring buffer of last N latency samples with O(1) statistics.
+//! Ring buffer of the last N latency samples.
 
 use parking_lot::Mutex;
 use std::time::{Duration, SystemTime};
@@ -37,7 +37,6 @@ pub(crate) struct Latencies10 {
     buf: Vec<LatencySample>,
     head: usize,
     len: usize,
-    sum: Duration,
     cap: usize,
 }
 
@@ -47,7 +46,6 @@ impl Latencies10 {
             buf: vec![LatencySample::real(Duration::ZERO); n],
             head: 0,
             len: 0,
-            sum: Duration::ZERO,
             cap: n,
         }
     }
@@ -55,13 +53,10 @@ impl Latencies10 {
     pub(crate) fn append(&mut self, sample: LatencySample) {
         if self.len < self.cap {
             self.buf[self.len] = sample;
-            self.sum += sample.latency;
             self.len += 1;
         } else {
-            let old = self.buf[self.head];
             self.buf[self.head] = sample;
             self.head = (self.head + 1) % self.cap;
-            self.sum = self.sum - old.latency + sample.latency;
         }
     }
 
@@ -101,13 +96,6 @@ impl Latencies10 {
         None
     }
 
-    pub(crate) fn avg(&self) -> Option<Duration> {
-        if self.len == 0 {
-            return None;
-        }
-        Some(self.sum / self.len as u32)
-    }
-
     #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.len
@@ -136,10 +124,6 @@ impl SyncLatencies10 {
     pub(crate) fn last_real_sample(&self) -> Option<LatencySample> {
         self.inner.lock().last_real_sample()
     }
-
-    pub(crate) fn avg(&self) -> Option<Duration> {
-        self.inner.lock().avg()
-    }
 }
 
 #[cfg(test)]
@@ -157,7 +141,6 @@ mod tests {
         l.append(real(15));
         assert_eq!(l.last(), Some(Duration::from_millis(15)));
         assert_eq!(l.count(), 2);
-        assert_eq!(l.avg(), Some(Duration::from_millis(10)));
     }
 
     #[test]
@@ -169,14 +152,12 @@ mod tests {
         l.append(real(4000));
         assert_eq!(l.last(), Some(Duration::from_secs(4)));
         assert_eq!(l.count(), 3);
-        assert_eq!(l.avg(), Some(Duration::from_secs(3)));
     }
 
     #[test]
     fn test_empty() {
         let l = Latencies10::new(5);
         assert_eq!(l.last(), None);
-        assert_eq!(l.avg(), None);
         assert_eq!(l.count(), 0);
     }
 

@@ -411,8 +411,12 @@ impl ControlPlaneHandle {
             )
             .await;
         let (mut proxy_stream, node, score_reporter) = match raced {
-            Some(pair) => pair,
-            None => {
+            Ok(Some(pair)) => pair,
+            Err(error) => {
+                self.stats.record_close(&outbound_name);
+                return Err(error);
+            }
+            Ok(None) => {
                 // Retry once only when a failed authoritative pick can produce
                 // a different plan. URLTest may race its alternates; Score
                 // re-scores the exact target and retries only a replacement.
@@ -467,6 +471,13 @@ impl ControlPlaneHandle {
                                     false,
                                 )
                                 .await;
+                            let retry = match retry {
+                                Ok(retry) => retry,
+                                Err(error) => {
+                                    self.stats.record_close(&outbound_name);
+                                    return Err(error);
+                                }
+                            };
                             if retry.is_some() {
                                 selection_chains = retry_selection_chains;
                             }
@@ -707,12 +718,11 @@ impl ControlPlaneHandle {
                                     }
                                     return;
                                 }
-                                if is_tcp_stream_alive(&stream) {
+                                if pool.deposit_tcp(&node_addr, stream).await {
                                     if let Some(reporter) = &pool_reporter {
                                         reporter.setup_succeeded();
                                         reporter.finish_setup_only();
                                     }
-                                    pool.deposit_tcp(&node_addr, stream).await;
                                 } else {
                                     if let Some(reporter) = &pool_reporter {
                                         reporter.setup_failed(crate::group::ScoreOutcome::Io(
@@ -774,8 +784,8 @@ impl ControlPlaneHandle {
     /// pool (≤2 per race, off the critical path). Failures are reported via
     /// traffic-based thresholds to avoid killing a node from a single
     /// transient failure. Returns the winning stream and its already-owned
-    /// node; `None` means every candidate failed (already logged) — close
-    /// accounting stays with the caller.
+    /// node; `Ok(None)` means every candidate failed. Local refusal remains
+    /// terminal as `Err`; close accounting stays with the caller.
     #[allow(clippy::too_many_arguments)]
     async fn race_candidates(
         &self,
@@ -789,11 +799,13 @@ impl ControlPlaneHandle {
         ipver: IpVersion,
         feedback: &HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
         cold_urltest: bool,
-    ) -> Option<(
-        crate::proxy::ProxyStream,
-        Node,
-        Option<crate::group::ScoreReporter>,
-    )> {
+    ) -> anyhow::Result<
+        Option<(
+            crate::proxy::ProxyStream,
+            Node,
+            Option<crate::group::ScoreReporter>,
+        )>,
+    > {
         let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
         let ctx = self.clone();
         let outbound = outbound_name.to_string();
@@ -868,6 +880,7 @@ impl ControlPlaneHandle {
 
         let mut last_err: Option<(String, String)> = None;
         let mut first_err: Option<(String, String)> = None;
+        let mut rejection = None;
         let mut timeout_count: usize = 0;
         let mut winner: Option<(
             crate::proxy::ProxyStream,
@@ -908,6 +921,11 @@ impl ControlPlaneHandle {
                     Ok((Err(e), _idx, _elapsed, node, _reporter)) => {
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         ctx.stats.record_error(&outbound);
+                        if honk_outbound::proxy::is_packet_rejection(&e) {
+                            rejection = Some(e);
+                            set.abort_all();
+                            break;
+                        }
                         report_dial_failure_if_current(
                             &runtime_generation,
                             &ctx.alive_set,
@@ -943,8 +961,16 @@ impl ControlPlaneHandle {
             }
         }
 
-        // Drain any remaining aborted tasks to avoid JoinSet drop panic.
-        while (set.join_next().await).is_some() {}
+        while let Some(result) = set.join_next().await {
+            if let Ok((Err(error), ..)) = result
+                && honk_outbound::proxy::is_packet_rejection(&error)
+            {
+                rejection.get_or_insert(error);
+            }
+        }
+        if let Some(error) = rejection {
+            return Err(error);
+        }
 
         // so the pool stays warm after a parallel-dial race. Limit to 2 deposits
         // per race to avoid thundering herd on the proxy servers.
@@ -1063,12 +1089,11 @@ impl ControlPlaneHandle {
                                 }
                                 return;
                             }
-                            if is_tcp_stream_alive(&stream) {
+                            if pool.deposit_tcp(&node_addr, stream).await {
                                 if let Some(reporter) = &pool_reporter {
                                     reporter.setup_succeeded();
                                     reporter.finish_setup_only();
                                 }
-                                pool.deposit_tcp(&node_addr, stream).await;
                             } else {
                                 if let Some(reporter) = &pool_reporter {
                                     reporter.setup_failed(crate::group::ScoreOutcome::Io(
@@ -1096,7 +1121,7 @@ impl ControlPlaneHandle {
             }
         }
 
-        match winner {
+        Ok(match winner {
             Some((stream, _, node, reporter)) => Some((stream, node, reporter)),
             None => {
                 if let Some((last_msg, last_name)) = last_err {
@@ -1122,7 +1147,7 @@ impl ControlPlaneHandle {
                 }
                 None
             }
-        }
+        })
     }
 
     /// Dial through a node using the TCP connection pool.

@@ -1,12 +1,13 @@
 //! Per-protocol facts: UDP support, pooling behavior, generation runtime
 //! ownership, and share-link schemes.
 
-use honk_config::node::{Node, WireMode};
+use honk_config::node::{Node, VlessTcpPath, VlessUdpPath};
 use honk_config::types::NodeProtocol;
 
+use crate::proxy::WarmRequirement;
 use crate::runtime::GenerationRuntime;
 
-/// Per-protocol facts. Function-typed fields cover per-node conditions:
+/// Predicate fields cover per-node conditions:
 /// VLESS, Trojan, and AnyTLS gate UDP on `node.network`, while Trojan
 /// ready-stream pooling additionally depends on its transport.
 pub struct ProtocolDescriptor {
@@ -14,17 +15,28 @@ pub struct ProtocolDescriptor {
     pub supports_udp: fn(&Node) -> bool,
     pub pool_ready_streams: fn(&Node) -> bool,
     pub pool_bare_tcp: fn(&Node) -> bool,
-    pub generation_runtime: fn(&Node) -> GenerationRuntime,
+    pub generation_runtime: GenerationRuntime,
     pub share_link_schemes: &'static [&'static str],
 }
 
 impl ProtocolDescriptor {
-    pub fn generation_runtime(&self, node: &Node) -> GenerationRuntime {
-        (self.generation_runtime)(node)
-    }
-
-    pub fn has_generation_runtime(&self, node: &Node) -> bool {
-        self.generation_runtime(node) != GenerationRuntime::None
+    pub fn supports_warm(&self, node: &Node, requirement: WarmRequirement) -> bool {
+        if self.protocol == NodeProtocol::VLess {
+            let vless = node
+                .vless()
+                .expect("VLESS descriptor requires VLESS config");
+            return match requirement {
+                WarmRequirement::Session => {
+                    matches!(vless.tcp_path(), VlessTcpPath::H2 | VlessTcpPath::Cool)
+                }
+                WarmRequirement::Udp => matches!(
+                    vless.udp_path(0),
+                    Some(VlessUdpPath::H2 | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate)
+                ),
+            };
+        }
+        self.generation_runtime != GenerationRuntime::None
+            && (requirement == WarmRequirement::Session || (self.supports_udp)(node))
     }
 }
 
@@ -47,35 +59,12 @@ fn always(_: &Node) -> bool {
     true
 }
 
-fn no_runtime(_: &Node) -> GenerationRuntime {
-    GenerationRuntime::None
-}
-
-fn anytls_runtime(_: &Node) -> GenerationRuntime {
-    GenerationRuntime::AnyTls
-}
-
-fn quic_runtime(_: &Node) -> GenerationRuntime {
-    GenerationRuntime::Quic
-}
-
 fn vless_supports_udp(node: &Node) -> bool {
-    node.vless().unwrap().mode != WireMode::Legacy && network_allows_udp(node)
+    node.vless().unwrap().udp_enabled()
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
-    matches!(
-        node.vless().unwrap().mode,
-        WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp
-    )
-}
-
-fn vless_runtime(node: &Node) -> GenerationRuntime {
-    match node.vless().unwrap().mode {
-        WireMode::H2mux | WireMode::H2muxPadded => GenerationRuntime::VlessH2Mux,
-        WireMode::MuxCool => GenerationRuntime::VlessCoolMux,
-        WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => GenerationRuntime::None,
-    }
+    node.vless().unwrap().tcp_path() == VlessTcpPath::Direct
 }
 
 /// Poolable only on the plain TCP transport: `dial()` completes the TLS
@@ -94,7 +83,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: no_runtime,
+        generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["ss"],
     },
     ProtocolDescriptor {
@@ -102,7 +91,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: network_allows_udp,
         pool_ready_streams: trojan_pool_ready_streams,
         pool_bare_tcp: always,
-        generation_runtime: no_runtime,
+        generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["trojan"],
     },
     ProtocolDescriptor {
@@ -110,7 +99,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: no_runtime,
+        generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["vmess"],
     },
     ProtocolDescriptor {
@@ -118,7 +107,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: vless_supports_udp,
         pool_ready_streams: never,
         pool_bare_tcp: vless_pool_bare_tcp,
-        generation_runtime: vless_runtime,
+        generation_runtime: GenerationRuntime::Vless,
         share_link_schemes: &["vless"],
     },
     // After the greeting (+ optional RFC 1929 auth) and a successful CONNECT
@@ -130,7 +119,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: always,
         pool_bare_tcp: always,
-        generation_runtime: no_runtime,
+        generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["socks5", "socks4", "socks4a"],
     },
     // QUIC-based (hy2/tuic/juicity): a pooled bare TCP is unusable — their
@@ -141,7 +130,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: quic_runtime,
+        generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["hysteria2", "hysteria", "hy2"],
     },
     ProtocolDescriptor {
@@ -149,7 +138,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: quic_runtime,
+        generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["tuic"],
     },
     ProtocolDescriptor {
@@ -157,7 +146,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: quic_runtime,
+        generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["juicity"],
     },
     // Multiplexed: the node-owned session pool already keeps reusable
@@ -168,7 +157,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: network_allows_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: anytls_runtime,
+        generation_runtime: GenerationRuntime::AnyTls,
         share_link_schemes: &["anytls"],
     },
     ProtocolDescriptor {
@@ -176,7 +165,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: no_runtime,
+        generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
     ProtocolDescriptor {
@@ -184,10 +173,16 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: no_runtime,
+        generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
 ];
+
+/// Whether a selected node permits packets to the target port.
+pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
+    node.vless()
+        .is_none_or(|vless| vless.udp_path(port).is_some())
+}
 
 pub fn descriptor(protocol: NodeProtocol) -> &'static ProtocolDescriptor {
     DESCRIPTORS
@@ -220,63 +215,55 @@ mod tests {
     }
 
     #[test]
-    fn generation_runtime_matches_protocol_family() {
-        let node = |protocol| Node {
-            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
-            ..Default::default()
-        };
-        for protocol in [
-            NodeProtocol::AnyTLS,
-            NodeProtocol::Tuic,
-            NodeProtocol::Juicity,
-            NodeProtocol::Hysteria2,
-        ] {
-            let node = node(protocol);
-            assert!(descriptor(protocol).has_generation_runtime(&node));
-        }
-        for protocol in [
-            NodeProtocol::VLess,
-            NodeProtocol::Trojan,
-            NodeProtocol::Direct,
-        ] {
-            let node = node(protocol);
-            assert!(!descriptor(protocol).has_generation_runtime(&node));
-        }
-    }
+    fn vless_capabilities_follow_selected_paths() {
+        use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
+        use std::num::NonZeroU16;
 
-    #[test]
-    fn vless_capabilities_follow_wire_mode() {
         let descriptor = descriptor(NodeProtocol::VLess);
-        for (mode, udp, bare, runtime) in [
-            (WireMode::Legacy, false, true, GenerationRuntime::None),
-            (WireMode::UotV2, true, true, GenerationRuntime::None),
-            (WireMode::Xudp, true, true, GenerationRuntime::None),
-            (WireMode::H2mux, true, false, GenerationRuntime::VlessH2Mux),
+        let limit = NonZeroU16::new(8).unwrap();
+        for (multiplex, bare, warm_tcp, warm_udp) in [
+            (VlessMultiplex::Off, true, false, false),
+            (VlessMultiplex::H2 { padding: false }, false, true, true),
             (
-                WireMode::H2muxPadded,
-                true,
+                VlessMultiplex::Xray {
+                    tcp: Some(limit),
+                    udp: VlessUdpMux::SharedTcp,
+                    udp443: Udp443Policy::Reject,
+                },
                 false,
-                GenerationRuntime::VlessH2Mux,
+                true,
+                true,
             ),
             (
-                WireMode::MuxCool,
+                VlessMultiplex::Xray {
+                    tcp: None,
+                    udp: VlessUdpMux::Separate(limit),
+                    udp443: Udp443Policy::Reject,
+                },
                 true,
                 false,
-                GenerationRuntime::VlessCoolMux,
+                true,
             ),
         ] {
             let node = Node {
                 outbound: honk_config::node::OutboundConfig::Vless(
                     honk_config::node::VlessConfig {
-                        mode,
+                        multiplex,
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
             };
-            assert_eq!((descriptor.supports_udp)(&node), udp);
+            assert!((descriptor.supports_udp)(&node));
             assert_eq!((descriptor.pool_bare_tcp)(&node), bare);
-            assert_eq!(descriptor.generation_runtime(&node), runtime);
+            assert_eq!(
+                descriptor.supports_warm(&node, WarmRequirement::Session),
+                warm_tcp
+            );
+            assert_eq!(
+                descriptor.supports_warm(&node, WarmRequirement::Udp),
+                warm_udp
+            );
         }
     }
 
@@ -306,7 +293,7 @@ mod tests {
         let vless = descriptor(NodeProtocol::VLess).supports_udp;
         let tcp_only = Node {
             outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
-                mode: WireMode::H2mux,
+                multiplex: honk_config::node::VlessMultiplex::H2 { padding: false },
                 network: Some("tcp".to_string()),
                 ..Default::default()
             }),
@@ -317,5 +304,32 @@ mod tests {
         let ss = descriptor(NodeProtocol::SS).supports_udp;
         let node = Node::default();
         assert!(ss(&node), "SS UDP is not network-gated");
+    }
+
+    #[test]
+    fn vless_udp_443_policy_is_path_scoped() {
+        use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
+        use std::num::NonZeroU16;
+
+        let mut node = Node {
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                multiplex: VlessMultiplex::Xray {
+                    tcp: Some(NonZeroU16::new(8).unwrap()),
+                    udp: VlessUdpMux::SharedTcp,
+                    udp443: Udp443Policy::Reject,
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(udp_target_allowed(&node, 53));
+        assert!(!udp_target_allowed(&node, 443));
+
+        let VlessMultiplex::Xray { udp443, .. } = &mut node.vless_mut().unwrap().multiplex else {
+            unreachable!()
+        };
+        *udp443 = Udp443Policy::Allow;
+        assert!(udp_target_allowed(&node, 443));
+        assert!(udp_target_allowed(&Node::default(), 443));
     }
 }

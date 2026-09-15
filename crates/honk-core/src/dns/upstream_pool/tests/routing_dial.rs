@@ -124,8 +124,8 @@ async fn dns_private_tls_connectors_follow_runtime_maintenance() {
 
     assert!(pool.query("proxy", &mock_dns_query(123)).await.is_err());
     let expired = std::time::Instant::now() + honk_outbound::runtime::TLS_IDLE_RETENTION;
-    assert_eq!(traffic.reap_tls_connectors(expired), 0);
-    assert_eq!(transport.reap_tls_connectors(expired), 1);
+    assert_eq!(traffic.reap_idle_resources(expired), 0);
+    assert_eq!(transport.reap_idle_resources(expired), 1);
 
     pool.close().await;
     server.abort();

@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, TryAcquireError};
-use tracing::{debug, warn};
+use tracing::warn;
 
 mod transport;
 
@@ -146,17 +146,9 @@ impl DnsController {
     /// Resolve a domain (A + AAAA) through the *currently installed*
     /// forwarder — reload-safe, unlike holding a resolver from startup.
     /// Used by the health-check resolver hook.
-    pub async fn resolve_domain(&self, domain: &str) -> Vec<std::net::IpAddr> {
-        match self.dns_service.resolve_name(domain).await {
-            Ok(resolved) => resolved.ipv4.into_iter().chain(resolved.ipv6).collect(),
-            Err(_) => {
-                debug!(
-                    error_kind = "lookup_failed",
-                    "DNS controller name resolution failed"
-                );
-                Vec::new()
-            }
-        }
+    pub async fn resolve_domain(&self, domain: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        let resolved = self.dns_service.resolve_name(domain).await?;
+        Ok(resolved.ipv4.into_iter().chain(resolved.ipv6).collect())
     }
 
     pub(crate) fn runtime_provider(&self) -> Arc<crate::dns::runtime::DnsServiceProvider> {

@@ -19,6 +19,7 @@ enum Reply {
     Empty,
     Nxdomain,
     Failure,
+    Rejection,
 }
 
 struct ScriptedPool {
@@ -41,6 +42,15 @@ impl ScriptedPool {
     fn blocked() -> Arc<Self> {
         Arc::new(Self {
             replies: [Reply::Address(300), Reply::Address(90)],
+            calls: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            entered: Notify::new(),
+            release: Some(Semaphore::new(0)),
+        })
+    }
+
+    fn blocked_rejection() -> Arc<Self> {
+        Arc::new(Self {
+            replies: [Reply::Rejection, Reply::Empty],
             calls: [AtomicUsize::new(0), AtomicUsize::new(0)],
             entered: Notify::new(),
             release: Some(Semaphore::new(0)),
@@ -75,6 +85,10 @@ impl DnsUpstreamPool for ScriptedPool {
             Reply::Address(ttl) => Ok(address_response(query, qtype, ttl)),
             Reply::Empty => Ok(empty_response(query, false)),
             Reply::Nxdomain => Ok(empty_response(query, true)),
+            Reply::Rejection => Err(anyhow::Error::new(
+                honk_outbound::proxy::PacketRejection::Policy,
+            )
+            .context("scripted packet rejection context")),
             Reply::Failure => anyhow::bail!("scripted {qtype} failure"),
         }
     }
@@ -200,6 +214,91 @@ async fn fallback_runs_once_only_when_both_families_are_unusable() {
     .await
     .expect_err("ineligible fallback family");
     assert!(filtered.to_string().contains("no A/AAAA records"));
+}
+
+#[tokio::test]
+async fn packet_rejection_survives_no_fallback_and_source_resolution() {
+    let error = service(
+        DnsStrategy::Ipv4Only,
+        ScriptedPool::new(Reply::Rejection, Reply::Failure),
+    )
+    .resolve_name_without_fallback("example.com")
+    .await
+    .expect_err("no-fallback packet rejection");
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
+
+    let error = service(
+        DnsStrategy::Ipv4Only,
+        ScriptedPool::new(Reply::Rejection, Reply::Failure),
+    )
+    .resolve_name_for_source("example.com", "192.0.2.1".parse().unwrap())
+    .await
+    .expect_err("source-specific packet rejection");
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
+}
+
+#[tokio::test]
+async fn shared_packet_rejection_skips_bootstrap_fallback() {
+    let pool = ScriptedPool::blocked_rejection();
+    let service = service(DnsStrategy::Both, pool.clone());
+    let flights = service.forwarder().singleflight().clone();
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let both_entered = pool.entered.notified();
+    tokio::pin!(both_entered);
+
+    let first_service = service.clone();
+    let first_calls = fallback_calls.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .resolve_name_with_fallback("example.com", move |_| async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), &mut both_entered)
+        .await
+        .expect("both family exchanges entered");
+
+    let second_calls = fallback_calls.clone();
+    let second = tokio::spawn(async move {
+        service
+            .resolve_name_with_fallback("example.com", move |_| async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while flights.counters().waiters < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both family exchanges shared");
+    pool.release
+        .as_ref()
+        .expect("blocked rejection release")
+        .add_permits(2);
+
+    let errors = [
+        first
+            .await
+            .expect("first lookup task")
+            .expect_err("first rejection"),
+        second
+            .await
+            .expect("second lookup task")
+            .expect_err("shared rejection"),
+    ];
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    assert!(errors.iter().all(honk_outbound::proxy::is_packet_rejection));
+    assert_eq!(pool.counts(), [1, 1]);
+    assert!(
+        errors
+            .iter()
+            .all(|error| format!("{error:#}").contains("scripted packet rejection context"))
+    );
 }
 
 #[tokio::test]

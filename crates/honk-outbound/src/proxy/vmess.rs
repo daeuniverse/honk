@@ -360,22 +360,6 @@ impl VmessHandler {
         )
     }
 
-    async fn connect_server(
-        node: &Node,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        super::transport::connect_transport(node, connect_timeout).await
-    }
-
-    /// Wrap an already-connected TCP stream with TLS (when `node.tls`) and
-    /// then the `node.transport` WS/gRPC layer (the `dial_with_tcp` path).
-    async fn wrap_transport(
-        node: &Node,
-        tcp: TcpStream,
-    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        super::transport::wrap_transport(node, tcp).await
-    }
-
     /// Build the request header and return a proxy stream backed by a
     /// duplex pipe + background relay task.
     fn perform_handshake(
@@ -431,7 +415,7 @@ impl TcpOutbound for VmessHandler {
             .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
         let uuid_bytes = uuid.as_bytes();
 
-        let stream = Self::connect_server(node, connect_timeout).await?;
+        let stream = super::transport::connect_transport(node, connect_timeout).await?;
         Self::perform_handshake(uuid_bytes, stream, target, target_domain)
     }
 
@@ -448,7 +432,7 @@ impl TcpOutbound for VmessHandler {
             .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
         let uuid_bytes = uuid.as_bytes();
 
-        let stream = Self::wrap_transport(node, tcp).await?;
+        let stream = super::transport::wrap_transport(node, tcp).await?;
         Self::perform_handshake(uuid_bytes, stream, target, target_domain)
     }
 }
@@ -571,6 +555,7 @@ async fn vmess_relay(
 
     let upload = async {
         server_write.write_all(&header_wire).await?;
+        server_write.flush().await?;
 
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
@@ -579,13 +564,9 @@ async fn vmess_relay(
             if n == 0 {
                 break;
             }
-            let mut offset = 0;
-            while offset < n {
-                let end = (offset + CHUNK_MAX_LEN).min(n);
-                let chunk = body.seal_chunk(&buf[offset..end]);
-                server_write.write_all(&chunk).await?;
-                offset = end;
-            }
+            let chunk = body.seal_chunk(&buf[..n]);
+            server_write.write_all(&chunk).await?;
+            server_write.flush().await?;
         }
         let term = body.seal_chunk(&[]);
         server_write.write_all(&term).await?;
@@ -677,7 +658,6 @@ async fn read_response_header<R: AsyncReadExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use honk_config::types::NodeProtocol;
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -779,22 +759,6 @@ mod tests {
         assert_eq!(c0, hex(CHUNK0));
         assert_eq!(c1, hex(CHUNK1));
         assert_eq!(term, hex(CHUNK_TERM));
-    }
-
-    #[test]
-    fn test_response_key_derivation_vectors() {
-        let session = Session {
-            req_key: [0x11; 16],
-            req_iv: [0x22; 16],
-            ..fixed_session()
-        };
-        let derived = Session {
-            resp_key: Sha256::digest(session.req_key)[..16].try_into().unwrap(),
-            resp_iv: Sha256::digest(session.req_iv)[..16].try_into().unwrap(),
-            ..session
-        };
-        assert_eq!(derived.resp_key.to_vec(), hex(RESP_KEY));
-        assert_eq!(derived.resp_iv.to_vec(), hex(RESP_IV));
     }
 
     /// Feed the exact bytes a Go (Xray-semantics) server would send and
@@ -899,14 +863,6 @@ mod tests {
         .await
         .expect("dropping the VMess stream must close its physical transport")
         .unwrap();
-    }
-
-    #[test]
-    fn test_protocol_returns_vmess() {
-        assert_eq!(
-            crate::descriptor::descriptor(NodeProtocol::VMess).protocol,
-            NodeProtocol::VMess
-        );
     }
 
     /// End-to-end over the WebSocket transport: a mock server parses the

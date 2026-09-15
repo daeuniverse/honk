@@ -6,6 +6,7 @@ use base64::Engine as _;
 use honk_config::types::NodeProtocol;
 use sha2::{Digest as _, Sha256};
 
+mod admission;
 mod clash;
 
 fn parse_clash_subscription(
@@ -261,7 +262,7 @@ fn test_parse_subscription_keeps_unique_nodes_with_duplicates() {
 #[test]
 fn test_parse_subscription_keeps_valid_sibling_after_intrinsic_rejection() {
     let invalid = "vless://00000000-0000-4000-8000-000000000001@h:443?encryption=e&type=ws&sni=ws&flow=xudp#a";
-    let valid = "vless://00000000-0000-4000-8000-000000000001@h:443?type=ws&sni=u&path=ws&vless_mode=xudp#b";
+    let valid = "vless://00000000-0000-4000-8000-000000000001@h:443?type=ws&sni=u&path=ws&packetEncoding=xudp#b";
     let sub = Subscription {
         sub_type: SubscriptionType::Simple,
         ..Default::default()
@@ -588,184 +589,8 @@ async fn subscription_store_skips_rejected_legacy_candidates() {
     }
 }
 
-fn assert_c17_original_indices(
-    sub_type: SubscriptionType,
-    fixture: &str,
-    expected_indices: &[(usize, honk_config::diagnostic::Severity)],
-    expected_codes: &[&str],
-) {
-    let subscription = Subscription {
-        sub_type,
-        ..Subscription::default()
-    };
-    let mut diagnostics = Vec::new();
-    let nodes =
-        parse_subscription_content_with_diagnostics(&subscription, fixture, &mut diagnostics)
-            .unwrap();
-
-    assert_eq!(
-        nodes
-            .iter()
-            .map(|node| node.name.as_str())
-            .collect::<Vec<_>>(),
-        ["usable-proxy"]
-    );
-    assert_eq!(
-        diagnostics
-            .iter()
-            .map(|diagnostic| (diagnostic.entry_index, diagnostic.severity))
-            .collect::<Vec<_>>(),
-        expected_indices
-            .iter()
-            .map(|&(index, severity)| (Some(index), severity))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code)
-            .collect::<Vec<_>>(),
-        expected_codes
-    );
-    let rendered = diagnostics
-        .iter()
-        .map(|diagnostic| format!("{diagnostic:?}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!rendered.contains("secret.example"));
-    assert!(!rendered.contains("secret-password"));
-}
-
-#[test]
-fn c17_structured_adapters_retain_original_mixed_entry_indices() {
-    use honk_config::diagnostic::Severity;
-
-    assert_c17_original_indices(
-        SubscriptionType::Simple,
-        include_str!("../../tests/fixtures/c17-mixed-structured.json"),
-        &[
-            (1, Severity::Info),
-            (2, Severity::Warning),
-            (3, Severity::Warning),
-            (4, Severity::Warning),
-        ],
-        &[
-            "subscription-profile-entry",
-            "malformed-subscription-entry",
-            "unsupported-subscription-entry",
-            "malformed-subscription-entry",
-        ],
-    );
-    assert_c17_original_indices(
-        SubscriptionType::Sip008,
-        include_str!("../../tests/fixtures/c17-mixed-sip008.json"),
-        &[(1, Severity::Warning), (2, Severity::Warning)],
-        &[
-            "malformed-subscription-entry",
-            "malformed-subscription-entry",
-        ],
-    );
-    assert_c17_original_indices(
-        SubscriptionType::Clash,
-        include_str!("../../tests/fixtures/c17-mixed-clash.json"),
-        &[
-            (1, Severity::Warning),
-            (2, Severity::Warning),
-            (3, Severity::Warning),
-            (4, Severity::Warning),
-        ],
-        &[
-            "unsupported-subscription-entry",
-            "malformed-subscription-entry",
-            "unsupported-subscription-entry",
-            "malformed-subscription-entry",
-        ],
-    );
-}
-
-#[test]
-fn c18_physical_lines_and_decoded_parent_survive() {
-    use honk_config::diagnostic::Severity;
-    for (body, profile, unsupported) in [
-        (include_str!("../../tests/fixtures/c18-uri-lines.txt"), 3, 4),
-        (
-            include_str!("../../tests/fixtures/c18-record-lines.txt"),
-            3,
-            6,
-        ),
-    ] {
-        for encoded in [false, true] {
-            let content = if encoded {
-                base64::engine::general_purpose::STANDARD.encode(body)
-            } else {
-                body.to_string()
-            };
-            let mut diagnostics = Vec::new();
-            let nodes = parse_subscription_content_with_diagnostics(
-                &Subscription::default(),
-                &content,
-                &mut diagnostics,
-            )
-            .unwrap();
-            assert_eq!(nodes[0].name, "usable");
-            assert_eq!(
-                diagnostics
-                    .iter()
-                    .map(|d| (d.line, d.severity))
-                    .collect::<Vec<_>>(),
-                [
-                    (Some(profile), Severity::Info),
-                    (Some(unsupported), Severity::Warning)
-                ]
-            );
-            assert_eq!(diagnostics[1].entry_index, Some(unsupported));
-            assert_eq!(diagnostics[1].code, "unsupported-subscription-entry");
-            let source = &diagnostics[1].source;
-            assert_eq!(source.index(), usize::from(encoded));
-            assert_eq!(
-                source.sources().metadata()[source.index()].parent,
-                encoded.then_some(0)
-            );
-            assert!(diagnostics.iter().all(|d| d.span.is_none()));
-        }
-    }
-}
-
 const C19_PARTIAL: &str = include_str!("../../tests/fixtures/c19-partial-body.txt");
 const C19_INVALID: &str = include_str!("../../tests/fixtures/c19-invalid-body.txt");
-
-#[test]
-fn c19_body_acceptance_retains_first_usable_and_failure_diagnostics() {
-    let sub = Subscription::default();
-    let mut diagnostics = Vec::new();
-    let nodes =
-        parse_subscription_content_with_diagnostics(&sub, C19_PARTIAL, &mut diagnostics).unwrap();
-    assert_eq!(
-        nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
-        ["first"]
-    );
-    assert_eq!(
-        diagnostics
-            .iter()
-            .map(|d| d.entry_index)
-            .collect::<Vec<_>>(),
-        [Some(1), Some(3)]
-    );
-    assert_eq!(diagnostics[1].related_indices, [2]);
-    let prefix = diagnostics.clone();
-    assert!(
-        parse_subscription_content_with_diagnostics(&sub, C19_INVALID, &mut diagnostics).is_err()
-    );
-    assert_eq!(&diagnostics[..prefix.len()], &prefix);
-    assert_eq!(
-        diagnostics[prefix.len()..]
-            .iter()
-            .filter(|d| !d.terminal)
-            .count(),
-        2
-    );
-    assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
-}
 
 #[tokio::test]
 async fn c19_store_acceptance_is_independent_of_runtime_publication() {
@@ -897,85 +722,4 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
     let error = result.unwrap_err();
     let error = error.downcast_ref::<DetailedConfigError>().unwrap();
     assert_eq!(error.diagnostic.as_ref(), &diagnostics[0]);
-}
-
-#[test]
-fn profile_diagnostic_budget_preserves_nodes_and_caller_prefix() {
-    let sub = Subscription::default();
-    let mut diagnostics = Vec::new();
-    parse_subscription_content_with_diagnostics(&sub, "STATUS=prefix", &mut diagnostics)
-        .unwrap_err();
-    let prefix = diagnostics.clone();
-    let body = format!(
-        "[General]\n{}[Proxy]\nfirst = socks5, 127.0.0.1, 1080\nsecond = socks5, 127.0.0.1, 1080\n",
-        "x\n".repeat(4096),
-    );
-    let nodes = parse_subscription_content_with_diagnostics(&sub, &body, &mut diagnostics).unwrap();
-    assert_eq!(
-        nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
-        ["first"]
-    );
-    assert_eq!(&diagnostics[..prefix.len()], &prefix);
-    let retained = &diagnostics[prefix.len()..];
-    assert!(
-        retained.len() <= 129,
-        "retained {} diagnostics",
-        retained.len()
-    );
-    assert_eq!(retained[0].line, Some(2));
-    assert_eq!(
-        retained.last().unwrap().code,
-        "subscription-diagnostics-truncated"
-    );
-    assert!(!retained.iter().any(|d| d.terminal));
-}
-
-#[test]
-fn uri_diagnostic_budget_preserves_late_valid_node() {
-    let body = format!(
-        "{}socks5://127.0.0.1:1080#survivor\n",
-        "unknown://host:1234\n".repeat(256)
-    );
-    let mut diagnostics = Vec::new();
-    let nodes = parse_subscription_content_with_diagnostics(
-        &Subscription::default(),
-        &body,
-        &mut diagnostics,
-    )
-    .unwrap();
-    assert_eq!(
-        nodes
-            .iter()
-            .map(|node| node.name.as_str())
-            .collect::<Vec<_>>(),
-        ["survivor"]
-    );
-    assert!(diagnostics.len() <= 129);
-    assert_eq!(
-        diagnostics.last().unwrap().code,
-        "subscription-diagnostics-truncated"
-    );
-}
-
-#[test]
-fn truncated_all_invalid_body_keeps_terminal_failure() {
-    let body = "unknown://host:1234\n".repeat(256);
-    let mut diagnostics = Vec::new();
-    assert!(
-        parse_subscription_content_with_diagnostics(
-            &Subscription::default(),
-            &body,
-            &mut diagnostics,
-        )
-        .is_err()
-    );
-    assert!(diagnostics.len() <= 130);
-    assert_eq!(
-        diagnostics
-            .iter()
-            .filter(|diagnostic| !diagnostic.terminal)
-            .count(),
-        129
-    );
-    assert!(diagnostics.last().unwrap().terminal);
 }

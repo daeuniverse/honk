@@ -124,6 +124,9 @@ fn protocol_from_name(proxy_type: &str) -> Result<NodeProtocol, &'static str> {
 fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     let proxy_type = yaml_text_alias(mapping, &["type"])?.ok_or("proxy type is missing")?;
     let protocol = protocol_from_name(&proxy_type)?;
+    if protocol == NodeProtocol::VLess && yaml_value(mapping, "vless_mode").is_some() {
+        return Err("VLESS vless_mode was removed");
+    }
 
     reject_active_unless(
         mapping,
@@ -331,7 +334,13 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.flow = optional_flow(flow.as_deref())
                 .map_err(|_| "VLESS flow is unsupported")?
                 .map(str::to_owned);
-            config.mode = options::parse_vless_external_mode(mapping)?;
+            let (udp_encoding, multiplex, udp_enabled) =
+                options::parse_vless_external_options(mapping)?;
+            config.udp_encoding = udp_encoding;
+            config.multiplex = multiplex;
+            if !udp_enabled {
+                config.network = Some("tcp".into());
+            }
         }
         OutboundConfig::Hysteria2(config) => {
             config.auth = yaml_text_alias(mapping, &["auth"])?.or(password);
@@ -697,6 +706,9 @@ pub(super) fn parse_clash_proxy(
     apply_stream(mapping, &mut node, udp)?;
     apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
     apply_quic(mapping, &mut node)?;
+    if let Some(config) = node.vless_mut() {
+        config.normalize();
+    }
     validate_imported_node(&node)?;
     node.validate()
         .map_err(|_| "invalid imported node protocol settings")?;

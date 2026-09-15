@@ -218,7 +218,8 @@ fn layered_failure_value(ages: [Option<Duration>; 3]) -> f64 {
     score_snapshot(&inner, "score", &context, node.id, now).failures
 }
 
-fn assert_aged_failure_layers_count_once() {
+#[test]
+fn layered_failure_freshness_uses_one_envelope() {
     // Given: the same 30-second-old failure appears in overlapping layers.
     let age = Some(Duration::from_secs(30));
 
@@ -275,11 +276,7 @@ fn assert_aged_failure_layers_count_once() {
 }
 
 #[test]
-fn layered_failure_freshness_uses_one_envelope() {
-    assert_aged_failure_layers_count_once();
-}
-
-fn assert_larger_specific_failure_layer_still_wins() {
+fn specific_failure_freshness_is_not_hidden() {
     // Given: global, family, and exact evidence are respectively 30, 20, and 10 seconds old.
     let global = evidence_decay(Duration::from_secs(30));
     let family = evidence_decay(Duration::from_secs(20));
@@ -297,11 +294,6 @@ fn assert_larger_specific_failure_layer_still_wins() {
 
     // Then: the freshest specific layer is the effective envelope.
     assert_close(effective, exact);
-}
-
-#[test]
-fn specific_failure_freshness_is_not_hidden() {
-    assert_larger_specific_failure_layer_still_wins();
 }
 
 #[test]
@@ -401,13 +393,12 @@ fn throughput_ignores_bursts_and_pools_dominant_direction() {
         now,
         &sample(10_000_000, 1, Duration::from_millis(999)),
         true,
-        1,
     );
-    stats.record_finish(now, &sample(65_535, 1, Duration::from_secs(2)), true, 2);
+    stats.record_finish(now, &sample(65_535, 1, Duration::from_secs(2)), true);
     assert_close(stats.throughput_windows, 0.0);
 
-    stats.record_finish(now, &sample(65_536, 1, Duration::from_secs(1)), true, 3);
-    stats.record_finish(now, &sample(1, 131_072, Duration::from_secs(3)), true, 4);
+    stats.record_finish(now, &sample(65_536, 1, Duration::from_secs(1)), true);
+    stats.record_finish(now, &sample(1, 131_072, Duration::from_secs(3)), true);
 
     assert_close(stats.throughput_bytes, 196_608.0);
     assert_close(stats.throughput_seconds, 4.0);
@@ -499,7 +490,6 @@ fn evidence_half_life_decays_every_historical_field() {
         throughput_windows: 4.0,
         fail_streak: 0,
         explore_not_before: None,
-        last_used: 9,
         updated_at: Some(start),
         selected_at: 0,
     };
@@ -519,7 +509,6 @@ fn evidence_half_life_decays_every_historical_field() {
     assert_close(stats.throughput_seconds, 5.0);
     assert_close(stats.throughput_windows, 2.0);
     assert_eq!(stats.incarnation, 7);
-    assert_eq!(stats.last_used, 9);
 }
 
 #[test]

@@ -20,7 +20,7 @@ mod resources {
     #[async_trait]
     pub(crate) trait RuntimeTransport: Send + Sync {
         async fn close(&self);
-        fn reap_tls_connectors(&self, _now: std::time::Instant) -> usize {
+        fn reap_idle_resources(&self, _now: std::time::Instant) -> usize {
             0
         }
     }
@@ -31,8 +31,8 @@ mod resources {
             UpstreamPool::close(self).await;
         }
 
-        fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
-            UpstreamPool::reap_tls_connectors(self, now)
+        fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
+            UpstreamPool::reap_idle_resources(self, now)
         }
     }
 }
@@ -144,8 +144,8 @@ impl DnsRuntime {
         &self.parts.routing_projection
     }
 
-    pub(crate) fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
-        self.parts.transport.reap_tls_connectors(now)
+    pub(crate) fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
+        self.parts.transport.reap_idle_resources(now)
     }
 
     pub(crate) fn cache(&self) -> Arc<tokio::sync::Mutex<super::cache::DnsCache>> {

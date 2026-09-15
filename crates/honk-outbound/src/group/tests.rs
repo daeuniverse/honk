@@ -3,21 +3,6 @@ use super::*;
 mod udp_selection;
 
 #[test]
-fn direct_selector_fast_path_preserves_first_member_selection() {
-    let a = make_node(nid("a"), "a");
-    let b = make_node(nid("b"), "b");
-    let group = make_group("selector", GroupPolicy::Selector, vec![a.id, b.id]);
-    let manager = GroupManager::new(&[group], &[a, b]);
-    assert_eq!(
-        manager
-            .select_node_for_domain("selector", ProbeDomain::Tcp, IpVersion::V4)
-            .expect("direct selector must choose first member")
-            .name,
-        "a"
-    );
-}
-
-#[test]
 fn direct_selector_plan_fast_path_preserves_choice_default_and_health() {
     let a = make_node(nid("plan-a"), "plan-a");
     let b = make_node(nid("plan-b"), "plan-b");
@@ -157,7 +142,6 @@ fn selector_tcp_last_resort_cannot_escape_an_empty_selected_subgroup() {
         );
     }
 }
-use chrono::Utc;
 
 fn nid(name: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes())
@@ -173,20 +157,11 @@ fn make_node(id: uuid::Uuid, name: &str) -> Node {
 
 fn make_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) -> Group {
     Group {
-        id: uuid::Uuid::new_v4(),
         name: name.into(),
         policy,
         nodes: ids,
-        filters: vec![],
-        groups: vec![],
-        default: None,
-        final_outbound: None,
-        check_url: None,
-        check_interval: None,
         tolerance: 50,
-        idle_timeout: None,
-        interrupt_connections: false,
-        created_at: Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -273,15 +248,28 @@ fn selector_default_filtered_by_health_refuses() {
 }
 
 #[test]
-fn selector_warm_node_keeps_configured_dead_leaf_and_resolves_nested_choice() {
+fn selector_warm_node_keeps_dead_nested_choice_and_cold_fallback() {
     let (a, b) = (nid("warm-a"), nid("warm-b"));
     let nodes = vec![make_node(a, "warm-a"), make_node(b, "warm-b")];
     let mut child = make_group("warm-child", GroupPolicy::Selector, vec![a, b]);
     child.default = Some("warm-b".into());
     let parent = make_subgroup("warm-parent", GroupPolicy::Selector, &["warm-child"]);
+    let cold = make_group("warm-cold", GroupPolicy::URLTest, vec![a, b]);
+    let cold_parent = make_subgroup("warm-cold-parent", GroupPolicy::Selector, &["warm-cold"]);
     let alive = Arc::new(AliveDialerSet::new());
-    let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(alive.clone()));
+    let manager = GroupManager::with_alive_set(
+        &[child, parent, cold, cold_parent],
+        &nodes,
+        Some(alive.clone()),
+    );
 
+    assert_eq!(
+        manager
+            .selector_warm_node("warm-parent")
+            .map(|node| node.id),
+        Some(b),
+        "nested selector defaults resolve within their own membership"
+    );
     manager.set_selector_choice("warm-child", "warm-a");
     alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(
@@ -290,6 +278,50 @@ fn selector_warm_node_keeps_configured_dead_leaf_and_resolves_nested_choice() {
             .map(|node| node.id),
         Some(a),
         "warm ownership retains the configured leaf despite failed health"
+    );
+    assert_eq!(
+        manager
+            .selector_warm_node("warm-cold-parent")
+            .map(|node| node.id),
+        Some(b),
+        "a cold nested policy falls back to its next production leaf"
+    );
+}
+
+#[test]
+fn selector_warm_node_keeps_duplicate_name_member_identity() {
+    let left = make_node(nid("warm-left"), "shared");
+    let right = make_node(nid("warm-right"), "shared");
+    let left_group = make_group("warm-left-group", GroupPolicy::Selector, vec![left.id]);
+    let right_group = make_group("warm-right-group", GroupPolicy::Selector, vec![right.id]);
+    let mut left_parent = make_subgroup(
+        "warm-left-parent",
+        GroupPolicy::Selector,
+        &["warm-left-group"],
+    );
+    left_parent.default = Some("warm-left-group".into());
+    let mut right_parent = make_subgroup(
+        "warm-right-parent",
+        GroupPolicy::Selector,
+        &["warm-right-group"],
+    );
+    right_parent.default = Some("warm-right-group".into());
+    let manager = GroupManager::new(
+        &[left_group, right_group, left_parent, right_parent],
+        &[left.clone(), right.clone()],
+    );
+
+    assert_eq!(
+        manager
+            .selector_warm_node("warm-left-parent")
+            .map(|node| node.id),
+        Some(left.id)
+    );
+    assert_eq!(
+        manager
+            .selector_warm_node("warm-right-parent")
+            .map(|node| node.id),
+        Some(right.id)
     );
 }
 
@@ -302,14 +334,6 @@ fn test_not_found() {
 }
 
 #[test]
-fn test_selector_choice_get_set() {
-    let m = GroupManager::new(&[], &[]);
-    assert!(m.get_selector_choice("g").is_none());
-    m.set_selector_choice("g", "node1");
-    assert_eq!(m.get_selector_choice("g"), Some("node1".into()));
-}
-
-#[test]
 fn test_urltest_selection() {
     let n = nid("a");
     let nodes = vec![make_node(n, "a")];
@@ -317,21 +341,6 @@ fn test_urltest_selection() {
     let selected = m.select_node("g").unwrap();
     assert_eq!(selected.id, n);
     assert_eq!(m.get_urltest_selection("g"), Some("a".into()));
-}
-
-#[test]
-fn test_group_policy() {
-    let n = nid("a");
-    let nodes = vec![make_node(n, "a")];
-    let m = GroupManager::new(
-        &[
-            make_group("sel", GroupPolicy::Selector, vec![n]),
-            make_group("url", GroupPolicy::URLTest, vec![n]),
-        ],
-        &nodes,
-    );
-    assert_eq!(m.get_group_policy("sel"), Some(GroupPolicy::Selector));
-    assert_eq!(m.get_group_policy("url"), Some(GroupPolicy::URLTest));
 }
 
 #[test]
@@ -346,41 +355,6 @@ fn test_node_names_in_group() {
     assert_eq!(names.len(), 2);
     assert!(names.contains(&"a".to_string()));
     assert!(names.contains(&"b".to_string()));
-}
-
-#[test]
-fn test_idle_default() {
-    let n = nid("a");
-    let nodes = vec![make_node(n, "a")];
-    // No idle_timeout → never idle
-    let m = GroupManager::new(&[make_group("g", GroupPolicy::Selector, vec![n])], &nodes);
-    assert!(!m.is_group_idle("g"));
-}
-
-#[test]
-fn test_idle_with_timeout() {
-    let n = nid("a");
-    let nodes = vec![make_node(n, "a")];
-    let mut group = make_group("g", GroupPolicy::Selector, vec![n]);
-    group.idle_timeout = Some(1);
-    let m = GroupManager::new(&[group], &nodes);
-    // Never used → idle.
-    assert!(m.is_group_idle("g"));
-    m.select_node("g");
-    assert!(!m.is_group_idle("g"));
-    std::thread::sleep(Duration::from_secs(1));
-    assert!(m.is_group_idle("g"));
-}
-
-#[test]
-fn test_final_outbound() {
-    let n = nid("a");
-    let nodes = vec![make_node(n, "a")];
-    let mut group = make_group("g", GroupPolicy::Selector, vec![n]);
-    group.final_outbound = Some("direct".into());
-    let m = GroupManager::new(&[group], &nodes);
-    assert_eq!(m.get_final_outbound("g"), Some("direct".into()));
-    assert_eq!(m.get_final_outbound("nope"), None);
 }
 
 #[test]
@@ -605,7 +579,7 @@ fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
 }
 
 #[test]
-fn urltest_retry_candidates_deduplicate_shared_nested_leaves_before_cap() {
+fn urltest_retry_plan_deduplicates_shared_nested_leaves_before_cap() {
     let (a, b) = (nid("retry-a"), nid("retry-b"));
     let nodes = vec![make_node(a, "retry-a"), make_node(b, "retry-b")];
     let groups = vec![
@@ -629,11 +603,14 @@ fn urltest_retry_candidates_deduplicate_shared_nested_leaves_before_cap() {
         Duration::from_millis(20),
     );
     let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive));
+    let context =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
 
     let retry_ids: Vec<_> = manager
-        .urltest_retry_candidates("retry", ProbeDomain::Tcp, IpVersion::V4)
+        .urltest_retry_plan_for_target("retry", &context)
+        .entries
         .into_iter()
-        .map(|node| node.id)
+        .map(|entry| entry.node.id)
         .collect();
     assert_eq!(retry_ids, vec![a, b]);
 }

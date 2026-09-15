@@ -152,8 +152,8 @@ async fn synack_deadline_is_tracked_per_stream() {
     );
 }
 
-/// Each open gets its own full deadline: acknowledging an earlier stream
-/// must not leave a later stream on the earlier one's clock.
+/// Each reused open gets its own full deadline: acknowledging one stream must
+/// neither reset it nor shorten a later stream's deadline.
 #[tokio::test(start_paused = true)]
 async fn synack_deadlines_do_not_share_elapsed_time() {
     let (session, mut server) = establish_test_session("127.0.0.1:443").await;
@@ -162,57 +162,71 @@ async fn synack_deadlines_do_not_share_elapsed_time() {
         .await
         .unwrap();
     tokio::task::yield_now().await;
+    assert!(session.peer_supports_synack.load(Ordering::Acquire));
 
-    let second = session
+    let _first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        read_frame(&mut server).await.unwrap();
+    }
+
+    let mut acknowledged = session
         .open_stream_direct(
             vec![0x01, 2, 2, 2, 2, 0, 80],
             session.try_reserve().unwrap(),
         )
         .await
         .unwrap();
-    read_frame(&mut server).await.unwrap();
-    read_frame(&mut server).await.unwrap();
-    tokio::task::yield_now().await;
+    for _ in 0..2 {
+        read_frame(&mut server).await.unwrap();
+    }
+    assert!(acknowledged.sid >= 2);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let _third = session
+    let mut unanswered = session
         .open_stream_direct(
             vec![0x01, 3, 3, 3, 3, 0, 80],
             session.try_reserve().unwrap(),
         )
         .await
         .unwrap();
-    let third_sid = _third.sid;
-    read_frame(&mut server).await.unwrap();
-    read_frame(&mut server).await.unwrap();
-    tokio::task::yield_now().await;
+    assert!(unanswered.sid >= 2);
+    for _ in 0..2 {
+        read_frame(&mut server).await.unwrap();
+    }
 
     tokio::time::advance(Duration::from_millis(500)).await;
-    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+    write_frame(&mut server, CMD_SYNACK, acknowledged.sid, &[])
         .await
         .unwrap();
-    tokio::task::yield_now().await;
+    write_frame(&mut server, CMD_PSH, acknowledged.sid, b"acknowledged")
+        .await
+        .unwrap();
+    let mut reply = [0; 12];
+    acknowledged.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"acknowledged");
 
-    // 1.6s past the second stream's deadline, but only 2.1s into the third's.
     tokio::time::advance(Duration::from_millis(1600)).await;
-    tokio::task::yield_now().await;
     assert!(
-        !session.is_closed(),
-        "the third stream keeps its own full deadline"
+        tokio::time::timeout(Duration::from_millis(1), unanswered.read(&mut [0; 1]))
+            .await
+            .is_err(),
+        "the later open keeps its own full deadline"
     );
 
-    tokio::time::advance(SYNACK_TIMEOUT).await;
+    tokio::time::advance(Duration::from_millis(1000)).await;
     tokio::task::yield_now().await;
-    // The third stream's own deadline fires; the session kept receiving
-    // frames (the second stream's SYNACK), so only the stream is reset.
-    assert!(
-        !session.is_closed(),
-        "an active session survives a single unanswered open"
-    );
-    assert!(
-        !session.synack_pending.lock().sids.contains_key(&third_sid),
-        "the third stream's deadline entry is consumed"
-    );
+    let error = tokio::time::timeout(Duration::from_millis(100), unanswered.read(&mut [0; 1]))
+        .await
+        .expect("acknowledging another stream must not reset this deadline")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!session.is_closed());
 }
 
 /// A live session that never acknowledges one open (the server's own target
@@ -313,38 +327,55 @@ async fn dropped_unanswered_stream_cancels_its_synack_deadline() {
     );
 }
 
-/// A SYNACK that arrives while the SYN is still queued must settle the open:
-/// registering at queue time means the wire-time arm finds nothing to do.
+/// A SYNACK received while a reused stream's SYN is physically queued settles
+/// that open before the writer later arms its deadline.
 #[tokio::test(start_paused = true)]
 async fn synack_before_wire_write_settles_the_open() {
-    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    let (session, mut server) = establish_test_session_with_capacity("127.0.0.1:443", 64).await;
     expect_handshake(&mut server).await;
     write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
         .await
         .unwrap();
     tokio::task::yield_now().await;
+    assert!(session.peer_supports_synack.load(Ordering::Acquire));
 
-    let second = session
+    let mut first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        read_frame(&mut server).await.unwrap();
+    }
+    first.write_all(&vec![0x5a; 1024]).await.unwrap();
+    tokio::task::yield_now().await;
+
+    let mut reused = session
         .open_stream_direct(
             vec![0x01, 2, 2, 2, 2, 0, 80],
             session.try_reserve().unwrap(),
         )
         .await
         .unwrap();
-    // ACK before the writer has written the SYN.
-    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+    assert!(reused.sid >= 2);
+    write_frame(&mut server, CMD_SYNACK, reused.sid, &[])
         .await
         .unwrap();
     tokio::task::yield_now().await;
-    // Now let the writer put the SYN on the wire.
-    read_frame(&mut server).await.unwrap();
-    read_frame(&mut server).await.unwrap();
-    tokio::task::yield_now().await;
+
+    let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, sid, data.len()), (CMD_PSH, first.sid, 1024));
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
 
     tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
-    tokio::task::yield_now().await;
-    assert!(
-        !session.is_closed(),
-        "an early SYNACK must not strand a never-armed deadline"
-    );
+    write_frame(&mut server, CMD_PSH, reused.sid, b"open")
+        .await
+        .unwrap();
+    let mut reply = [0; 4];
+    reused.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"open");
+    assert!(!session.is_closed());
 }

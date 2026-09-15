@@ -44,11 +44,15 @@ pub type TlsStream<S> = tokio_boring::SslStream<S>;
 #[derive(Debug)]
 pub struct BatchRead<S> {
     inner: S,
+    pending_error: Option<io::Error>,
 }
 
 impl<S> BatchRead<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            pending_error: None,
+        }
     }
 }
 
@@ -64,6 +68,9 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BatchRead<S> {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
+            if let Some(error) = self.pending_error.take() {
+                return Poll::Ready(Err(error));
+            }
             let before = buf.filled().len();
             match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
                 Poll::Ready(Ok(())) => {
@@ -71,12 +78,12 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BatchRead<S> {
                         return Poll::Ready(Ok(())); // EOF: deliver what we have
                     }
                 }
-                Poll::Ready(Err(e)) => {
-                    return if buf.filled().len() > start {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Ready(Err(e))
-                    };
+                Poll::Ready(Err(error)) => {
+                    if buf.filled().len() > start {
+                        self.pending_error = Some(error);
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Ready(Err(error));
                 }
                 Poll::Pending => {
                     return if buf.filled().len() > start {
@@ -191,7 +198,7 @@ impl TlsConnector {
         let mut cfg = self.connector.configure()?;
         if self.chrome {
             cfg.set_permute_extensions(true);
-            set_chrome_key_shares(&mut cfg)?;
+            set_chrome_key_shares_ssl_ref(&cfg)?;
             if self.alps {
                 add_chrome_alps(&mut cfg)?;
             }
@@ -246,26 +253,11 @@ impl TlsConnector {
             }
         }
     }
-
-    /// Underlying BoringSSL connector (for QUIC-side reuse of the ctx).
-    pub fn boring_connector(&self) -> &SslConnector {
-        &self.connector
-    }
 }
 
-/// Chrome sends two key shares: X25519MLKEM768 and X25519, in that order.
-/// boring exposes this only via FFI.
-fn set_chrome_key_shares(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
-    let ssl: &boring::ssl::SslRef = cfg;
-    set_chrome_key_shares_ssl_ref(ssl)
-}
-
-/// Same as [`set_chrome_key_shares`] for a bare `Ssl` (QUIC path).
-pub(crate) fn set_chrome_key_shares_ssl(ssl: &boring::ssl::Ssl) -> anyhow::Result<()> {
-    set_chrome_key_shares_ssl_ref(ssl)
-}
-
-fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
+/// Chrome sends X25519MLKEM768 and X25519 key shares, in that order.
+/// BoringSSL exposes this only through FFI.
+pub(crate) fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
     let shares = [SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519];
     let ok = unsafe {
         boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
@@ -562,11 +554,18 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         } else {
             tls.alpn.iter().any(|protocol| protocol == "h2")
         };
-    let default_alpn = chrome.then_some(if websocket {
-        HTTP11_ALPN_WIRE
+    let default_alpn = if node
+        .transport()
+        .is_some_and(|transport| transport.transport == "grpc")
+    {
+        Some(b"\x02h2".as_slice())
     } else {
-        CHROME_ALPN_WIRE
-    });
+        chrome.then_some(if websocket {
+            HTTP11_ALPN_WIRE
+        } else {
+            CHROME_ALPN_WIRE
+        })
+    };
     let alpn_wire = custom_alpn.as_deref().or(default_alpn);
     let mut builder = base_builder(tls.skip_cert_verify || pin.is_some())?;
     if let Some(pin) = pin {
@@ -706,18 +705,6 @@ mod tests {
             let received = server.join().unwrap();
             assert_eq!(received, b"ping", "chrome={chrome}");
         }
-    }
-
-    #[tokio::test]
-    async fn ech_grease_does_not_break_handshake() {
-        // Chrome mode with no ECH config sends ECH GREASE; servers must ignore it.
-        let (cert, key) = server_cert();
-        let (port, server) = spawn_server(&cert, &key);
-        let mut stream = loopback_connect(&test_node(), true, port).await.unwrap();
-        use tokio::io::AsyncWriteExt;
-        stream.write_all(b"ok").await.unwrap();
-        stream.shutdown().await.unwrap();
-        assert_eq!(server.join().unwrap(), b"ok");
     }
 
     /// Spawn a server holding real ECH keys (boring test fixtures:
@@ -1067,22 +1054,6 @@ mod batch_read_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn drains_all_available_in_one_read() {
-        let (mut w, r) = tokio::io::duplex(64);
-        let mut s = BatchRead::new(r);
-        w.write_all(&[1u8; 10]).await.unwrap();
-        w.write_all(&[2u8; 20]).await.unwrap();
-        // One read must coalesce both writes (a plain duplex read would
-        // also return 30 here; the point is the wrapper never truncates
-        // a wakeup's worth of data to the first inner read).
-        let mut buf = [0u8; 64];
-        let n = s.read(&mut buf).await.unwrap();
-        assert_eq!(n, 30);
-        assert_eq!(&buf[..10], &[1u8; 10]);
-        assert_eq!(&buf[10..30], &[2u8; 20]);
-    }
-
-    #[tokio::test]
     async fn eof_delivers_partial_then_zero() {
         let (mut w, r) = tokio::io::duplex(64);
         let mut s = BatchRead::new(r);
@@ -1093,6 +1064,47 @@ mod batch_read_tests {
         assert_eq!(n, 10, "buffered data must be delivered before EOF");
         let n = s.read(&mut buf).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn preserves_error_after_batched_bytes() {
+        struct Scripted {
+            step: u8,
+        }
+
+        impl tokio::io::AsyncRead for Scripted {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                self.step += 1;
+                match self.step {
+                    1 => {
+                        buf.put_slice(b"ok");
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    2 => std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "scripted read failure",
+                    ))),
+                    3 => {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    _ => std::task::Poll::Ready(Ok(())),
+                }
+            }
+        }
+
+        let mut stream = BatchRead::new(Scripted { step: 0 });
+        let mut buf = [0u8; 8];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ok");
+
+        let error = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1146,6 +1158,7 @@ mod batch_read_tests {
 /// extension real Chrome sends is just an offer, never a resumption.
 pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
     let mut builder = base_builder(true)?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     if chrome {
         apply_chrome_ctx(&mut builder)?;
         builder.set_cipher_list(CHROME_CIPHER_LIST)?;

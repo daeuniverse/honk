@@ -19,6 +19,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use honk_config::node::Node;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -44,6 +45,13 @@ pub(crate) async fn wrap_transport(
     tcp: TcpStream,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let stream = maybe_tls_wrap(node, tcp).await?;
+    wrap_after_tls(node, stream).await
+}
+
+pub(crate) async fn wrap_after_tls(
+    node: &Node,
+    stream: Box<dyn AsyncReadWrite>,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     match node.transport().unwrap().transport.as_str() {
         "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,
@@ -262,9 +270,8 @@ struct GrpcStream {
     /// DATA-frame payloads awaiting message parsing; a message may span
     /// multiple DATA frames.
     msg_buf: Vec<u8>,
-    /// Outbound bytes not yet fully written; short writes keep the rest
-    /// queued instead of losing half a frame.
-    write_queue: std::collections::VecDeque<u8>,
+    /// Outbound frames owned until the inner transport consumes them.
+    write_queue: VecDeque<u8>,
     /// Client→server flow-control windows (RFC 7540 §6.9): the server's
     /// advertised initial stream window plus WINDOW_UPDATE increments,
     /// minus queued DATA payload bytes.
@@ -277,9 +284,6 @@ struct GrpcStream {
     peer_max_frame: usize,
     /// DATA payload bytes received since the last WINDOW_UPDATE top-up.
     recv_unacked: u32,
-    /// A poll_write chunk accepted into `write_queue` but not yet fully
-    /// flushed; reported to the caller only once the drain completes.
-    pending_accepted: Option<usize>,
     /// SETTINGS ACKs / WINDOW_UPDATEs sit in `write_queue`; the read path
     /// flushes them while downloading so a pure receiver never stalls.
     control_pending: bool,
@@ -314,9 +318,8 @@ const H2_DEFAULT_MAX_FRAME: usize = 16384;
 /// far below the advertised ~2 GiB window, so the top-up frames are
 /// always flushed by ongoing reads long before the peer could stall.
 const H2_WINDOW_REFRESH: u32 = 8 * 1024 * 1024;
-/// poll_write waits for at least this much send window, keeping tiny
-/// sliver frames off the wire.
-const H2_MIN_WRITE_WINDOW: i64 = 1024;
+/// gRPC prefix plus protobuf tag and the one-byte varint for one payload byte.
+const GRPC_MESSAGE_OVERHEAD_MIN: usize = 7;
 
 /// Encode an uncompressed HPACK string length (RFC 7541 §5.1).
 fn push_hpack_string_length(hpack: &mut Vec<u8>, length: usize) {
@@ -348,13 +351,12 @@ impl GrpcStream {
             read_buf: Vec::new(),
             undecoded: Vec::new(),
             msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
+            write_queue: VecDeque::new(),
             send_stream_window: H2_DEFAULT_WINDOW,
             send_conn_window: H2_DEFAULT_WINDOW,
             peer_initial_window: H2_DEFAULT_WINDOW,
             peer_max_frame: H2_DEFAULT_MAX_FRAME,
             recv_unacked: 0,
-            pending_accepted: None,
             control_pending: false,
             stream_eof: false,
             end_stream_sent: false,
@@ -438,24 +440,16 @@ impl GrpcStream {
         hpack.push(4); // "honk" len
         hpack.extend_from_slice(b"honk");
 
-        let payload_len = hpack.len() as u32;
-        let frame_header: [u8; 9] = [
-            (payload_len >> 16) as u8,
-            (payload_len >> 8) as u8,
-            payload_len as u8,
+        let mut frame = Vec::with_capacity(9 + hpack.len());
+        push_frame_header(
+            &mut frame,
+            hpack.len() as u32,
             H2_HEADERS,
-            // gRPC is bidirectional streaming: DATA frames follow, so the
-            // HEADERS frame must NOT carry END_STREAM (servers reject
-            // writes on a client-closed stream with 400).
             H2_FLAG_END_HEADERS,
-            ((self.stream_id >> 24) & 0x7F) as u8,
-            (self.stream_id >> 16) as u8,
-            (self.stream_id >> 8) as u8,
-            self.stream_id as u8,
-        ];
-
-        self.inner.write_all(&frame_header).await?;
-        self.inner.write_all(&hpack).await?;
+            self.stream_id,
+        );
+        frame.extend_from_slice(&hpack);
+        self.inner.write_all(&frame).await?;
         self.inner.flush().await?;
         Ok(())
     }
@@ -631,11 +625,12 @@ impl GrpcStream {
         self.control_pending = true;
     }
 
-    /// Drive inbound frames until the send window allows another DATA
-    /// frame; Pending when the socket would block (the waker is armed on
-    /// the read side, so an arriving WINDOW_UPDATE re-polls the writer).
+    /// Drive inbound frames until the send window fits at least one application
+    /// byte and its gRPC/protobuf envelope. Pending arms the read-side waker for
+    /// the WINDOW_UPDATE or SETTINGS change that can make progress.
     fn poll_send_window(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        while self.send_stream_window.min(self.send_conn_window) < H2_MIN_WRITE_WINDOW {
+        while self.send_stream_window.min(self.send_conn_window) <= GRPC_MESSAGE_OVERHEAD_MIN as i64
+        {
             if self.try_parse_frame() {
                 continue;
             }
@@ -711,19 +706,39 @@ fn push_varint(out: &mut Vec<u8>, mut value: usize) {
     out.push(value as u8);
 }
 
+fn grpc_chunk_len(input_len: usize, max_data_frame: usize) -> usize {
+    let mut chunk = input_len.min(max_data_frame.saturating_sub(GRPC_MESSAGE_OVERHEAD_MIN));
+    while chunk != 0 && chunk + 6 + protobuf_varint_len(chunk) > max_data_frame {
+        chunk -= 1;
+    }
+    chunk
+}
+
+fn protobuf_varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
 impl GrpcStream {
     /// Write as much of the queued frame as possible; Pending keeps the
     /// remainder queued for the next call.
     fn drain_write_queue(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         while !self.write_queue.is_empty() {
-            let n = {
-                let contiguous = self.write_queue.make_contiguous();
-                match Pin::new(&mut self.inner).poll_write(cx, contiguous) {
-                    Poll::Ready(Ok(n)) => n,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
+            let n = match Pin::new(&mut self.inner).poll_write(cx, self.write_queue.as_slices().0) {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             };
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "grpc: inner transport accepted zero bytes",
+                )));
+            }
             self.write_queue.drain(..n);
         }
         Poll::Ready(Ok(()))
@@ -736,31 +751,28 @@ impl AsyncWrite for GrpcStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // A previously accepted chunk must be fully flushed (and reported)
-        // before another frame is queued, or the caller's buffer accounting
-        // would consume bytes twice.
-        if let Some(n) = self.pending_accepted {
-            match self.drain_write_queue(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.pending_accepted = None;
-                    return Poll::Ready(Ok(n));
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if self.end_stream_sent {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "grpc: stream write side is closed",
+            )));
+        }
+        match self.drain_write_queue(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
         }
         match self.poll_send_window(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        let available = self.send_stream_window.min(self.send_conn_window);
-        // Frame overhead beyond the chunk: 5B gRPC length prefix + the
-        // protobuf envelope (0x0a tag + varint, ≤ 6B) + a margin.
-        let chunk_len = buf
-            .len()
-            .min(self.peer_max_frame.saturating_sub(16))
-            .min((available - 16).max(0) as usize);
+        let available = self.send_stream_window.min(self.send_conn_window) as usize;
+        let chunk_len = grpc_chunk_len(buf.len(), self.peer_max_frame.min(available));
+        debug_assert!(chunk_len != 0);
         let chunk = &buf[..chunk_len];
         // Message: [1B uncompressed] [4B BE length] [protobuf envelope]:
         // field 1 bytes content (0x0a tag + varint length + payload).
@@ -777,14 +789,7 @@ impl AsyncWrite for GrpcStream {
         self.send_stream_window -= h2_len as i64;
         self.send_conn_window -= h2_len as i64;
         self.write_queue.extend(frame);
-        match self.drain_write_queue(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_len)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                self.pending_accepted = Some(chunk_len);
-                Poll::Pending
-            }
-        }
+        Poll::Ready(Ok(chunk_len))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -876,6 +881,182 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct GatedWriter {
+        open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        written: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+        write_zero: bool,
+    }
+
+    impl tokio::io::AsyncRead for GatedWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for GatedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.write_zero {
+                return Poll::Ready(Ok(0));
+            }
+            if !self.open.load(std::sync::atomic::Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            self.written.lock().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_queued_write_owns_caller_bytes_and_zero_write_errors() {
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let written = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut stream = GrpcStream {
+            inner: Box::new(GatedWriter {
+                open: open.clone(),
+                written: written.clone(),
+                write_zero: false,
+            }),
+            stream_id: 1,
+            read_buf: Vec::new(),
+            undecoded: Vec::new(),
+            msg_buf: Vec::new(),
+            write_queue: VecDeque::new(),
+            send_stream_window: H2_DEFAULT_WINDOW,
+            send_conn_window: H2_DEFAULT_WINDOW,
+            peer_initial_window: H2_DEFAULT_WINDOW,
+            peer_max_frame: H2_DEFAULT_MAX_FRAME,
+            recv_unacked: 0,
+            control_pending: false,
+            stream_eof: false,
+            end_stream_sent: false,
+        };
+
+        let mut owned = b"owned".to_vec();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.write(&owned))
+                .await
+                .expect("queue ownership must not wait for the blocked writer")
+                .unwrap(),
+            owned.len()
+        );
+        owned.fill(b'z');
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                stream.write(b"cancelled"),
+            )
+            .await
+            .is_err()
+        );
+        open.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(stream.write(b"x").await.unwrap(), 1);
+        stream.flush().await.unwrap();
+
+        let mut expected = Vec::new();
+        push_frame_header(&mut expected, 12, H2_DATA, 0, 1);
+        expected.extend_from_slice(&[0, 0, 0, 0, 7, 0x0a, 5]);
+        expected.extend_from_slice(b"owned");
+        push_frame_header(&mut expected, 8, H2_DATA, 0, 1);
+        expected.extend_from_slice(&[0, 0, 0, 0, 3, 0x0a, 1, b'x']);
+        assert_eq!(*written.lock(), expected);
+
+        let mut zero = GrpcStream {
+            inner: Box::new(GatedWriter {
+                open,
+                written: Default::default(),
+                write_zero: true,
+            }),
+            stream_id: 1,
+            read_buf: Vec::new(),
+            undecoded: Vec::new(),
+            msg_buf: Vec::new(),
+            write_queue: b"queued".to_vec().into(),
+            send_stream_window: H2_DEFAULT_WINDOW,
+            send_conn_window: H2_DEFAULT_WINDOW,
+            peer_initial_window: H2_DEFAULT_WINDOW,
+            peer_max_frame: H2_DEFAULT_MAX_FRAME,
+            recv_unacked: 0,
+            control_pending: false,
+            stream_eof: false,
+            end_stream_sent: false,
+        };
+        let error = tokio::time::timeout(std::time::Duration::from_millis(20), zero.flush())
+            .await
+            .expect("zero-byte write must terminate")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    #[tokio::test]
+    async fn grpc_partial_control_writes_reclaim_consumed_storage() {
+        let (client, mut server) = tokio::io::duplex(13);
+        let mut stream = GrpcStream {
+            inner: Box::new(client),
+            stream_id: 1,
+            read_buf: Vec::new(),
+            undecoded: Vec::new(),
+            msg_buf: Vec::new(),
+            write_queue: VecDeque::new(),
+            send_stream_window: H2_DEFAULT_WINDOW,
+            send_conn_window: H2_DEFAULT_WINDOW,
+            peer_initial_window: H2_DEFAULT_WINDOW,
+            peer_max_frame: H2_DEFAULT_MAX_FRAME,
+            recv_unacked: 0,
+            control_pending: false,
+            stream_eof: false,
+            end_stream_sent: false,
+        };
+        assert_eq!(stream.write(b"seed").await.unwrap(), 4);
+        let mut expected = vec![0, 0, 11, H2_DATA, 0, 0, 0, 0, 1, 0, 0, 0, 0, 6, 0x0a, 4];
+        expected.extend_from_slice(b"seed");
+        let mut received = Vec::new();
+        let mut partial = [0; 13];
+        assert!(futures_util::poll!(std::pin::pin!(stream.flush())).is_pending());
+        server.read_exact(&mut partial).await.unwrap();
+        received.extend_from_slice(&partial);
+
+        // Keep seven bytes unsent throughout; only the live frame backlog,
+        // not lifetime wire traffic, may determine retained queue storage.
+        for increment in 1u32..=8 {
+            stream.recv_unacked = increment;
+            stream.queue_window_updates();
+            for stream_id in [1, 0] {
+                expected.extend_from_slice(&[0, 0, 4, H2_WINDOW_UPDATE, 0, 0, 0, 0, stream_id]);
+                expected.extend_from_slice(&increment.to_be_bytes());
+            }
+            for _ in 0..2 {
+                assert!(futures_util::poll!(std::pin::pin!(stream.flush())).is_pending());
+                server.read_exact(&mut partial).await.unwrap();
+                received.extend_from_slice(&partial);
+            }
+            assert_eq!(received, expected[..expected.len() - 7]);
+            assert!(stream.write_queue.capacity() <= 4 * 26);
+        }
+
+        stream.flush().await.unwrap();
+        let mut remaining = [0; 7];
+        server.read_exact(&mut remaining).await.unwrap();
+        received.extend_from_slice(&remaining);
+        assert_eq!(received, expected);
+    }
+
     #[tokio::test]
     async fn test_grpc_stream_tolerates_short_reads_and_writes() {
         // One gRPC DATA frame on stream 1: [9B h2 hdr][5B length prefix]
@@ -895,13 +1076,12 @@ mod tests {
             read_buf: Vec::new(),
             undecoded: Vec::new(),
             msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
+            write_queue: VecDeque::new(),
             send_stream_window: H2_DEFAULT_WINDOW,
             send_conn_window: H2_DEFAULT_WINDOW,
             peer_initial_window: H2_DEFAULT_WINDOW,
             peer_max_frame: H2_DEFAULT_MAX_FRAME,
             recv_unacked: 0,
-            pending_accepted: None,
             control_pending: false,
             stream_eof: false,
             end_stream_sent: false,
@@ -1183,12 +1363,12 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// gRPC flow control: the server's SETTINGS_INITIAL_WINDOW_SIZE
-    /// applies to the already-open stream by delta; with a zero window the
-    /// client must hold DATA frames until a WINDOW_UPDATE arrives, and
-    /// poll_shutdown must emit an empty END_STREAM DATA frame.
+    /// gRPC flow control: SETTINGS_INITIAL_WINDOW_SIZE applies to the already
+    /// open stream. A zero window stalls DATA, while a legal 128-byte window
+    /// accepts the largest application chunk whose exact envelope fits. The
+    /// shutdown path then emits an empty END_STREAM DATA frame.
     #[tokio::test]
-    async fn test_grpc_transport_send_window_and_end_stream() {
+    async fn test_grpc_transport_small_send_window_and_end_stream() {
         let (client_side, mut server_side) = tokio::io::duplex(8192);
         let mut stream = GrpcStream {
             inner: Box::new(client_side),
@@ -1196,13 +1376,12 @@ mod tests {
             read_buf: Vec::new(),
             undecoded: Vec::new(),
             msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
+            write_queue: VecDeque::new(),
             send_stream_window: H2_DEFAULT_WINDOW,
             send_conn_window: H2_DEFAULT_WINDOW,
             peer_initial_window: H2_DEFAULT_WINDOW,
             peer_max_frame: H2_DEFAULT_MAX_FRAME,
             recv_unacked: 0,
-            pending_accepted: None,
             control_pending: false,
             stream_eof: false,
             end_stream_sent: false,
@@ -1232,29 +1411,46 @@ mod tests {
         .await;
         assert!(stalled.is_err(), "client wrote with a zero window");
 
-        // Grant stream + connection window; the stalled write proceeds.
+        // A legal small initial window must make progress without waiting for
+        // an arbitrary minimum frame size.
+        let mut setting = Vec::new();
+        push_frame_header(&mut setting, 6, H2_SETTINGS, 0, 0);
+        setting.extend_from_slice(&[0, 4]);
+        setting.extend_from_slice(&128u32.to_be_bytes());
+        server_side.write_all(&setting).await.unwrap();
+        let payload = [0x5a; 256];
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.write(&payload))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(accepted, 121);
+        stream.flush().await.unwrap();
+
+        // Wire order: one ACK per SETTINGS, then the exactly bounded DATA frame.
+        let mut got = vec![0u8; 9 + 9 + 9 + 128];
+        server_side.read_exact(&mut got).await.unwrap();
+        let ack = [0, 0, 0, H2_SETTINGS, H2_FLAG_ACK, 0, 0, 0, 0];
+        assert_eq!(&got[..9], &ack);
+        assert_eq!(&got[9..18], &ack);
+        let data = &got[18..];
+        assert_eq!(&data[..9], &[0, 0, 128, H2_DATA, 0, 0, 0, 0, 1]);
+        assert_eq!(&data[9..16], &[0, 0, 0, 0, 123, 0x0a, 121]);
+        assert_eq!(&data[16..], &payload[..accepted]);
+
         let mut grant = Vec::new();
         push_frame_header(&mut grant, 4, H2_WINDOW_UPDATE, 0, 1);
-        grant.extend_from_slice(&2048u32.to_be_bytes());
-        push_frame_header(&mut grant, 4, H2_WINDOW_UPDATE, 0, 0);
-        grant.extend_from_slice(&2048u32.to_be_bytes());
+        grant.extend_from_slice(&136u32.to_be_bytes());
         server_side.write_all(&grant).await.unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.write_all(b"hello"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let accepted = stream.write(&payload).await.unwrap();
+        assert_eq!(accepted, 128);
+        stream.flush().await.unwrap();
 
-        // Wire order: the SETTINGS ACK the client queued while stalled,
-        // then the DATA frame.
-        let mut got = vec![0u8; 9 + 9 + 12];
-        server_side.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got[..9], &[0, 0, 0, H2_SETTINGS, H2_FLAG_ACK, 0, 0, 0, 0]);
-        let data = &got[9..];
-        assert_eq!(&data[..9], &[0, 0, 12, H2_DATA, 0, 0, 0, 0, 1]);
-        assert_eq!(&data[9 + 7..], b"hello");
+        let mut data = vec![0; 9 + 136];
+        server_side.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data[..9], &[0, 0, 136, H2_DATA, 0, 0, 0, 0, 1]);
+        assert_eq!(&data[9..17], &[0, 0, 0, 0, 131, 0x0a, 0x80, 0x01]);
+        assert_eq!(&data[17..], &payload[..accepted]);
 
         // poll_shutdown queues an empty DATA frame with END_STREAM.
         tokio::time::timeout(std::time::Duration::from_secs(2), stream.shutdown())
@@ -1264,6 +1460,18 @@ mod tests {
         let mut end = [0u8; 9];
         server_side.read_exact(&mut end).await.unwrap();
         assert_eq!(&end, &[0, 0, 0, H2_DATA, H2_FLAG_END_STREAM, 0, 0, 0, 1]);
+
+        // Even a fresh window grant cannot reopen the closed write side.
+        server_side.write_all(&grant).await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), stream.write(b"x"))
+            .await
+            .expect("closed write must not wait for flow control")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(stream.write(&[]).await.unwrap(), 0);
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert_eq!(server_side.read(&mut end).await.unwrap(), 0);
     }
 
     /// gRPC read side: the read window is topped up once the received DATA
@@ -1280,13 +1488,12 @@ mod tests {
             read_buf: Vec::new(),
             undecoded: Vec::new(),
             msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
+            write_queue: VecDeque::new(),
             send_stream_window: H2_DEFAULT_WINDOW,
             send_conn_window: H2_DEFAULT_WINDOW,
             peer_initial_window: H2_DEFAULT_WINDOW,
             peer_max_frame: H2_DEFAULT_MAX_FRAME,
             recv_unacked: 0,
-            pending_accepted: None,
             control_pending: false,
             stream_eof: false,
             end_stream_sent: false,
@@ -1305,8 +1512,7 @@ mod tests {
             expect.extend_from_slice(&data_len.to_be_bytes());
         }
         assert_eq!(
-            stream.write_queue.make_contiguous(),
-            &expect,
+            stream.write_queue, expect,
             "one WINDOW_UPDATE pair topping up the received bytes"
         );
         assert!(stream.control_pending);

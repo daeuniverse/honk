@@ -123,6 +123,11 @@ Production `DnsService` callers require strict query/response wire validation be
 
 Each generation has two independent 2,048 limits: controller query lifecycles and active singleflight keys. UDP ingress additionally uses that generation's startup-budgeted slow-path quota (at most 256), separate from generic UDP initialization. One flight accepts at most 256 followers. Saturated flights reject rather than opening unbounded upstream exchanges; the controller renders that overload as `REFUSED`. Publication atomically removes the flight and broadcasts its result to attached followers; a later cache miss can start a fresh flight. Completed failures retain their cause without being cached, so attached followers do not each repeat the failed exchange. Dropping a leader without a published result removes the flight and wakes followers to retry ownership; this includes cancellation and compatibility-only successes without a validated response template.
 
+Initialization and flight fan-out use `SharedError`, an `Arc`-backed error that
+clones the original causal chain for builders and waiters instead of rebuilding
+it from display text. A completed failure is not cached; all attached waiters
+observe the same typed source, including `PacketRejection::Capacity`.
+
 ### Hosts snapshot
 
 Generation construction reads every repeatable `use_host` source once and merges them in declaration order. `true` selects `/etc/hosts`, whose parser indexes exact names and aliases; a path selects an OxiDNS-compatible exact, domain-suffix, regexp, and keyword rule file. Later definitions replace earlier matching definitions. Exact and longest-suffix lookups take precedence over ordered regexp and keyword matches. Query handling performs no file I/O.
@@ -139,9 +144,23 @@ Only IN-class A and AAAA queries use the snapshot. A known name with no address 
 | `ipv4only` | Only A is eligible. AAAA is answered NODATA without upstream I/O. |
 | `ipv6only` | Only AAAA is eligible. A is answered NODATA without upstream I/O. |
 
-A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, logical client source, original destination, and the rest of the wire profile remain unchanged. Sibling failure or NODATA does not suppress a usable non-preferred response. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
+A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, logical client source, original destination, and the rest of the wire profile remain unchanged. Ordinary sibling failure or NODATA does not suppress a usable non-preferred response; a typed local packet refusal instead terminates the caller's resolution with that cause. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
 
 The strategy also orders bootstrap-resolved upstream dial targets. `both` uses IPv4-first compatibility order; preference modes put their family first while retaining the other family. Stream and QUIC transports walk the ordered candidates. Direct UDP keeps the existing two-attempt bound: after the first candidate fails, its retry selects the other family before another address of the same family and caches the winner.
+
+Typed local packet refusals, including capacity, are not availability failures.
+DoH3/DoQ and proxied reusable-session initialization preserve the same
+`SharedError` cause for the builder and every waiter. The outer route loop and
+name-family aggregation do not turn that cause into another route, bootstrap,
+or system-DNS attempt. Health and URLTest resolver hooks preserve it to the
+final consumer, so denied lookups neither demote nodes nor substitute the
+default UDP check target. Independently permitted probes and configured literal
+fallback IPs remain usable. A typed refusal cannot become a stale-cache answer
+or a successful non-preferred-family answer. Ordinary failures, empty responses,
+and accepted SERVFAIL retain the documented fallback behavior.
+This also covers cold and cached `udp://` attempts carried over a proxy TCP
+session: a refusal stops before resolving a retry, and a refusal on the final
+attempt retains its typed cause instead of becoming a display-only error.
 
 ### DNS routing
 
@@ -184,7 +203,7 @@ Configured ECS is a generation-pinned named-upstream transport policy, not ingre
 | Positive TTL | `fixed_domain_ttl` has first priority; zero disables caching for that domain. Otherwise nonzero `optimistic_cache_ttl` overrides the answer minimum TTL. With neither override, a positive NOERROR response uses the minimum of all walked non-OPT record TTLs, including zero; zero supersedes the exact slot without caching. The selected nonzero TTL is also written into cached records. Failure rcodes keep their existing TTL extraction. |
 | Negative TTL | NXDOMAIN uses `min(SOA TTL, SOA MINIMUM, 300)` seconds; missing SOA or zero lifetime supersedes the exact slot without retaining the response. SERVFAIL still defaults to 60 seconds and clamps the SOA-derived lifetime to `1..=300`. `fixed_domain_ttl: 0` prevents caching for every response code without superseding an existing entry. |
 | NODATA TTL | NOERROR with `ANCOUNT=0` retains its full wire in the positive slot. A nonzero `fixed_domain_ttl` overrides SOA and the cap; otherwise lifetime is `min(SOA TTL, SOA MINIMUM, 300)`, with missing SOA or zero superseding the exact slot without caching. `optimistic_cache_ttl` does not apply. NODATA remains stale-eligible; stale rewriting changes SOA TTL, not MINIMUM. |
-| Stale handling | Expired positive answers remain eligible for serve-stale for one hour. An upstream exchange error or accepted SERVFAIL may return one. `optimistic_stale_reply_ttl` defaults to 30 seconds; a non-zero value replaces every non-OPT RR TTL and sets the outcome TTL. `0` preserves cached policy-rewritten TTLs, not authoritative TTLs; the outcome TTL then comes from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. Near-expiry hits start a deduplicated stale-while-revalidate refresh. |
+| Stale handling | Expired positive answers remain eligible for serve-stale for one hour. An ordinary upstream exchange error or accepted SERVFAIL may return one; typed local packet refusals never do. `optimistic_stale_reply_ttl` defaults to 30 seconds; a non-zero value replaces every non-OPT RR TTL and sets the outcome TTL. `0` preserves cached policy-rewritten TTLs, not authoritative TTLs; the outcome TTL then comes from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. Near-expiry hits start a deduplicated stale-while-revalidate refresh. |
 | Flush fence | A publication epoch prevents foreground or background work begun before a flush from repopulating memory or persistence after the flush barrier. |
 
 A background refresh captures the Resolve slot's publication revision with its positive lookup. Every accepted exact publication, including a negative merge or restore, advances that revision. Publication requires the same revision and a retained positive under the shard lock. A matching cacheable NXDOMAIN removes the refreshed positive before storing the negative; a cacheable positive or NODATA replaces the slot. NXDOMAIN, NODATA, or a zero-TTL positive without a usable lifetime removes the whole slot instead, including any negative value. SERVFAIL without eligible stale fallback retains the positive and merges the negative. A newer publication, a negative-only slot, or eviction discards the refresh result; eviction does not allow re-admission without an owner.
@@ -242,7 +261,7 @@ Incremental acknowledgement compares the successful write with the current desir
 
 ## Generations and reload
 
-One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of both traffic session reuse and predecessor DNS sessions. The DNS registry shares its source configuration generation's dial semaphore and the process-wide physical-dial ceiling, not its retirement flag or protocol pools.
+One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of traffic session reuse and predecessor DNS sessions. The fork shares its source configuration generation's dial semaphore, the process physical-dial ceiling, and the process VLESS-carrier gate, but not retirement state or protocol pools.
 
 The existing TLS maintenance pass also reaps the active DNS registry's idle connectors. Terminal registry shutdown releases its cached connectors even while a retired runtime remains retained.
 

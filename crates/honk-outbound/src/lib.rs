@@ -17,6 +17,7 @@ pub mod quic_boring;
 pub mod reality;
 pub mod runtime;
 pub(crate) mod session;
+mod shared_error;
 pub mod tls;
 pub mod urltest;
 pub mod util;
@@ -26,4 +27,5 @@ pub use proxy::{
     ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound, WarmOutcome, WarmRequirement,
     WarmableOutbound,
 };
+pub use shared_error::SharedError;
 pub use util::{connect_marked, connect_marked_addr, connect_outbound, udp_marked_bind};

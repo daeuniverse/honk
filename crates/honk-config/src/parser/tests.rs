@@ -404,22 +404,26 @@ node {
     }
 
     #[test]
-    fn test_parse_vless_mode_link() {
+    fn test_parse_vless_packet_and_mux_links() {
+        use crate::node::VlessUdpPath;
+
         let config = parse_dae_config(
-            "node {\n    xudp: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=mux-cool#node'\n}",
+            "node {\n    auto: 'vless://00000000-0000-0000-0000-000000000001@example.com:443#node'\n    disabled: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=none&udp=0#node'\n    xudp: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=xudp#node'\n    cool: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=xray&xudpProxyUDP443=allow#node'\n}",
         )
         .unwrap();
-        assert_eq!(config.nodes.len(), 2);
-        assert_eq!(config.nodes[0].name, "xudp");
-        assert_eq!(
-            config.nodes[0].vless().unwrap().mode,
-            crate::node::WireMode::Xudp
-        );
-        assert_eq!(config.nodes[1].name, "cool");
-        assert_eq!(
-            config.nodes[1].vless().unwrap().mode,
-            crate::node::WireMode::MuxCool
-        );
+        assert_eq!(config.nodes.len(), 4);
+        for (index, (name, path)) in [
+            ("auto", Some(VlessUdpPath::Native)),
+            ("disabled", None),
+            ("xudp", Some(VlessUdpPath::Xudp)),
+            ("cool", Some(VlessUdpPath::CoolShared)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(config.nodes[index].name, name);
+            assert_eq!(config.nodes[index].vless().unwrap().udp_path(53), path);
+        }
     }
 
     #[test]

@@ -602,9 +602,13 @@ mod strategy {
                 false,
                 mode,
             ))
-            .await;
+            .await
+            .map_err(anyhow::Error::from);
             Ok(match sibling {
                 Ok(outcome) => response_has_family_ips(outcome.rendered(), preferred_qtype),
+                Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
+                    return Err(error);
+                }
                 Err(_) => {
                     debug!(
                         error_kind = "preferred_family_probe_failed",

@@ -23,7 +23,7 @@ facade 与内部实现按职责拆分：
 | `filter.rs` | 按网络和地址族过滤存活性 |
 | `policy.rs` | Selector、URLTest、LoadBalance、Fallback 选择与延迟排名 |
 | `score.rs` | Score 评分、exact-once 反馈与 target-aware 选择 |
-| `state.rs` | URLTest/Fallback 缓存、Selector 选择、空闲时间戳与回调 |
+| `state.rs` | URLTest/Fallback 缓存、Selector 选择与回调 |
 
 选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，只有当前 Selector 选择路径能到达该节点时，才会将它作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到其他成员或 `direct`。UDP 继续执行正常的存活性排除。最后尝试服务会记录限流警告（每组 60 秒）；预热 peek 保持静默。
 
@@ -129,14 +129,14 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 
 | 探测路径 | 行为 |
 | --- | --- |
-| TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。`ProxyHttpProber` 将 HTTP 执行交给下述 outbound 共享测量路径；只有成功的热路径 RTT 进入匹配的 TCP 地址族状态。setup 与目标交换失败会更新活性/冷却，但不贡献延迟或排名 strike。 |
-| UDP 健康 | 通过节点自己的 `dial_udp_transport`，向第一个 `udp_check_dns` 目标发送一个最小 DNS 查询。成功记录实测 RTT，并把 `DnsUdp` 与 `DataUdp` 都标记为存活；失败分别给两个 UDP 域增加一次探测失败——除非同周期的独立 Score QUIC 握手成功，此时只有 `DnsUdp` 记录失败，`DataUdp` 由握手成功标记为存活（被封的 `:53` 检查目标不能判死一条正常的 UDP 数据通路）。它从不修改 TCP 状态。 |
+| TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。`ProxyHttpProber` 将 HTTP 执行交给 outbound 共享测量路径；只有 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Session)` 才复用 runtime，否则探测后关闭 guarded cold runtime。只有成功 warm-path RTT 进入匹配 TCP 地址族状态；setup 与目标交换 failure 更新 liveness/cooldown，但不贡献 latency 或 ranking strike。 |
+| UDP 健康 | 通过节点 packet path 向第一个 `udp_check_dns` 目标发送最小 DNS query。它独立检查 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Udp)`；该 requirement 未预热时，探测后关闭 guarded cold runtime。成功记录 RTT，并把 `DnsUdp` 与 `DataUdp` 标为存活；失败分别给两个 UDP domain 增加一次 probe failure，除非同周期独立 Score QUIC handshake 成功，此时只让 `DnsUdp` 失败而保持 `DataUdp` 存活。它绝不修改 TCP state。 |
 | Score QUIC 评分 | 通过新的 packet transport 为 Score 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`，无论 DNS 探测成败都会运行。成功或失败会更新精确 `DataUdp` 分数与聚合先验，不奖励未观测的 byte volume；当 DNS 探测失败而握手成功时，还会按上表所述复活 `DataUdp` 活性。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
-`has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。已建立 endpoint 的终止性发送/接收错误，以及从未收到回包时的回包空闲到期，会上报 `DataUdp` 流量失败。单包拥塞、已有回包后的空闲到期、主动 endpoint 退役、节点死亡取消和进程关闭不影响健康状态。
+`has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享 VLESS，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
 
-alive→dead 转换会调用控制面死亡回调，清除该节点的池连接与 UDP endpoint，避免新流量取得陈旧的可复用对象。
+类型化 policy、size 与 `PacketRejection::Capacity` refusal 对候选是 terminal，但不影响 health 或 Score；CLI 调用方收到 capacity error，而不是 `NotApplicable`。单包拥塞、已有 reply 后的 idle expiry、主动退役、节点死亡取消和进程关闭也不影响健康。alive→dead 转换调用带 `(NodeId, name)` 的控制面回调，清除 pool connection 与 UDP endpoint。若 sibling UDP domain 明确存活，则跳过该 UDP domain 的死亡清理，避免被阻断的 `:53` 探测清除正常 flow。
 
 每个节点最近一次真实 TCP 延迟样本每 60 秒写入 `cache.db`；启动时只恢复不超过 24 小时的样本。存活性从不由缓存恢复。合成 10 秒占位样本带有标记，不显示在历史中，不进入移动平均，也不会作为最近真实样本持久化；选择降级由失败 strike 计数承担，与占位样本无关。
 
@@ -171,18 +171,31 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 | 机制 | 候选与生命周期 | 保留资源 | 边界 |
 | --- | --- | --- | --- |
 | 启动预连接 | 仅在启动时运行一轮；先取各组当前选择，再按配置顺序。只有可池化裸 TCP 的代理节点合格。 | 向池中存入一条服务端裸 TCP 连接 | `'auto'` 最多选择 8 个节点；`0` 关闭。它不持有策略 retention bit。 |
-| Selector 固定 | 始终跟踪每个 Selector 的配置叶节点，包括不健康的显式选择；多个组共享的叶节点按 UUID 去重。 | 一条 AnyTLS、VLESS H2MUX 或 VLESS Mux.Cool pool session；一个 QUIC client/connection；否则一条服务端裸 TCP | 有效选择变化会立即唤醒；10 秒周期修复丢失、已消费或已过期状态。 |
-| UDP 预热集 | 需显式启用；每轮对每个地址族重新选择各组 top `min(N, 3)` 的可复用 UDP 叶节点，再按 UUID 全局去重。 | 协议的可复用 UDP-capable generation session 或 QUIC client | 最多并发 4 个预热尝试；进程保留集会重新排名并封顶 `4 × N`。 |
+| Selector 固定 | 始终跟踪每个 Selector 的配置叶节点，包括不健康的显式选择；多个组共享的叶节点按 UUID 去重。 | TCP path 选择的可复用 session（AnyTLS 或 VLESS H2/shared Mux.Cool）、一个 QUIC client/connection，否则一条服务端裸 TCP | 有效选择变化会立即唤醒；10 秒周期修复丢失、已消费或已过期状态。 |
+| UDP 预热集 | 需显式启用；每轮对每个地址族重新选择各组 top `min(N, 3)` 的可复用 UDP 叶节点，再按 UUID 全局去重。 | UDP path 选择的可复用状态，包括 VLESS H2/shared/separate Mux.Cool pool，或一个 QUIC client | 最多并发 4 个预热尝试；进程保留集会重新排名并封顶 `4 × N`。 |
 
-Selector 与 UDP 所有权是可复用节点 runtime 上相互独立的 bit。移除一个所有者时，如果另一个仍在，资源继续保留；只有最后一个所有者释放后，才会排空未来可复用状态。活跃流持有自己的 stream 或 connection 句柄，不会被切断。启动预连接只是 pool seed，不参与这些 bit。
+Selector 与 UDP ownership 是 reusable node runtime 上相互独立的 bit。
+`WarmRequirement::Session` 跟随 TCP path，`WarmRequirement::Udp` 跟随 UDP
+path，因此仅 UDP 的 VLESS pool 不改变 direct-TCP warming 或 bare-TCP
+eligibility。移除一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用
+owner 释放后才排空未来 reuse。active flow 不会被切断，startup preconnect
+仍只是一颗 pool seed。
 
-重载时，配置未变化的节点会把现有 `NodeRuntime` 转移给替代 generation，其中包括存活的 AnyTLS、VLESS H2MUX/Mux.Cool 与 QUIC 状态。旧 generation 不再接受新的预热工作，活跃流则正常排空。周期 HTTP 健康探测与按需 Clash 延迟测试都会先在临时 runtime 中预热冷的可复用 session 或 QUIC client，再开始计时并在结束后关闭，因此扫描不会新增每成员常驻 transport 状态。只有预热后的目标交换成功才报告健康并向选择逻辑贡献 RTT。
+重载时，配置不变的节点把现有 `NodeRuntime` 转移给 replacement，包括 AnyTLS、
+VLESS pool/source key 与 QUIC state；配置变化时得到 fresh runtime。现有 outbound
+maintenance pass 与其他 idle resource 一起回收未受 retention 的 idle VLESS
+carrier，不创建新的 protocol timer。
 
 ## 拨号准入预算
 
 `max_concurrent_dials` 默认为 64，并为物理代理连接和协议握手创建 generation-local semaphore。配置值会被启动时计算出的不可变进程级描述符 gate 限制。重载可以改变替代 generation 的本地上限，但重叠的新旧 generation 仍共享同一个进程 gate。
 
 Ready 池命中和已预热 generation 传输上的逻辑流不占额度。`block` 不会拨号；`DirectHandler::dial` 与其他物理连接一样经过 `admit_physical_dial`。已卸载到数据路径的直连流量，以及通过 reqwest 直连的 UI 下载，不使用该 handler 的准入 gate。裸 TCP 池命中仍需执行协议握手，因此仍受拨号预算准入。
+
+每条 VLESS 物理 carrier 还从启动时确定的进程 carrier gate 取得 permit；重载
+generation 与 DNS fork 共用该 gate。permit 经 provisional、active、draining
+与 idle carrier I/O 一直持有到 task teardown。该全局 gate 是权威边界；
+Mux.Cool 不再叠加逐节点两 carrier 限制。
 
 ## 相关文档
 

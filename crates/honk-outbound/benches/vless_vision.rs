@@ -1,8 +1,4 @@
-//! VLESS Vision response-codec benchmark over a clear loopback carrier.
-//!
-//! The production Vision combinations remain TLS/REALITY-only. The clear
-//! carrier removes handshake and crypto variance so this benchmark measures
-//! the VLESS response-header and Vision unpadding path.
+//! VLESS Vision framed and direct-copy throughput over loopback TLS 1.3.
 
 use std::hint::black_box;
 use std::net::SocketAddr;
@@ -66,23 +62,55 @@ fn direct_wire() -> Arc<Vec<u8>> {
     Arc::new(wire)
 }
 
-async fn spawn_server(wire: Arc<Vec<u8>>) -> SocketAddr {
+async fn spawn_server(wire: Arc<Vec<u8>>, direct: bool) -> SocketAddr {
+    use boring::pkey::PKey;
+    use boring::ssl::{SslAcceptor, SslMethod, SslVersion};
+    use boring::x509::X509;
+
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate(&X509::from_pem(cert.pem().as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_private_key(&PKey::private_key_from_pem(key.serialize_pem().as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let acceptor = Arc::new(acceptor.build());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
+        while let Ok((socket, _)) = listener.accept().await {
             let wire = Arc::clone(&wire);
+            let acceptor = Arc::clone(&acceptor);
             tokio::spawn(async move {
+                let mut socket = tokio_boring::accept(&acceptor, socket).await.unwrap();
                 let mut request = [0_u8; REQUEST_HEADER_BYTES];
-                if socket.read_exact(&mut request).await.is_err() {
-                    return;
+                socket.read_exact(&mut request).await.unwrap();
+                let tls_bytes = if direct {
+                    2 + 16 + 5 + FRAME_CONTENT_BYTES + FRAME_PADDING_BYTES
+                } else {
+                    wire.len()
+                };
+                for chunk in wire[..tls_bytes].chunks(SOURCE_CHUNK_BYTES) {
+                    socket.write_all(chunk).await.unwrap();
                 }
-                for chunk in wire.chunks(SOURCE_CHUNK_BYTES) {
-                    if socket.write_all(chunk).await.is_err() {
-                        return;
+                socket.flush().await.unwrap();
+                if direct {
+                    let raw = socket.get_mut();
+                    for chunk in wire[tls_bytes..].chunks(SOURCE_CHUNK_BYTES) {
+                        raw.write_all(chunk).await.unwrap();
                     }
+                    raw.shutdown().await.unwrap();
+                } else {
+                    socket.shutdown().await.unwrap();
                 }
-                let _ = socket.shutdown().await;
             });
         }
     });
@@ -95,6 +123,12 @@ fn benchmark_node(server: SocketAddr) -> Node {
         outbound: OutboundConfig::Vless(VlessConfig {
             uuid: Some(UUID_TEXT.into()),
             flow: Some("xtls-rprx-vision".into()),
+            tls: honk_config::node::TlsOptions {
+                enabled: true,
+                skip_cert_verify: true,
+                sni: Some("localhost".into()),
+                ..Default::default()
+            },
             ..Default::default()
         }),
         address: server.to_string(),
@@ -123,8 +157,8 @@ fn bench_vision(c: &mut Criterion) {
         .build()
         .unwrap();
     let (framed_node, direct_node) = runtime.block_on(async {
-        let framed = spawn_server(framed_wire()).await;
-        let direct = spawn_server(direct_wire()).await;
+        let framed = spawn_server(framed_wire(), false).await;
+        let direct = spawn_server(direct_wire(), true).await;
         (benchmark_node(framed), benchmark_node(direct))
     });
 

@@ -660,8 +660,8 @@ fn delay_ms(d: Duration) -> u64 {
 
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
-/// history; failures return 503, but only the second consecutive failure
-/// adds a synthetic penalty and demotes the node.
+/// history; errors return 503. Repeated transport failures demote the node,
+/// while local policy refusals remain neutral.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
@@ -700,11 +700,10 @@ async fn get_proxy_delay(
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
             Err(e) => {
-                // A lone failure leaves history unchanged; a second
-                // consecutive failure adds the synthetic penalty and
-                // demotes the node.
-                s.alive_set
-                    .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
+                if !honk_outbound::proxy::is_packet_rejection(&e) {
+                    s.alive_set
+                        .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
+                }
                 error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &format!("An error occurred in the delay test: {e}"),

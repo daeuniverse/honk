@@ -114,7 +114,10 @@ async fn builder_error_is_fanned_out_to_waiters() {
             .acquire(|| async move {
                 let _ = started_tx.send(());
                 let _ = release_rx.await;
-                anyhow::bail!("malformed handshake")
+                Err(
+                    anyhow::Error::new(honk_outbound::proxy::PacketRejection::Policy)
+                        .context("malformed handshake"),
+                )
             })
             .await
     });
@@ -137,21 +140,27 @@ async fn builder_error_is_fanned_out_to_waiters() {
     release_tx.send(()).expect("release builder");
 
     // Then
-    assert!(
+    let assert_shared_error = |error: anyhow::Error| {
+        assert!(error.to_string().contains("malformed handshake"));
+        assert!(honk_outbound::proxy::is_packet_rejection(&error));
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<honk_outbound::proxy::PacketRejection>(),
+            Some(&honk_outbound::proxy::PacketRejection::Policy)
+        );
+    };
+    assert_shared_error(
         leader
             .await
             .expect("leader task")
-            .expect_err("builder fails")
-            .to_string()
-            .contains("malformed handshake")
+            .expect_err("builder fails"),
     );
     while let Some(result) = waiters.join_next().await {
-        assert!(
+        assert_shared_error(
             result
                 .expect("waiter task")
-                .expect_err("same generation fails")
-                .to_string()
-                .contains("malformed handshake")
+                .expect_err("same generation fails"),
         );
     }
 }

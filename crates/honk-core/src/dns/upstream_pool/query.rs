@@ -28,6 +28,14 @@ fn udp_attempt_addresses(
     Some([first, retry])
 }
 
+fn retryable_error(error: anyhow::Error) -> anyhow::Result<anyhow::Error> {
+    if honk_outbound::proxy::is_packet_rejection(&error) {
+        Err(error)
+    } else {
+        Ok(error)
+    }
+}
+
 impl UpstreamPool {
     pub(super) async fn udp_pool(
         &self,
@@ -221,7 +229,7 @@ impl UpstreamPool {
                     .await
                 {
                     Ok(response) => return Ok(response),
-                    Err(error) => Some((address, error)),
+                    Err(error) => Some((address, retryable_error(error)?)),
                 }
             } else {
                 let admission = self.admit_query().await?;
@@ -242,7 +250,7 @@ impl UpstreamPool {
                     }
                     Err(error) => {
                         drop(admission);
-                        Some((address, error))
+                        Some((address, retryable_error(error)?))
                     }
                 }
             }
@@ -273,7 +281,7 @@ impl UpstreamPool {
                     .await
                 {
                     Ok(response) => return Ok(response),
-                    Err(first_error) => (first, first_error, retry),
+                    Err(first_error) => (first, retryable_error(first_error)?, retry),
                 }
             } else {
                 match self.exchange_direct_udp(entry, first, raw_query).await {
@@ -288,7 +296,7 @@ impl UpstreamPool {
                             )
                             .await;
                     }
-                    Err(first_error) => (first, first_error, retry),
+                    Err(first_error) => (first, retryable_error(first_error)?, retry),
                 }
             }
         };
@@ -304,10 +312,8 @@ impl UpstreamPool {
             return self
                 .query_udp_via_proxy(upstream_name, entry, &route, raw_query)
                 .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "UDP DNS failed via {retry}: {error} (first {first}: {first_error})"
-                    )
+                .with_context(|| {
+                    format!("UDP DNS failed via {retry} (first {first}: {first_error})")
                 });
         }
         match self.exchange_direct_udp(entry, retry, raw_query).await {
@@ -315,9 +321,9 @@ impl UpstreamPool {
                 self.finish_direct_udp_query(upstream_name, entry, retry, raw_query, exchange)
                     .await
             }
-            Err(error) => Err(anyhow::anyhow!(
-                "UDP DNS failed via {retry}: {error} (first {first}: {first_error})"
-            )),
+            Err(error) => Err(error).with_context(|| {
+                format!("UDP DNS failed via {retry} (first {first}: {first_error})")
+            }),
         }
     }
 }
@@ -392,6 +398,7 @@ impl DnsUpstreamPool for UpstreamPool {
                     };
                 }
                 Err(error) => {
+                    let error = retryable_error(error)?;
                     debug!(
                         target: "honk_core::dns::upstream_pool::failure",
                         upstream = upstream_name,

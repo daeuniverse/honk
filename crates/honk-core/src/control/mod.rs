@@ -49,7 +49,7 @@ use crate::dns::DnsResolver;
 use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
 use crate::ebpf::EbpfBackend;
 use crate::group::{GroupManager, SharedGroupManager};
-use crate::pool::{ConnectionPool, is_tcp_stream_alive};
+use crate::pool::ConnectionPool;
 use crate::proxy::ProxyRegistry;
 use crate::relay;
 use crate::routing::{ConnectionInfo, Router};

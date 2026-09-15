@@ -19,9 +19,10 @@ pub(super) type UdpPrepare<T> = Arc<
 >;
 
 /// Fixed callbacks let the scheduler keep policy, health, and metric effects
-/// at the integration boundary. In particular, only an actual future `Err`
-/// triggers `on_dial_error`; aborted or never-started candidates are neutral.
+/// at the integration boundary. Completed transport errors trigger
+/// `on_dial_error`; rejected, aborted and never-started candidates are neutral.
 pub(super) struct UdpStaggerCallbacks {
+    pub(super) allows_target: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
     pub(super) is_eligible: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
     pub(super) on_dial_error: Arc<dyn Fn(&Node) + Send + Sync>,
     pub(super) on_attempt: Arc<dyn Fn() + Send + Sync>,
@@ -50,7 +51,7 @@ pub(super) async fn prepare_udp_plan<T>(
     deadline: tokio::time::Instant,
     prepare: UdpPrepare<T>,
     callbacks: UdpStaggerCallbacks,
-) -> Option<(Node, T)>
+) -> anyhow::Result<Option<(Node, T)>>
 where
     T: Send + 'static,
 {
@@ -62,6 +63,7 @@ where
     let started_at = tokio::time::Instant::now();
     let mut next = 0;
     let mut tasks = JoinSet::new();
+    let mut rejection = None;
 
     let winner = 'schedule: loop {
         if tokio::time::Instant::now() >= deadline {
@@ -84,6 +86,10 @@ where
             let due = started_at + stagger_offset(next);
             if now < due {
                 break;
+            }
+            if !(callbacks.allows_target)(&node) {
+                rejection = Some(honk_outbound::proxy::PacketRejection::Policy.into());
+                break 'schedule None;
             }
             next += 1;
             if records_stagger_metrics {
@@ -123,8 +129,11 @@ where
                 // The node died between launch and completion. Dropping the
                 // speculative transport is neutral; it never owned a lease.
             }
-            Err(_) => {
-                // This is the sole scheduler path that is a real dial error.
+            Err(error) => {
+                if honk_outbound::proxy::is_packet_rejection(&error) {
+                    rejection = Some(error);
+                    break 'schedule None;
+                }
                 (callbacks.on_dial_error)(&node);
             }
         }
@@ -133,7 +142,13 @@ where
     tasks.abort_all();
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok((node, Err(_))) => (callbacks.on_dial_error)(&node),
+            Ok((node, Err(error))) => {
+                if honk_outbound::proxy::is_packet_rejection(&error) {
+                    rejection.get_or_insert(error);
+                } else {
+                    (callbacks.on_dial_error)(&node);
+                }
+            }
             Ok((_, Ok(_))) => {}
             Err(error) if error.is_cancelled() && records_stagger_metrics => {
                 (callbacks.on_cancellation)()
@@ -141,13 +156,16 @@ where
             Err(_) => {}
         }
     }
+    if let Some(error) = rejection {
+        return Err(error);
+    }
     if winner.is_some() && tokio::time::Instant::now() < deadline {
         if records_stagger_metrics {
             (callbacks.on_winner)();
         }
-        winner
+        Ok(winner)
     } else {
-        None
+        Ok(None)
     }
 }
 

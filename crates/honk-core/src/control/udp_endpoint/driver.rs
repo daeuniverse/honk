@@ -13,6 +13,7 @@ pub(super) const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 enum PacketSendFailure {
     Congestion(io::Error),
+    Rejected(io::Error),
     Transport(io::Error),
 }
 
@@ -41,24 +42,34 @@ impl PacketSendFailure {
     fn into_io_error(self) -> io::Error {
         match self {
             Self::Congestion(error) => io::Error::new(io::ErrorKind::WouldBlock, error),
+            Self::Rejected(error) => error,
             Self::Transport(error) => error,
         }
     }
 }
 
-fn classify_send_error(
-    transport: &dyn honk_outbound::proxy::PacketTransport,
-    error: io::Error,
-) -> PacketSendFailure {
-    if matches!(
-        honk_outbound::proxy::packet_error_class(&error),
-        honk_outbound::proxy::PacketErrorClass::Congestion
-    ) || (error.kind() == io::ErrorKind::TimedOut && transport.send_timeout_is_congestion())
-    {
-        PacketSendFailure::Congestion(error)
-    } else {
-        PacketSendFailure::Transport(error)
+fn classify_send_error(endpoint: &UdpEndpoint, error: io::Error) -> PacketSendFailure {
+    match honk_outbound::proxy::packet_error_class(&error) {
+        honk_outbound::proxy::PacketErrorClass::Rejected => PacketSendFailure::Rejected(error),
+        honk_outbound::proxy::PacketErrorClass::Congestion => PacketSendFailure::Congestion(error),
+        _ if error.kind() == io::ErrorKind::TimedOut && endpoint.send_timeout_is_congestion() => {
+            PacketSendFailure::Congestion(error)
+        }
+        _ => PacketSendFailure::Transport(error),
     }
+}
+
+fn duplicate_send_error(error: &io::Error) -> io::Error {
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(rejection) = current.downcast_ref::<honk_outbound::proxy::PacketRejection>() {
+            return (*rejection).into();
+        }
+        source = current.source();
+    }
+    io::Error::new(error.kind(), error.to_string())
 }
 
 pub(super) struct TaskRegistry {
@@ -185,11 +196,41 @@ pub(super) struct UdpDriverResult {
     pub(super) outcome: ScoreOutcome,
 }
 
+pub(in crate::control) enum DriverReplySocket {
+    Bounded(Arc<ReplySocket>),
+    #[cfg(test)]
+    Untracked(Arc<UdpSocket>),
+}
+
+impl From<Arc<ReplySocket>> for DriverReplySocket {
+    fn from(socket: Arc<ReplySocket>) -> Self {
+        Self::Bounded(socket)
+    }
+}
+
+#[cfg(test)]
+impl From<Arc<UdpSocket>> for DriverReplySocket {
+    fn from(socket: Arc<UdpSocket>) -> Self {
+        Self::Untracked(socket)
+    }
+}
+
+impl DriverReplySocket {
+    fn into_socket(self) -> Arc<ReplySocket> {
+        match self {
+            Self::Bounded(socket) => socket,
+            #[cfg(test)]
+            Self::Untracked(socket) => Arc::new(ReplySocket::untracked(socket)),
+        }
+    }
+}
+
 pub(super) struct UdpDriverContext {
     pub(super) endpoint: Arc<UdpEndpoint>,
     pub(super) queue_rx: mpsc::Receiver<QueuedDatagram>,
-    pub(super) reply_socket: Arc<UdpSocket>,
+    pub(super) reply_socket: Arc<ReplySocket>,
     pub(super) reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
+    pub(super) reply_socket_slots: Arc<Semaphore>,
     pub(super) client_addr: SocketAddr,
     pub(super) client_dst: SocketAddr,
     pub(super) alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
@@ -265,7 +306,15 @@ pub(super) fn score_driver_outcome(
             ScoreOutcome::Cancelled
         };
     }
-    if endpoint.proxy_socket.quic_path_stalled() {
+    if let Err(error) = result
+        && matches!(
+            honk_outbound::proxy::packet_error_class(error),
+            honk_outbound::proxy::PacketErrorClass::Rejected
+        )
+    {
+        return ScoreOutcome::Rejected;
+    }
+    if endpoint.quic_path_stalled() {
         return ScoreOutcome::Timeout;
     }
     match result {
@@ -299,11 +348,12 @@ impl UdpEndpointPool {
         decision_token: u32,
         endpoint: Arc<UdpEndpoint>,
         queue_rx: mpsc::Receiver<QueuedDatagram>,
-        reply_socket: Arc<UdpSocket>,
+        reply_socket: impl Into<DriverReplySocket>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
         outbound_name: String,
     ) -> UdpDriverHandle {
+        let reply_socket = reply_socket.into().into_socket();
         let key = EndpointKey::new(client_addr, client_dst);
         let outbound_tracker = stats.outbound_tracker(&outbound_name);
         let (ready_tx, ready) = oneshot::channel();
@@ -349,6 +399,7 @@ impl UdpEndpointPool {
                     queue_rx,
                     reply_socket,
                     reply_socket_factory: Arc::clone(&pool.reply_socket_factory),
+                    reply_socket_slots: Arc::clone(&pool.reply_socket_slots),
                     client_addr,
                     client_dst,
                     alive_set,
@@ -391,6 +442,7 @@ pub(super) async fn run_endpoint_driver(
         queue_rx,
         reply_socket,
         reply_socket_factory,
+        reply_socket_slots,
         client_addr,
         client_dst,
         alive_set,
@@ -414,23 +466,21 @@ pub(super) async fn run_endpoint_driver(
     )
     .await
     {
-        let congested = matches!(&failure, PacketSendFailure::Congestion(_));
+        let neutral = matches!(
+            &failure,
+            PacketSendFailure::Congestion(_) | PacketSendFailure::Rejected(_)
+        );
         let result = Err(failure.into_io_error());
         // Health reporting can synchronously retire and mark this endpoint dead.
         let outcome = score_driver_outcome(&endpoint, &result);
-        if !congested && !endpoint.dead.load(Ordering::Acquire) {
+        if !neutral && !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
             alive_set.report_unavailable_traffic(
                 endpoint.node_id,
                 honk_outbound::alive::ProbeDomain::DataUdp,
                 health_family,
             );
         }
-        let _ = first_ack.send(
-            result
-                .as_ref()
-                .map(|_| ())
-                .map_err(|error| io::Error::new(error.kind(), error.to_string())),
-        );
+        let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
         return UdpDriverResult { result, outcome };
     }
 
@@ -452,58 +502,76 @@ pub(super) async fn run_endpoint_driver(
                     error
                 );
             }
+            Err(PacketSendFailure::Rejected(error)) => {
+                let result = Err(error);
+                let outcome = score_driver_outcome(&endpoint, &result);
+                let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
+                return UdpDriverResult { result, outcome };
+            }
             Err(PacketSendFailure::Transport(error)) => {
                 let result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
-                if !endpoint.dead.load(Ordering::Acquire) {
+                if !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
                     alive_set.report_unavailable_traffic(
                         endpoint.node_id,
                         honk_outbound::alive::ProbeDomain::DataUdp,
                         health_family,
                     );
                 }
-                let _ = first_ack.send(
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| io::Error::new(error.kind(), error.to_string())),
-                );
+                let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
         }
     }
     let _ = first_ack.send(Ok(()));
 
-    let sender = send_followers(
-        Arc::clone(&endpoint),
-        queue_rx,
-        Arc::clone(&stats),
-        outbound_tracker.clone(),
-        send_timeout.as_mut(),
-    );
-    let receiver = receive_loop(
-        Arc::clone(&endpoint),
-        reply_socket,
-        reply_socket_factory,
-        client_addr,
-        client_dst,
-        Arc::clone(&alive_set),
-        stats,
-        outbound_tracker,
-    );
-    tokio::pin!(sender);
-    tokio::pin!(receiver);
-    let result = tokio::select! {
-        result = &mut sender => result,
-        result = &mut receiver => result,
+    let result = if endpoint.is_source() {
+        send_source_followers(
+            Arc::clone(&endpoint),
+            queue_rx,
+            Arc::clone(&stats),
+            outbound_tracker.clone(),
+            send_timeout.as_mut(),
+        )
+        .await
+    } else {
+        let sender = send_followers(
+            Arc::clone(&endpoint),
+            queue_rx,
+            Arc::clone(&stats),
+            outbound_tracker.clone(),
+            send_timeout.as_mut(),
+        );
+        let receiver = receive_loop(
+            Arc::clone(&endpoint),
+            reply_socket,
+            reply_socket_factory,
+            reply_socket_slots,
+            client_addr,
+            client_dst,
+            Arc::clone(&alive_set),
+            stats,
+            outbound_tracker,
+        );
+        tokio::pin!(sender);
+        tokio::pin!(receiver);
+        tokio::select! {
+            result = &mut sender => result,
+            result = &mut receiver => result,
+        }
     };
+    if endpoint.is_source() && result.as_ref().err().is_some_and(is_reply_idle_timeout) {
+        endpoint.source_flow_idle_expired();
+    }
     // Capture the score before the error-triggered death callback can retire it.
     let outcome = score_driver_outcome(&endpoint, &result);
     if let Err(error) = &result
+        && !endpoint.is_source()
         && !endpoint.dead.load(Ordering::Acquire)
         && !matches!(
             honk_outbound::proxy::packet_error_class(error),
             honk_outbound::proxy::PacketErrorClass::Congestion
+                | honk_outbound::proxy::PacketErrorClass::Rejected
         )
         && !(is_reply_idle_timeout(error) && endpoint.has_reply())
     {
@@ -541,6 +609,7 @@ async fn send_followers(
                     error
                 );
             }
+            Err(PacketSendFailure::Rejected(error)) => return Err(error),
             Err(PacketSendFailure::Transport(error)) => return Err(error),
         }
     }
@@ -548,6 +617,54 @@ async fn send_followers(
         io::ErrorKind::Interrupted,
         "UDP endpoint queue closed",
     ))
+}
+
+async fn send_source_followers(
+    endpoint: Arc<UdpEndpoint>,
+    mut queue_rx: mpsc::Receiver<QueuedDatagram>,
+    stats: Arc<StatsManager>,
+    outbound_tracker: OutboundTracker,
+    mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
+) -> io::Result<()> {
+    let mut reply_epoch = endpoint.reply_epoch.load(Ordering::Acquire);
+    let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
+    tokio::pin!(reply_idle_timeout);
+    loop {
+        tokio::select! {
+            packet = queue_rx.recv() => {
+                let Some(packet) = packet else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "UDP endpoint queue closed",
+                    ));
+                };
+                match send_one(
+                    &endpoint,
+                    &stats,
+                    &outbound_tracker,
+                    send_timeout.as_mut(),
+                    packet,
+                    false,
+                ).await {
+                    Ok(()) => {}
+                    Err(PacketSendFailure::Congestion(error)) => {
+                        debug!("UDP endpoint packet dropped under send congestion: {}", error);
+                    }
+                    Err(PacketSendFailure::Rejected(error))
+                    | Err(PacketSendFailure::Transport(error)) => return Err(error),
+                }
+            }
+            changed = endpoint.wait_for_reply_after(reply_epoch) => {
+                reply_epoch = changed;
+                reply_idle_timeout
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + REPLY_IDLE_TIMEOUT);
+            }
+            _ = reply_idle_timeout.as_mut() => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
+            }
+        }
+    }
 }
 
 async fn send_one(
@@ -571,21 +688,15 @@ async fn send_one(
     endpoint
         .begin_send_attempt()
         .map_err(PacketSendFailure::Transport)?;
-    let transport = endpoint.proxy_socket.as_ref();
-    let attempt = QuicSendAttempt::new(transport);
-    let timeout = transport.send_timeout().max(Duration::from_millis(1));
+    let attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
+    let source_admitted = endpoint.is_source().then(|| AtomicBool::new(false));
+    let timeout = endpoint.send_timeout().max(Duration::from_millis(1));
     send_timeout
         .as_mut()
         .reset(tokio::time::Instant::now() + timeout);
     let sent = tokio::select! {
         biased;
-        result = async {
-            if first {
-                transport.send_packet_confirmed(&packet.data).await
-            } else {
-                transport.send_packet(&packet.data).await
-            }
-        } => Ok(result),
+        result = endpoint.send_packet_with_admission(&packet.data, first, source_admitted.as_ref()) => Ok(result),
         _ = send_timeout.as_mut() => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "UDP PacketTransport send timed out",
@@ -596,13 +707,15 @@ async fn send_one(
         Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
     };
     let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
-    match &sent {
-        Ok(Ok(())) if endpoint_retired => attempt.failure(),
-        Ok(Ok(())) => attempt.success(),
-        Ok(Err(_)) | Err(_) if endpoint_retired => attempt.failure(),
-        Ok(Err(_)) | Err(_) if timed_out => attempt.timeout(),
-        Ok(Err(_)) | Err(_) => attempt.failure(),
-    };
+    if let Some(attempt) = attempt {
+        match &sent {
+            Ok(Ok(())) if endpoint_retired => attempt.failure(),
+            Ok(Ok(())) => attempt.success(),
+            Ok(Err(_)) | Err(_) if endpoint_retired => attempt.failure(),
+            Ok(Err(_)) | Err(_) if timed_out => attempt.timeout(),
+            Ok(Err(_)) | Err(_) => attempt.failure(),
+        }
+    }
     let result = if endpoint_retired {
         Err(PacketSendFailure::Transport(io::Error::new(
             io::ErrorKind::ConnectionAborted,
@@ -611,10 +724,27 @@ async fn send_one(
     } else {
         match sent {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(classify_send_error(transport, error)),
-            Err(error) => Err(classify_send_error(transport, error)),
+            Ok(Err(error)) => Err(classify_send_error(endpoint, error)),
+            Err(error)
+                if source_admitted
+                    .as_ref()
+                    .is_some_and(|admitted| !admitted.load(Ordering::Acquire)) =>
+            {
+                Err(PacketSendFailure::Congestion(error))
+            }
+            Err(error) => Err(classify_send_error(endpoint, error)),
         }
     };
+    if endpoint.is_source()
+        && !endpoint_retired
+        && let Err(PacketSendFailure::Transport(error)) = &result
+    {
+        endpoint.fail_source(if is_reply_idle_timeout(error) {
+            ScoreOutcome::Timeout
+        } else {
+            ScoreOutcome::Io(error.kind())
+        });
+    }
     if let Some(started) = started {
         stats.record_udp_first_send_latency(started.elapsed());
     }
@@ -637,8 +767,9 @@ async fn send_one(
 #[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     endpoint: Arc<UdpEndpoint>,
-    reply_socket: Arc<UdpSocket>,
+    reply_socket: Arc<ReplySocket>,
     reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
+    reply_socket_slots: Arc<Semaphore>,
     client_addr: SocketAddr,
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
@@ -646,6 +777,9 @@ async fn receive_loop(
     outbound_tracker: OutboundTracker,
 ) -> io::Result<()> {
     let ipver = endpoint.health_family;
+    let transport = endpoint
+        .flow_transport()
+        .expect("ordinary UDP receive loop requires a PacketTransport");
     // The normal fixed-target path keeps using the pre-created socket without
     // allocating. Full-cone sources populate this small endpoint-local cache.
     let mut alternate_reply_sockets = Vec::new();
@@ -658,7 +792,7 @@ async fn receive_loop(
             .reset(tokio::time::Instant::now() + REPLY_IDLE_TIMEOUT);
         let received = tokio::select! {
             biased;
-            packet = endpoint.proxy_socket.recv_packet(&mut buf) => Some(packet),
+            packet = transport.recv_packet(&mut buf) => Some(packet),
             _ = reply_idle_timeout.as_mut() => None,
         };
         let (n, source) = match received {
@@ -669,7 +803,7 @@ async fn receive_loop(
             }
         };
         if source != endpoint.relay_addr
-            && !endpoint.proxy_socket.allows_full_cone_replies()
+            && !transport.allows_full_cone_replies()
             && !endpoint.validate_reply_peer(source)
         {
             debug!(
@@ -708,7 +842,18 @@ async fn receive_loop(
                             "UDP endpoint reply-source socket cache is full",
                         ));
                     }
-                    let socket = reply_socket_factory.create(source)?;
+                    let socket = match ReplySocket::create(
+                        reply_socket_factory.as_ref(),
+                        &reply_socket_slots,
+                        source,
+                    ) {
+                        Ok(socket) => socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            debug!("UDP reply socket capacity exhausted for {}", source);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     alternate_reply_sockets.push((source, socket));
                     alternate_reply_sockets.len() - 1
                 }

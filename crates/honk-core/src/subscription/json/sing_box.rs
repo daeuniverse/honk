@@ -7,11 +7,6 @@ use serde_yaml::{Mapping, Value};
 use super::{
     NodeResult, NormalizedEntry, move_credential_strings, move_strings, put, take_optional_string,
 };
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PacketNetwork {
-    Both,
-    TcpOnly,
-}
 
 pub(super) fn normalize(value: Value) -> NodeResult {
     let Value::Mapping(mut source) = value else {
@@ -41,6 +36,9 @@ pub(super) fn normalize(value: Value) -> NodeResult {
             ));
         }
     };
+    if protocol == NodeProtocol::VLess && source.contains_key("vless_mode") {
+        return Err("VLESS vless_mode was removed");
+    }
     if source.remove("detour").is_some_and(|value| active(&value)) {
         return Err("sing-box detour chaining is unsupported");
     }
@@ -181,31 +179,30 @@ fn normalize_vmess(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
 fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
     move_credential_strings(&mut source, &mut proxy, &[("uuid", "uuid")])?;
     move_strings(&mut source, &mut proxy, &[("flow", "flow")])?;
-    let network = normalize_packet_network(&mut source, &mut proxy)?;
+    normalize_packet_network(&mut source, &mut proxy)?;
     let packet_encoding = source.remove("packet_encoding");
     let multiplex = normalize_vless_multiplex(&mut source, &mut proxy)?;
     let uot = normalize_vless_uot(&mut source, &mut proxy)?;
     let packet_encoding = match packet_encoding {
-        None | Some(Value::Null) if network == PacketNetwork::Both && !multiplex && !uot => "xudp",
-        None | Some(Value::Null) => "",
-        Some(Value::String(value)) if matches!(value.as_str(), "" | "xudp") => {
-            if value.is_empty() && network == PacketNetwork::Both && !multiplex && !uot {
-                return Err("native sing-box VLESS UDP is unsupported");
-            }
-            if network == PacketNetwork::TcpOnly || multiplex || uot || value.is_empty() {
-                ""
-            } else {
-                "xudp"
-            }
+        None | Some(Value::Null) if !multiplex && !uot => Some("xudp"),
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let encoding = match value.as_str() {
+                "" => "none",
+                "xudp" => "xudp",
+                _ => return Err("unsupported sing-box VLESS packet encoding"),
+            };
+            (!multiplex && !uot).then_some(encoding)
         }
-        Some(Value::String(_)) => return Err("unsupported sing-box VLESS packet encoding"),
         Some(_) => return Err("sing-box VLESS packet encoding must be a string"),
     };
-    put(
-        &mut proxy,
-        "packet-encoding",
-        Value::String(packet_encoding.into()),
-    );
+    if let Some(packet_encoding) = packet_encoding {
+        put(
+            &mut proxy,
+            "packet-encoding",
+            Value::String(packet_encoding.into()),
+        );
+    }
     normalize_transport(&mut source, &mut proxy)?;
     normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
@@ -340,28 +337,18 @@ fn normalize_anytls(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
     Ok(proxy)
 }
 
-fn normalize_packet_network(
-    source: &mut Mapping,
-    proxy: &mut Mapping,
-) -> Result<PacketNetwork, &'static str> {
+fn normalize_packet_network(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
     let network = match source.remove("network") {
-        None | Some(Value::Null) => return Ok(PacketNetwork::Both),
+        None | Some(Value::Null) => return Ok(()),
         Some(network) => network,
     };
     let Value::String(network) = network else {
         return Err("sing-box packet network must be a string");
     };
-    match packet_network(&network)? {
-        None => Ok(PacketNetwork::Both),
-        Some(false) => {
-            put(proxy, "udp", Value::Bool(false));
-            Ok(PacketNetwork::TcpOnly)
-        }
-        Some(true) => {
-            put(proxy, "udp", Value::Bool(true));
-            Ok(PacketNetwork::Both)
-        }
+    if let Some(enabled) = packet_network(&network)? {
+        put(proxy, "udp", Value::Bool(enabled));
     }
+    Ok(())
 }
 
 fn reject_packet_network(source: &mut Mapping) -> Result<(), &'static str> {

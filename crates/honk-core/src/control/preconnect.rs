@@ -97,19 +97,17 @@ impl ControlPlane {
                             ))
                             .await
                         {
-                            Ok(stream) if is_tcp_stream_alive(&stream) => {
-                                if let Some(reporter) = &reporter {
-                                    reporter.setup_succeeded();
-                                }
-                                pool.deposit_tcp(&addr, stream).await;
-                                stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
-                                if let Some(reporter) = &reporter {
-                                    reporter.finish_setup_only();
-                                }
-                                debug!("Preconnect warmup: deposited connection to {}", addr);
-                            }
-                            Ok(_) => {
-                                if let Some(reporter) = &reporter {
+                            Ok(stream) => {
+                                if pool.deposit_tcp(&addr, stream).await {
+                                    if let Some(reporter) = &reporter {
+                                        reporter.setup_succeeded();
+                                    }
+                                    stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
+                                    if let Some(reporter) = &reporter {
+                                        reporter.finish_setup_only();
+                                    }
+                                    debug!("Preconnect warmup: deposited connection to {}", addr);
+                                } else if let Some(reporter) = &reporter {
                                     reporter.setup_failed(crate::group::ScoreOutcome::Io(
                                         io::ErrorKind::ConnectionAborted,
                                     ));

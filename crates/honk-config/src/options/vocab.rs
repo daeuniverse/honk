@@ -38,13 +38,13 @@ where
 
 /// Normalize the optional VLESS flow value.
 ///
-/// Empty and whitespace-only values are absent. The only supported nonempty
-/// value is the exact Vision flow spelling.
+/// Empty and whitespace-only values are absent. Nonempty values retain one of
+/// the two exact supported Vision spellings.
 pub fn optional_flow(value: Option<&str>) -> Result<Option<&str>, &'static str> {
     let Some(value) = optional_text([value])? else {
         return Ok(None);
     };
-    if value == "xtls-rprx-vision" {
+    if matches!(value, "xtls-rprx-vision" | "xtls-rprx-vision-udp443") {
         Ok(Some(value))
     } else {
         Err("unsupported VLESS flow")

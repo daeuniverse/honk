@@ -1483,6 +1483,41 @@ async fn test_node_delay_failure_is_503() {
     assert_eq!(resp.status(), 404);
 }
 
+#[tokio::test]
+async fn node_delay_resolver_refusal_does_not_demote_node() {
+    honk_outbound::urltest::set_urltest_resolver(Arc::new(|host, port| {
+        Box::pin(async move {
+            if host == "packet-refusal.invalid" {
+                return Err(honk_outbound::proxy::PacketRejection::Policy.into());
+            }
+            Ok(tokio::net::lookup_host((host.as_str(), port))
+                .await?
+                .collect())
+        })
+    }));
+    let app = spawn_app("", "").await;
+    app.state.alive_set.record_probe_latency(
+        make_node("node-a").id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(123),
+    );
+    let client = http_client();
+    for _ in 0..2 {
+        let response = client
+            .get(app.url("/proxies/node-a/delay?url=https://packet-refusal.invalid/&timeout=1000"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert!(!app.state.alive_set.is_failure_demoted(
+        make_node("node-a").id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+    ));
+}
+
 /// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
 /// sub-group members to their representative leaves, consecutive failures
 /// replace the leaf's display history, and `/proxies/{subgroup-tag}/delay`

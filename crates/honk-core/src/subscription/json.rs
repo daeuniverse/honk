@@ -197,7 +197,7 @@ fn move_credential_strings(
 
 #[cfg(test)]
 mod tests {
-    use honk_config::node::WireMode;
+    use honk_config::node::{VlessMultiplex, VlessUdpEncoding};
     use honk_config::types::NodeProtocol;
 
     use super::*;
@@ -242,7 +242,7 @@ mod tests {
                     {"type":"shadowsocks","tag":"ss","server":"ss.example","server_port":8388,"method":"aes-256-gcm","password":"ss-password"},
                     {"type":"socks","tag":"socks","server":"socks.example","server_port":1080,"version":"5","username":"user","password":"socks-password"},
                     {"type":"vmess","tag":"vmess","server":"vmess.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000002","security":"auto","alter_id":0,"network":"tcp","tls":{"enabled":true,"server_name":"vmess-sni.example","insecure":true},"transport":{"type":"ws","path":"/socket","headers":{"Host":"ws-host.example"}}},
-                    {"type":"vless","tag":"vless","server":"vless.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000003","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"vless-sni.example","reality":{"enabled":true,"public_key":"jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc","short_id":"abcd"},"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"TunService"}},
+                    {"type":"vless","tag":"vless","server":"vless.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000003","tls":{"enabled":true,"server_name":"vless-sni.example","reality":{"enabled":true,"public_key":"jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc","short_id":"abcd"},"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"TunService"}},
                     {"type":"trojan","tag":"trojan","server":"trojan.example","server_port":443,"password":"trojan-password","tls":{"enabled":true,"server_name":"trojan-sni.example"}},
                     {"type":"hysteria2","tag":"hy2","server":"hy2.example","server_ports":["20000:20002","8443"],"hop_interval":"15s","up_mbps":100,"down_mbps":200,"password":"hy2-password","obfs":{"type":"salamander","password":"obfs-password"},"initial_stream_receive_window":1048576,"initial_connection_receive_window":2097152,"disable_path_mtu_discovery":true,"tls":{"enabled":true,"server_name":"hy2-sni.example","insecure":true,"alpn":["h3"]}},
                     {"type":"tuic","tag":"tuic","server":"tuic.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000004","password":"tuic-password","congestion_control":"bbr","udp_relay_mode":"native","initial_packet_size":1252,"tls":{"enabled":true,"server_name":"tuic-sni.example","alpn":["h3","tuic"]}},
@@ -289,7 +289,7 @@ mod tests {
         assert!(vmess.tls().unwrap().skip_cert_verify);
 
         let vless = nodes[3].vless().unwrap();
-        assert_eq!(vless.mode, WireMode::Xudp);
+        assert_eq!(vless.udp_encoding, VlessUdpEncoding::Xudp);
         assert_eq!(vless.transport.transport, "grpc");
         assert_eq!(vless.transport.grpc_service.as_deref(), Some("TunService"));
         assert_eq!(
@@ -324,26 +324,104 @@ mod tests {
     }
 
     #[test]
-    fn sing_box_vless_packet_and_multiplex_modes_are_not_guessed() {
+    fn sing_box_vless_packet_settings_preserve_source_defaults_and_network_gate() {
         let nodes = parse_json_subscription(
             json(
                 r#"{"outbounds":[
                   {"type":"vless","tag":"default-xudp","server":"one.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000011"},
-                  {"type":"vless","tag":"explicit-native","server":"two.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000012","network":"tcp","packet_encoding":""},
-                  {"type":"vless","tag":"h2mux","server":"three.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000013","multiplex":{"enabled":true,"protocol":"h2mux","padding":true}},
-                  {"type":"vless","tag":"uot","server":"four.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000014","udp_over_tcp":{"enabled":true,"version":2}},
-                  {"type":"vless","tag":"mux-explicit-xudp","server":"five.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000019","packet_encoding":"xudp","multiplex":{"enabled":true,"protocol":"h2mux"}}
+                  {"type":"vless","tag":"default-xudp-disabled","server":"disabled-default.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000010","network":"tcp"},
+                  {"type":"vless","tag":"native-enabled","server":"two.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000012","packet_encoding":"","multiplex":{"enabled":false}},
+                  {"type":"vless","tag":"native-disabled","server":"three.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000013","network":"tcp","packet_encoding":""},
+                  {"type":"vless","tag":"xudp-disabled","server":"four.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000014","network":"tcp","packet_encoding":"xudp"},
+                  {"type":"vless","tag":"native-vision-tcp","server":"five.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000015","network":"tcp","packet_encoding":"","flow":"xtls-rprx-vision","tls":{"enabled":true}},
+                  {"type":"vless","tag":"h2mux-disabled","server":"six.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000016","network":"tcp","multiplex":{"enabled":true,"protocol":"h2mux","padding":true}},
+                  {"type":"vless","tag":"uot","server":"seven.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000017","udp_over_tcp":{"enabled":true,"version":2}},
+                  {"type":"vless","tag":"wrapper-precedence","server":"eight.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000018","packet_encoding":"","multiplex":{"enabled":true,"protocol":"h2mux"}},
+                  {"type":"vless","tag":"disabled-wrapper-default","server":"nine.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000019","multiplex":{"enabled":false}},
+                  {"type":"vless","tag":"xudp-wrapper-precedence","server":"ten.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000020","packet_encoding":"xudp","multiplex":{"enabled":true,"protocol":"h2mux"}}
                 ]}"#,
             ),
             None,
         )
         .unwrap();
-        assert_eq!(nodes[0].vless().unwrap().mode, WireMode::Xudp);
-        assert_eq!(nodes[1].vless().unwrap().mode, WireMode::Legacy);
-        assert_eq!(nodes[1].network(), Some("tcp"));
-        assert_eq!(nodes[2].vless().unwrap().mode, WireMode::H2muxPadded);
-        assert_eq!(nodes[3].vless().unwrap().mode, WireMode::UotV2);
-        assert_eq!(nodes[4].vless().unwrap().mode, WireMode::H2mux);
+
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "default-xudp",
+                "default-xudp-disabled",
+                "native-enabled",
+                "native-disabled",
+                "xudp-disabled",
+                "native-vision-tcp",
+                "h2mux-disabled",
+                "uot",
+                "wrapper-precedence",
+                "disabled-wrapper-default",
+                "xudp-wrapper-precedence",
+            ]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| {
+                    let config = node.vless().unwrap();
+                    (config.udp_encoding, config.multiplex, config.udp_enabled())
+                })
+                .collect::<Vec<_>>(),
+            [
+                (VlessUdpEncoding::Xudp, VlessMultiplex::Off, true),
+                (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+                (VlessUdpEncoding::Native, VlessMultiplex::Off, true),
+                (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+                (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+                (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+                (
+                    VlessUdpEncoding::Auto,
+                    VlessMultiplex::H2 { padding: true },
+                    false,
+                ),
+                (VlessUdpEncoding::UotV2, VlessMultiplex::Off, true,),
+                (
+                    VlessUdpEncoding::Auto,
+                    VlessMultiplex::H2 { padding: false },
+                    true,
+                ),
+                (VlessUdpEncoding::Xudp, VlessMultiplex::Off, true),
+                (
+                    VlessUdpEncoding::Auto,
+                    VlessMultiplex::H2 { padding: false },
+                    true,
+                ),
+            ]
+        );
+        assert!(nodes.iter().all(|node| node.id == node.derive_id()));
+    }
+
+    #[test]
+    fn sing_box_rejects_removed_vless_mode_before_projection() {
+        assert!(matches!(
+            sing_box::normalize(json(r#"{"type":"vless","vless_mode":null}"#)),
+            Err("VLESS vless_mode was removed")
+        ));
+        let nodes = parse_json_subscription(
+            json(
+                r#"{"outbounds":[
+                  {"type":"vless","tag":"null","server":"null.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000071","vless_mode":null},
+                  {"type":"vless","tag":"empty","server":"empty.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000072","vless_mode":""},
+                  {"type":"vless","tag":"false","server":"false.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000073","vless_mode":false},
+                  {"type":"vless","tag":"old-value","server":"old.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000074","vless_mode":"legacy"},
+                  {"type":"vmess","tag":"vmess-unchanged","server":"vmess.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000075","vless_mode":"xudp"}
+                ]}"#,
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "vmess-unchanged");
     }
 
     const C10_SING_BOX_TRANSPORTS: &str = r#"{"outbounds":[
@@ -403,9 +481,9 @@ mod tests {
                 "native-anytls-udp"
             ]
         );
-        assert_eq!(nodes[0].network(), Some("tcp,udp"));
+        assert!(nodes[0].vless().unwrap().udp_enabled());
         assert_eq!(nodes[0].transport().unwrap().transport, "ws");
-        assert_eq!(nodes[1].network(), Some("tcp,udp"));
+        assert!(nodes[1].vless().unwrap().udp_enabled());
         assert_eq!(nodes[1].transport().unwrap().transport, "grpc");
         assert_eq!(nodes[2].network(), None);
         assert_eq!(nodes[2].transport().unwrap().transport, "tcp");
@@ -449,7 +527,6 @@ mod tests {
                 r#"{"outbounds":[
                   {"type":"selector","tag":"select","outbounds":["good"]},
                   {"type":"vless","tag":"bad-packet-mode","server":"bad.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000021","packet_encoding":"packetaddr"},
-                  {"type":"vless","tag":"unsupported-native-udp","server":"native.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000024","packet_encoding":""},
                   {"type":"hysteria2","tag":"bad-hop-range","server":"bad-hop.example","server_ports":["9000:8000"],"password":"password","tls":{"enabled":true}},
                   {"type":"hysteria2","tag":"bad-hy2-alpn","server":"bad-hy2.example","server_port":443,"password":"password","tls":{"enabled":true,"alpn":["hq-29"]}},
                   {"type":"juicity","tag":"bad-juicity-alpn","server":"bad-juicity.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000022","password":"password","tls":{"enabled":true,"alpn":["hq-29"]}},

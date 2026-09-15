@@ -19,7 +19,7 @@ use options::{
     RecordOptions, take_any_active, take_any_matching, take_bool, take_bool_alias,
     take_credential_alias, take_duration_alias, take_option, take_optional_flow_alias,
     take_optional_text_alias, take_packet_network, take_raw, take_stream_transport_alias,
-    take_vmess_cipher_alias,
+    take_vless_packet_encoding_alias, take_vmess_cipher_alias,
 };
 
 /// Parse physical records while emitting one normalized outcome at a time.
@@ -128,7 +128,7 @@ fn parse_named(fields: &[Field], protocol: &'static str) -> RecordResult<Mapping
     }
     let port = parse_port(fields.get(2).ok_or("record port is missing")?.value.trim())
         .ok_or("record port is invalid")?;
-    let (positions, mut options) = positional_options(fields, 3, Dialect::Named)?;
+    let (positions, mut options) = positional_options(fields, 3, Dialect::Named, protocol)?;
     options.remove("tag");
     normalize_protocol(
         Dialect::Named,
@@ -145,7 +145,7 @@ fn parse_qx(fields: &[Field], protocol: &'static str) -> RecordResult<Mapping> {
     let (_, endpoint) = record_header(fields.first().ok_or("record header is missing")?)
         .ok_or("record header is malformed")?;
     let (server, port) = parse_endpoint(endpoint).ok_or("record endpoint is invalid")?;
-    let (positions, mut options) = positional_options(fields, 1, Dialect::QuantumultX)?;
+    let (positions, mut options) = positional_options(fields, 1, Dialect::QuantumultX, protocol)?;
     if !positions.is_empty() {
         return Err("Quantumult X record has a positional field");
     }
@@ -170,6 +170,9 @@ fn normalize_protocol(
     positions: &[String],
     mut options: RecordOptions,
 ) -> RecordResult<Mapping> {
+    if protocol == "vless" && options.contains("vless_mode") {
+        return Err("VLESS vless_mode was removed");
+    }
     consume_record_controls(protocol, &mut options)?;
     let mut map = base_mapping(protocol, name, server, port);
     apply_security(&mut map, dialect, protocol, &mut options)?;
@@ -255,6 +258,7 @@ fn positional_options(
     fields: &[Field],
     start: usize,
     dialect: Dialect,
+    protocol: &str,
 ) -> RecordResult<(Vec<String>, RecordOptions)> {
     let mut positions = Vec::new();
     let mut options = RecordOptions::default();
@@ -262,7 +266,11 @@ fn positional_options(
         if field.value.trim().is_empty() {
             continue;
         }
-        if field.quoted || (dialect == Dialect::Named && looks_like_base64_credential(&field.value))
+        // VLESS credentials are UUIDs; the base64 heuristic swallows empty options.
+        if field.quoted
+            || (dialect == Dialect::Named
+                && protocol != "vless"
+                && looks_like_base64_credential(&field.value))
         {
             positions.push(if field.quoted {
                 field.value.clone()
@@ -439,7 +447,7 @@ fn apply_protocol(
             if dialect == Dialect::Named {
                 apply_transport(map, options, positions)?;
             }
-            apply_vless_mode(map, options)?;
+            apply_vless_packet_encoding(map, options)?;
         }
         "hysteria2" => {
             let auth = take_credential_alias(options, &["password", "auth"])?.or_else(|| {
@@ -736,7 +744,7 @@ fn tls_capable(protocol: &str) -> bool {
     )
 }
 
-fn apply_vless_mode(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
+fn apply_vless_packet_encoding(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
     for key in ["packet-addr", "packet_addr", "packetaddr"] {
         if let Some(value) = options.remove(key)
             && parse_bool(&value).ok_or("record boolean option is invalid")?
@@ -744,16 +752,8 @@ fn apply_vless_mode(map: &mut Mapping, options: &mut RecordOptions) -> RecordRes
             return Err("VLESS packet-addr is unsupported");
         }
     }
-    if let Some(value) = take_option(
-        options,
-        &["packet-encoding", "packet_encoding", "packetencoding"],
-    ) {
-        if !matches!(value.as_str(), "none" | "xudp" | "") {
-            return Err("VLESS packet encoding is unsupported");
-        }
-        if value == "xudp" {
-            put_str(map, "packet-encoding", "xudp");
-        }
+    if let Some(encoding) = take_vless_packet_encoding_alias(options)? {
+        put_str(map, "packet-encoding", encoding);
     }
     Ok(())
 }

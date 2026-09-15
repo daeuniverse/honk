@@ -58,6 +58,8 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 
 `build_tuples_key` 必须用 `mem::zeroed()` 初始化 `TuplesKey`。这个 `#[repr(C)]` key 在 40 字节布局中只有 37 字节字段，内核会散列包括三个 padding 字节在内的全部 40 字节。因此逐字段初始化可能产生用户态无法可靠查询或删除的 key。
 
+权威单候选 TCP 的 transport 失败只重试一次，且重新解析必须提供有效替代项。URLTest 使用 target-aware retry plan 中按延迟排序的前三个候选；Score 记录失败、重新评估精确目标，只重试不同的替代节点。本地 typed refusal 是终态，包括排空竞速任务时发现的已完成拒绝；其他策略或真正的单叶结果不重试。
+
 ## UDP endpoint 流水线
 
 ### 目的地址 provenance
@@ -75,18 +77,40 @@ UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP
 
 ### Transport 与事务
 
-`PacketTransport` 是生产 UDP 的唯一接口。原生 UDP handler 包装真实 socket；隧道 handler 直接实现 framing，并暴露 `relay_addr()`、`send_packet`、`send_packet_confirmed` 和 `recv_packet`。控制平面不会为 framed transport 创建 loopback socket bridge。
+普通 transport 使用 `PacketTransport`；native handler 包装真实 socket，tunnel
+直接实现 packet framing。来源共享的 VLESS XUDP/Mux.Cool 则提交类型化 source
+attachment，让 endpoint view 共用一条 transport receiver。两种形态都不创建
+loopback bridge。
 
 Endpoint 创建是事务性的：
 
 1. 把 `(client, original destination)` 预留为 `Initializing`；lease 持有首个 datagram、queue permit、slow-path permit、token、generation 和 cancellation epoch。
-2. 路由、嗅探、选择并最终确定一个合格 transport。在发布前创建透明 anyfrom reply socket。
-3. 启动 endpoint driver，并等待其 ready barrier。
-4. 在共享 epoch fence 下，把精确的 `Initializing` identity 原子替换为 `Ready`。
-5. 转移保留的首包，用 `send_packet_confirmed` 发送并等待 acknowledgement。
-6. 按 FIFO 顺序发送嗅探保留的 fragment 和未触碰的 queue follower，再运行 steady send 和 receive 路径。
+2. 路由、嗅探、选择并准备合格 transport。在发布前创建透明 anyfrom reply socket。
+3. 只提交选中候选的 `PreparedUdpTransport<T>` 或 VLESS source preparation；fallible commit 返回选中的 `Arc<T>`/attachment，drop loser 自动回滚。
+4. 启动 endpoint driver，并等待其 ready barrier。
+5. 在共享 epoch fence 下，把精确的 `Initializing` identity 原子替换为 `Ready`。
+6. 转移保留的首包，通过已提交 transport 发送并等待 acknowledgement。
+7. 按 FIFO 顺序发送嗅探保留的 fragment 和未触碰的 queue follower，再运行 steady send 和 receive 路径。
 
-透明 UDP 的 transport preparation 在路由与选择完成后开始，直到最终 transport 的协议状态 commit 完成才结束。权威路径与冷启动 URLTest 共用一个绝对 `max(10s, 4 × connect_timeout)` deadline，覆盖代理主机名解析、物理拨号准入、控制协商、stagger／满容量等待和 commit。scheduler 到期后不再启动后续候选，并在 initializer 恢复前中止和排空所有已启动任务。嗅探／路由位于该边界之前；reply socket 创建、driver ready 与报文发送位于其后，分别受已有事务或 I/O 上限约束。
+透明 UDP preparation 在路由与选择完成后开始，到选中 transport 的协议状态
+commit 完成才结束。权威路径与冷启动 URLTest 共用一个绝对
+`max(10s, 4 × connect_timeout)` deadline，覆盖解析、物理拨号准入、控制协商、
+stagger／满容量等待与 commit。到期后不再启动后续候选，并在返回前排空所有
+已启动 preparation。嗅探／路由位于该边界之前；reply socket 创建、发布与
+packet I/O 位于其后，受已有事务及 I/O 上限约束。不会自动重放 packet。
+
+对于来源共享 VLESS，`udp_endpoint/source.rs` 按 reused runtime identity、
+规范化 client、UDP path 与 `ActualPeer` 或 `RewriteTo(original destination)`
+索引一个 owner。它持有一条 XUDP session、一条 receiver 与多个 endpoint send
+view。完整 `(client, destination)` endpoint map 仍权威持有 route、token、
+generation 与逐 flow Score。reply classification 不会把已占用 wrong-owner、
+`Initializing` 或 `Retiring` entry 当作 foreign；只有缺失的 `ActualPeer` key
+可做 foreign delivery，且没有逐 flow Score。domain route 保持 original
+destination scope。迟到的 send/reply/removal callback 在动作前重新校验 owner、
+token、generation 与 endpoint identity。
+Source sharing 不会合并 kernel/NFQUEUE flow ownership：每个规范 endpoint
+继续保有独立 decision token、generation、terminal transition 与五元组
+retirement fence。
 
 每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST、PKTINFO 与逐报文 `SO_MARK` 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送各有五秒超时。超时或错误具有歧义，因为 transport 可能已接受 packet 的一部分，因此 driver 不会重放该 datagram，也不会继续后续 follower。
 
@@ -100,7 +124,9 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 
 每个 UDP 流最多保留 64 个 datagram，包括首包。所有流共享精确的 8 MiB payload permit 预算。准入在复制前取得每流 slot 和全局 byte permit；FIFO 饱和时丢弃最新 datagram。NFQUEUE 有独立 ingest actor，限制为 256 个条目和 8 MiB 排队 payload。
 
-启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算输入上限设为 1,048,576。在该上限处，固定分区为：
+启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算
+输入上限设为 1,048,576。在剩余描述符决定 UDP endpoint 数量之前，先按
+`min(after_dials / 8, 8192)` 分出 VLESS carrier 容量。在上限处固定分区为：
 
 | 所有者 | 容量 | 描述符记账 |
 | --- | ---: | ---: |
@@ -108,17 +134,32 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 | 已接受 TCP 流 | 16,384 | 每个 6 = 98,304 |
 | 保留 TCP pool | 2048 | 每个 1 = 2048 |
 | 临时出站 dial | 1024 | 每个 1 = 1024 |
-| UDP endpoint | 8192 | 每个 3 = 24,576 |
-| **合计** |  | **126,208** |
-剩余描述符余量有意不分配：较高的 `RLIMIT_NOFILE` 不代表拥有等量的内存或调度能力。TCP 从描述符导出的固定分区开始，该分区封顶为 16,384 个流，并在保留一半 non-TCP 预算作为突发余量的前提下借用空闲的 non-TCP 描述符余量。在 1,048,576 上限处，保留的 non-TCP 所有者空闲时，当前目标可提高到 18,688；4,096 描述符服务则可从 160 扩展到 320。已有流不会被切断，固定预留用于保护控制平面描述符。
+| VLESS 物理 carrier | 8192 | 每个 1 = 8192 |
+| UDP endpoint | 8192 | 每个 10 = 81,920 |
+| **合计** |  | **191,744** |
 
-一个 TCP 流为 accepted socket、outbound socket 和两组各含两个 FD 的 splice pipe 记账。一个 UDP endpoint 按常见最坏所有权形态记账：relay socket、SOCKS5 控制流和 anyfrom reply socket。较小的 `RLIMIT_NOFILE` 值以相同的饱和算术缩放分区。
+一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流和全部八个
+anyfrom reply socket 记账。一个 TCP 流为 accepted/outbound socket 和两组
+各含两个 FD 的 splice pipe 记账。更小限制使用相同的饱和分区；VLESS carrier
+结果为零时保持零。
+
+进程 VLESS-carrier semaphore 由 traffic generation 与 DNS runtime fork 共享。
+carrier 在 actual I/O 的 provisional、active、draining 与 idle 状态中始终持有
+permit，直到 task teardown 才释放。权威 physical-FD 上限是该进程 gate，
+而不是逐节点 pool limit 的总和。耗尽返回类型化 local capacity rejection，
+不影响节点 health 或 Score。
+
+其余 descriptor headroom 有意不分配：较高 `RLIMIT_NOFILE` 不代表拥有等量
+memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 16,384
+个 flow；它可借用 idle non-TCP headroom，同时保留一半作为 burst reserve，
+且不超过 floor 的两倍。已有 flow 不会被切断，固定 reserve 保护控制面 FD。
 
 各准入上限彼此独立：
 
 | 准入 | 上限 |
 | --- | ---: |
-| TCP 流 permit | 描述符导出的 floor；1,048,576 上限时为 16,384，借用空闲保留余量后可达 18,688 |
+| TCP 流 permit | 描述符导出的 floor，加上对观测到的 idle non-TCP headroom 的有界借用 |
+| VLESS 物理 carrier | 启动时固定的 `min(after_dials / 8, 8192)` 进程 gate |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | 端口 53 入口 slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
@@ -132,6 +173,10 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 当两端都是普通 `TcpStream` 时，`relay_splice` 运行两个并发 `splice(2)` pump。每个方向持有一条最多 64 KiB 的非阻塞 pipe，因此全双工中继最多请求四个 pipe FD 和 128 KiB pipe page。EOF 对另一端 write side 执行 half-close，并允许反向继续排空。
 
 每个方向的首次 splice 同时是 capability probe。在任何字节到达目的 socket 前返回 `EINVAL`、`ENOSYS` 或 `EXDEV`，即可无损回退到用户态 copy，并设置进程全局 latch；后续连接跳过 probe。其他错误，或字节已经暂存后返回 unsupported，会使中继失败，而不是冒数据丢失风险。TLS 或协议包装流使用 `relay_auto`，它始终使用基于 select 的 copy loop。
+
+copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的字节，再使用
+Tokio 原生 copier；输入暂时空闲时也会 flush 待发字节。每个方向使用默认
+8 KiB 缓冲区，不要求应用再发一个请求或关闭连接才能送出当前请求。
 
 首次 EOF 后，两条中继路径只限制空闲排空时间：`DRAIN_DEADLINE` 是没有任何字节进展的 30 秒。活跃 survivor 可以运行超过 30 秒；静默 survivor 不能无限持有 accepted socket。
 

@@ -8,10 +8,10 @@
 //! IPv6:   ATYP(0x04) | 16 octets | port(2)
 //! ```
 //!
-//! The trojan, shadowsocks (+2022), anytls and juicity
-//! handlers all use this exact layout; VMess and TUIC use the same layout
-//! with a different ATYP numbering ([`AtypScheme`]). VLESS keeps its own
-//! encoding (port before ATYP) and is deliberately not unified here.
+//! The trojan, shadowsocks (+2022), AnyTLS, Juicity, and TUIC handlers use
+//! this address-then-port layout; TUIC selects different ATYP bytes through
+//! [`AtypScheme`]. VMess also reuses that numbering table but writes the port
+//! first. VLESS keeps its own encoding and is deliberately not unified here.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

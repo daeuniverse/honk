@@ -95,8 +95,6 @@ pub fn alive_index(domain: ProbeDomain, ipver: IpVersion) -> usize {
     domain as usize * IpVersion::count() + ipver as usize
 }
 
-pub type ProtocolDomain = ProbeDomain;
-
 /// Result of one HTTP health probe. Only a complete warm exchange is healthy
 /// and contributes latency; setup and target-exchange failures stay distinct
 /// for diagnostics.
@@ -105,6 +103,7 @@ pub enum HttpProbeResult {
     WarmSuccess(Duration),
     SetupFailure(String),
     ExchangeFailure(String),
+    LocalRefusal(crate::proxy::PacketRejection),
 }
 
 /// Trait for HTTP-based health check probing through proxy nodes.
@@ -139,11 +138,12 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 /// from UDP selection permanently (no traffic left to revive them).
 #[derive(Debug)]
 pub struct UdpProbeOutcome {
-    /// Round-trip of the minimal DNS query through the node's UDP transport.
-    pub dns: Result<Duration, String>,
+    /// Round-trip of the minimal DNS query through the node's UDP transport;
+    /// `None` when target policy skips it or local target initialization is still pending.
+    pub dns: Option<anyhow::Result<Duration>>,
     /// Independent data-path handshake result; `None` when not run (no HTTPS
-    /// check URL, or the node belongs to no Score group).
-    pub data_path: Option<Result<Duration, String>>,
+    /// check URL, no Score group, or target policy skips it).
+    pub data_path: Option<anyhow::Result<Duration>>,
 }
 
 /// Trait for UDP-based health check probing through proxy nodes.
@@ -251,17 +251,10 @@ impl Default for PerProtocolState {
 }
 
 fn fresh_states() -> [PerProtocolState; ALIVE_STATES_PER_NODE] {
-    [
-        PerProtocolState::new(),
-        PerProtocolState::new(),
-        PerProtocolState::new(),
-        PerProtocolState::new(),
-        PerProtocolState::new(),
-        PerProtocolState::new(),
-    ]
+    std::array::from_fn(|_| PerProtocolState::new())
 }
 
-type EbpfAliveCallback = Box<dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync>;
+type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
 
 /// Callback fired when a node's (domain, ip-version) state flips
 /// alive→dead on the probe path (same trigger as the eBPF connectivity
@@ -269,7 +262,7 @@ type EbpfAliveCallback = Box<dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync>;
 /// honk-core purges pooled connections and UDP endpoints bound to the
 /// node from it. Fires once per domain/ip-version flip — handlers
 /// must be idempotent.
-type DeathCallback = Box<dyn Fn(Uuid, &str) + Send + Sync>;
+type DeathCallback = dyn Fn(Uuid, &str) + Send + Sync;
 
 /// Resolves a custom-check-URL group's member tags to `(tag, current
 /// leaf node)` pairs for probing (see `url_member_resolver`).
@@ -306,16 +299,13 @@ pub struct ProbeRecord {
 /// Maximum probe history entries per node per domain/IP version.
 const MAX_PROBE_HISTORY: usize = 100;
 
-/// Domain resolver for health-check targets: `(host, port) → addrs`.
+/// Domain resolver for health-check targets: `(host, port) → Result<addrs>`.
 /// honk-core installs the DNS-forwarder-backed resolver so all health-check
 /// name resolution shares honk's own DNS stack (routing, cache, serve-stale)
 /// instead of the raw system resolver; bootstrap DNS stays for node
 /// hostnames and startup.
 pub type ResolveHook = Arc<
-    dyn Fn(
-            String,
-            u16,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+    dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<SocketAddr>>> + Send>>
         + Send
         + Sync,
 >;
@@ -326,9 +316,9 @@ pub struct AliveDialerSet {
     states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
-    registered: RwLock<HashMap<Uuid, RegisteredNode>>,
-    ebpf_callback: RwLock<Option<EbpfAliveCallback>>,
-    death_callback: RwLock<Option<DeathCallback>>,
+    registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
+    ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
+    death_callback: RwLock<Option<Arc<DeathCallback>>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
@@ -342,12 +332,10 @@ pub struct AliveDialerSet {
     /// Last emergency probe timestamps per node for cooldown (Go: lastNotifyUdp/lastNotifyTcp).
     last_emergency_tcp: Mutex<HashMap<Uuid, Instant>>,
     last_emergency_udp: Mutex<HashMap<Uuid, Instant>>,
-    /// HTTP health check URL and method from config (Go: TcpCheckOption).
-    /// When set, the probe uses HTTP(S) requests through the proxy instead of
-    /// raw TCP connect, matching Go's `HttpCheck` behaviour.
+    /// HTTP health prober and URL from config (Go: TcpCheckOption).
+    /// When set, probes use HTTP(S) through the proxy instead of raw TCP.
     http_prober: RwLock<Option<HttpProberRef>>,
     check_url: RwLock<String>,
-    check_method: RwLock<String>,
     /// Probe target for the `direct` node (`host:port`): the proxy check URL
     /// is meaningless for direct egress, so direct is measured with a raw
     /// TCP connect against the bootstrap resolver instead. Defaults to
@@ -427,7 +415,6 @@ impl AliveDialerSet {
             last_emergency_udp: Mutex::new(HashMap::new()),
             http_prober: RwLock::new(None),
             check_url: RwLock::new(String::new()),
-            check_method: RwLock::new(String::new()),
             direct_check_addr: RwLock::new(DEFAULT_DIRECT_CHECK_ADDR.to_string()),
             check_url_ips: RwLock::new(Vec::new()),
             udp_prober: RwLock::new(None),
@@ -471,7 +458,6 @@ impl AliveDialerSet {
         check_method: String,
     ) {
         *self.http_prober.write() = Some(prober);
-        *self.check_method.write() = check_method.clone();
 
         let Ok(target) = honk_config::check::decode_health_http_target(&check_url) else {
             tracing::warn!("Invalid health check URL; falling back to TCP probe");
@@ -485,7 +471,7 @@ impl AliveDialerSet {
         // Resolve the check URL hostname once at startup; dae-format literal
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
-        let addrs = self.resolve_host(hostname, port).await;
+        let addrs = self.resolve_host(hostname, port).await.unwrap_or_default();
         if addrs.is_empty() {
             tracing::warn!("Failed to resolve health check URL '{}'", hostname);
         }
@@ -523,21 +509,28 @@ impl AliveDialerSet {
         *self.resolver.write() = Some(hook);
     }
 
-    /// Resolve `host` via the installed hook, falling back to the system
-    /// resolver when no hook is set or the hook finds nothing.
-    pub async fn resolve_host(&self, host: &str, port: u16) -> Vec<SocketAddr> {
+    /// Resolve `host` via the installed hook. Typed local refusal is returned;
+    /// ordinary empty or failed hook results retain the system fallback.
+    pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let hook = self.resolver.read().clone();
         if let Some(hook) = hook {
-            let out = hook(host.to_string(), port).await;
-            if !out.is_empty() {
-                return out;
+            match hook(host.to_string(), port).await {
+                Ok(out) if !out.is_empty() => return Ok(out),
+                Err(error) if crate::proxy::is_packet_rejection(&error) => return Err(error),
+                Ok(_) => {
+                    tracing::debug!(
+                        "health-check resolver found nothing for {host}; system fallback"
+                    )
+                }
+                Err(_) => {
+                    tracing::debug!("health-check resolver failed for {host}; system fallback")
+                }
             }
-            tracing::debug!("health-check resolver found nothing for {host}; system fallback");
         }
-        tokio::net::lookup_host((host, port))
+        Ok(tokio::net::lookup_host((host, port))
             .await
             .map(|it| it.collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// Refresh the cached check URL IPs.  Called at the start of each full
@@ -547,22 +540,28 @@ impl AliveDialerSet {
         let check_url = self.check_url.read().clone();
         if let Ok(target) = honk_config::check::decode_health_http_target(&check_url) {
             let port = target.port();
-            let addrs = self.resolve_host(target.host(), port).await;
-            if !addrs.is_empty() {
-                let ips = Self::merge_check_addrs(addrs, &check_url, port);
+            let ips = match self.resolve_host(target.host(), port).await {
+                Ok(addrs) => Self::merge_check_addrs(addrs, &check_url, port),
+                Err(_) => {
+                    *self.check_url_ips.write() =
+                        Self::merge_check_addrs(Vec::new(), &check_url, port);
+                    return;
+                }
+            };
+            if !ips.is_empty() {
                 *self.check_url_ips.write() = ips;
             }
         }
     }
 
-    pub fn set_ebpf_callback(&self, cb: EbpfAliveCallback) {
-        *self.ebpf_callback.write() = Some(cb);
+    pub fn set_ebpf_callback(&self, cb: Box<EbpfAliveCallback>) {
+        *self.ebpf_callback.write() = Some(cb.into());
     }
 
     /// Install the callback fired when a node's state flips alive→dead
     /// (see [`DeathCallback`]). Re-callable; pass `None` to remove.
-    pub fn set_death_callback(&self, cb: Option<DeathCallback>) {
-        *self.death_callback.write() = cb;
+    pub fn set_death_callback(&self, cb: Option<Box<DeathCallback>>) {
+        *self.death_callback.write() = cb.map(Arc::from);
     }
 
     /// Install the node name → eBPF outbound index resolver used by
@@ -574,17 +573,37 @@ impl AliveDialerSet {
     }
 
     fn push_ebpf(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion, alive: bool) {
-        let outbound = match *self.outbound_resolver.read() {
-            Some(ref resolve) => match resolve(node_id) {
-                Some(id) => id,
-                // Node has no eBPF outbound id (not in any group) — skip.
-                None => return,
-            },
-            // Legacy fallback when no resolver is installed (tests).
-            None => 0,
-        };
-        if let Some(ref cb) = *self.ebpf_callback.read() {
+        self.notify_health_change(node_id, domain, ipver, alive, || true);
+    }
+
+    fn notify_health_change(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        alive: bool,
+        is_current: impl Fn() -> bool,
+    ) {
+        let should_notify = || is_current() && self.is_alive_for(node_id, domain, ipver) == alive;
+        if !should_notify() {
+            return;
+        }
+        let resolver = self.outbound_resolver.read().clone();
+        let outbound = resolver.map_or(Some(0), |resolve| resolve(node_id));
+        let ebpf_callback = self.ebpf_callback.read().clone();
+        if let (Some(outbound), Some(cb)) = (outbound, ebpf_callback)
+            && should_notify()
+        {
             cb(node_id, outbound, domain as u32, ipver as u32, alive);
+        }
+        if !alive && should_notify() && !self.udp_sibling_explicitly_alive(node_id, domain) {
+            let cb = self.death_callback.read().clone();
+            let name = self.node_name(node_id);
+            if let Some(cb) = cb
+                && should_notify()
+            {
+                cb(node_id, &name);
+            }
         }
     }
 
@@ -663,6 +682,7 @@ impl AliveDialerSet {
 
     /// Mark a node as alive for a specific domain/IP version, recording the
     /// probe latency so `Latencies10` and `MovingAverage` are updated.
+    #[cfg(test)]
     fn mark_alive_for_latency(
         &self,
         node_id: Uuid,
@@ -670,20 +690,9 @@ impl AliveDialerSet {
         ipver: IpVersion,
         latency: Duration,
     ) {
-        let idx = alive_index(domain, ipver);
-        let was_alive = self.with_state(node_id, idx, |e| {
-            let was = e.alive;
-            e.reset_on_success();
-            was
-        });
-        if !was_alive {
+        if self.record_probe_latency_state(node_id, domain, ipver, latency, true) {
             self.push_ebpf(node_id, domain, ipver, true);
         }
-        if latency > Duration::ZERO {
-            let coll = self.get_or_create_collection(node_id, idx);
-            coll.mark_available(latency);
-        }
-        self.record_probe_history(node_id, idx, true, Some(latency));
     }
 
     /// Check if a node is within its grace period.
@@ -729,6 +738,19 @@ impl AliveDialerSet {
         force: bool,
         is_traffic: bool,
     ) {
+        if self.mark_unavailable_state(node_id, domain, ipver, force, is_traffic) {
+            self.notify_health_change(node_id, domain, ipver, false, || true);
+        }
+    }
+
+    fn mark_unavailable_state(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        force: bool,
+        is_traffic: bool,
+    ) -> bool {
         let idx = alive_index(domain, ipver);
 
         // Builtins are the base layer, not candidates: direct failures are
@@ -739,7 +761,7 @@ impl AliveDialerSet {
         // proxied. Only the liveness verdict is suppressed — probes and
         // dial outcomes still feed latency ranking.
         if node_id == DIRECT_NODE_ID || node_id == BLOCK_NODE_ID {
-            return;
+            return false;
         }
 
         // During the grace period (fresh registrations, e.g. right after a
@@ -749,7 +771,7 @@ impl AliveDialerSet {
         // cycles to recover from. Forced deaths always bypass grace.
         if !force && self.is_in_grace_period(node_id) {
             self.record_probe_history(node_id, idx, false, None);
-            return;
+            return false;
         }
 
         let threshold = if is_traffic {
@@ -758,7 +780,7 @@ impl AliveDialerSet {
             probe_failure_threshold(domain)
         };
 
-        let (was_alive, _failures) = self.with_state(node_id, idx, |e| {
+        let changed = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             e.consecutive_successes = 0;
             if force {
@@ -785,24 +807,9 @@ impl AliveDialerSet {
                     e.alive = false;
                 }
             }
-            (was, e.consecutive_failures + e.traffic_failures)
+            was && !e.alive && !force
         });
 
-        if was_alive && !force {
-            let still_alive = self.read_state(node_id, idx).alive;
-            if !still_alive {
-                self.push_ebpf(node_id, domain, ipver, false);
-                // A split UDP death (e.g. the DNS check target is blocked
-                // while data-path handshakes succeed) leaves the sibling
-                // domain carrying live flows; purging them would interrupt
-                // healthy traffic for no liveness gain.
-                if !self.udp_sibling_explicitly_alive(node_id, domain)
-                    && let Some(ref cb) = *self.death_callback.read()
-                {
-                    cb(node_id, &self.node_name(node_id));
-                }
-            }
-        }
         if !is_traffic {
             // Probe counters own liveness and cooldown; ranking strikes are
             // reserved for real dial failures.
@@ -811,6 +818,7 @@ impl AliveDialerSet {
         }
 
         self.record_probe_history(node_id, idx, false, None);
+        changed
     }
 
     fn mark_dead_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
@@ -926,16 +934,9 @@ impl AliveDialerSet {
     /// Get (or create) the `DialerCollection` for a given node and domain index.
     fn get_or_create_collection(&self, node_id: Uuid, idx: usize) -> Arc<DialerCollection> {
         let mut cols = self.collections.write();
-        let arr = cols.entry(node_id).or_insert_with(|| {
-            [
-                Arc::new(DialerCollection::new()),
-                Arc::new(DialerCollection::new()),
-                Arc::new(DialerCollection::new()),
-                Arc::new(DialerCollection::new()),
-                Arc::new(DialerCollection::new()),
-                Arc::new(DialerCollection::new()),
-            ]
-        });
+        let arr = cols
+            .entry(node_id)
+            .or_insert_with(|| std::array::from_fn(|_| Arc::new(DialerCollection::new())));
         Arc::clone(&arr[idx])
     }
 
@@ -948,12 +949,25 @@ impl AliveDialerSet {
         ipver: IpVersion,
         latency: Duration,
     ) {
+        if self.record_probe_latency_state(node_id, domain, ipver, latency, false) {
+            self.push_ebpf(node_id, domain, ipver, true);
+        }
+    }
+
+    fn record_probe_latency_state(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        latency: Duration,
+        immediate: bool,
+    ) -> bool {
         let idx = alive_index(domain, ipver);
         let revived = self.with_state(node_id, idx, |e| {
             let was = e.alive;
-            if was {
+            if was || immediate {
                 e.reset_on_success();
-                false
+                !was
             } else {
                 e.consecutive_successes += 1;
                 e.consecutive_failures = 0;
@@ -977,15 +991,15 @@ impl AliveDialerSet {
                 }
             }
         });
-        if revived {
-            self.push_ebpf(node_id, domain, ipver, true);
-        }
-        let coll = self.get_or_create_collection(node_id, idx);
-        if revived || self.read_state(node_id, idx).alive {
-            coll.mark_available(latency);
+        if (!immediate || latency > Duration::ZERO)
+            && (revived || self.read_state(node_id, idx).alive)
+        {
+            self.get_or_create_collection(node_id, idx)
+                .mark_available(latency);
         }
 
         self.record_probe_history(node_id, idx, true, Some(latency));
+        revived
     }
 
     /// Read the moving average latency for a node-domain pair.
@@ -1043,22 +1057,6 @@ impl AliveDialerSet {
         let cols = self.collections.read();
         let coll = cols.get(&node_id).map(|arr| &arr[idx])?;
         coll.latencies.last_real_sample().map(|s| (s.latency, s.at))
-    }
-
-    /// Moving average of the recent probe samples for the same
-    /// (domain, ipver) state — this is what dae's `min_moving_avg` /
-    /// `min_avg10` group policies rank nodes by. Falls back to the latest
-    /// sample when there is only one.
-    pub fn get_avg_latency(
-        &self,
-        node_id: Uuid,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-    ) -> Option<Duration> {
-        let idx = alive_index(domain, ipver);
-        let cols = self.collections.read();
-        let coll = cols.get(&node_id).map(|arr| &arr[idx])?;
-        coll.latencies.avg().or_else(|| coll.latencies.last())
     }
 
     /// Dial-failure handling: only DIAL_FAILURE_STRIKE_AT consecutive dial
@@ -1145,9 +1143,8 @@ impl AliveDialerSet {
     }
 
     pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
-        self.registered
-            .write()
-            .insert(node_id, RegisteredNode { name, address });
+        let mut registered = self.registered.write();
+        registered.insert(node_id, Arc::new(RegisteredNode { name, address }));
         self.node_registered_at
             .write()
             .insert(node_id, Instant::now());
@@ -1158,7 +1155,11 @@ impl AliveDialerSet {
     /// Snapshot of currently registered nodes (NodeId → name/address), used
     /// by config reload to diff and re-register only what changed.
     pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {
-        self.registered.read().clone()
+        self.registered
+            .read()
+            .iter()
+            .map(|(id, node)| (*id, node.as_ref().clone()))
+            .collect()
     }
 
     /// Registered display name for logs and prober lookups; falls back to
@@ -1172,12 +1173,18 @@ impl AliveDialerSet {
     }
 
     pub fn remove_node(&self, node_id: Uuid) {
-        self.registered.write().remove(&node_id);
+        let mut registered = self.registered.write();
+        registered.remove(&node_id);
         self.states.write().remove(&node_id);
+        self.collections.write().remove(&node_id);
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);
-        let mut history = self.probe_history.write();
-        history.retain(|(id, _), _| *id != node_id);
+        self.probe_history
+            .write()
+            .retain(|(id, _), _| *id != node_id);
+        self.last_emergency_tcp.lock().remove(&node_id);
+        self.last_emergency_udp.lock().remove(&node_id);
+        self.trigger_pending.lock().remove(&node_id);
     }
 
     /// A link/address/route change invalidates probe backoff that may have
@@ -1413,22 +1420,30 @@ impl AliveDialerSet {
 
     /// Cached resolved IPs for a custom check URL, resolving on first use
     /// (same caching + literal-fallback semantics as the global check URL).
-    async fn check_ips_for_url(&self, url: &str) -> Vec<SocketAddr> {
+    async fn check_ips_for_url(&self, url: &str) -> anyhow::Result<Vec<SocketAddr>> {
         if let Some(ips) = self.url_check_ips.read().get(url) {
-            return ips.clone();
+            return Ok(ips.clone());
         }
         let ips = match honk_config::check::decode_health_http_target(url) {
             Ok(target) => {
                 let port = target.port();
-                let addrs = self.resolve_host(target.host(), port).await;
-                Self::merge_check_addrs(addrs, url, port)
+                match self.resolve_host(target.host(), port).await {
+                    Ok(addrs) => Self::merge_check_addrs(addrs, url, port),
+                    Err(error) => {
+                        let literals = Self::merge_check_addrs(Vec::new(), url, port);
+                        if literals.is_empty() {
+                            return Err(error);
+                        }
+                        literals
+                    }
+                }
             }
             Err(_) => Self::merge_check_addrs(Vec::new(), url, 80),
         };
         self.url_check_ips
             .write()
             .insert(url.to_string(), ips.clone());
-        ips
+        Ok(ips)
     }
 
     /// Replace the whole URLTest group table (config reload).
@@ -1534,23 +1549,6 @@ impl AliveDialerSet {
             _ => return false,
         };
         groups.iter().all(|group| self.is_urltest_group_idle(group))
-    }
-
-    /// Number of consecutive TCP failures for this node.
-    /// Used by `GroupManager` to add a backoff penalty to latency-based
-    /// selection, deprioritising recently-flapping nodes.
-    pub fn consecutive_failures(
-        &self,
-        node_id: Uuid,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-    ) -> u32 {
-        let idx = alive_index(domain, ipver);
-        self.states
-            .read()
-            .get(&node_id)
-            .map(|s| s[idx].consecutive_failures)
-            .unwrap_or(0)
     }
 
     /// Extract the comma-separated literal fallback IPs from a dae-format

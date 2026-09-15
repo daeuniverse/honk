@@ -145,13 +145,25 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 
 远程订阅与本地文件共享引擎的自动格式识别：编码/原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及受支持的 Surge/Surfboard/Loon/Quantumult X 记录。不支持的节点会被跳过，不打印原始输入。使用 `-` 可避免把含凭据的 provider URL 放入 argv 和进程列表。
 
-对每个节点，命令报告服务端地址族、完整的代理 IPv4/IPv6 交换、代理 URLTest 延迟、经 packet handler 的 DNS 查询，以及经该 handler 的真实 QUIC 握手。VMess、legacy VLESS 及 `network` 排除 UDP 的节点，其 UDP 显示 `n/a`；非 legacy VLESS 模式使用其配置的 packet transport。
+对每个节点，命令报告服务端地址族、完整的代理 IPv4/IPv6 交换、代理 URLTest 延迟、经 packet handler 的 DNS 查询，以及经该 handler 的真实 QUIC 握手。VLESS 行使用以下脱敏 shape，不包含端点、UUID、REALITY key、SNI 或 URL query：
+
+```text
+vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision|/vision-udp443]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
+```
+
+`tcp=` 表示有效 TCP 路径。即使 H2MUX 或 Xray mux 当前接管目标 UDP 路径，`udp-fallback=` 仍表示规范化后的回退字段；`udp=disabled` 表示不允许 packet 拨号。`padding=` 只对 H2MUX 出现。对 Xray mux，`TCP` 为每条 TCP carrier 的有效逻辑 child 并发（`0` 表示关闭），`UDP` 为 `protocol`、`shared` 或独立 UDP pool 的逐 carrier 逻辑 child 并发，`POLICY` 为 UDP/443 的 `reject`、`skip` 或 `allow`。示例 shape 包括 `vless/tls/tcp/tcp=plain/udp-fallback=native`、`vless/reality/grpc/tcp=h2mux/udp-fallback=auto/padding=true` 与 `vless/tls/tcp/vision-udp443/tcp=mux-cool/udp-fallback=auto/mux=8:shared:allow`。
+
+探测资格状态码为 `supported`、`invalid-uuid`、`invalid-reality`、`invalid-config`、`unsupported-transport`、`unsupported-flow`、`vision-without-tls`/`vision-non-tcp`；无效或有意不支持的条目仍会显示，但不会执行网络操作。Vision 的 TCP 只能使用符合条件的 direct carrier，UDP-only Xray mux 仍然有效。VLESS Encryption 可以与 Vision 组合；只有未加密 Vision 还要求 raw TCP 上使用 TLS 1.3 或 REALITY。
+
+`n/a` 表示探测不适用，例如 packet 拨号被关闭，或 UDP/443 策略拒绝该目标。本地 carrier 容量拒绝是已尝试后的 terminal failure，显示为 `FAIL(...)` 而不是 `n/a`，且对远程端点健康保持中立。之所以需要区分，是因为共享的全局文件描述符预算所能接纳的物理 VLESS carrier 可能少于各节点 mux 上限之和。
 
 UDP DNS 目标解析、packet transport 建立、发送与接收共用一个 `--timeout` 预算。解析失败或超时只体现在 DNS 列，TCP、URLTest 和 QUIC 探测继续进行。不支持 UDP 的节点跳过该解析；主机名解析失败时不会替换为另一个目标。
 
 UDP DNS 主机名目标使用共享异步解析器，读取 `/etc/resolv.conf` 中首个数字形式的 nameserver（UDP 端口 `53`），并在 `/etc/hosts` 存在时加载它，不执行阻塞的 NSS 查询。此路径不应用 NSS 插件或解析器搜索后缀。解析器不可用时，DNS 列报告 `resolve`，不会回退到公共解析器；字面量目标不需要解析器。
 
-VLESS 输出被严格限制为显示名称与规范化的承载、传输和 wire shape。资格状态码为 `supported`、`invalid-uuid`、`invalid-reality`、`invalid-config`、`unsupported-transport`、`unsupported-flow`、`vision-without-tls`、`vision-non-tcp`；探测失败码仅有 `resolve`、`timeout`、`exchange`、`handler`。凭据、端点详情、SNI、REALITY key、URL query 数据和原始错误绝不会输出。
+VLESS carrier/session 按 runtime 与规范化 wire shape 复用，因此更改规范 UDP/mux query 可能更改节点身份与 pool 复用。共享物理 carrier 容量是全局的；XUDP 的 8-byte Global ID 则按 honk 的 runtime/client/path/destination source identity 确定作用域，不作为进程级无碰撞 NAT key。见[节点参考](./nodes.md#vless-udp-and-multiplexing)与规范的 [VLESS 出站设计](../design/outbound.md#sourcesession-ownership-and-capacity)。
+
+探测失败码为 `resolve`、`timeout`、`exchange`、`handler` 与 `admission`。凭据、端点详情、SNI、REALITY key、URL query 数据和原始错误绝不会输出。
 
 ### `bpf`
 

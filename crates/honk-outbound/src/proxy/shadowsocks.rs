@@ -11,10 +11,9 @@
 //! - `2022-blake3-aes-256-gcm`
 //! - `2022-blake3-chacha20-poly1305`
 //!
-//! The handler dials the Shadowsocks server, performs the salt + subkey
-//! handshake, and returns a `ProxyStream` backed by a local duplex pipe.
-//! A background task encrypts traffic to the server and decrypts traffic
-//! back using Shadowsocks' record chunking (`[len][tag][payload][tag]`).
+//! The handler dials the Shadowsocks server, writes the salt + request
+//! prologue, and returns the inline codec in [`super::ss_stream::SsStream`].
+//! Caller-driven reads and writes apply Shadowsocks record chunking directly.
 //!
 //! UDP is supported for both cipher families through `dial_udp_transport`:
 //! datagrams are sealed/opened in place and exchanged over a connected
@@ -42,6 +41,8 @@ use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, Tcp
 
 pub(crate) const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub(crate) const CHUNK_MAX_LEN: usize = 0x3FFF; // 2^14 - 1
+// The UDP wire-length bound includes address headers, padding, and AEAD tags.
+const UDP_PACKET_BUFFER_SIZE: usize = u16::MAX as usize + 1;
 
 /// Whether `method` names a Shadowsocks 2022 (SIP022) cipher.
 pub(crate) fn is_2022_method(method: &str) -> bool {
@@ -61,40 +62,21 @@ pub(crate) struct CipherConf {
 
 impl CipherConf {
     pub(crate) fn for_method(method: &str) -> anyhow::Result<Self> {
-        match method.to_lowercase().as_str() {
-            "aes-128-gcm" => Ok(CipherConf {
-                key_len: 16,
-                salt_len: 16,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            "aes-256-gcm" => Ok(CipherConf {
-                key_len: 32,
-                salt_len: 32,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            "chacha20-ietf-poly1305" | "chacha20-poly1305" => Ok(CipherConf {
-                key_len: 32,
-                salt_len: 32,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            // SIP022: salt length equals the key length.
-            "2022-blake3-aes-128-gcm" => Ok(CipherConf {
-                key_len: 16,
-                salt_len: 16,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Ok(CipherConf {
-                key_len: 32,
-                salt_len: 32,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
+        let key_len = match method.to_lowercase().as_str() {
+            "aes-128-gcm" | "2022-blake3-aes-128-gcm" => 16,
+            "aes-256-gcm"
+            | "chacha20-ietf-poly1305"
+            | "chacha20-poly1305"
+            | "2022-blake3-aes-256-gcm"
+            | "2022-blake3-chacha20-poly1305" => 32,
             _ => anyhow::bail!("unsupported Shadowsocks cipher: {}", method),
-        }
+        };
+        Ok(Self {
+            key_len,
+            salt_len: key_len,
+            nonce_len: 12,
+            tag_len: 16,
+        })
     }
 }
 
@@ -221,10 +203,9 @@ impl AeadCipher {
         out: &mut Vec<u8>,
     ) -> Result<(), aes_gcm::aead::Error> {
         match self {
-            AeadCipher::Aes128Gcm(c) | AeadCipher::Aes256Gcm(c) => {
-                boring_seal_into(c, nonce, plaintext, aad, out)
-            }
-            AeadCipher::ChaCha20Poly1305(c) => boring_seal_into(c, nonce, plaintext, aad, out),
+            AeadCipher::Aes128Gcm(c)
+            | AeadCipher::Aes256Gcm(c)
+            | AeadCipher::ChaCha20Poly1305(c) => boring_seal_into(c, nonce, plaintext, aad, out),
             AeadCipher::XChaCha20Poly1305(c) => {
                 use aes_gcm::aead::AeadInOut;
                 out.extend_from_slice(plaintext);
@@ -264,10 +245,9 @@ impl AeadCipher {
         }
         let (ct, tag) = buf.split_at_mut(buf.len() - tag_len);
         match self {
-            AeadCipher::Aes128Gcm(c) | AeadCipher::Aes256Gcm(c) => {
-                c.open_in_place(nonce, ct, tag, aad).map_err(aead_err)?;
-            }
-            AeadCipher::ChaCha20Poly1305(c) => {
+            AeadCipher::Aes128Gcm(c)
+            | AeadCipher::Aes256Gcm(c)
+            | AeadCipher::ChaCha20Poly1305(c) => {
                 c.open_in_place(nonce, ct, tag, aad).map_err(aead_err)?;
             }
             AeadCipher::XChaCha20Poly1305(c) => {
@@ -461,8 +441,9 @@ impl PacketOutbound for ShadowsocksHandler {
         let (crypto, outbound, socks) =
             Self::udp_server_session(node, target, target_domain, connect_timeout).await?;
         Ok(Arc::new(SsUdpTransport {
-            socket: Arc::new(outbound),
+            socket: outbound,
             crypto: tokio::sync::Mutex::new(crypto),
+            recv_buf: tokio::sync::Mutex::new(None),
             socks,
             target,
         }))
@@ -528,8 +509,9 @@ impl ShadowsocksHandler {
 /// Framed Shadowsocks UDP transport: datagrams are sealed/opened in place
 /// and go straight over the connected server-facing socket.
 struct SsUdpTransport {
-    socket: Arc<tokio::net::UdpSocket>,
+    socket: tokio::net::UdpSocket,
     crypto: tokio::sync::Mutex<SsUdpCrypto>,
+    recv_buf: tokio::sync::Mutex<Option<Vec<u8>>>,
     socks: Vec<u8>,
     target: SocketAddr,
 }
@@ -572,12 +554,22 @@ impl PacketTransport for SsUdpTransport {
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        let n = self.socket.recv(buf).await?;
+        let mut recv_buf = self.recv_buf.lock().await;
+        // Core already supplies a full datagram buffer; only smaller callers
+        // need reusable ciphertext scratch separate from their plaintext output.
+        let wire = if buf.len() >= UDP_PACKET_BUFFER_SIZE {
+            &mut *buf
+        } else {
+            recv_buf
+                .get_or_insert_with(|| vec![0u8; UDP_PACKET_BUFFER_SIZE])
+                .as_mut_slice()
+        };
+        let n = self.socket.recv(wire).await?;
         let payload = self
             .crypto
             .lock()
             .await
-            .open(&buf[..n])
+            .open(&wire[..n])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         if payload.len() > buf.len() {
             return Err(std::io::Error::new(
@@ -852,10 +844,11 @@ mod tests {
         client.connect(server.local_addr().unwrap()).await.unwrap();
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let transport = Arc::new(SsUdpTransport {
-            socket: Arc::new(client),
+            socket: client,
             crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
                 LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
             )),
+            recv_buf: tokio::sync::Mutex::new(None),
             socks: addr::encode_address(target, None).unwrap(),
             target,
         });
@@ -981,52 +974,6 @@ mod tests {
         assert_eq!(received, payload);
     }
 
-    /// End-to-end UDP test: mock legacy-AEAD server, real
-    /// `dial_udp_transport`, payload exchange through the framed transport.
-    #[tokio::test]
-    async fn test_dial_udp_legacy_end_to_end() {
-        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server.local_addr().unwrap();
-        let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 65536];
-            loop {
-                let (n, src) = server.recv_from(&mut buf).await.unwrap();
-                let payload = server_crypto.open(&buf[..n]).unwrap();
-                let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
-                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None).unwrap();
-                let packet = server_crypto.seal(&socks, &reply).unwrap();
-                server.send_to(&packet, src).await.unwrap();
-            }
-        });
-
-        let node = Node {
-            name: "test-ss-udp".into(),
-            address: server_addr.ip().to_string(),
-            port: server_addr.port(),
-            outbound: honk_config::node::OutboundConfig::Shadowsocks(
-                honk_config::node::ShadowsocksConfig {
-                    encryption: Some("aes-128-gcm".into()),
-                    password: Some("test-password".into()),
-                    ..Default::default()
-                },
-            ),
-            ..Default::default()
-        };
-        let handler = ShadowsocksHandler::new();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let transport = handler
-            .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
-            .await
-            .unwrap();
-
-        transport.send_packet(b"hello dns").await.unwrap();
-        let mut buf = [0u8; 65536];
-        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!(src, target);
-        assert_eq!(&buf[..n], b"HELLO DNS");
-    }
-
     /// End-to-end TCP test: mock legacy-AEAD TCP server (salt + chunk
     /// codec), real `dial` through the inline `SsStream`, bulk data both
     /// ways (chunk boundaries crossed many times).
@@ -1143,8 +1090,7 @@ mod tests {
         assert_eq!(received, expected);
     }
 
-    /// Same as `test_dial_udp_legacy_end_to_end` but through the framed
-    /// `dial_udp_transport` path (no loopback pair).
+    /// End-to-end UDP test over the real framed `dial_udp_transport` path.
     #[tokio::test]
     async fn test_dial_udp_transport_legacy_end_to_end() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1183,10 +1129,16 @@ mod tests {
             .unwrap();
         assert_eq!(transport.relay_addr(), target);
 
-        transport.send_packet(b"hello dns").await.unwrap();
-        let mut buf = [0u8; 65536];
-        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
+        let payload = [b'a'; 1200];
+        let mut buf = [0u8; 1200];
+        let (received, sent) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(biased; transport.recv_packet(&mut buf), transport.send_packet(&payload))
+        })
+        .await
+        .expect("pending receive must not block the send that elicits its reply");
+        sent.unwrap();
+        let (n, src) = received.unwrap();
         assert_eq!(src, target);
-        assert_eq!(&buf[..n], b"HELLO DNS");
+        assert_eq!(&buf[..n], &[b'A'; 1200]);
     }
 }

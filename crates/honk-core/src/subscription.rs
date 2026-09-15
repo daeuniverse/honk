@@ -5,8 +5,8 @@
 //! builder; URI lists use [`Node::from_share_link`] from honk-config.
 
 use honk_config::diagnostic::{
-    DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, Severity, finish_attempt,
-    report_detailed_diagnostics,
+    DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, SettingSegment, Severity,
+    finish_attempt, report_detailed_diagnostics,
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::node::Node;
@@ -190,7 +190,10 @@ impl<'a> AdmissionOwner<'a> {
                 diagnostic.terminal = false;
                 if self.reserve() {
                     diagnostic.source = self.source.clone();
-                    diagnostic.setting = SettingPath::new(path).index(ordinal);
+                    diagnostic.setting.0.splice(
+                        ..1,
+                        [SettingSegment::Field(path), SettingSegment::Index(ordinal)],
+                    );
                     diagnostic.entry_index = Some(ordinal);
                     diagnostic.line = line;
                     diagnostic.span = None;

@@ -433,11 +433,11 @@ impl Hy2Client {
         &self,
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<Hy2ConnState>)> {
-        let password = self.password.clone();
+        let password = &self.password;
         let rx_bytes_per_second = self.rx_bytes_per_second;
         self.quic
             .connection_with_metrics(connect_timeout, move |conn| async move {
-                authenticate(&conn, &password, rx_bytes_per_second, connect_timeout).await
+                authenticate(&conn, password, rx_bytes_per_second, connect_timeout).await
             })
             .await
     }
@@ -535,17 +535,13 @@ impl Hysteria2Handler {
         Self
     }
 
-    fn resolve_password(node: &Node) -> &str {
-        node.hysteria2().unwrap().auth.as_deref().unwrap_or("")
-    }
-
     async fn build_client(
         &self,
         node: &Node,
         profiles: Option<Arc<crate::quic::AdaptiveFlowProfiles>>,
     ) -> anyhow::Result<Arc<Hy2Client>> {
         let hy2 = node.hysteria2().unwrap();
-        let password = Self::resolve_password(node);
+        let password = hy2.auth.as_deref().unwrap_or("");
         let obfs = hy2.obfs.as_deref().filter(|s| !s.is_empty());
         if let Some(obfs) = obfs
             && obfs.len() < SALAMANDER_MIN_PSK_LEN
@@ -890,10 +886,7 @@ impl PacketTransport for Hy2UdpTransport {
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
         if data.len() > MAX_UDP_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "hysteria2 datagram too large",
-            ));
+            return Err(super::PacketRejection::InvalidSize.into());
         }
         self.state.touch();
         let packet_id = self

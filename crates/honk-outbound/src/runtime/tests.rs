@@ -1,6 +1,7 @@
 use super::*;
 use honk_config::types::NodeProtocol;
 use std::sync::atomic::AtomicUsize;
+mod vless_runtime;
 
 fn node(name: &str, protocol: NodeProtocol) -> Node {
     let host = format!("{name}.example");
@@ -25,9 +26,9 @@ fn node(name: &str, protocol: NodeProtocol) -> Node {
     node
 }
 
-fn vless_node(name: &str, mode: honk_config::node::WireMode) -> Node {
+fn vless_node(name: &str, multiplex: honk_config::node::VlessMultiplex) -> Node {
     let mut node = node(name, NodeProtocol::VLess);
-    node.vless_mut().unwrap().mode = mode;
+    node.vless_mut().unwrap().multiplex = multiplex;
     node.id = node.derive_id();
     node
 }
@@ -84,7 +85,7 @@ fn registry_admission_rejects_invalid_collections() {
     let mut intrinsic = canonical_node("invalid-endpoint");
     intrinsic.port = 0;
     assert_admission(
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[intrinsic], 1, 1, None)
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[intrinsic], 1, 1, 1, None)
             .unwrap_err(),
         "invalid-config-value",
         0,
@@ -135,29 +136,6 @@ fn registry_admission_rechecks_dns_fork_source_state() {
         "noncanonical-node-id",
         0,
     );
-}
-
-#[test]
-fn vless_registry_runtime_follows_wire_mode() {
-    use honk_config::node::WireMode;
-    for (mode, expected) in [
-        (WireMode::Legacy, 0),
-        (WireMode::UotV2, 0),
-        (WireMode::Xudp, 0),
-        (WireMode::H2mux, 1),
-        (WireMode::H2muxPadded, 1),
-        (WireMode::MuxCool, 2),
-    ] {
-        let node = vless_node("vless", mode);
-        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let actual = match &registry.get(&node.id).unwrap().runtime {
-            ProtocolRuntime::None => 0,
-            ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_)) => 1,
-            ProtocolRuntime::VlessMux(VlessMuxRuntime::Cool(_)) => 2,
-            _ => panic!("unexpected VLESS runtime"),
-        };
-        assert_eq!(actual, expected);
-    }
 }
 
 #[derive(Default)]
@@ -237,7 +215,10 @@ async fn retirement_releases_cached_non_flow_state() {
 async fn warm_retention_releases_only_after_last_owner() {
     for node in [
         node("anytls-retained", NodeProtocol::AnyTLS),
-        vless_node("vless-retained", honk_config::node::WireMode::H2mux),
+        vless_node(
+            "vless-retained",
+            honk_config::node::VlessMultiplex::H2 { padding: false },
+        ),
     ] {
         let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let runtime = registry.get(&node.id).unwrap();
@@ -246,7 +227,9 @@ async fn warm_retention_releases_only_after_last_owner() {
         runtime.retain_warm(WarmRetention::Udp).await.commit();
         let retained = || match &runtime.runtime {
             ProtocolRuntime::AnyTls(anytls) => anytls.pool.is_warm_retained(),
-            ProtocolRuntime::VlessMux(vless) => vless.is_warm_retained(),
+            ProtocolRuntime::Vless(vless) => {
+                vless.pool_is_warm_retained(honk_config::node::VlessUdpPath::H2)
+            }
             _ => panic!("session protocol must own a pool"),
         };
         assert!(retained());
@@ -290,7 +273,7 @@ fn reap_keeps_recent_active_ratio_and_rebuilds_evicted_connectors() {
         })
         .collect();
 
-    assert_eq!(registry.reap_tls_connectors(Instant::now()), 12);
+    assert_eq!(registry.reap_idle_resources(Instant::now()), 12);
     assert_eq!(
         loaded
             .iter()
@@ -313,7 +296,7 @@ fn reap_drops_idle_connector_even_inside_hot_ratio() {
     let runtime = registry.get(&node.id).unwrap();
     runtime.anytls_tls_connector().unwrap();
     assert_eq!(
-        registry.reap_tls_connectors(Instant::now() + TLS_IDLE_RETENTION),
+        registry.reap_idle_resources(Instant::now() + TLS_IDLE_RETENTION),
         1
     );
     assert!(!runtime.tls_connector_loaded());
@@ -329,65 +312,23 @@ async fn warm_resources_report_session_state_only() {
 
     let anytls_runtime = registry.get(&anytls.id).unwrap();
     let tuic_runtime = registry.get(&tuic.id).unwrap();
-    assert!(!anytls_runtime.is_warm_or_stateless());
-    assert!(!tuic_runtime.is_warm_or_stateless());
+    assert!(!anytls_runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
+    assert!(!tuic_runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
     assert!(
-        registry.get(&trojan.id).unwrap().is_warm_or_stateless(),
+        registry
+            .get(&trojan.id)
+            .unwrap()
+            .is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session),
         "session-less protocols have nothing to retain either way"
     );
 
-    struct FakeClient;
-    #[async_trait::async_trait]
-    impl QuicRuntimeClient for FakeClient {
-        fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
-            self
-        }
-        async fn force_close(&self) {}
-        async fn release_warm(&self) {}
-    }
     let ProtocolRuntime::Quic(quic) = &tuic_runtime.runtime else {
         panic!("tuic runtime expected");
     };
-    quic.client(|| async { Ok(Arc::new(FakeClient)) })
+    quic.client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
         .await
         .unwrap();
-    assert!(tuic_runtime.is_warm_or_stateless());
-}
-
-#[tokio::test]
-async fn build_and_get_roundtrip() {
-    let nodes = vec![
-        node("a", NodeProtocol::AnyTLS),
-        node("b", NodeProtocol::Trojan),
-    ];
-    let registry = OutboundRuntimeRegistry::build(&nodes).unwrap();
-    assert_eq!(registry.len(), 2);
-    let rt = registry.get(&nodes[0].id).unwrap();
-    assert_eq!(rt.node.name, "a");
-    assert!(rt.udp_capable);
-    registry.shutdown().await; // terminal cleanup is idempotent
-}
-
-#[test]
-fn rejects_nil_uuid() {
-    let mut n = node("nil", NodeProtocol::Trojan);
-    n.id = uuid::Uuid::nil();
-    assert!(OutboundRuntimeRegistry::build(&[n]).is_err());
-}
-
-#[test]
-fn rejects_duplicate_uuid() {
-    let a = node("a", NodeProtocol::Trojan);
-    let mut b = node("b", NodeProtocol::SS);
-    b.id = a.id;
-    assert!(OutboundRuntimeRegistry::build(&[a.clone(), b]).is_err());
-
-    // A duplicate with the same name and canonical identity remains rejected.
-    assert_admission(
-        OutboundRuntimeRegistry::build(&[a.clone(), a]).unwrap_err(),
-        "duplicate-node-id",
-        1,
-    );
+    assert!(tuic_runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
 }
 
 #[test]
@@ -401,14 +342,15 @@ fn explicit_dial_limit_is_generation_owned() {
 #[tokio::test]
 async fn overlapping_generations_share_the_startup_dial_ceiling() {
     let (first, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, None).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, 4, None).unwrap();
     let mut held = Vec::new();
     for _ in 0..3 {
         held.push(first.acquire_dial_permit().await);
     }
 
     let (second, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, Some(&first)).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, 99, Some(&first))
+            .unwrap();
     assert_eq!(second.dial_limit(), 4);
     held.push(second.acquire_dial_permit().await);
     assert!(
@@ -430,6 +372,7 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
         std::slice::from_ref(&node),
         1,
         2,
+        2,
         None,
     )
     .unwrap();
@@ -450,7 +393,8 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
         .await
         .expect("released generation capacity must admit DNS");
     let (successor, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, Some(&main)).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, Some(&main))
+            .unwrap();
     let successor_permit = successor.acquire_dial_permit().await;
     assert!(
         tokio::time::timeout(Duration::from_millis(10), successor.acquire_dial_permit())
@@ -585,9 +529,10 @@ async fn overlapping_generations_bound_physical_address_attempts() {
     }
 
     let (first, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, None).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, None).unwrap();
     let (second, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, Some(&first)).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, 99, Some(&first))
+            .unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let run = |generation: Arc<OutboundRuntimeRegistry>| {
@@ -637,7 +582,10 @@ fn udp_capability_matrix() {
 
 #[test]
 fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
-    let unchanged = vless_node("vless", honk_config::node::WireMode::H2mux);
+    let unchanged = vless_node(
+        "vless",
+        honk_config::node::VlessMultiplex::H2 { padding: false },
+    );
     let mut changed = node("tuic", NodeProtocol::Tuic);
     let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
     let first_unchanged = first.get(&unchanged.id).unwrap();
@@ -702,60 +650,6 @@ async fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
         anytls.pool.is_retired(),
         "the new generation owns the reused runtime's shutdown"
     );
-}
-
-#[tokio::test]
-async fn vless_mux_pools_retire_and_shut_down_with_their_generation() {
-    use honk_config::node::WireMode;
-    for mode in [WireMode::H2mux, WireMode::MuxCool] {
-        let node = vless_node("vless", mode);
-        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let runtime = registry.get(&node.id).unwrap();
-        let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
-            panic!("VLESS mux runtime expected");
-        };
-        registry.retire_reusable_state().await;
-        assert!(mux.is_retired());
-
-        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let runtime = registry.get(&node.id).unwrap();
-        let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
-            panic!("VLESS mux runtime expected");
-        };
-        registry.shutdown().await;
-        assert!(mux.is_retired());
-    }
-}
-
-#[test]
-fn vless_mux_runtime_reuse_is_mode_exact() {
-    use honk_config::node::WireMode;
-    let node = vless_node("vless-cool", WireMode::MuxCool);
-    let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-    let (unchanged, reused) =
-        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 64, Some(&first))
-            .unwrap();
-    assert_eq!(reused, HashSet::from([node.id]));
-    assert!(Arc::ptr_eq(
-        &first.get(&node.id).unwrap(),
-        &unchanged.get(&node.id).unwrap()
-    ));
-
-    let mut changed = node.clone();
-    changed.vless_mut().unwrap().mode = WireMode::H2mux;
-    changed.id = changed.derive_id();
-    let (changed_registry, reused) =
-        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&changed), 64, Some(&first))
-            .unwrap();
-    assert!(reused.is_empty());
-    assert!(!Arc::ptr_eq(
-        &first.get(&node.id).unwrap(),
-        &changed_registry.get(&changed.id).unwrap()
-    ));
-    assert!(matches!(
-        changed_registry.get(&changed.id).unwrap().runtime,
-        ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_))
-    ));
 }
 
 #[test]

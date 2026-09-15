@@ -361,10 +361,10 @@ impl UpstreamPool {
             .map_err(|_| anyhow::anyhow!("DNS upstream runtime generation is already set"))
     }
 
-    pub(crate) fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
+    pub(crate) fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
         self.runtime_generation
             .get()
-            .map_or(0, |generation| generation.reap_tls_connectors(now))
+            .map_or(0, |generation| generation.reap_idle_resources(now))
     }
 
     pub fn set_group_manager(&self, group_manager: Option<SharedGroupManager>) {

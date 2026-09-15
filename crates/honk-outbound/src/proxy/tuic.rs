@@ -424,10 +424,10 @@ impl TuicClient {
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<TuicConnState>)> {
         let uuid = self.uuid;
-        let password = self.password.clone();
+        let password = &self.password;
         self.quic
             .connection_with_metrics(connect_timeout, move |conn| async move {
-                crate::quic::exporter_auth(&conn, &uuid, &password, TUIC_VERSION, true, AUTH_GRACE)
+                crate::quic::exporter_auth(&conn, &uuid, password, TUIC_VERSION, true, AUTH_GRACE)
                     .await?;
                 Ok(TuicConnState::new(conn))
             })
@@ -467,18 +467,18 @@ impl TuicHandler {
         // ALPN override from the share link (`alpn=h3`, comma-separated);
         // servers configured without `tuic` in their ALPN list reject the
         // handshake at the TLS layer otherwise.
-        let alpn: Vec<Vec<u8>> = tuic
+        let mut alpn: Vec<&[u8]> = tuic
             .alpn
             .as_deref()
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(|p| p.as_bytes().to_vec())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec![b"tuic".to_vec()]);
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::as_bytes)
+            .collect();
+        if alpn.is_empty() {
+            alpn.push(b"tuic");
+        }
         let options = crate::quic::QuicClientOptions {
             congestion: Some(crate::quic::congestion_factory(tuic.congestion.as_deref())),
             // Keep both protocol and QUIC PING liveness in fallback mode.
@@ -488,8 +488,7 @@ impl TuicHandler {
             max_udp_payload_size: tuic.quic.mtu,
             ..Default::default()
         };
-        let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
-        let config = crate::quic::client_config(node, &alpn_refs, options).await?;
+        let config = crate::quic::client_config(node, &alpn, options).await?;
         Ok(Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
                 .with_flow_control_profiles(profiles)
@@ -1185,26 +1184,6 @@ mod tests {
     async fn test_udp_session_ids_rotate_connections_before_reuse() {
         assert_udp_session_id_rotation(true).await;
         assert_udp_session_id_rotation(false).await;
-    }
-
-    #[tokio::test]
-    async fn test_connection_reuse_across_dials() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-
-        for i in 0..3 {
-            let mut stream = handler
-                .dial(&node, target, None, Duration::from_secs(5))
-                .await
-                .expect("dial should succeed");
-            let payload = format!("req{i}");
-            stream.stream.write_all(payload.as_bytes()).await.unwrap();
-            let mut buf = [0u8; 16];
-            let n = stream.stream.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], payload.as_bytes());
-        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use super::{
     read_frame, write_frame,
 };
 #[cfg(test)]
-use crate::proxy::addr;
+use crate::proxy::MuxSession as _;
 #[cfg(test)]
 use crate::proxy::uot::V1_ATYP_DOMAIN as UOT_V1_ATYP_DOMAIN;
 #[cfg(test)]
@@ -277,26 +277,6 @@ impl PacketTransport for AnyTlsUotTransport {
 }
 
 #[cfg(test)]
-mod uot_tests {
-    use super::*;
-
-    #[test]
-    fn test_uot_request_uses_socks5_address_form() {
-        let v4 = addr::encode_address("1.2.3.4:53".parse().unwrap(), None).unwrap();
-        assert_eq!(v4, vec![0x01, 1, 2, 3, 4, 0, 53]);
-        let v6 = addr::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None).unwrap();
-        assert_eq!(v6[0], 0x04);
-        assert_eq!(v6.len(), 1 + 16 + 2);
-        let fqdn =
-            addr::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com")).unwrap();
-        assert_eq!(fqdn[0], 0x03);
-        assert_eq!(fqdn[1], 11);
-        assert_eq!(&fqdn[2..13], b"example.com");
-        assert_eq!(&fqdn[13..], &[1, 187]);
-    }
-}
-
-#[cfg(test)]
 mod uot_transport_tests {
     use super::*;
 
@@ -347,31 +327,16 @@ mod uot_transport_tests {
         assert_eq!(auth, TEST_AUTH);
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SETTINGS);
-        let permit = session.try_reserve().unwrap();
-        let (sid, rx, guard) = session
-            .open_uot_stream(vec![0x01, 0, 0, 0, 0, 0, 0], permit)
+        let transport = Arc::clone(&session)
+            .open_packet(session.try_reserve().unwrap(), target, None)
             .await
-            .unwrap();
-        let permit = guard.commit();
+            .unwrap_or_else(|_| panic!("UoT transport must open"));
 
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SYN);
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_PSH);
-        (
-            Arc::new(AnyTlsUotTransport {
-                session,
-                sid,
-                receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
-                setup: tokio::sync::Mutex::new(Some(
-                    crate::proxy::uot::connect_request(target, None).unwrap(),
-                )),
-                target,
-                target_domain: None,
-                _permit: permit,
-            }),
-            server_end,
-        )
+        (transport, server_end)
     }
 
     /// The UoT request and first datagram share one PSH; later datagrams carry
@@ -463,10 +428,31 @@ mod uot_transport_tests {
 
     #[tokio::test]
     async fn uot_send_enforces_anytls_go_packet_limit_without_poisoning_stream() {
+        use crate::proxy::{
+            PacketErrorClass, PacketRejection, io_packet_rejection, packet_error_class,
+        };
+
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let request = crate::proxy::uot::connect_request(target, None).unwrap();
         let (transport, mut server) = uot_test_transport(target).await;
         let payload = vec![0x5a; UOT_MAX_PACKET_SIZE];
+        let oversized = vec![0; UOT_MAX_PACKET_SIZE + 1];
+        let error =
+            futures_util::FutureExt::now_or_never(transport.send_packet_confirmed(&oversized))
+                .expect("local refusal must not wait for I/O")
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            io_packet_rejection(&error),
+            Some(PacketRejection::InvalidSize)
+        );
+        assert_eq!(packet_error_class(&error), PacketErrorClass::Rejected);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), read_frame(&mut server))
+                .await
+                .is_err(),
+            "rejected first datagram must not consume setup or emit a PSH"
+        );
 
         transport.send_packet(&payload).await.unwrap();
         let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
@@ -478,11 +464,13 @@ mod uot_transport_tests {
         );
         assert_eq!(&data[request.len() + 2..], payload);
 
-        let error = transport
-            .send_packet(&vec![0; UOT_MAX_PACKET_SIZE + 1])
-            .await
-            .unwrap_err();
+        let error = transport.send_packet(&oversized).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            io_packet_rejection(&error),
+            Some(PacketRejection::InvalidSize)
+        );
+        assert_eq!(packet_error_class(&error), PacketErrorClass::Rejected);
 
         transport.send_packet(b"kept").await.unwrap();
         let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
@@ -524,6 +512,53 @@ mod uot_transport_tests {
                 .is_err(),
             "the cancelled datagram must not be queued"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_uot_waiter_never_queues_payload_after_fin() {
+        for confirmed in [false, true] {
+            let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+            let (transport, mut server) = uot_test_transport(target).await;
+            let sid = transport.sid;
+            transport.send_packet(b"initial").await.unwrap();
+            assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+
+            let capacity = (WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32;
+            let held = Arc::clone(&transport.session.writer_q.data_permits)
+                .acquire_many_owned(capacity)
+                .await
+                .unwrap();
+            let send = async {
+                if confirmed {
+                    transport.send_packet_confirmed(b"retired").await
+                } else {
+                    transport.send_packet(b"retired").await
+                }
+            };
+            tokio::pin!(send);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut send)
+                    .await
+                    .is_err()
+            );
+
+            transport.session.end_uot_stream(sid, true);
+            let (cmd, fin_sid, _) = read_frame(&mut server).await.unwrap();
+            assert_eq!((cmd, fin_sid), (CMD_FIN, sid));
+            drop(held);
+
+            let error = tokio::time::timeout(Duration::from_secs(1), send)
+                .await
+                .expect("retired send must resume")
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), read_frame(&mut server))
+                    .await
+                    .is_err(),
+                "no PSH may follow the stream FIN"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

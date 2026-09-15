@@ -140,6 +140,7 @@ pub enum ScoreOutcome {
     Success,
     Timeout,
     Io(io::ErrorKind),
+    Rejected,
     Cancelled,
     Shutdown,
     Other,
@@ -147,6 +148,13 @@ pub enum ScoreOutcome {
 
 impl ScoreOutcome {
     pub fn from_error(error: &anyhow::Error) -> Self {
+        if let Some(rejection) = crate::proxy::packet_rejection(error) {
+            return if rejection == crate::proxy::PacketRejection::Cancelled {
+                Self::Cancelled
+            } else {
+                Self::Rejected
+            };
+        }
         error
             .chain()
             .find_map(|source| source.downcast_ref::<io::Error>())
@@ -214,7 +222,6 @@ struct Stats {
     throughput_windows: f64,
     fail_streak: u32,
     explore_not_before: Option<Instant>,
-    last_used: u64,
     updated_at: Option<Instant>,
     selected_at: u64,
 }
@@ -261,26 +268,18 @@ impl Stats {
         self.throughput_windows *= factor;
     }
 
-    fn record_start(&mut self, now: Instant, tick: u64) {
+    fn record_start(&mut self, now: Instant) {
         self.decay_to(now);
         self.attempts += 1.0;
-        self.last_used = tick;
     }
 
-    fn record_finish(
-        &mut self,
-        now: Instant,
-        sample: &FlowSample,
-        count_usefulness: bool,
-        tick: u64,
-    ) {
+    fn record_finish(&mut self, now: Instant, sample: &FlowSample, count_usefulness: bool) {
         self.decay_to(now);
         if matches!(
             sample.outcome,
-            ScoreOutcome::Cancelled | ScoreOutcome::Shutdown
+            ScoreOutcome::Rejected | ScoreOutcome::Cancelled | ScoreOutcome::Shutdown
         ) {
             self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
-            self.last_used = tick;
             return;
         }
         if !sample.streak_neutral {
@@ -319,7 +318,6 @@ impl Stats {
                 self.useful_failure += 1.0;
             }
         }
-        self.last_used = tick;
     }
 }
 
@@ -338,14 +336,14 @@ where
     K: std::hash::Hash + Eq,
 {
     if let Some(stats) = cache.get_mut(&key) {
-        stats.record_start(now, tick);
+        stats.record_start(now);
         return stats.incarnation;
     }
     let mut stats = Stats {
         incarnation: tick,
         ..Default::default()
     };
-    stats.record_start(now, tick);
+    stats.record_start(now);
     // A full cache means this put evicts the LRU tail.
     if cache.len() == cache.cap().get() {
         *evictions = evictions.saturating_add(1);
@@ -361,7 +359,6 @@ fn record_cell_finish<K>(
     now: Instant,
     sample: &FlowSample,
     count_usefulness: bool,
-    tick: u64,
 ) where
     K: std::hash::Hash + Eq,
 {
@@ -370,7 +367,7 @@ fn record_cell_finish<K>(
     };
     let remove_empty = match cache.get_mut(key) {
         Some(stats) if stats.incarnation == incarnation => {
-            stats.record_finish(now, sample, count_usefulness, tick);
+            stats.record_finish(now, sample, count_usefulness);
             stats.attempts == 0.0 && stats.completed() == 0.0
         }
         _ => false,
@@ -482,20 +479,6 @@ impl SelectionReasonKey {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SelectionReasonCounts {
-    cold_explore: u64,
-    periodic_explore: u64,
-    reliability_winner: u64,
-    performance_winner: u64,
-    incumbent_held: u64,
-    fresh_failure_bypass: u64,
-    dead_filtered: u64,
-    switch_flap: u64,
-    fail_streak_excluded: u64,
-    explore_backed_off: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScoreReasonCounters {
     pub cold_explore: u64,
     pub periodic_explore: u64,
@@ -507,23 +490,6 @@ pub struct ScoreReasonCounters {
     pub switch_flap: u64,
     pub fail_streak_excluded: u64,
     pub explore_backed_off: u64,
-}
-
-impl ScoreReasonCounters {
-    const fn from_private(counts: SelectionReasonCounts) -> Self {
-        Self {
-            cold_explore: counts.cold_explore,
-            periodic_explore: counts.periodic_explore,
-            reliability_winner: counts.reliability_winner,
-            performance_winner: counts.performance_winner,
-            incumbent_held: counts.incumbent_held,
-            fresh_failure_bypass: counts.fresh_failure_bypass,
-            dead_filtered: counts.dead_filtered,
-            switch_flap: counts.switch_flap,
-            fail_streak_excluded: counts.fail_streak_excluded,
-            explore_backed_off: counts.explore_backed_off,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,7 +516,7 @@ struct StateInner {
     valid_groups: HashSet<String>,
     selection_counts: HashMap<SelectionCadenceKey, u64>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
-    selection_reasons: HashMap<SelectionReasonKey, SelectionReasonCounts>,
+    selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
     active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
     exact_evictions: u64,
@@ -610,7 +576,7 @@ impl ScorePolicyState {
                 SelectionNetwork::Tcp => &mut groups[index].tcp,
                 SelectionNetwork::Udp => &mut groups[index].udp,
             };
-            *destination = ScoreReasonCounters::from_private(*counts);
+            *destination = *counts;
         }
         groups
     }
@@ -808,7 +774,7 @@ impl ScorePolicyState {
         &self,
         group: &str,
         network: SelectionNetwork,
-    ) -> SelectionReasonCounts {
+    ) -> ScoreReasonCounters {
         self.inner
             .lock()
             .selection_reasons
@@ -916,8 +882,6 @@ impl ScorePolicyState {
         {
             return;
         }
-        inner.tick = inner.tick.saturating_add(1);
-        let tick = inner.tick;
         for (index, attribution) in attributions.iter().enumerate() {
             if !inner
                 .valid
@@ -933,7 +897,6 @@ impl ScorePolicyState {
                 started.aggregate,
                 now,
                 sample,
-                tick,
             );
             if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
                 let key = ExactKey {
@@ -950,7 +913,6 @@ impl ScorePolicyState {
                     now,
                     sample,
                     sample.count_usefulness,
-                    tick,
                 );
             }
         }
@@ -1432,7 +1394,6 @@ fn record_aggregate_finish(
     cells: [Option<u64>; 2],
     now: Instant,
     sample: &FlowSample,
-    tick: u64,
 ) {
     for (index, family) in aggregate_families(context).into_iter().enumerate() {
         if index == 1 && family.is_none() {
@@ -1451,7 +1412,6 @@ fn record_aggregate_finish(
             now,
             sample,
             sample.count_usefulness && context.target.is_some(),
-            tick,
         );
     }
 }

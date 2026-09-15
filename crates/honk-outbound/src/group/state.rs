@@ -1,6 +1,4 @@
-//! Selection state: the runtime caches behind the policies (URLTest
-//! selections per network, Fallback pins, Selector runtime choices, idle
-//! timestamps) plus the persist/interrupt callbacks fired when they change.
+//! Runtime selection caches and callbacks fired when they change.
 
 use super::*;
 
@@ -104,19 +102,8 @@ impl GroupManager {
             .any(|group| group.interrupt_connections)
     }
 
-    /// Record group activity: updates idle tracking only for groups that
-    /// actually configure an idle timeout, then wakes URLTest health checks.
+    /// Wake URLTest health checks when a group serves traffic.
     pub(super) fn mark_used(&self, group_name: &str) {
-        if self
-            .groups
-            .get(group_name)
-            .and_then(|group| group.idle_timeout)
-            .is_some_and(|timeout| timeout > 0)
-        {
-            self.last_used
-                .write()
-                .insert(group_name.to_string(), Instant::now());
-        }
         if let Some(alive) = &self.alive_set {
             alive.mark_group_active(group_name);
         }
@@ -136,23 +123,6 @@ impl GroupManager {
         if let Some(ref cb) = *self.interrupt_callback.read() {
             cb(group_name);
         }
-    }
-
-    /// Whether this group has been idle longer than its `idle_timeout`.
-    pub fn is_group_idle(&self, group_name: &str) -> bool {
-        let group = match self.groups.get(group_name) {
-            Some(g) => g,
-            None => return false,
-        };
-        let idle_timeout = match group.idle_timeout {
-            Some(t) if t > 0 => Duration::from_secs(t),
-            _ => return false,
-        };
-        self.last_used
-            .read()
-            .get(group_name)
-            .map(|t| t.elapsed() >= idle_timeout)
-            .unwrap_or(true)
     }
 
     /// Get the current URLTest selected node name for TCP.

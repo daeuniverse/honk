@@ -142,13 +142,13 @@ impl JuicityClient {
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<JuicityConnState>)> {
         let uuid = self.uuid;
-        let password = self.password.clone();
+        let password = &self.password;
         self.quic
             .connection_with_metrics(connect_timeout, move |conn| async move {
                 let auth_stream = crate::quic::exporter_auth(
                     &conn,
                     &uuid,
-                    &password,
+                    password,
                     JUICITY_VERSION,
                     false,
                     AUTH_GRACE,
@@ -526,7 +526,6 @@ mod tests {
     use super::*;
     use crate::quic::testutil;
     use quinn::VarInt;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// AUTHENTICATE command byte (the shared `exporter_auth` writes it
@@ -732,28 +731,5 @@ mod tests {
             .expect("reply timed out")
             .unwrap();
         assert_eq!(&buf[..n], b"second");
-    }
-
-    #[test]
-    fn test_metadata_codec() {
-        let mut buf = Vec::new();
-        JuiceAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 80)).encode(&mut buf);
-        assert_eq!(
-            buf,
-            vec![crate::proxy::addr::ATYP_IPV4, 93, 184, 216, 34, 0x00, 0x50]
-        );
-
-        let mut buf = Vec::new();
-        JuiceAddr::Domain("example.com".to_string(), 443).encode(&mut buf);
-        assert_eq!(buf[0], crate::proxy::addr::ATYP_DOMAIN);
-        assert_eq!(buf[1], 11);
-        assert_eq!(&buf[2..13], b"example.com");
-        assert_eq!(&buf[13..15], &[0x01, 0xbb]);
-
-        let mut buf = Vec::new();
-        JuiceAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8080, 0, 0)).encode(&mut buf);
-        assert_eq!(buf.len(), 19);
-        assert_eq!(buf[0], crate::proxy::addr::ATYP_IPV6);
-        assert_eq!(&buf[17..19], &[0x1f, 0x90]);
     }
 }

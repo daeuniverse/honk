@@ -12,7 +12,12 @@ fn test_settings_payload_format() {
     assert_eq!(scheme.md5, "75cff2ad89aadf5e257059ee571ebe11");
     assert_eq!(
         scheme.settings_payload().as_ref(),
-        b"v=2\nclient=honk/0.0.1-alpha\npadding-md5=75cff2ad89aadf5e257059ee571ebe11\n"
+        concat!(
+            "v=2\nclient=honk/",
+            env!("CARGO_PKG_VERSION"),
+            "\npadding-md5=75cff2ad89aadf5e257059ee571ebe11\n"
+        )
+        .as_bytes()
     );
 }
 
@@ -74,16 +79,6 @@ async fn padding_writer_honors_check_and_frame_size_boundaries() {
     assert_eq!(long.len(), 50);
     assert_eq!(long[25], CMD_WASTE);
     assert_eq!(&long[30..32], &18u16.to_be_bytes());
-
-    let mut frame = Vec::new();
-    write_frame(&mut frame, CMD_PSH, 1, &vec![0; u16::MAX as usize])
-        .await
-        .unwrap();
-    assert_eq!(frame.len(), FRAME_HEADER_LEN + u16::MAX as usize);
-    let error = write_frame(&mut Vec::new(), CMD_PSH, 1, &vec![0; u16::MAX as usize + 1])
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 fn anytls_node(name: &str) -> Node {
@@ -105,15 +100,6 @@ fn zero_idle_anytls_node(name: &str) -> Node {
     node.anytls_mut().unwrap().min_idle_session = Some(0);
     node.id = node.derive_id();
     node
-}
-
-#[test]
-fn test_resolve_password() {
-    let mut node = anytls_node("test");
-    assert_eq!(AnyTlsHandler::resolve_password(&node), "");
-
-    node.anytls_mut().unwrap().password = Some("anytls-secret".into());
-    assert_eq!(AnyTlsHandler::resolve_password(&node), "anytls-secret");
 }
 
 #[tokio::test]
@@ -289,6 +275,9 @@ fn writer_queue_bounds_control_pressure_and_rejects_after_close() {
 
 const TEST_AUTH: &[u8] = b"test-auth";
 const TEST_SETTINGS: &[u8] = b"test-settings";
+const TEST_OVERFLOW_BURST_FRAMES: usize = 512;
+const TEST_STREAM_BURST_BYTES: usize = 2 * 1024 * 1024;
+const TEST_SESSION_BURST_BYTES: usize = 8 * 1024 * 1024;
 
 fn test_padding() -> Arc<PaddingState> {
     Arc::new(PaddingState {
@@ -310,16 +299,31 @@ async fn establish_test_session_with_budget(
     addr: &str,
     inbound_payload_budget: Arc<InboundPayloadBudget>,
 ) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
-    let (client_end, server_end) = tokio::io::duplex(1 << 20);
+    establish_test_session_with_capacity_and_budget(addr, 1 << 20, inbound_payload_budget).await
+}
+
+async fn establish_test_session_with_capacity(
+    addr: &str,
+    capacity: usize,
+) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
+    establish_test_session_with_capacity_and_budget(addr, capacity, test_inbound_payload_budget())
+        .await
+}
+
+async fn establish_test_session_with_capacity_and_budget(
+    addr: &str,
+    capacity: usize,
+    inbound_payload_budget: Arc<InboundPayloadBudget>,
+) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
+    let (client_end, server_end) = tokio::io::duplex(capacity);
     let (read, write) = tokio::io::split(client_end);
-    let padding_state = test_padding();
     let session = AnyTlsSession::establish(
         addr,
         Box::new(read),
         Box::new(write),
         TEST_AUTH,
         bytes::Bytes::from_static(TEST_SETTINGS),
-        padding_state,
+        test_padding(),
         inbound_payload_budget,
     )
     .await

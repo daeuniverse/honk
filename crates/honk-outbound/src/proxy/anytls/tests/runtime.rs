@@ -47,7 +47,7 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
     expect_handshake(&mut server).await;
     let probe_session = Arc::clone(&session);
     let probe = tokio::spawn(async move {
-        let guard = crate::runtime::NodeRuntime::ephemeral_guarded(&node);
+        let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
         let runtime = guard.runtime();
         let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
             panic!("expected AnyTLS runtime")
@@ -73,7 +73,7 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
 #[tokio::test]
 async fn ephemeral_runtime_close_releases_session_and_connection() {
     let node = anytls_node("ephemeral-probe");
-    let runtime = crate::runtime::NodeRuntime::ephemeral(&node);
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
     assert!(runtime.is_ephemeral());
     let pool = match &runtime.runtime {
         crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
@@ -117,7 +117,7 @@ async fn warm_resources_flip_with_pool_session() {
     let generation =
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
     let runtime = generation.get(&node.id).unwrap();
-    assert!(!runtime.is_warm_or_stateless());
+    assert!(!runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
 
     let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
         panic!("expected AnyTLS runtime")
@@ -125,12 +125,12 @@ async fn warm_resources_flip_with_pool_session() {
     let (session, mut server) = establish_test_session("warm-resources").await;
     expect_handshake(&mut server).await;
     anytls.pool.insert(&session);
-    assert!(runtime.is_warm_or_stateless());
+    assert!(runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
     assert_eq!(runtime.warm_counts().sessions, 1);
 
     session.close();
     assert!(
-        !runtime.is_warm_or_stateless(),
+        !runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session),
         "a closed session no longer counts as warm"
     );
     assert_eq!(runtime.warm_counts().sessions, 0);
@@ -216,59 +216,6 @@ async fn runtime_retirement_drains_live_session_without_cutting_it() {
     assert!(session.is_closed(), "last stream release must finish drain");
 }
 
-#[tokio::test]
-async fn uot_setup_fallback_waits_for_capacity_and_cancellation_does_not_enqueue() {
-    let (session, mut server) = establish_test_session("uot-setup-capacity").await;
-    expect_handshake(&mut server).await;
-    let capacity = (WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32;
-    let held = Arc::clone(&session.writer_q.data_permits)
-        .acquire_many_owned(capacity)
-        .await
-        .unwrap();
-
-    let setup = session.enqueue_confirmed_data(7, bytes::Bytes::from_static(b"setup"));
-    tokio::pin!(setup);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut setup)
-            .await
-            .is_err(),
-        "oversized first datagrams must not drop their fallback setup"
-    );
-    drop(held);
-    tokio::time::timeout(Duration::from_secs(1), setup)
-        .await
-        .unwrap()
-        .unwrap();
-    let (cmd, sid, payload) = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut server))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (cmd, sid, payload.as_slice()),
-        (CMD_PSH, 7, b"setup".as_slice())
-    );
-
-    let held = Arc::clone(&session.writer_q.data_permits)
-        .acquire_many_owned(capacity)
-        .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            session.enqueue_confirmed_data(7, bytes::Bytes::from_static(b"cancelled")),
-        )
-        .await
-        .is_err()
-    );
-    drop(held);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), read_frame(&mut server))
-            .await
-            .is_err(),
-        "cancelling before capacity is acquired must not enqueue setup"
-    );
-    session.close();
-}
 #[tokio::test]
 async fn warm_uses_only_its_generation_owned_runtime_pool() {
     let node = zero_idle_anytls_node("warm-anytls");
@@ -356,21 +303,20 @@ async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
 
 #[tokio::test]
 async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
-    let handler = AnyTlsHandler::new();
     let node = zero_idle_anytls_node("speculative-shared");
     let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let (session, _server) = establish_test_session("speculative-shared").await;
     pool.insert(&session);
-    let prepared = handler
-        .dial_udp_transport_speculative_with(
-            &node,
-            Arc::clone(&pool),
-            "8.8.8.8:53".parse().unwrap(),
-            None,
-            || async { unreachable!("a shared checkout cannot dial") },
-        )
-        .await
-        .unwrap();
+    let prepared = AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+        &node,
+        Arc::clone(&pool),
+        "8.8.8.8:53".parse().unwrap(),
+        None,
+        None,
+        || async { unreachable!("a shared checkout cannot dial") },
+    )
+    .await
+    .unwrap();
     assert_eq!(session.streams.lock().unwrap().len(), 1);
 
     drop(prepared);
@@ -387,23 +333,22 @@ async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
 
 #[tokio::test]
 async fn speculative_detached_winner_commits_into_captured_pool_once() {
-    let handler = AnyTlsHandler::new();
     let node = zero_idle_anytls_node("speculative-detached-commit");
     let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let (session, _server) = establish_test_session("speculative-detached-commit").await;
-    let prepared = handler
-        .dial_udp_transport_speculative_with(
-            &node,
-            Arc::clone(&pool),
-            "8.8.8.8:53".parse().unwrap(),
-            None,
-            {
-                let session = Arc::clone(&session);
-                move || async move { Ok(session) }
-            },
-        )
-        .await
-        .unwrap();
+    let prepared = AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+        &node,
+        Arc::clone(&pool),
+        "8.8.8.8:53".parse().unwrap(),
+        None,
+        None,
+        {
+            let session = Arc::clone(&session);
+            move || async move { Ok(session) }
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(pool.metrics().sessions, 0);
     assert_eq!(session.streams.lock().unwrap().len(), 1);
 
@@ -489,23 +434,22 @@ async fn late_predecessor_commit_obeys_successor_dial_limit() {
 
 #[tokio::test]
 async fn speculative_detached_commit_fails_closed_after_generation_shutdown() {
-    let handler = AnyTlsHandler::new();
     let node = zero_idle_anytls_node("speculative-detached-shutdown");
     let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let (session, _server) = establish_test_session("speculative-detached-shutdown").await;
-    let prepared = handler
-        .dial_udp_transport_speculative_with(
-            &node,
-            Arc::clone(&pool),
-            "8.8.8.8:53".parse().unwrap(),
-            None,
-            {
-                let session = Arc::clone(&session);
-                move || async move { Ok(session) }
-            },
-        )
-        .await
-        .unwrap();
+    let prepared = AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+        &node,
+        Arc::clone(&pool),
+        "8.8.8.8:53".parse().unwrap(),
+        None,
+        None,
+        {
+            let session = Arc::clone(&session);
+            move || async move { Ok(session) }
+        },
+    )
+    .await
+    .unwrap();
 
     pool.shutdown();
     assert!(prepared.commit().await.is_err());
@@ -524,31 +468,29 @@ impl Drop for CancelledDial {
 
 #[tokio::test]
 async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
-    let handler = Arc::new(AnyTlsHandler::new());
     let node = zero_idle_anytls_node("speculative-abort");
     let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
-        let handler = Arc::clone(&handler);
         let node = node.clone();
         let pool = Arc::clone(&pool);
         let started = Arc::clone(&started);
         let cancelled = Arc::clone(&cancelled);
         async move {
-            let _ = handler
-                .dial_udp_transport_speculative_with(
-                    &node,
-                    pool,
-                    "8.8.8.8:53".parse().unwrap(),
-                    None,
-                    move || async move {
-                        let _cancelled = CancelledDial(cancelled);
-                        started.notify_one();
-                        futures_util::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
-                    },
-                )
-                .await;
+            let _ = AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+                &node,
+                pool,
+                "8.8.8.8:53".parse().unwrap(),
+                None,
+                None,
+                move || async move {
+                    let _cancelled = CancelledDial(cancelled);
+                    started.notify_one();
+                    futures_util::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
+                },
+            )
+            .await;
         }
     });
     tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -579,31 +521,29 @@ async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
 
 #[tokio::test]
 async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
-    let handler = Arc::new(AnyTlsHandler::new());
     let node = zero_idle_anytls_node("speculative-shutdown");
     let pool: Arc<AnyTlsPool> = Arc::new(AnyTlsPool::new());
     let started = Arc::new(tokio::sync::Notify::new());
     let cancelled = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
-        let handler = Arc::clone(&handler);
         let node = node.clone();
         let pool = Arc::clone(&pool);
         let started = Arc::clone(&started);
         let cancelled = Arc::clone(&cancelled);
         async move {
-            handler
-                .dial_udp_transport_speculative_with(
-                    &node,
-                    pool,
-                    "8.8.8.8:53".parse().unwrap(),
-                    None,
-                    move || async move {
-                        let _cancelled = CancelledDial(cancelled);
-                        started.notify_one();
-                        futures_util::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
-                    },
-                )
-                .await
+            AnyTlsHandler::dial_udp_transport_speculative_for_pool_with(
+                &node,
+                pool,
+                "8.8.8.8:53".parse().unwrap(),
+                None,
+                None,
+                move || async move {
+                    let _cancelled = CancelledDial(cancelled);
+                    started.notify_one();
+                    futures_util::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
+                },
+            )
+            .await
         }
     });
     tokio::time::timeout(Duration::from_secs(1), started.notified())

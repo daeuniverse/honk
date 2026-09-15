@@ -72,6 +72,15 @@ async fn send_timeout_after_reply_is_not_idle_success() {
         ScoreOutcome::Cancelled
     );
     assert_eq!(
+        score_driver_outcome(
+            &endpoint,
+            &Err(io::Error::from(
+                honk_outbound::proxy::PacketRejection::InvalidSize,
+            )),
+        ),
+        ScoreOutcome::Rejected
+    );
+    assert_eq!(
         score_driver_outcome(&endpoint, &idle_timeout),
         ScoreOutcome::Success
     );
@@ -142,8 +151,9 @@ async fn run_endpoint_driver(
         UdpDriverContext {
             endpoint,
             queue_rx,
-            reply_socket,
+            reply_socket: Arc::new(ReplySocket::untracked(reply_socket)),
             reply_socket_factory: Arc::new(SystemUdpReplySocketFactory),
+            reply_socket_slots: Arc::new(Semaphore::new(MAX_REPLY_SOCKETS_PER_ENDPOINT)),
             client_addr,
             client_dst,
             alive_set,
@@ -169,6 +179,7 @@ fn make_addr(ip: &str, port: u16) -> SocketAddr {
 enum DriverSendAction {
     Ok,
     Error,
+    Rejected,
     Congestion,
     Panic,
     Pending,
@@ -272,6 +283,9 @@ impl honk_outbound::proxy::PacketTransport for ScriptedPacketTransport {
             DriverSendAction::Congestion => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "scripted UDP send congestion",
+            )),
+            DriverSendAction::Rejected => Err(io::Error::from(
+                honk_outbound::proxy::PacketRejection::InvalidSize,
             )),
             DriverSendAction::Panic => panic!("scripted UDP send panic"),
             DriverSendAction::Pending => std::future::pending::<io::Result<()>>().await,
@@ -409,6 +423,32 @@ impl UdpReplySocketFactory for InjectedReplySocketFactory {
         self.created.lock().push(source);
         UdpSocket::from_std(socket)
     }
+}
+
+#[tokio::test]
+async fn reply_socket_credits_cover_retained_teardown_sockets() {
+    let sockets: Vec<_> = (0..=MAX_REPLY_SOCKETS_PER_ENDPOINT)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let sources: Vec<_> = sockets
+        .iter()
+        .map(|socket| socket.local_addr().unwrap())
+        .collect();
+    let pool = UdpEndpointPool::with_reply_socket_factory(
+        1,
+        Arc::new(InjectedReplySocketFactory::new(sockets)),
+    );
+    let mut retained: Vec<_> = sources[..MAX_REPLY_SOCKETS_PER_ENDPOINT]
+        .iter()
+        .map(|source| pool.create_reply_socket(*source).unwrap())
+        .collect();
+    let Err(error) = pool.create_reply_socket(sources[MAX_REPLY_SOCKETS_PER_ENDPOINT]) else {
+        panic!("reply socket budget admitted a ninth retained descriptor");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    retained.pop();
+    pool.create_reply_socket(sources[MAX_REPLY_SOCKETS_PER_ENDPOINT])
+        .unwrap();
 }
 
 fn commit_ready(
@@ -1599,6 +1639,101 @@ async fn udp_endpoint_worker_keeps_flow_alive_on_congested_steady_send() {
             )
             .is_empty(),
         "send congestion must not report the node unavailable"
+    );
+}
+
+#[tokio::test]
+async fn udp_endpoint_worker_keeps_first_packet_rejection_health_neutral() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    let client = make_addr("10.0.0.1", 12345);
+    let dst = make_addr("8.8.8.8", 53);
+    let relay = make_addr("192.168.1.1", 1080);
+    let (first, queue_rx) = reserve_driver_packets(&pool, &stats, client, dst, b"first", &[]);
+    let transport = Arc::new(ScriptedPacketTransport::new(
+        relay,
+        [DriverSendAction::Rejected],
+    ));
+    let endpoint = driver_test_endpoint(transport, relay);
+    let (first_ack_tx, first_ack_rx) = oneshot::channel();
+    let worker = tokio::spawn(run_endpoint_driver(
+        endpoint,
+        queue_rx,
+        test_reply_socket().await,
+        client,
+        dst,
+        Arc::clone(&alive),
+        Arc::clone(&stats),
+        "test-node".to_owned(),
+        first,
+        first_ack_tx,
+    ));
+
+    assert_eq!(
+        honk_outbound::proxy::packet_error_class(&first_ack_rx.await.unwrap().unwrap_err()),
+        honk_outbound::proxy::PacketErrorClass::Rejected
+    );
+    let error = worker.await.unwrap().unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_error_class(&error),
+        honk_outbound::proxy::PacketErrorClass::Rejected
+    );
+    assert!(
+        alive
+            .get_probe_history(
+                TEST_NODE_ID,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                honk_outbound::alive::IpVersion::V4,
+            )
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn udp_endpoint_worker_keeps_steady_packet_rejection_health_neutral() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    let client = make_addr("10.0.0.1", 12345);
+    let dst = make_addr("8.8.8.8", 53);
+    let relay = make_addr("192.168.1.1", 1080);
+    let (first, queue_rx) =
+        reserve_driver_packets(&pool, &stats, client, dst, b"first", &[b"steady"]);
+    let transport = Arc::new(ScriptedPacketTransport::new(
+        relay,
+        [DriverSendAction::Ok, DriverSendAction::Rejected],
+    ));
+    let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
+    let (first_ack_tx, first_ack_rx) = oneshot::channel();
+    let worker = tokio::spawn(run_endpoint_driver(
+        endpoint,
+        queue_rx,
+        test_reply_socket().await,
+        client,
+        dst,
+        Arc::clone(&alive),
+        Arc::clone(&stats),
+        "test-node".to_owned(),
+        first,
+        first_ack_tx,
+    ));
+
+    first_ack_rx.await.unwrap().unwrap();
+    transport.wait_for_send_count(2).await;
+    let error = worker.await.unwrap().unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_error_class(&error),
+        honk_outbound::proxy::PacketErrorClass::Rejected
+    );
+    assert!(
+        alive
+            .get_probe_history(
+                TEST_NODE_ID,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                honk_outbound::alive::IpVersion::V4,
+            )
+            .is_empty()
     );
 }
 

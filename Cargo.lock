@@ -1604,7 +1604,6 @@ dependencies = [
  "quinn-proto",
  "rand 0.10.2",
  "rcgen",
- "rustls-pemfile",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sha3",
@@ -1619,7 +1618,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-root-certs",
- "webpki-roots",
 ]
 
 [[package]]

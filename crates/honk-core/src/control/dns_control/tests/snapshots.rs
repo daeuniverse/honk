@@ -208,8 +208,14 @@ async fn resolve_domain_keeps_old_snapshot_without_blocking_publication() {
     }
     assert!(!running.is_finished(), "old lookup must remain paused");
     release.notify_waiters();
-    let old_ips = running.await.expect("old lookup task");
-    let new_ips = controller.resolve_domain("example.com").await;
+    let old_ips = running
+        .await
+        .expect("old lookup task")
+        .expect("old lookup result");
+    let new_ips = controller
+        .resolve_domain("example.com")
+        .await
+        .expect("new lookup result");
 
     assert_eq!(
         old_ips,

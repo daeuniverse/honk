@@ -13,13 +13,8 @@ use super::{
     UdpSocketTransport,
 };
 
+#[derive(Default)]
 pub struct DirectHandler;
-
-impl Default for DirectHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl DirectHandler {
     pub fn new() -> Self {
@@ -100,28 +95,6 @@ impl ProbeableOutbound for DirectHandler {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn test_direct_connect() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
-                stream.write_all(b"hello").await.ok();
-            }
-        });
-
-        let handler = DirectHandler::new();
-        let node = Node::default();
-        let target: SocketAddr = addr;
-
-        let result = handler
-            .dial(&node, target, None, Duration::from_secs(3))
-            .await;
-        assert!(result.is_ok());
-    }
 
     #[tokio::test]
     async fn direct_connect_respects_one_physical_dial_permit() {

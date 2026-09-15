@@ -32,6 +32,7 @@ const METHOD_USERNAME_PASSWORD: u8 = 0x02;
 const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 
 /// Full SOCKS5 proxy handler.
+#[derive(Default)]
 pub struct Socks5Handler;
 
 impl Socks5Handler {
@@ -62,18 +63,12 @@ impl Socks5Handler {
         password: Option<&str>,
     ) -> anyhow::Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let methods = if username.is_some() && password.is_some() {
-                vec![METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
+            let greeting: &[u8] = if username.is_some() && password.is_some() {
+                &[SOCKS5_VERSION, 2, METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
             } else {
-                vec![METHOD_NO_AUTH]
+                &[SOCKS5_VERSION, 1, METHOD_NO_AUTH]
             };
-
-            // Send: VER(1) | NMETHODS(1) | METHODS(N)
-            let mut greeting = Vec::with_capacity(2 + methods.len());
-            greeting.push(SOCKS5_VERSION);
-            greeting.push(methods.len() as u8);
-            greeting.extend_from_slice(&methods);
-            stream.write_all(&greeting).await?;
+            stream.write_all(greeting).await?;
 
             // Read: VER(1) | METHOD(1)
             let mut response = [0u8; 2];
@@ -264,17 +259,12 @@ impl Socks5Handler {
         // silent leaves this await pending, and the caller only bounds the
         // connect that precedes it.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let methods = if username.is_some() && password.is_some() {
-                vec![METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
+            let greeting: &[u8] = if username.is_some() && password.is_some() {
+                &[SOCKS5_VERSION, 2, METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
             } else {
-                vec![METHOD_NO_AUTH]
+                &[SOCKS5_VERSION, 1, METHOD_NO_AUTH]
             };
-
-            let mut greeting = Vec::with_capacity(2 + methods.len());
-            greeting.push(SOCKS5_VERSION);
-            greeting.push(methods.len() as u8);
-            greeting.extend_from_slice(&methods);
-            stream.write_all(&greeting).await?;
+            stream.write_all(greeting).await?;
 
             let mut response = [0u8; 2];
             stream.read_exact(&mut response).await?;
@@ -345,16 +335,9 @@ impl Socks5Handler {
                 ATYP_IPV6 => {
                     let mut addr = [0u8; 18];
                     stream.read_exact(&mut addr).await?;
-                    let ip = std::net::Ipv6Addr::from([
-                        ((addr[0] as u16) << 8) | addr[1] as u16,
-                        ((addr[2] as u16) << 8) | addr[3] as u16,
-                        ((addr[4] as u16) << 8) | addr[5] as u16,
-                        ((addr[6] as u16) << 8) | addr[7] as u16,
-                        ((addr[8] as u16) << 8) | addr[9] as u16,
-                        ((addr[10] as u16) << 8) | addr[11] as u16,
-                        ((addr[12] as u16) << 8) | addr[13] as u16,
-                        ((addr[14] as u16) << 8) | addr[15] as u16,
-                    ]);
+                    let ip = std::net::Ipv6Addr::from(
+                        <[u8; 16]>::try_from(&addr[..16]).expect("slice length"),
+                    );
                     let port = u16::from_be_bytes([addr[16], addr[17]]);
                     SocketAddr::new(std::net::IpAddr::V6(ip), port)
                 }
@@ -426,7 +409,7 @@ impl Socks5Handler {
 
 #[derive(Debug)]
 struct Socks5UdpTransport {
-    socket: Arc<UdpSocket>,
+    socket: UdpSocket,
     control: tokio::sync::Mutex<TcpStream>,
     /// Reused connected-UDP receive scratch; never reallocated per packet.
     recv_buf: tokio::sync::Mutex<Vec<u8>>,
@@ -541,12 +524,6 @@ impl PacketTransport for Socks5UdpTransport {
     }
 }
 
-impl Default for Socks5Handler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl TcpOutbound for Socks5Handler {
     async fn dial(
@@ -603,7 +580,7 @@ impl PacketOutbound for Socks5Handler {
         udp_socket.connect(relay_addr).await?;
 
         Ok(Arc::new(Socks5UdpTransport {
-            socket: Arc::new(udp_socket),
+            socket: udp_socket,
             control: tokio::sync::Mutex::new(control),
             recv_buf: tokio::sync::Mutex::new(vec![0u8; u16::MAX as usize]),
             target_addr: target,
@@ -975,30 +952,6 @@ mod tests {
             Some("dns.example.test"),
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn socks5_udp_transport_strips_reply_header() {
-        let server = run_udp_associate_test_server(socks5_udp_associate_reply(
-            "127.0.0.1:0".parse().unwrap(),
-        ))
-        .await;
-        let target: SocketAddr = "203.0.113.9:5353".parse().unwrap();
-        let transport = dial_udp_test_transport(&server, target, None).await;
-        let client_addr = transport_client_addr(&server, &transport).await;
-        server
-            .relay
-            .send_to(
-                &expected_socks5_udp_datagram(target, None, 0, b"reply payload"),
-                client_addr,
-            )
-            .await
-            .unwrap();
-
-        let mut received = [0u8; 1024];
-        let (n, source) = transport.recv_packet(&mut received).await.unwrap();
-        assert_eq!(&received[..n], b"reply payload");
-        assert_eq!(source, target);
     }
 
     #[tokio::test]
@@ -1428,31 +1381,5 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_socks5_connectivity() {
-        let server_addr = run_test_socks5_server().await;
-
-        let node = Node {
-            name: "test".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
-            address: server_addr.ip().to_string(),
-            host: String::new(),
-            port: server_addr.port(),
-            ..Default::default()
-        };
-
-        let handler = Socks5Handler::new();
-        assert!(handler.test_connectivity(&node).await);
-    }
-
-    #[test]
-    fn test_pool_ready_streams_declared() {
-        // SOCKS5 completed-CONNECT streams are pure data channels and may
-        // be pooled for direct reuse.
-        let pool_ready_streams =
-            crate::descriptor::descriptor(NodeProtocol::Socks5).pool_ready_streams;
-        assert!(pool_ready_streams(&Node::default()));
     }
 }

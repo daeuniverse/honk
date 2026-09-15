@@ -23,7 +23,7 @@ VMess JSON 的 `ps` 备注缺失或为空时，先使用 `vmess-{host}` 通过�
 
 识别 tag 与链接的结束引号时，反斜杠会转义下一个字符；解析后的文本保留原始转义序列。
 
-协议已识别但格式错误的链接会被丢弃，并产生 `invalid-node-entry` 诊断。诊断使用原始节点条目序号，不包含链接或节点名称。数据接口返回诊断而不记录日志；普通接口只报告一次。未知协议属于配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS 传输行为必须写在各链接的 `vless_mode=` 查询参数中。
+协议已识别但格式错误的链接会被丢弃并产生 warning。已知的无效字段保留具体的安全原因及 schema 路径；未知解析失败使用 `invalid-node-entry`。诊断携带原始节点条目序号与来源位置，不包含原始链接、值或节点名称。数据接口返回诊断而不记录日志；普通接口只报告一次。未知协议或已删除的 VLESS `vless_mode` 属于配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS 数据包与 carrier 选择必须写在该链接精确的 `packetEncoding=`、`mux=` 和 `udp=` query 参数中。
 
 旧版 `ss://base64(method:password@host:port)` 格式按字面值读取解码后的凭据，不做 URL 解码：`%20` 保持为 `%20`，`?`、`/`、`#`、`:` 和 `@` 仍是密码字符。最后一个 `@` 分隔凭据与端点；userinfo 本身也可以是 `base64(method:password)`。解码后的载荷缺少 `@`，或凭据无法解析为方法与密码时，拒绝解析。URL userinfo 格式仍按百分号解码凭据。端点、路径、query（包括 `/?plugin=...`）和 fragment 继续按 URL 处理。
 
@@ -35,13 +35,15 @@ VMess JSON 的 `ps` 备注缺失或为空时，先使用 `vmess-{host}` 通过�
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-凭据指纹遵循各 handler 的字段优先级。旧版 dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow` 以及每种非 `legacy` VLESS mode。非空的结构化 `tls_alpn` 以旧 ID 为 namespace、JSON 元组 `["tls-alpn", <有序列表>]` 为 name 派生子 UUID v5，从而将 ALPN 与任意凭据文本分离。空 `tls_alpn` 保留旧 ID。调优参数与显示元数据不参与。
+凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow`，以及有效的 VLESS UDP 权限、回退 encoding 和 multiplex 路径。非空的结构化 `tls_alpn` 以基础 ID 为 namespace、JSON 元组 `["tls-alpn", <有序列表>]` 为 name 派生子 UUID v5，从而将 ALPN 与任意凭据文本分离。空 `tls_alpn` 保留基础 ID。调优参数与显示元数据不参与，但改变物理路径的 VLESS multiplex 上限除外。
 
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
-本次升级时，上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 的节点，其 ID 会变更一次，以 ID 为键的健康状态和预热状态会重新建立。这些字段不含两种字符的节点保留原 ID。ALPN 使用独立的 JSON 子 UUID 派生步骤，因此仅 ALPN 含有 `|` 或 `\` 不会在本次升级时改变已有 ID。Selector 选择按成员名称迁移。连接池中的就绪流原本就会在所属配置版本退出时移除。`name`/`subtag` 筛选器不受影响。
+**破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及 session 状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
 
-因此，只要可拨号端点不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
+不要为了迁移 ID 而删除缓存。持久化已启用且可读时，未变更的组名、成员名可用于恢复 Selector 选择；有效且不超过 24 小时的 TCP-v4 延迟样本会在启动时按节点名关联到新 ID。这些样本只用于排名，不恢复存活性；改名或重复名称不能保证恢复同一个叶节点。就绪流原本就随所属 generation 退役，`name`/`subtag` 筛选语义不变。
+
+只要可拨号端点和 dial shape 不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
 
 ## 节点字段
 
@@ -57,7 +59,8 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `port` | u16 | `0` | 服务端端口；URL 形链接省略时使用 `443` |
 | `username` / `password` | string? | null | 来自 userinfo 的认证、UUID 或密钥 |
 | `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串 |
-| `vless_mode` | `WireMode` | `legacy` | `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 或 `mux-cool` |
+| `packet_encoding` | `VlessUdpEncoding` | VLESS 使用 `auto` | 结构化 VLESS 回退 encoding：`auto`、`native`、`xudp` 或 `uot-v2`；规范 URI 的 `packetEncoding=none` 映射为 `native` |
+| `multiplex` | `VlessMultiplex` | VLESS 使用 `{"protocol":"off"}` | 结构化 VLESS carrier 选择：`off`、`h2` 或 `xray`；精确形态见下文 |
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
@@ -70,7 +73,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `reality_public_key` | string? | null | 来自 `pbk` 的 REALITY X25519 公钥 |
 | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
-| `flow` | string? | null | 来自非空 `flow` 或 Shadowrocket `xtls=2` 的 VLESS flow；只支持 `xtls-rprx-vision` |
+| `flow` | string? | null | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow |
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
@@ -99,6 +102,8 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 ### 结构化 loader 兼容性
 
 TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所选 `protocol` 自己的字段；其他协议遗留的非默认字段会被剥离而不会拒绝节点，并由一条警告列出被剥离的字段名。例如，`ss` 节点上的 `tls: true` 会被忽略并告警，而不会开启 TLS。对 Trojan、VLESS、Hysteria2 与 AnyTLS，`username` 不是凭证别名；缺少该协议实际凭证字段时，单独提供的 `username` 会被剥离并触发针对性警告，从而保持旧版行为与 ID。所选协议实际使用的值仍会正常解析与校验。Honk 自身输出仍可安全 round-trip。启用 `store_subscribe` 时，原始订阅正文仅在解析成功后持久化；被拒绝的刷新不会覆盖上一份有效正文。
+
+VLESS 扁平输入已移除 `vless_mode`。只要原始输入中出现该字段，节点就会被拒绝，包括值为 `null` 或任一旧版已知拼写；请用 `network` 表示 packet 权限、`packet_encoding` 表示回退、`multiplex` 表示 carrier 选择。唯一保留的 `vless_mode: "legacy"` 是非 VLESS 扁平格式序列化的兼容占位字段。它不配置 VLESS，非 VLESS 行为与身份保持不变。
 
 扁平凭据别名在剥离不兼容字段前比较：Hysteria2 的 `hy2_auth`/`password`，TUIC 和 Juicity 的专用 UUID/`username`、专用密码/`password`，以及 AnyTLS 的 `password`/`anytls_password`。缺失或 null 表示未提供；已提供的字符串须逐字节一致，空字符串和首尾空格也参与比较。空凭据仍须满足对应协议的要求。扁平凭据字段仍须使用字符串；数字转换仅适用于订阅导入。
 
@@ -131,7 +136,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `ss` | `shadowsocks` | 是 | 是 | AEAD 与 Shadowsocks 2022 |
 | `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC transport |
 | `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC 与 REALITY；handler 需要 `rprx` |
-| `vless` | — | 是 | 取决于 mode* | Legacy、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
+| `vless` | — | 是 | 可配置* | 原生 UDP、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
 | `tuic` | — | 是 | 是 | QUIC 上的 TUIC v5 |
@@ -140,7 +145,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `direct` | — | 是 | 是 | 保留的内置直连出站；没有分享链接 scheme |
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接 scheme |
 
-`network` 还可关闭 Trojan、AnyTLS 与非 legacy VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。Legacy VLESS 没有 UDP，VMess UDP 尚未实现。
+`network` 可独立于流 transport 关闭 Trojan、AnyTLS 和 VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。VMess UDP 尚未实现。
 
 对于支持 `network` 的协议，扁平结构化输入接受逗号分隔的 `tcp`/`udp`，忽略各项首尾空白和 ASCII 大小写。`tcp` 关闭 UDP；`udp` 与 `tcp,udp` 都允许 UDP。空文本或纯空白规范化为未指定，保留协议的默认能力。`quic` 等未知值，或非空列表中的空项，会使节点被拒绝。该字段只控制 UDP 准入；`udp` 不会额外禁止 TCP。
 
@@ -160,6 +165,10 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 
 长度错误或不是 base64 的密钥会导致 handler 构造失败。
 
+UDP 重放保护分别保留当前和前一个服务端 session 的窗口。前一个 session
+连续 60 秒没有活动后才接受第三个 session。只有认证及响应 header 校验
+成功后才修改接收 session 状态，无效包不能重置重放历史。
+
 ### 流传输
 
 支持流传输的分享链接用 `type=` 或其 `network=` 别名选择传输方式。空文本和 `tcp` 表示裸 TCP；`ws`、`grpc` 分别选择 WebSocket、gRPC。赋值前会比较所有已提供的别名，包括兼容的 `obfs` 声明和重复查询键；不一致则拒绝链接。`h2`、`kcp` 等不支持的名称会在解析时被拒绝。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。`alpn` 为兼容而接受，但不会存储。
@@ -175,7 +184,7 @@ VMess 接受 v2rayN Base64 JSON（`net`、`host`、`path`、`sni`），也接受
 
 VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，保留原有默认 UDP 能力；已有的有效空传输字段也保留原始写法。
 
-VLESS 已完成以下 live 互通验证：TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。Vision 支持的 direct-copy 组合是带 TLS 或 REALITY 的裸 TCP，而不是 WS/gRPC。
+VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。未加密 Vision 的 direct-copy 路径是使用 TLS 1.3 或 REALITY 的裸 TCP，而不是 WS/gRPC；加密 Vision 遵循下文的组合规则。
 
 ### Shadowrocket VLESS
 
@@ -193,7 +202,7 @@ query 映射遵循 [Shadowrocket 导出器](https://github.com/cedar2025/Xboard/
 | `obfs=websocket`、`obfsParam`、`path` | WebSocket transport、Host header 回退值和路径。 |
 | `obfs=grpc`、`path` | gRPC transport 和 service name 回退值。 |
 
-TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision`。
+TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。
 
 Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 仅用作 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。TLS 使用方最终仍可回退到节点主机名。
 
@@ -244,26 +253,69 @@ Duration 接受裸秒数以及 `ms`、`s`、`m`、`h` 后缀。
 
 ## VLESS
 
-### Mode
+<a id="vless-udp-and-multiplexing"></a>
 
-`vless_mode` 是唯一、互斥的规范化 mode，绝不协商。
+### UDP 与多路复用
 
-| Mode | TCP | UDP | 行为 |
-| --- | --- | --- | --- |
-| `legacy` | 普通 VLESS stream | 否 | 向后兼容默认值；省略时保留 legacy 身份 |
-| `uot-v2` | 普通 VLESS stream | 直连 UoT v2 | 每个 UDP transport 一条 connected UoT stream |
-| `h2mux` | H2MUX 逻辑 stream | 原生 connected sing-mux UDP | TCP 与 UDP 共用节点所有的 HTTP/2 carrier pool |
-| `h2mux-padded` | H2MUX 逻辑 stream | 原生 connected sing-mux UDP | 带 sing-mux v1 padding 的 `h2mux` |
-| `xudp` | 普通 VLESS stream | Single XUDP | 每个 UDP transport 一条不入池的 mux-command carrier，session ID 0 |
-| `mux-cool` | Mux.Cool 逻辑 stream | 池化 XUDP | TCP 与 UDP 共用节点所有的 Xray Mux.Cool carrier pool |
+VLESS 有三个独立选择。`udp=0|1` 控制是否允许 packet 拨号，`packetEncoding=auto|none|xudp|uot-v2` 选择回退 packet 协议，`mux=off|h2mux|xray` 选择 TCP/UDP carrier 路径。这些选择不会协商。
 
-规范 query 为 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`。旧别名 `packetEncoding=xudp` 映射为 `xudp`。重复的 mode 表示会被拒绝。
+| 规范 URI query | 默认值 | 接受值与作用 |
+| --- | --- | --- |
+| `udp` | 允许 | `1`/`true` 允许 packet 拨号；`0`/`false` 关闭 UDP 而不关闭 TCP。文本布尔值不区分 ASCII 大小写；重复声明必须一致。 |
+| `packetEncoding` | `auto` | `auto`、`none`（原生 VLESS command-UDP）、`xudp`（Single XUDP）或 `uot-v2`。mux 不接管 UDP 路径时使用该回退值。 |
+| `mux` | `off` | `off`、`h2mux` 或 `xray`。 |
+| `padding` | `false` | 仅对 `mux=h2mux` 有效的 bool；选择 sing-mux v1 padding。 |
+| `concurrency` | `0` | 仅对 `mux=xray` 有效的有符号 `i16`：负值关闭 TCP mux，零允许每条 TCP carrier 同时承载 8 个逻辑 child，正值设置该逐 carrier 并发且最多 128；它不设置物理 carrier 数量。 |
+| `xudpConcurrency` | `0` | 仅对 `mux=xray` 有效的有符号 `i16`：负值使用协议回退；零在 TCP mux 启用时共享 TCP pool 及其逐 carrier 并发，否则使用协议回退；正值建立独立 UDP pool，每条 carrier 的逻辑 child 并发使用该值且最多 128。 |
+| `xudpProxyUDP443` | `reject` | 仅对 `mux=xray` 有效的 `reject`、`skip` 或 `allow`；UDP/443 的精确优先级见下文。 |
 
-每个非 `legacy` mode 都拒绝非空且非 `none` 的 VLESS Encryption。Vision 只支持与 `legacy` 或 `xudp`、TLS 或 REALITY，以及裸 TCP transport 组合。不会发生 mode 协商、回退或首包重放。
+`packetEncoding`、`mux` 与每个 mux 控制项最多出现一次。重复的 `udp` 声明仅在所有值一致时接受。
 
-解析器拒绝而不是猜测以下含义模糊的第三方 query 形式：`mux`、`smux`、`multiplex`、`udp-over-tcp`、`udp_over_tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`packet_addr`、`xudp`、`only-tcp`、`only_tcp`、`brutal`、`brutal-opts`、`brutal_opts`、`max-connections`、`max_connections`、`min-streams`、`min_streams`、`max-streams` 与 `max_streams`。
+`mux=off` 保留普通 VLESS TCP，UDP 使用 `packetEncoding`；`uot-v2` 为每个 UDP transport 建立一条 connected UoT v2 stream。`mux=h2mux` 通过同一个节点所有的 HTTP/2 carrier pool 承载逻辑 TCP 和原生 connected sing-mux UDP；`padding=true` 保留现有 padded H2MUX wire 格式。H2MUX 接管两类路径，因此回退 encoding 不会替换其 UDP 路径。它保留现有 pool 策略，不继承 Mux.Cool 每条 carrier 128 个 child 后 rollover 的行为。`mux=xray` 对两个并发设置启用的 pool 使用 Xray Mux.Cool。因此 TCP 与 UDP pooling 相互独立。
 
-本参考只描述配置表面。carrier 所有权与 wire framing 见[出站设计](../design/outbound.md)。
+以下是规范示例（使用合成 UUID）：
+
+```dae
+node {
+    auto: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#auto'
+    h2_padded: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=h2mux&padding=true&udp=1#h2-padded'
+    xray_shared: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=xray&concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip&udp=1#xray-shared'
+    vision_udp_pool: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&flow=xtls-rprx-vision&packetEncoding=auto&mux=xray&concurrency=-1&xudpConcurrency=8&xudpProxyUDP443=skip&udp=1#vision-udp-pool'
+}
+```
+
+结构化 TOML/YAML/JSON 使用 `network` 表示 packet 权限（`tcp` 关闭 UDP；省略、`udp` 或 `tcp,udp` 允许），使用 `packet_encoding`（`auto`、`native`、`xudp`、`uot-v2`）表示回退，并使用带 tag 的 `multiplex` 值。Multiplex 形态为 `{"protocol":"off"}`、`{"protocol":"h2","padding":true|false}`，以及 `{"protocol":"xray","tcp":N|null,"udp":"protocol"|"shared-tcp"|{"separate":N},"udp443":"reject"|"skip"|"allow"}`。`tcp` 和每个 `separate` 值都是正数的逐 carrier 逻辑 child 并发上限，且最多 128；省略/null 表示关闭 TCP mux pool。
+
+#### 从 `vless_mode` 迁移
+
+**破坏性配置变更：**`vless_mode` 已删除，不是兼容别名。升级前应迁移静态链接与 provider 内容。静态 `node {}` 中出现该字段会拒绝候选配置；订阅只丢弃对应条目，保留其他有效节点。全部使用旧模式的订阅缓存无法在离线状态下恢复节点；离线升级前应确保本地已有迁移后的 body，不要删除仍可用的 Selector 或延迟状态。单个 provider 恢复失败本身不导致启动退出，但最终组装的配置仍须通过校验。
+
+每种旧 mode 都有直接且保留能力的替代组合：
+
+| 已移除的 `vless_mode` | `packetEncoding` | `mux` | `udp` | 额外 query |
+| --- | --- | --- | --- | --- |
+| `auto` | `auto` | `off` | `1` | — |
+| `native` | `none` | `off` | `1` | — |
+| `legacy` | `auto` | `off` | `0` | 保留仅 TCP 行为；不保留旧身份。 |
+| `uot-v2` | `uot-v2` | `off` | `1` | — |
+| `h2mux` | `auto` | `h2mux` | `1` | `padding=false` |
+| `h2mux-padded` | `auto` | `h2mux` | `1` | `padding=true` |
+| `xudp` | `xudp` | `off` | `1` | — |
+| `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
+
+最后一行保留 TCP/UDP 可用性及原来的 Vision UDP/443 gate；对被 skip 的非 Vision UDP/443 目标，它可能使用协议回退，而不是 pooled XUDP。本次升级中所有接纳的 VLESS 节点都使用新的身份派生规则，见[节点身份](#节点身份)。
+
+旧版 `vless_mode` URI 语法会被拒绝。解析器也拒绝 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`xudp`、`only-tcp`、Brutal 控制项与 H2 stream 数量调优等含义不明确的第三方 URI 拼写；只有上表中的精确规范参数会配置这些选择。
+
+#### 目标选择与组合
+
+未启用 Vision 时，`packetEncoding=auto` 对目标端口 53、443 使用原生 VLESS UDP，其他端口使用 Single XUDP。启用 Vision 时，获准目标使用 Single XUDP。原生 UDP 发送范围为 1–8190 字节，Single XUDP 为 1–7526 字节；空包或超长包是 packet 局部拒绝，接收到的零长度 frame 仍是数据报。
+
+对 `mux=xray`，先应用 UDP/443 策略。`reject` 即使在两个 mux pool 都关闭时也拒绝 UDP/443。`skip` 选择 `packetEncoding`，再应用普通 Vision gate。只有该目标实际使用 Xray UDP mux pool 时，`allow` 才绕过 Vision UDP/443 gate；协议回退目标仍遵循普通 gate。在 Xray mux 之外，基础 `xtls-rprx-vision` 拒绝 UDP/443，`xtls-rprx-vision-udp443` 则放行并在线上发送基础 flow。策略和容量拒绝对本次尝试是终止性的，且不影响健康/Score；不会触发其他节点/direct 回退或自动重放 packet。
+
+Vision 始终要求 direct TCP 路径：`mux=off`，或 `mux=xray` 且关闭 TCP mux。所有 H2MUX TCP 组合都无效，包括使用 Encryption 时。Vision 可以使用仅 UDP 的 Xray pool；`concurrency=-1` 时，用正数 `xudpConcurrency` 建立该 pool。未加密 Vision 还要求使用协商 TLS 1.3 或 REALITY 的裸 TCP。加密 Vision 可以保留已选 outer stream transport 与 random-XOR 处理，但仍不能启用 TCP mux、H2MUX UDP、原生 UDP 或 UoT v2；XUDP/Xray UDP 或关闭 UDP 均有效。
+
+VLESS carrier slot 来自进程级文件描述符预算，并先于 UDP endpoint slot 划分，因此可复用 carrier 容量会与 endpoint 数量互相取舍。容量耗尽报告为本地容量问题，而不是远端协议失败。honk 还根据其可复用 source/session 所有权与按目的地路由语义限定 XUDP Global ID 的 scope；这不是 Xray 的仅源身份，也不承诺无冲突 NAT 身份。规范生命周期与 scope 定义见[源/session 所有权与容量](../design/outbound.md#sourcesession-ownership-and-capacity)。
 
 ### Encryption
 
@@ -273,7 +325,7 @@ Duration 接受裸秒数以及 `ms`、`s`、`m`、`h` 后缀。
 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 ```
 
-密钥解码后可以是 32 字节 X25519 密钥或 1184 字节 ML-KEM-768 密钥；也接受链式认证密钥。`0rtt` 使用缓存 ticket，冷启动时走 1-RTT 路径。VLESS Encryption 位于所选 TCP/TLS/REALITY/WS/gRPC transport 内层，但要求 `legacy` mode，且不能与 `flow` 组合。
+密钥解码后可以是 32 字节 X25519 密钥或 1184 字节 ML-KEM-768 密钥；也接受链式认证密钥。`0rtt` 使用缓存 ticket，冷启动时走 1-RTT 路径。VLESS Encryption 位于选定的 outer TCP/TLS/REALITY/WS/gRPC transport 内层。它支持原生或 XUDP 回退以及 Xray UDP pool，但不支持 H2MUX TCP/UDP 或 UoT v2。Encryption 与 Vision 可以在上述 direct-TCP-path 规则下组合。
 
 ### REALITY 与 Vision
 
@@ -281,16 +333,21 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 
 | Query | 含义 |
 | --- | --- |
-| `security=reality` | 选择 REALITY 并开启 TLS。选择了 REALITY 却没有 `pbk` 的节点会在校验时被拒绝，而不是降级成普通 TLS |
-| `pbk` | Base64url 编码的 32 字节 X25519 服务端公钥；无效输入 fail-closed |
-| `sid` | 偶数长度十六进制 short ID，最多 8 字节；允许为空 |
-| `spx` | 存储 spider path；选择 REALITY 时默认为 `/` |
-| `flow=xtls-rprx-vision` | 开启受支持的 Vision flow |
-| `fp` | 接受但忽略；ClientHello 指纹由全局 TLS mode 控制 |
+| `security=reality` | 选择 REALITY 并开启 TLS。选择了 REALITY 却没有 `pbk` 的节点会在校验时被拒绝，而不是降级成普通 TLS。 |
+| `pbk` | Base64url 编码的 32 字节 X25519 服务端公钥；无效输入 fail-closed。 |
+| `sid` | 偶数长度十六进制 short ID，最多 8 字节；允许为空。 |
+| `spx` | 存储 spider path；选择 REALITY 时默认为 `/`。 |
+| `flow=xtls-rprx-vision` | 按上述 UDP/443 规则启用 Vision。 |
+| `flow=xtls-rprx-vision-udp443` | 启用 Vision 的普通 UDP/443 例外；线上 addon 仍使用基础 flow。 |
+| `fp` | 接受但忽略；ClientHello 指纹由全局 TLS mode 控制。 |
 
 显式 `security=` 会覆盖 VLESS 历史默认值：`none` 关闭 TLS，其他值开启。没有 `security` 时 VLESS 默认开启 TLS。标准 VMess 链接改用其 v2rayN JSON `tls` 字段。
 
-REALITY 用其 REALITY key 认证对端并 fail-closed；它不需要 CA 校验或 `skip_cert_verify`。服务端 REALITY `dest`/客户端 SNI 应选择 TLS Certificate 消息小于 8 KiB 的目标，因为 sing-box REALITY 缓冲区为 8192 字节；已知 `dl.google.com` 可容纳，`www.microsoft.com` 不可容纳。
+REALITY 仅使用 TLS 1.3，并依次通告 hybrid `X25519MLKEM768` 与预设 classic `X25519` key share。客户端认证从该预设 classic share 派生并绑定完整 ClientHello；服务端认证校验 REALITY key/HMAC，并 fail-closed。每个 ClientHello 只 seal 一次；HelloRetryRequest 再次调用 callback 时，会在复用 key/nonce 前中止，honk 不会重试该 REALITY 握手。
+
+裸 TCP pool 仅在握手前 socket 保持静默时接纳它。任何排队的服务端字节（包括 fatal TLS alert）都会在接纳或取出时拒绝该裸 entry；没有 SNI/alert 特例，也不会重试握手。已经完成协议准备的 ready stream 即使含有有效的 buffered application data，也不会因此被拒绝。
+
+REALITY 不需要 CA 校验或 `skip_cert_verify`。服务端 REALITY `dest`/客户端 SNI 应选择 TLS Certificate 消息小于 8 KiB 的目标，因为 sing-box REALITY 缓冲区为 8192 字节；已知 `dl.google.com` 可容纳，`www.microsoft.com` 不可容纳。
 
 ## TLS 指纹与 ECH
 
@@ -317,7 +374,7 @@ REALITY 用其 REALITY key 认证对端并 fail-closed；它不需要 CA 校验�
 | --- | --- |
 | `ss://` | SIP002 userinfo/完整 authority base64 形式，以及 `plugin` |
 | `vmess://` | 宽松 base64 v2rayN JSON（`add`、`port`、`id`、`scy`、`net`、`host`、`path`、`tls`、`sni`、`ps`） |
-| `vless://` | URL userinfo UUID，加 transport、TLS/REALITY、flow、Encryption 与规范 mode query |
+| `vless://` | URL userinfo UUID，加流 transport、TLS/REALITY、flow、Encryption 与上文规范 UDP/mux query |
 | `trojan://` | URL userinfo 密钥，加 transport 与 TLS query |
 | `anytls://` | URL userinfo 密钥，加 TLS 与池 query |
 | `hysteria2://` | 上述 Hysteria2 query 映射；也接受 `hysteria://` |

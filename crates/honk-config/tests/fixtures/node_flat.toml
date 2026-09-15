@@ -7,7 +7,7 @@ port = 443
 username = "00000000-0000-0000-0000-000000000001"
 password = "00000000-0000-0000-0000-000000000001"
 encryption = "none"
-vless_mode = "xudp"
+packet_encoding = "xudp"
 transport = "ws"
 tls = true
 sni = "front.example"
@@ -30,3 +30,6 @@ subscription_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 group_id = "12345678-1234-4234-8234-123456789abc"
 created_at = "2026-01-02T03:04:05Z"
 updated_at = "2026-02-03T04:05:06Z"
+
+[multiplex]
+protocol = "off"

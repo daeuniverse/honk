@@ -34,6 +34,7 @@ async fn udp_preparation_deadline_drains_pending_candidate() {
         })
     };
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
@@ -65,7 +66,7 @@ async fn udp_preparation_deadline_drains_pending_candidate() {
         .await
         .expect("UDP preparation must enforce its own deadline")
         .expect("preparation task must not panic");
-    assert!(result.is_none());
+    assert!(result.unwrap().is_none());
     assert_eq!(permits.available_permits(), 1);
     assert_eq!(errors.load(Ordering::Relaxed), 0);
 }
@@ -82,6 +83,7 @@ async fn udp_preparation_deadline_prevents_future_stagger_start() {
         })
     };
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
@@ -105,7 +107,7 @@ async fn udp_preparation_deadline_prevents_future_stagger_start() {
     tokio::task::yield_now().await;
     assert_eq!(starts.load(Ordering::SeqCst), 1);
     tokio::time::advance(Duration::from_millis(20)).await;
-    assert!(task.await.unwrap().is_none());
+    assert!(task.await.unwrap().unwrap().is_none());
     assert_eq!(starts.load(Ordering::SeqCst), 1);
     assert_eq!(errors.load(Ordering::SeqCst), 1);
 }
@@ -129,6 +131,7 @@ async fn udp_preparation_deadline_drains_three_pending_candidates() {
         })
     };
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: Arc::new(|_| panic!("cancellation is health-neutral")),
         on_attempt: Arc::new(|| {}),
@@ -168,9 +171,126 @@ async fn udp_preparation_deadline_drains_three_pending_candidates() {
             .await
             .expect("all pending preparations must stop at the deadline")
             .unwrap()
+            .unwrap()
             .is_none()
     );
     assert_eq!(starts.load(Ordering::SeqCst), 3);
     assert_eq!(permits.available_permits(), 3);
     assert_eq!(cancellations.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_policy_preflight_does_not_prepare_or_report_failure() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let prepare: UdpPrepare<()> = {
+        let starts = Arc::clone(&starts);
+        Arc::new(move |_, _| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        })
+    };
+    let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| false),
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: {
+            let errors = Arc::clone(&errors);
+            Arc::new(move |_| {
+                errors.fetch_add(1, Ordering::SeqCst);
+            })
+        },
+        on_attempt: Arc::new(|| {}),
+        on_winner: Arc::new(|| {}),
+        on_cancellation: Arc::new(|| {}),
+    };
+
+    let error = prepare_udp_plan(
+        SelectionPlanMode::ColdUrlTest,
+        vec![candidate("rejected"), candidate("fallback")],
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        prepare,
+        callbacks,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(errors.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_udp_policy_rejection_does_not_fail_over_or_report_failure() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let prepare: UdpPrepare<()> = {
+        let starts = Arc::clone(&starts);
+        Arc::new(move |index, _| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if index == 0 {
+                    Err(honk_outbound::proxy::PacketRejection::Policy.into())
+                } else {
+                    Ok(())
+                }
+            })
+        })
+    };
+    let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: {
+            let errors = Arc::clone(&errors);
+            Arc::new(move |_| {
+                errors.fetch_add(1, Ordering::SeqCst);
+            })
+        },
+        on_attempt: Arc::new(|| {}),
+        on_winner: Arc::new(|| {}),
+        on_cancellation: Arc::new(|| {}),
+    };
+
+    let error = prepare_udp_plan(
+        SelectionPlanMode::ColdUrlTest,
+        vec![candidate("rejected"), candidate("fallback")],
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        prepare,
+        callbacks,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(errors.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unscheduled_policy_denial_does_not_veto_an_earlier_winner() {
+    let prepare: UdpPrepare<()> = Arc::new(|index, _| {
+        assert_eq!(index, 0, "the later candidate must not start");
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok(())
+        })
+    });
+    let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|node| node.name != "later-denied"),
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: Arc::new(|_| panic!("no candidate failed")),
+        on_attempt: Arc::new(|| {}),
+        on_winner: Arc::new(|| {}),
+        on_cancellation: Arc::new(|| {}),
+    };
+    let winner = prepare_udp_plan(
+        SelectionPlanMode::ColdUrlTest,
+        vec![candidate("allowed"), candidate("later-denied")],
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        prepare,
+        callbacks,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(winner.0.name, "allowed");
 }

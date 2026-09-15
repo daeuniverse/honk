@@ -681,6 +681,10 @@ pub(crate) struct EncryptedStream {
     read_plaintext: Vec<u8>,
     read_plaintext_offset: usize,
     read_eof: bool,
+    direct_read: bool,
+    direct_xor_header: [u8; FRAME_HEADER_LEN],
+    direct_xor_header_len: usize,
+    direct_xor_skip: usize,
     ticket_use: Option<TicketUse>,
 }
 
@@ -722,6 +726,10 @@ impl EncryptedStream {
             read_plaintext: Vec::new(),
             read_plaintext_offset: 0,
             read_eof: false,
+            direct_read: false,
+            direct_xor_header: [0; FRAME_HEADER_LEN],
+            direct_xor_header_len: 0,
+            direct_xor_skip: 0,
             ticket_use,
         }
     }
@@ -794,6 +802,73 @@ impl EncryptedStream {
             self.read_plaintext_offset = 0;
         }
         true
+    }
+
+    /// Bypass Encryption framing after an authenticated Vision Direct command.
+    /// Pending authenticated plaintext remains ahead of the underlying outer
+    /// transport, and random mode keeps XORing only each TLS-like header.
+    pub(super) fn poll_direct_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if output.remaining() == 0 || self.copy_plaintext(output) {
+            return Poll::Ready(Ok(()));
+        }
+        if !self.direct_read {
+            if !matches!(self.read_phase, ReadPhase::Header) || self.read_offset != 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VLESS Encryption Direct switch outside a frame boundary",
+                )));
+            }
+            self.direct_read = true;
+        }
+
+        let start = output.filled().len();
+        let poll = Pin::new(&mut *self.inner).poll_read(cx, output);
+        if let Poll::Ready(Ok(())) = &poll {
+            let end = output.filled().len();
+            self.apply_direct_xor(&mut output.filled_mut()[start..end]);
+        }
+        poll
+    }
+
+    // Xray unwraps CommonConn at Direct but deliberately leaves XorConn in place.
+    fn apply_direct_xor(&mut self, data: &mut [u8]) {
+        let Some(xor) = self.recv_xor.as_mut() else {
+            return;
+        };
+        let mut offset = 0;
+        while offset < data.len() {
+            if self.direct_xor_skip > 0 {
+                let count = self.direct_xor_skip.min(data.len() - offset);
+                self.direct_xor_skip -= count;
+                offset += count;
+                continue;
+            }
+
+            let count = (FRAME_HEADER_LEN - self.direct_xor_header_len).min(data.len() - offset);
+            xor.apply(&mut data[offset..offset + count]);
+            self.direct_xor_header[self.direct_xor_header_len..self.direct_xor_header_len + count]
+                .copy_from_slice(&data[offset..offset + count]);
+            self.direct_xor_header_len += count;
+            offset += count;
+
+            if self.direct_xor_header_len == FRAME_HEADER_LEN {
+                let length =
+                    u16::from_be_bytes([self.direct_xor_header[3], self.direct_xor_header[4]])
+                        as usize;
+                self.direct_xor_skip = if self.direct_xor_header[..3] == [23, 3, 3]
+                    && (TAG_LEN + 1..=MAX_FRAME_CIPHERTEXT).contains(&length)
+                {
+                    length
+                } else {
+                    0
+                };
+                self.direct_xor_header_len = 0;
+            }
+        }
     }
 
     fn invalidate_ticket(&mut self) {
@@ -1264,6 +1339,18 @@ mod raw_blake3 {
 mod tests {
     use super::*;
 
+    struct DirectReader<'a>(&'a mut EncryptedStream);
+
+    impl AsyncRead for DirectReader<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.get_mut().0.poll_direct_read(cx, buf)
+        }
+    }
+
     #[test]
     fn raw_context_derive_matches_blake3_for_utf8_context() {
         let context = b"VLESS";
@@ -1378,6 +1465,99 @@ mod tests {
         client.read_to_end(&mut reply).await.unwrap();
         assert_eq!(reply, b"reply");
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_drains_authenticated_plaintext_and_keeps_encrypted_writes() {
+        let key = vec![13_u8; 96];
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let mut server_recv = StreamAead::new(b"client", &key, true).unwrap();
+        let mut stream = EncryptedStream::new(
+            Box::new(client_io),
+            key.clone(),
+            true,
+            StreamAead::new(b"client", &key, true).unwrap(),
+            Some(StreamAead::new(b"server", &key, true).unwrap()),
+            None,
+            None,
+            None,
+            PeerInit::Ready,
+            None,
+            false,
+        );
+        stream.read_plaintext = b"authenticated-".to_vec();
+        server_io.write_all(b"outer").await.unwrap();
+        server_io.shutdown().await.unwrap();
+
+        let mut plaintext = Vec::new();
+        DirectReader(&mut stream)
+            .read_to_end(&mut plaintext)
+            .await
+            .unwrap();
+        assert_eq!(plaintext, b"authenticated-outer");
+
+        stream.write_all(b"uplink").await.unwrap();
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        server_io.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, [23, 3, 3, 0, 22]);
+        let mut body = vec![0_u8; 22];
+        server_io.read_exact(&mut body).await.unwrap();
+        let length = server_recv.open(&mut body, &header).unwrap();
+        assert_eq!(&body[..length], b"uplink");
+    }
+
+    #[tokio::test]
+    async fn direct_random_xor_continues_across_partial_headers() {
+        let key = vec![17_u8; 96];
+        let iv = [19_u8; IV_LEN];
+        let mut sender = AesCtr::new(&key, &iv);
+        let mut receiver = AesCtr::new(&key, &iv);
+
+        let prior_plain = [23, 3, 3, 0, 17];
+        let mut prior_wire = prior_plain;
+        sender.apply(&mut prior_wire);
+        receiver.apply(&mut prior_wire);
+        assert_eq!(prior_wire, prior_plain);
+
+        let mut plaintext = Vec::new();
+        let mut wire = Vec::new();
+        for body in [b"a".repeat(17), b"b".repeat(19)] {
+            let mut header = [23, 3, 3, 0, body.len() as u8];
+            plaintext.extend_from_slice(&header);
+            plaintext.extend_from_slice(&body);
+            sender.apply(&mut header);
+            wire.extend_from_slice(&header);
+            wire.extend_from_slice(&body);
+        }
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let mut stream = EncryptedStream::new(
+            Box::new(client_io),
+            key.clone(),
+            true,
+            StreamAead::new(b"client", &key, true).unwrap(),
+            Some(StreamAead::new(b"server", &key, true).unwrap()),
+            None,
+            Some(receiver),
+            None,
+            PeerInit::Ready,
+            None,
+            true,
+        );
+        server_io.write_all(&wire).await.unwrap();
+        server_io.shutdown().await.unwrap();
+
+        let mut output = Vec::new();
+        let mut reader = DirectReader(&mut stream);
+        loop {
+            let mut byte = [0_u8; 1];
+            if reader.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            output.push(byte[0]);
+        }
+
+        assert_eq!(output, plaintext);
     }
 
     #[tokio::test]

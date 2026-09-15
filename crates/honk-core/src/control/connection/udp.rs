@@ -7,6 +7,30 @@ use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
+enum PreparedEndpointTransport {
+    Flow(honk_outbound::proxy::PreparedUdpTransport),
+    #[cfg(feature = "rprx")]
+    Source(crate::control::udp_endpoint::VlessSourcePreparation),
+}
+
+enum CommittedEndpointTransport {
+    Flow(Arc<dyn honk_outbound::proxy::PacketTransport>),
+    #[cfg(feature = "rprx")]
+    Source(crate::control::udp_endpoint::SourceAttachment),
+}
+
+#[cfg(feature = "rprx")]
+fn vless_source_path(node: &Node, port: u16) -> Option<honk_config::node::VlessUdpPath> {
+    let path = node.vless()?.udp_path(port)?;
+    matches!(
+        path,
+        honk_config::node::VlessUdpPath::Xudp
+            | honk_config::node::VlessUdpPath::CoolShared
+            | honk_config::node::VlessUdpPath::CoolSeparate
+    )
+    .then_some(path)
+}
+
 impl ControlPlaneHandle {
     pub(in crate::control) async fn serve_udp_connection(
         &self,
@@ -215,7 +239,7 @@ impl ControlPlaneHandle {
         ) {
             None
         } else {
-            quic_domain.clone()
+            quic_domain.as_deref().map(Arc::<str>::from)
         };
         let target_is_domain = target_domain.is_some();
         #[cfg(feature = "ebpf")]
@@ -329,44 +353,106 @@ impl ControlPlaneHandle {
         let runtime_generation = self.runtime_registry.read().clone();
         let prepare_generation = Arc::clone(&runtime_generation);
         let prepare: UdpPrepare<(
-            honk_outbound::proxy::PreparedUdpTransport,
+            PreparedEndpointTransport,
             Option<crate::group::ScoreReporter>,
             Vec<String>,
         )> = {
             let registry = self.proxy_registry.clone();
             let stats = self.stats.clone();
             let feedback = score_feedback.clone();
+            #[cfg(feature = "rprx")]
+            let udp_pool = Arc::clone(&self.udp_pool);
+            #[cfg(feature = "rprx")]
+            let alive_set = Arc::clone(&self.alive_set);
+            let target_domain = target_domain.clone();
             Arc::new(move |index: usize, node: Node| {
                 let registry = registry.clone();
                 let stats = stats.clone();
                 let runtime_generation = Arc::clone(&prepare_generation);
                 let feedback = feedback.get(index).cloned().flatten();
                 let selection_chain = selection_chains.get(index).cloned().unwrap_or_default();
+                #[cfg(feature = "rprx")]
+                let udp_pool = Arc::clone(&udp_pool);
+                #[cfg(feature = "rprx")]
+                let alive_set = Arc::clone(&alive_set);
                 let target_domain = target_domain.clone();
                 Box::pin(async move {
                     let reporter = feedback.map(|feedback| feedback.start());
                     let dial_started_at = std::time::Instant::now();
-                    let result = if plan_mode == SelectionPlanMode::ColdUrlTest {
-                        registry
-                            .dial_udp_transport_speculative(
-                                Arc::clone(&runtime_generation),
-                                node.id,
-                                original_dst,
-                                target_domain.as_deref(),
-                                connect_timeout,
-                            )
-                            .await
-                    } else {
-                        registry
-                            .dial_udp_transport_runtime(
-                                Arc::clone(&runtime_generation),
-                                node.id,
-                                original_dst,
-                                target_domain.as_deref(),
-                                connect_timeout,
-                            )
-                            .await
-                            .map(honk_outbound::proxy::PreparedUdpTransport::ready)
+                    let result = {
+                        #[cfg(feature = "rprx")]
+                        if let Some(path) = vless_source_path(&node, original_dst.port()) {
+                            let runtime = runtime_generation.get(&node.id).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "node {} is not in the captured runtime generation",
+                                    node.id
+                                )
+                            })?;
+                            udp_pool
+                                .prepare_vless_source(
+                                    Arc::clone(&runtime_generation),
+                                    runtime,
+                                    client_addr,
+                                    path,
+                                    target_is_domain.then_some(original_dst),
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                    Arc::clone(&alive_set),
+                                    Arc::clone(&stats),
+                                    scheduler_ipver,
+                                )
+                                .await
+                                .map(PreparedEndpointTransport::Source)
+                        } else if plan_mode == SelectionPlanMode::ColdUrlTest {
+                            registry
+                                .dial_udp_transport_speculative(
+                                    Arc::clone(&runtime_generation),
+                                    node.id,
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                )
+                                .await
+                                .map(PreparedEndpointTransport::Flow)
+                        } else {
+                            registry
+                                .dial_udp_transport_runtime(
+                                    Arc::clone(&runtime_generation),
+                                    node.id,
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                )
+                                .await
+                                .map(honk_outbound::proxy::PreparedUdpTransport::ready)
+                                .map(PreparedEndpointTransport::Flow)
+                        }
+                        #[cfg(not(feature = "rprx"))]
+                        if plan_mode == SelectionPlanMode::ColdUrlTest {
+                            registry
+                                .dial_udp_transport_speculative(
+                                    Arc::clone(&runtime_generation),
+                                    node.id,
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                )
+                                .await
+                                .map(PreparedEndpointTransport::Flow)
+                        } else {
+                            registry
+                                .dial_udp_transport_runtime(
+                                    Arc::clone(&runtime_generation),
+                                    node.id,
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                )
+                                .await
+                                .map(honk_outbound::proxy::PreparedUdpTransport::ready)
+                                .map(PreparedEndpointTransport::Flow)
+                        }
                     };
                     stats.record_udp_dial_latency(dial_started_at.elapsed());
                     match result {
@@ -385,6 +471,9 @@ impl ControlPlaneHandle {
             })
         };
         let callbacks = UdpStaggerCallbacks {
+            allows_target: Arc::new(move |node| {
+                honk_outbound::descriptor::udp_target_allowed(node, original_dst.port())
+            }),
             is_eligible: {
                 let group_manager = self.group_manager.clone();
                 Arc::new(move |node| {
@@ -428,7 +517,7 @@ impl ControlPlaneHandle {
             prepare,
             callbacks,
         )
-        .await
+        .await?
         else {
             debug!(
                 "All UDP transport preparations failed for '{}'",
@@ -465,10 +554,10 @@ impl ControlPlaneHandle {
                 node.name
             ));
         }
-        // Promotion is explicit and still pre-publication: detached AnyTLS
-        // sessions and QUIC clients become generation-owned only for the
-        // finalized winner. It shares the preparation deadline because QUIC
-        // promotion may wait for the generation runtime lock.
+        // Final promotion remains pre-publication and inside the unchanged
+        // absolute preparation deadline.
+        #[cfg(feature = "rprx")]
+        let source_pool = Arc::clone(&self.udp_pool);
         let transport = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(transport_deadline) => {
@@ -479,7 +568,19 @@ impl ControlPlaneHandle {
                     "UDP transport preparation exceeded its overall deadline"
                 ));
             }
-            result = prepared_transport.commit() => match result {
+            result = async move {
+                match prepared_transport {
+                    PreparedEndpointTransport::Flow(prepared) => prepared
+                        .commit()
+                        .await
+                        .map(CommittedEndpointTransport::Flow),
+                    #[cfg(feature = "rprx")]
+                    PreparedEndpointTransport::Source(prepared) => prepared
+                        .commit(&source_pool)
+                        .await
+                        .map(CommittedEndpointTransport::Source),
+                }
+            } => match result {
                 Ok(transport) => transport,
                 Err(error) => {
                     if let Some(reporter) = &score_reporter {
@@ -512,16 +613,32 @@ impl ControlPlaneHandle {
         self.stats
             .record_udp_reply_ready_latency(reply_ready_started.elapsed());
 
-        let relay_addr = transport.relay_addr();
-        let endpoint = Arc::new(UdpEndpoint::new_scored(
-            transport,
-            relay_addr,
-            target_is_domain,
-            node.id,
-            scheduler_ipver,
-            score_reporter,
-        ));
-        endpoint.record_pending_reply_peer(relay_addr);
+        let endpoint = Arc::new(match transport {
+            CommittedEndpointTransport::Flow(transport) => {
+                let relay_addr = transport.relay_addr();
+                let endpoint = UdpEndpoint::new_scored(
+                    transport,
+                    relay_addr,
+                    target_is_domain,
+                    node.id,
+                    scheduler_ipver,
+                    score_reporter,
+                );
+                endpoint.record_pending_reply_peer(relay_addr);
+                endpoint
+            }
+            #[cfg(feature = "rprx")]
+            CommittedEndpointTransport::Source(attachment) => UdpEndpoint::new_source_scored(
+                attachment,
+                original_dst,
+                target_domain.as_deref(),
+                Arc::clone(&reply_socket),
+                self.stats.outbound_tracker(&outbound_name),
+                node.id,
+                scheduler_ipver,
+                score_reporter,
+            ),
+        });
 
         let tracker_id = if let Some(conn_id) = self.connection_tracker.register_if_enabled(|| {
             let id = uuid::Uuid::new_v4().to_string();

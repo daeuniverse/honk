@@ -1,15 +1,6 @@
 use super::*;
 use std::time::Duration;
 
-fn make_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) -> Group {
-    Group {
-        name: name.into(),
-        policy,
-        nodes: ids,
-        ..Default::default()
-    }
-}
-
 /// Repro of the gateway scenario: urltest group where one node has a
 /// good UDP latency (trojan) and another (anytls, UoT-blackhole) has
 /// none. The UDP pick must choose the trojan node, not mirror TCP.

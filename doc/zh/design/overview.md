@@ -54,9 +54,9 @@ flowchart LR
 
 `ConfigSeed` 对节点数组中的每个原始条目使用 Node 适配器。结构化输入失败时，诊断保留节点、组和订阅的原始序号、安全的配置字段路径及解码器提供的行列号，不保留解码器的原始错误文本；映射和按字段声明顺序排列的序列均保留序号。详细文件和 JSON 加载接口在失败时保留调用方已有的诊断；格式回退成功时，只移除已放弃尝试的诊断。所有格式均失败时，按尝试顺序保留诊断，并附上一个终止错误。dae 语义错误会终止加载，除非完整文档能按 YAML、TOML 或 JSON 解码为至少含一个已知 Config 顶层键的映射；此时交由结构化格式加载器处理并报告结果。包含文件错误和不受支持的策略错误仍会终止加载。
 
-解析器和分享链接的数据接口保留安全诊断，不自行记录日志。标量值、名称、链接和原始错误内容不对外输出，但保留静态错误原因及迁移说明，包括用 `vless_mode` 替代独立的 `mux` 设置、用 `dns.use_host` 替代 `dns.hosts_file`。组、过滤器、订阅和条目使用原始序号定位。dae 详细诊断共享仅含元数据的来源表，记录包含文件的父子关系及可用的物理行号。节遍历顺序保持不变；接受规则的变化见方言和节点参考。只有最外层加载尝试追加终止错误。
+解析器和分享链接的数据接口保留安全诊断，不自行记录日志。标量值、名称、链接和原始错误内容不对外输出，但保留固定错误原因和 `dns.hosts_file` → `dns.use_host` 等迁移说明。组、过滤器、订阅和条目使用原始序号定位；只有最外层加载尝试追加终止错误。
 
-`src/node/validation.rs` 负责节点自身及集合准入，复用 `src/node/protocol.rs` 中的 VLESS 和 ALPN 检查。校验携带固定字段与原因，只在失败时分配诊断上下文。详细 Config 加载接口和集合准入保留原始原因及从 1 开始的节点序号；包含文件中的语义错误先保留失败字段的来源，再投影旧错误类别。节点警告及分享链接早期错误都在解析器边界补充物理条目坐标，不受节点标签影响。`Config::validate` 投影 `Config::validate_detailed` 的结果；DNS 引用校验仍与运行时共用 `DnsRouting::request_source`，仅在拒绝时构造诊断路径。
+`src/node/validation.rs` 负责集合准入与共享检查；`src/node/vless.rs` 独占规范 `VlessConfig` 的 normalization、path selection 与组合校验；`src/node/protocol.rs` 持有其他协议配置及共享 TLS/stream/QUIC options。详细 loader 保留类型化 cause 与原始 one-based 节点坐标。
 
 `src/parser/mod.rs` 负责文件级 `include` 和有序顶层分派。`lexer.rs` 与 `cursor.rs` 保留引用源文本的词法单元、注释范围及有界片段，`read.rs` 提供共享的标量与表达式读取接口；各节由 `scalars.rs`、`entries.rs`、`groups.rs`、`dns.rs` 和 `routing.rs` 读取。包含文件的 glob 模式以入口文件所在目录为基准解析；匹配文件的规范化路径不得超出入口目录。重复包含和循环包含均被拒绝。允许忽略未知内容的读取器整块跳过未知嵌套块，不应用其子项；节点和订阅的兼容包装块仍会遍历，`experimental` 外层和 NFQUEUE 错误仍会终止解析。
 
@@ -65,6 +65,8 @@ flowchart LR
 片段明确区分已接纳或已忽略的语句、紧凑块和普通花括号块，读取器不再根据末尾词法单元猜测结构。语句准入先于紧凑块切分和续接状态更新；组的动态块头与条目值分开处理，条目值开始后不再提前切分声明。结构注释花括号诊断使用游标当前作用域判定，在 EOF 检查前统一发出。过滤器诊断保留原始词法单元的错误来源；遍历节点、订阅和组的同级声明时重置语义诊断归属。
 
 遍历语法区分单行条目和多行表达式；括号保护状态仅随实际返回的表达式语句跨越同源分段，在来源边界重置。已建立索引的起始花括号保留其块头和子树归属。订阅原始字段独立于结构块头视图保留完整起始词法单元的字节。
+
+`src/share_link.rs` 是唯一 `Node::from_share_link` parser；`src/share_link/options.rs` 把 URI packet encoding 与独立 mux controls 归入规范协议模型，再进行 normalization、validation 与 identity derivation。`src/node/wire.rs` 是唯一 flat serde adapter；VLESS 输入即使以 `null` 出现已移除的旧字段也会拒绝，而同一字段在非 VLESS 输入上仅为兼容 artifact。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 
 ## 高层数据路径
 
@@ -96,8 +98,8 @@ flowchart TB
 4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
 5. [控制面](./control-plane.md)恢复原始目的地址；普通流消费 eBPF 路由 handoff，缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。端口 53 流量遵循不同的[TCP handoff 与 UDP 逐报文准入规则](./control-plane.md#透明代理入口)。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
-7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。显式选择 Score 时，它只在健康合格成员中按目标的 TCP/UDP 与目标地址族 transport-quality 评分排名；服务特定的语义解锁应由 routing 或 geosite 选择专用 Score 组表达。省略策略仍使用 Selector。
-8. [出站层](./outbound.md)拨号该叶节点，并中继 TCP 或数据报。嗅探得到的 TCP 字节先于后续流量转发。
+7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威策略选择解析为叶节点。Score 只用逐目标 TCP/UDP 证据在健康合格成员中排名。TCP/UDP 通常只采用一个权威叶节点；只有冷启动顶层 URLTest 会先 stagger 候选，且只有 winner 提交 endpoint 或 source transport。
+8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；XUDP/Mux.Cool 可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source session。嗅探得到的 TCP 字节先于后续流量转发。
 9. 控制面出口携带 `DAE_BYPASS_MARK`（`0x100`），避免再次被 WAN TC 拦截。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
 ## 运行时不变量
@@ -105,6 +107,7 @@ flowchart TB
 - **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带 `DAE_BYPASS_MARK`（`0x100`）或使用 loopback。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。
 - **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
+- **VLESS source 边界：** 共享 XUDP/Mux.Cool 按 reused runtime、规范化 client、UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source session 持有唯一 receiver 与 transport health。
 - **网络命名空间纪律：** 进程常驻 host netns。它只通过有作用域且完全同步的 `with_daens_netns` 调用进入 `daens`；`setns` 跨度内不得出现 `.await`，恢复原命名空间失败时进程必须中止。
 - **数据路径准入：** `DATAPATH_STATE_MAP[0]` 在全部监听 FD 已发布且全部接收循环已运行前保持关闭，并在拆除监听器前关闭。gate 关闭期间，TC 原样放行流量。
 - **NFQUEUE 就绪与所有权：** 启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；ready 变更必须经过 fence，生命周期歧义为致命错误，同一 netns 的防火墙管理器不得修改这些对象。

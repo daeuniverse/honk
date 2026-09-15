@@ -509,6 +509,64 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
     );
 }
 
+#[tokio::test]
+async fn packet_rejection_does_not_serve_expired_positive() {
+    use honk_outbound::proxy::{PacketRejection, packet_rejection};
+
+    let query = build_dns_query("example.com", 1);
+    let cache = Arc::new(Mutex::new(DnsCache::new(8)));
+    let routing = router("first", Vec::new(), None);
+    let engine = DnsEngine::from_router(&routing, None).expect("engine");
+    let prepared = engine
+        .prepare(&query, DnsRequestMeta::EMPTY, IngressProfile::Internal)
+        .expect("prepared");
+    let RequestPlan::Exchange(scope) = prepared.plan() else {
+        panic!("exchange plan");
+    };
+    let cache_key = CacheKey::new(
+        prepared.query(),
+        None,
+        scope.clone(),
+        OperationKind::Resolve,
+    );
+    cache.lock().await.service().insert_expired_exact_for_test(
+        cache_key,
+        response(&query, [9, 9, 9, 9], 30),
+        30,
+    );
+
+    for rejection in [PacketRejection::Policy, PacketRejection::Capacity] {
+        for strict in [true, false] {
+            let source = honk_outbound::SharedError::new(
+                anyhow::Error::new(std::io::Error::from(rejection)).context("upstream dial"),
+            );
+            let forwarder = DnsForwarder::new(
+                exchange([("first", Err(source.into()))], None),
+                cache.clone(),
+                routing.clone(),
+            );
+            let error = if strict {
+                anyhow::Error::from(
+                    forwarder
+                        .resolve_outcome(&query)
+                        .await
+                        .expect_err("terminal refusal"),
+                )
+            } else {
+                forwarder
+                    .resolve(&query)
+                    .await
+                    .expect_err("terminal refusal")
+            };
+            assert_eq!(packet_rejection(&error), Some(rejection));
+            assert!(matches!(
+                error.downcast_ref::<DnsForwardError>().expect("forward error").unshared(),
+                DnsForwardError::Exchange { upstream, .. } if upstream == "first"
+            ));
+        }
+    }
+}
+
 #[test]
 fn engine_rejects_multiple_questions_before_policy_planning() {
     let mut wire = build_dns_query("allowed.example", 1);

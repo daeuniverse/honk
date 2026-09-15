@@ -543,14 +543,13 @@ mod tests {
         let s2c_salt = vec![9u8; conf.salt_len];
         let (send_cipher, peer_read_cipher) = ciphers(&master, &c2s_salt, &s2c_salt);
 
-        let peer_master = master.clone();
-        let peer_salt = c2s_salt.clone();
-        tokio::spawn(async move {
+        let peer_salt = c2s_salt;
+        let peer = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             // Slow reader: tiny reads with a delay so the writer's flush
             // path repeatedly hits Pending.
             let mut plain_seen = Vec::new();
-            let mut buf = vec![0u8; 4096];
+            let mut buf = vec![0u8; RECV_BUF_CAP];
             let mut carry = 0usize;
             let mut pending_len = None;
             let mut nonce = vec![0u8; 12];
@@ -560,7 +559,8 @@ mod tests {
             hkdf_sha1_derive(&m, &peer_salt, &mut subkey);
             let read_cipher = AeadCipher::new(METHOD, &subkey).unwrap();
             loop {
-                let n = sock.read(&mut buf[carry..carry + 977]).await.unwrap();
+                let end = (carry + 977).min(buf.len());
+                let n = sock.read(&mut buf[carry..end]).await.unwrap();
                 if n == 0 {
                     break;
                 }
@@ -584,7 +584,6 @@ mod tests {
                     break;
                 }
             }
-            let _ = peer_master;
             let expected: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
             assert_eq!(plain_seen, expected);
         });
@@ -602,7 +601,7 @@ mod tests {
         assert_eq!(off, payload.len());
         stream.flush().await.unwrap();
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        peer.await.unwrap();
     }
 
     /// Legacy AEAD: a server that sends its response salt only AFTER the
@@ -613,7 +612,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let conf = CipherConf::for_method(METHOD).unwrap();
-        let _master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
 
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
@@ -685,24 +683,8 @@ mod tests {
             master_key: send_master,
             method: METHOD.to_string(),
         };
-        // Emulate the handler's legacy dial tail.
-        let (read_half, write_half) = server.into_split();
-        let mut stream = SsStream {
-            write_half,
-            read_half: None,
-            send_cipher,
-            send_nonce,
-            send_buf: Vec::with_capacity(SEND_BUF_CAP),
-            send_off: 0,
-            recv_cipher: None,
-            recv_nonce: vec![0u8; 12],
-            recv_prologue: Some(Box::pin(prologue.run(read_half))),
-            recv_pending_len: None,
-            recv_buf: vec![0u8; RECV_BUF_CAP],
-            plain_start: 0,
-            plain_end: 0,
-            carry: 0,
-        };
+        // Emulate the handler's legacy dial tail through its production constructor.
+        let mut stream = SsStream::new_legacy(server, send_cipher, send_nonce, prologue);
         // The payload goes out BEFORE the server salt exists anywhere.
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];

@@ -48,6 +48,9 @@ where
             Ok(Err(error)) => error,
             Err(_) => anyhow::anyhow!("timed out after {budget:?}"),
         };
+        if honk_outbound::proxy::is_packet_rejection(&error) {
+            return Err(error.context(format!("{label} dial to {address}")));
+        }
         tracing::debug!(
             %address,
             transport = label,
@@ -259,5 +262,32 @@ mod tests {
         assert_eq!(*attempts.lock(), addresses);
         assert_eq!(start.elapsed(), Duration::from_secs(3));
         assert!(error.to_string().contains("[2001:db8::1]:53"));
+    }
+
+    #[tokio::test]
+    async fn packet_rejection_does_not_try_another_address() {
+        let first = "192.0.2.1:53".parse().unwrap();
+        let second = "192.0.2.2:53".parse().unwrap();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempts);
+
+        let error = dial_candidates(
+            vec![first, second],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            "test",
+            move |address, _| {
+                recorded.lock().push(address);
+                async move {
+                    Err::<std::net::SocketAddr, _>(
+                        honk_outbound::proxy::PacketRejection::Policy.into(),
+                    )
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(honk_outbound::proxy::is_packet_rejection(&error));
+        assert_eq!(*attempts.lock(), vec![first]);
     }
 }

@@ -360,42 +360,42 @@ fn selection_reason_precedence_is_stable() {
     let expected = [
         (
             "cold",
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 cold_explore: 1,
                 ..Default::default()
             },
         ),
         (
             "periodic",
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 periodic_explore: 1,
                 ..Default::default()
             },
         ),
         (
             "held",
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 incumbent_held: 1,
                 ..Default::default()
             },
         ),
         (
             "bypass",
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 fresh_failure_bypass: 1,
                 ..Default::default()
             },
         ),
         (
             "reliable",
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 reliability_winner: 1,
                 ..Default::default()
             },
         ),
         (
             "performance",
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 performance_winner: 1,
                 ..Default::default()
             },
@@ -470,7 +470,7 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
     for group in ["target-top", "aggregate-child"] {
         assert_eq!(
             state.selection_reason_counts(group, SelectionNetwork::Udp),
-            SelectionReasonCounts {
+            ScoreReasonCounters {
                 cold_explore: 1,
                 dead_filtered: 1,
                 ..Default::default()
@@ -479,11 +479,11 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
     }
     assert_eq!(
         state.selection_reason_counts("singleton", SelectionNetwork::Tcp),
-        SelectionReasonCounts::default()
+        ScoreReasonCounters::default()
     );
     assert_eq!(
         state.selection_reason_counts("last-resort", SelectionNetwork::Tcp),
-        SelectionReasonCounts {
+        ScoreReasonCounters {
             dead_filtered: 1,
             ..Default::default()
         }
@@ -526,19 +526,19 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
     let _ = stale.selection_plan_for_target("stale", &target);
     assert_eq!(
         stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
-        SelectionReasonCounts::default()
+        ScoreReasonCounters::default()
     );
     let _ = replacement.selection_plan_for_target("stale", &target);
     assert_eq!(
         stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
-        SelectionReasonCounts {
+        ScoreReasonCounters {
             cold_explore: 1,
             dead_filtered: 1,
             ..Default::default()
         }
     );
 
-    let saturated = SelectionReasonCounts {
+    let saturated = ScoreReasonCounters {
         cold_explore: u64::MAX,
         periodic_explore: u64::MAX,
         reliability_winner: u64::MAX,
@@ -656,7 +656,7 @@ fn private_reason_counts_follow_committed_name_lifecycle() {
     println!(
         "private lifecycle recorded={recorded:?} hidden={recorded:?} restored={recorded:?} recreated={reset:?}"
     );
-    assert_eq!(reset, SelectionReasonCounts::default());
+    assert_eq!(reset, ScoreReasonCounters::default());
 }
 
 #[test]
@@ -732,7 +732,7 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
     assert_eq!(snapshot[1].tcp.cold_explore, 1);
     assert_eq!(later[1].tcp.cold_explore, 2);
 
-    let saturated = SelectionReasonCounts {
+    let saturated = ScoreReasonCounters {
         cold_explore: u64::MAX,
         periodic_explore: u64::MAX,
         reliability_winner: u64::MAX,
@@ -749,10 +749,7 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
         saturated,
     );
     let saturated_snapshot = manager.score_reason_snapshot();
-    assert_eq!(
-        saturated_snapshot[1].udp,
-        ScoreReasonCounters::from_private(saturated)
-    );
+    assert_eq!(saturated_snapshot[1].udp, saturated);
     println!("owned score snapshot={snapshot:?} later={later:?} saturated={saturated_snapshot:?}");
 }
 
@@ -777,7 +774,7 @@ fn delay_test_members_do_not_record_score_selection() {
     let state = manager.score_state();
     assert_eq!(
         state.selection_reason_counts("delay-peek-sub", SelectionNetwork::Tcp),
-        SelectionReasonCounts::default()
+        ScoreReasonCounters::default()
     );
     assert!(state.inner.lock().selection_history.is_empty());
 }
@@ -813,7 +810,7 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     );
     assert_eq!(
         state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp),
-        SelectionReasonCounts::default()
+        ScoreReasonCounters::default()
     );
     assert!(state.inner.lock().selection_history.is_empty());
 
@@ -885,7 +882,7 @@ fn selector_commit_follows_non_first_default() {
     );
     assert_eq!(
         state.selection_reason_counts("def-sub-a", SelectionNetwork::Tcp),
-        SelectionReasonCounts::default()
+        ScoreReasonCounters::default()
     );
 }
 
@@ -949,7 +946,7 @@ fn score_reason_snapshot_reload_policy_is_name_based() {
     let _ = manager.selection_plan_for_target("persist", &target);
     assert_eq!(
         state.selection_reason_counts("persist", SelectionNetwork::Tcp),
-        SelectionReasonCounts {
+        ScoreReasonCounters {
             cold_explore: 1,
             ..Default::default()
         }

@@ -210,7 +210,7 @@ enum DialSignal {
     /// recorded).
     Done,
     /// Dial failed — waiters surface the error themselves.
-    Failed(Arc<anyhow::Error>),
+    Failed(crate::SharedError),
 }
 
 /// How a protocol open failed, for the pool's retry decision.
@@ -442,6 +442,57 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         pool.sessions.len()
     }
 
+    /// Drain idle sessions above the configured or runtime-retained reusable floor.
+    /// Sessions with live streams are never disturbed; terminal sessions are pruned.
+    pub fn reap_unretained_idle(&self) -> usize {
+        if self.state() != PoolState::Running {
+            return 0;
+        }
+        let to_close = {
+            let mut pool = self.pool.lock();
+            if self.state() != PoolState::Running {
+                return 0;
+            }
+            let min_live = pool
+                .base_min_idle
+                .max(if pool.warm_retained { 1 } else { 0 });
+            let mut remaining = pool
+                .sessions
+                .iter()
+                .filter(|session| session.state() == SessionState::Active)
+                .count();
+            let mut to_close = Vec::new();
+            pool.sessions.retain(|session| {
+                if session.is_closed() {
+                    return false;
+                }
+                let active = session.state() == SessionState::Active;
+                if session.active_streams() != 0 || (active && remaining <= min_live) {
+                    return true;
+                }
+                session.begin_drain();
+                if active {
+                    remaining -= 1;
+                }
+                if session.active_streams() == 0 {
+                    to_close.push(Arc::clone(session));
+                    false
+                } else {
+                    true
+                }
+            });
+            to_close
+        };
+        let reaped = to_close.len();
+        for session in to_close {
+            session.close();
+        }
+        if reaped != 0 {
+            self.capacity_notify.notify_waiters();
+        }
+        reaped
+    }
+
     /// Pin or unpin a reusable warm session. Unpinning immediately closes
     /// idle sessions above the explicit standby floor and drains active excess
     /// sessions without cutting their streams.
@@ -454,25 +505,32 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             if self.state() != PoolState::Running {
                 return;
             }
+            if pool.warm_retained == retained {
+                return;
+            }
             pool.warm_retained = retained;
             if retained {
                 Vec::new()
             } else {
-                pool.sessions.retain(|session| !session.is_closed());
+                let base_min_idle = pool.base_min_idle;
                 let mut active_kept = 0usize;
                 let mut to_close = Vec::new();
-                for session in &pool.sessions {
-                    if session.state() == SessionState::Active && active_kept < pool.base_min_idle {
+                pool.sessions.retain(|session| {
+                    if session.is_closed() {
+                        return false;
+                    }
+                    if session.state() == SessionState::Active && active_kept < base_min_idle {
                         active_kept += 1;
-                        continue;
+                        return true;
                     }
                     session.begin_drain();
                     if session.active_streams() == 0 {
                         to_close.push(Arc::clone(session));
+                        false
+                    } else {
+                        true
                     }
-                }
-                pool.sessions
-                    .retain(|session| !to_close.iter().any(|closed| Arc::ptr_eq(closed, session)));
+                });
                 to_close
             }
         };
@@ -609,7 +667,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             if self.config.spread_sessions && self.has_usable_session() {
                                 continue;
                             }
-                            return Err(anyhow::anyhow!(e).context("session dial failed"));
+                            return Err(anyhow::Error::new(e).context("session dial failed"));
                         }
                         DialSignal::Pending | DialSignal::Done => {}
                     }
@@ -681,8 +739,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         DialSignal::Done
                                     }
                                     Ok(Err(e)) => {
-                                        let backoff =
-                                            Self::record_dial_failure(&mut pool, &config);
+                                        let backoff = if crate::proxy::is_packet_rejection(&e) {
+                                            None
+                                        } else {
+                                            Some(Self::record_dial_failure(&mut pool, &config))
+                                        };
                                         // The waiter only sees the outer context; keep
                                         // the full chain available for diagnostics.
                                         tracing::debug!(
@@ -691,17 +752,22 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                             "session dial failed: {:#}",
                                             e
                                         );
-                                        DialSignal::Failed(Arc::new(e.context(anyhow!(
-                                            "session dial failed ({} consecutive, backoff {:?})",
-                                            pool.dial_failures,
-                                            backoff
-                                        ))))
+                                        let context = backoff.map_or_else(
+                                            || "session dial rejected".to_owned(),
+                                            |backoff| {
+                                                format!(
+                                                    "session dial failed ({} consecutive, backoff {:?})",
+                                                    pool.dial_failures, backoff
+                                                )
+                                            },
+                                        );
+                                        DialSignal::Failed(crate::SharedError::new(e.context(context)))
                                     }
                                     Err(_panic) => {
                                         pool.dial_failures += 1;
                                         pool.next_dial_at =
                                             Some(Instant::now() + config.dial_backoff);
-                                        DialSignal::Failed(Arc::new(anyhow!(
+                                        DialSignal::Failed(crate::SharedError::new(anyhow!(
                                             "session dial panicked (backoff {:?})",
                                             config.dial_backoff
                                         )))
@@ -810,7 +876,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     match signal {
                         DialSignal::Closed => return Err(Self::pool_closed_err()),
                         DialSignal::Failed(error) => {
-                            return Err(anyhow::anyhow!(error).context("session dial failed"));
+                            return Err(anyhow::Error::new(error).context("session dial failed"));
                         }
                         DialSignal::Pending | DialSignal::Done => {}
                     }
@@ -876,28 +942,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         Err(last_err.expect("open_with attempts always record an error"))
     }
 
-    /// Insert an externally-established session (e.g. one built on a
-    /// pooled TCP stream). The session is always tracked — even over the
-    /// hard cap: an untracked session is orphaned from the janitor while
-    /// its demux task holds it (and its TCP connection) open forever.
-    /// Over-cap entries are transient; the janitor reaps them when idle.
-    /// After shutdown the session is closed instead of inserted.
+    /// Seed a session for tests that exercise the production pool paths.
     #[cfg(test)]
     pub fn insert(&self, session: &Arc<S>) {
-        if self.state() != PoolState::Running {
-            session.close();
-            return;
-        }
-        let mut pool = self.pool.lock();
-        // Re-check under the registration lock: shutdown marks terminal
-        // before draining the pool, so a late dial cannot repopulate it.
-        if self.state() != PoolState::Running {
-            drop(pool);
-            session.close();
-            return;
-        }
-        pool.sessions.retain(|s| !s.is_closed());
-        pool.sessions.push(Arc::clone(session));
+        self.pool.lock().sessions.push(Arc::clone(session));
     }
 
     /// Current metrics snapshot.
@@ -942,15 +990,20 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     return;
                 }
                 pool.sessions.retain(|s| !s.is_closed());
-                let live: Vec<Arc<S>> = pool.sessions.clone();
+                let live = &pool.sessions;
                 let mut to_close = Vec::new();
                 idle_since.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
                 drain_at.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
                 let min_idle = pool
                     .base_min_idle
                     .max(if pool.warm_retained { 1 } else { 0 });
-                for s in &live {
+                let mut remaining_active = live
+                    .iter()
+                    .filter(|session| session.state() == SessionState::Active)
+                    .count();
+                for s in live {
                     let ptr = Arc::as_ptr(s) as usize;
+                    let was_active = s.state() == SessionState::Active;
                     // Max-age drain: stop taking new streams past the
                     // jittered deadline; close once fully drained.
                     if let Some(max_age) = self.config.max_session_age {
@@ -962,7 +1015,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             s.begin_drain();
                         }
                     }
-                    if s.state() == SessionState::Draining && s.active_streams() == 0 {
+                    if was_active && s.state() != SessionState::Active {
+                        remaining_active -= 1;
+                    }
+                    if s.state() != SessionState::Active && s.active_streams() == 0 {
                         to_close.push(Arc::clone(s));
                         continue;
                     }
@@ -971,10 +1027,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         continue;
                     }
                     let since = idle_since.entry(ptr).or_insert(now);
-                    if now.duration_since(*since) >= idle_timeout
-                        && live.len() - to_close.len() > min_idle
-                    {
+                    if now.duration_since(*since) >= idle_timeout && remaining_active > min_idle {
                         to_close.push(Arc::clone(s));
+                        remaining_active -= 1;
                     }
                 }
                 to_close
@@ -990,7 +1045,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     return;
                 }
                 (
-                    pool.sessions.len(),
+                    pool.sessions
+                        .iter()
+                        .filter(|session| session.state() == SessionState::Active)
+                        .count(),
                     pool.base_min_idle
                         .max(if pool.warm_retained { 1 } else { 0 }),
                 )

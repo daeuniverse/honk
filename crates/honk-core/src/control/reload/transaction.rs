@@ -322,6 +322,7 @@ impl ControlPlane {
                 &new_config.nodes,
                 dial_limit,
                 self.resource_budget.transient_dials,
+                self.resource_budget.vless_carriers,
                 Some(&self.runtime_registry.read()),
             ) {
                 Ok((registry, reused)) => (Arc::new(registry), reused),

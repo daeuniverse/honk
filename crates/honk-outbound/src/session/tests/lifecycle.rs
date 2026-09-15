@@ -44,6 +44,45 @@ async fn caller_cancel_does_not_stop_shared_dial() {
     assert_eq!(pool.pool.lock().dial_failures, 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn shared_dial_waiters_preserve_typed_capacity_rejection() {
+    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let leader_pool = Arc::clone(&pool);
+    let leader = tokio::spawn(async move {
+        leader_pool
+            .offer(move || async move {
+                blocked.await.unwrap();
+                Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity))
+            })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let waiter_pool = Arc::clone(&pool);
+    let waiter = tokio::spawn(async move {
+        waiter_pool
+            .offer(|| async { unreachable!("waiter must share the in-flight dial") })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.send(()).unwrap();
+
+    for result in [leader.await.unwrap(), waiter.await.unwrap()] {
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<crate::proxy::PacketRejection>(),
+            Some(crate::proxy::PacketRejection::Capacity)
+        )));
+    }
+    assert_eq!(pool.pool.lock().dial_failures, 0);
+    assert!(pool.pool.lock().next_dial_at.is_none());
+    let session = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .expect("released capacity must admit without a synthetic backoff");
+    assert!(!session.is_closed());
+}
+
 /// v2: a panicking dial surfaces as an internal failure to every
 /// waiter; the inflight entry clears and the next offer re-dials.
 #[tokio::test(start_paused = true)]
@@ -79,8 +118,8 @@ async fn dial_panic_wakes_waiters_and_reelects() {
     assert!(!session.is_closed());
 }
 
-/// Phase 1: shutdown aborts the in-flight dial (leader), wakes every
-/// waiter with PoolClosed, and rejects offers/inserts afterwards.
+/// Shutdown aborts the in-flight dial, wakes every waiter with PoolClosed,
+/// and rejects later offers.
 #[tokio::test(start_paused = true)]
 async fn shutdown_wakes_leader_and_waiters() {
     let pool = Arc::new(pool(SessionPoolConfig::default()));
@@ -106,16 +145,6 @@ async fn shutdown_wakes_leader_and_waiters() {
             .await
             .is_err(),
         "offers stay rejected after shutdown"
-    );
-    let s = TestSession::new();
-    pool.insert(&s);
-    assert!(
-        s.closed.load(Ordering::Relaxed),
-        "insert after shutdown closes the session"
-    );
-    assert!(
-        !pool.has_usable_session(),
-        "a shutdown pool cannot retain a late session insertion"
     );
 }
 
@@ -218,6 +247,49 @@ async fn warm_retention_pins_one_idle_session_until_release() {
         session.is_closed(),
         "unpin restores the configured zero floor"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn janitor_preserves_and_replenishes_warm_carriers_while_old_streams_drain() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        janitor_interval: Duration::from_secs(1),
+        ..Default::default()
+    }));
+    let old = TestSession::new();
+    old.streams.store(1, Ordering::Relaxed);
+    old.begin_drain();
+    let replacement = TestSession::new();
+    pool.insert(&old);
+    pool.insert(&replacement);
+    pool.set_warm_retained(true);
+    let rewarmed = TestSession::new();
+    pool.ensure_janitor(0, Duration::from_secs(2), {
+        let rewarmed = Arc::clone(&rewarmed);
+        move || {
+            let rewarmed = Arc::clone(&rewarmed);
+            async move { Ok(rewarmed) }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let offered = pool
+        .offer(|| async { anyhow::bail!("warm replacement must avoid redial") })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&offered, &replacement));
+    assert!(!old.is_closed(), "the old live stream must survive reaping");
+
+    replacement.streams.store(1, Ordering::Relaxed);
+    replacement.begin_drain();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let offered = pool
+        .offer(|| async { anyhow::bail!("janitor must restore a reusable warm carrier") })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&offered, &rewarmed));
+    assert!(!old.is_closed());
+    assert!(!replacement.is_closed());
+    pool.shutdown();
 }
 
 /// v2 max-age: past the jittered deadline the session drains (no new

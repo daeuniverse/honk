@@ -1,15 +1,145 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use honk_config::dns::DnsStrategy;
+use honk_config::node::{OutboundConfig, TlsOptions, VlessConfig};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+use honk_config::types::NodeProtocol;
+use honk_outbound::proxy::{
+    PacketOutbound, PacketTransport, ProtocolEntry, ProxyStream, TcpOutbound,
+};
 
 use super::*;
 use crate::dns::forwarder::DnsUpstreamPool;
 use crate::routing::Router;
+
+#[derive(Debug)]
+struct CountingVlessHandler {
+    packet_dials: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl TcpOutbound for CountingVlessHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("unexpected TCP dial")
+    }
+}
+
+#[async_trait::async_trait]
+impl PacketOutbound for CountingVlessHandler {
+    async fn dial_udp_transport(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.packet_dials.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("allowed VLESS packet dial reached")
+    }
+}
+
+#[derive(Debug)]
+struct RefusingTcpHandler {
+    calls: AtomicUsize,
+    failures_before_refusal: usize,
+}
+
+#[async_trait::async_trait]
+impl TcpOutbound for RefusingTcpHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures_before_refusal {
+            return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
+        }
+        Err(honk_outbound::proxy::PacketRejection::Capacity.into())
+    }
+}
+
+#[tokio::test]
+async fn udp_proxy_refusal_stops_cold_and_cached_attempts() {
+    for cached in [false, true] {
+        check_udp_proxy_refusal(cached, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn udp_proxy_retry_preserves_terminal_cause() {
+    // The TCP transport retries a reset once before the outer address retry.
+    check_udp_proxy_refusal(false, 2).await;
+}
+
+async fn check_udp_proxy_refusal(cached: bool, failures_before_refusal: usize) {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream = make_upstream(
+        "refusal",
+        &server.local_addr().unwrap().to_string(),
+        DnsProtocol::Udp,
+    );
+    let node = Node::from_share_link("socks5://127.0.0.1:1080#refusing-proxy").unwrap();
+    let handler = Arc::new(RefusingTcpHandler {
+        calls: AtomicUsize::new(0),
+        failures_before_refusal,
+    });
+    let mut registry = crate::proxy::ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Socks5,
+        Arc::clone(&handler),
+    ));
+    let traffic = Arc::new(tokio::sync::RwLock::new(
+        Router::new(&[], "direct").unwrap(),
+    ));
+    let pool = UpstreamPool::new_with_proxy(
+        &[upstream],
+        make_router(),
+        Some(Arc::new(registry)),
+        vec![node.clone()],
+        vec![],
+    )
+    .unwrap()
+    .with_traffic_router(Arc::clone(&traffic));
+    let query = mock_dns_query(0x1234);
+    if cached {
+        let reply = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+            let response = mock_dns_response(u16::from_be_bytes([buf[0], buf[1]]));
+            server.send_to(&response, peer).await.unwrap();
+        });
+        assert_eq!(
+            pool.query("refusal", &query).await.unwrap(),
+            mock_dns_response(0x1234)
+        );
+        reply.await.unwrap();
+    }
+    *traffic.write().await = Router::new(&[], &node.name).unwrap();
+    let error = pool.query("refusal", &query).await.unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_rejection(&error),
+        Some(honk_outbound::proxy::PacketRejection::Capacity),
+        "cached={cached}, prior failures={failures_before_refusal}: {error:#}",
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        failures_before_refusal + 1
+    );
+    pool.close().await;
+}
 
 async fn bind_matching_tcp_udp(
     tcp_ip: IpAddr,
@@ -219,6 +349,101 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
     let proxy_query = tcp_task.await.unwrap();
     assert!(direct_query.ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113]));
     assert_eq!(proxy_query[2..], query[2..]);
+    pool.close().await;
+    bootstrap_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn doh3_base_vision_refusal_stops_resolved_route_fallback() {
+    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(2).await;
+    let resolver =
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
+    let mut denied = Node {
+        name: "base-vision".into(),
+        address: "127.0.0.1:443".into(),
+        host: "127.0.0.1".into(),
+        port: 443,
+        outbound: OutboundConfig::Vless(VlessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            flow: Some("xtls-rprx-vision".into()),
+            tls: TlsOptions {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    denied.id = denied.derive_id();
+    let mut allowed = denied.clone();
+    allowed.name = "vision-udp443".into();
+    allowed.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+    allowed.id = allowed.derive_id();
+    let route = |ip: &str, outbound: &str| RoutingRule {
+        name: format!("route-{outbound}"),
+        condition: RoutingCondition {
+            ip: vec![ip.into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple(outbound.into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    };
+    let traffic = Arc::new(tokio::sync::RwLock::new(
+        Router::new(
+            &[
+                route("127.0.0.1/32", &denied.name),
+                route("::1/128", &allowed.name),
+            ],
+            "direct",
+        )
+        .unwrap(),
+    ));
+    let packet_dials = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(CountingVlessHandler {
+        packet_dials: Arc::clone(&packet_dials),
+    });
+    let mut registry = crate::proxy::ProxyRegistry::new();
+    registry.register(
+        ProtocolEntry::new(NodeProtocol::VLess, Arc::clone(&handler)).with_packet(handler),
+    );
+    let generation = Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(&[denied.clone(), allowed.clone()])
+            .unwrap(),
+    );
+    let upstream = make_upstream("vision-h3", "vision-h3.test/dns-query", DnsProtocol::H3);
+    let pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[upstream],
+        make_router(),
+        Some(Arc::new(registry)),
+        vec![denied, allowed],
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap()
+    .with_traffic_router(traffic);
+    pool.set_runtime_generation(generation).unwrap();
+
+    let error = pool
+        .query("vision-h3", &mock_dns_query(0x1234))
+        .await
+        .expect_err("base Vision must refuse DoH3 UDP/443 without route fallback");
+
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
+    assert_eq!(
+        error
+            .root_cause()
+            .downcast_ref::<honk_outbound::proxy::PacketRejection>(),
+        Some(&honk_outbound::proxy::PacketRejection::Policy)
+    );
+    assert_eq!(
+        packet_dials.load(Ordering::SeqCst),
+        0,
+        "the allowed sibling route must not dial"
+    );
+
     pool.close().await;
     bootstrap_task.await.unwrap();
 }

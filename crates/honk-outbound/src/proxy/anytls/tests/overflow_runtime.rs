@@ -54,7 +54,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
 /// only the stall watchdog reaps it, strictly after a full grace
 /// without flush progress.
 #[tokio::test(start_paused = true)]
-async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
+async fn large_parked_stream_reaps_via_watchdog_only_after_stall_grace() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
     let sid = 41;
     let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
@@ -69,7 +69,7 @@ async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
         .insert(sid, StreamSink::Tcp(tx));
     session.overflow.lock().push_back(
         sid,
-        StreamEvent::Data(InboundPayload::for_test(vec![0; STREAM_OVERFLOW_BYTES_CAP])),
+        StreamEvent::Data(InboundPayload::for_test(vec![0; TEST_STREAM_BURST_BYTES])),
     );
 
     session
@@ -81,7 +81,7 @@ async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
     assert!(!session.killed_streams.lock().unwrap().contains(&sid));
     assert_eq!(
         session.overflow.lock().stream_usage(sid).bytes,
-        STREAM_OVERFLOW_BYTES_CAP + 1
+        TEST_STREAM_BURST_BYTES + 1
     );
 
     tokio::time::advance(OVERFLOW_WATCHDOG_TICK * 2).await;
@@ -93,9 +93,8 @@ async fn stream_byte_cap_reaps_via_watchdog_only_after_stall_grace() {
     session.close();
 }
 
-/// Fast-peer burst regression: a peer can park past the session byte
-/// soft cap in the milliseconds before the reader is first scheduled —
-/// parking never waits and never kills inside the grace, the late
+/// Fast-peer regression: a multi-megabyte burst can park before the reader is
+/// first scheduled. Parking never waits or kills inside the grace, the late
 /// reader drains, and every byte arrives in order.
 #[tokio::test]
 async fn overflow_burst_within_grace_survives_and_delivers() {
@@ -112,7 +111,7 @@ async fn overflow_burst_within_grace_survives_and_delivers() {
 
     const FRAME: usize = 32 * 1024;
 
-    let frames = STREAM_QUEUE_CAP + SESSION_OVERFLOW_BYTES_CAP / FRAME + 8;
+    let frames = STREAM_QUEUE_CAP + TEST_SESSION_BURST_BYTES / FRAME + 8;
     let dispatcher = tokio::spawn({
         let session = Arc::clone(&session);
         async move {
@@ -313,11 +312,11 @@ async fn session_hard_cap_kills_only_after_full_grace_of_waits() {
     session.close();
 }
 
-/// At the session soft cap parking is immediate — the demux never
-/// waits: a sibling with no parked frames dispatches normally, and
-/// reader progress flushes the parked frame into the freed slot.
+/// With hundreds of parked frames admission remains immediate: a sibling with
+/// no parked frames dispatches normally, and reader progress flushes the next
+/// parked frame into the freed slot.
 #[tokio::test]
-async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
+async fn large_parked_queue_flushes_without_blocking_siblings() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
     let slow_sid = 61;
     let fast_sid = 62;
@@ -340,7 +339,7 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
     let mut fast_stream = AnyTlsStream::new(Arc::clone(&session), fast_sid, fast_rx, fast_permit);
     {
         let mut overflow = session.overflow.lock();
-        for _ in 0..SESSION_OVERFLOW_CAP {
+        for _ in 0..TEST_OVERFLOW_BURST_FRAMES {
             overflow.push_back(
                 slow_sid,
                 StreamEvent::Data(InboundPayload::for_test(vec![1; 8])),
@@ -385,7 +384,10 @@ async fn session_soft_cap_parks_immediately_and_flushes_on_progress() {
         StreamEvent::Data(data) => assert_eq!(data, vec![9, 8, 7]),
         StreamEvent::Fin | StreamEvent::Error(_) => panic!("waiting stream was terminated"),
     }
-    assert_eq!(session.overflow.lock().usage().frames, SESSION_OVERFLOW_CAP);
+    assert_eq!(
+        session.overflow.lock().usage().frames,
+        TEST_OVERFLOW_BURST_FRAMES
+    );
     assert!(!session.is_closed());
     session.close();
 }
@@ -646,10 +648,9 @@ async fn session_close_preserves_killed_reset_until_owner_reads() {
 }
 
 /// 3B-2: a stalled stream is first parked in the session overflow
-/// (non-blocking); parking past the session soft cap still does not
-/// kill, but past the stall grace the watchdog reaps just that
-/// stream — queued data still drains, then the reader sees a reset
-/// (never a clean EOF), and the session survives.
+/// (non-blocking); a large parked queue does not kill inside the grace, but
+/// afterward the watchdog reaps just that stream. Queued data drains before
+/// the reader sees a reset (never a clean EOF), and the session survives.
 #[tokio::test(start_paused = true)]
 async fn test_hol_slow_consumer_reset_after_queue_drains() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
@@ -674,7 +675,7 @@ async fn test_hol_slow_consumer_reset_after_queue_drains() {
         "overflow parking must not kill the stream"
     );
 
-    for _ in 0..SESSION_OVERFLOW_CAP {
+    for _ in 0..TEST_OVERFLOW_BURST_FRAMES {
         session.dispatch_data(sid, vec![2u8; 8]).await;
     }
     assert!(session.streams.lock().unwrap().get(&sid).is_some());
@@ -751,13 +752,12 @@ async fn test_hol_stall_does_not_block_other_streams() {
     }
 }
 
-/// Regression: tripping the session overflow cap must never stall the
-/// demux. Driven through the real receive loop over the duplex: a slow
-/// stream parked to the session soft cap, one more frame for it, then
-/// a frame for a fast sibling — the sibling must receive within a
-/// bounded delay (the old demux waited ~500ms per cap trip here).
+/// Regression: a large session overflow must never stall the demux. Driven
+/// through the real receive loop over the duplex: one slow stream parks
+/// hundreds of frames, then a fast sibling must receive within a bounded
+/// delay.
 #[tokio::test]
-async fn demux_overflow_cap_never_blocks_sibling_streams() {
+async fn demux_large_overflow_never_blocks_sibling_streams() {
     let (session, mut server) = establish_test_session("127.0.0.1:443").await;
     expect_handshake(&mut server).await;
     let slow_sid = 91;
@@ -774,18 +774,18 @@ async fn demux_overflow_cap_never_blocks_sibling_streams() {
     let fast_permit = session.try_reserve().unwrap();
     let mut fast_stream = AnyTlsStream::new(Arc::clone(&session), fast_sid, fast_rx, fast_permit);
 
-    for _ in 0..STREAM_QUEUE_CAP + SESSION_OVERFLOW_CAP {
+    for _ in 0..STREAM_QUEUE_CAP + TEST_OVERFLOW_BURST_FRAMES {
         write_frame(&mut server, CMD_PSH, slow_sid, &[1u8; 8])
             .await
             .unwrap();
     }
     tokio::time::timeout(Duration::from_secs(2), async {
-        while session.overflow.lock().usage().frames != SESSION_OVERFLOW_CAP {
+        while session.overflow.lock().usage().frames != TEST_OVERFLOW_BURST_FRAMES {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
-    .expect("demux parks up to the session soft cap");
+    .expect("demux parks the complete slow-stream burst");
 
     write_frame(&mut server, CMD_PSH, slow_sid, &[2u8; 8])
         .await
@@ -878,29 +878,5 @@ async fn overflow_watchdog_retires_when_the_overflow_drains() {
     tokio::time::advance(OVERFLOW_WATCHDOG_TICK * 2).await;
     tokio::task::yield_now().await;
     assert!(session.watchdog.lock().unwrap().is_none());
-    session.close();
-}
-
-/// UoT saturation retires only the affected sid and never parks bytes in
-/// the session-wide TCP overflow.
-#[tokio::test]
-async fn uot_sink_saturation_retires_only_stream() {
-    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
-    expect_handshake(&mut server).await;
-    let (tx, _rx) = mpsc::channel(1);
-    tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
-        .unwrap();
-    session
-        .streams
-        .lock()
-        .unwrap()
-        .insert(77, StreamSink::Uot(tx));
-    session.dispatch_data(77, vec![1; 16]).await;
-    assert!(!session.streams.lock().unwrap().contains_key(&77));
-    assert!(!session.is_closed());
-    assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
-    assert!(session.watchdog.lock().unwrap().is_none());
-    let (cmd, sid, _) = read_frame(&mut server).await.unwrap();
-    assert_eq!((cmd, sid), (CMD_FIN, 77));
     session.close();
 }

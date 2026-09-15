@@ -311,8 +311,8 @@ impl AsyncUdpSocket for Hy2UdpSocket {
     ) -> Poll<io::Result<usize>> {
         let base_port = self.hop.lock().as_ref().and_then(HopState::base_port);
         let mut count = 0;
-        for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
-            let mut read_buf = ReadBuf::new(&mut buf[..]);
+        for _ in 0..bufs.len().min(meta.len()) {
+            let mut read_buf = ReadBuf::new(&mut bufs[count][..]);
             match self.socket.poll_recv_from(cx, &mut read_buf) {
                 Poll::Ready(Ok(addr)) => {
                     let len = match &self.obfs {
@@ -324,7 +324,7 @@ impl AsyncUdpSocket for Hy2UdpSocket {
                             Some(port) => SocketAddr::new(addr.ip(), port),
                             None => addr,
                         };
-                        *meta_slot = quinn::udp::RecvMeta {
+                        meta[count] = quinn::udp::RecvMeta {
                             addr,
                             len,
                             stride: len,

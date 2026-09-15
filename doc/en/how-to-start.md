@@ -327,7 +327,7 @@ cargo run --release -p honk-core -- \
 ## Current capabilities and limitations
 
 - Outbounds: Direct, Block, SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS.
-- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and non-legacy VLESS modes. VMess and legacy VLESS are TCP-only.
+- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and VLESS when its independent packet permission is enabled. VLESS fallback encoding and multiplex carrier are separate choices; VMess remains TCP-only. See the [VLESS node reference](reference/nodes.md#vless-udp-and-multiplexing).
 - Groups: Selector, URLTest, LoadBalance, Fallback, and Score.
 - DNS upstreams: UDP, TCP, DoT, DoH, DoH3, and DoQ, optionally through a node or group.
 - `direct` and `block` are built-in nodes and must not be redeclared.

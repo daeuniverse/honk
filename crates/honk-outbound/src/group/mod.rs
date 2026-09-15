@@ -222,8 +222,6 @@ pub struct GroupManager {
     lb_counters: HashMap<String, [AtomicUsize; 2]>,
     /// Per-group TCP/UDP Fallback pins.
     fallback_cache: RwLock<HashMap<String, [Option<String>; 2]>>,
-    /// Per-group last-used timestamp for idle timeout.
-    last_used: RwLock<HashMap<String, Instant>>,
     /// Per-group selector choice (set via API, persisted by caller).
     /// group_name → selected node name.
     selector_choice: RwLock<HashMap<String, String>>,
@@ -276,24 +274,6 @@ impl GroupManager {
         alive_set: Option<Arc<AliveDialerSet>>,
         score_state: Arc<ScorePolicyState>,
     ) -> Self {
-        Self::build(groups, nodes, alive_set, score_state)
-    }
-
-    fn build(
-        groups: &[Group],
-        nodes: &[Node],
-        alive_set: Option<Arc<AliveDialerSet>>,
-        score_state: Arc<ScorePolicyState>,
-    ) -> Self {
-        Self::build_inner(groups, nodes, alive_set, score_state)
-    }
-
-    fn build_inner(
-        groups: &[Group],
-        nodes: &[Node],
-        alive_set: Option<Arc<AliveDialerSet>>,
-        score_state: Arc<ScorePolicyState>,
-    ) -> Self {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
         resolver::break_group_cycles(&mut group_map);
@@ -320,7 +300,6 @@ impl GroupManager {
                 })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
-            last_used: RwLock::new(HashMap::new()),
             selector_choice: RwLock::new(HashMap::new()),
             last_resort_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
@@ -361,43 +340,6 @@ impl GroupManager {
             &mut visited,
             0,
             SelectionEffects::Apply,
-        )
-    }
-
-    /// Select a single alive node, excluding one by name (for failover retry).
-    pub fn select_node_excluded(
-        &self,
-        name: &str,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-        excluded_node_name: &str,
-    ) -> Option<&Node> {
-        let group = self.groups.get(name)?;
-        let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(
-            group,
-            domain,
-            ipver,
-            &mut visited,
-            0,
-            SelectionEffects::Apply,
-        );
-        let candidates: Vec<Candidate> = self
-            .filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref())
-            .into_iter()
-            .filter(|c| c.node.name != excluded_node_name)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        Some(
-            self.pick_best_by_latency(
-                &candidates,
-                group,
-                SelectionNetwork::from_probe_domain(domain),
-                ipver,
-            )
-            .node,
         )
     }
 
@@ -454,55 +396,6 @@ impl GroupManager {
             ipver,
             SelectionEffects::Peek,
         )
-    }
-
-    /// Retry candidates after an authoritative single-candidate dial
-    /// failure: unique URLTest leaves in latency order (≤3). Within the race
-    /// order is irrelevant — a just-failed incumbent that still measures
-    /// fastest re-races alongside its alternates and loses by failing
-    /// again; a strike-demoted one is re-raced too, since the race itself
-    /// is the verdict. Non-URLTest groups yield no candidates (pins are
-    /// not retried).
-    pub fn urltest_retry_candidates(
-        &self,
-        group_name: &str,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-    ) -> Vec<&Node> {
-        let Some(group) = self.groups.get(group_name) else {
-            return Vec::new();
-        };
-        if group.policy != GroupPolicy::URLTest {
-            return Vec::new();
-        }
-        let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(
-            group,
-            domain,
-            ipver,
-            &mut visited,
-            0,
-            SelectionEffects::Peek,
-        );
-        let candidates =
-            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
-        let network = SelectionNetwork::from_probe_domain(domain);
-        let mut retry = Vec::with_capacity(3);
-        for candidate in
-            self.order_by_latency(candidates, network, ipver, group.check_url.as_deref())
-        {
-            if retry
-                .iter()
-                .any(|node: &&Node| node.id == candidate.node.id)
-            {
-                continue;
-            }
-            retry.push(candidate.node);
-            if retry.len() == 3 {
-                break;
-            }
-        }
-        retry
     }
 
     fn selection_plan_for_domain_with_effects(

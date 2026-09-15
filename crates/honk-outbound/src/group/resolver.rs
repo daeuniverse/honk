@@ -152,9 +152,8 @@ impl GroupManager {
             let Some(sub) = self.groups.get(sub_tag.as_str()) else {
                 continue;
             };
-            // Sub-group participation counts as activity only for real
-            // traffic. Peek follows the same nested policy without waking
-            // health checks or updating idle timestamps.
+            // Sub-group participation wakes health checks only for real
+            // traffic; peek must remain observational.
             if sub_effects.applies() {
                 self.mark_used(sub_tag);
             }
@@ -353,37 +352,48 @@ impl GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Vec<String> {
+        self.selection_path_for_network(group_name, network).0
+    }
+
+    fn selection_path_for_network(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> (Vec<String>, Option<&Node>) {
         let mut chain = vec![group_name.to_string()];
-        let mut current = group_name.to_string();
+        let Some(mut group) = self.groups.get(group_name) else {
+            return (chain, None);
+        };
         for _ in 0..MAX_GROUP_DEPTH {
-            let Some(group) = self.groups.get(&current) else {
-                break;
-            };
-            let next: Option<String> = match group.policy {
-                GroupPolicy::Selector => self
-                    .selector_choice
-                    .read()
-                    .get(&group.name)
-                    .cloned()
-                    .or_else(|| group.default.clone())
-                    .or_else(|| self.member_tags(group).first().map(|s| s.to_string())),
-                GroupPolicy::URLTest => {
-                    self.get_urltest_selection_for_network(&group.name, network)
-                }
-                GroupPolicy::Fallback => {
-                    self.get_fallback_selection_for_network(&group.name, network)
-                }
+            let member = match group.policy {
+                GroupPolicy::Selector => self.selector_member(group),
+                GroupPolicy::URLTest => self
+                    .get_urltest_selection_for_network(&group.name, network)
+                    .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
+                GroupPolicy::Fallback => self
+                    .get_fallback_selection_for_network(&group.name, network)
+                    .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
                 GroupPolicy::LoadBalance => None,
-                GroupPolicy::Score => self.get_score_selection_for_network(&group.name, network),
+                GroupPolicy::Score => self
+                    .get_score_selection_for_network(&group.name, network)
+                    .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
             };
-            let Some(tag) = next else { break };
-            if tag == current || chain.contains(&tag) {
-                break;
+            let Some(member) = member else { break };
+            match member {
+                GroupMember::Node(node) => {
+                    chain.push(node.name.clone());
+                    return (chain, Some(node));
+                }
+                GroupMember::Group(next) => {
+                    if chain.contains(&next.name) {
+                        break;
+                    }
+                    chain.push(next.name.clone());
+                    group = next;
+                }
             }
-            chain.push(tag.clone());
-            current = tag;
         }
-        chain
+        (chain, None)
     }
 
     /// Resolve a Selector's configured choice to the leaf that must remain
@@ -397,9 +407,8 @@ impl GroupManager {
             return None;
         }
         if let Some(node) = self
-            .selection_chain(group_name)
-            .last()
-            .and_then(|name| self.node_by_name(name))
+            .selection_path_for_network(group_name, SelectionNetwork::Tcp)
+            .1
         {
             return Some(node);
         }

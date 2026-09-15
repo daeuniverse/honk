@@ -22,6 +22,7 @@ pub(crate) struct ResourceBudget {
     pub active_tcp_flows: usize,
     pub tcp_pool_entries: usize,
     pub transient_dials: usize,
+    pub vless_carriers: usize,
     pub udp_endpoints: usize,
     pub udp_slow_path: usize,
     pub dns_slow_path: usize,
@@ -54,7 +55,10 @@ impl ResourceBudget {
                 .min(after_tcp_pool)
         };
         let after_dials = after_tcp_pool.saturating_sub(transient_dials);
-        let udp_endpoints = (after_dials / UDP_ENDPOINT_DESCRIPTOR_COST).min(MAX_ENDPOINTS);
+        let vless_carriers = (after_dials / 8).min(MAX_ENDPOINTS);
+        let udp_endpoints = (after_dials.saturating_sub(vless_carriers)
+            / UDP_ENDPOINT_DESCRIPTOR_COST)
+            .min(MAX_ENDPOINTS);
 
         Self {
             effective_nofile,
@@ -62,6 +66,7 @@ impl ResourceBudget {
             active_tcp_flows,
             tcp_pool_entries,
             transient_dials,
+            vless_carriers,
             udp_endpoints,
             udp_slow_path: udp_endpoints.min(MAX_UDP_SLOW_PATH),
             dns_slow_path: transient_dials.min(MAX_DNS_SLOW_PATH),
@@ -80,6 +85,7 @@ impl ResourceBudget {
         let non_tcp_budget = self
             .tcp_pool_entries
             .saturating_add(self.transient_dials)
+            .saturating_add(self.vless_carriers)
             .saturating_add(
                 self.udp_endpoints
                     .saturating_mul(UDP_ENDPOINT_DESCRIPTOR_COST),
@@ -105,6 +111,7 @@ impl ResourceBudget {
             )
             .saturating_add(self.tcp_pool_entries)
             .saturating_add(self.transient_dials)
+            .saturating_add(self.vless_carriers)
             .saturating_add(
                 self.udp_endpoints
                     .saturating_mul(UDP_ENDPOINT_DESCRIPTOR_COST),
@@ -135,6 +142,7 @@ mod tests {
             assert!(budget.active_tcp_flows <= MAX_ACTIVE_TCP_FLOWS);
             assert!(budget.tcp_pool_entries <= MAX_TOTAL_ENTRIES);
             assert!(budget.transient_dials <= MAX_TRANSIENT_DIALS);
+            assert!(budget.vless_carriers <= MAX_ENDPOINTS);
             assert!(budget.udp_endpoints <= MAX_ENDPOINTS);
             assert!(budget.udp_slow_path <= budget.udp_endpoints);
             assert!(budget.dns_slow_path <= budget.transient_dials);
@@ -148,7 +156,8 @@ mod tests {
             let non_udp_descriptors = budget.fixed_reserve
                 + budget.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST
                 + budget.tcp_pool_entries
-                + budget.transient_dials;
+                + budget.transient_dials
+                + budget.vless_carriers;
             let endpoint_descriptors = budget.udp_endpoints * (2 + MAX_REPLY_SOCKETS_PER_ENDPOINT);
 
             assert!(non_udp_descriptors + endpoint_descriptors <= budget.effective_nofile);
@@ -163,6 +172,7 @@ mod tests {
         let fully_reserved_fds = tcp_only_fds
             + budget.tcp_pool_entries
             + budget.transient_dials
+            + budget.vless_carriers
             + budget.udp_endpoints * UDP_ENDPOINT_DESCRIPTOR_COST;
 
         let borrowed = budget.elastic_tcp_flows(budget.active_tcp_flows, tcp_only_fds);

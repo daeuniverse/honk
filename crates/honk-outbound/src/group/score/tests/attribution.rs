@@ -49,6 +49,28 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
 }
 
 #[test]
+fn rejected_exact_attempt_is_neutral() {
+    let nodes = [node("a"), node("b")];
+    let manager = super::super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+    let context = context("rejected.example", IpVersion::V4);
+    let first = manager.selection_plan_for_target("score", &context);
+    assert_eq!(first.entries[0].node.id, nodes[0].id);
+    first.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .start()
+        .setup_failed(ScoreOutcome::Rejected);
+
+    assert!(
+        !manager
+            .score_state()
+            .has_exact("score", &context, nodes[0].id)
+    );
+    assert_eq!(selected(&manager, &context), nodes[0].id);
+}
+
+#[test]
 fn cancelled_exact_attempt_does_not_hide_aggregate_failure() {
     let nodes = [node("a"), node("b")];
     let manager = super::super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -461,6 +483,17 @@ fn compact_outcome_finds_nested_io_errors() {
     let error = anyhow::Error::new(io::Error::new(io::ErrorKind::TimedOut, "secret target"))
         .context("outer context");
     assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Timeout);
+    let rejection =
+        anyhow::Error::new(crate::proxy::PacketRejection::Policy).context("outer context");
+    assert_eq!(ScoreOutcome::from_error(&rejection), ScoreOutcome::Rejected);
+    let io_rejection = anyhow::Error::new(std::io::Error::from(
+        crate::proxy::PacketRejection::InvalidSize,
+    ))
+    .context("outer context");
+    assert_eq!(
+        ScoreOutcome::from_error(&io_rejection),
+        ScoreOutcome::Rejected
+    );
 }
 
 #[test]

@@ -135,7 +135,10 @@ impl Node {
                     optional_flow(Some(flow))
                         .and_then(|flow| flow.ok_or("unsupported VLESS flow"))
                         .map_err(|message| invalid(Some("flow"), message))?;
-                    if !config.tls.enabled && config.tls.reality_public_key.is_none() {
+                    if !config.is_encrypted()
+                        && !config.tls.enabled
+                        && config.tls.reality_public_key.is_none()
+                    {
                         return Err(invalid(Some("flow"), "VLESS flow requires TLS or REALITY"));
                     }
                 }

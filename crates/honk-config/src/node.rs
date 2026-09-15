@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 
 mod protocol;
 mod validation;
+mod vless;
 mod wire;
 
 pub use protocol::*;
 pub use validation::validate_node_collection;
+pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
 
@@ -45,50 +47,6 @@ use crate::types::NodeProtocol;
 /// breaks.
 pub const NODE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x3d8f2e1a_9b4c_4d57_8f3a_2c6e1d0b9a7f);
-
-/// Normalized multiplexing and packet wire behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum WireMode {
-    #[default]
-    Legacy,
-    UotV2,
-    H2mux,
-    H2muxPadded,
-    Xudp,
-    MuxCool,
-}
-impl WireMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::UotV2 => "uot-v2",
-            Self::H2mux => "h2mux",
-            Self::H2muxPadded => "h2mux-padded",
-            Self::Xudp => "xudp",
-            Self::MuxCool => "mux-cool",
-        }
-    }
-}
-
-impl std::str::FromStr for WireMode {
-    type Err = crate::ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "legacy" => Ok(Self::Legacy),
-            "uot-v2" => Ok(Self::UotV2),
-            "h2mux" => Ok(Self::H2mux),
-            "h2mux-padded" => Ok(Self::H2muxPadded),
-            "xudp" => Ok(Self::Xudp),
-            "mux-cool" => Ok(Self::MuxCool),
-            _ => Err(crate::ConfigError::Parse(
-                "unsupported wire mode (expected legacy/uot-v2/h2mux/h2mux-padded/xudp/mux-cool)"
-                    .into(),
-            )),
-        }
-    }
-}
 
 /// A proxy node definition. Protocol-specific state lives in [`OutboundConfig`];
 /// the outer node carries only identity, endpoint, and provenance shared by all
@@ -491,32 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vless_mode_serde_and_default() {
-        assert_eq!(Node::default().vless(), None);
-        for (value, mode) in [
-            ("legacy", WireMode::Legacy),
-            ("uot-v2", WireMode::UotV2),
-            ("h2mux", WireMode::H2mux),
-            ("h2mux-padded", WireMode::H2muxPadded),
-            ("xudp", WireMode::Xudp),
-            ("mux-cool", WireMode::MuxCool),
-        ] {
-            assert_eq!(
-                serde_json::from_str::<WireMode>(&format!("\"{value}\"")).unwrap(),
-                mode
-            );
-            assert_eq!(
-                serde_json::to_string(&mode).unwrap(),
-                format!("\"{value}\"")
-            );
-            assert_eq!(value.parse::<WireMode>().unwrap(), mode);
-            assert_eq!(mode.as_str(), value);
-        }
-        let error = "smux".parse::<WireMode>().unwrap_err().to_string();
-        assert!(error.contains("xudp/mux-cool"));
-    }
-
-    #[test]
     fn test_protocol_identity_goldens() {
         let cases = [
             (
@@ -538,46 +470,6 @@ mod tests {
                 "vmess",
                 "vmess://eyJwcyI6InZtZXNzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoidGxzIn0",
                 "263e811a-31e9-572f-bb87-66f1fc63ce98",
-            ),
-            (
-                "vless-legacy",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443#legacy",
-                "d47c73f3-910d-56b4-baa5-d230c76d788b",
-            ),
-            (
-                "vless-uot-v2",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=uot-v2#uot-v2",
-                "372e7dc7-86a7-5d0d-accc-ba38fd103214",
-            ),
-            (
-                "vless-h2mux",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=h2mux#h2mux",
-                "258ef463-002a-5fdf-8901-a1c8508ff988",
-            ),
-            (
-                "vless-h2mux-padded",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=h2mux-padded#h2mux-padded",
-                "7f5ed150-4f89-54e1-b157-4d123d7fbc52",
-            ),
-            (
-                "vless-xudp",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp#xudp",
-                "85e3e4ce-e4e7-546b-93d5-e1d8a0742f4b",
-            ),
-            (
-                "vless-mux-cool",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=mux-cool#mux-cool",
-                "4133852f-b86f-5a8f-b8fb-b335023645fe",
-            ),
-            (
-                "vless-encrypted",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443#encrypted",
-                "9add2074-63e8-5b29-ba6b-26ed937d2464",
-            ),
-            (
-                "vless-populated-dial",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?security=reality&type=ws&sni=cdn.example.com&path=%2Fp&host=ws.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&spx=%2Fprobe#populated",
-                "529c3f31-3295-54f2-86e5-15cfc43f1a39",
             ),
             (
                 "hysteria2",
@@ -605,11 +497,6 @@ mod tests {
             let mut node = Node::from_share_link(link).unwrap();
             // Admission changed; the historical identity material and hashes did not.
             match &mut node.outbound {
-                OutboundConfig::Vless(config) if name == "vless-encrypted" => {
-                    config.uuid = Some("b".into());
-                    config.encryption = Some("a".into());
-                }
-                OutboundConfig::Vless(config) => config.uuid = Some("uuid".into()),
                 OutboundConfig::Tuic(config) => config.uuid = Some("uuid".into()),
                 OutboundConfig::Juicity(config) => config.uuid = Some("uuid".into()),
                 _ => {}
@@ -684,7 +571,7 @@ mod tests {
         )
         .unwrap();
         let mut xudp = Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp&sni=b",
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=xudp&sni=b",
         )
         .unwrap();
         encrypted.vless_mut().unwrap().uuid = Some("b".into());
@@ -701,36 +588,65 @@ mod tests {
     }
 
     #[test]
-    fn test_vless_mode_identity() {
-        let mut legacy = Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443#legacy",
+    fn test_vless_identity_uses_canonical_effective_settings() {
+        let off =
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443")
+                .unwrap();
+        let no_pools = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=xray&concurrency=-1&xudpConcurrency=-1&xudpProxyUDP443=allow",
         )
         .unwrap();
-        let mut explicit_legacy =
-            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy#explicit")
-                .unwrap();
-        legacy.vless_mut().unwrap().uuid = Some("uuid".into());
-        legacy.id = legacy.derive_id();
-        explicit_legacy.vless_mut().unwrap().uuid = Some("uuid".into());
-        explicit_legacy.id = explicit_legacy.derive_id();
-        assert_eq!(legacy.id, explicit_legacy.id);
+        assert_ne!(off.id, no_pools.id);
+        let mut spaced_none = off.clone();
+        spaced_none.vless_mut().unwrap().encryption = Some(" none ".into());
+        assert_eq!(off.id, spaced_none.derive_id());
 
-        let ids = ["uot-v2", "h2mux", "h2mux-padded", "xudp", "mux-cool"].map(|mode| {
-            let mut node = Node::from_share_link(&format!(
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode={mode}#{mode}"
-            ))
-            .unwrap();
-            node.vless_mut().unwrap().uuid = Some("uuid".into());
-            node.derive_id()
-        });
-        assert!(ids.iter().all(|id| *id != legacy.id));
-        assert_eq!(
-            ids.iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            ids.len()
-        );
+        let defaults = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=xray",
+        )
+        .unwrap();
+        let explicit = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=xray&concurrency=8&xudpConcurrency=0",
+        )
+        .unwrap();
+        assert_eq!(defaults.id, explicit.id);
+
+        let pooled_auto = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=xray&xudpConcurrency=8&xudpProxyUDP443=allow",
+        )
+        .unwrap();
+        let pooled_unused_encoding = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=uot-v2&mux=xray&xudpConcurrency=8&xudpProxyUDP443=allow",
+        )
+        .unwrap();
+        assert_eq!(pooled_auto.id, pooled_unused_encoding.id);
+    }
+
+    #[test]
+    fn test_vless_packet_disable_identity_is_effective() {
+        let enabled = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=none",
+        )
+        .unwrap();
+        let disabled = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=none&udp=0",
+        )
+        .unwrap();
+        let mut equivalent = disabled.clone();
+        equivalent.vless_mut().unwrap().network = Some(" TCP ".into());
+        assert_ne!(enabled.id, disabled.id);
+        assert_eq!(disabled.id, equivalent.derive_id());
+        for network in ["udp", " TCP, UDP "] {
+            let mut equivalent = enabled.clone();
+            equivalent.vless_mut().unwrap().network = Some(network.into());
+            assert_eq!(enabled.id, equivalent.derive_id());
+        }
+
+        let disabled_xudp = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=xudp&udp=0",
+        )
+        .unwrap();
+        assert_eq!(disabled.id, disabled_xudp.id);
     }
 
     #[test]
@@ -864,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_redacts_vless_mode_context_name() {
+    fn test_validate_redacts_vless_path_context_name() {
         let mut node = Node::from_share_link(
             "vless://00000000-0000-0000-0000-000000000001@example.com:443#vless",
         )
@@ -874,7 +790,7 @@ mod tests {
         const CANARY: &str = "node-name-canary-vless";
         node.name = CANARY.into();
         let vless = node.vless_mut().unwrap();
-        vless.mode = WireMode::UotV2;
+        vless.udp_encoding = VlessUdpEncoding::UotV2;
         vless.flow = Some("xtls-rprx-vision".into());
         vless.tls.enabled = true;
 

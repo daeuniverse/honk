@@ -80,7 +80,7 @@ The sniffers feed the canonical initializer and may resolve a staged decision, b
 
 `build_tuples_key` must initialize `TuplesKey` with `mem::zeroed()`. The `#[repr(C)]` key has 37 field bytes in a 40-byte layout, and the kernel hashes all 40 bytes, including its three padding bytes. Field-wise initialization can therefore create keys that userspace cannot look up or delete reliably.
 
-An authoritative single-candidate TCP failure is retried exactly once, only if re-resolution offers a useful alternative. URLTest races latency-ordered top-3 `urltest_retry_candidates`; Score records failure, re-ranks the exact target, and retries only a different replacement. Never retry other policies or true single-leaf outcomes.
+An authoritative single-candidate TCP transport failure is retried exactly once, only if re-resolution offers a useful alternative. URLTest races the latency-ordered top three from the target-aware retry plan; Score records failure, re-ranks the exact target, and retries only a different replacement. Local typed refusals remain terminal, including already-completed refusals discovered while draining a race. Never retry other policies or true single-leaf outcomes.
 
 - `src/sniffing.rs` — **TCP only**: TLS SNI + HTTP Host (≤4096 bytes; buffered bytes returned for forwarding); `parse_client_hello_body` shared with the QUIC sniffer in `control/quic.rs`.
 
@@ -101,18 +101,43 @@ Malformed controller-owned UDP53 retains compatible controller handoff facts for
 
 ### Transport and transaction
 
-`PacketTransport` is the only production UDP interface. Native UDP handlers wrap a real socket; tunnel handlers implement framing directly and expose `relay_addr()`, `send_packet`, `send_packet_confirmed`, and `recv_packet`. The control plane does not create a loopback socket bridge for framed transports.
+Ordinary transports use `PacketTransport`; native handlers wrap a real socket
+and tunnels frame packets directly. Source-shared VLESS XUDP/Mux.Cool instead
+commits a typed source attachment whose endpoint views share one transport
+receiver. The control plane creates no loopback bridge for either shape.
 
 Endpoint creation is transactional:
 
 1. Reserve `(client, original destination)` as `Initializing`; the lease owns the first datagram, queue permits, slow-path permit, token, generation, and cancellation epoch.
-2. Route, sniff, select, and finalize one eligible transport. Create the transparent anyfrom reply socket before publication.
-3. Spawn the endpoint driver and wait for its ready barrier.
-4. Atomically replace the exact `Initializing` identity with `Ready` under the shared epoch fence.
-5. Transfer the retained first packet, send it with `send_packet_confirmed`, and wait for its acknowledgement.
-6. Send sniff-retained fragments and untouched queue followers in FIFO order, then run steady send and receive paths.
+2. Route, sniff, select, and prepare eligible transports. Create the transparent anyfrom reply socket before publication.
+3. Select one candidate and commit only its `PreparedUdpTransport<T>` or VLESS source preparation; the fallible commit returns the selected `Arc<T>`/attachment while dropped losers roll back.
+4. Spawn the endpoint driver and wait for its ready barrier.
+5. Atomically replace the exact `Initializing` identity with `Ready` under the shared epoch fence.
+6. Transfer the retained first packet, send it through the committed transport, and wait for acknowledgement.
+7. Send sniff-retained fragments and untouched queue followers in FIFO order, then run steady send and receive paths.
 
-Transparent UDP transport preparation starts after routing and selection and ends only when the finalized transport's protocol-state commit completes. Authoritative and cold URLTest paths share one absolute `max(10s, 4 × connect_timeout)` deadline across proxy-host resolution, physical-dial admission, control negotiation, stagger/full-capacity waits, and commit. On scheduler expiry, no later candidate starts and every started task is aborted and drained before the initializer resumes. Sniffing/routing precede this boundary; reply-socket creation, driver readiness, and packet sends follow it under their separate transactional or I/O bounds.
+Transparent UDP preparation starts after routing and selection and ends only
+when the selected transport's protocol-state commit completes. Authoritative
+and cold URLTest paths share one absolute `max(10s, 4 × connect_timeout)`
+deadline across resolution, physical-dial admission, control negotiation,
+stagger/full-capacity waits, and commit. Expiry starts no later candidate and
+drains every started preparation before returning. Sniffing/routing precede
+this boundary; reply-socket creation, publication, and packet I/O follow under
+their existing transaction and I/O bounds. There is no automatic packet replay.
+
+For source-shared VLESS, `udp_endpoint/source.rs` indexes one owner by reused
+runtime identity, normalized client, UDP path, and `ActualPeer` or
+`RewriteTo(original destination)`. It owns one XUDP session, one receiver, and
+multiple endpoint send views. The full `(client, destination)` endpoint map is
+still canonical for routing, token, generation, and per-flow Score. Reply
+classification never treats an occupied wrong-owner, `Initializing`, or
+`Retiring` entry as foreign; only an absent `ActualPeer` key is eligible for
+foreign delivery, without per-flow Score. Domain routes remain scoped to their
+original destination. Late send/reply/removal callbacks revalidate owner,
+token, generation, and endpoint identity before acting.
+Source sharing does not merge kernel/NFQUEUE flow ownership: every canonical
+endpoint keeps its own decision token, generation, terminal transition, and
+five-tuple retirement fence.
 
 Each transparent socket consumes at most eight datagrams per readiness turn with `recvmmsg`. Every slot retains independent ORIGDST and PKTINFO metadata, packets remain in kernel order, and malformed metadata drops only that slot. After a drained queue, the next wake starts with one slot; a full read immediately reopens the eight-slot batch, avoiding sparse-traffic setup cost. The cap bounds scheduler fairness and payload storage to 512 KiB per socket, or 4 MiB across the current four sockets per family when both families are active. The listener loop only validates, reserves, and enqueues; it never awaits `PacketTransport` I/O. The endpoint driver owns all transport calls. First and steady sends each have a five-second timeout. A timeout or error is ambiguous because the transport may have accepted part of the packet, so the driver never replays that datagram or advances to later followers.
 
@@ -130,7 +155,11 @@ For NFQUEUE ingress, client/destination-keyed `PendingUdpVerdicts` carries only 
 
 Each UDP flow retains at most 64 datagrams including its first packet. All flows share an exact 8 MiB payload-permit budget. Admission obtains per-flow slots and global byte permits before copying; FIFO saturation drops the newest datagram. NFQUEUE has a separate ingest actor bounded to 256 entries and 8 MiB of queued payload.
 
-At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the active value once, and caps the budgeting input at 1,048,576. At that cap the fixed partition is:
+At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the
+active value once, and caps the budgeting input at 1,048,576. VLESS carrier
+capacity is carved out as `min(after_dials / 8, 8192)` before the remaining
+descriptor budget determines UDP endpoint count. At the cap the fixed partition
+is:
 
 | Owner | Capacity | Descriptor accounting |
 | --- | ---: | ---: |
@@ -138,17 +167,35 @@ At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the a
 | Accepted TCP flows | 16,384 | 6 each = 98,304 |
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
-| UDP endpoints | 8192 | 3 each = 24,576 |
-| **Total** |  | **126,208** |
-The remaining descriptor headroom is deliberately unassigned: a high `RLIMIT_NOFILE` is not treated as proof of equivalent memory or scheduler capacity. TCP starts with a descriptor-derived fixed partition capped at 16,384 flows and elastically borrows idle non-TCP descriptor headroom while retaining half of the non-TCP budget as burst reserve. At the 1,048,576 cap that raises the current target to 18,688 when the reserved non-TCP owners are idle; a 4,096-descriptor service scales from 160 to 320. Existing flows are never cut, and a fixed reserve protects control-plane descriptors.
+| VLESS physical carriers | 8192 | 1 each = 8192 |
+| UDP endpoints | 8192 | 10 each = 81,920 |
+| **Total** |  | **191,744** |
 
-A TCP flow budgets the accepted socket, outbound socket, and two two-FD splice pipes. A UDP endpoint budgets the worst common ownership shape: relay socket, SOCKS5 control stream, and anyfrom reply socket. Smaller `RLIMIT_NOFILE` values scale the same partition with saturating arithmetic.
+One UDP endpoint budgets a relay socket, a possible SOCKS5 control stream, and
+all eight possible anyfrom reply sockets. One TCP flow budgets the accepted and
+outbound sockets plus two two-FD splice pipes. Smaller limits use the same
+saturating partition; a zero VLESS-carrier result stays zero.
+
+The process VLESS-carrier semaphore is shared by traffic generations and DNS
+runtime forks. A carrier holds its permit during actual I/O through provisional,
+active, draining, and idle lifecycle states, releasing it only when its task
+tears down. This process gate, not a sum of per-node pool limits, is the
+authoritative physical-FD bound. Exhaustion is a typed local capacity rejection
+and is neutral to node health and Score.
+
+The remaining headroom is deliberately unassigned: a high `RLIMIT_NOFILE` is
+not proof of equivalent memory or scheduler capacity. TCP starts with a
+descriptor-derived floor capped at 16,384 flows and may borrow idle non-TCP
+headroom while retaining half that budget as burst reserve, never exceeding
+twice its floor. Existing flows are never cut, and the fixed reserve protects
+control-plane descriptors.
 
 Admission ceilings are distinct:
 
 | Admission | Ceiling |
 | --- | ---: |
-| TCP flow permits | Descriptor-derived floor; 16,384 at the 1,048,576 cap, reaching 18,688 from idle reserved headroom |
+| TCP flow permits | Descriptor-derived floor plus bounded borrowing of observed idle non-TCP headroom |
+| VLESS physical carriers | Startup `min(after_dials / 8, 8192)` process gate |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
@@ -162,6 +209,11 @@ Transparent TCP waits for either IP-family listener to become readable before re
 When both sides are plain `TcpStream`, `relay_splice` runs two concurrent `splice(2)` pumps. Each direction owns one nonblocking pipe of at most 64 KiB, so a full-duplex relay requests at most four pipe FDs and 128 KiB of pipe pages. EOF half-closes the opposite write side and lets the reverse direction drain.
 
 The first splice in each direction is also a capability probe. `EINVAL`, `ENOSYS`, or `EXDEV` before any byte has reached a destination permits a lossless userspace-copy fallback and sets a process-wide latch; later connections skip the probe. Other errors, or an unsupported result after bytes have been staged, fail the relay rather than risk loss. Wrapped TLS or protocol streams use `relay_auto`, which always uses the select-based copy loop.
+
+The copy pumps flush bytes buffered by sniffing or protocol setup before reading
+new input, then use Tokio's native copier, which flushes pending writes when input
+becomes idle. Each direction uses its default 8 KiB buffer; buffering never requires
+the application to send another request or close before its current request leaves.
 
 After the first EOF, both relay paths bound only idle drain time: `DRAIN_DEADLINE` is 30 seconds without a byte of progress. An active survivor may run longer than 30 seconds; a silent survivor cannot pin accepted sockets indefinitely.
 

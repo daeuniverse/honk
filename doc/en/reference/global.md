@@ -64,6 +64,13 @@ These inputs are captured at startup. A reload that changes their effective valu
 
 DAE `check_tolerance` still updates URLTest group tolerances on reload. Group-specific check URLs and direct checks retain their existing live-update paths. Reloading `utls_imitate` stores the compatibility value but does not change the fingerprint.
 
+UDP DNS target initialization is attempted at startup within the health-check
+timeout. A local refusal or initialization timeout leaves the configured target
+pending for a later health cycle, without a default substitution or node-health
+penalty; independent QUIC checks can continue. The first successfully resolved
+address remains pinned. Deferred resolution and the DNS exchange share one probe
+deadline; ordinary resolution failures retain the existing default fallback.
+
 ## Interface semantics
 
 An empty `lan_interface` is literal: honk installs no LAN TC hooks and never substitutes `lo`. A WAN-only gateway therefore uses only `wan_interface`; host-originated TCP and UDP that traverse those WAN hooks are still proxied, while no synthetic LAN interception is added.

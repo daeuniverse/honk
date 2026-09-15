@@ -8,7 +8,10 @@
   "username": "00000000-0000-0000-0000-000000000001",
   "password": "00000000-0000-0000-0000-000000000001",
   "encryption": "none",
-  "vless_mode": "xudp",
+  "packet_encoding": "xudp",
+  "multiplex": {
+    "protocol": "off"
+  },
   "plugin": null,
   "plugin_opts": null,
   "transport": "ws",

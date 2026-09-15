@@ -146,7 +146,6 @@ impl DetailedConfigError {
                 )),
                 "unsupported stream transport"
                 | "conflicting stream transport aliases"
-                | "unsupported VLESS obfs transport"
                 | "unsupported VMess obfs transport" => Some((
                     "invalid-config-value",
                     SettingPath::new("nodes").field("transport"),
@@ -162,11 +161,6 @@ impl DetailedConfigError {
                     "invalid-config-value",
                     SettingPath::new("nodes").field("sni"),
                     "conflicting TLS server name aliases",
-                )),
-                "conflicting VLESS flow parameters" | "unsupported VLESS flow" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("flow"),
-                    "VLESS flow must be absent or exactly xtls-rprx-vision; aliases must agree",
                 )),
                 "dns.hosts_file was removed; use one or more use_host paths" => Some((
                     "removed-dns-hosts-file",

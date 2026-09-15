@@ -1,5 +1,6 @@
 use super::*;
-use crate::subscription::clash::options::parse_vless_external_mode;
+
+mod vless;
 
 #[test]
 fn test_parse_clash_subscription() {
@@ -270,212 +271,6 @@ proxies:
 }
 
 #[test]
-fn test_parse_clash_vless_modes() {
-    let yaml = r#"
-proxies:
-  - name: h2-default
-    type: vless
-    server: h2.example
-    port: 443
-    uuid: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
-    smux:
-      enabled: true
-      padding: false
-  - name: h2-padded
-    type: vless
-    server: padded.example
-    port: 443
-    uuid: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
-    multiplex:
-      enabled: true
-      protocol: h2mux
-      padding: true
-  - name: uot-default
-    type: vless
-    server: uot-default.example
-    port: 443
-    uuid: cccccccc-cccc-4ccc-8ccc-cccccccccccc
-    udp-over-tcp: true
-  - name: uot-v2
-    type: vless
-    server: uot-v2.example
-    port: 443
-    uuid: dddddddd-dddd-4ddd-8ddd-dddddddddddd
-    udp_over_tcp:
-      enabled: true
-      version: 2
-  - name: legacy
-    type: vless
-    server: legacy.example
-    port: 443
-    uuid: eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
-    smux:
-      enabled: false
-  - name: xudp
-    type: vless
-    server: xudp.example
-    port: 443
-    uuid: ffffffff-ffff-4fff-8fff-ffffffffffff
-    packet-encoding: xudp
-    flow: xtls-rprx-vision
-    tls: true
-"#;
-
-    let nodes = parse_clash_subscription(yaml, None).unwrap();
-    assert_eq!(nodes.len(), 6);
-    assert_eq!(
-        nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::H2mux
-    );
-    assert_eq!(
-        nodes[1].vless().unwrap().mode,
-        honk_config::node::WireMode::H2muxPadded
-    );
-    assert_eq!(
-        nodes[2].vless().unwrap().mode,
-        honk_config::node::WireMode::UotV2
-    );
-    assert_eq!(
-        nodes[3].vless().unwrap().mode,
-        honk_config::node::WireMode::UotV2
-    );
-    assert_eq!(
-        nodes[4].vless().unwrap().mode,
-        honk_config::node::WireMode::Legacy
-    );
-    assert_eq!(
-        nodes[5].vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
-    );
-    assert_eq!(
-        nodes[5].vless().unwrap().flow.as_deref(),
-        Some("xtls-rprx-vision")
-    );
-}
-
-#[test]
-fn test_external_vless_mode_representations() {
-    use honk_config::node::WireMode;
-
-    for (options, expected) in [
-        ("{}", WireMode::Legacy),
-        ("packet-encoding: ''", WireMode::Legacy),
-        ("packet_encoding: xudp", WireMode::Xudp),
-        ("xudp: true", WireMode::Xudp),
-        ("xudp: false", WireMode::Legacy),
-        ("udp: true\nxudp: true", WireMode::Xudp),
-        ("udp: true", WireMode::Xudp),
-        ("udp: true\npacket-encoding: ''", WireMode::Xudp),
-        (
-            "multiplex: { enabled: true, protocol: '', padding: false }",
-            WireMode::H2mux,
-        ),
-        (
-            "multiplex: { enabled: true, padding: true }",
-            WireMode::H2muxPadded,
-        ),
-    ] {
-        let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();
-        assert_eq!(
-            parse_vless_external_mode(value.as_mapping().unwrap()).unwrap(),
-            expected,
-            "{options}"
-        );
-    }
-}
-
-#[test]
-fn clash_vless_udp_defaults_to_xudp() {
-    let yaml = r#"proxies:
-  - name: ordinary
-    type: vless
-    server: vless.example
-    port: 443
-    uuid: 11111111-1111-4111-8111-111111111111
-    udp: true
-"#;
-    let nodes = parse_clash_subscription(yaml, None).unwrap();
-    assert_eq!(
-        nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
-    );
-}
-
-#[test]
-fn test_rejects_ambiguous_external_vless_modes() {
-    for options in [
-        "smux: { enabled: true }",
-        "multiplex: { enabled: true, protocol: '' }",
-        "smux: { enabled: true, protocol: smux }",
-        "smux: { enabled: true, protocol: yamux }",
-        "udp-over-tcp: { enabled: true, version: 1 }",
-        "packet-encoding: packetaddr",
-        "packet-encoding: mux-cool",
-        "packet-encoding: unsupported",
-        "packet-addr: true",
-        "mux: true",
-        "mux: { enabled: true }",
-        "packet-encoding: xudp\nxudp: true",
-        "packet-encoding: xudp\npacket_encoding: xudp",
-        "packet-encoding: xudp\nsmux: { enabled: true }",
-        "xudp: true\nudp-over-tcp: true",
-        "smux: { enabled: true, only-tcp: true }",
-        "smux: { enabled: true, brutal: { enabled: true } }",
-        "smux: { enabled: true, brutal-opts: { enabled: true, up: 100 Mbps } }",
-        "smux: { enabled: true, max-connections: 2 }",
-        "smux: { enabled: true, min-streams: 1 }",
-        "smux: { enabled: true, max-streams: 128 }",
-        "smux: { enabled: true }\nudp-over-tcp: true",
-        "udp: false\nxudp: true",
-    ] {
-        let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();
-        let mapping = value.as_mapping().unwrap();
-        assert!(
-            parse_vless_external_mode(mapping).is_err(),
-            "unsupported options must fail: {options}"
-        );
-    }
-}
-
-#[test]
-fn test_clash_import_skips_unsupported_vless_mode() {
-    let yaml = r#"
-proxies:
-  - name: unsupported
-    type: vless
-    server: bad.example
-    port: 443
-    uuid: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
-    packet-encoding: packetaddr
-  - name: unsupported-flow
-    type: vless
-    server: flow.example
-    port: 443
-    uuid: cccccccc-cccc-4ccc-8ccc-cccccccccccc
-    flow: xtls-rprx-vision
-    tls: true
-    smux:
-      enabled: true
-  - name: unsupported-encryption
-    type: vless
-    server: encryption.example
-    port: 443
-    uuid: dddddddd-dddd-4ddd-8ddd-dddddddddddd
-    encryption: mlkem768x25519plus.native.1rtt.key
-    udp-over-tcp: true
-  - name: valid
-    type: vless
-    server: good.example
-    port: 443
-    uuid: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
-    udp-over-tcp: true
-"#;
-    let nodes = parse_clash_subscription(yaml, None).unwrap();
-    assert_eq!(nodes.len(), 1);
-    assert_eq!(nodes[0].name, "valid");
-}
-
-#[test]
 fn test_parse_clash_skips_removed_protocols() {
     // ssr/http/trojan-go support was removed: subscription entries are
     // skipped with a warning instead of failing the whole fetch.
@@ -703,16 +498,16 @@ fn clash_restores_fallback_names_and_lazy_ws_host_precedence() {
 }
 
 #[test]
-fn clash_rejects_legacy_vless_udp_and_nondefault_juicity_windows() {
+fn clash_accepts_explicit_native_vless_udp_and_rejects_nondefault_juicity_windows() {
     let yaml = r#"proxies:
-  - name: legacy-udp
+  - name: native-from-xudp-false
     type: vless
     server: legacy.example
     port: 443
     uuid: 11111111-1111-4111-8111-111111111111
     udp: true
     xudp: false
-  - name: disabled-packet-udp
+  - name: native-from-none
     type: vless
     server: packet.example
     port: 443
@@ -745,14 +540,22 @@ fn clash_rejects_legacy_vless_udp_and_nondefault_juicity_windows() {
     initial-stream-receive-window: 1234
 "#;
     let nodes = parse_clash_subscription(yaml, None).unwrap();
-    assert_eq!(nodes.len(), 2);
-    assert_eq!(nodes[0].name, "disabled-mux");
+    assert_eq!(nodes.len(), 4);
+    assert_eq!(nodes[0].name, "native-from-xudp-false");
     assert_eq!(
-        nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
+        nodes[0].vless().unwrap().udp_encoding,
+        honk_config::node::VlessUdpEncoding::Native
     );
-    assert_eq!(nodes[1].name, "default-window");
-    assert_eq!(nodes[1].juicity().unwrap().quic.mtu, Some(1400));
+    assert_eq!(
+        nodes[1].vless().unwrap().udp_encoding,
+        honk_config::node::VlessUdpEncoding::Native
+    );
+    assert_eq!(
+        nodes[2].vless().unwrap().udp_encoding,
+        honk_config::node::VlessUdpEncoding::Xudp
+    );
+    assert_eq!(nodes[3].name, "default-window");
+    assert_eq!(nodes[3].juicity().unwrap().quic.mtu, Some(1400));
 }
 
 const C07_CLASH_SERVERNAME_ALIASES: &str = r#"proxies:

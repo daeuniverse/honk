@@ -174,7 +174,7 @@ pub(in crate::control) async fn warm_selector_candidate(
         stats.clear_warm(node.id, crate::stats::WarmReason::Selector);
     }
 
-    if descriptor.has_generation_runtime(&node) {
+    if descriptor.supports_warm(&node, honk_outbound::proxy::WarmRequirement::Session) {
         let reporter = group_manager
             .read()
             .feedback_for_node(
@@ -251,15 +251,7 @@ pub(in crate::control) async fn warm_selector_candidate(
                 }
                 return;
             }
-            Ok(stream) if is_tcp_stream_alive(&stream) => stream,
-            Ok(_) => {
-                if let Some(reporter) = &reporter {
-                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
-                        io::ErrorKind::ConnectionAborted,
-                    ));
-                }
-                return;
-            }
+            Ok(stream) => stream,
             Err(error) => {
                 if let Some(reporter) = &reporter {
                     reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
@@ -272,12 +264,18 @@ pub(in crate::control) async fn warm_selector_candidate(
                 return;
             }
         };
-        if let Some(reporter) = &reporter {
-            reporter.setup_succeeded();
-        }
-        connection_pool.deposit_tcp(&addr, stream).await;
-        if let Some(reporter) = &reporter {
-            reporter.finish_setup_only();
+        if connection_pool.deposit_tcp(&addr, stream).await {
+            if let Some(reporter) = &reporter {
+                reporter.setup_succeeded();
+                reporter.finish_setup_only();
+            }
+        } else {
+            if let Some(reporter) = &reporter {
+                reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                    io::ErrorKind::ConnectionAborted,
+                ));
+            }
+            return;
         }
     }
     if connection_pool.has_live_bare_entry(&addr) {
@@ -337,12 +335,11 @@ pub(in crate::control) fn udp_warm_candidates(
                 if !configured_ids.contains(&node.id) {
                     continue;
                 }
-                let Some(runtime) = generation.get(&node.id) else {
+                if generation.get(&node.id).is_none() {
                     continue;
-                };
-                if !runtime.udp_capable
-                    || !honk_outbound::descriptor::descriptor(node.protocol())
-                        .has_generation_runtime(node)
+                }
+                if !honk_outbound::descriptor::descriptor(node.protocol())
+                    .supports_warm(node, honk_outbound::proxy::WarmRequirement::Udp)
                 {
                     continue;
                 }
@@ -532,9 +529,11 @@ impl ControlPlane {
                     let reporter = generation
                         .get(&node_id)
                         .filter(|runtime| {
-                            runtime.udp_capable
-                                && honk_outbound::descriptor::descriptor(runtime.node.protocol())
-                                    .has_generation_runtime(&runtime.node)
+                            honk_outbound::descriptor::descriptor(runtime.node.protocol())
+                                .supports_warm(
+                                    &runtime.node,
+                                    honk_outbound::proxy::WarmRequirement::Udp,
+                                )
                         })
                         .and_then(|_| {
                             group_manager.read().feedback_for_node(
