@@ -1,0 +1,4 @@
+global {
+/* omitted */
+log_file: x
+}

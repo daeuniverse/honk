@@ -143,3 +143,67 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/fuzz/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read pinned fuzz toolchain
+        id: toolchain
+        run: echo "nightly=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.nightly }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fuzz-${{ steps.toolchain.outputs.nightly }}
+          workspaces: fuzz -> target
+          cache-on-failure: true
+      - name: Install clang and pinned cargo-fuzz
+        env:
+          FUZZ_NIGHTLY: ${{ steps.toolchain.outputs.nightly }}
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y clang
+          source .github/ci/pins.env
+          cargo +"$FUZZ_NIGHTLY" install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
+          rustc +"$FUZZ_NIGHTLY" -V | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo +"$FUZZ_NIGHTLY" fuzz --version | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Fuzz parser inputs
+        working-directory: fuzz
+        env:
+          FUZZ_NIGHTLY: ${{ steps.toolchain.outputs.nightly }}
+        run: |
+          set -euo pipefail
+          failed=0
+          # New inputs go to a scratch directory (libFuzzer writes to the first
+          # corpus argument); the committed seeds under fuzz/corpus stay seeds.
+          for target in document share_link lexer; do
+            mkdir -p "$RUNNER_TEMP/fuzz-grown/$target"
+            if cargo +"$FUZZ_NIGHTLY" fuzz run "$target" \
+              "$RUNNER_TEMP/fuzz-grown/$target" "corpus/$target" -- \
+              -jobs=2 -workers=2 -max_total_time=480 -timeout=10 -rss_limit_mb=2048; then
+              echo "- $target: completed the 480-second run" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- $target: failed; inspect fuzz-inputs and the job log" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+          exit "$failed"
+      - name: Upload fuzz findings and corpus
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-inputs
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+            ${{ runner.temp }}/fuzz-grown/
+            fuzz/*.log
+          retention-days: 30
+          if-no-files-found: error

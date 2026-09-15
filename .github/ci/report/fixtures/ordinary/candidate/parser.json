@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "run_id": 101,
+  "run_attempt": 1,
+  "lane": "parser",
+  "matrix": {"target": "x86_64-unknown-linux-gnu", "toolchain": "pinned-stable"},
+  "measured_sha": "776f2f0f",
+  "baseline_sha": null,
+  "units": {"conformance_cases": "cases", "fuzz_replay_inputs": "inputs"},
+  "values": {
+    "conformance_cases": {"value": {"total": 212, "equal": 112, "bounded": 14, "rejected_as_expected": 86}, "unit": "cases", "available": true},
+    "fuzz_replay_inputs": {"value": 7221, "unit": "inputs", "available": true}
+  },
+  "signals": [],
+  "failure": null
+}

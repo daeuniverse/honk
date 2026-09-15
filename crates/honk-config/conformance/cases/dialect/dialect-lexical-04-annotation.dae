@@ -1,0 +1,6 @@
+group {
+proxy {
+filter: name(x) [add_latency: -500ms]
+}
+
+}

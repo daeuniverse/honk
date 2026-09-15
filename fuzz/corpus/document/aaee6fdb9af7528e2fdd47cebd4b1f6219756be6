@@ -1,0 +1,9 @@
+dns {
+routing {
+request {
+qtype(TYPO) -> reject
+}
+
+}
+
+}

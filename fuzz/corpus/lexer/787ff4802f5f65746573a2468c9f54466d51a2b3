@@ -1,0 +1,241 @@
+global {
+    wan_interface: bond0 # 使用 "auto" 自动侦测 WAN 接口。
+    lan_interface: podman0
+    log_level: info
+    dial_mode: domain++
+    allow_insecure: false
+    auto_config_kernel_parameter: true
+    # 运行时状态与相对资源根目录（须为绝对路径；修改后需重启）
+    data_dir: '/var/lib/honk'
+    # 运行日志追加写入 data_dir 下的文件（空值关闭文件输出）
+    log_file: 'honk.log'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
+    check_interval: 300s
+    bootstrap_resolver: '1.1.1.1:53'
+    # 保存成功获取的订阅正文到运行目录 .sub,启动/重载时可离线恢复
+    store_subscribe: true
+    # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
+    nfqueue_enable: true
+
+    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/zh/configuration.md)
+    # 大订阅基线关闭额外 UDP 预热；Selector 选择仍单独保活。
+    udp_warm_node_count: 0
+    # 大订阅诊断基线也关闭启动裸 TCP 预连接。
+    preconnect_node_count: 0
+    # 物理代理连接/握手上限（默认 64；Ready/已热复用和 direct/block 不占额度）
+    # max_concurrent_dials: 64
+}
+
+# 代理节点链
+node {
+    iris-1: 'socks5://10.10.10.1:2077'
+    # Hysteria2 端口跳跃,两种等价写法（mport 参数 / 官方内嵌形式）:
+    # hy2-a: 'hysteria2://pass@example.com:443?mport=20000-30000&mhop=30#hy2-a'
+    # hy2-b: 'hysteria2://pass@example.com:443,20000-30000?mhop=30#hy2-b'
+}
+
+subscription {
+    sub: 'http://sub'(honk/1.0 like)
+    # 需要独立刷新周期时使用块形式；interval: 0 可禁用定期刷新
+    # sub2: {
+    #     url: 'http://sub'
+    #     ua: 'honk/1.0'
+    #     interval: '10000s'
+    # }
+}
+
+# 对于中国大陆域名使用 alidns，其他使用 googledns 查询。
+dns {
+    #ipversion_prefer: 4
+    # 向上游携带 ECS(客户端近似网段),改善 CDN 解析本地性;仅直连拨号注入
+    client_subnet: auto
+    # 独立 DNS 监听器（默认关闭；无认证递归,必须用防火墙限制来源）
+    # bind: 'tcp+udp://:1053'
+    # hosts 快照:true 加入 /etc/hosts,路径加载 OxiDNS 兼容规则文件;可重复
+    # use_host: true
+    upstream {
+        local: 'udp://127.0.0.1:53'
+        remote: 'tcp+udp://dns.google:53'
+        # 上游末尾的 -> tag 强制经指定节点/组拨号
+        # remote_doh: 'https://dns.google/dns-query' -> omg
+    }
+    routing {
+        request {
+            qtype(https) -> reject
+            qname(geosite:gfw) -> remote
+            fallback: local
+        }
+        response {
+            upstream(remote) -> accept
+            qname(geosite:private) -> accept
+            ip(geoip:cn) -> accept
+            fallback: remote
+        }
+    }
+}
+
+# 代理组
+group {
+    # 按订阅 tag 过滤示例：filter: subtag(sub) && !name(keyword: 'ExpireAt-')
+    # 固定节点
+    iris {
+        filter: name('iris-1')
+        policy: fixed(0)
+    }
+
+    # 按地区分组;score 策略基于真实流量按目标自适应选择可靠节点
+    # （无需 tolerance/url 等旋钮;健康检查失败自动排除）
+    hk {
+        filter: name(keyword: '🇭🇰')
+        policy: score
+        final: iris
+    }
+    jp {
+        filter: name(keyword: '🇯🇵')
+        filter: name('tokyo')
+        policy: score
+        final: iris
+    }
+    kr {
+        filter: name(keyword: '🇰🇷')
+        policy: score
+        final: iris
+    }
+    tw {
+        filter: name(keyword: '🇹🇼')
+        policy: score
+        final: iris
+    }
+    sgp {
+        filter: name(keyword: '🇸🇬')
+        policy: score
+        final: iris
+    }
+    us {
+        filter: name(keyword: '🇺🇸')
+        policy: score
+        final: iris
+    }
+
+    # 通用代理（无地区过滤，用于未匹配到具体地区的流量）
+    omg {
+        policy: score
+        final: iris
+    }
+
+    # 嵌套组:子组的策略选择各贡献一个候选,本组在其上再跑一次自己的策略
+    asia {
+        filter: group('hk', 'jp', 'kr', 'tw', 'sgp')
+        policy: score
+        final: iris
+    }
+}
+
+# 路由规则
+# 参考: https://github.com/daeuniverse/dae/blob/main/docs/routing.md
+routing {
+    # ============================================================
+    # must_direct: DNS 服务、代理客户端、系统服务
+    # ============================================================
+    pname(dnsmasq, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    pname(AdGuardHome) -> direct(must)
+    pname(mosdns) -> direct(must)
+    pname(NetworkManager) -> direct(must)
+    pname(systemd-networkd) -> direct(must)
+    pname(systemd-resolved) -> direct(must)
+    pname(dhcpcd) -> direct
+
+    # BT 下载
+    dscp(4) -> direct(must)
+    pname(qbittorrent) -> direct(must)
+
+    # 代理客户端直连（防止回环）
+    pname(iris) -> direct(must)
+    pname(iris-meta) -> direct(must)
+    pname(sing-box) -> direct(must)
+    pname(mihomo) -> direct(must)
+    pname(frpc) -> direct(must)
+    pname(einat) -> direct(must)
+
+    # 虚拟化
+    pname(qemu-system-x86) -> direct(must)
+
+    # 包管理器
+    pname(pacman) -> direct
+
+    sip(10.10.10.24/32) -> direct
+
+    # ============================================================
+    # GeoIP 规则
+    # ============================================================
+    # Broad private must-direct also bypasses LAN private DNS.
+    # Add && !dport(53) yourself if you want that DNS intercepted.
+    dip(geoip: private) -> direct(must)
+    dip(geoip: cn) -> direct(must)
+
+    # ============================================================
+    # 域名直连
+    # ============================================================
+    domain(geosite: private) -> direct
+    domain(geosite: apple-cn) -> direct
+    domain(suffix: apple.com.cn) -> direct
+    domain(geosite: geolocation-cn) -> direct
+    domain(geosite: category-games@cn) -> direct
+    domain(geosite: category-ai-cn) -> direct
+    domain(geosite: onedrive) -> direct
+    domain(geosite: steam@cn) -> direct
+    domain(keyword: m-team) -> direct
+
+    # ============================================================
+    # 域名代理
+    # ============================================================
+    # AI 服务
+    domain(geosite: category-ai-!cn) -> sgp
+
+    # 域名规则（优先级高于 geoip，先匹配域名再回退到 IP）
+    domain(geosite: netflix) -> sgp
+    domain(geosite: category-media, geosite: youtube) -> sgp
+    domain(geosite: bahamut) -> hk
+    domain(geosite: pixiv) -> hk
+    domain(geosite: nintendo) -> hk
+    domain(keyword: paradox) -> hk
+    domain(keyword: wemod) -> hk
+    domain(geosite: category-games) -> hk
+    domain(geosite: google) -> hk
+    domain(geosite: category-dev) -> hk
+
+    # IP 级别路由（domain 规则优先于 IP 规则）
+    dip(geoip: jp) -> jp
+    dip(geoip: telegram) -> sgp
+    # dip(x.x.x.x) -> tw  # 特定 IP 走台湾
+
+    # Google
+    domain(geosite: google) -> hk
+
+    # ============================================================
+    # 通用端口代理（未命中具体规则时走 omg）
+    # ============================================================
+    dport(22, 80, 443, 8080, 6443, 9090) -> omg
+
+    # ============================================================
+    # fallback
+    # ============================================================
+    fallback: direct
+}
+
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'
+        external_ui: 'yacd'
+        secret: ''
+        default_mode: 'Rule'
+    }
+    cache_file {
+        enabled: true
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false
+    }
+}

@@ -1,0 +1,3 @@
+routing {
+!geosite:cn -> proxy
+}

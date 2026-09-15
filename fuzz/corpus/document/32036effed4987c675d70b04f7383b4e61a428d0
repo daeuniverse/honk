@@ -1,0 +1,3 @@
+dns {
+use_host: /tmp/a#b
+}

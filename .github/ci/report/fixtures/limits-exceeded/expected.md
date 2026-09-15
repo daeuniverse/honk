@@ -1,4 +1,4 @@
-⚠️ **CI report** aaaabbbb vs `main` ccccdddd: 2 limits exceeded (eBPF VM not run: `ci:ebpf`; full lanes not run: `ci:full`)
+⚠️ **CI report** aaaabbbb vs `main` ccccdddd: 2 limits exceeded (eBPF VM not run: `ci:ebpf`; parser lane not run: `ci:full`; full lanes not run: `ci:full`)
 
 - **`honk-core` peak memory in the smoke 33 MB**, limit 24 MB (`main` 20 MB)
 - **slowest test 61 s**, limit 60 s (`slow::case`, `main` 50 s)

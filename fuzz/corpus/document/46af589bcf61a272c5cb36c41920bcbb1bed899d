@@ -1,0 +1,12 @@
+dns {
+    upstream {
+    }
+    routing {
+        request {
+            fallback: reject
+        }
+        response {
+            fallback: accept
+        }
+    }
+}

@@ -1,0 +1,3 @@
+subscription {
+'paid:https://example.com/sub'
+}

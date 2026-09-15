@@ -1,0 +1,11 @@
+dns {
+  routing {
+    response {
+      qname('a # b') -> accept
+      fallback: accept
+    }
+  }
+}
+routing {
+  fallback: direct
+}

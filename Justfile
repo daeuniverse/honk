@@ -89,6 +89,29 @@ test-core:
 test-config:
     cargo test -p honk-config
 
+
+# Compare with the pinned dae parser (Go 1.26+, Python 3.11+, network).
+parser-ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    (cd tools/dae-parse && go build -o "$work/dae-parse" .)
+    python3 tools/dae-parse/fetch.py "$work/conformance-src"
+    DAE_PARSE_BIN="$work/dae-parse" CONFORMANCE_SRC="$work/conformance-src" \
+      cargo test -p honk-config --features conformance --test conformance -- --nocapture
+    just fuzz-replay
+
+# Replay saved inputs with stable Rust; no Go or nightly required.
+fuzz-replay:
+    env -u DAE_PARSE_BIN cargo test -p honk-config --features fuzz-checks --test fuzz_replay -- --nocapture
+
+# Fuzz one parser target for a while (needs the eBPF nightly and cargo-fuzz);
+# grown inputs go under fuzz/target, the committed seeds stay seeds.
+fuzz target seconds="60":
+    mkdir -p fuzz/target/grown/{{target}}
+    cd fuzz && cargo +{{ebpf_toolchain}} fuzz run {{target}} target/grown/{{target}} corpus/{{target}} -- -max_total_time={{seconds}} -timeout=10
+
 # Run eBPF common tests
 test-ebpf:
     cargo test -p honk-ebpf-common

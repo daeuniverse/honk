@@ -1,0 +1,1 @@
+vmess://{standard_authority}?tls=1&peer=sni.example.com&obfs=websocket&path=%2Fvmess-ws&obfsParam=cdn.example.com&tls=1

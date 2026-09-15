@@ -1,0 +1,6 @@
+dns {
+upstream {
+u: 'udp://1.1.1.1:53' outbound: proxy
+}
+
+}

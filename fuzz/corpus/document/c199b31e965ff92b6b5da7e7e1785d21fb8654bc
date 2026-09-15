@@ -1,0 +1,11 @@
+global {
+    check_tolerance: secret-duration
+}
+node {
+    broken: 'vmess://!secret-link'
+}
+experimental {
+    udp_nfqueue {
+        enabled: false
+    }
+}

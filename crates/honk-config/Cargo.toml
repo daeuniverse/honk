@@ -5,6 +5,22 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+conformance = []
+fuzz-checks = []
+
+[[test]]
+name = "conformance"
+required-features = ["conformance"]
+
+[[test]]
+name = "fuzz_replay"
+required-features = ["fuzz-checks"]
+
+[[example]]
+name = "project"
+required-features = ["conformance"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

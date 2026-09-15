@@ -1,0 +1,3 @@
+dns {
+client_subnet: auto(9.9.9.9)
+}

@@ -25,10 +25,12 @@ reload::transaction: persist callback installed before publication (reload_rebas
 </details>
 
 **Measurements**
-<details><summary>10 metrics, 2 over limit</summary>
+<details><summary>12 metrics, 2 over limit</summary>
 
 | | This PR | `main` | Change | Limit |
 |---|---|---|---|---|
+| Parser conformance | 212 cases: 112 equal, 14 bounded, 86 rejected as expected | — | — | no unrecorded differences |
+| Parser fuzz replay | 7221 inputs | no baseline | — | all inputs pass |
 | `honk-core` peak memory in the smoke | **41 MB** | 20 MB | +21 MB | 24 MB |
 | `honk-core` release binary | 19.5 MB | 19 MB | +0.5 MB | 20.9 MB |
 | Slowest test | **61 s** | 58 s | +3 s | 60 s |

@@ -1,0 +1,9 @@
+dns {
+routing {
+request {
+qname(a) -> proxy->backup
+}
+
+}
+
+}

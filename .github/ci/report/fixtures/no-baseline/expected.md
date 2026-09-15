@@ -1,4 +1,4 @@
-✅ **CI report** 5555aaaa vs `main` (no baseline): no limits exceeded (eBPF VM not run: `ci:ebpf`; full lanes not run: `ci:full`)
+✅ **CI report** 5555aaaa vs `main` (no baseline): no limits exceeded (eBPF VM not run: `ci:ebpf`; parser lane not run: `ci:full`; full lanes not run: `ci:full`)
 
 **Tests**
 <details><summary>2 tests, 1 ignored, no baseline</summary>

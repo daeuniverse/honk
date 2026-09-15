@@ -1,0 +1,4 @@
+global {
+    lan_interface: 'eth0', 'eth1'
+    tcp_check_url: 'https://one.example/a,https://two.example/b'
+}

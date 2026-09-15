@@ -1,0 +1,13 @@
+dns {
+    upstream {
+        zeta: 'udp://192.0.2.3:53'
+        default: 'udp://192.0.2.1:53'
+        alpha: 'udp://192.0.2.2:53'
+    }
+    routing {
+        request {
+            qname(full: valid.example) -> default
+            fallback: missing
+        }
+    }
+}

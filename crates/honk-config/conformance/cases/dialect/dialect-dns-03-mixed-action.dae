@@ -1,0 +1,12 @@
+dns {
+upstream {
+MixedCase: 'udp://1.1.1.1:53'
+}
+routing {
+request {
+qname(a) -> MixedCase
+}
+
+}
+
+}

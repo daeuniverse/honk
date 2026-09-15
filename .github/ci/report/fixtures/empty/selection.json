@@ -8,7 +8,8 @@
   "filters": {
     "code": "true",
     "docs": "true",
-    "ebpf": "true"
+    "ebpf": "true",
+    "parser": "false"
   },
   "filter_outcome": "success",
   "intended_lanes": [

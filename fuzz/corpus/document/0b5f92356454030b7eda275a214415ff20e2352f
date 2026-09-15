@@ -1,0 +1,8 @@
+dns {
+    use_host: true
+    use_host: /tmp/a#b
+    use_host: 'agent # build'
+    use_host: /tmp/don't
+    use_host: false
+    use_host: true
+}

@@ -1,0 +1,6 @@
+dns {
+fixed_domain_ttl {
+x: 60#note
+}
+
+}

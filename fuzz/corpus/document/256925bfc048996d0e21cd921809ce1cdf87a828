@@ -1,0 +1,8 @@
+subscription {
+  wrapper {
+    a: 'http://example.test/sub'
+  }
+}
+routing {
+  fallback: direct
+}

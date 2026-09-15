@@ -1,0 +1,6 @@
+global {
+future {
+log_file: ignored
+}
+
+}

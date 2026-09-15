@@ -1,0 +1,136 @@
+# honk 示例配置（dae 语法）
+#
+# 说明文档：doc/zh/configuration.md（配置指南）、doc/README.md（设计与字段参考索引）
+# 最小示例见 config.min.dae；生产向完整示例见 config.dae。
+
+global {
+    # WAN 接口可填 auto 自动侦测；LAN 接口通常是网桥或其从接口。
+    wan_interface: auto
+    lan_interface: eth0
+
+    log_level: info
+    tproxy_port: 12345
+    # 拨号模式：ip / domain / domain+ / domain++
+    dial_mode: domain
+    allow_insecure: false
+    auto_config_kernel_parameter: true
+    # 运行时状态与相对资源根目录（默认 /var/share/honk，须为绝对路径）
+    data_dir: '/var/share/honk'
+    # 相对日志路径在 data_dir 下解析；留空则只输出到控制台。
+    log_file: 'honk.log'
+    # 保存成功获取的订阅正文到运行目录 .sub（默认开启）
+    store_subscribe: true
+    # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
+    nfqueue_enable: true
+
+    # 健康检查：TCP 用 HTTPS 探测，UDP 用 DNS 探测（经节点自身隧道）
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
+    check_interval: 30s
+    # 新节点延迟 <= 旧节点延迟 - tolerance 才切换
+    check_tolerance: 50ms
+    # 预热与拨号预算（详细语义见 doc/zh/configuration.md）：
+    # - 健康探测只测不暖:探测不会给冷节点留下常驻会话,无需担心节点多。
+    # - UDP 预热：每组每 IP 族 top-N 个 UDP 叶子预建会话（单组封顶 3，
+    #   进程总量封顶 4×N；大订阅建议 N=1-3）。
+    # udp_warm_node_count: 3
+    # - 启动裸 TCP 预连接:'auto'(默认,最多 8 个,各组当前选中优先)
+    #   / 0(关闭) / N;AnyTLS/QUIC 与内置 direct/block 自动排除。
+    # preconnect_node_count: 'auto'
+    # 物理代理连接/握手并发上限（默认 64；Ready/已热复用及 direct/block 不占额度）
+    # max_concurrent_dials: 64
+}
+
+# 订阅（可选）：节点只合并进内存、不回写本文件；原始正文默认缓存到 .sub
+# subscription {
+#     mysub: 'https://example.com/subscription'
+# }
+
+# 节点：必须为「标签: '分享链接'」形式（不带标签的裸链接会被忽略）
+node {
+    home-socks5: 'socks5://user:pass@gw.example.com:1080'
+    ss-node: 'ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@ss.example.com:8388'
+    trojan-ws: 'trojan://secret@trojan.example.com:443?sni=trojan.example.com&type=ws&path=%2Fws&host=trojan.example.com'
+    hy2-node: 'hysteria2://secret@hy2.example.com:443?sni=hy2.example.com'
+}
+
+# 分组
+group {
+    # 也可按 subscription 中冒号左侧的 tag 过滤:
+    # filter: subtag(mysub) && !name(keyword: 'ExpireAt-')
+    # 固定使用组内第一个节点
+    manual {
+        filter: name('home-socks5')
+        policy: fixed(0)
+    }
+
+    # 按延迟自动选择；无存活节点时回退到 manual 组
+    auto {
+        filter: name(keyword: 'node')
+        policy: min_moving_avg
+        final: manual
+    }
+}
+
+dns {
+    # 省略 bind，只保留透明 :53，避免额外暴露无认证的递归监听器。
+    ipversion_prefer: 4
+    use_host: true
+    # 自动推断直连公网路径的 /24；代理上游不会携带生成的 ECS。
+    client_subnet: auto
+    upstream {
+        # 固定 IP 避免 bootstrap 依赖；显式 direct 让国内 CDN 使用直连 ECS。
+        alidns: 'https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com' -> direct
+        # 境外解析使用可代理的 DoH；DoQ/DoH3 当前仍只能直连。
+        googledns: 'https://8.8.8.8/dns-query?tls_server_name=dns.google' -> auto
+    }
+    routing {
+        request {
+            # 已知污染域名直接走代理，其余先取更接近直连出口的应答。
+            qname(geosite: gfw) -> googledns
+            fallback: alidns
+        }
+        response {
+            upstream(googledns) -> accept
+            qname(geosite: private) -> accept
+            ip(geoip: cn) -> accept
+            fallback: googledns
+        }
+    }
+}
+
+routing {
+    # 本机 DNS/系统服务直连，防止回环
+    pname(dnsmasq, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    pname(sing-box, mihomo) -> direct(must)
+
+    # 私有与国内 IP 直连
+    # 宽泛私网 must 也会绕过 LAN 私网 DNS；需保留接管时显式加上 && !dport(53)。
+    dip(geoip: private) -> direct(must)
+    dip(geoip: cn) -> direct
+
+    # 域名规则（先于 IP 规则匹配）
+    domain(geosite: geolocation-cn) -> direct
+    domain(suffix: internal.example.com) -> direct
+    domain(geosite: google) -> auto
+
+    # 其余流量
+    fallback: manual
+}
+
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'
+        external_ui: 'ui'
+        secret: ''
+        default_mode: 'Rule'
+    }
+    cache_file {
+        enabled: true
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false
+        store_dns: false
+    }
+}

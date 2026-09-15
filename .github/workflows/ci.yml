@@ -38,6 +38,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       docs: ${{ steps.filter.outputs.docs }}
       ebpf: ${{ steps.filter.outputs.ebpf }}
+      parser: ${{ steps.filter.outputs.parser }}
       full: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
       ebpf_label: ${{ contains(github.event.pull_request.labels.*.name, 'ci:ebpf') }}
     steps:
@@ -48,6 +49,8 @@ jobs:
           filters: |
             code:
               - 'crates/**'
+              - 'tools/dae-parse/**'
+              - 'fuzz/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'config.dae'
@@ -64,6 +67,22 @@ jobs:
               - '*.md'
               - '.agents/**'
               - 'doc/**'
+            parser:
+              - 'crates/honk-config/**'
+              - 'tools/dae-parse/**'
+              - 'fuzz/**'
+              - 'doc/en/reference/dialect.md'
+              - 'doc/zh/reference/dialect.md'
+              - 'example.dae'
+              - 'config.dae'
+              - 'config.min.dae'
+              - 'doc/**/*.md'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/ci/pins.env'
+              - 'Justfile'
+              - '.github/workflows/ci.yml'
             ebpf:
               - 'crates/honk-ebpf*/**'
               - 'crates/honk-core/src/ebpf/**'
@@ -95,11 +114,13 @@ jobs:
             const failed = pr && process.env.FILTER_OUTCOME !== "success";
             const full = labels.includes("ci:full");
             const code = !pr || failed || filters.code === "true" || full;
+            const parser = !pr || failed || filters.parser === "true" || full;
             const floor = push || (dispatch && (inputs.ebpf || inputs.full)) ||
               (pr && (failed || filters.ebpf === "true" || labels.includes("ci:ebpf") || full));
             const docs = !pr || failed || filters.code === "true" || filters.docs === "true" || full;
             const lanes = ["changes"];
             if (code) lanes.push("lint", "test", "smoke", "ebpf-check");
+            if (parser) lanes.push("parser");
             if (floor) lanes.push("ebpf");
             const heavy = push || (dispatch && inputs.full) || (pr && (failed || full));
             if (heavy) lanes.push("ebpf-recent", "aarch64", "features", "cross-musl");
@@ -108,7 +129,7 @@ jobs:
             fs.mkdirSync("target/ci-report", { recursive: true });
             fs.writeFileSync("target/ci-report/selection.json", JSON.stringify({
               event: context.eventName, inputs, labels,
-              filters: { code: filters.code ?? null, docs: filters.docs ?? null, ebpf: filters.ebpf ?? null },
+              filters: { code: filters.code ?? null, docs: filters.docs ?? null, ebpf: filters.ebpf ?? null, parser: filters.parser ?? null },
               filter_outcome: process.env.FILTER_OUTCOME,
               intended_lanes: lanes, run_id: context.runId, run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
             }, null, 2) + "\n");
@@ -118,6 +139,108 @@ jobs:
         with:
           name: ci-report-selection
           path: target/ci-report/selection.json
+          retention-days: 30
+          if-no-files-found: error
+
+  parser:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.parser == 'true' || needs.changes.outputs.full == 'true') }}
+    name: dae-config parser (conformance + fuzz replay)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: parser
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: tools/dae-parse/go.mod
+          cache-dependency-path: tools/dae-parse/go.sum
+      - name: Build dae oracle
+        working-directory: tools/dae-parse
+        run: |
+          go build -o "$RUNNER_TEMP/dae-parse" .
+          "$RUNNER_TEMP/dae-parse" -version
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/conformance-src
+          key: conformance-src-${{ hashFiles('crates/honk-config/conformance/manifest.toml') }}
+      - name: Fetch and verify pinned dae sources
+        run: python3 tools/dae-parse/fetch.py "$RUNNER_TEMP/conformance-src"
+      - name: Compare parser conformance
+        env:
+          DAE_PARSE_BIN: ${{ runner.temp }}/dae-parse
+          CONFORMANCE_SRC: ${{ runner.temp }}/conformance-src
+          CONFORMANCE_RESULT: ${{ runner.temp }}/conformance-result.json
+        run: cargo test -p honk-config --features conformance --test conformance -- --nocapture
+      - name: Replay saved inputs on stable
+        if: ${{ !cancelled() }}
+        env:
+          FUZZ_REPLAY_RESULT: ${{ runner.temp }}/fuzz-replay-result.json
+        run: env -u DAE_PARSE_BIN cargo test -p honk-config --features fuzz-checks --test fuzz_replay -- --nocapture
+      - name: Write parser CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const read = name => {
+              try { return JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/${name}.json`, "utf8")); }
+              catch { return null; }
+            };
+            const conformance = read("conformance-result");
+            const replay = read("fuzz-replay-result");
+            const bounded = text => Buffer.from(String(text).replace(/```/g, "'''")).subarray(0, 280).toString("utf8");
+            const counts = conformance && Object.fromEntries(
+              ["total", "equal", "bounded", "rejected_as_expected"].map(key => [key, conformance[key]]));
+            let failure = null;
+            if (conformance?.failure) {
+              failure = {summary: bounded(`parser case ${conformance.failure.case}`),
+                detail_lines: [bounded(conformance.failure.path), bounded(conformance.failure.detail)]};
+            } else if (replay?.failure) {
+              failure = {summary: "parser fuzz replay failed",
+                detail_lines: [bounded(replay.failure.path), bounded(replay.failure.detail)]};
+            } else if (!conformance || !replay) {
+              failure = {summary: "parser lane missing conformance or replay results; see job steps", detail_lines: []};
+            } else if (process.env.JOB_STATUS !== "success") {
+              failure = {summary: bounded(`parser lane ${process.env.JOB_STATUS}; see job steps`), detail_lines: []};
+            }
+            const observation = (value, unit, reason) => value === null
+              ? {value: null, unit, available: false, reason}
+              : {value, unit, available: true};
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            fs.writeFileSync("target/ci-report/parser.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "parser",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null,
+              units: {conformance_cases: "cases", fuzz_replay_inputs: "inputs"},
+              values: {
+                conformance_cases: observation(counts, "cases", "conformance did not produce a result"),
+                fuzz_replay_inputs: observation(replay?.inputs ?? null, "inputs", "replay did not produce a result"),
+              },
+              signals: [], failure,
+            }, null, 2) + "\n");
+            if (failure) core.setFailed(failure.summary);
+      - name: Upload parser CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-parser
+          path: target/ci-report/parser.json
           retention-days: 30
           if-no-files-found: error
 

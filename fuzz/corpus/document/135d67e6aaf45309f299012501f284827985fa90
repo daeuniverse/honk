@@ -1,0 +1,10 @@
+global {
+    disable_waiting_network: t
+    auto_config_kernel_parameter: y
+    store_subscribe: f
+    allow_insecure: n
+    tls_fragment: t
+    mptcp: y
+    so_mark_from_dae: 08000000
+    check_interval: 2
+}

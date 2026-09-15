@@ -1,0 +1,1 @@
+vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&type=ws&path=%2Fvless-ws&host=cdn.example&sni=cdn.example#n

@@ -1,0 +1,13 @@
+dns {
+    routing {
+        request {
+            sub('PRIVATE_PROVIDER_NAME') -> default
+        }
+        response {
+            sub('PRIVATE_RESPONSE_NAME') -> accept
+        }
+    }
+}
+node {
+    mux: PRIVATE_SECRET
+}

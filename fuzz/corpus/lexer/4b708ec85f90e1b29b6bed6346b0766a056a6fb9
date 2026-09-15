@@ -1,0 +1,12 @@
+dns {
+    routing {
+        request {
+            sub('PRIVATE_PROVIDER_NAME') && qname(full:example.test) -> alidns
+            qtype(a) -> reject
+        }
+        response {
+            qname(suffix:example.test) && node('PRIVATE_NODE_NAME') -> accept
+            upstream(googledns) -> reject
+        }
+    }
+}

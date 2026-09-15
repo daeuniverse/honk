@@ -1,0 +1,2 @@
+global { log_file:'honk.log' }
+node { a:'socks5://127.0.0.1:1080' }

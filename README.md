@@ -79,3 +79,5 @@ These checkboxes indicate maintainer review status, not feature availability:
 SPDX-License-Identifier: GPL-3.0-only
 Copyright (c) 2025, glassyiris <honk@catmint.cc> and honk contributors
 ```
+
+The development-only test oracle under `tools/dae-parse/` links dae (AGPL-3.0-only); its `README.md` states that boundary. It is never shipped.

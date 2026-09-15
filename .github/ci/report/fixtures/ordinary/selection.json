@@ -5,12 +5,14 @@
   "filters": {
     "code": "true",
     "docs": "true",
-    "ebpf": "false"
+    "ebpf": "false",
+    "parser": "true"
   },
   "filter_outcome": "success",
   "intended_lanes": [
     "changes",
     "test",
+    "parser",
     "smoke",
     "docs"
   ],

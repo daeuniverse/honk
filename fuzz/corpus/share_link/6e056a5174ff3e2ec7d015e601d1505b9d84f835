@@ -1,0 +1,1 @@
+hysteria2://secret@example.com:8443?sni=tls.example&insecure=1#edge

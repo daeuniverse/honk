@@ -1,0 +1,10 @@
+dns {
+routing {
+request {
+qname(
+a.example) -> reject
+}
+
+}
+
+}

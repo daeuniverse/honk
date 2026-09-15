@@ -1,0 +1,3 @@
+global {
+check_tolerance: 1.5s
+}

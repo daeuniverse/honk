@@ -1,0 +1,6 @@
+subscription {
+    'paid # east': 'https://example.com/sub#token #data'('agent # build')
+}
+routing {
+    fallback: direct
+}

@@ -8,13 +8,13 @@ use crate::routing::{RoutingCondition, RoutingConfig, RoutingRule};
 
 /// A window over physical source pieces, including gaps owned by comments.
 #[derive(Clone, Copy)]
-struct Expression<'p, 'd, 'a> {
+pub(super) struct Expression<'p, 'd, 'a> {
     pieces: &'p [Text<'d, 'a>],
-    span: Span,
+    pub(super) span: Span,
 }
 
 impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
-    fn new(pieces: &'p [Text<'d, 'a>]) -> Self {
+    pub(super) fn new(pieces: &'p [Text<'d, 'a>]) -> Self {
         Self {
             pieces,
             span: Span {
@@ -24,7 +24,7 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         }
     }
 
-    fn sub(self, start: usize, end: usize) -> Self {
+    pub(super) fn sub(self, start: usize, end: usize) -> Self {
         let first = self.pieces.partition_point(|piece| piece.span.end <= start);
         let last = if start == end {
             first
@@ -49,7 +49,7 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         })
     }
 
-    fn trim(self) -> Self {
+    pub(super) fn trim(self) -> Self {
         let mut parts = self
             .parts()
             .map(Text::trim)
@@ -62,22 +62,22 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         }
     }
 
-    fn is_empty(self) -> bool {
+    pub(super) fn is_empty(self) -> bool {
         self.span.start == self.span.end
     }
 
-    fn starts_with(self, prefix: &str) -> bool {
+    pub(super) fn starts_with(self, prefix: &str) -> bool {
         self.parts()
             .next()
             .is_some_and(|part| part.raw().starts_with(prefix))
     }
 
-    fn find(self, delimiter: &str) -> Option<usize> {
+    pub(super) fn find(self, delimiter: &str) -> Option<usize> {
         self.parts()
             .find_map(|part| part.find(delimiter).map(|offset| part.span.start + offset))
     }
 
-    fn split<'s>(self, delimiter: &'s str) -> impl Iterator<Item = Self> + 's
+    pub(super) fn split<'s>(self, delimiter: &'s str) -> impl Iterator<Item = Self> + 's
     where
         'p: 's,
         'd: 's,
@@ -102,7 +102,7 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         })
     }
 
-    fn parentheses(self) -> impl Iterator<Item = (usize, u8)> + 'p
+    pub(super) fn parentheses(self) -> impl Iterator<Item = (usize, u8)> + 'p
     where
         'd: 'p,
     {
@@ -126,7 +126,7 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         output
     }
 
-    fn unquote(self) -> Self {
+    pub(super) fn unquote(self) -> Self {
         let text = self.trim();
         let mut parts = text.parts();
         match (parts.next(), parts.next()) {
@@ -138,7 +138,7 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         }
     }
 
-    fn value(self) -> std::borrow::Cow<'d, str> {
+    pub(super) fn value(self) -> std::borrow::Cow<'d, str> {
         let mut parts = self.parts();
         match (parts.next(), parts.next()) {
             (Some(part), None) => std::borrow::Cow::Borrowed(part.raw()),

@@ -1,0 +1,16 @@
+dns {
+    upstream {
+        default: 'udp://192.0.2.1:53'
+        alidns: 'udp://192.0.2.2:53'
+    }
+    routing {
+        request {
+            qname(full: ali.example) -> AliDNS
+            fallback: default
+        }
+        response {
+            qname(full: ali.example) -> AliDNS
+            fallback: alidns
+        }
+    }
+}

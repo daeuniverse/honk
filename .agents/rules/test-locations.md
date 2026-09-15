@@ -20,6 +20,7 @@ Read with: `AGENTS.md` (Testing instructions); `real-ebpf.md` for the root-gated
     - `crates/honk-config/tests/include.rs` — file-based dae include loading (glob order, nested paths, merge semantics, cycles, directory boundaries, and preservation of policy errors).
     - `crates/honk-config/tests/dns_validation.rs` — named upstream references, original diagnostic paths, complete rule traversal, and shared effective-request precedence.
     - `crates/honk-config/tests/share_link.rs` — share-link parsing + config format round-trips.
+    - `crates/honk-config/tests/conformance.rs` requires `conformance`; it compares manifest inputs with the pinned dae oracle when `DAE_PARSE_BIN` is set. The `project` example requires the same feature. `tests/fuzz_replay.rs` requires `fuzz-checks` and replays `fuzz/corpus/<target>/` and `fuzz/artifacts/<target>/` through the shared library assertions on stable Rust. The independent `fuzz/` workspace supplies the nightly libFuzzer targets.
 - Runtime and transport:
     - `crates/honk-nfqueue/src/*` — NFQA parsing, netlink/nft encoding, exactly-once verdicts; the ignored `kernel_tests.rs` contract exercises the production queue/table in an isolated real netns.
     - `crates/honk-outbound/src/group/tests.rs`, `group/tests/udp_selection.rs`, and `group/score/tests/` — selection semantics (Selector/URLTest/LoadBalance/Fallback/Score, nested groups, UDP exclusion), target attribution, decay and metric qualification, deterministic exploration, reporter lifecycle, reload sharing, and LRU safety.

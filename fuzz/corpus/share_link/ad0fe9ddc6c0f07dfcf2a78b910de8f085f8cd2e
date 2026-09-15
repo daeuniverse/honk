@@ -1,0 +1,1 @@
+vless://{authority}?tls=1&xtls=0&peer=tls.example&{alias}#edge

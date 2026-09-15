@@ -1,0 +1,3 @@
+subscription {
+a: 'https://example.com/sub'(agent{})
+}

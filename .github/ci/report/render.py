@@ -32,6 +32,8 @@ METRIC_UNITS = {
     "reload_benchmark": "ratios",
     "toolchain": "rustc-cache",
     "vm_environment": "kernel-accelerator",
+    "conformance_cases": "cases",
+    "fuzz_replay_inputs": "inputs",
     # The agreed ordinary layout fixture predates stage 1. No stage-1 producer emits this.
     "ebpf_instructions": "instructions",
 }
@@ -47,6 +49,7 @@ SIGNAL_KINDS = {
 SELECTION_JOBS = {
     "lint": "fmt + clippy",
     "test": "cargo nextest (workspace)",
+    "parser": "dae-config parser (conformance + fuzz replay)",
     "smoke": "DNS smoke (release honk-core)",
     "ebpf-check": "eBPF feature compile guard",
     "ebpf": "eBPF object + real VM kernel tests",
@@ -66,6 +69,7 @@ REPORT_JOBS = {
 POLICY_GROUPS = (
     ({"lint", "test", "smoke", "ebpf-check"}, "code lanes not run: `ci:full`"),
     ({"ebpf"}, "eBPF VM not run: `ci:ebpf`"),
+    ({"parser"}, "parser lane not run: `ci:full`"),
     (
         {"ebpf-recent", "aarch64", "features", "cross-musl"},
         "full lanes not run: `ci:full`",
@@ -262,8 +266,8 @@ def validate_selection(raw: Any, provenance: set[tuple[int, int, str]], head_sha
         "selection.labels must be a string array",
     )
     require(
-        isinstance(raw["filters"], dict) and set(raw["filters"]) == {"code", "docs", "ebpf"},
-        "selection.filters must contain the three path filters",
+        isinstance(raw["filters"], dict) and set(raw["filters"]) == {"code", "docs", "ebpf", "parser"},
+        "selection.filters must contain the four path filters",
     )
     require_string(raw["filter_outcome"], "selection.filter_outcome", 40)
     lanes = raw["intended_lanes"]
@@ -396,6 +400,32 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
     old_test = matching_baseline(test, baseline) if test is not None else None
     smoke = reports.get("smoke")
     old_smoke = matching_baseline(smoke, baseline) if smoke is not None else None
+    parser = reports.get("parser")
+    old_parser = matching_baseline(parser, baseline) if parser is not None else None
+    cases = metric(parser, "conformance_cases")
+    if cases is not None:
+        fields = ("total", "equal", "bounded", "rejected_as_expected")
+        require(isinstance(cases, dict) and set(cases) == set(fields), "invalid conformance counts")
+        counts = {field: require_integer(cases[field], f"conformance {field}") for field in fields}
+        require(sum(counts[field] for field in fields[1:]) <= counts["total"], "conformance counts exceed total")
+        rows.append([
+            "Parser conformance",
+            f"{counts['total']} cases: {counts['equal']} equal, {counts['bounded']} bounded, "
+            f"{counts['rejected_as_expected']} rejected as expected",
+            "—", "—", "no unrecorded differences",
+        ])
+    replay = metric(parser, "fuzz_replay_inputs")
+    if replay is not None:
+        count = require_integer(replay, "fuzz replay inputs")
+        old_replay = metric(old_parser, "fuzz_replay_inputs")
+        old_count = require_integer(old_replay, "baseline fuzz replay inputs") if old_replay is not None else None
+        rows.append([
+            "Parser fuzz replay", f"{count} inputs",
+            f"{old_count} inputs" if old_count is not None else "no baseline",
+            f"{count - old_count:+}" if old_count is not None and count != old_count else "—",
+            "all inputs pass",
+        ])
+
 
     # The smoke runs the release binary; the cap is sized for that profile.
     memory = metric(smoke, "smoke_memory")

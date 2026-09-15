@@ -79,3 +79,5 @@ VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-c
 SPDX-License-Identifier: GPL-3.0-only
 Copyright (c) 2025, glassyiris <honk@catmint.cc> and honk contributors
 ```
+
+`tools/dae-parse/` 下仅用于开发的测试 oracle 链接了 dae（AGPL-3.0-only），边界见该目录的 `README.md`。它不随发布物分发。

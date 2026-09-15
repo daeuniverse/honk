@@ -1,0 +1,2 @@
+global { log_file: /tmp/x 'piece'(part)tail }
+routing { fallback: direct }

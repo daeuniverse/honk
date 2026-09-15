@@ -1,0 +1,5 @@
+dns {
+    upstream {
+        alidns: 'udp://192.0.2.1:53'
+    }
+}

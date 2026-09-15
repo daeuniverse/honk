@@ -1,0 +1,3 @@
+routing {
+dip(2001:db8::/32) -> direct
+}

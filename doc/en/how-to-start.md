@@ -360,3 +360,9 @@ cargo run --release -p honk-core -- \
 - [DNS configuration](reference/dns.md)
 - [CLI](reference/cli.md)
 - [Architecture overview](design/overview.md)
+
+## Check parser changes
+
+From the repository root, run `just parser-ci` with the pinned stable Rust compiler, Go 1.26 or newer, Python 3.11 or newer, and network access. How to write a case is in `crates/honk-config/conformance/README.md`; the oracle and its licence are described in `tools/dae-parse/README.md`. It builds the pinned dae oracle, fetches upstream examples with manifest SHA256 checks, compares decoded structure and recorded dialect differences, then replays saved fuzz inputs. `just fuzz-replay` needs only stable Rust after Cargo dependencies are cached; it uses the same assertions as the fuzz targets. A replay failure prints the input path, and a hung input fails after five seconds.
+
+The `parser` CI lane runs for config code, the oracle, fuzz inputs, corpus source documents and their build inputs, or with `ci:full`. Ordinary workspace commands do not enable `conformance` or `fuzz-checks` and need neither Go nor nightly. The weekly job uses the nightly channel in `crates/honk-ebpf/rust-toolchain.toml` and cargo-fuzz pinned in `.github/ci/pins.env`. It runs `document`, `share_link`, and `lexer` for 480 seconds each with two workers and uploads findings and corpus files. Add a retained finding under `fuzz/artifacts/<target>/` to replay it on stable. Sanitizer-only findings still require the nightly fuzz target.

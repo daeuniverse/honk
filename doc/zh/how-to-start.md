@@ -360,3 +360,9 @@ cargo run --release -p honk-core -- \
 - [DNS 配置](reference/dns.md)
 - [CLI](reference/cli.md)
 - [架构概览](design/overview.md)
+
+## 检查解析器改动
+
+在仓库根目录执行 `just parser-ci`，需要固定版本的 stable Rust、Go 1.26 或更新、Python 3.11 或更新，以及网络。它会构建固定版本的 dae oracle，按 manifest 里的 SHA-256 拉取上游示例，比较解码后的结构与已记录的方言差异，然后重放保存的 fuzz 输入。`just fuzz-replay` 只需要 stable Rust（Cargo 依赖已缓存时），使用与 fuzz target 相同的断言；重放失败会打印输入路径，输入卡住则在五秒后失败。案例写法见 `crates/honk-config/conformance/README.md`，oracle 及其许可证见 `tools/dae-parse/README.md`。
+
+`parser` CI lane 在配置代码、oracle、fuzz 输入、语料来源文档及其构建输入改动时执行，也随 `ci:full` 执行。普通的工作区命令不会启用 `conformance` 或 `fuzz-checks`，既不需要 Go 也不需要 nightly。每周任务使用 `crates/honk-ebpf/rust-toolchain.toml` 里的 nightly 通道和 `.github/ci/pins.env` 里固定版本的 cargo-fuzz，对 `document`、`share_link`、`lexer` 各执行 480 秒、两个 worker，并上传发现与语料。把保留的发现放到 `fuzz/artifacts/<target>/` 下，就能在 stable 上重放。只有 sanitizer 才能发现的问题仍需 nightly 的 fuzz target。

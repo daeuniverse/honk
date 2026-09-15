@@ -1,0 +1,7 @@
+subscription {
+    sub: 'http://sub'(honk/1.0 like)#xxxx
+    other: 'http://other'(agent)# note
+}
+routing {
+    fallback: direct
+}

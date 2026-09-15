@@ -1,0 +1,6 @@
+dns {
+upstream {
+u: 'https://dns.example/q?x=outbound:proxy#frag'
+}
+
+}

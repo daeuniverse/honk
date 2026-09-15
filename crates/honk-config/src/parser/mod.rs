@@ -1,3 +1,5 @@
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod cursor;
 mod diagnostics;
 mod dns;

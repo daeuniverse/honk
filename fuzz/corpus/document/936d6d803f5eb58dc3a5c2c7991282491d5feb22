@@ -1,0 +1,9 @@
+group {
+proxy {
+future {
+policy: score
+}
+
+}
+
+}

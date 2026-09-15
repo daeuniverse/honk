@@ -1,0 +1,6 @@
+group {
+proxy {
+policy: mystery(x)
+}
+
+}

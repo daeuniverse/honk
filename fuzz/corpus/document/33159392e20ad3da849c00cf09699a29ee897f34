@@ -1,0 +1,4 @@
+global
+{
+log_file: x
+}

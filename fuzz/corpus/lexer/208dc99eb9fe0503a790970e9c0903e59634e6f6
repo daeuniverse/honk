@@ -1,0 +1,6 @@
+experimental {
+clash_api {
+secret: 'a}b'
+}
+
+}

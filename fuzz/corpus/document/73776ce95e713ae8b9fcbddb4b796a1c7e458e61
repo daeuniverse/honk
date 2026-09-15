@@ -1,0 +1,1 @@
+dns { use_host: /tmp/don't } # don't

@@ -1,0 +1,8 @@
+subscription {
+  a: b: {
+    url: 'http://example.test/sub'
+  }
+}
+routing {
+  fallback: direct
+}

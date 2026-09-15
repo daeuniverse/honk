@@ -1,0 +1,6 @@
+subscription {
+    tag: 'https://h/p'(agent # build)
+}
+routing {
+    fallback: direct
+}

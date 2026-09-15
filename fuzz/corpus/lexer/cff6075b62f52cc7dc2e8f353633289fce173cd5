@@ -1,0 +1,7 @@
+node {
+    'ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1'#note
+    ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8389#hk2#note
+}
+routing {
+    fallback: direct
+}

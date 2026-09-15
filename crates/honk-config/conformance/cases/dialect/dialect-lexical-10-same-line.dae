@@ -1,0 +1,1 @@
+global { log_level: debug log_file: x }

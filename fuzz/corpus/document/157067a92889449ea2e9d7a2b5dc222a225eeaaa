@@ -1,0 +1,8 @@
+subscription {
+paid: {
+url: 'https://example.com/sub'
+ua: agent
+interval: 60s
+}
+
+}

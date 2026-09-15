@@ -1,0 +1,3 @@
+global {
+tcp_check_url: 'https://one.example/a,https://two.example/b'
+}

@@ -134,6 +134,21 @@ mod routing_syntax {
     use honk_config::diagnostic::{DetailedDiagnostic, Severity};
     use honk_config::parser::parse_dae_config_with_detailed_diagnostics;
 
+    #[test]
+    fn spaced_must_is_an_outbound_name() {
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "routing {\n domain(x) -> proxy( must )\n domain(y) -> proxy(must)\n}",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.routing.rules[0].outbound,
+            honk_config::routing::RoutingOutbound::Simple("proxy( must )".into())
+        );
+        assert!(!config.routing.rules[0].must);
+        assert!(config.routing.rules[1].must);
+    }
+
     fn input(name: &str) -> String {
         std::fs::read_to_string(format!(
             "{}/tests/fixtures/parser/routing/{name}.dae",

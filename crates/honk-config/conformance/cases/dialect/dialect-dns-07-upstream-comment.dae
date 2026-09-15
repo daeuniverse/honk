@@ -1,0 +1,6 @@
+dns {
+upstream {
+v: 'udp://8.8.8.8:53' # note
+}
+
+}

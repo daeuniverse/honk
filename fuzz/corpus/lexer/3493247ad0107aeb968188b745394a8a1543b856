@@ -1,0 +1,6 @@
+routing {
+future {
+domain(x) -> direct
+}
+
+}

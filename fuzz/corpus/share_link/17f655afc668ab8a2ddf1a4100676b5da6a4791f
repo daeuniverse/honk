@@ -1,0 +1,1 @@
+trojan://secret@example.com:443?type=ws&sni=example.com&host=example.com&path=/path#trojan_ws

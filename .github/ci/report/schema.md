@@ -24,6 +24,12 @@ Each producer writes one UTF-8 JSON object to `<lane>.json`. The reporter accept
 | `failure.summary` | string | when non-null | One-line explanation of what failed. |
 | `failure.detail_lines` | array of strings | when non-null | At most 20 lines, each at most 300 UTF-8 bytes; longer collections render inside `<details>`. |
 
-Stage 1 accepts these value names and canonical units: `test_inventory` (`test-names`), `ignored_tests` (`tests`), `slowest_test` (`seconds`), `dns_smoke` (`queries-and-names`), `smoke_memory` (`MiB`, the release `honk-core` measured by the `smoke` lane), `smoke_cpu` (`seconds`), `binary_size` (`bytes`, the release `honk-core` file), `reload_benchmark` (`ratios`), `toolchain` (`rustc-cache`), and `vm_environment` (`kernel-accelerator`). The ordinary layout fixture also carries `ebpf_instructions` (`instructions`) to reproduce the agreed comment; no stage-1 producer emits it.
+Stage 1 accepts these value names and canonical units: `test_inventory` (`test-names`), `ignored_tests` (`tests`), `slowest_test` (`seconds`), `dns_smoke` (`queries-and-names`), `smoke_memory` (`MiB`, the release `honk-core` measured by the `smoke` lane), `smoke_cpu` (`seconds`), `binary_size` (`bytes`, the release `honk-core` file), `reload_benchmark` (`ratios`), `toolchain` (`rustc-cache`), `vm_environment` (`kernel-accelerator`), `conformance_cases` (`cases`), and `fuzz_replay_inputs` (`inputs`). The ordinary layout fixture also carries `ebpf_instructions` (`instructions`); no stage-1 producer emits it.
 
-`ci-report-selection` is the separate policy record. Its `selection.json` contains the event, dispatch inputs, labels, `code`/`docs`/`ebpf` filter outputs, filter outcome, intended lane names, run ID, and run attempt.
+`ci-report-selection` is the separate policy record. Its `selection.json` contains the event, dispatch inputs, labels, `code`/`docs`/`ebpf`/`parser` filter outputs, filter outcome, intended lane names, run ID, and run attempt.
+
+## Parser lane
+
+`ci-report-parser` contains `parser.json`, with lane `parser`. The lane writes and uploads the report even after failure, with 30-day retention and the same 256 KiB limit. `failure.summary` names the first failing conformance case; `failure.detail_lines` starts with its first differing path. Replay failures name the saved input. Setup or build failures point to the job steps rather than inventing a case.
+
+`conformance_cases.value` is an object with nonnegative integer fields `total`, `equal`, `bounded`, and `rejected_as_expected`. The three outcome counts cannot exceed the total; failed cases may be unclassified. `fuzz_replay_inputs.value` is the nonnegative number of inputs attempted, including the failing input when replay stops early. Missing results are unavailable observations, not zeros. The renderer shows one row per metric; neither count has a performance limit.
