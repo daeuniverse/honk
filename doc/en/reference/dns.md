@@ -40,7 +40,7 @@ A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fr
 
 Listener ownership is process-scoped. A SIGHUP reload accepts semantically equivalent spelling, but rejects any change to the host, port, or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver; restrict source access with the host firewall and never publish it to an untrusted network.
 
-Local `:53` precedence is transport-specific, with a full FIB check for wildcard binds; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
+Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
 
 ## Hosts snapshot (`use_host`)
 

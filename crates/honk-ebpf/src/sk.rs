@@ -8,9 +8,7 @@ use core::ffi::{c_long, c_void};
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::{bpf_sock, bpf_sock_tuple},
-    helpers::{
-        bpf_map_lookup_elem, bpf_sk_assign, bpf_sk_lookup_tcp, bpf_sk_lookup_udp, bpf_sk_release,
-    },
+    helpers::{bpf_map_lookup_elem, bpf_sk_assign, bpf_sk_lookup_udp, bpf_sk_release},
 };
 
 use crate::{errno::ENOENT, routing::bpf_sock_is_dae_socket};
@@ -55,30 +53,14 @@ pub(crate) fn sk_assign_released(
 /// Outcome of a socket probe, captured before the reference is released so
 /// callers can never leak it.
 pub(crate) struct SkProbe {
-    /// `bpf_sock.state` (e.g. `BPF_TCP_LISTEN` = 10).
-    pub state: u32,
-    /// The socket belongs to the proxy engine itself (its own listeners and
-    /// control-plane sockets must not be re-intercepted).
+    /// The destination socket carries the configured honk mark.
     pub is_dae_socket: bool,
     /// Wildcard binds need an independent route-locality check because socket
     /// lookup alone also matches forwarded destinations.
     pub is_wildcard: bool,
 }
 
-/// Probe the TCP socket matching `tuple` in `netns_id`, releasing the
-/// reference before returning. `None` when nothing matched.
-#[inline(always)]
-pub(crate) fn probe_tcp_socket(
-    ctx: &TcContext,
-    tuple: &mut bpf_sock_tuple,
-    tuple_size: u32,
-    netns_id: u64,
-) -> Option<SkProbe> {
-    let sk = unsafe { bpf_sk_lookup_tcp(ctx.skb.skb as *mut _, tuple, tuple_size, netns_id, 0) };
-    probe_result(sk)
-}
-
-/// UDP variant of [`probe_tcp_socket`].
+/// Probe the UDP socket matching `tuple`, releasing its reference before returning.
 #[inline(always)]
 pub(crate) fn probe_udp_socket(
     ctx: &TcContext,
@@ -87,11 +69,6 @@ pub(crate) fn probe_udp_socket(
     netns_id: u64,
 ) -> Option<SkProbe> {
     let sk = unsafe { bpf_sk_lookup_udp(ctx.skb.skb as *mut _, tuple, tuple_size, netns_id, 0) };
-    probe_result(sk)
-}
-
-#[inline(always)]
-fn probe_result(sk: *mut bpf_sock) -> Option<SkProbe> {
     if sk.is_null() {
         return None;
     }
@@ -104,7 +81,6 @@ fn probe_result(sk: *mut bpf_sock) -> Option<SkProbe> {
         true
     };
     let probe = SkProbe {
-        state: unsafe { (*sk).state },
         is_dae_socket: bpf_sock_is_dae_socket(sk as *const _),
         is_wildcard,
     };

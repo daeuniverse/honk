@@ -40,7 +40,7 @@
 
 监听器归进程所有。SIGHUP 重载接受语义等价的不同写法，但 host、port 或 transport 集合的任何变化都会作为 restart-required 被拒绝。通配或 LAN 侧 bind 会暴露一个无认证的递归 resolver；必须用主机防火墙限制来源，绝不能发布到不可信网络。
 
-本地 `:53` 优先接收按 TCP/UDP 分别判断，通配监听还需完整 FIB 检查；见[监听器矩阵](../design/dns.md#dns-所有权状态机)。
+监听 `:53` 不会抢先于 LAN 流量策略接收查询：即使 dnsmasq 或 `dns.bind` 占用该 socket，非 `must` 的 LAN TCP/UDP53 查询仍进入 honk 透明 DNS。主机 loopback 和显式原生 `direct(must)` 交付仍可到达该普通监听器；见[监听器矩阵](../design/dns.md#dns-所有权状态机)。
 
 ## Hosts 快照（`use_host`）
 

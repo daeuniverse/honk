@@ -95,12 +95,17 @@ fn tcp_listener(address: SocketAddr) -> TcpListener {
 }
 
 fn tcp_connect(address: SocketAddr, dscp: u8) -> TcpStream {
+    tcp_connect_marked(address, dscp, 0)
+}
+
+fn tcp_connect_marked(address: SocketAddr, dscp: u8, mark: u32) -> TcpStream {
     let domain = if address.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).unwrap();
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Mark, &mark).unwrap();
     set_dscp(&socket, address.is_ipv6(), dscp);
     socket
         .connect_timeout(&address.into(), Duration::from_secs(2))
@@ -136,10 +141,6 @@ fn accept_connection(listener: &TcpListener) -> (TcpStream, SocketAddr) {
             Err(error) => panic!("TCP accept: {error}"),
         }
     }
-}
-
-fn accept_source(listener: &TcpListener) -> SocketAddr {
-    accept_connection(listener).1
 }
 
 fn set_dscp(socket: &impl AsRawFd, ipv6: bool, dscp: u8) {
@@ -178,6 +179,7 @@ fn exchange_tcp(client: &mut TcpStream, server: &mut TcpStream, query: &[u8], an
     assert_eq!(received, wire);
 }
 
+#[track_caller]
 fn recv_marked(socket: &UdpSocket) -> (Vec<u8>, SocketAddr, u32) {
     let mut payload = [0u8; 64];
     let mut source: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -417,6 +419,16 @@ fn run_dns_network(use_redirect_peer: u8, verify_l3: bool) {
             0,
             true,
         )];
+        rules.push(rule(
+            "blocked-local-service",
+            RoutingCondition {
+                dscp: vec!["16".into()],
+                ..Default::default()
+            },
+            "block",
+            0,
+            true,
+        ));
         rules.extend(dns_ordering_rules());
         let plan = compile(&rules);
         let mut backend = RealEbpfBackend::load_routing_test_fixture(&object(), param).unwrap();
@@ -476,6 +488,11 @@ fn run_dns_network(use_redirect_peer: u8, verify_l3: bool) {
             UdpDnsRoute::new(OutboundIndex::ControlPlaneRouting as u8, generation)
                 .unwrap()
                 .to_mark();
+        let query =
+            b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x03com\x00\x00\x01\x00\x01";
+        let mut answer = query.to_vec();
+        answer[2] = 0x81;
+        answer[3] = 0x80;
         if let Some(tun) = l3_tun.as_mut() {
             for (source, destination, source_port, dscp, receiver, expected_mark) in [
                 (
@@ -522,34 +539,80 @@ fn run_dns_network(use_redirect_peer: u8, verify_l3: bool) {
 
         let exact4 = udp_socket("10.81.0.1:53".parse().unwrap(), false);
         let exact6 = udp_socket("[fd81::1]:53".parse().unwrap(), false);
-        for (client, local, destination, payload) in [
+        if let Some(tun) = l3_tun.as_mut() {
+            for (source, destination, receiver) in [
+                ("10.82.0.2", "10.81.0.1", &listeners.udp4),
+                ("fd83::2", "fd81::1", &listeners.udp6),
+            ] {
+                let source: IpAddr = source.parse().unwrap();
+                let packet = packet(
+                    source,
+                    destination.parse().unwrap(),
+                    IPPROTO_UDP,
+                    44004,
+                    53,
+                    0,
+                    0,
+                );
+                tun.write_all(&packet[14..]).unwrap();
+                let (payload, observed_source, mark) = recv_marked(receiver);
+                assert_eq!(payload, [0xa5]);
+                assert_eq!(observed_source, SocketAddr::new(source, 44004));
+                assert_eq!(mark, controller_mark);
+            }
+        }
+        for (client, local, receiver, destination, payload) in [
             (
                 &client4,
                 &exact4,
+                &listeners.udp4,
                 "10.81.0.1:53".parse::<SocketAddr>().unwrap(),
                 b"exact4".as_slice(),
             ),
             (
                 &client6,
                 &exact6,
+                &listeners.udp6,
                 "[fd81::1]:53".parse().unwrap(),
                 b"exact6".as_slice(),
             ),
         ] {
             client.send_to(payload, destination).unwrap();
-            let (size, source) = local.recv_from(&mut buffer).unwrap();
-            assert_eq!(&buffer[..size], payload);
+            let (observed, source, mark) = recv_marked(receiver);
+            assert_eq!(observed, payload);
             assert_eq!(source, client.local_addr().unwrap());
+            assert_eq!(mark, controller_mark);
+            local.set_nonblocking(true).unwrap();
+            assert_eq!(
+                local.recv_from(&mut buffer).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
         drop((exact4, exact6));
         let tcp_exact4 = tcp_listener("10.81.0.1:53".parse().unwrap());
         let tcp_exact6 = tcp_listener("[fd81::1]:53".parse().unwrap());
-        for (local, destination) in [
-            (&tcp_exact4, "10.81.0.1:53".parse::<SocketAddr>().unwrap()),
-            (&tcp_exact6, "[fd81::1]:53".parse().unwrap()),
+        for (local, receiver, destination) in [
+            (
+                &tcp_exact4,
+                &listeners.tcp4,
+                "10.81.0.1:53".parse::<SocketAddr>().unwrap(),
+            ),
+            (
+                &tcp_exact6,
+                &listeners.tcp6,
+                "[fd81::1]:53".parse().unwrap(),
+            ),
         ] {
-            let client = in_netns(&client_ns, || tcp_connect(destination, 0));
-            assert_eq!(accept_source(local), client.local_addr().unwrap());
+            let mut client = in_netns(&client_ns, || tcp_connect(destination, 0));
+            let (mut server, source) = accept_connection(receiver);
+            assert_eq!(source, client.local_addr().unwrap());
+            for _ in 0..2 {
+                exchange_tcp(&mut client, &mut server, query, &answer);
+            }
+            assert_eq!(
+                local.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
         drop((tcp_exact4, tcp_exact6));
 
@@ -557,26 +620,104 @@ fn run_dns_network(use_redirect_peer: u8, verify_l3: bool) {
         let wildcard6 = udp_socket("[::]:53".parse().unwrap(), false);
         let tcp_wildcard4 = tcp_listener("0.0.0.0:53".parse().unwrap());
         let tcp_wildcard6 = tcp_listener("[::]:53".parse().unwrap());
-        for (client, local, tcp, destination) in [
+        for (client, local, tcp, receiver, tcp_receiver, destination) in [
             (
                 &client4,
                 &wildcard4,
                 &tcp_wildcard4,
+                &listeners.udp4,
+                &listeners.tcp4,
                 "10.81.0.1:53".parse::<SocketAddr>().unwrap(),
             ),
             (
                 &client6,
                 &wildcard6,
                 &tcp_wildcard6,
+                &listeners.udp6,
+                &listeners.tcp6,
                 "[fd81::1]:53".parse().unwrap(),
             ),
         ] {
-            client.send_to(b"wild", destination).unwrap();
+            set_dscp(client, destination.is_ipv6(), 16);
+            client.send_to(b"block-must", destination).unwrap();
+            for (dscp, expected_mark) in [(0, controller_mark), (46, raw_mark)] {
+                set_dscp(client, destination.is_ipv6(), dscp);
+                client.send_to(b"wild", destination).unwrap();
+                let (payload, source, mark) = recv_marked(receiver);
+                assert_eq!(payload, b"wild");
+                assert_eq!(source, client.local_addr().unwrap());
+                assert_eq!(mark, expected_mark);
+                let mut stream = in_netns(&client_ns, || tcp_connect(destination, dscp));
+                let (mut server, source) = accept_connection(tcp_receiver);
+                assert_eq!(source, stream.local_addr().unwrap());
+                exchange_tcp(&mut stream, &mut server, query, &answer);
+            }
+            in_netns(&client_ns, || {
+                let domain = if destination.is_ipv4() {
+                    socket2::Domain::IPV4
+                } else {
+                    socket2::Domain::IPV6
+                };
+                let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).unwrap();
+                set_dscp(&socket, destination.is_ipv6(), 16);
+                assert_eq!(
+                    socket
+                        .connect_timeout(&destination.into(), Duration::from_secs(2))
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+            });
+            assert_eq!(
+                tcp.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            set_dscp(client, destination.is_ipv6(), 8);
+            client.send_to(query, destination).unwrap();
             let (size, source) = local.recv_from(&mut buffer).unwrap();
-            assert_eq!(&buffer[..size], b"wild");
+            assert_eq!(&buffer[..size], query);
             assert_eq!(source, client.local_addr().unwrap());
-            let stream = in_netns(&client_ns, || tcp_connect(destination, 0));
-            assert_eq!(accept_source(tcp), stream.local_addr().unwrap());
+            local.send_to(&answer, source).unwrap();
+            let (size, source) = client.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..size], answer);
+            assert_eq!(source, destination);
+            set_dscp(client, destination.is_ipv6(), 0);
+            let mut stream = in_netns(&client_ns, || tcp_connect(destination, 8));
+            let (mut server, source) = accept_connection(tcp);
+            assert_eq!(source, stream.local_addr().unwrap());
+            exchange_tcp(&mut stream, &mut server, query, &answer);
+
+            let loopback = if destination.is_ipv4() {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 53))
+            } else {
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 53))
+            };
+            let backend_client = udp_socket(SocketAddr::new(loopback.ip(), 0), false);
+            backend_client.send_to(query, loopback).unwrap();
+            let (size, source) = local.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..size], query);
+            assert_eq!(source, backend_client.local_addr().unwrap());
+            local.send_to(&answer, source).unwrap();
+            let (size, source) = backend_client.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..size], answer);
+            assert_eq!(source, loopback);
+            let mut stream = tcp_connect(loopback, 0);
+            let (mut server, source) = accept_connection(tcp);
+            assert_eq!(source, stream.local_addr().unwrap());
+            exchange_tcp(&mut stream, &mut server, query, &answer);
+        }
+
+        for (client, destination) in [
+            (&client4, "10.81.0.1:5353".parse::<SocketAddr>().unwrap()),
+            (&client6, "[fd81::1]:5353".parse().unwrap()),
+        ] {
+            let local = udp_socket(destination, false);
+            set_dscp(client, destination.is_ipv6(), 16);
+            client.send_to(b"local-udp", destination).unwrap();
+            let (size, source) = local.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..size], b"local-udp");
+            assert_eq!(source, client.local_addr().unwrap());
+            set_dscp(client, destination.is_ipv6(), 0);
         }
 
         let resolver4 = in_netns(&resolver_ns, || {
@@ -618,11 +759,6 @@ fn run_dns_network(use_redirect_peer: u8, verify_l3: bool) {
             }
         }
 
-        let query =
-            b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x03com\x00\x00\x01\x00\x01";
-        let mut answer = query.to_vec();
-        answer[2] = 0x81;
-        answer[3] = 0x80;
         for (receiver, destination) in [
             (&listeners.tcp4, resolver4.local_addr().unwrap()),
             (&listeners.tcp6, resolver6.local_addr().unwrap()),
@@ -683,4 +819,109 @@ fn dns_local_fib_and_v4_v6_carriers_reach_resolvers_without_snat() {
 #[ignore = "requires root, Linux with TUN, SO_RCVMARK, HONK_ROUTING_TEST_OBJECT, redirect_peer, veth/netkit, and isolated netns support"]
 fn dns_l3_tun_v4_v6_controller_and_raw_marks_reach_redirect_peer_listeners() {
     run_dns_network(1, true);
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+fn dns_marked_loopback_backend_survives_lan_hook_without_exempting_other_marks() {
+    for bypass_mark in [DAE_BYPASS_MARK, 0] {
+        isolated(move || {
+            let mut netlink = crate::netlink::NlSock::new().unwrap();
+            let (lo, _) = netlink.get_link("lo").unwrap();
+            netlink.set_link_up(lo, true).unwrap();
+            let param = DaeParam {
+                dae_socket_mark: bypass_mark,
+                ..fixture_param()
+            };
+            let plan = compile(&[rule(
+                "block-dns",
+                RoutingCondition {
+                    port: vec!["53".into()],
+                    ..Default::default()
+                },
+                "block",
+                0,
+                true,
+            )]);
+            let mut backend = RealEbpfBackend::load_routing_test_fixture(&object(), param).unwrap();
+            backend.publish_routing_plan(&plan, &[]).unwrap();
+            let listeners = TproxyListeners::new();
+            listeners.publish(&mut backend).unwrap();
+            load_classifier(&mut backend, "lan_ingress_l2");
+            aya::programs::tc::qdisc_add_clsact("lo").unwrap();
+            let program: &mut SchedClassifier = backend
+                .bpf_mut()
+                .unwrap()
+                .program_mut("lan_ingress_l2")
+                .unwrap()
+                .try_into()
+                .unwrap();
+            program.attach("lo", TcAttachType::Ingress).unwrap();
+            backend
+                .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT)
+                .unwrap();
+            backend.set_datapath_ready(true).unwrap();
+
+            for destination in [
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 53)),
+            ] {
+                let server = udp_socket(destination, false);
+                let tcp_server = tcp_listener(destination);
+                let client = udp_socket(SocketAddr::new(destination.ip(), 0), false);
+                if bypass_mark != 0 {
+                    nix::sys::socket::setsockopt(
+                        &client,
+                        nix::sys::socket::sockopt::Mark,
+                        &bypass_mark,
+                    )
+                    .unwrap();
+                    client.send_to(b"backend-query", destination).unwrap();
+                    let mut bytes = [0; 64];
+                    let (size, source) = server.recv_from(&mut bytes).unwrap();
+                    assert_eq!(&bytes[..size], b"backend-query");
+                    assert_eq!(source, client.local_addr().unwrap());
+                    server.send_to(b"backend-answer", source).unwrap();
+                    let (size, source) = client.recv_from(&mut bytes).unwrap();
+                    assert_eq!(&bytes[..size], b"backend-answer");
+                    assert_eq!(source, destination);
+                    let mut stream = tcp_connect_marked(destination, 0, bypass_mark);
+                    let (mut accepted, source) = accept_connection(&tcp_server);
+                    assert_eq!(source, stream.local_addr().unwrap());
+                    for _ in 0..2 {
+                        exchange_tcp(&mut stream, &mut accepted, b"query", b"reply");
+                    }
+                }
+                server
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                for mark in [0, DAE_BYPASS_MARK | 0x200] {
+                    nix::sys::socket::setsockopt(&client, nix::sys::socket::sockopt::Mark, &mark)
+                        .unwrap();
+                    client.send_to(b"must-drop", destination).unwrap();
+                    let mut bytes = [0; 64];
+                    assert_eq!(
+                        server.recv_from(&mut bytes).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    let domain = if destination.is_ipv4() {
+                        socket2::Domain::IPV4
+                    } else {
+                        socket2::Domain::IPV6
+                    };
+                    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).unwrap();
+                    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Mark, &mark)
+                        .unwrap();
+                    socket
+                        .connect_timeout(&destination.into(), Duration::from_millis(200))
+                        .expect_err("a non-exact mark must not bypass the DNS block");
+                }
+                assert_eq!(
+                    tcp_server.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+            backend.set_datapath_ready(false).unwrap();
+        });
+    }
 }

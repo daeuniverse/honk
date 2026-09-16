@@ -60,7 +60,7 @@ flowchart LR
 
 | 程序 | 挂钩 | 内核职责 |
 | --- | --- | --- |
-| `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/本地流量，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数，以及可选的歧义 UDP 暂存。 |
+| `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/控制平面及非 DNS 本地流量，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数，以及可选的歧义 UDP 暂存。 |
 | `wan_ingress_l2`, `wan_ingress_l3` | WAN TC ingress | 刷新反向连接状态；单网卡拓扑不挂载。 |
 | `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态并抑制本机生成的 ICMPv6 Redirect 数据包；单网卡拓扑在共用接口上跳过。 |
 | `wan_egress_l2`, `wan_egress_l3` | WAN TC egress | 路由主机发起的 TCP/UDP，使用进程名与控制平面 bypass 数据，检查出站连通性，缓存决策并重定向代理流量。 |
@@ -117,15 +117,15 @@ TCP SYN handoff 尾部增加 `u64 routing_generation`：`RoutingHandoffEntry` �
 
 真实透明 UDP/53 从 `SO_RCVMARK` 启用的 `SOL_SOCKET`/`SO_MARK` 辅助数据取得逐报文出站及策略代际，不能用最新的 tuple handoff 替代。同一个 skb 的 `cb[2]` 跨链路保存路由编码与不回绕的 20 位已提交策略代际，再由必需的 `dae0peer` TC 恢复。内部可变携带位为 `0x37fffeff`，其余签名匹配掩码为 `0xc8000100`；`daens` 内部 fwmark 规则只忽略这些专用可变位，不改变用户规则 mark 的保留位约束。
 
-本地套接字探测必须区分 honk 自身的透明监听器和普通本地服务。`bpf_sock_is_dae_socket` 把完整套接字 mark 与 `PARAM.dae_socket_mark` 比较，后者由用户空间设为 `DAE_BYPASS_MARK`。相等表示“honk 监听器”，探测继续透明路径；普通未标记监听器可以取得该目的地址。主机网络命名空间中的 `dns.bind` 套接字有意保持为普通未标记监听器。
+非 DNS 本地套接字探测通过完整 socket mark 与 `PARAM.dae_socket_mark` 的比较，区分 honk 的透明监听器和普通本地服务。主机网络命名空间中的 `dns.bind` 套接字仍是普通未标记监听器，但它的存在不能绕过 LAN 端口 53 策略。
 
 ## 数据包行为与不变量
 
 ### DNS 与本地监听器优先级
 
-LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后执行一次正常有序策略，不单独扫描 must 规则。[流量规则所有权](../reference/routing.md#出站目标与-must)决定原生、丢弃、原始转发或控制器路径。端口 `53` 仍豁免 LAN 出站健康检查丢包，但不豁免终局用户 `must` 结果。
+LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后执行一次正常有序策略，不单独扫描 must 规则。[流量规则所有权](../reference/routing.md#出站目标与-must)决定原生、丢弃、原始转发或控制器路径。具体地址或通配地址的本地 `:53` 监听均不能覆盖该策略。端口 `53` 仍豁免 LAN 出站健康检查丢包，但不豁免已选用户 `must` 结果。
 
-本地套接字探测先于流量策略运行，并按传输协议分别判断；探测使用报文所在的当前网络命名空间（负 netns ID），不是相对命名空间 ID `0`。绑定到具体地址的 UDP 套接字，或处于 `LISTEN` 状态的 TCP 套接字，对其传输协议优先。wildcard 匹配仅在完整 FIB 查找返回 `NOT_FWDED` 时优先；单独的套接字查找也会匹配转发目的地址。监听器 mark 检查把 honk 自身的透明监听器排除在该优先规则之外。因此，本地 `dns.bind` 监听器可拥有主机本地 `:53`，而远端解析器流量继续接受流量策略与 DNS 接管判断。空 bind 不代表关闭透明 DNS。
+只有非 DNS 流量继续在流量策略之前探测本地 socket。探测使用报文所在的当前网络命名空间（负 netns ID），不是相对命名空间 ID `0`；匹配的非 honk socket 可以接收，通配匹配还要求完整 FIB 返回 `NOT_FWDED`。原有 TCP 纯 SYN 跳过探测的行为保留。解析后的目的端口 `53` 请求，在标记非零且完全匹配控制平面 bypass mark 时保留原生投递；普通请求继续执行路由，不探测本地监听器。后端回包仍受既有非 53 策略约束。空 bind 不代表关闭透明 DNS。
 
 实际本地 socket 的优先接收不等于所有网关地址强制直连。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面；需要时使用[显式用户规则](../reference/routing.md#显式本地路由)。
 

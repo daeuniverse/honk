@@ -471,19 +471,6 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
     result == BPF_FIB_LKUP_RET_NOT_FWDED as c_long
 }
 
-/// Existing flows probe for a local owner as before. Pure SYNs normally skip
-/// this lookup, except TCP DNS: a real host-netns port-53 LISTEN socket must
-/// get first refusal before ordered traffic routing.
-#[inline(always)]
-const fn tcp_socket_probe_required(pure_syn: bool, destination_port: u16) -> bool {
-    !pure_syn || destination_port == 53
-}
-
-// Host-build-free structural coverage for the no_std eBPF crate.
-const _: [(); 1] = [(); tcp_socket_probe_required(true, 53) as usize];
-const _: [(); 0] = [(); tcp_socket_probe_required(true, 443) as usize];
-const _: [(); 1] = [(); tcp_socket_probe_required(false, 443) as usize];
-
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
@@ -512,6 +499,15 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // be routed, marked, or conntracked — pass through immediately.
     if crate::transport::dst_is_special(pkt, link_h_len) {
         return pass_through_classified(ctx);
+    }
+
+    if pkt.tuples.five.dst_port == 53 && (pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP)
+    {
+        // A marked backend query must also survive an explicitly LAN-bound lo.
+        let bypass_mark = PARAM.load().dae_socket_mark;
+        if bypass_mark != 0 && unsafe { (*ctx.skb.skb).mark } == bypass_mark {
+            return pass_through_classified(ctx);
+        }
     }
 
     if pkt.l4proto == IPPROTO_TCP && !crate::contrack::is_new_tcp_connection(&pkt.tcph) {
@@ -614,7 +610,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         IpVersionType::V6 as u8
     };
 
-    if pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP {
+    // A local DNS listener must not short-circuit the configured traffic policy.
+    if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port != 53 {
         let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
         let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
             unsafe {
@@ -642,36 +639,13 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
         };
 
-        if pkt.l4proto == IPPROTO_TCP {
-            // Preserve the general pure-SYN lookup skip. TCP DNS is the sole
-            // exception so a LAN host listener gets first refusal before
-            // compiled routing.
-            let pure_syn = pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0;
-            if tcp_socket_probe_required(pure_syn, pkt.tuples.five.dst_port) {
-                let param = PARAM.load();
-                if let Some(probe) =
-                    sk::probe_tcp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
-                {
-                    // A local (non-dae) LISTEN socket owns this destination:
-                    // NAT loopback — leave it to the kernel.
-                    // BPF_TCP_LISTEN = 10
-                    if !probe.is_dae_socket
-                        && probe.state == 10
-                        && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-                    {
-                        return pass_through_classified(ctx);
-                    }
-                }
-            }
-        } else {
-            let param = PARAM.load();
-            if let Some(probe) =
-                sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
-                && !probe.is_dae_socket
-                && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-            {
-                return pass_through_classified(ctx);
-            }
+        let param = PARAM.load();
+        if let Some(probe) =
+            sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            && !probe.is_dae_socket
+            && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
+        {
+            return pass_through_classified(ctx);
         }
     }
 

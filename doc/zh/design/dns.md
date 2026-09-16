@@ -8,9 +8,8 @@
 
 ```mermaid
 flowchart LR
-    T[LAN/WAN TCP/UDP :53] --> E[现有入口排除与本地监听优先]
-    E -->|本地 socket 接收| L[本地服务]
-    E -->|其余流量| R[正常有序流量策略]
+    T[LAN/WAN TCP/UDP :53] --> E[既有入口与控制平面排除]
+    E --> R[正常有序流量策略]
     R -->|direct must| N[Linux 原生路径]
     R -->|block must| DROP[丢弃]
     R -->|group must| RAW[原始 TCP relay / UDP PacketTransport]
@@ -55,39 +54,35 @@ flowchart LR
 - SIGHUP 中 `dns.bind` 的语义变化要求重启。未变化的监听器继续使用新发布的 DNS generation。
 - 独立请求传入 `original_dst=None`；选择 `asis` 因而产生 DNS 失败（`SERVFAIL`），不会递归拨回监听器。
 
-将 `dns.bind` 留空不关闭透明 TCP 与 UDP 拦截。本地监听优先接收按 transport 分别判断，详见下文。
+将 `dns.bind` 留空不关闭透明 TCP 与 UDP 拦截。本地端口 53 监听器不能让普通 LAN DNS 跳过流量策略。
 
 ## DNS 所有权状态机
 
-下表针对 LAN 客户端，并明确区分**第一接收者**、**真正的应答来源**与**最终回包者**。`Honk bind` 是 host network namespace 中的普通监听器；绑定 `:54` 不会占用 `:53`。`透明 Honk` 依赖真实 eBPF datapath 与已挂载的接口 hook，且在现有入口排除后没有终局用户 `must` 结果；mock 模式没有这条路径。
+下表区分 LAN 入站与普通主机/loopback 投递。`透明 Honk` 依赖真实 eBPF 数据面与已挂载的 LAN hook；mock 模式不能拦截报文。`must` 表示不再通过嗅探重判、保留已选出站，不是一个“绕过所有处理”的开关。
 
-| dnsmasq 状态 | Honk `dns.bind` | 查询目标 | 第一接收者 | 真正的应答来源 | 最终回包者 |
-| --- | --- | --- | --- | --- | --- |
-| 运行于 `:53`；命中本地/DHCP/缓存 | 任意不冲突的 bind | 网关 `:53` | dnsmasq | dnsmasq 本地数据或缓存 | dnsmasq |
-| 运行于 `:53`；未命中并转发到 `127.0.0.1#54` | `:54` 运行 | 网关 `:53` | dnsmasq | Honk 缓存/hosts/策略或 Honk 上游 | dnsmasq |
-| 运行于 `:53`；未命中且 dnsmasq 没有可用上游 | 任意 | 网关 `:53` | dnsmasq | 无 | dnsmasq 返回 `SERVFAIL` 或超时 |
-| 运行于 `:53`；转发目标 `127.0.0.1#54` 已停止 | `:54` 停止 | 网关 `:53` | dnsmasq | 无 | dnsmasq 返回 `SERVFAIL` 或超时 |
-| 运行于 `:53` | `:54` 运行 | 外部 `:53`（例如 `8.8.8.8:53`） | 无终局 `must` 且启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
-| 已停止 | `:54` 运行 | 网关 `:54` | Honk bind | Honk 缓存/hosts/策略或 Honk 上游 | Honk bind |
-| 已停止 | `:54` 运行 | 网关 `:53` | 无终局 `must` 且启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
-| 已停止 | bind 关闭 | 网关或外部 `:53` | 无终局 `must` 且启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
-| 已停止或没有占用 `:53` | `:53` 运行 | 网关 `:53` | Honk bind | Honk 缓存/hosts/策略或 Honk 上游 | Honk bind |
-| 已占用 `:53` | 尝试绑定 `:53` | 网关 `:53` | 启动时 bind 冲突 | 在只剩一个所有者前无 | 没有确定的所有者；一个服务必须失败 |
-| 任意 | bind 关闭或已停止 | 网关 `:54` | 没有 Honk listener | 无 | 连接拒绝或超时 |
-| 任意 | 任意 | 非 DNS 端口 | 普通路由路径 | 选中的出站 | 普通流 |
+| 查询路径 | 流量策略结果 | 接收者 | 应答路径 |
+| --- | --- | --- | --- |
+| LAN 查询网关或外部 `:53`，无论本机是否有 dnsmasq / `dns.bind` 监听 | 非 `must` | Honk DNS 控制器 | Honk hosts、缓存、请求/响应策略与选定上游；透明 anyfrom/stream 回包 |
+| LAN 查询由 dnsmasq 监听的网关 `:53` | `direct(must)` | Linux 原生投递到 dnsmasq | dnsmasq 本地数据、缓存或上游 |
+| LAN 查询网关或外部 `:53`，即使有本地监听 | `block(must)` | 无 | 丢弃 |
+| LAN 查询网关或外部 `:53`，即使有本地监听 | `group(must)` | Honk 原始 TCP/UDP 组传输 | 原始 DNS 流量经已选组转发，不经过 `DnsController` |
+| 不经过透明准入的普通主机/loopback 查询 `127.0.0.1:53` | 不适用 | dnsmasq | dnsmasq 本地数据、缓存或上游 |
+| 投递到非 53 端口的 `dns.bind`，例如 `127.0.0.1:54` | 不是透明端口 53 准入 | Honk bind | 同一套 Honk DNS 策略与上游栈 |
+| 数据面未启用或流量不经过已挂载 hook | 不执行 Honk 策略 | 普通目的 socket | 对应本地服务；没有监听则拒绝或超时 |
 
-没有本地监听接收的端口 53 查询遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；该表不表示畸形 UDP payload 会进入控制器。
+有效非 `must` DNS 查询遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；畸形 UDP payload 保留既有回退。具体地址或通配地址上的本地 `:53` socket 均不能提前终结 LAN 准入。非 DNS 本地 socket 探测保留原有 transport、FIB 与 TCP 纯 SYN 规则。
 
-本地 listener 检查按 TCP、UDP transport 分开执行。具体地址的本地 `:53` socket 优先；通配 socket 只有在完整 FIB 查询报告 `NOT_FWDED` 时优先，转发或结果不明确的目的地址仍接受流量策略与 DNS 接管判断。因此，停止 dnsmasq 不会让 Honk `:54` 自动占用 `:53`；没有终局用户 `must` 结果时，接管可来自透明拦截。若要让 Honk 成为普通网关 `:53` 服务，应停止或迁移 dnsmasq，并将 `bind` 配置为 `tcp+udp://:53`。
+解析后的 DNS 请求仅在携带非零、与配置控制平面 bypass mark 完全相等的标记时保留原生投递。这是请求侧豁免，与用户规则中的 `must` 无关；回包仍遵循既有非 53 路由规则。未经过 LAN hook 的普通 loopback 后端访问不变。Honk 和 dnsmasq 绑定同一已占用端口仍会产生普通 socket bind 冲突；透明拦截本身不占用主机端口 `53`。
 
-OpenWrt 最常见的转发状态是：
+以 dnsmasq 为后端时，LAN 查询可以先进入 Honk，而 dnsmasq 保留端口 53 监听：
 
 ```text
-LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
-            <- dnsmasq :53 <- 127.0.0.1:54 <----------------------
+LAN 客户端 -> 网关 :53 -> Honk 透明 DNS 策略
+                           | local 上游 -> 127.0.0.1:53 -> dnsmasq -> 外部解析器
+                           | remote 上游 -> 选定直连/代理传输
 ```
 
-如果 Honk 选择的上游也是 dnsmasq `127.0.0.1:53`，而 dnsmasq 又把未命中请求转发到 Honk `:54`，两个服务会形成递归环。应使用真正的外部 Honk 上游，或让 dnsmasq 自己处理该上游。
+Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是 LAN 端口 53 的接管开关。主机 loopback 到 dnsmasq 的请求不会因为启动了 Honk 就变成 LAN 请求。如果改为 dnsmasq 把未命中请求转发给 Honk，Honk 的选定上游就不能再指回该 dnsmasq，否则形成递归环。只有 Honk DNS 策略选中 dnsmasq 后端时，才会获取它的本地/DHCP 名称与缓存应答。
 
 ## 解析管线
 

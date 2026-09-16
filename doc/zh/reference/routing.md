@@ -49,7 +49,7 @@ routing {
 普通 domain pattern/suffix/keyword 互为同一条件内的备选；同一规则另有 `geosite`
 字段时，它仍是一个独立的 AND 条件。
 
-`mac(...)` 与其他流量条件一样，可以通过终局 `direct(must)` 规则绕过透明 DNS；普通 `direct` 不会取消 DNS 接管。LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后，执行一次正常有序流量策略，不单独扫描 must 规则。
+`mac(...)` 与其他流量条件一样，可以通过终局 `direct(must)` 规则绕过透明 DNS；普通 `direct` 不会取消 DNS 接管。LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，执行一次正常有序流量策略，不单独扫描 must 规则。LAN 端口 `53` 跳过本地套接字探测，即使 dnsmasq 或 `dns.bind` 已监听该目的地址也不例外。
 
 ## 出站目标与 `must`
 
@@ -61,18 +61,18 @@ routing {
 
 裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。每份配置最多可定义 250 个顶层用户组；更高的路由序号由 ABI 保留。
 
-追加 `(must)` 后，命中的结果立即终结规则搜索并跳过后续域名重路由。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续扫描”的 `MustRules` opcode。
+追加 `(must)` 后，命中的结果立即终结规则搜索，并跳过嗅探与后续域名重路由（`no_sniff` 语义）。它保留选中的 direct、block 或 group 动作，并非一概绕过 honk。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续扫描”的 `MustRules` opcode。
 
-TCP/UDP 目的端口 `53` 的接管权限如下；实际本地监听 socket 的优先接收发生在流量策略之前：
+TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` 监听 socket 不能先于 LAN 流量策略接收报文：
 
 | 流量策略结果 | DNS 行为 |
 | --- | --- |
-| `direct(must)` | 保持 Linux 原生路径，保留配置的 skb mark；不进入 honk DNS。 |
+| `direct(must)` | 保持 Linux 原生路径，保留配置的 skb mark；不进行 honk 透明 DNS 拦截，目标本地解析器仍可正常接收查询。 |
 | `block(must)` | 丢弃报文。 |
 | `group(must)` | 通过该组的原始 TCP relay / UDP `PacketTransport` 转发，跳过 honk DNS 的 hosts、缓存、请求/响应策略和投影。 |
 | 非 `must` 的 `direct`、组或 `block` | 有效 DNS 查询仍归 DNS 控制器处理；Clash 模式直连 offload 不会抢走接管权限。 |
 
-畸形的非 `must` UDP53 payload 保留通用 UDP 回退，不进入 `DnsController`；控制器一行不表示所有端口 53 payload 都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)；本地监听优先接收条件见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
+畸形的非 `must` UDP53 payload 保留通用 UDP 回退，不进入 `DnsController`；控制器一行不表示所有端口 53 payload 都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)。LAN 本地 socket 优先接收仅适用于非 53 目的端口，按 transport 分别判断；通配监听仍需完整 FIB 返回 `NOT_FWDED`，非 DNS TCP 纯 SYN 仍跳过探测。透明 LAN 与原生/loopback 交付的区别见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
 
 ## Geo 资源
 
@@ -104,7 +104,7 @@ honk 不再在启动、重载或接口变化时注入网关地址的 `direct(mus
 dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 ```
 
-这是一条可选的用户规则，不是运行时自动规则。实际本地 socket 的优先接收属于入口归属判断，不等于所有网关地址强制直连；探测在报文所在的当前网络命名空间进行。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面。
+这是一条可选的用户规则，不是运行时自动规则。它保留端口 `53` 的透明 DNS 接管，除非其他终局 `must` 结果取得所有权。非 53 本地 socket 的优先接收属于入口归属判断，不等于所有网关地址强制直连；探测在报文所在的当前网络命名空间进行。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面。
 
 使用真实 LAN 绑定时，如果无法按已编译规则的实际顺序确认：已观测到的配置
 LAN/WAN 网卡地址，其 TCP/UDP 目的端口 `1–65535`（排除 `53`）均有无条件

@@ -72,8 +72,8 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[入口排除、本地监听优先、有序策略]
-  TC -->|本地 socket 优先接收| LOCAL[本地服务]
+  PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[入口排除与有序策略]
+  TC -->|非 DNS 本地 socket 接收| LOCAL[本地服务]
   TC -->|direct must 或非 DNS 安全 direct| NATIVE[Linux 原生路径]
   TC -->|block must、非 DNS block 或失活丢包| DROP[丢弃]
   TC -->|非 must DNS :53| DAE0[dae0]
@@ -92,7 +92,7 @@ flowchart TB
 
 ### 报文路径
 
-1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。现有入口排除和实际本地 socket 所有权先于有序流量策略；`direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径。
+1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。既有入口与控制平面排除先执行；普通 LAN 端口 53 不能因本地 socket 而跳过策略，非 DNS 本地探测行为不变。`direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径。
 2. [流量规则所有权](../reference/routing.md#出站目标与-must)决定哪些端口 53 查询进入[DNS 管线](./dns.md)。已准入的透明查询、可选 host-netns `dns.bind` 与流关联 reality/目标查询共用按代固定的 DNS 策略、缓存/singleflight、上游池和路由投影。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
 4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。

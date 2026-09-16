@@ -8,7 +8,7 @@ Field-level settings, accepted URI forms, and defaults belong in the [DNS config
 
 ```mermaid
 flowchart LR
-    T[TCP/UDP :53 after local/special exclusions] --> TR[Ordered traffic policy]
+    T[TCP/UDP :53 after existing ingress and control-plane exclusions] --> TR[Ordered traffic policy]
     TR -->|direct must| N[Native Linux path]
     TR -->|block must| DROP[Drop]
     TR -->|group must| RAW[Raw TCP/UDP group transport]
@@ -66,42 +66,35 @@ The standalone listener has these lifecycle and admission invariants:
 - A semantic `dns.bind` change on SIGHUP is restart-required. An unchanged listener continues through the newly published DNS generation.
 - Standalone requests pass `original_dst=None`; selecting `asis` therefore produces a DNS failure (`SERVFAIL`) rather than dialing the listener recursively.
 
-Leaving `dns.bind` empty does not disable transparent TCP/UDP interception. Local-listener precedence is transport-specific, as described below.
+Leaving `dns.bind` empty does not disable transparent TCP/UDP interception. A local port-53 listener does not exempt ordinary LAN DNS from traffic policy.
 
 ## DNS ownership state machine
 
-This matrix is for a LAN client and separates the **first receiver**, the **actual answer source**, and the **final reply sender**. `Honk bind` is an ordinary host-network listener; binding `:54` does not claim `:53`. `Transparent Honk` requires the real eBPF datapath, an attached interface hook, and no terminal user `must` result after local/special exclusions; it is unavailable in mock mode.
+This matrix distinguishes LAN ingress from ordinary host/loopback delivery. `Transparent Honk` requires the real eBPF datapath and attached LAN hooks; mock mode cannot intercept packets. `must` suppresses sniff-driven rerouting and preserves the selected outbound, not a blanket bypass of processing.
 
-| dnsmasq state | Honk `dns.bind` | Query target | First receiver | Actual answer source | Final reply sender |
-| --- | --- | --- | --- | --- | --- |
-| Running on `:53`; local/DHCP/cache hit | Any non-conflicting bind | Gateway `:53` | dnsmasq | dnsmasq local data or cache | dnsmasq |
-| Running on `:53`; miss forwarded to `127.0.0.1#54` | `:54` running | Gateway `:53` | dnsmasq | Honk cache/hosts/policy or Honk upstream | dnsmasq |
-| Running on `:53`; miss has no reachable dnsmasq upstream | Any | Gateway `:53` | dnsmasq | None | dnsmasq returns `SERVFAIL` or times out |
-| Running on `:53`; forwarding target `127.0.0.1#54` is stopped | `:54` stopped | Gateway `:53` | dnsmasq | None | dnsmasq returns `SERVFAIL` or times out |
-| Running on `:53` | `:54` running | External `:53` (for example `8.8.8.8:53`), no terminal `must` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
-| Stopped | `:54` running | Gateway `:54` | Honk bind | Honk cache/hosts/policy or Honk upstream | Honk bind |
-| Stopped | `:54` running | Gateway `:53`, no terminal `must` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
-| Stopped | Bind disabled | Gateway or external `:53`, no terminal `must` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
-| Stopped or does not own `:53` | `:53` running | Gateway `:53` | Honk bind | Honk cache/hosts/policy or Honk upstream | Honk bind |
-| Owns `:53` | Attempts `:53` | Gateway `:53` | Bind conflict during startup | None until one owner remains | No deterministic owner; one service must fail |
-| Any | Bind disabled or stopped | Gateway `:54` | No Honk listener | None | Connection refusal or timeout |
-| Does not own target for this transport | Does not own target | Unclaimed `:53`, `direct(must)` | Original destination through native Linux | Target resolver, if reachable | Target resolver, subject to external firewall/NAT |
-| Does not own target for this transport | Does not own target | Unclaimed `:53`, `block(must)` | Kernel drop | None | None |
-| Does not own target for this transport | Does not own target | Unclaimed `:53`, `group(must)` | Honk raw TCP/UDP transport | Target resolver through the selected group | Honk raw relay, not `DnsController` |
-| Any | Any | Non-DNS port | Normal routing path | Selected outbound | Normal flow |
+| Query path | Traffic-policy result | Receiver | Answer path |
+| --- | --- | --- | --- |
+| LAN to gateway or external `:53`, with or without a local dnsmasq / `dns.bind` listener | Non-`must` | Honk DNS controller | Honk hosts/cache/request/response policy and selected upstream; transparent anyfrom/stream reply |
+| LAN to gateway `:53` owned by dnsmasq | `direct(must)` | dnsmasq through native Linux | dnsmasq local data/cache/upstream |
+| LAN to gateway or external `:53`, even with a local listener | `block(must)` | None | Drop |
+| LAN to gateway or external `:53`, even with a local listener | `group(must)` | Honk raw TCP/UDP group transport | Original DNS traffic through the selected group, without `DnsController` processing |
+| Ordinary host/loopback query to dnsmasq `127.0.0.1:53` outside transparent admission | Not applicable | dnsmasq | dnsmasq local data/cache/upstream |
+| Request delivered to the configured non-53 `dns.bind`, such as `127.0.0.1:54` | Not transparent port-53 admission | Honk bind | The same Honk DNS policy and upstream stack |
+| No active datapath, or traffic outside attached hooks | Not evaluated by Honk | Ordinary destination socket | Its local service, or connection refusal/timeout when none exists |
 
-Unclaimed port-53 queries follow [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must); the matrix does not turn malformed UDP payloads into controller queries.
+Valid non-`must` DNS queries follow [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must); malformed UDP payloads retain their existing fallback. Neither an exact nor a wildcard local `:53` socket may short-circuit LAN admission. Non-DNS local-socket probing retains its transport, FIB, and TCP pure-SYN rules.
 
-The local-listener check is per TCP/UDP transport. A specifically addressed local `:53` socket wins. A wildcard socket wins only when the complete FIB lookup says `NOT_FWDED`; otherwise traffic proceeds to ordered policy. Stopping dnsmasq does not make Honk `:54` automatically own `:53`: any takeover is transparent interception, conditional on an enabled datapath and no terminal user `must` result. To make Honk the ordinary gateway `:53` service, stop or move dnsmasq and configure `bind` for `tcp+udp://:53`.
+Parsed DNS requests bearing a nonzero exact configured control-plane bypass mark retain native delivery. This request-side exemption is independent of a user's `must` route; replies still follow the existing non-53 routing rules. Ordinary loopback backend access outside attached LAN hooks is unchanged. Binding Honk to a port already occupied by dnsmasq still causes an ordinary socket bind conflict; transparent interception does not reserve host port `53`.
 
-The common OpenWrt forwarding state is:
+For a dnsmasq backend, LAN queries can enter Honk first while dnsmasq retains its port-53 listener:
 
 ```text
-LAN client -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS policy/upstream
-            <- dnsmasq :53 <- 127.0.0.1:54 <----------------------
+LAN client -> gateway :53 -> transparent Honk DNS policy
+                              | local upstream -> 127.0.0.1:53 -> dnsmasq -> external resolver
+                              | remote upstream -> selected direct/proxy transport
 ```
 
-If Honk's selected upstream is also dnsmasq `127.0.0.1:53` while dnsmasq forwards misses to Honk `:54`, the two services form a recursion loop. Use a genuinely external Honk upstream or let dnsmasq handle that upstream itself.
+Honk's optional bind may be `:53530`, another free port, or disabled; it is not what intercepts LAN port `53`. Host-loopback requests to dnsmasq do not become LAN requests merely because Honk exists. If dnsmasq instead forwards misses to Honk, do not also point Honk's selected upstream back at that dnsmasq: this creates a recursion loop. Local/DHCP names and cached dnsmasq answers reach Honk only when its DNS policy selects that backend.
 
 ## Resolution pipeline
 

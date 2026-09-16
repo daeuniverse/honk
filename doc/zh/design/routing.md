@@ -46,8 +46,8 @@ native-direct 与已有流缓存路径保持原生执行。
 - 配置 `(must)` 是终结结果：设置显式的 `must` 决策字段并跳过嗅探。
   Clash 模式不能覆盖 `must` 或 `block`。
 
-LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后，
-执行一次正常有序策略，不单独扫描 must 规则。[路由参考](../reference/routing.md#出站目标与-must)
+LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，
+执行一次正常有序策略，不单独扫描 must 规则；本地监听器不能提前放行普通 LAN DNS。[路由参考](../reference/routing.md#出站目标与-must)
 定义 DNS 所有权及[显式本地路由迁移](../reference/routing.md#显式本地路由)。
 
 旧 lowering 丢弃 full/regex、把协议 OR 降成 TCP、截断规则链、DNS 只投影首条整规则、

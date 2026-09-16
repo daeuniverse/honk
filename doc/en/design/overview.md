@@ -72,7 +72,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 ```mermaid
 flowchart TB
   PACKET[LAN-forwarded or host-originated TCP/UDP] --> TC[TC classification]
-  TC -->|local/special, direct must, or safe non-DNS direct| NATIVE[Native Linux path]
+  TC -->|special, non-DNS local, direct must, or safe non-DNS direct| NATIVE[Native Linux path]
   TC -->|block must or non-DNS block/dead outbound| DROP[Drop]
   TC -->|non-must DNS after ordered policy| DAE0[dae0]
   TC -->|raw DNS group must, proxy, or userspace decision| DAE0
@@ -90,7 +90,7 @@ flowchart TB
 
 ### Packet walk
 
-1. The [datapath](./datapath.md) classifies LAN-forwarded traffic at LAN TC and host-originated TCP/UDP at WAN TC. Actual local-socket and special exclusions run first. `direct(must)` and route-time-safe non-DNS direct decisions remain on the native Linux path; decisions that still need userspace are not offloaded.
+1. The [datapath](./datapath.md) classifies LAN-forwarded traffic at LAN TC and host-originated TCP/UDP at WAN TC. Existing ingress and control-plane exclusions run first. Ordinary LAN port-53 traffic cannot bypass policy through a local socket; non-DNS local-socket handling remains unchanged. `direct(must)` and route-time-safe non-DNS direct decisions remain on the native Linux path; decisions that still need userspace are not offloaded.
 2. [Traffic-rule ownership](../reference/routing.md#outbound-targets-and-must) determines which port-53 queries enter the [DNS pipeline](./dns.md). Admitted transparent queries, optional host-netns `dns.bind`, and flow-associated reality/target lookups share generation-pinned DNS policy, cache/singleflight, upstream pools, and routing projection.
 3. The [datapath](./datapath.md) redirects ordinary proxy and userspace decisions through `dae0`; inside `daens`, `sk_lookup` assigns them to the [control plane's](./control-plane.md) transparent TCP or UDP listener.
 4. The [NFQUEUE staging](./nfqueue.md) path is enabled by default through `global.nfqueue_enable` when startup prerequisites pass ([Configuration](../configuration.md)); it holds only ambiguous LAN-forwarded UDP after LAN TC and before conntrack/NAT. Each staged flow allocates a persistent unique decision token and publishes token-bound Pending before fixed queue `320`; host-originated WAN traffic stays on canonical TPROXY. Direct/proxy/block completion follows `honk-core`'s `control/nfqueue.rs`; direct creates no userspace socket/copy/retransmission/endpoint/connection entry.

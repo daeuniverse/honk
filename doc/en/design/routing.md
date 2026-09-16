@@ -55,7 +55,7 @@ The cutover preserves the current userspace matching contract:
   mode.
 
 LAN/WAN TCP/UDP destination port `53` evaluates this same ordered policy once
-after local/special exclusions, not a separate must-only scan. The
+after existing ingress and control-plane exclusions, not a separate must-only scan. Local listeners do not exempt ordinary LAN DNS. The
 [routing reference](../reference/routing.md#outbound-targets-and-must) defines
 DNS ownership and [explicit local-rule migration](../reference/routing.md#explicit-local-rules).
 

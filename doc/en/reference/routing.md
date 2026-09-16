@@ -49,7 +49,7 @@ Every positive field has a corresponding list under `RoutingCondition.not`; the 
 Ordinary domain pattern/suffix/keyword alternatives share one condition. When the
 same rule also populates `geosite`, that field remains a separate AND-ed condition.
 
-A matching `mac(...) -> direct(must)` can exempt a client from transparent DNS; ordinary `direct` does not. LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered traffic policy once after local/special exclusions, not a separate must-only scan.
+A matching `mac(...) -> direct(must)` can exempt a client from transparent DNS; ordinary `direct` does not. LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered traffic policy once after existing ingress and control-plane exclusions, not a separate must-only scan. LAN port `53` skips local-socket probing, even when dnsmasq or `dns.bind` listens on the destination.
 
 ## Outbound targets and `must`
 
@@ -61,20 +61,20 @@ A matching `mac(...) -> direct(must)` can exempt a client from transparent DNS; 
 
 Bare node names are not valid outbound targets: `Config::validate` rejects them. Wrap the node in a group (for example `filter: name('node')`) and reference the group instead. A group and a node also may not share a name. A configuration may define at most 250 top-level user groups; higher routing ordinals are reserved by the ABI.
 
-Appending `(must)` makes a matched result terminal and skips later domain rerouting. Clash `Global` and `Direct` modes never override a must result or `block`. It is not the historical internal `MustRules` opcode that continued scanning.
+Appending `(must)` makes a matched result terminal and skips sniffing and later domain rerouting (`no_sniff` semantics). It preserves the selected direct, block, or group action; it is not a blanket bypass of honk. Clash `Global` and `Direct` modes never override a must result or `block`. It is not the historical internal `MustRules` opcode that continued scanning.
 
 For TCP/UDP destination port `53`, traffic-rule ownership is:
 
 | Ordered policy result | DNS ownership |
 | --- | --- |
-| `direct(must)` | Native Linux path, including the configured skb mark; no honk DNS processing. |
+| `direct(must)` | Native Linux path, including the configured skb mark; no transparent honk DNS interception. A targeted local resolver can receive the query normally. |
 | `block(must)` | Drop. |
 | `group(must)` | Carry the original TCP/UDP through the group's normal raw transport, bypassing `DnsController`, cache, hosts, request/response policy, and routing projection. |
 | Any non-`must` result, including ordinary `block` | Valid DNS queries enter `DnsController`; Clash Direct-mode offload cannot take this ownership. |
 
 Malformed non-`must` UDP53 payloads retain the generic UDP fallback rather than entering `DnsController`; the controller row is not a claim that every port-53 payload is DNS. Route-metadata admission follows the [TCP/UDP distinction](../design/control-plane.md#transparent-ingress).
 
-Actual bound local sockets take precedence before traffic routing, independently per transport; wildcard ownership also requires full FIB `NOT_FWDED`. See [DNS ownership](../design/dns.md#dns-ownership-state-machine).
+LAN local-socket precedence applies only to non-53 destinations, independently per transport; wildcard ownership also requires full FIB `NOT_FWDED`, and the non-DNS TCP pure-SYN probe skip remains. Bound `:53` sockets cannot preempt the policy results above. See [DNS ownership](../design/dns.md#dns-ownership-state-machine) for transparent LAN versus native/loopback delivery.
 
 ## Geo assets
 
@@ -106,7 +106,7 @@ honk no longer injects interface-address `direct(must)` rules at startup, SIGHUP
 dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 ```
 
-This is optional user configuration, not an inserted rule. It leaves port `53` available for transparent DNS unless another terminal `must` result takes ownership. Existing local socket ownership remains a pre-routing exclusion, including the non-DNS TCP pure-SYN probe skip; there is no unconditional gateway-management reachability guarantee without explicit routing.
+This is optional user configuration, not an inserted rule. It leaves port `53` available for transparent DNS unless another terminal `must` result takes ownership. Existing non-53 local-socket ownership remains a pre-routing exclusion, including the non-DNS TCP pure-SYN probe skip; there is no unconditional gateway-management reachability guarantee without explicit routing.
 
 With real LAN bindings, honk warns when the compiled rule order cannot confirm
 unconditional `direct(must)` coverage for the observed addresses of configured
