@@ -275,11 +275,11 @@ fn dispatch_datagram(
         }
         let parsed = packet::parse_packet_message(message.body, received_at).map_err(|error| {
             FatalError::MalformedMessage {
-                error: error.to_string(),
+                error: format!("cannot safely identify queued UDP packet: {error}"),
             }
         })?;
         let guard = VerdictGuard::new(Arc::clone(socket), parsed.packet_id, Arc::clone(tracker));
-        if catch_unwind(AssertUnwindSafe(|| (callback)(parsed.packet, guard))).is_err() {
+        if catch_unwind(AssertUnwindSafe(|| (callback)(parsed.event, guard))).is_err() {
             return Err(FatalError::CallbackPanicked);
         }
     }
@@ -408,6 +408,125 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+    use crate::{NF_ACCEPT, NF_DROP, PacketError, PacketEvent, VerdictError};
+
+    fn queued_udp_message(packet_id: u32, udp_length: u16, checksum: u16) -> Vec<u8> {
+        let mut packet = vec![0u8; 72];
+        packet[0] = 0x4f;
+        packet[2..4].copy_from_slice(&72u16.to_be_bytes());
+        packet[9] = libc::IPPROTO_UDP as u8;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&[203, 0, 113, 7]);
+        packet[60..62].copy_from_slice(&53000u16.to_be_bytes());
+        packet[62..64].copy_from_slice(&443u16.to_be_bytes());
+        packet[64..66].copy_from_slice(&udp_length.to_be_bytes());
+        packet[66..68].copy_from_slice(&checksum.to_be_bytes());
+        packet[68..].copy_from_slice(b"next");
+
+        let mut message = Vec::new();
+        let start = netlink::put_message_header(
+            &mut message,
+            netlink::NFNL_SUBSYS_QUEUE << 8 | NFQA_MSG_PACKET,
+            0,
+            0,
+            libc::AF_INET as u8,
+            QUEUE_NUM,
+        );
+        let mut header = [0, 0, 0, 0, 0x08, 0x00, 0];
+        header[..4].copy_from_slice(&packet_id.to_be_bytes());
+        netlink::put_attribute(&mut message, 1, &header);
+        netlink::put_attribute_be32(&mut message, 3, crate::NFQUEUE_SIGNATURE_MARK | 7);
+        netlink::put_attribute(&mut message, 10, &packet);
+        netlink::seal_message(&mut message, start);
+        message
+    }
+
+    #[test]
+    fn rejected_payload_keeps_verdict_ownership_and_following_packet_is_processed() {
+        let (socket, peer, mut fatal) = QueueSocket::for_test();
+        let tracker = GuardTracker::new();
+        let (sender, events) = std::sync::mpsc::channel();
+        let callback: PacketCallback = Arc::new(move |event, mut guard| {
+            match &event {
+                PacketEvent::Rejected { .. } => guard.drop_packet().unwrap(),
+                PacketEvent::Datagram(_) => guard.accept(0x400).unwrap(),
+            }
+            assert!(matches!(
+                guard.drop_packet(),
+                Err(VerdictError::AlreadyCommitted)
+            ));
+            sender.send(event).unwrap();
+        });
+        let mut datagram = queued_udp_message(11, 3, 0);
+        datagram.extend_from_slice(&queued_udp_message(12, 12, 1));
+        datagram.extend_from_slice(&queued_udp_message(13, 12, 0));
+        let received_at = Instant::now();
+        dispatch_datagram(
+            Bytes::from(datagram),
+            received_at,
+            &socket,
+            &callback,
+            &tracker,
+        )
+        .expect("malicious UDP length and checksum are packet-local, not queue protocol failures");
+
+        let expected_tuple = crate::UdpTuple {
+            client: "10.0.0.2:53000".parse().unwrap(),
+            destination: "203.0.113.7:443".parse().unwrap(),
+        };
+        for expected_error in [PacketError::MalformedUdp, PacketError::InvalidUdpChecksum] {
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                PacketEvent::Rejected { tuple, mark, received_at: time, error }
+                    if tuple == expected_tuple && mark == crate::NFQUEUE_SIGNATURE_MARK | 7
+                        && time == received_at && error == expected_error
+            ));
+        }
+        let PacketEvent::Datagram(packet) = events.try_recv().unwrap() else {
+            panic!("following valid UDP datagram was rejected");
+        };
+        assert_eq!(packet.tuple, expected_tuple);
+        assert_eq!(packet.payload.as_ref(), b"next");
+        assert_eq!(tracker.count(), 0);
+        assert!(fatal.try_recv().is_err());
+
+        for (packet_id, verdict) in [(11u32, NF_DROP), (12u32, NF_DROP), (13u32, NF_ACCEPT)] {
+            let response = receive_exact(peer.as_raw_fd())
+                .unwrap()
+                .expect("one verdict per original");
+            let response = netlink::messages(response).next().unwrap().unwrap();
+            let attributes = netlink::attributes(response.body.slice(netlink::NFGENMSG_LEN..))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(attributes[0].kind, 2);
+            assert_eq!(&attributes[0].payload[..4], &verdict.to_be_bytes());
+            assert_eq!(&attributes[0].payload[4..], &packet_id.to_be_bytes());
+        }
+        assert!(receive_exact(peer.as_raw_fd()).unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_nfqa_is_fatal_even_with_a_known_packet_header() {
+        let (socket, peer, _fatal) = QueueSocket::for_test();
+        let tracker = GuardTracker::new();
+        let callback: PacketCallback = Arc::new(|_, _| panic!("malformed envelope dispatched"));
+        let mut datagram = queued_udp_message(11, 12, 0);
+        datagram.extend_from_slice(&[0, 0, 3, 0]);
+        netlink::seal_message(&mut datagram, 0);
+
+        assert!(matches!(
+            dispatch_datagram(
+                Bytes::from(datagram),
+                Instant::now(),
+                &socket,
+                &callback,
+                &tracker
+            ),
+            Err(FatalError::MalformedMessage { .. })
+        ));
+        assert_eq!(tracker.count(), 0);
+        assert!(receive_exact(peer.as_raw_fd()).unwrap().is_none());
+    }
 
     #[test]
     fn queue_row_finds_owned_queue() {
@@ -518,10 +637,6 @@ mod tests {
             &tracker,
         )
         .expect_err("malformed netlink length must stop the listener");
-        assert!(matches!(
-            error,
-            FatalError::MalformedMessage { error }
-                if error == format!("invalid netlink message length {}", netlink::NLMSG_HDRLEN + 1)
-        ));
+        assert!(matches!(error, FatalError::MalformedMessage { .. }));
     }
 }

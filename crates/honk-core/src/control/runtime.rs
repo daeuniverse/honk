@@ -525,15 +525,7 @@ impl ControlPlane {
         // into the group (see the comment above), so loops are flow-disjoint.
         let (critical_fatal_tx, mut critical_fatal_rx) = mpsc::unbounded_channel();
         {
-            let state = UdpLoopState {
-                udp_pool: Arc::clone(&self.udp_pool),
-                stats: Arc::clone(&self.stats),
-                udp_concurrency_limit: Arc::clone(&self.udp_concurrency_limit),
-                dns_controller: Arc::clone(&self.dns_controller),
-                drain: self.drain_tracker.clone(),
-                requires_dns_route_mark: daens_netns_exists(),
-                handle: self.spawn_handle(),
-            };
+            let state = UdpLoopState::new(self, daens_netns_exists());
             let mut tasks = self.background_tasks.lock().await;
             for (socket, family) in udp4_sockets
                 .iter()

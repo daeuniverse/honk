@@ -38,13 +38,12 @@ pub const UDP_DECISION_GENERATION_SHIFT: u32 = 28;
 /// Generation tag carried in the remaining token bits.
 pub const UDP_DECISION_GENERATION_MASK: u32 = 0x3;
 
-/// Maximum non-wrapping compiled-policy generation carried by UDP DNS packets.
-// ponytail: restart at the 20-bit ceiling; add fenced rollover only if it is reached.
+/// Maximum non-wrapping routing generation, reserved persistently across restarts and queue fences.
 pub const DNS_ROUTE_GENERATION_MAX: u64 = (1 << 20) - 1;
 /// Outbound/generation bits ignored by the daens TPROXY fwmark rule.
 pub const DNS_ROUTE_MARK_MASK: u32 = 0x37ff_feff;
 
-/// Per-packet UDP DNS routing authority carried across the dae0 link.
+/// Per-packet UDP DNS routing authority for dae0 or native host reassembly.
 /// Generation bits occupy 0..7, 9..15, 24..26 and 28..29.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpDnsRoute {
@@ -100,6 +99,19 @@ impl UdpDnsRoute {
         let generation =
             mark & 0xff | (mark >> 1) & 0x7f00 | (mark >> 9) & 0x3_8000 | (mark >> 10) & 0xc_0000;
         Self::new(outbound, generation as u64)
+    }
+
+    #[inline(always)]
+    pub const fn to_nfqueue_mark(self) -> u32 {
+        self.to_mark() | NFQUEUE_SIGNATURE_MARK
+    }
+
+    #[inline(always)]
+    pub const fn from_nfqueue_mark(mark: u32) -> Option<Self> {
+        if mark & NFQUEUE_SIGNATURE_MARK != NFQUEUE_SIGNATURE_MARK {
+            return None;
+        }
+        Self::from_mark(mark & !NFQUEUE_SIGNATURE_MARK)
     }
 }
 
@@ -642,6 +654,11 @@ mod udp_dns_route_tests {
                 let mark = route.to_mark();
                 assert_eq!(mark & !DNS_ROUTE_MARK_MASK, TPROXY_MARK);
                 assert_eq!(UdpDnsRoute::from_mark(mark), Some(route));
+                assert_eq!(
+                    UdpDnsRoute::from_nfqueue_mark(route.to_nfqueue_mark()),
+                    Some(route)
+                );
+                assert_eq!(UdpDnsRoute::from_mark(route.to_nfqueue_mark()), None);
             }
         }
     }
@@ -665,6 +682,25 @@ mod udp_dns_route_tests {
         }
         assert_eq!(UdpDnsRoute::from_mark(TPROXY_MARK | (2 << 16)), None);
         assert_eq!(UdpDnsRoute::from_mark(TPROXY_MARK | (0xfc << 16) | 1), None);
+    }
+
+    #[test]
+    fn nfqueue_carrier_rejects_incomplete_signature_and_invalid_dns_authority() {
+        let mark = UdpDnsRoute::new(2, 1).unwrap().to_nfqueue_mark();
+        for invalid in [
+            mark & !NFQUEUE_SIGNATURE_MARK,
+            mark & !CLASSIFIED_MARK,
+            mark & !NFQUEUE_PENDING_MARK,
+            mark & !TPROXY_MARK,
+            mark | DAE_BYPASS_MARK,
+            mark & !1,
+        ] {
+            assert_eq!(UdpDnsRoute::from_nfqueue_mark(invalid), None);
+        }
+        for outbound in [0, 1, 0xfc, 0xfe, 0xff] {
+            let invalid = (mark & !(0xff << 16)) | (outbound << 16);
+            assert_eq!(UdpDnsRoute::from_nfqueue_mark(invalid), None);
+        }
     }
 }
 

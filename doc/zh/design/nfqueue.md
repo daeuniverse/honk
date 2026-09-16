@@ -20,9 +20,9 @@ global {
 | --- | --- |
 | 经过 LAN TC 后语义尚不明确的新 LAN 转发 UDP | 启用且 ready 时，暂存唯一 token 并在 NFQUEUE 中持有原始 skb |
 | 主机发起的 WAN UDP | 保持规范 TPROXY 路径；主机 egress 不经过这个 `inet prerouting` hook |
-| UDP 端口 `53` | 遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；不进入普通 UDP conn-state，绝不暂存或分配 decision token |
+| UDP 端口 `53` | 遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；需要控制器/原始组处理的 LAN 分片查询走下述完整数据报路径，不创建普通 conn-state 或 decision token |
 | 内部/特殊或反向流量 | 绝不暂存 |
-| `must` 或 `block` 路由结果 | 视为终态；绝不暂存 |
+| 非 DNS 的 `must` 或 `block` 路由结果 | 视为终态；绝不暂存 |
 | 路由时已经确定安全的 direct 结果 | 走内核 direct 路径；绝不暂存 |
 | 已启用但尚未 ready 时的暂存候选 | 丢弃新流；无关的非暂存 UDP 保持正常路径 |
 
@@ -48,11 +48,23 @@ flowchart LR
 | Verdict 所有权 | 不可 `Clone`、恰好一次的 `VerdictGuard`；未提交的 guard 在 drop 时发送 `NF_DROP` |
 | Ingest 所有权 | 单 actor，队列上限为 `256` 项和 `8 MiB` payload；仅当 actor dequeue 时才尝试取得 UDP slow-path permit |
 | nftables 所有权 | 单个原子事务独占精确的 `inet honk_nfqueue` / `udp_decision`，即优先级 `-250` 的 `inet prerouting` filter chain；只有携带 Pending 签名的 UDP 才进入队列 |
-| 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。输入畸形或截断、`ENOBUFS`、listener 意外退出以及 verdict socket 失败均为 fatal |
+| 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。可识别的坏包、UDP payload 截断和校验和错误发送 `NF_DROP`；畸形队列元数据、无法识别的报文头、`ENOBUFS`、listener 退出和 verdict socket 失败仍为 fatal |
 
 服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
 
 每次内核统计采样先在调用线程所在的队列网络命名空间中打开 procfs 文件，再通过已绑定该命名空间的文件描述符异步读取；采样对象不由进程主线程或阻塞工作线程的命名空间决定。
+
+## LAN DNS 分片
+
+TC 按普通流量策略判定 offset-zero 的 UDP/53 首片。原生 `direct(must)`、`block(must)` 和可信的精确控制平面 mark 保留原动作。需要 DNS 控制器或原始 must 组的查询不再进入 `daens`，而在 host skb mark 中携带路由/代际；后续片同样留在 host。内核 IPv4/IPv6 重组在优先级 `-400` 执行，早于现有队列 `-250` 和 conntrack `-200`。不增加用户态分片缓冲或 fragment-ID map。
+
+Actor 在成功、饱和和拒绝路径均先区分完整 DNS 数据报与普通 token 流；验证 carrier、当前代际和准入 epoch，对原包确认 `NF_DROP` 后，才发布到透明 socket 共用的有界 DNS/原始 UDP 管线。回复沿用现有 redirect 元数据恢复原目的地址。分发前验证 UDP 校验和，允许 IPv4 零校验和并识别内核 checksum-partial 元数据；没有该元数据的 IPv6 零校验和被拒绝。
+
+队列关闭或未 ready 时，需要控制器/原始组处理的分片丢弃，不能回退原生绕过 DNS 策略。未分片 DNS 保留 TC 快路径；本路径不增加 TCP 分片支持。与 TC redirect 不同，它经过 host raw hook，前置防火墙丢包或改写 mark 可以阻止准入。复制截断时丢弃已识别报文，不转发不完整查询。
+
+需要该路径的以太网首片必须发给本机（`PACKET_HOST`）；纯二层转发候选 fail-closed，不假设 bridge-to-inet hook 已启用。LAN 和 WAN egress 还会丢弃未被消费的 DNS queue carrier，准入关闭时也不例外。不改写桥接防火墙 sysctl。桥与 slave MAC 不同的情况下，分片查询可能被保守拒绝；未分片 DNS 和原生 direct-must 保持既有行为。
+
+`ROUTING_GENERATION_SEQUENCE` 是 core 持有并 pin 的单项计数器。在每次路由发布或 NFQUEUE fence 前预留不回绕的 20 位值；fence 只替换不可变 descriptor，保留编译策略和 maps。普通清理/重启保留计数器，旧首片不能授权新进程的组索引。耗尽或 fence 失败保持 NFQUEUE readiness 关闭，重启不重置计数器。只要 host 命名空间仍可能保留报文，就必须像 `UDP_DECISION_SEQUENCE` 一样保留该 pin；重启系统同时清除重组队列和 bpffs 状态。
 
 ## 决策 token 协议
 

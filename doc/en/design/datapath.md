@@ -149,7 +149,7 @@ The local-socket probe remains before traffic routing only for non-DNS traffic. 
 
 Native direct is subject to external firewall/NAT; see [DNS source boundaries](./dns.md#ingress-paths) for its distinction from `asis` and client-facing anyfrom replies.
 
-UDP53 stays outside ordinary UDP conn-state, NFQUEUE staging, and decision-token allocation. No DNS registry, map, dependency, or configuration key is added for this ownership path.
+UDP53 stays outside ordinary UDP conn-state and decision-token allocation. Fragmented LAN queries requiring controller/raw delivery use [native reassembly and NFQUEUE](./nfqueue.md#fragmented-lan-dns); unfragmented queries retain TC redirection. A pinned routing-generation counter fences queued metadata across restart without adding a fragment cache or configuration key.
 
 ### Special and internal traffic
 

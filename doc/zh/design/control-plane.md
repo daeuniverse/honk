@@ -71,7 +71,7 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 3. 其他情况只有非 wildcard listener bind 可以提供目的地址。
 4. 缺失、畸形、重复、截断或未指定的元数据，会在 slow-path 预留或 payload 保留前被丢弃。
 
-UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP/53 随后按 Config → backend 读锁顺序，在一致快照下验证策略代际并固定语义分组名，再通过既有 epoch gate 预留和入队。同一 tuple 的不兼容普通/原始/其他分组报文被拒绝，而不是借用错误的 transport。非 `must` 有效 DNS 保留独立查询预算；UDP/53 不进入普通 UDP conn-state 或 NFQUEUE staging，也不分配 decision token。
+UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP/53 随后按 Config → backend 读锁顺序，在一致快照下验证策略代际并固定语义分组名，再通过既有 epoch gate 预留和入队。同一 tuple 的不兼容普通/原始/其他分组报文被拒绝，而不是借用错误的 transport。非 `must` 有效 DNS 保留独立查询预算；UDP/53 不创建普通 UDP conn-state 或 decision token。重组后的分片通过 [NFQUEUE](./nfqueue.md#lan-dns-分片) 共用该准入，原包确认丢弃后才发布工作。
 
 归控制器所有的畸形 UDP/53 可保留兼容的 controller handoff 事实用于通用路由，但会丢弃不兼容的终局原始 handoff 及其过期报文事实。
 

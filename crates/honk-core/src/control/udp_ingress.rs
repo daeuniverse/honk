@@ -1,5 +1,6 @@
 //! Transparent UDP provenance, bounded admission, and receive-loop dispatch.
 
+use super::udp_endpoint::DatagramPayload;
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +37,14 @@ pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOri
 /// Owns admitted work after routing publication guards have been released.
 pub(super) enum UdpSlowPathWork {
     Initialize(UdpInitLease),
+    #[cfg(feature = "ebpf")]
+    QueuedDatagram {
+        data: Bytes,
+        raw_dns_group: Option<String>,
+        expected_epoch: u64,
+        enqueued_at: u32,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
     Dns {
         admission: crate::control::dns_control::AdmittedDnsQuery,
         data: Bytes,
@@ -96,29 +105,12 @@ pub(super) fn begin_udp_slow_path_at(
     if original_dst.port() == 53
         && let Some((dns_controller, validated)) = dns
     {
-        let admission = match dns_controller.try_admit_query(true) {
-            Ok(admission) => {
-                stats.record_udp_slow_permit_accepted();
-                admission
-            }
-            Err(error) => {
-                if let Some((runtime, udp_permit)) = error.udp_reply {
-                    stats.record_udp_slow_permit_accepted();
-                    return UdpSlowPathWork::DnsRefused {
-                        runtime,
-                        udp_permit,
-                        response: crate::dns::response::build_dns_refused(data),
-                    };
-                }
-                stats.record_udp_slow_permit_rejected();
-                return UdpSlowPathWork::Done;
-            }
-        };
-        return UdpSlowPathWork::Dns {
-            admission,
-            data: Bytes::copy_from_slice(data),
+        return begin_udp_dns_query(
+            dns_controller,
+            stats,
+            DatagramPayload::Borrowed(data),
             validated,
-        };
+        );
     }
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
         return UdpSlowPathWork::Done;
@@ -142,6 +134,37 @@ pub(super) fn begin_udp_slow_path_at(
     }
 }
 
+fn begin_udp_dns_query(
+    dns_controller: &crate::control::dns_control::DnsController,
+    stats: &StatsManager,
+    data: DatagramPayload<'_>,
+    validated: ValidatedDnsQuery,
+) -> UdpSlowPathWork {
+    let admission = match dns_controller.try_admit_query(true) {
+        Ok(admission) => {
+            stats.record_udp_slow_permit_accepted();
+            admission
+        }
+        Err(error) => {
+            if let Some((runtime, udp_permit)) = error.udp_reply {
+                stats.record_udp_slow_permit_accepted();
+                return UdpSlowPathWork::DnsRefused {
+                    runtime,
+                    udp_permit,
+                    response: crate::dns::response::build_dns_refused(data.as_slice()),
+                };
+            }
+            stats.record_udp_slow_permit_rejected();
+            return UdpSlowPathWork::Done;
+        }
+    };
+    UdpSlowPathWork::Dns {
+        admission,
+        data: data.into_bytes(),
+        validated,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct UdpLoopState {
     pub(super) udp_pool: Arc<UdpEndpointPool>,
@@ -154,6 +177,18 @@ pub(super) struct UdpLoopState {
 }
 
 impl UdpLoopState {
+    pub(super) fn new(plane: &ControlPlane, requires_dns_route_mark: bool) -> Self {
+        Self {
+            udp_pool: Arc::clone(&plane.udp_pool),
+            stats: Arc::clone(&plane.stats),
+            udp_concurrency_limit: Arc::clone(&plane.udp_concurrency_limit),
+            dns_controller: Arc::clone(&plane.dns_controller),
+            drain: Arc::clone(&plane.drain_tracker),
+            requires_dns_route_mark,
+            handle: plane.spawn_handle(),
+        }
+    }
+
     pub(super) async fn dispatch_datagram_at(
         &self,
         data: &[u8],
@@ -182,44 +217,14 @@ impl UdpLoopState {
                 debug!(%src_addr, %original_dst, "Dropping UDP/53 without a valid route mark");
                 return;
             };
-            let expected_epoch = self.udp_pool.initialization_epoch();
-            let config = self.handle.config.read().await;
-            let backend = self.handle.ebpf.read().await;
-            if backend.routing_policy_generation() != u64::from(route.generation()) {
-                debug!(%src_addr, %original_dst, packet_generation = route.generation(),
-                    "Dropping UDP/53 from a stale routing generation");
-                return;
-            }
-            let raw_dns_group = if route.outbound() == OutboundIndex::ControlPlaneRouting as u8 {
-                None
-            } else {
-                let Some(group) = route
-                    .outbound()
-                    .checked_sub(OutboundIndex::UserBase as u8)
-                    .and_then(|index| config.groups.get(index as usize))
-                else {
-                    debug!(%src_addr, %original_dst, outbound = route.outbound(),
-                        "Dropping UDP/53 with no current route owner");
-                    return;
-                };
-                Some(group.name.as_str())
-            };
-            drop(backend);
-            let validated_dns = if raw_dns_group.is_none() {
-                validate_exact_dns_query(data)
-            } else {
-                None
-            };
-            // Config remains guarded through synchronous admission, not through spawned I/O.
-            self.admit_datagram_at(
-                data,
+            self.admit_routed_dns_at(
+                DatagramPayload::Borrowed(data),
                 src_addr,
                 original_dst,
-                validated_dns,
-                raw_dns_group,
-                Some(expected_epoch),
+                route,
                 enqueued_at,
             )
+            .await
         } else {
             let validated_dns = if original_dst.port() == 53 {
                 destination
@@ -239,6 +244,83 @@ impl UdpLoopState {
             )
         };
         self.spawn_work(src_addr, original_dst, work);
+    }
+
+    pub(super) async fn admit_routed_dns_at(
+        &self,
+        data: DatagramPayload<'_>,
+        src_addr: SocketAddr,
+        original_dst: SocketAddr,
+        route: UdpDnsRoute,
+        enqueued_at: u32,
+    ) -> UdpSlowPathWork {
+        let expected_epoch = self.udp_pool.initialization_epoch();
+        let config = self.handle.config.read().await;
+        let backend = self.handle.ebpf.read().await;
+        if backend.routing_policy_generation() != u64::from(route.generation()) {
+            debug!(%src_addr, %original_dst, packet_generation = route.generation(),
+                "Dropping UDP/53 from a stale routing generation");
+            return UdpSlowPathWork::Done;
+        }
+        let raw_dns_group = if route.outbound() == OutboundIndex::ControlPlaneRouting as u8 {
+            None
+        } else {
+            let Some(group) = route
+                .outbound()
+                .checked_sub(OutboundIndex::UserBase as u8)
+                .and_then(|index| config.groups.get(index as usize))
+            else {
+                debug!(%src_addr, %original_dst, outbound = route.outbound(),
+                    "Dropping UDP/53 with no current route owner");
+                return UdpSlowPathWork::Done;
+            };
+            Some(group.name.as_str())
+        };
+        drop(backend);
+        if self.drain.should_reject() || !self.udp_pool.initialization_epoch_is(expected_epoch) {
+            self.stats.record_udp_slow_permit_closed();
+            return UdpSlowPathWork::Done;
+        }
+        if udp_ingress_excluded(src_addr, original_dst) {
+            return UdpSlowPathWork::Done;
+        }
+        let validated_dns = raw_dns_group
+            .is_none()
+            .then(|| validate_exact_dns_query(data.as_slice()))
+            .flatten();
+        // Config remains guarded through synchronous admission, not through spawned I/O.
+        if let Some(validated) = validated_dns {
+            return begin_udp_dns_query(&self.dns_controller, &self.stats, data, validated);
+        }
+        match data {
+            DatagramPayload::Borrowed(data) => self.admit_datagram_at(
+                data,
+                src_addr,
+                original_dst,
+                None,
+                raw_dns_group,
+                Some(expected_epoch),
+                enqueued_at,
+            ),
+            #[cfg(feature = "ebpf")]
+            DatagramPayload::Owned(data) => {
+                let Some(permit) =
+                    try_admit_udp_slow_path(&self.stats, &self.udp_concurrency_limit)
+                else {
+                    return UdpSlowPathWork::Done;
+                };
+                // Ready endpoints can send immediately: retain privately until NF_DROP succeeds.
+                UdpSlowPathWork::QueuedDatagram {
+                    data,
+                    raw_dns_group: raw_dns_group.map(str::to_owned),
+                    expected_epoch,
+                    enqueued_at,
+                    permit,
+                }
+            }
+            #[cfg(all(test, not(feature = "ebpf")))]
+            DatagramPayload::Owned(_) => unreachable!("queued DNS requires NFQUEUE"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -284,14 +366,48 @@ impl UdpLoopState {
         )
     }
 
-    fn spawn_work(&self, src_addr: SocketAddr, original_dst: SocketAddr, work: UdpSlowPathWork) {
+    pub(super) fn spawn_work(
+        &self,
+        src_addr: SocketAddr,
+        original_dst: SocketAddr,
+        work: UdpSlowPathWork,
+    ) {
         match work {
             UdpSlowPathWork::Done => {}
+            #[cfg(feature = "ebpf")]
+            UdpSlowPathWork::QueuedDatagram {
+                data,
+                raw_dns_group,
+                expected_epoch,
+                enqueued_at,
+                permit,
+            } => {
+                if self.drain.should_reject()
+                    || !self.udp_pool.initialization_epoch_is(expected_epoch)
+                {
+                    self.stats.record_udp_slow_permit_closed();
+                    return;
+                }
+                if let EndpointReservation::Initializing(lease) =
+                    self.udp_pool.reserve_payload_or_enqueue_at(
+                        src_addr,
+                        original_dst,
+                        DatagramPayload::Owned(data),
+                        raw_dns_group.as_deref(),
+                        expected_epoch,
+                        permit,
+                        enqueued_at,
+                        &self.stats,
+                    )
+                {
+                    self.spawn_work(src_addr, original_dst, UdpSlowPathWork::Initialize(lease));
+                }
+            }
             UdpSlowPathWork::Initialize(lease) => {
                 let handle = self.handle.clone();
-                let drain = Arc::clone(&self.drain);
+                let guard = ConnectionGuard::new(Arc::clone(&self.drain));
                 self.udp_pool.spawn_slow_path(async move {
-                    let _guard = ConnectionGuard::new(drain);
+                    let _guard = guard;
                     if let Err(error) = handle.serve_udp_connection(lease).await {
                         warn!(%src_addr, %original_dst, %error, "Error handling UDP");
                     }
@@ -418,6 +534,10 @@ pub(super) fn reserve_udp_slow_path(
         data,
     ) {
         UdpSlowPathWork::Initialize(lease) => Some(lease),
+        #[cfg(feature = "ebpf")]
+        UdpSlowPathWork::QueuedDatagram { .. } => {
+            unreachable!("socket admission cannot produce queued-only work")
+        }
         UdpSlowPathWork::Dns { .. }
         | UdpSlowPathWork::DnsRefused { .. }
         | UdpSlowPathWork::Done => None,
@@ -461,6 +581,18 @@ pub(super) fn udp_fast_path(
     )
 }
 
+fn udp_ingress_excluded(client_addr: SocketAddr, original_dst: SocketAddr) -> bool {
+    if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
+        trace!(%client_addr, %original_dst, "Skipping honk-internal UDP");
+        return true;
+    }
+    if is_broadcast_or_multicast(&original_dst.ip()) {
+        trace!(%client_addr, %original_dst, "Skipping broadcast/multicast UDP");
+        return true;
+    }
+    false
+}
+
 /// Ready hits only enqueue under existing byte/packet permits; transport I/O
 /// stays with the endpoint driver and valid DNS keeps its separate query budget.
 #[allow(clippy::too_many_arguments)]
@@ -474,12 +606,7 @@ fn udp_fast_path_at(
     raw_dns_group: Option<&str>,
     enqueued_at: u32,
 ) -> bool {
-    if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
-        trace!(%client_addr, %original_dst, "Skipping honk-internal UDP");
-        return true;
-    }
-    if is_broadcast_or_multicast(&original_dst.ip()) {
-        trace!(%client_addr, %original_dst, "Skipping broadcast/multicast UDP");
+    if udp_ingress_excluded(client_addr, original_dst) {
         return true;
     }
     if original_dst.port() == 53 && validated_dns.is_some() {

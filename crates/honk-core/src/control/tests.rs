@@ -114,8 +114,8 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     assert_eq!(snapshot.actor_queued_bytes, 66_707);
     assert!(snapshot.actor_oldest_age_nanos >= Duration::from_millis(25).as_nanos() as u64);
 
-    drop(queue.dequeue(1_200));
-    drop(queue.dequeue(65_507));
+    drop(queue.dequeue(1_200, true));
+    drop(queue.dequeue(65_507, true));
     let mut max_payloads = 0;
     while queue.try_enqueue(Instant::now(), 65_507) {
         max_payloads += 1;
@@ -126,7 +126,7 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     assert!(max_payloads < NFQUEUE_INGEST_QUEUE_LEN);
 
     for _ in 0..max_payloads {
-        drop(queue.dequeue(65_507));
+        drop(queue.dequeue(65_507, true));
     }
     let empty = stats.udp_snapshot().nfqueue;
     assert_eq!(empty.actor_queue_depth, 0);
@@ -186,10 +186,12 @@ fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
     assert!(queue.try_enqueue(Instant::now(), 0));
     assert_eq!(limit.available_permits(), 1);
 
-    let first = queue.dequeue(0).expect("first dequeued request permit");
+    let first = queue
+        .dequeue(0, true)
+        .expect("first dequeued request permit");
     assert_eq!(limit.available_permits(), 0);
     drop(first);
-    assert!(queue.dequeue(0).is_some());
+    assert!(queue.dequeue(0, true).is_some());
 }
 
 #[cfg(feature = "ebpf")]
@@ -3178,6 +3180,10 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         super::UdpSlowPathWork::Dns { .. } | super::UdpSlowPathWork::DnsRefused { .. } => {
             panic!("non-DNS follower must not take the DNS branch")
         }
+        #[cfg(feature = "ebpf")]
+        super::UdpSlowPathWork::QueuedDatagram { .. } => {
+            panic!("socket follower must not defer queue publication")
+        }
     }
     let udp = stats.udp_snapshot();
     assert_eq!(udp.slow_permit_accepted, 1);
@@ -4763,6 +4769,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             }
             let backend_shutdown = control.finalize_shutdown().await;
             let _ = std::fs::remove_file(pin_root.join(crate::ebpf::UDP_DECISION_SEQUENCE_MAP));
+            let _ = std::fs::remove_file(pin_root.join("ROUTING_GENERATION_SEQUENCE"));
             let _ = std::fs::remove_dir(&pin_root);
 
             exercise?;

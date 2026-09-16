@@ -324,6 +324,12 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             );
         }
         IPPROTO_UDP => {
+            // Pure L2 bridging can skip inet prerouting: queued DNS must never escape natively.
+            if pkt.tuples.five.dst_port == 53
+                && UdpDnsRoute::from_nfqueue_mark(unsafe { (*ctx.skb.skb).mark }).is_some()
+            {
+                return Err(TC_ACT_SHOT);
+            }
             // Skip DNS traffic to reduce state churn.
             if u16::from_be_bytes(pkt.udph.src) == 53 || u16::from_be_bytes(pkt.udph.dst) == 53 {
                 return Err(TC_ACT_PIPE);
@@ -817,9 +823,6 @@ fn do_tproxy_wan_egress_udp(
 /// to the TCP or UDP handler.
 #[inline(always)]
 fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
-    if !crate::maps::datapath_ready() {
-        return Err(TC_ACT_OK);
-    }
     let scratch_key: u32 = 0;
     let pkt = match unsafe { PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
@@ -831,6 +834,17 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         // Unsupported or malformed traffic is left untouched.
+        return Err(TC_ACT_OK);
+    }
+
+    // An owned queue carrier must not escape through a WAN-role bridge port either.
+    if pkt.l4proto == IPPROTO_UDP
+        && pkt.tuples.five.dst_port == 53
+        && UdpDnsRoute::from_nfqueue_mark(unsafe { (*ctx.skb.skb).mark }).is_some()
+    {
+        return Err(TC_ACT_SHOT);
+    }
+    if !crate::maps::datapath_ready() {
         return Err(TC_ACT_OK);
     }
 

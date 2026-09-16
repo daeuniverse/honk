@@ -56,7 +56,7 @@ impl PendingUdpIdentity {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TestVerdict {
+pub(in crate::control) enum TestVerdict {
     Accept { id: u64, mark: u32 },
     Drop { id: u64 },
 }
@@ -68,6 +68,8 @@ pub(super) enum StoredVerdictGuard {
         id: u64,
         sink: Arc<Mutex<Vec<TestVerdict>>>,
     },
+    #[cfg(test)]
+    Failure,
 }
 
 impl StoredVerdictGuard {
@@ -79,6 +81,8 @@ impl StoredVerdictGuard {
                 sink.lock().push(TestVerdict::Accept { id: *id, mark });
                 Ok(())
             }
+            #[cfg(test)]
+            Self::Failure => Err("injected verdict failure".into()),
         }
     }
 
@@ -90,11 +94,13 @@ impl StoredVerdictGuard {
                 sink.lock().push(TestVerdict::Drop { id: *id });
                 Ok(())
             }
+            #[cfg(test)]
+            Self::Failure => Err("injected verdict failure".into()),
         }
     }
 }
 
-pub(super) struct HeldVerdict {
+pub(in crate::control) struct HeldVerdict {
     pub(super) guard: StoredVerdictGuard,
     pub(super) received_at: Instant,
 }
@@ -108,9 +114,21 @@ impl HeldVerdict {
     }
 
     #[cfg(test)]
-    pub(super) fn test(id: u64, received_at: Instant, sink: Arc<Mutex<Vec<TestVerdict>>>) -> Self {
+    pub(in crate::control) fn test(
+        id: u64,
+        received_at: Instant,
+        sink: Arc<Mutex<Vec<TestVerdict>>>,
+    ) -> Self {
         Self {
             guard: StoredVerdictGuard::Test { id, sink },
+            received_at,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) fn failure(received_at: Instant) -> Self {
+        Self {
+            guard: StoredVerdictGuard::Failure,
             received_at,
         }
     }
@@ -256,6 +274,16 @@ impl AdmissionGate {
             "NFQUEUE admission reopened before quiescence"
         );
         state.open = true;
+    }
+
+    pub(super) fn epoch(&self) -> Option<u64> {
+        let state = self.state.lock();
+        state.open.then_some(state.epoch)
+    }
+
+    pub(super) fn try_enter_at(&self, epoch: u64) -> Option<AdmissionTicket<'_>> {
+        let ticket = self.try_enter()?;
+        (ticket.epoch == epoch).then_some(ticket)
     }
 
     pub(super) fn try_enter(&self) -> Option<AdmissionTicket<'_>> {

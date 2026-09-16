@@ -106,9 +106,12 @@ impl RealEbpfBackend {
         if sequence_pin.try_exists()? {
             syscall::validate_pinned_udp_decision_sequence(&sequence_pin)?;
         }
+        let routing_generation_sequence = routing::open_routing_generation_sequence(
+            &pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP),
+        )?;
 
-        // A stale pin must never hide a generation-owned map. The token
-        // allocator is the sole exception because token reuse is forbidden.
+        // A stale pin must never hide a generation-owned map. Persistent
+        // allocators are opened separately because generation reuse is forbidden.
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut loader = EbpfLoader::new();
         loader
@@ -543,6 +546,8 @@ impl RealEbpfBackend {
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,
+            routing_generation_sequence,
+            udp_staging_quiesce_incomplete: false,
         })
     }
 

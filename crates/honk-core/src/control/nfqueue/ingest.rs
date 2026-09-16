@@ -1,6 +1,92 @@
 use super::*;
 
 impl PendingUdpVerdicts {
+    pub(in crate::control) async fn ingest_dns_wait(
+        &self,
+        state: &super::super::udp_ingress::UdpLoopState,
+        packet: QueuedPacket,
+        guard: VerdictGuard,
+        epoch: Option<u64>,
+    ) {
+        let held = HeldVerdict::kernel(guard, packet.received_at);
+        self.ingest_dns_held_wait(state, packet, held, epoch).await;
+    }
+
+    pub(in crate::control) async fn ingest_dns_held_wait(
+        &self,
+        state: &super::super::udp_ingress::UdpLoopState,
+        packet: QueuedPacket,
+        held: HeldVerdict,
+        epoch: Option<u64>,
+    ) {
+        use super::super::udp_endpoint::DatagramPayload;
+        use super::super::udp_ingress::UdpSlowPathWork;
+
+        self.stats.record_udp_nfqueue_received();
+        let Some(_admission) = epoch.and_then(|epoch| self.admission.try_enter_at(epoch)) else {
+            self.drop_one(held, DropOutcome::Cancel);
+            return;
+        };
+        let deadline = packet.received_at + HARD_HOLD_TIMEOUT;
+        if Instant::now() >= deadline {
+            self.drop_one(held, DropOutcome::Cancel);
+            return;
+        }
+        let Some(route) = UdpDnsRoute::from_nfqueue_mark(packet.mark) else {
+            self.drop_one(held, DropOutcome::Other);
+            return;
+        };
+        let client = packet.tuple.client;
+        let destination = packet.tuple.destination;
+        let enqueued_at = super::super::udp_endpoint::queue_now().wrapping_sub(
+            u32::try_from(packet.received_at.elapsed().as_millis()).unwrap_or(u32::MAX),
+        );
+        let work = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            state.admit_routed_dns_at(
+                DatagramPayload::Owned(packet.payload),
+                client,
+                destination,
+                route,
+                enqueued_at,
+            ),
+        )
+        .await;
+        let Ok(work) = work else {
+            self.drop_one(held, DropOutcome::Cancel);
+            return;
+        };
+        if Instant::now() >= deadline || self.admission.epoch() != epoch {
+            self.drop_one(held, DropOutcome::Cancel);
+            return;
+        }
+        let outcome = if matches!(work, UdpSlowPathWork::Done) {
+            DropOutcome::Other
+        } else {
+            DropOutcome::Proxy
+        };
+        if self.drop_one_fatal(held, outcome).is_ok() {
+            // The admission ticket covers publication as well as validation and the verdict.
+            state.spawn_work(client, destination, work);
+        }
+    }
+
+    pub(in crate::control) fn reject_packet(
+        &self,
+        tuple: UdpTuple,
+        mark: u32,
+        received_at: Instant,
+        guard: VerdictGuard,
+    ) {
+        self.stats.record_udp_nfqueue_received();
+        self.reject_held_packet(
+            tuple,
+            mark,
+            HeldVerdict::kernel(guard, received_at),
+            DropOutcome::Other,
+        );
+    }
+
     pub(in crate::control) async fn ingest_wait(
         &self,
         packet: QueuedPacket,
@@ -19,6 +105,10 @@ impl PendingUdpVerdicts {
         slow_permit: Option<OwnedSemaphorePermit>,
     ) -> NfqueueIngest {
         self.stats.record_udp_nfqueue_received();
+        if packet.tuple.destination.port() == 53 {
+            self.drop_one(held, DropOutcome::Other);
+            return NfqueueIngest::Dropped;
+        }
         let Some(decision_token) = extract_nfqueue_token(packet.mark) else {
             self.drop_one(held, DropOutcome::Other);
             return NfqueueIngest::Dropped;
@@ -78,9 +168,21 @@ impl PendingUdpVerdicts {
         held: HeldVerdict,
         outcome: DropOutcome,
     ) {
-        if let Some(decision_token) = extract_nfqueue_token(packet.mark) {
+        self.reject_held_packet(packet.tuple, packet.mark, held, outcome);
+    }
+
+    pub(super) fn reject_held_packet(
+        &self,
+        tuple: UdpTuple,
+        mark: u32,
+        held: HeldVerdict,
+        outcome: DropOutcome,
+    ) {
+        if tuple.destination.port() != 53
+            && let Some(decision_token) = extract_nfqueue_token(mark)
+        {
             self.schedule_cleanup_for_key(
-                FlowKey::new(packet.tuple.client, packet.tuple.destination),
+                FlowKey::new(tuple.client, tuple.destination),
                 decision_token,
             );
         }

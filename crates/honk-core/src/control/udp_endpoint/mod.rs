@@ -39,10 +39,10 @@ use source::{SourceEndpoint, SourceOwner, SourceRetirement, SourceScope};
 pub mod bench_support;
 #[cfg(feature = "ebpf")]
 pub(in crate::control) use admission::OwnedEnqueueError;
-use admission::{EndpointEntry, EndpointKey, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY};
 pub(in crate::control) use admission::{
-    EndpointReservation, QueuedDatagram, UdpInitLease, queue_now,
+    DatagramPayload, EndpointReservation, QueuedDatagram, UdpInitLease, queue_now,
 };
+use admission::{EndpointEntry, EndpointKey, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY};
 #[cfg(test)]
 use admission::{ReservationGateHook, ReservationPublicationHook};
 

@@ -115,13 +115,22 @@ fn queue_timestamp(received_at: Instant) -> u32 {
     queue_now().wrapping_sub(duration_millis(received_at.elapsed()))
 }
 
-enum DatagramPayload<'a> {
+#[derive(Clone)]
+pub(in crate::control) enum DatagramPayload<'a> {
     Borrowed(&'a [u8]),
     #[cfg(any(feature = "ebpf", test))]
     Owned(Bytes),
 }
 
 impl DatagramPayload<'_> {
+    pub(in crate::control) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            #[cfg(any(feature = "ebpf", test))]
+            Self::Owned(data) => data,
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Borrowed(data) => data.len(),
@@ -130,7 +139,7 @@ impl DatagramPayload<'_> {
         }
     }
 
-    fn into_bytes(self) -> Bytes {
+    pub(in crate::control) fn into_bytes(self) -> Bytes {
         match self {
             Self::Borrowed(data) => Bytes::copy_from_slice(data),
             #[cfg(any(feature = "ebpf", test))]
@@ -815,6 +824,30 @@ impl UdpEndpointPool {
         enqueued_at: u32,
         stats: &StatsManager,
     ) -> EndpointReservation {
+        self.reserve_payload_or_enqueue_at(
+            client,
+            dst,
+            DatagramPayload::Borrowed(data),
+            raw_dns_group,
+            expected_epoch,
+            slow_permit,
+            enqueued_at,
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::control) fn reserve_payload_or_enqueue_at(
+        self: &Arc<Self>,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: DatagramPayload<'_>,
+        raw_dns_group: Option<&str>,
+        expected_epoch: u64,
+        slow_permit: OwnedSemaphorePermit,
+        enqueued_at: u32,
+        stats: &StatsManager,
+    ) -> EndpointReservation {
         let key = EndpointKey::new(client, dst);
         loop {
             if self.terminal.load(Ordering::Acquire) {
@@ -838,7 +871,7 @@ impl UdpEndpointPool {
                             match self.enqueue_at(
                                 &initializing.queue_tx,
                                 &initializing.flow_slots,
-                                DatagramPayload::Borrowed(data),
+                                data.clone(),
                                 enqueued_at,
                                 stats,
                             ) {
@@ -858,7 +891,7 @@ impl UdpEndpointPool {
                             match self.enqueue_at(
                                 &ready.queue_tx,
                                 &ready.flow_slots,
-                                DatagramPayload::Borrowed(data),
+                                data.clone(),
                                 enqueued_at,
                                 stats,
                             ) {
@@ -880,7 +913,7 @@ impl UdpEndpointPool {
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
                     return self.reserve_new_at(
                         vacant,
-                        DatagramPayload::Borrowed(data),
+                        data,
                         0,
                         raw_dns_group,
                         expected_epoch,

@@ -241,12 +241,16 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         "detach_hooks must detach the cgroup programs"
     );
     backend.cleanup().await.expect("cleanup");
-    assert!(
-        pin_root.join(UDP_DECISION_SEQUENCE_MAP).exists(),
-        "ordinary cleanup must preserve the token allocator pin"
-    );
-    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("remove test allocator pin");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        assert!(
+            pin_root.join(name).exists(),
+            "ordinary cleanup must preserve {name}"
+        );
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
 }
 
@@ -284,13 +288,18 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
             .id(),
         foreign_id
     );
-    assert!(
-        pin_root
-            .join(UDP_DECISION_SEQUENCE_MAP)
-            .try_exists()
-            .expect("allocator pin readable"),
-        "cleanup removed the persistent allocator"
-    );
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        assert!(
+            pin_root
+                .join(name)
+                .try_exists()
+                .expect("allocator pin readable"),
+            "cleanup removed {name}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&pin_root);
 }
@@ -391,9 +400,52 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     assert_eq!(reset.exhausted, 0);
     reloaded.detach_hooks().expect("detach hooks after reload");
     reloaded.cleanup().await.expect("reload cleanup");
-    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("remove test allocator pin");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn invalid_routing_sequence_pin_is_never_reset() {
+    use aya::maps::IterableMap;
+
+    let pin_root = Path::new("/sys/fs/bpf").join(format!(
+        "honk-routing-sequence-invalid-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&pin_root).unwrap();
+    let pin = pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP);
+    for (entries, flags, value) in [
+        (2, 0, 17),
+        (1, 1 << 7, 17),
+        (1, 0, DNS_ROUTE_GENERATION_MAX + 1),
+    ] {
+        let mut sequence = AyaArray::<_, u64>::create(entries, flags).unwrap();
+        sequence.set(0, value, 0).unwrap();
+        sequence.map().pin(&pin).unwrap();
+        let id = sequence.map().info().unwrap().id();
+        assert!(
+            RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                None,
+                "lo",
+                false
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(aya::maps::MapInfo::from_pin(&pin).unwrap().id(), id);
+        assert_eq!(sequence.get(&0, 0).unwrap(), value);
+        std::fs::remove_file(&pin).unwrap();
+    }
+    std::fs::remove_dir(pin_root).unwrap();
 }
 
 #[tokio::test]
@@ -479,8 +531,12 @@ async fn pname_is_ready_before_first_packet() {
         .cleanup()
         .await
         .expect("clean up pname test backend");
-    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("remove pname test allocator pin");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove pname test allocator pin");
+    }
     std::fs::remove_dir(&pin_root).expect("remove pname test pin root");
 }
 

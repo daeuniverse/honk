@@ -1,4 +1,4 @@
-//! Token-bound ownership of original UDP skbs held by NFQUEUE.
+//! Verdict ownership for token-bound UDP and reassembled routed DNS originals.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use honk_ebpf_common::{
     CLASSIFIED_MARK, OutboundIndex, ROUTING_META_FLAG_OFFLOAD, ROUTING_META_FLAG_PUBLISHED,
-    TuplesKey, UdpDecisionState, extract_nfqueue_token, skb_mark_has_reserved_bits,
+    TuplesKey, UdpDecisionState, UdpDnsRoute, extract_nfqueue_token, skb_mark_has_reserved_bits,
 };
-use honk_nfqueue::{QueuedPacket, VerdictGuard};
+use honk_nfqueue::{QueuedPacket, UdpTuple, VerdictGuard};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 
@@ -22,12 +22,13 @@ use crate::stats::StatsManager;
 mod cell;
 mod ingest;
 mod transition;
+pub(in crate::control) use cell::HeldVerdict;
 pub(super) use cell::PendingUdpIdentity;
 #[cfg(test)]
-use cell::TestVerdict;
+pub(in crate::control) use cell::TestVerdict;
 use cell::{
-    AdmissionGate, CellState, CleanupRequest, DropOutcome, FlowCell, FlowKey, HeldVerdict,
-    RetainedState, terminal_cell_is_stale,
+    AdmissionGate, CellState, CleanupRequest, DropOutcome, FlowCell, FlowKey, RetainedState,
+    terminal_cell_is_stale,
 };
 #[cfg(test)]
 use ingest::retained_state;
@@ -131,6 +132,10 @@ impl PendingUdpVerdicts {
 
     pub(super) fn open_admission(&self) {
         self.admission.open();
+    }
+
+    pub(in crate::control) fn admission_epoch(&self) -> Option<u64> {
+        self.admission.epoch()
     }
 }
 

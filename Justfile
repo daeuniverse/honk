@@ -135,7 +135,7 @@ run-debug:
     @pkill honk-core 2>/dev/null || true
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
-    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE -delete 2>/dev/null || true
+    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE ! -name ROUTING_GENERATION_SEQUENCE -delete 2>/dev/null || true
     sleep 1
     RUST_LOG=info ./target/release/honk-core \
         --config config.dae \
@@ -182,7 +182,7 @@ clean:
     cargo clean
 
 # Clean transient honk-core state while preserving the boot-lifetime UDP
-# decision sequence pin. The MASQUERADE/table-2023 lines remove only legacy
+# decision and routing generation sequence pins. The MASQUERADE/table-2023 lines remove only legacy
 # leftovers; no iptables rules are installed by the live engine.
 clean-all:
     @echo "=== Stopping honk-core ==="
@@ -191,8 +191,8 @@ clean-all:
     @echo "=== Removing link + netns ==="
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
-    @echo "=== Cleaning ephemeral BPF maps (preserving UDP_DECISION_SEQUENCE) ==="
-    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE -delete 2>/dev/null || true
+    @echo "=== Cleaning ephemeral BPF maps (preserving UDP_DECISION_SEQUENCE and ROUTING_GENERATION_SEQUENCE) ==="
+    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE ! -name ROUTING_GENERATION_SEQUENCE -delete 2>/dev/null || true
     @echo "=== Cleaning policy routes (live: table 100) ==="
     @ip rule del fwmark 0x8000000/0x8000000 table 100 2>/dev/null || true
     @ip route flush table 100 2>/dev/null || true

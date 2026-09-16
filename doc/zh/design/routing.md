@@ -172,9 +172,10 @@ lookup；仅清零 IPv4 key 的 padding，不清零马上会被覆盖的字节�
 及供诊断使用的 active domain-map ID。一次路由只取一个 descriptor，再同步调用一个
 槽；缓存命中报文不新增这个 lookup。
 
-已提交路由代际不回绕。单进程最多成功发布 1,048,575 次**编译路由策略**，
-耗尽后保留当前策略并拒绝替换，重启后才能继续。这不是所有 SIGHUP 或 DNS
-runtime 重载的次数限制：未变化的编译策略可以跳过发布。物理携带格式见
+已提交路由代际不回绕。`ROUTING_GENERATION_SEQUENCE` 跨进程重启保留预留值，
+20 位空间最多预留 1,048,575 次，包括失败发布和仅替换 descriptor 的 NFQUEUE fence。
+耗尽时保留当前策略、拒绝进一步发布，并保持 NFQUEUE fence 关闭；只要 host 分片队列
+仍可能存活，就不能删除该 pin。未变化策略可跳过重编译，但队列 fence 仍发布新 descriptor 代际。物理携带格式见
 [数据路径 ABI](./datapath.md#map-清单)，排队元数据与代际生命周期见
 [控制面准入](./control-plane.md#透明代理入口)。
 

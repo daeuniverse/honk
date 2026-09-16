@@ -101,6 +101,8 @@ pub struct RealEbpfBackend {
     routing_generation: Option<routing::RoutingGeneration>,
     routing_slot: u32,
     routing_generation_counter: u64,
+    routing_generation_sequence: AyaArray<AyaMapData, u64>,
+    udp_staging_quiesce_incomplete: bool,
 }
 
 /// Detect the first cgroup2 mount point from /proc/mounts.
@@ -437,10 +439,8 @@ impl RealEbpfBackend {
 
     /// The pin root defaults to `/sys/fs/bpf`, which every other BPF consumer on the host also
     /// pins into, so cleanup unlinks the names this instance claimed rather than sweeping the
-    /// directory. `UDP_DECISION_SEQUENCE` is never in that list — attach pins it through
-    /// `map_pin_path` and skips the loop — so the persistent allocator survives by construction.
-    /// A name the current object no longer contains is no longer swept; the sweep used to remove
-    /// it, and nothing else does now.
+    /// directory. Neither persistent sequence is claimed, so both survive ordinary cleanup,
+    /// including cleanup by an older object that does not know the routing sequence pin.
     fn remove_nonpersistent_pins(&self) -> std::io::Result<()> {
         for name in &self.pinned_maps {
             if let Err(error) = std::fs::remove_file(self.pin_root.join(name))
@@ -507,10 +507,15 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            flags & DATAPATH_FLAG_NFQ_READY == 0 || !self.udp_staging_quiesce_incomplete,
+            "UDP staging quiescence must complete before NFQUEUE can reopen"
+        );
         self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        self.udp_staging_quiesce_incomplete = true;
         let previous = self.rotate_udp_decision_epoch()?;
         self.wait_udp_decision_slot(previous)?;
 
@@ -533,6 +538,8 @@ impl EbpfBackend for RealEbpfBackend {
                 "UDP staging quiescence rejected token {token}: {result:?}"
             );
         }
+        self.fence_routing_generation()?;
+        self.udp_staging_quiesce_incomplete = false;
         Ok(())
     }
 
@@ -1174,8 +1181,8 @@ impl EbpfBackend for RealEbpfBackend {
             let _ = h.await;
         }
 
-        // Drop map fds before unlinking generation-owned pins. The persistent
-        // allocator pin remains the sole owner across ordinary shutdown.
+        // Drop object map fds before unlinking generation-owned pins; both
+        // persistent sequence pins survive ordinary shutdown.
         if let Some(bpf) = self.bpf.take() {
             drop(bpf);
         }

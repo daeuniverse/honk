@@ -74,6 +74,8 @@ flowchart LR
 
 解析后的 DNS 请求仅在携带非零、与配置控制平面 bypass mark 完全相等的标记时保留原生投递。这是请求侧豁免，与用户规则中的 `must` 无关；回包仍遵循既有非 53 路由规则。未经过 LAN hook 的普通 loopback 后端访问不变。Honk 和 dnsmasq 绑定同一已占用端口仍会产生普通 socket bind 冲突；透明拦截本身不占用主机端口 `53`。
 
+需要控制器/原始组处理的 LAN UDP 分片查询要求 NFQUEUE ready，并使用[内核重组](./nfqueue.md#lan-dns-分片)，不是原生策略旁路；该路径不处理 TCP 分片。
+
 以 dnsmasq 为后端时，LAN 查询可以先进入 Honk，而 dnsmasq 保留端口 53 监听：
 
 ```text
@@ -254,6 +256,8 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
+
+路由发布在准入前拒绝旧代排队元数据；已准入查询保留原代 lease。20 位 carrier 使用持久化、启动周期内不回绕的分配器，也计入只替换 descriptor 的 NFQUEUE fence。失败预留值不复用，普通重启不重置耗尽；见[路由发布](./routing.md)。
 
 ## 可观测性
 

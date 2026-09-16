@@ -829,6 +829,71 @@ async fn active_direct_follower_does_not_wait_for_backend() {
         }]
     );
 }
+
+#[tokio::test]
+async fn rejected_dns_carrier_never_aborts_an_ordinary_token_incarnation() {
+    let route = UdpDnsRoute::new(OutboundIndex::ControlPlaneRouting as u8, 1).unwrap();
+    let mark = route.to_nfqueue_mark();
+    let token = extract_nfqueue_token(mark).unwrap();
+    let client = "192.0.2.10:40000".parse().unwrap();
+    let dns = FlowKey::new(client, "198.51.100.20:53".parse().unwrap());
+    let ordinary = FlowKey::new(client, "198.51.100.20:443".parse().unwrap());
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    for key in [dns, ordinary] {
+        mock.seed_staged_udp_flow(
+            &key.tuples(),
+            ConnState {
+                state: UdpDecisionState::Pending as u8,
+                decision_token: token,
+                ..ConnState::default()
+            },
+        );
+    }
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let (pending, mut fatal) = PendingUdpVerdicts::new(
+        Arc::clone(&backend),
+        Arc::new(UdpEndpointPool::new()),
+        Arc::new(StatsManager::new()),
+    );
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    for (id, key) in [(1, dns), (2, ordinary)] {
+        pending.reject_held_packet(
+            UdpTuple {
+                client: key.client,
+                destination: key.destination,
+            },
+            mark,
+            HeldVerdict::test(id, Instant::now(), Arc::clone(&sink)),
+            DropOutcome::Other,
+        );
+    }
+    pending.drain_scheduled_cleanups().await;
+    let backend = backend.read().await;
+    assert_eq!(
+        backend
+            .udp_conn_state_lookup(&dns.tuples())
+            .unwrap()
+            .unwrap()
+            .decision_token,
+        token,
+        "DNS rejection must not reinterpret its route carrier as a cleanup token"
+    );
+    assert!(
+        backend
+            .udp_conn_state_lookup(&ordinary.tuples())
+            .unwrap()
+            .is_none(),
+        "known rejected ordinary packets still retire their exact pending token"
+    );
+    assert_eq!(
+        *sink.lock(),
+        vec![TestVerdict::Drop { id: 1 }, TestVerdict::Drop { id: 2 }]
+    );
+    assert!(matches!(
+        fatal.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
 #[tokio::test]
 async fn transition_write_lock_respects_original_packet_deadline() {
     let fixture = pending_fixture(26);

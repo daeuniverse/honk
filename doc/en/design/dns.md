@@ -86,6 +86,8 @@ Valid non-`must` DNS queries follow [traffic-rule ownership](../reference/routin
 
 Parsed DNS requests bearing a nonzero exact configured control-plane bypass mark retain native delivery. This request-side exemption is independent of a user's `must` route; replies still follow the existing non-53 routing rules. Ordinary loopback backend access outside attached LAN hooks is unchanged. Binding Honk to a port already occupied by dnsmasq still causes an ordinary socket bind conflict; transparent interception does not reserve host port `53`.
 
+Fragmented LAN UDP queries needing controller/raw handling require ready NFQUEUE and use [kernel reassembly](./nfqueue.md#fragmented-lan-dns), not a native-policy bypass. TCP fragmentation is not handled by that path.
+
 For a dnsmasq backend, LAN queries can enter Honk first while dnsmasq retains its port-53 listener:
 
 ```text
@@ -270,7 +272,7 @@ The 30-second deadline bounds waiting for query leases, not completion of transp
 
 SIGHUP builds policy, `/etc/hosts`, groups, routing, upstream transports, projection data, and the outbound runtime before the commit point. Publication occurs with the control-plane routing/config locks; failed preparation leaves the current generation intact. A semantic `dns.bind` change is the exception: listener ownership is process-scoped and the reload is rejected as restart-required.
 
-Routing publication can reject old queued DNS metadata before admission; already admitted queries keep their generation leases. The nonwrapping 20-bit routing carrier permits at most 1,048,575 successful compiled-policy publications per process, not that many total SIGHUPs or DNS runtime generations. Exhaustion preserves the current policy and requires restart before another publication; see [routing publication](./routing.md#synchronous-slots-and-atomic-publication).
+Routing publication rejects stale queued DNS metadata before admission; already admitted queries keep their generation leases. The nonwrapping 20-bit carrier uses a persistent boot-lifetime allocator, including descriptor-only NFQUEUE fences. Failed reservations are not reused; ordinary restart does not reset exhaustion. See [routing publication](./routing.md#synchronous-slots-and-atomic-publication).
 
 ## Observability
 

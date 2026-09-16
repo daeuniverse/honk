@@ -130,8 +130,8 @@ LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后执行�
 实际本地 socket 的优先接收不等于所有网关地址强制直连。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面；需要时使用[显式用户规则](../reference/routing.md#显式本地路由)。
 
 原生直连仍受外部防火墙/NAT 影响；它与 `asis` 及客户端侧 anyfrom 回复的区别见[DNS 来源边界](./dns.md#入口路径)。
+LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 NFQUEUE](./nfqueue.md#lan-dns-分片)；未分片查询仍走 TC redirect。不创建普通 UDP conn-state 或 decision token；持久化路由代际计数器隔离重启前的排队元数据，不增加分片缓存或配置键。
 
-UDP/53 仍不进入普通 UDP conn-state 或 NFQUEUE staging，不分配 decision token；没有新的 DNS 注册表、map、依赖或配置键。
 
 ### 特殊与内部流量
 

@@ -7,8 +7,8 @@ use crate::routing::{Router, golden};
 use aya_obj::generated::{bpf_attr, bpf_cmd};
 use honk_config::types::DialMode;
 use honk_ebpf_common::{
-    DNS_ROUTE_GENERATION_MAX, DaeParam, ROUTING_POLICY_ROOT_NAME, ROUTING_SLOT_NAMES,
-    RoutingDecision,
+    DATAPATH_FLAG_NFQ_ENABLED, DATAPATH_FLAG_NFQ_READY, DNS_ROUTE_GENERATION_MAX, DaeParam,
+    ROUTING_POLICY_ROOT_NAME, ROUTING_SLOT_NAMES, RoutingDecision,
 };
 use std::os::fd::{AsFd, AsRawFd};
 
@@ -170,18 +170,7 @@ fn publication_failure_recovery_and_frozen_root() {
     let root_candidate_name = ROUTING_SLOT_NAMES[root_candidate_slot as usize];
     let root_candidate_targets = backend.routing_targets(root_candidate_name).unwrap();
 
-    // Freezing only the real root makes its root-last update fail with EPERM.
-    let aya::maps::Map::ArrayOfMaps(root) = backend
-        .bpf()
-        .unwrap()
-        .map(ROUTING_POLICY_ROOT_NAME)
-        .unwrap()
-    else {
-        panic!("routing root is not an array of maps");
-    };
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = root.fd().as_fd().as_raw_fd() as u32;
-    bpf_syscall(bpf_cmd::BPF_MAP_FREEZE, &mut attr).unwrap();
+    freeze_root(&backend);
 
     let root_error = backend
         .publish_routing_plan(&root_candidate, &[])
@@ -255,7 +244,10 @@ fn routing_generation_ceiling_preserves_the_committed_root() {
         RoutingPushPlan::compile(&replacement_router, &ids, "direct", DialMode::Ip).unwrap();
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
-    backend.routing_generation_counter = DNS_ROUTE_GENERATION_MAX - 1;
+    backend
+        .routing_generation_sequence
+        .set(0, DNS_ROUTE_GENERATION_MAX - 1, 0)
+        .unwrap();
     backend.publish_routing_plan(&old, &[]).unwrap();
     assert_eq!(
         backend.routing_policy_generation(),
@@ -278,4 +270,143 @@ fn routing_generation_ceiling_preserves_the_committed_root() {
         backend.run_routing_test(&input).unwrap().decision,
         committed.decision
     );
+    backend
+        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
+        .unwrap();
+    assert!(backend.quiesce_udp_staging().is_err());
+    assert!(
+        backend
+            .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+            .is_err()
+    );
+    assert_eq!(
+        backend.run_routing_test(&input).unwrap().decision,
+        committed.decision
+    );
+}
+
+fn freeze_root(backend: &RealEbpfBackend) {
+    let aya::maps::Map::ArrayOfMaps(root) = backend
+        .bpf()
+        .unwrap()
+        .map(ROUTING_POLICY_ROOT_NAME)
+        .unwrap()
+    else {
+        panic!("routing root is not an array of maps");
+    };
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = root.fd().as_fd().as_raw_fd() as u32;
+    bpf_syscall(bpf_cmd::BPF_MAP_FREEZE, &mut attr).unwrap();
+}
+
+fn published_descriptor(backend: &RealEbpfBackend) -> honk_ebpf_common::RoutingPolicyDescriptor {
+    let root = backend
+        .bpf()
+        .unwrap()
+        .map(ROUTING_POLICY_ROOT_NAME)
+        .unwrap();
+    let root =
+        aya::maps::ArrayOfMaps::<_, super::super::RoutingDescriptor>::try_from(root).unwrap();
+    root.get(&0, 0).unwrap().get(&0, 0).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+async fn pinned_generation_survives_restart_and_failed_fence() {
+    let pin_root = std::path::Path::new("/sys/fs/bpf").join(format!(
+        "honk-routing-generation-test-{}",
+        std::process::id()
+    ));
+    let object = object();
+    let rules = [rule(
+        "dns-owner",
+        honk_config::routing::RoutingCondition {
+            port: vec!["53".into()],
+            ..Default::default()
+        },
+        "proxy",
+        0x808,
+        true,
+    )];
+    let router = Router::new(&rules, "direct").unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    let mut connection = golden::connection();
+    connection.dst_port = 53;
+    let input = input(&connection);
+    let mut backend = RealEbpfBackend::load(&object, &pin_root, 12345, None, "lo", false)
+        .await
+        .unwrap();
+    backend.publish_routing_plan(&plan, &[]).unwrap();
+    let initial = backend.routing_policy_generation();
+    let decision = backend.run_routing_test(&input).unwrap().decision;
+    assert_eq!(decision.outbound, 2);
+    assert_eq!(decision.must, 1);
+    let before = published_descriptor(&backend);
+
+    backend
+        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
+        .unwrap();
+    backend.quiesce_udp_staging().unwrap();
+    let fenced = backend.routing_policy_generation();
+    assert!(fenced > initial);
+    assert_eq!(backend.run_routing_test(&input).unwrap().decision, decision);
+    assert_eq!(
+        published_descriptor(&backend),
+        honk_ebpf_common::RoutingPolicyDescriptor {
+            generation: fenced,
+            ..before
+        }
+    );
+    backend
+        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+        .unwrap();
+
+    freeze_root(&backend);
+    assert!(backend.publish_routing_plan(&plan, &[]).is_err());
+    let reserved = backend.routing_generation_sequence.get(&0, 0).unwrap();
+    assert!(reserved > fenced);
+    assert_eq!(backend.routing_policy_generation(), fenced);
+    backend
+        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
+        .unwrap();
+    assert!(backend.quiesce_udp_staging().is_err());
+    let failed_fence = backend.routing_generation_sequence.get(&0, 0).unwrap();
+    assert!(failed_fence > reserved);
+    assert_eq!(backend.routing_policy_generation(), fenced);
+    assert_eq!(backend.run_routing_test(&input).unwrap().decision, decision);
+    assert_eq!(
+        published_descriptor(&backend),
+        honk_ebpf_common::RoutingPolicyDescriptor {
+            generation: fenced,
+            ..before
+        }
+    );
+    assert!(
+        backend
+            .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+            .is_err()
+    );
+    assert_eq!(
+        backend.array_get::<u32>("DATAPATH_FLAGS_MAP", 0).unwrap(),
+        Some(DATAPATH_FLAG_NFQ_ENABLED)
+    );
+    drop(backend);
+
+    let mut reloaded = RealEbpfBackend::load(&object, &pin_root, 12345, None, "lo", false)
+        .await
+        .unwrap();
+    reloaded.publish_routing_plan(&plan, &[]).unwrap();
+    assert!(reloaded.routing_policy_generation() > failed_fence);
+    assert_eq!(
+        reloaded.run_routing_test(&input).unwrap().decision,
+        decision
+    );
+    reloaded.cleanup().await.unwrap();
+    for name in [
+        crate::ebpf::UDP_DECISION_SEQUENCE_MAP,
+        super::super::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).unwrap();
+    }
+    std::fs::remove_dir(pin_root).unwrap();
 }

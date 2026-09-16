@@ -249,11 +249,13 @@ admission, which would pass traffic through, or by punting all flows. Rule-deriv
 flags and domain writers must use the same policy generation. Mode/NFQUEUE
 coordination and existing-flow ownership remain with their current controllers.
 
-The committed routing generation is nonwrapping. At most 1,048,575 successful
-**compiled-routing publications** are allowed per process; exhaustion rejects
-replacement, preserves current policy, and requires restart before further
-publications. This is not a limit on every SIGHUP or DNS runtime generation:
-unchanged compiled policy can skip publication. See [datapath ABI](./datapath.md#map-inventory)
+The committed routing generation is nonwrapping. `ROUTING_GENERATION_SEQUENCE`
+persists reservations across process restarts; its 20-bit space permits 1,048,575
+reservations, including failed publications and descriptor-only NFQUEUE fences.
+At exhaustion the active policy remains, further publication is rejected and
+NFQUEUE fences remain closed. Do not delete the pin while host fragment queues
+can survive. Unchanged policy can skip recompilation, but a queue fence still
+publishes a fresh descriptor generation. See [datapath ABI](./datapath.md#map-inventory)
 for physical carriers and [control-plane admission](./control-plane.md#transparent-ingress)
 for queued metadata and generation lifetimes.
 

@@ -33,7 +33,7 @@ Default on; restart-required. Activation requires the real eBPF backend and an `
 Mock/no-`ebpf` startup or failed fixed-queue preflight warns and disables staging
 for this process, never rewriting config. Set `false` for unprivileged mock development.
 Only LAN-forwarded UDP: `inet prerouting` follows LAN TC; host WAN egress stays TPROXY.
-Exclude DNS 53, internal/special, reverse, `must`, `block`, and already-safe direct.
+Ordinary staging excludes DNS 53, internal/special, reverse, must/block and safe direct. Fragmented LAN UDP53 needing controller/raw delivery instead uses kernel reassembly followed by the same queue, without ordinary conn-state/tokens. Disabled/unready NFQUEUE drops those fragments; unfragmented DNS and native direct-must remain unchanged.
 No queue/worker/timeout/failure knobs: queue `320` and fail-closed behavior are fixed.
 Owned nftables names and firewall restrictions: `crates/honk-nfqueue`.
 

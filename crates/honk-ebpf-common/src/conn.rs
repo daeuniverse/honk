@@ -160,7 +160,7 @@ pub struct ParseTransportCtx {
     pub ihl: u8,              // IP header length in 4-byte units
     pub l4proto: u8,          // Actual L4 protocol
     pub listener_l4proto: u8, // Listener protocol
-    pub pad: u8,              // Alignment padding
+    pub is_fragmented: u8,
 }
 
 /// CT_ARGS_HAS_* bit flags.

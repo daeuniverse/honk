@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt;
 
-pub use packet::{PacketError, QueuedPacket, UdpTuple};
+pub use packet::{PacketError, PacketEvent, QueuedPacket, UdpTuple};
 pub use rules::{CHAIN_NAME, CHAIN_PRIORITY, TABLE_NAME};
 pub use verdict::{NF_ACCEPT, NF_DROP, VerdictError, VerdictGuard};
 
@@ -42,7 +42,7 @@ pub fn preflight() -> Result<(), PreflightError> {
     })
 }
 
-pub type PacketCallback = Arc<dyn Fn(QueuedPacket, VerdictGuard) + Send + Sync + 'static>;
+pub type PacketCallback = Arc<dyn Fn(PacketEvent, VerdictGuard) + Send + Sync + 'static>;
 pub type FatalReceiver = tokio::sync::oneshot::Receiver<FatalError>;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

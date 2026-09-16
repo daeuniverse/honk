@@ -404,3 +404,274 @@ async fn malformed_controller_fallback_discards_incompatible_raw_handoff_metadat
     assert!(state.udp_pool.shutdown().await);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
+
+#[cfg(feature = "ebpf")]
+fn queued_dns_packet(client: SocketAddr, payload: &[u8], mark: u32) -> honk_nfqueue::QueuedPacket {
+    honk_nfqueue::QueuedPacket {
+        tuple: honk_nfqueue::UdpTuple {
+            client,
+            destination: super::addr("203.0.113.53:53"),
+        },
+        payload: bytes::Bytes::copy_from_slice(payload),
+        mark,
+        received_at: std::time::Instant::now(),
+    }
+}
+
+#[cfg(feature = "ebpf")]
+fn queued_dns_owner(
+    state: &udp_ingress::UdpLoopState,
+) -> (
+    nfqueue::PendingUdpVerdicts,
+    tokio::sync::mpsc::Receiver<nfqueue::PendingUdpFatal>,
+) {
+    let (pending, fatal) = nfqueue::PendingUdpVerdicts::new(
+        Arc::clone(&state.handle.ebpf),
+        Arc::clone(&state.udp_pool),
+        Arc::clone(&state.stats),
+    );
+    pending.open_admission();
+    (pending, fatal)
+}
+
+#[cfg(feature = "ebpf")]
+async fn dispatch_queued_dns(
+    state: &udp_ingress::UdpLoopState,
+    pending: &nfqueue::PendingUdpVerdicts,
+    packet: honk_nfqueue::QueuedPacket,
+    epoch: Option<u64>,
+) {
+    let verdicts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let held = nfqueue::HeldVerdict::test(1, packet.received_at, Arc::clone(&verdicts));
+    pending
+        .ingest_dns_held_wait(state, packet, held, epoch)
+        .await;
+    assert_eq!(
+        *verdicts.lock(),
+        vec![nfqueue::TestVerdict::Drop { id: 1 }],
+        "queued DNS must drop its original exactly once, never accept it"
+    );
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn queued_dns_uses_canonical_controller_and_raw_owner() {
+    let (state, mut received, dns_queries) = fixture(&[]);
+    let (pending, mut fatal) = queued_dns_owner(&state);
+    let generation = state.handle.ebpf.read().await.routing_policy_generation();
+    let alpha = UdpDnsRoute::new(OutboundIndex::UserBase as u8, generation).unwrap();
+    let beta = UdpDnsRoute::new(OutboundIndex::UserBase as u8 + 1, generation).unwrap();
+    let controller =
+        UdpDnsRoute::new(OutboundIndex::ControlPlaneRouting as u8, generation).unwrap();
+    let client = super::addr("10.0.0.20:53000");
+    let epoch = pending.admission_epoch();
+
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"raw queue first", alpha.to_nfqueue_mark()),
+        epoch,
+    )
+    .await;
+    assert_eq!(
+        sent(&mut received).await,
+        ("alpha-node".into(), b"raw queue first".to_vec())
+    );
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(
+            client,
+            &super::dns_query_payload(),
+            controller.to_nfqueue_mark(),
+        ),
+        epoch,
+    )
+    .await;
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"wrong Ready owner", beta.to_nfqueue_mark()),
+        epoch,
+    )
+    .await;
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"same Ready owner", alpha.to_nfqueue_mark()),
+        epoch,
+    )
+    .await;
+    assert_eq!(
+        sent(&mut received).await,
+        ("alpha-node".into(), b"same Ready owner".to_vec())
+    );
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(
+            super::addr("10.0.0.21:53000"),
+            b"malformed controller fallback",
+            controller.to_nfqueue_mark(),
+        ),
+        epoch,
+    )
+    .await;
+    assert_eq!(
+        sent(&mut received).await,
+        (
+            "alpha-node".into(),
+            b"malformed controller fallback".to_vec()
+        )
+    );
+    assert!(state.udp_pool.shutdown().await);
+    assert_eq!(dns_queries.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        fatal.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn queued_dns_rejects_stale_carriers_and_closed_or_reopened_admission() {
+    let (state, mut received, dns_queries) = fixture(&[]);
+    let (pending, _fatal) = queued_dns_owner(&state);
+    let generation = state.handle.ebpf.read().await.routing_policy_generation();
+    let alpha = UdpDnsRoute::new(OutboundIndex::UserBase as u8, generation).unwrap();
+    let stale = UdpDnsRoute::new(OutboundIndex::UserBase as u8, generation + 1).unwrap();
+    let unknown = UdpDnsRoute::new(OutboundIndex::UserBase as u8 + 2, generation).unwrap();
+    let client = super::addr("10.0.0.22:53000");
+    let old_epoch = pending.admission_epoch();
+    for mark in [
+        stale.to_nfqueue_mark(),
+        unknown.to_nfqueue_mark(),
+        alpha.to_mark(),
+    ] {
+        dispatch_queued_dns(
+            &state,
+            &pending,
+            queued_dns_packet(client, b"rejected carrier", mark),
+            old_epoch,
+        )
+        .await;
+    }
+    pending.cancel_all().await;
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"closed gate", alpha.to_nfqueue_mark()),
+        old_epoch,
+    )
+    .await;
+    pending.open_admission();
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"queued before fence", alpha.to_nfqueue_mark()),
+        old_epoch,
+    )
+    .await;
+    let mut expired = queued_dns_packet(client, b"expired", alpha.to_nfqueue_mark());
+    expired.received_at -= nfqueue::HARD_HOLD_TIMEOUT;
+    dispatch_queued_dns(&state, &pending, expired, pending.admission_epoch()).await;
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"current admission", alpha.to_nfqueue_mark()),
+        pending.admission_epoch(),
+    )
+    .await;
+    assert_eq!(
+        sent(&mut received).await,
+        ("alpha-node".into(), b"current admission".to_vec()),
+        "no rejected packet may precede the accepted same-flow sentinel"
+    );
+    assert!(state.udp_pool.shutdown().await);
+    assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn queued_dns_verdict_failure_cannot_send_ready_raw_or_start_controller() {
+    let (state, mut received, dns_queries) = fixture(&[]);
+    let (pending, mut fatal) = queued_dns_owner(&state);
+    let generation = state.handle.ebpf.read().await.routing_policy_generation();
+    let alpha = UdpDnsRoute::new(OutboundIndex::UserBase as u8, generation).unwrap();
+    let controller =
+        UdpDnsRoute::new(OutboundIndex::ControlPlaneRouting as u8, generation).unwrap();
+    let client = super::addr("10.0.0.23:53000");
+    dispatch(&state, client, b"ready", Some(alpha)).await;
+    assert_eq!(sent(&mut received).await.1, b"ready");
+    let query = super::dns_query_payload();
+    for (route, payload) in [
+        (alpha, b"failed raw verdict".as_slice()),
+        (controller, query.as_slice()),
+    ] {
+        let packet = queued_dns_packet(client, payload, route.to_nfqueue_mark());
+        let held = nfqueue::HeldVerdict::failure(packet.received_at);
+        pending
+            .ingest_dns_held_wait(&state, packet, held, pending.admission_epoch())
+            .await;
+        assert!(fatal.try_recv().is_ok(), "verdict ambiguity must be fatal");
+    }
+    dispatch(&state, client, b"sentinel after failure", Some(alpha)).await;
+    assert_eq!(
+        sent(&mut received).await.1,
+        b"sentinel after failure",
+        "a failed verdict must not publish into an already-running endpoint"
+    );
+    assert!(state.udp_pool.shutdown().await);
+    assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn queued_dns_config_wait_obeys_receipt_deadline_and_admission_drain() {
+    let (state, mut received, dns_queries) = fixture(&[]);
+    let (pending, _fatal) = queued_dns_owner(&state);
+    let generation = state.handle.ebpf.read().await.routing_policy_generation();
+    let alpha = UdpDnsRoute::new(OutboundIndex::UserBase as u8, generation).unwrap();
+    let client = super::addr("10.0.0.24:53000");
+    let mut packet = queued_dns_packet(client, b"blocked on config", alpha.to_nfqueue_mark());
+    packet.received_at -= nfqueue::HARD_HOLD_TIMEOUT - Duration::from_millis(100);
+    let writer = state.handle.config.write().await;
+    let mut ingest = std::pin::pin!(dispatch_queued_dns(
+        &state,
+        &pending,
+        packet,
+        pending.admission_epoch(),
+    ));
+    {
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(ingest.as_mut(), &mut context),
+            Poll::Pending
+        ));
+    }
+    let mut drain = std::pin::pin!(pending.cancel_all());
+    {
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(drain.as_mut(), &mut context),
+            Poll::Pending
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(ingest, drain);
+    })
+    .await
+    .expect("receipt deadline must release admission while config remains locked");
+    drop(writer);
+    pending.open_admission();
+    dispatch_queued_dns(
+        &state,
+        &pending,
+        queued_dns_packet(client, b"after drain", alpha.to_nfqueue_mark()),
+        pending.admission_epoch(),
+    )
+    .await;
+    assert_eq!(sent(&mut received).await.1, b"after drain");
+    assert!(state.udp_pool.shutdown().await);
+    assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
+}

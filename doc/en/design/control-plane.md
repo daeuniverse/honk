@@ -97,6 +97,8 @@ An authoritative single-candidate TCP transport failure is retried exactly once,
 
 UDP ingress captures the initializer epoch before any awaited validation. Raw UDP53 admission then holds the `Config` read lock followed by the backend read lock to validate the committed routing generation and pin the semantic group. Reservation and enqueue remain under the existing epoch gates. An incompatible ordinary/raw/group owner on the same tuple is rejected, not silently borrowed. Valid non-`must` DNS instead enters its separate query budgets. UDP53 never allocates ordinary conn-state or NFQUEUE decision tokens.
 
+Reassembled [LAN DNS fragments](./nfqueue.md#fragmented-lan-dns) share this admission through NFQUEUE; work publication follows confirmed removal of the original queued packet.
+
 Malformed controller-owned UDP53 retains compatible controller handoff facts for generic routing, but discards an incompatible terminal raw handoff together with its stale packet facts.
 
 ### Transport and transaction

@@ -22,6 +22,7 @@ const ROUTING_TARGETS: [&str; 4] = [
 const FACT_MAP_CAPACITY: u32 = 2_048_000;
 const BPF_F_NO_PREALLOC: u32 = 1;
 const VERIFIER_LOG_SIZE: usize = 1 << 20;
+pub(super) const ROUTING_GENERATION_SEQUENCE_MAP: &str = "ROUTING_GENERATION_SEQUENCE";
 
 type RoutingLpm = AyaLpmTrie<AyaMapData, [u32; 4], DomainRouting>;
 type RoutingDomain = AyaHashMap<AyaMapData, [u32; 4], DomainRouting>;
@@ -34,7 +35,7 @@ pub(super) struct RoutingGeneration {
     _source_v4: RoutingLpm,
     _source_v6: RoutingLpm,
     _mac: RoutingLpm,
-    _descriptor: RoutingDescriptor,
+    descriptor: RoutingDescriptor,
     _btf: OwnedFd,
     _program: OwnedFd,
     _links: Vec<OwnedFd>,
@@ -277,7 +278,69 @@ fn lpm_fd(map: &RoutingLpm) -> RawFd {
     map.map().fd().as_fd().as_raw_fd()
 }
 
+pub(super) fn open_routing_generation_sequence(
+    pin: &Path,
+) -> anyhow::Result<AyaArray<AyaMapData, u64>> {
+    let sequence = if pin.try_exists()? {
+        let data = AyaMapData::from_pin(pin)?;
+        let info = data.info()?;
+        anyhow::ensure!(
+            info.max_entries() == 1 && info.map_flags() == 0,
+            "{ROUTING_GENERATION_SEQUENCE_MAP} has incompatible map shape"
+        );
+        AyaArray::<_, u64>::try_from(aya::maps::Map::from_map_data(data)?)?
+    } else {
+        let sequence = AyaArray::<_, u64>::create(1, 0)?;
+        sequence.map().pin(pin)?;
+        sequence
+    };
+    anyhow::ensure!(
+        sequence.get(&0, 0)? <= DNS_ROUTE_GENERATION_MAX,
+        "{ROUTING_GENERATION_SEQUENCE_MAP} exceeds its generation space"
+    );
+    Ok(sequence)
+}
+
 impl RealEbpfBackend {
+    fn reserve_routing_generation(&mut self) -> anyhow::Result<u64> {
+        let generation = self
+            .routing_generation_sequence
+            .get(&0, 0)?
+            .checked_add(1)
+            .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
+            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+        // The process singleton lock serializes reservations across backend lifetimes.
+        self.routing_generation_sequence.set(0, generation, 0)?;
+        Ok(generation)
+    }
+
+    fn publish_routing_descriptor(
+        &mut self,
+        value: RoutingPolicyDescriptor,
+    ) -> anyhow::Result<RoutingDescriptor> {
+        let mut descriptor = RoutingDescriptor::create(1, 0)?;
+        descriptor.set(0, value, 0)?;
+        let root = self
+            .bpf_mut()?
+            .map_mut(ROUTING_POLICY_ROOT_NAME)
+            .ok_or_else(|| anyhow::anyhow!("map '{ROUTING_POLICY_ROOT_NAME}' not found"))?;
+        let mut root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
+        root.set(0, &descriptor, 0)?;
+        Ok(descriptor)
+    }
+
+    pub(super) fn fence_routing_generation(&mut self) -> anyhow::Result<()> {
+        let Some(active) = self.routing_generation.as_ref() else {
+            return Ok(());
+        };
+        let mut value = active.descriptor.get(&0, 0)?;
+        value.generation = self.reserve_routing_generation()?;
+        let descriptor = self.publish_routing_descriptor(value)?;
+        self.routing_generation.as_mut().unwrap().descriptor = descriptor;
+        self.routing_generation_counter = value.generation;
+        Ok(())
+    }
+
     fn routing_targets(&mut self, slot_name: &str) -> anyhow::Result<Vec<Target>> {
         let bpf = self.bpf_mut()?;
         let mut names = ROUTING_TARGETS.to_vec();
@@ -316,14 +379,7 @@ impl RealEbpfBackend {
         plan: &crate::control::routing_matcher::RoutingPushPlan,
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
-        let generation = self
-            .routing_generation_counter
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
-        anyhow::ensure!(
-            generation <= DNS_ROUTE_GENERATION_MAX,
-            "routing generation counter exhausted at {DNS_ROUTE_GENERATION_MAX}"
-        );
+        let generation = self.reserve_routing_generation()?;
         let active = self.routing_slot;
         anyhow::ensure!(
             active < ROUTING_SLOT_NAMES.len() as u32,
@@ -349,16 +405,7 @@ impl RealEbpfBackend {
             domain_map_id,
             reserved: 0,
         };
-        let mut descriptor = RoutingDescriptor::create(1, 0)?;
-        descriptor.set(0, descriptor_value, 0)?;
-        {
-            let root = self
-                .bpf_mut()?
-                .map_mut(ROUTING_POLICY_ROOT_NAME)
-                .ok_or_else(|| anyhow::anyhow!("map '{ROUTING_POLICY_ROOT_NAME}' not found"))?;
-            let mut root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
-            root.set(0, &descriptor, 0)?;
-        }
+        let descriptor = self.publish_routing_descriptor(descriptor_value)?;
 
         let candidate = RoutingGeneration {
             domain: maps.domain,
@@ -367,7 +414,7 @@ impl RealEbpfBackend {
             _source_v4: maps.source_v4,
             _source_v6: maps.source_v6,
             _mac: maps.mac,
-            _descriptor: descriptor,
+            descriptor,
             _btf: btf,
             _program: program,
             _links: links,
@@ -426,6 +473,8 @@ impl RealEbpfBackend {
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,
+            routing_generation_sequence: AyaArray::create(1, 0)?,
+            udp_staging_quiesce_incomplete: false,
         })
     }
 

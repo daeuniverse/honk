@@ -85,6 +85,7 @@ impl NfqueueActorQueue {
     pub(super) fn dequeue(
         &self,
         payload_bytes: usize,
+        ordinary_udp: bool,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let mut state = self.state.lock();
         let entry = state
@@ -95,7 +96,9 @@ impl NfqueueActorQueue {
         state.payload_bytes = state.payload_bytes.saturating_sub(entry.payload_bytes);
         self.publish(&state);
         drop(state);
-        Arc::clone(&self.slow_limit).try_acquire_owned().ok()
+        ordinary_udp
+            .then(|| Arc::clone(&self.slow_limit).try_acquire_owned().ok())
+            .flatten()
     }
 
     fn sample(&self) {
@@ -471,13 +474,31 @@ impl ControlPlane {
         let pending = Arc::new(pending);
         self.pending_udp_verdicts = Some(Arc::clone(&pending));
 
-        type IngestRequest = (honk_nfqueue::QueuedPacket, honk_nfqueue::VerdictGuard);
+        type IngestRequest = (
+            honk_nfqueue::QueuedPacket,
+            honk_nfqueue::VerdictGuard,
+            Option<u64>,
+        );
         let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestRequest>(NFQUEUE_INGEST_QUEUE_LEN);
         let slow_limit = Arc::clone(&self.udp_concurrency_limit);
         let actor_queue = Arc::new(NfqueueActorQueue::new(Arc::clone(&self.stats), slow_limit));
         let callback_pending = Arc::clone(&pending);
         let callback_queue = Arc::clone(&actor_queue);
-        let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
+        let callback: honk_nfqueue::PacketCallback = Arc::new(move |event, guard| {
+            let packet = match event {
+                honk_nfqueue::PacketEvent::Datagram(packet) => packet,
+                honk_nfqueue::PacketEvent::Rejected {
+                    tuple,
+                    mark,
+                    received_at,
+                    error,
+                } => {
+                    debug!(%error, "Dropping rejected NFQUEUE UDP packet");
+                    callback_pending.reject_packet(tuple, mark, received_at, guard);
+                    return;
+                }
+            };
+            let epoch = callback_pending.admission_epoch();
             let Ok(slot) = ingest_tx.try_reserve() else {
                 callback_pending.reject_actor_queue(packet, guard);
                 return;
@@ -486,7 +507,7 @@ impl ControlPlane {
                 callback_pending.reject_actor_queue(packet, guard);
                 return;
             }
-            slot.send((packet, guard));
+            slot.send((packet, guard, epoch));
         });
         let (service, listener_fatal) = match honk_nfqueue::NfqueueService::start(callback) {
             Ok(runtime) => runtime,
@@ -499,9 +520,17 @@ impl ControlPlane {
         let initializer = self.spawn_handle();
         let drain = Arc::clone(&self.drain_tracker);
         let ingest_queue = Arc::clone(&actor_queue);
+        let dns_ingress = super::udp_ingress::UdpLoopState::new(self, true);
         let ingest_worker = tokio::spawn(async move {
-            while let Some((packet, guard)) = ingest_rx.recv().await {
-                let permit = ingest_queue.dequeue(packet.payload.len());
+            while let Some((packet, guard, epoch)) = ingest_rx.recv().await {
+                let dns = packet.tuple.destination.port() == 53;
+                let permit = ingest_queue.dequeue(packet.payload.len(), !dns);
+                if dns {
+                    actor_pending
+                        .ingest_dns_wait(&dns_ingress, packet, guard, epoch)
+                        .await;
+                    continue;
+                }
                 let nfqueue::NfqueueIngest::Initialize { lease, identity } =
                     actor_pending.ingest_wait(packet, guard, permit).await
                 else {

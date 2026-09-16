@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::{
-    FatalReceiver, NFQUEUE_SIGNATURE_MARK, NfqueueService, PacketCallback, QUEUE_NUM, StartError,
-    TABLE_NAME, UdpTuple, VerdictError, netlink,
+    FatalReceiver, NFQUEUE_SIGNATURE_MARK, NfqueueService, PacketCallback, PacketEvent, QUEUE_NUM,
+    StartError, TABLE_NAME, UdpTuple, VerdictError, netlink,
 };
 
 const INPUT_TOKEN: u32 = 0x0012_3456;
@@ -93,7 +93,10 @@ fn exercise_kernel_contract(runtime: &tokio::runtime::Runtime) {
     );
 
     let (event_tx, events) = mpsc::channel();
-    let callback: PacketCallback = Arc::new(move |packet, mut guard| {
+    let callback: PacketCallback = Arc::new(move |event, mut guard| {
+        let PacketEvent::Datagram(packet) = event else {
+            panic!("valid kernel datagram rejected: {event:?}");
+        };
         let decision = if packet.payload.starts_with(b"accept-") {
             CallbackDecision::Accept
         } else if packet.payload.as_ref() == b"explicit-drop" {
