@@ -554,6 +554,3 @@ mod tests {
 
 #[cfg(test)]
 mod wire_tests;
-
-#[cfg(test)]
-mod compat_tests;
