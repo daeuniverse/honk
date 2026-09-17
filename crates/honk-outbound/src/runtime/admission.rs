@@ -154,10 +154,26 @@ pub(crate) async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
 {
+    admit_replacement_dial(future, false).await
+}
+
+/// Reuse one retained permit only after dropping a socket dialed in this scope.
+/// Supplied sockets must acquire fresh admission even when siblings hold permits.
+pub(crate) async fn admit_replacement_dial<T, E, F>(future: F, reuse_existing: bool) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
     let scope = DIAL_SCOPE.try_with(Arc::clone).ok();
-    let permit = match &scope {
-        Some(scope) => scope.admission.clone().acquire().await,
-        None => DialAdmission::standalone().acquire().await,
+    let retained = scope.as_ref().filter(|_| reuse_existing).and_then(|scope| {
+        let mut held = scope.held.lock();
+        held.extra.pop().or_else(|| held.first.take())
+    });
+    let permit = match retained {
+        Some(permit) => permit,
+        None => match &scope {
+            Some(scope) => scope.admission.clone().acquire().await,
+            None => DialAdmission::standalone().acquire().await,
+        },
     };
     if let Some(scope) = &scope {
         scope.start();

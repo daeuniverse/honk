@@ -426,6 +426,206 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
 }
 
 #[tokio::test]
+async fn cold_replacement_retains_shared_scope_admission() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (registry, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+    let (successor, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, Some(&registry))
+            .unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let (scope, original) = registry
+        .scope_dials_with_start(
+            async {
+                let stream = admit_physical_dial(tokio::net::TcpStream::connect(address))
+                    .await
+                    .unwrap();
+                (capture_dial_scope(), stream)
+            },
+            {
+                let starts = Arc::clone(&starts);
+                move || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+    drop(original);
+
+    let mut competing = Box::pin(
+        successor.scope_dials(admit_physical_dial(tokio::net::TcpStream::connect(address))),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut competing)
+            .await
+            .is_err()
+    );
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let replacement = tokio::spawn(scope.clone().scope(admit_replacement_dial(
+        async move {
+            let stream = tokio::net::TcpStream::connect(address).await?;
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            Ok::<_, std::io::Error>(stream)
+        },
+        true,
+    )));
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("a cold replacement must not reacquire its occupied permit")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut competing)
+            .await
+            .is_err(),
+        "the replacement must hold process admission throughout its connect"
+    );
+    finish_tx.send(()).unwrap();
+    let stream = replacement.await.unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut competing)
+            .await
+            .is_err(),
+        "successful replacement admission must remain in the shared scope"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    drop((stream, scope));
+    tokio::time::timeout(Duration::from_secs(1), competing)
+        .await
+        .expect("ending the shared scope must release process admission")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn supplied_replacement_cannot_use_a_shared_siblings_permit() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (registry, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, None).unwrap();
+    let occupied = registry.acquire_dial_permit().await;
+    let (scope, sibling) = registry
+        .scope_dials(async {
+            let stream = admit_physical_dial(tokio::net::TcpStream::connect(address))
+                .await
+                .unwrap();
+            (capture_dial_scope(), stream)
+        })
+        .await;
+    let mut replacement = Box::pin(scope.clone().scope(admit_replacement_dial(
+        tokio::net::TcpStream::connect(address),
+        false,
+    )));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut replacement)
+            .await
+            .is_err(),
+        "supplied sockets cannot borrow a successful sibling's admission"
+    );
+    drop(occupied);
+    let stream = tokio::time::timeout(Duration::from_secs(1), &mut replacement)
+        .await
+        .expect("released real capacity must admit the supplied replacement")
+        .unwrap();
+    drop(replacement);
+
+    let mut competing = Box::pin(
+        registry.scope_dials(admit_physical_dial(tokio::net::TcpStream::connect(address))),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut competing)
+            .await
+            .is_err(),
+        "the sibling and successful supplied replacement each occupy admission"
+    );
+    drop((stream, sibling, scope));
+    tokio::time::timeout(Duration::from_secs(1), competing)
+        .await
+        .expect("ending the shared scope must release both permits")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn replacement_failure_and_cancellation_release_transferred_admission() {
+    for cancel in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (registry, _) =
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+        let scope = registry
+            .scope_dials(async {
+                let stream = admit_physical_dial(tokio::net::TcpStream::connect(address))
+                    .await
+                    .unwrap();
+                drop(stream);
+                capture_dial_scope()
+            })
+            .await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let replacement = tokio::spawn(scope.clone().scope(admit_replacement_dial(
+            async move {
+                let _stream = tokio::net::TcpStream::connect(address).await?;
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                Err::<(), _>(std::io::Error::other("replacement failed"))
+            },
+            true,
+        )));
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("replacement must start before failure or cancellation")
+            .unwrap();
+        let mut competing = Box::pin(
+            registry.scope_dials(admit_physical_dial(tokio::net::TcpStream::connect(address))),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut competing)
+                .await
+                .is_err()
+        );
+        if cancel {
+            replacement.abort();
+            assert!(replacement.await.unwrap_err().is_cancelled());
+        } else {
+            finish_tx.send(()).unwrap();
+            assert!(replacement.await.unwrap().is_err());
+        }
+        tokio::time::timeout(Duration::from_secs(1), competing)
+            .await
+            .expect("failed or cancelled replacement must release admission before scope exit")
+            .unwrap();
+        drop(scope);
+    }
+}
+
+#[tokio::test]
+async fn cold_replacement_without_retained_credit_waits_for_admission() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (registry, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+    let occupied = registry.acquire_dial_permit().await;
+    let scope = registry.scope_dials(async { capture_dial_scope() }).await;
+    let mut replacement = Box::pin(scope.scope(admit_replacement_dial(
+        tokio::net::TcpStream::connect(address),
+        true,
+    )));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut replacement)
+            .await
+            .is_err(),
+        "cold provenance alone cannot bypass admission without a retained permit"
+    );
+    drop(occupied);
+    tokio::time::timeout(Duration::from_secs(1), replacement)
+        .await
+        .expect("replacement without a retained credit must use released capacity")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn one_dial_permit_serializes_real_tcp_fallbacks() {
     struct Active(Arc<AtomicUsize>);
     impl Drop for Active {

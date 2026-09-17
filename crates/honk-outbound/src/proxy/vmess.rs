@@ -415,7 +415,7 @@ impl TcpOutbound for VmessHandler {
             .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
         let uuid_bytes = uuid.as_bytes();
 
-        let stream = super::transport::connect_transport(node, connect_timeout).await?;
+        let stream = super::transport::wrap_transport(node, None, connect_timeout).await?;
         Self::perform_handshake(uuid_bytes, stream, target, target_domain)
     }
 
@@ -425,14 +425,14 @@ impl TcpOutbound for VmessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         tcp: TcpStream,
-        _connect_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         let password = node.vmess().unwrap().uuid.as_deref().unwrap_or("");
         let uuid = uuid::Uuid::parse_str(password)
             .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
         let uuid_bytes = uuid.as_bytes();
 
-        let stream = super::transport::wrap_transport(node, tcp).await?;
+        let stream = super::transport::wrap_transport(node, Some(tcp), connect_timeout).await?;
         Self::perform_handshake(uuid_bytes, stream, target, target_domain)
     }
 }

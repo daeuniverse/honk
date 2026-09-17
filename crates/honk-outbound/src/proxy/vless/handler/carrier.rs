@@ -8,7 +8,7 @@ use super::{CMD_TCP, ResponseHeaderStrip, VLessHandler, VisionStream};
 use crate::proxy::{AsyncReadWrite, ProxyStream};
 
 impl VLessHandler {
-    /// Build the post-connect stream for a dial. Encrypted Vision keeps the
+    /// Build the connected stream for a dial. Encrypted Vision keeps the
     /// concrete `EncryptedStream` through response and Vision wrapping so
     /// Direct bypasses only AEAD while its boxed outer transport stays intact.
     /// Unencrypted raw TCP/TLS keeps its concrete type for the existing raw switch.
@@ -16,7 +16,8 @@ impl VLessHandler {
         &self,
         node: &Node,
         uuid: [u8; 16],
-        tcp: TcpStream,
+        tcp: Option<TcpStream>,
+        connect_timeout: std::time::Duration,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let vless = node.vless().unwrap();
@@ -26,7 +27,9 @@ impl VLessHandler {
             && matches!(vless.transport.transport.as_str(), "" | "tcp")
         {
             let stream: Box<dyn AsyncReadWrite> =
-                match crate::proxy::transport::maybe_tls_wrap_concrete(node, tcp).await? {
+                match crate::proxy::transport::maybe_tls_wrap_concrete(node, tcp, connect_timeout)
+                    .await?
+                {
                     crate::proxy::transport::MaybeTls::Tls(tls) => {
                         if tls.ssl().version2() != Some(boring::ssl::SslVersion::TLS1_3) {
                             anyhow::bail!("VLESS Vision requires negotiated TLS 1.3");
@@ -46,7 +49,7 @@ impl VLessHandler {
             });
         }
 
-        let stream = crate::proxy::transport::maybe_tls_wrap(node, tcp).await?;
+        let stream = crate::proxy::transport::maybe_tls_wrap(node, tcp, connect_timeout).await?;
         let stream: Box<dyn AsyncReadWrite> = match permit {
             Some(permit) => Box::new(crate::proxy::RuntimeOwnedIo {
                 inner: stream,
@@ -89,14 +92,9 @@ impl VLessHandler {
         connect_timeout: std::time::Duration,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let tcp = match tcp {
-            Some(tcp) => tcp,
-            None => {
-                let address = format!("{}:{}", node.host(), node.port);
-                crate::util::connect_outbound(&address, connect_timeout).await?
-            }
-        };
-        let mut stream = self.dial_stream(node, uuid, tcp, permit).await?;
+        let mut stream = self
+            .dial_stream(node, uuid, tcp, connect_timeout, permit)
+            .await?;
         stream.write_all(&header).await?;
         stream.flush().await?;
         Ok(stream)

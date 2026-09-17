@@ -400,7 +400,7 @@ hooks ([Technology stack](../../../AGENTS.md#technology-stack)):
 
 ### ClientHello authentication
 
-The ClientHello advertises `X25519MLKEM768` first and standalone `X25519`
+The first ClientHello advertises `X25519MLKEM768` first and standalone `X25519`
 second. REALITY authentication deliberately derives from the preset classic
 X25519 private key/share even when the peer negotiates the hybrid share. The
 fixup callback zeros the 32-byte legacy `session_id` slot and computes:
@@ -426,6 +426,24 @@ ephemeral ed25519 certificate whose signature is exactly
 mask-target certificate, or any other authentication failure is fail-closed;
 the client does not infer a unique remote cause. There is no PKI fallback or
 session resumption.
+
+The shared VLESS/Trojan/VMess transport permits one compatibility attempt only
+when the first completed TLS handshake presents a non-ed25519 leaf. It drops
+that connection, then opens a fresh bypass-marked TCP socket to the same peer
+address and offers only X25519. SNI, server public key and short ID are unchanged;
+the SSL state, client random and ephemeral key are new. The replacement must
+pass the same REALITY HMAC authentication before any proxy header or application
+data is sent. An invalid ed25519 HMAC, missing certificate, TLS/IO error or HRR
+does not trigger this attempt; every second-attempt failure is terminal.
+
+This certificate outcome is unauthenticated, not proof of a legacy server:
+wrong credentials or an active attacker can induce the classical attempt, but
+cannot bypass its authentication. There is no cached profile or new setting.
+Both attempts, admission waits and connections share one setup deadline of
+`3 × connect_timeout`; outer caller deadlines can expire sooner. Cold replacement
+holds the failed socket's admission credit through authentication; supplied or
+pooled sockets acquire fresh credit rather than borrowing a sibling's permit.
+Direct callers of the low-level `reality_connect` helper remain single-attempt.
 
 The profile prepends ed25519 to the Chrome-derived signature list so BoringSSL
 can verify the server's TLS CertificateVerify with that leaf key. This differs

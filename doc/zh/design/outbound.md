@@ -347,7 +347,7 @@ REALITY 是只允许 TLS 1.3 的专用 BoringSSL 握手。workspace 中 patched
 
 ### ClientHello 认证
 
-ClientHello 先声明 `X25519MLKEM768`，再声明独立 `X25519`。即使 peer 协商
+首次 ClientHello 先声明 `X25519MLKEM768`，再声明独立 `X25519`。即使 peer 协商
 hybrid share，REALITY 认证仍刻意从预置的 classic X25519 私钥/share 派生。
 fixup callback 把 32 字节 legacy `session_id` 槽清零，并计算：
 
@@ -376,6 +376,20 @@ HMAC-SHA512(authKey, raw_ed25519_public_key)
 
 不匹配、普通 mask-target 证书或其他认证失败都 fail-closed；客户端不会据此
 归因唯一远端原因。不会回退 PKI，也不使用 session resumption。
+
+共享 VLESS/Trojan/VMess transport 仅在首次 TLS 握手完成后收到非 ed25519
+叶证书时，允许一次兼容尝试：关闭该连接，向同一 peer 地址新建带 bypass mark
+的 TCP socket，并只通告 X25519。SNI、服务端公钥和 short ID 不变；SSL 状态、
+client random 与临时密钥全部重新生成。新连接仍须通过同一 REALITY HMAC 认证，
+之后才能发送代理头或应用数据。ed25519 HMAC 错误、缺失证书、TLS/IO 错误或
+HRR 不触发兼容尝试；第二次尝试的任何失败都是最终失败。
+
+该证书结果未经认证，不能证明服务端是旧版本：错误凭据或主动攻击者也可能
+诱发 classical 尝试，但不能绕过其认证。不缓存 profile，不增加配置项。
+两次尝试、配额等待及连接共享 `3 × connect_timeout` 的 setup deadline；
+外层调用方的 deadline 可以更早到期。冷连接替换期间持有已关闭 socket 的
+配额直到认证结束；传入或池化 socket 的替换必须申请新配额，不能借用同级
+连接持有的 permit。直接调用底层 `reality_connect` helper 仍只尝试一次。
 
 REALITY profile 在 Chrome-derived signature algorithm 列表前加入 ed25519，
 使 BoringSSL 能以该叶证书公钥验证服务端 TLS CertificateVerify。这与本次核对的

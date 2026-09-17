@@ -2,7 +2,15 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
-async fn hello_offers_hybrid_then_preset_classic_and_authenticates_full_transcript() {
+async fn both_tls_and_key_share_profiles_authenticate_the_full_transcript() {
+    for chrome in [false, true] {
+        for hybrid in [false, true] {
+            check_hello(chrome, hybrid).await;
+        }
+    }
+}
+
+async fn check_hello(chrome: bool, hybrid: bool) {
     let server_private = [0x51_u8; 32];
     let mut server_public = [0_u8; 32];
     unsafe {
@@ -14,7 +22,9 @@ async fn hello_offers_hybrid_then_preset_classic_and_authenticates_full_transcri
         server_name: "localhost".to_owned(),
     };
     let (client, mut peer) = tokio::io::duplex(16 * 1024);
-    let connect = tokio::spawn(async move { reality_connect(client, &config, false).await });
+    let connect = tokio::spawn(async move {
+        reality_connect_with_key_shares(client, &config, chrome, hybrid).await
+    });
     let mut record_header = [0_u8; 5];
     peer.read_exact(&mut record_header).await.unwrap();
     assert_eq!(record_header[0], 22);
@@ -50,7 +60,14 @@ async fn hello_offers_hybrid_then_preset_classic_and_authenticates_full_transcri
         }
         cursor += len;
     }
-    assert_eq!(shares, vec![(0x11ec, 1184 + 32), (29, 32)]);
+    // GREASE stays in the authenticated transcript, not the negotiated groups.
+    shares.retain(|(group, _)| group >> 8 != group & 0xff || group & 0x0f != 0x0a);
+    let expected = if hybrid {
+        vec![(0x11ec, 1184 + 32), (29, 32)]
+    } else {
+        vec![(29, 32)]
+    };
+    assert_eq!(shares, expected, "chrome={chrome}, hybrid={hybrid}");
     let classic_public: [u8; 32] = classic_public.unwrap();
     let mut shared = [0_u8; 32];
     assert_eq!(
@@ -91,6 +108,7 @@ fn repeated_client_hello_is_rejected_without_resealing() {
             short_id: [0; 8],
             server_name: "localhost".into(),
         },
+        true,
     )
     .unwrap();
     let mut hello = vec![1, 0, 0, 0x4d, 3, 3];

@@ -327,7 +327,7 @@ async fn test_ws_transport_roundtrip() {
     transport.ws_path = Some("/ws-path".into());
     transport.ws_host = Some("cdn.example.com".into());
 
-    let mut stream = connect_transport(&node, std::time::Duration::from_secs(3))
+    let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3))
         .await
         .unwrap();
     stream.write_all(b"ping").await.unwrap();
@@ -520,7 +520,7 @@ async fn test_grpc_transport_roundtrip() {
     transport.transport = "grpc".into();
     transport.grpc_service = Some("testSvc".into());
 
-    let mut stream = connect_transport(&node, std::time::Duration::from_secs(3))
+    let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3))
         .await
         .unwrap();
     stream.write_all(b"hello").await.unwrap();

@@ -41,6 +41,25 @@ impl TrojanHandler {
         header.extend_from_slice(CRLF);
         Ok(header)
     }
+
+    async fn dial_stream(
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        tcp: Option<TcpStream>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
+        let header = Self::build_request_header(password, target, target_domain)?;
+        let mut stream = super::transport::wrap_transport(node, tcp, connect_timeout).await?;
+        stream.write_all(&header).await?;
+        stream.flush().await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(|s| s.to_string()),
+        })
+    }
 }
 
 #[async_trait]
@@ -52,10 +71,7 @@ impl TcpOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = format!("{}:{}", node.host(), node.port);
-        let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
-        self.dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-            .await
+        Self::dial_stream(node, target, target_domain, None, connect_timeout).await
     }
 
     async fn dial_with_tcp(
@@ -64,18 +80,9 @@ impl TcpOutbound for TrojanHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         tcp: TcpStream,
-        _connect_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let header = Self::build_request_header(password, target, target_domain)?;
-        let mut stream = super::transport::wrap_transport(node, tcp).await?;
-        stream.write_all(&header).await?;
-        stream.flush().await?;
-        Ok(ProxyStream {
-            stream,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+        Self::dial_stream(node, target, target_domain, Some(tcp), connect_timeout).await
     }
 }
 
@@ -95,7 +102,7 @@ impl PacketOutbound for TrojanHandler {
             );
         }
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let mut control = super::transport::connect_transport(node, connect_timeout).await?;
+        let mut control = super::transport::wrap_transport(node, None, connect_timeout).await?;
         let addr_header = addr::encode_address(target, target_domain)?;
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
         header.extend_from_slice(hex_sha224(password).as_bytes());

@@ -349,7 +349,7 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 显式 `security=` 会覆盖 VLESS 历史默认值：`none` 关闭 TLS，其他值开启。没有 `security` 时 VLESS 默认开启 TLS。标准 VMess 链接改用其 v2rayN JSON `tls` 字段。
 重复的 `security` 与已识别的 `tls` 声明必须一致，包括别名之间的 TLS 开关；后值不能覆盖前面的冲突声明。VLESS 与编码 VMess 只接受 `tls=0|1`；其他 scheme 保留对未识别 `tls` 文本的处理。Trojan 与 AnyTLS 会拒绝显式明文声明，而不是静默保留强制 TLS。
 
-REALITY 仅使用 TLS 1.3，并依次通告 hybrid `X25519MLKEM768` 与预设 classic `X25519` key share。客户端认证从该预设 classic share 派生并绑定完整 ClientHello；服务端认证校验 REALITY key/HMAC，并 fail-closed。每个 ClientHello 只 seal 一次；HelloRetryRequest 再次调用 callback 时，会在复用 key/nonce 前中止，honk 不会重试该 REALITY 握手。
+REALITY 仅使用 TLS 1.3，首次尝试依次通告 hybrid `X25519MLKEM768` 与预设 classic `X25519` share。仅当握手完成后收到非 ed25519 叶证书，才向同一 peer 新建一次仅使用 X25519 的连接；新连接仍须通过配置的 REALITY key/HMAC 认证，之后才能发送代理数据。两次尝试共享 `3 × connect_timeout` 的 setup deadline，不增加配置项。该触发结果未经认证，并非服务端版本检测。ed25519 HMAC 错误、TLS/IO 错误及 HRR 仍是最终失败。每条连接只 seal 一次 ClientHello，不复用 key/nonce。参见[兼容与认证边界](../design/outbound.md)。
 
 裸 TCP pool 仅在握手前 socket 保持静默时接纳它。任何排队的服务端字节（包括 fatal TLS alert）都会在接纳或取出时拒绝该裸 entry；没有 SNI/alert 特例，也不会重试握手。已经完成协议准备的 ready stream 即使含有有效的 buffered application data，也不会因此被拒绝。
 

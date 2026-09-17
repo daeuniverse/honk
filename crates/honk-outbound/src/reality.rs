@@ -47,6 +47,10 @@ pub struct RealityConfig {
     pub server_name: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("REALITY server presented a real certificate (potential MITM or redirection)")]
+pub(crate) struct RealityMaskCertificate;
+
 /// REALITY parameters from a node, or `None` when the node is not REALITY.
 ///
 /// Like pinSHA256, these keys are security assertions: an unparseable
@@ -96,6 +100,18 @@ pub async fn reality_connect<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    reality_connect_with_key_shares(stream, config, chrome, true).await
+}
+
+pub(crate) async fn reality_connect_with_key_shares<S>(
+    stream: S,
+    config: &RealityConfig,
+    chrome: bool,
+    hybrid: bool,
+) -> anyhow::Result<TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let connector = crate::tls::build_reality_connector(chrome)?;
     let mut cfg = connector.configure()?;
     if chrome {
@@ -104,7 +120,7 @@ where
         cfg.set_enable_ech_grease(true);
         crate::tls::add_chrome_alps(&mut cfg)?;
     }
-    setup_reality_ssl(&cfg, config)?;
+    setup_reality_ssl(&cfg, config, hybrid)?;
     let tls = tokio_boring::connect(cfg, &config.server_name, stream)
         .await
         .map_err(|e| {
@@ -273,7 +289,7 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
     }
 }
 
-fn setup_reality_ssl(ssl: &SslRef, config: &RealityConfig) -> anyhow::Result<()> {
+fn setup_reality_ssl(ssl: &SslRef, config: &RealityConfig, hybrid: bool) -> anyhow::Result<()> {
     // CertificateVerify still needs an offered Ed25519 signature scheme even
     // when ordinary chain verification is disabled. This deliberately differs
     // from the Chrome-derived list; it is not an exact browser fingerprint.
@@ -304,12 +320,18 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
     }
     // New REALITY servers require the hybrid share first, but authenticate
     // against the preset standalone X25519 share when both are present.
-    let groups = c"X25519MLKEM768:X25519";
+    let groups = if hybrid {
+        c"X25519MLKEM768:X25519"
+    } else {
+        c"X25519"
+    };
     let ok = unsafe { boring_sys::SSL_set1_groups_list(ssl.as_ptr(), groups.as_ptr()) };
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_groups_list");
     }
-    crate::tls::set_chrome_key_shares_ssl_ref(ssl)?;
+    if hybrid {
+        crate::tls::set_chrome_key_shares_ssl_ref(ssl)?;
+    }
     let ok = unsafe {
         boring_sys::SSL_set_ex_data(
             ssl.as_ptr(),
@@ -332,10 +354,9 @@ fn verify_server_certificate(ssl: &SslRef, auth_key: &[u8; 32]) -> anyhow::Resul
         .peer_certificate()
         .context("REALITY server presented no certificate")?;
     let pkey = cert.public_key()?;
-    anyhow::ensure!(
-        pkey.id() == Id::ED25519,
-        "REALITY server presented a real certificate (potential MITM or redirection)"
-    );
+    if pkey.id() != Id::ED25519 {
+        return Err(RealityMaskCertificate.into());
+    }
     let mut raw_pub = [0u8; 32];
     let raw_pub = pkey
         .raw_public_key(&mut raw_pub)
@@ -533,3 +554,6 @@ mod tests {
 
 #[cfg(test)]
 mod wire_tests;
+
+#[cfg(test)]
+mod compat_tests;
