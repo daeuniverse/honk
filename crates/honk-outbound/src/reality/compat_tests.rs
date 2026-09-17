@@ -206,28 +206,38 @@ async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Cap
     Captured { peer, hello }
 }
 
+async fn exchange(node: &Node, tcp: Option<TcpStream>) -> anyhow::Result<Vec<u8>> {
+    let MaybeTls::Tls(mut tls) = maybe_tls_wrap_concrete(node, tcp, CONNECT_TIMEOUT).await? else {
+        panic!("REALITY returned plaintext");
+    };
+    tls.write_all(CLIENT_DATA).await?;
+    let mut received = vec![0; SERVER_DATA.len()];
+    tls.read_exact(&mut received).await?;
+    Ok(received)
+}
+
 async fn exercise(replies: &[Reply], supplied: bool) -> Vec<Captured> {
     timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let key = PKey::generate(Id::X25519).unwrap();
         let node = node(addr, &key, supplied);
+        let (registry, _) =
+            crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                &[],
+                1,
+                1,
+                1,
+                None,
+            )
+            .unwrap();
         let client = async {
             let tcp = if supplied {
                 Some(TcpStream::connect(addr).await.unwrap())
             } else {
                 None
             };
-            match maybe_tls_wrap_concrete(&node, tcp, CONNECT_TIMEOUT).await {
-                Ok(MaybeTls::Tls(mut tls)) => {
-                    tls.write_all(CLIENT_DATA).await.unwrap();
-                    let mut received = vec![0; SERVER_DATA.len()];
-                    tls.read_exact(&mut received).await.unwrap();
-                    Ok(received)
-                }
-                Ok(MaybeTls::Plain(_)) => panic!("REALITY returned plaintext"),
-                Err(error) => Err(error),
-            }
+            exchange(&node, tcp).await
         };
         let server = async {
             let mut captured = Vec::new();
@@ -236,7 +246,7 @@ async fn exercise(replies: &[Reply], supplied: bool) -> Vec<Captured> {
             }
             captured
         };
-        let (result, captured) = tokio::join!(client, server);
+        let (result, captured) = tokio::join!(registry.scope_dials(client), server);
         if matches!(replies.last(), Some(Reply::Authenticated)) {
             assert_eq!(result.unwrap(), SERVER_DATA);
         } else {
@@ -283,9 +293,71 @@ fn assert_fresh_classical_retry(captured: &[Captured]) {
 
 #[tokio::test]
 async fn mask_retries_fresh_classical_and_only_authenticated_stream_carries_data() {
-    let captured = exercise(&[Reply::Mask, Reply::Authenticated], true).await;
-    assert_fresh_classical_retry(&captured);
+    for supplied in [false, true] {
+        let captured = exercise(&[Reply::Mask, Reply::Authenticated], supplied).await;
+        assert_fresh_classical_retry(&captured);
+    }
     assert_eq!(exercise(&[Reply::Authenticated], false).await.len(), 1);
+}
+
+#[tokio::test]
+async fn supplied_fallback_waits_for_capacity_without_spending_sibling_credit() {
+    timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sibling_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let key = PKey::generate(Id::X25519).unwrap();
+        let node = node(listener.local_addr().unwrap(), &key, true);
+        let (registry, _) =
+            crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                &[],
+                2,
+                2,
+                2,
+                None,
+            )
+            .unwrap();
+        let occupied = registry.acquire_dial_permit().await;
+        let (sibling, scope) = registry
+            .scope_dials(async {
+                let sibling = crate::runtime::admit_physical_dial(TcpStream::connect(
+                    sibling_listener.local_addr().unwrap(),
+                ))
+                .await
+                .unwrap();
+                (sibling, crate::runtime::capture_dial_scope())
+            })
+            .await;
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut client = Box::pin(scope.clone().scope(exchange(&node, Some(tcp))));
+        let first = tokio::select! {
+            captured = serve(&listener, Reply::Mask, &key) => captured,
+            result = &mut client => panic!("fallback completed before mask exchange: {result:?}"),
+        };
+        assert!(timeout(Duration::from_millis(20), async {
+            tokio::select! {
+                _ = listener.accept() => panic!("supplied fallback spent a sibling's credit"),
+                result = &mut client => panic!("fallback completed without capacity: {result:?}"),
+            }
+        }).await.is_err());
+        drop(occupied);
+        let (result, second) = tokio::join!(client, serve(&listener, Reply::Authenticated, &key));
+        assert_eq!(result.unwrap(), SERVER_DATA);
+        assert_fresh_classical_retry(&[first, second]);
+        assert!(
+            timeout(Duration::from_millis(20), registry.acquire_dial_permit())
+                .await
+                .is_err()
+        );
+        drop((sibling, scope));
+        timeout(Duration::from_secs(1), registry.acquire_dial_permit())
+            .await
+            .unwrap();
+        assert!(listener.accept().now_or_never().is_none());
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

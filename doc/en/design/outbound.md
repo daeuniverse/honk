@@ -282,8 +282,8 @@ TCP -> optional TLS or REALITY -> optional WebSocket or gRPC -> protocol header
 ```
 
 `maybe_tls_wrap_concrete` preserves the concrete TCP/TLS type needed by VLESS Vision direct-copy.
-When REALITY parameters are present, it dispatches to `reality::reality_connect` instead
-of ordinary TLS. The same shared path therefore gives Trojan, VMess, and VLESS
+When REALITY parameters are present, its [bounded authenticated setup](#server-authentication-and-fingerprint-constraints)
+replaces ordinary TLS. The same shared path therefore gives Trojan, VMess, and VLESS
 consistent TLS, REALITY, WS, and gRPC setup.
 
 Cold and pooled-bare Trojan streams use that same complete transport stack.

@@ -83,20 +83,20 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     if !tls.alpn.is_empty() {
         node.validate_protocol()?;
     }
-    let reality = crate::reality::parse_reality_config(node)?;
-    let deadline = reality
-        .as_ref()
-        .map(|_| tokio::time::Instant::now() + connect_timeout * 3);
     let cold = tcp.is_none();
-    let setup = async {
-        let tcp = match tcp {
-            Some(tcp) => tcp,
+    let initial_tcp = async {
+        match tcp {
+            Some(tcp) => Ok(tcp),
             None => {
                 let addr = format!("{}:{}", node.host(), node.port);
-                crate::util::connect_outbound(&addr, connect_timeout).await?
+                crate::util::connect_outbound(&addr, connect_timeout).await
             }
-        };
-        if let Some(reality) = reality {
+        }
+    };
+    if let Some(reality) = crate::reality::parse_reality_config(node)? {
+        let deadline = tokio::time::Instant::now() + connect_timeout * 3;
+        let setup = async {
+            let tcp = initial_tcp.await?;
             let peer = tcp.peer_addr()?;
             let chrome = crate::tls::chrome_mode();
             let tls_stream =
@@ -108,9 +108,8 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                         // The failed handshake has dropped its SSL/TCP before admission
                         // transfers. Supplied sockets cannot spend another dial's credit.
                         let replacement = async {
-                            let remaining = deadline
-                                .unwrap()
-                                .saturating_duration_since(tokio::time::Instant::now());
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
                             if remaining.is_zero() {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::TimedOut,
@@ -133,24 +132,22 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                     }
                     Err(error) => return Err(error),
                 };
-            return Ok(MaybeTls::Tls(Box::new(tls_stream)));
-        }
-        if tls.enabled {
-            let connector = crate::tls::build_connector(node)?;
-            let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
-            let tls_stream = connector.connect(&server_name, tcp).await?;
-            return Ok(MaybeTls::Tls(Box::new(tls_stream)));
-        }
-        Ok(MaybeTls::Plain(tcp))
-    };
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, setup)
+            Ok(MaybeTls::Tls(Box::new(tls_stream)))
+        };
+        return tokio::time::timeout_at(deadline, setup)
             .await
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "REALITY setup timeout")
-            })?,
-        None => setup.await,
+            })?;
     }
+    let tcp = initial_tcp.await?;
+    if tls.enabled {
+        let connector = crate::tls::build_connector(node)?;
+        let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let tls_stream = connector.connect(&server_name, tcp).await?;
+        return Ok(MaybeTls::Tls(Box::new(tls_stream)));
+    }
+    Ok(MaybeTls::Plain(tcp))
 }
 
 /// Upgrade an already-connected (optionally TLS-wrapped) stream to

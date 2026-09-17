@@ -250,7 +250,7 @@ TCP -> optional TLS or REALITY -> optional WebSocket or gRPC -> protocol header
 ```
 
 `maybe_tls_wrap_concrete` 保留 Vision 所需的具体 TCP/TLS 类型。存在
-REALITY 参数时，它分派到 `reality_connect`，而不是普通 TLS。因此同一
+REALITY 参数时，它使用[有界认证建立过程](#服务端认证与指纹约束)，而不是普通 TLS。因此同一
 共享路径为 Trojan、VMess 与 VLESS 提供一致的 TLS、REALITY、WS 与 gRPC
 建立过程。
 
