@@ -1,5 +1,7 @@
 use std::future::Future;
 
+use super::failure::FailureClass;
+
 pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
     label: &'static str,
     raw_query: &[u8],
@@ -16,7 +18,9 @@ where
     let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
     let result = match once(reporter.clone()).await {
         Ok(response) => Ok(response),
-        Err(first) if honk_outbound::proxy::is_packet_rejection(&first) => Err(first),
+        Err(first) if super::failure::classify(&first) != FailureClass::SessionSuspect => {
+            Err(first)
+        }
         Err(first) => {
             record_reset(label);
             reset().await;
@@ -202,6 +206,42 @@ mod tests {
             .node
             .id;
         assert_eq!(selected, incumbent);
+    }
+
+    #[tokio::test]
+    async fn deterministic_answer_does_not_reset_or_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+        let reset_count = Arc::clone(&resets);
+
+        let error = super::exchange_with_retry(
+            "test",
+            &[0; 12],
+            move |_| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<Vec<u8>, _>(
+                        crate::dns::transport::failure::DeterministicResponse {
+                            transport: "DoH",
+                            reason: "HTTP status 400".into(),
+                        }
+                        .into(),
+                    )
+                }
+            },
+            move || {
+                reset_count.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "DoH HTTP status 400");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

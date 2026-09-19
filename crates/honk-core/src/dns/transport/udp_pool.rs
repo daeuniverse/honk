@@ -25,11 +25,39 @@ struct Pending {
     nonce: u64,
     question: Vec<u8>,
     original_id: [u8; 2],
-    reply: oneshot::Sender<Vec<u8>>,
+    reply: oneshot::Sender<Result<Vec<u8>, ReceiveFailure>>,
 }
+
+/// A receive error the loop passes on to the queries it was serving.
+#[derive(Debug, Clone)]
+struct ReceiveFailure {
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl ReceiveFailure {
+    fn new(error: &std::io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::new(self.kind, self.message))
+            .context("UDP DNS receive failed")
+    }
+}
+
+/// A socket whose `recv` keeps failing with no datagram in between is dead;
+/// a single error is one datagram's fate (a port-unreachable ICMP, a path
+/// MTU report) and the socket serves the next query.
+const RECEIVE_ERRORS_BEFORE_STOP: u32 = 8;
 
 struct State {
     closed: bool,
+    /// The receive loop stopped on a socket that kept failing; queries fail with it at once.
+    stopped: Option<ReceiveFailure>,
     next_nonce: u64,
     pending: HashMap<u16, Pending>,
     retired: VecDeque<(Instant, u16)>,
@@ -95,6 +123,7 @@ impl UdpPool {
             socket: Arc::clone(&socket),
             state: Mutex::new(State {
                 closed: false,
+                stopped: None,
                 next_nonce: 0,
                 pending: HashMap::new(),
                 retired: VecDeque::new(),
@@ -109,6 +138,11 @@ impl UdpPool {
         );
         pool.receive_task.lock().await.replace(receive_task);
         Ok(pool)
+    }
+
+    /// The receive loop gave the socket up; a caller holding this pool replaces it.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.state.lock().stopped.is_some()
     }
 
     pub(crate) async fn close(&self) {
@@ -138,6 +172,9 @@ impl UdpPool {
             let mut state = self.state.lock();
             if state.closed {
                 anyhow::bail!("UDP DNS exchange pool is closed");
+            }
+            if let Some(failure) = &state.stopped {
+                return Err(failure.clone().into_error());
             }
             Self::purge_retired(&mut state);
             if state.pending.len() >= MAX_PENDING {
@@ -174,7 +211,8 @@ impl UdpPool {
             reporter.tx(query.len() as u64);
         }
         match tokio::time::timeout(self.timeout, receiver).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Err(failure))) => Err(failure.into_error()),
             Ok(Err(_)) => anyhow::bail!("UDP DNS receive loop stopped"),
             Err(_) => anyhow::bail!("UDP DNS query timed out after {:?}", self.timeout),
         }
@@ -182,14 +220,64 @@ impl UdpPool {
 
     async fn receive_loop(pool: Weak<Self>, socket: Arc<UdpSocket>) {
         let mut buffer = vec![0; 65535];
+        let mut consecutive_errors = 0u32;
         loop {
-            let Ok(Ok(length)) =
-                tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buffer)).await
-            else {
-                if pool.strong_count() == 0 {
-                    break;
+            let length = match tokio::time::timeout(
+                Duration::from_secs(1),
+                socket.recv(&mut buffer),
+            )
+            .await
+            {
+                Ok(Ok(length)) => {
+                    consecutive_errors = 0;
+                    length
                 }
-                continue;
+                // The idle tick: only a chance to notice the pool is gone.
+                Err(_) => {
+                    if pool.strong_count() == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                // A receive error is an answer for the queries in flight — a
+                // port-unreachable means the peer is not listening — rather
+                // than a wait for their timeout. A socket that only fails ends
+                // the loop and fails every later query at once.
+                Ok(Err(error)) => {
+                    let Some(pool) = pool.upgrade() else {
+                        break;
+                    };
+                    let failure = ReceiveFailure::new(&error);
+                    consecutive_errors += 1;
+                    let fatal = consecutive_errors >= RECEIVE_ERRORS_BEFORE_STOP;
+                    let pending = {
+                        let mut state = pool.state.lock();
+                        if fatal {
+                            state.stopped = Some(failure.clone());
+                        }
+                        let ids: Vec<u16> = state.pending.keys().copied().collect();
+                        ids.into_iter()
+                            .filter_map(|id| {
+                                let pending = state.pending.remove(&id)?;
+                                Self::retire_id(&mut state, id);
+                                Some(pending)
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    tracing::debug!(
+                        error = %error,
+                        fatal,
+                        failed = pending.len(),
+                        "UDP DNS receive error"
+                    );
+                    for pending in pending {
+                        let _ = pending.reply.send(Err(failure.clone()));
+                    }
+                    if fatal {
+                        break;
+                    }
+                    continue;
+                }
             };
             if length < 12 {
                 continue;
@@ -219,7 +307,7 @@ impl UdpPool {
             if let Some(pending) = pending {
                 let mut response = buffer[..length].to_vec();
                 response[..2].copy_from_slice(&pending.original_id);
-                let _ = pending.reply.send(response);
+                let _ = pending.reply.send(Ok(response));
             }
         }
     }
@@ -342,6 +430,54 @@ mod tests {
         responder.await.unwrap();
     }
 
+    /// A connected UDP socket learns from a port-unreachable ICMP that the
+    /// peer is not listening: the query in flight fails with that error
+    /// well inside its timeout, and the socket stays usable.
+    #[tokio::test]
+    async fn refused_peer_fails_the_query_before_its_timeout() {
+        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let timeout = Duration::from_secs(5);
+        let pool = UdpPool::new(address, timeout).await.unwrap();
+
+        let started = Instant::now();
+        let error = pool.exchange(&query(0x1234), None).await.unwrap_err();
+        assert!(
+            started.elapsed() < timeout,
+            "the refusal must arrive before the timeout: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("UDP DNS receive failed"),
+            "{error:#}"
+        );
+        assert!(pool.state.lock().stopped.is_none());
+        pool.close().await;
+    }
+
+    /// Errors with no datagram in between mean the socket itself is done: the
+    /// loop stops, later queries fail at once, and the pool says so, which is
+    /// what lets the upstream cache replace it.
+    #[tokio::test]
+    async fn a_socket_that_only_fails_stops_the_pool() {
+        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let pool = UdpPool::new(address, Duration::from_secs(5)).await.unwrap();
+        for _ in 0..RECEIVE_ERRORS_BEFORE_STOP {
+            pool.exchange(&query(0x1234), None).await.unwrap_err();
+        }
+        assert!(pool.is_stopped());
+        let started = Instant::now();
+        let error = pool.exchange(&query(0x1234), None).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(500), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("UDP DNS receive failed"),
+            "{error:#}"
+        );
+        pool.close().await;
+    }
+
     #[tokio::test]
     async fn cancelled_exchange_rejects_delayed_wire_response() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -438,6 +574,7 @@ mod tests {
     fn retired_id_bitmap_tracks_expiry_without_history_scans() {
         let mut state = State {
             closed: false,
+            stopped: None,
             next_nonce: 0,
             pending: HashMap::new(),
             retired: VecDeque::new(),

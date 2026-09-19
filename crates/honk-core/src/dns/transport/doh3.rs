@@ -19,8 +19,8 @@ use super::framing::force_dns_id_zero;
 use super::lifecycle::LifecycleSlot;
 use super::owned_task::OwnedTask;
 use super::{
-    DnsMessageBody, SharedQuicEndpoint, build_doh_request, dns_quic_config, doh_content_length,
-    exchange_with_retry, finish_doh_response, quic_connect_endpoint,
+    DnsMessageBody, SharedQuicEndpoint, build_doh_request, check_doh_status, dns_quic_config,
+    doh_content_length, exchange_with_retry, finish_doh_response, quic_connect_endpoint,
 };
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -99,12 +99,22 @@ impl Doh3Client {
             let mut wire = raw_query.to_vec();
             let orig_id = force_dns_id_zero(&mut wire);
 
-            let req = build_doh_request(&self.dial.endpoint, None, "DoH3")?;
-
-            let mut stream = sender
-                .send_request(req)
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?;
+            let request = || build_doh_request(&self.dial.endpoint, None, "DoH3");
+            let mut stream = match sender.send_request(request()?).await {
+                Ok(stream) => stream,
+                // An HTTP/3 GOAWAY leaves QUIC open, so only the request learns the
+                // session is draining; rebuild once before the query counts an attempt.
+                Err(h3::error::StreamError::RemoteClosing { .. }) => {
+                    debug!(transport = "doh3", "DoH3 session is draining; rebuilding");
+                    self.close_session().await;
+                    sender = self.get_sender().await?;
+                    sender
+                        .send_request(request()?)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?
+                }
+                Err(e) => return Err(anyhow::anyhow!("DoH3 send_request: {e}")),
+            };
 
             stream
                 .send_data(Bytes::from(wire))
@@ -123,7 +133,7 @@ impl Doh3Client {
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH3 recv_response: {e}"))?;
 
-            let status = response.status();
+            check_doh_status("DoH3", response.status())?;
             let content_length = doh_content_length("DoH3", response.headers())?;
             let mut buf = DnsMessageBody::new("DoH3", content_length)?;
             while let Some(mut bytes) = stream
@@ -139,7 +149,7 @@ impl Doh3Client {
                 }
             }
 
-            let response = finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)?;
+            let response = finish_doh_response("DoH3", buf.into_bytes(), orig_id)?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &response)
             {
@@ -157,14 +167,28 @@ impl Doh3Client {
         })?
     }
 
+    /// A sender on a live QUIC connection; one that closed between queries
+    /// is rebuilt before the query goes out rather than failing it.
     async fn get_sender(&self) -> anyhow::Result<H3Sender> {
-        let session = self.session.acquire(|| self.handshake()).await?;
-        session
-            .sender
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("DoH3 session is closing"))
+        for attempt in 0..2 {
+            let session = self.session.acquire(|| self.handshake()).await?;
+            match session.connection.close_reason() {
+                None => {
+                    return session
+                        .sender
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("DoH3 session is closing"));
+                }
+                Some(reason) if attempt == 0 => {
+                    debug!(error = %reason, transport = "doh3", "DoH3 connection is closed; rebuilding");
+                    self.close_session().await;
+                }
+                Some(reason) => anyhow::bail!("DoH3 connection closed: {reason}"),
+            }
+        }
+        unreachable!("the loop returns or fails on its second pass")
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {

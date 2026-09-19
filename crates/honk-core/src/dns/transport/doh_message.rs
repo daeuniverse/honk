@@ -1,4 +1,5 @@
 use super::super::endpoint::DnsEndpoint;
+use super::failure::DeterministicResponse;
 
 /// `host[:port]` authority string (brackets bare IPv6, elides default 443).
 fn authority(host: &str, port: u16) -> String {
@@ -46,17 +47,36 @@ pub(super) fn build_doh_request(
 
 /// Shared DoH/DoH3 response validation: 2xx status, minimum DNS header size,
 /// then restore the original query ID.
-pub(super) fn finish_doh_response(
-    label: &str,
+/// The status verdict, before the body is read: a 5xx may pass on a fresh
+/// session, so it stays a plain error; a 4xx is the peer's settled answer.
+pub(super) fn check_doh_status(
+    label: &'static str,
     status: http::StatusCode,
+) -> anyhow::Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_server_error() {
+        anyhow::bail!("{label} HTTP status {status}")
+    } else {
+        Err(DeterministicResponse {
+            transport: label,
+            reason: format!("HTTP status {status}"),
+        }
+        .into())
+    }
+}
+
+pub(super) fn finish_doh_response(
+    label: &'static str,
     mut body: Vec<u8>,
     orig_id: u16,
 ) -> anyhow::Result<Vec<u8>> {
-    if !status.is_success() {
-        anyhow::bail!("{label} HTTP status {status}");
-    }
     if body.len() < 12 {
-        anyhow::bail!("{label} response too short ({} bytes)", body.len());
+        return Err(DeterministicResponse {
+            transport: label,
+            reason: format!("response too short ({} bytes)", body.len()),
+        }
+        .into());
     }
     super::framing::restore_dns_id(&mut body, orig_id);
     Ok(body)
