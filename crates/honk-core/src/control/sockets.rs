@@ -437,12 +437,33 @@ fn replace_dns_reply_socket(is_v6: bool, old: &Arc<UdpSocket>) -> io::Result<Arc
     Ok(new_sock)
 }
 
+/// Whether a reply send error is about this destination (no route, the
+/// client refused, the datagram is too large) rather than the socket. A
+/// destination error is reported as is: rebuilding the socket would not
+/// change it, and the family's other clients keep the socket they share.
+#[cfg(target_os = "linux")]
+fn send_error_is_destination_specific(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::ECONNREFUSED
+                | libc::EMSGSIZE
+                | libc::EACCES
+                | libc::EPERM
+                | libc::ENOBUFS
+        )
+    )
+}
+
 /// Try to send a DNS reply through the cached per-family transparent socket.
 ///
 /// Returns `None` when the cached path is unavailable (socket creation
-/// failed) and the caller should fall back to a one-shot socket. On a send
-/// failure the cached socket is rebuilt once and the send retried once
-/// before the error is reported.
+/// failed) and the caller should fall back to a one-shot socket. On a
+/// socket-level send failure the cached socket is rebuilt once and the send
+/// retried once before the error is reported; a destination-specific
+/// failure is reported without touching the shared socket.
 #[cfg(target_os = "linux")]
 async fn send_dns_reply_cached(
     data: &[u8],
@@ -467,6 +488,10 @@ async fn send_dns_reply_cached(
         .await;
     match first {
         Ok(n) => return Some(Ok(n)),
+        Err(e) if send_error_is_destination_specific(&e) => {
+            debug!("DNS reply to {} failed ({}); socket kept", client_addr, e);
+            return Some(Err(e));
+        }
         Err(e) => {
             debug!(
                 "cached DNS reply socket send failed ({}); rebuilding once",

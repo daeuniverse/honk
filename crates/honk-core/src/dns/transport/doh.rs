@@ -18,8 +18,8 @@ use super::framing::force_dns_id_zero;
 use super::lifecycle::LifecycleSlot;
 use super::owned_task::OwnedTask;
 use super::{
-    DialContext, DnsMessageBody, build_doh_request, doh_content_length, exchange_with_retry,
-    finish_doh_response,
+    DialContext, DnsMessageBody, build_doh_request, check_doh_status, doh_content_length,
+    exchange_with_retry, finish_doh_response,
 };
 use honk_outbound::tls::TlsConnector;
 
@@ -49,7 +49,18 @@ impl DohClient {
         dial: DialContext,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
-        let connector = honk_outbound::tls::build_dns_connector(false, DOH_ALPN_WIRE)?;
+        Self::with_connector(
+            dial,
+            active_tasks,
+            honk_outbound::tls::build_dns_connector(false, DOH_ALPN_WIRE)?,
+        )
+    }
+
+    fn with_connector(
+        dial: DialContext,
+        active_tasks: Arc<AtomicUsize>,
+        connector: TlsConnector,
+    ) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             dial,
             connector,
@@ -104,7 +115,7 @@ impl DohClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH response error: {e}"))?;
 
-            let status = response.status();
+            check_doh_status("DoH", response.status())?;
             let content_length = doh_content_length("DoH", response.headers())?;
             let mut body = response.into_body();
             let mut buf = DnsMessageBody::new("DoH", content_length)?;
@@ -115,7 +126,7 @@ impl DohClient {
                 let _ = body.flow_control().release_capacity(n);
             }
 
-            let response = finish_doh_response("DoH", status, buf.into_bytes(), orig_id)?;
+            let response = finish_doh_response("DoH", buf.into_bytes(), orig_id)?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &response)
             {
@@ -130,13 +141,28 @@ impl DohClient {
         })?
     }
 
+    /// A sender on a live session. The connection driver can stop between
+    /// queries (server GOAWAY, idle close), leaving a sender clone that only
+    /// fails; `ready` catches that, and the session is rebuilt once before
+    /// the query goes out, instead of the query spending its retry on it.
     async fn get_sender(&self) -> anyhow::Result<H2Sender> {
-        let session = self.session.acquire(|| self.handshake()).await?;
-        session
-            .sender
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("DoH session is closing"))
+        for attempt in 0..2 {
+            let session = self.session.acquire(|| self.handshake()).await?;
+            let sender = session
+                .sender
+                .lock()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("DoH session is closing"))?;
+            match sender.ready().await {
+                Ok(sender) => return Ok(sender),
+                Err(error) if attempt == 0 => {
+                    debug!(error = %error, transport = "doh", "DoH session is dead; rebuilding");
+                    self.close_session().await;
+                }
+                Err(error) => anyhow::bail!("DoH session unusable: {error}"),
+            }
+        }
+        unreachable!("the loop returns or fails on its second pass")
     }
 
     async fn handshake(&self) -> anyhow::Result<H2Session> {

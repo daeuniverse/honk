@@ -45,6 +45,7 @@ impl UpstreamPool {
         let family = if address.is_ipv6() { 1 } else { 0 };
         if let Some((cached_address, pool)) = entry.udp.lock().pools[family].as_ref()
             && *cached_address == address
+            && !pool.is_stopped()
         {
             return Ok(Arc::clone(pool));
         }
@@ -58,6 +59,7 @@ impl UpstreamPool {
             let mut state = entry.udp.lock();
             if let Some((cached_address, pool)) = state.pools[family].as_ref()
                 && *cached_address == address
+                && !pool.is_stopped()
             {
                 (Arc::clone(pool), Some(candidate))
             } else {

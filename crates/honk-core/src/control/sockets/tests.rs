@@ -655,3 +655,20 @@ fn netns_transparent_udp_batches_preserve_queued_packet_marks() -> anyhow::Resul
     .join()
     .expect("UDP mark namespace thread")
 }
+
+#[test]
+fn reply_send_errors_about_the_destination_keep_the_socket() {
+    for code in [libc::EHOSTUNREACH, libc::ECONNREFUSED, libc::EMSGSIZE] {
+        assert!(send_error_is_destination_specific(
+            &io::Error::from_raw_os_error(code)
+        ));
+    }
+    for code in [libc::EBADF, libc::ENOTSOCK, libc::EIO] {
+        assert!(!send_error_is_destination_specific(
+            &io::Error::from_raw_os_error(code)
+        ));
+    }
+    assert!(!send_error_is_destination_specific(&io::Error::other(
+        "no os code"
+    )));
+}
