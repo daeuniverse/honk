@@ -1,0 +1,18 @@
+[Unit]
+Description=honk Service
+Documentation=https://github.com/daeuniverse/honk
+After=network-online.target docker.service systemd-sysctl.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=root
+LimitNPROC=512
+LimitNOFILE=1048576
+ExecStart=/usr/bin/honk-core --disable-timestamp -c /etc/honk/config.dae
+ExecReload=/usr/bin/honk-core reload
+Restart=on-abnormal
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
