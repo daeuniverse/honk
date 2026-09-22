@@ -120,6 +120,8 @@ async fn native_catalog_capabilities_and_recording_disable_are_honest() {
     let flows = response_json(app.get("/api/v1/flows?detail=full").send().await.unwrap()).await;
     assert_eq!(flows["flows"], serde_json::json!([]));
     assert_eq!(flows["coverage"]["userspace_tcp"], "none");
+    let settings = response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+    assert_eq!(settings["recording"]["flows"]["active"], false);
     let nodes = response_json(app.get("/api/v1/nodes?limit=1").send().await.unwrap()).await;
     assert_eq!(nodes["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(nodes["nodes"][0]["health"], serde_json::json!([]));
@@ -327,7 +329,8 @@ async fn native_only_successful_observation_gets_attach() {
             response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
         for recorder in ["flows", "logs", "dns_log", "events"] {
             assert_eq!(
-                settings["recording"][recorder]["active"], true,
+                settings["recording"][recorder]["active"],
+                recorder != "flows" || poll == "/api/v1/flows",
                 "{poll}: {recorder}"
             );
         }
@@ -339,6 +342,104 @@ async fn native_only_successful_observation_gets_attach() {
         );
         app.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn native_sse_flow_demand_requires_explicit_diagnostics() {
+    for (path, flow_demand) in [
+        ("/api/v1/events", false),
+        (
+            "/api/v1/events?kinds=runtime.updated,operation.updated,generation.changed",
+            false,
+        ),
+        ("/api/v1/events?flow_id=%20", false),
+        (
+            "/api/v1/events?kinds=runtime.updated&flow_id=example",
+            false,
+        ),
+        ("/api/v1/logs", false),
+        ("/api/v1/events?kinds=flow.updated", true),
+        ("/api/v1/events?kinds=flow.gap", true),
+        ("/api/v1/events?flow_id=example", true),
+    ] {
+        let app = TestApp::new(|_| {}).await;
+        let mut stream = app
+            .get(path)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            next_event(&mut stream, &mut String::new()).await.0,
+            "stream.ready"
+        );
+        let settings =
+            response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+        assert_eq!(
+            settings["recording"]["flows"]["active"], flow_demand,
+            "{path}"
+        );
+        for recorder in ["logs", "dns_log", "events"] {
+            assert_eq!(settings["recording"][recorder]["active"], true, "{path}");
+        }
+        // The response precedes this GET's renewal, so it observes the SSE demand.
+        let flows = response_json(app.get("/api/v1/flows").send().await.unwrap()).await;
+        assert_eq!(
+            flows["coverage"]["userspace_tcp"],
+            if flow_demand { "partial" } else { "none" },
+            "{path}"
+        );
+        let enabled = response_json(app.get("/api/v1/flows").send().await.unwrap()).await;
+        assert_eq!(enabled["coverage"]["userspace_tcp"], "partial");
+        drop(stream);
+        app.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn native_rejected_flow_streams_cannot_activate_capture() {
+    let app = TestApp::new(|_| {}).await;
+    let path = "/api/v1/events?kinds=flow.updated";
+    for (header, value, status) in [
+        ("accept", "application/json", StatusCode::BAD_REQUEST),
+        ("last-event-id", "bad", StatusCode::CONFLICT),
+    ] {
+        assert_eq!(
+            app.get(path)
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+        let settings =
+            response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+        assert_eq!(settings["recording"]["flows"]["active"], false);
+        assert_eq!(settings["recording"]["events"]["active"], false);
+    }
+    let mut streams = Vec::new();
+    for _ in 0..16 {
+        let mut stream = app
+            .get("/api/v1/events?kinds=runtime.updated")
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        next_event(&mut stream, &mut String::new()).await;
+        streams.push(stream);
+    }
+    assert_eq!(
+        app.get(path).send().await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let settings = response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+    assert_eq!(settings["recording"]["flows"]["active"], false);
+    assert_eq!(settings["recording"]["events"]["active"], true);
+    drop(streams);
+    app.shutdown().await;
 }
 
 #[tokio::test]

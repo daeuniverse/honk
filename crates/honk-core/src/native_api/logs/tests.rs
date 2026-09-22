@@ -104,7 +104,7 @@ async fn tracing_retains_during_grace_and_resume_ready_cannot_skip_replay() {
     let mut config = honk_config::Config::default();
     config.global.log_level = "trace".into();
     let owner = super::super::observation::NativeObservation::new(&config);
-    owner.settings.renew(&owner);
+    owner.settings.renew(&owner, false);
     let store = Arc::clone(&owner.logs);
     let dispatch = capture(&store);
     let mut stream = response(&store, "?level=info&target=honk_core::control", None)

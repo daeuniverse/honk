@@ -78,7 +78,7 @@ impl NativeObservation {
     #[cfg(test)]
     pub(crate) fn attach_for_test(&self) {
         self.settings.pin_for_test(self);
-        self.settings.renew(self);
+        self.settings.renew(self, true);
     }
 
     pub(crate) fn committed(

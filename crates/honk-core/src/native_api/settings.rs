@@ -83,6 +83,7 @@ struct Values {
     allowed: [bool; 3],
     modes: [RecorderMode; 3],
     attached: bool,
+    flow_demand: bool,
 }
 impl Values {
     fn configured(config: &Config) -> Self {
@@ -100,13 +101,20 @@ impl Values {
             ],
             modes: [RecorderMode::Auto; 3],
             attached: false,
+            flow_demand: false,
         }
     }
     fn active(self) -> [bool; 3] {
         std::array::from_fn(|index| {
             self.allowed[index]
                 && match self.modes[index] {
-                    RecorderMode::Auto => self.attached,
+                    RecorderMode::Auto => {
+                        if index == 0 {
+                            self.flow_demand
+                        } else {
+                            self.attached
+                        }
+                    }
                     RecorderMode::On => true,
                     RecorderMode::Off => false,
                 }
@@ -172,27 +180,32 @@ impl Attachment {
     }
 }
 
-pub(super) struct StreamLease(Arc<Mutex<Attachment>>);
+pub(super) struct StreamLease {
+    attachment: Arc<Mutex<[Attachment; 2]>>,
+    flow_demand: bool,
+}
 impl Drop for StreamLease {
     fn drop(&mut self) {
-        let mut attachment = self.0.lock();
-        attachment.streams -= 1;
-        if attachment.streams == 0 {
-            attachment.deadline = Some(Instant::now() + Duration::from_secs(60));
+        for attachment in &mut self.attachment.lock()[..=usize::from(self.flow_demand)] {
+            attachment.streams -= 1;
+            if attachment.streams == 0 {
+                attachment.deadline = Some(Instant::now() + Duration::from_secs(60));
+            }
         }
     }
 }
 
 pub(crate) struct Settings {
     values: Mutex<Values>,
-    attachment: Arc<Mutex<Attachment>>,
+    // General attachment and diagnostic flow demand expire independently.
+    attachment: Arc<Mutex<[Attachment; 2]>>,
     stopped: std::sync::atomic::AtomicBool,
 }
 impl Settings {
     pub(crate) fn new(config: &Config) -> Self {
         Self {
             values: Mutex::new(Values::configured(config)),
-            attachment: Arc::new(Mutex::new(Attachment::default())),
+            attachment: Arc::new(Mutex::new(std::array::from_fn(|_| Attachment::default()))),
             stopped: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -202,6 +215,8 @@ impl Settings {
         next.allowed = current.allowed;
         next.attached =
             current.attached && !self.stopped.load(std::sync::atomic::Ordering::Acquire);
+        next.flow_demand =
+            current.flow_demand && !self.stopped.load(std::sync::atomic::Ordering::Acquire);
         next.apply(owner);
         *current = next;
     }
@@ -214,26 +229,35 @@ impl Settings {
     }
     fn json(&self, values: Values) -> Value {
         let mut value = values.json();
-        value["recording"]["grace_remaining_seconds"] = json!(self.attachment.lock().remaining());
+        value["recording"]["grace_remaining_seconds"] =
+            json!(self.attachment.lock()[0].remaining());
         value
     }
-    pub(crate) fn renew(&self, owner: &NativeObservation) {
+    pub(crate) fn renew(&self, owner: &NativeObservation, flow_demand: bool) {
         let mut current = self.values.lock();
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        self.attachment.lock().deadline = Some(Instant::now() + Duration::from_secs(60));
-        if !current.attached {
+        for attachment in &mut self.attachment.lock()[..=usize::from(flow_demand)] {
+            attachment.deadline = Some(Instant::now() + Duration::from_secs(60));
+        }
+        if !current.attached || (flow_demand && !current.flow_demand) {
             current.attached = true;
+            current.flow_demand |= flow_demand;
             current.apply_recording(owner);
         }
     }
     pub(crate) fn maintain(&self, owner: &NativeObservation) {
         let mut current = self.values.lock();
-        let attached = self.attachment.lock().active(Instant::now())
-            && !self.stopped.load(std::sync::atomic::Ordering::Acquire);
-        if current.attached != attached {
+        let [attached, flow_demand] = {
+            let attachment = self.attachment.lock();
+            let running = !self.stopped.load(std::sync::atomic::Ordering::Acquire);
+            let now = Instant::now();
+            std::array::from_fn(|index| running && attachment[index].active(now))
+        };
+        if current.attached != attached || current.flow_demand != flow_demand {
             current.attached = attached;
+            current.flow_demand = flow_demand;
             current.apply_recording(owner);
         }
     }
@@ -251,21 +275,29 @@ impl Settings {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
         current.attached = false;
+        current.flow_demand = false;
         current.modes = [RecorderMode::Off; 3];
         current.apply_recording(owner);
     }
     pub(super) fn subscribe(
         &self,
         owner: &NativeObservation,
+        flow_demand: bool,
         admit: impl FnOnce() -> Result<super::events::Subscription, ApiError>,
     ) -> Result<super::events::Subscription, ApiError> {
         let mut current = self.values.lock();
         let mut stream = admit()?;
         if !self.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            self.attachment.lock().streams += 1;
-            stream.attach(StreamLease(Arc::clone(&self.attachment)));
-            if !current.attached {
+            for attachment in &mut self.attachment.lock()[..=usize::from(flow_demand)] {
+                attachment.streams += 1;
+            }
+            stream.attach(StreamLease {
+                attachment: Arc::clone(&self.attachment),
+                flow_demand,
+            });
+            if !current.attached || (flow_demand && !current.flow_demand) {
                 current.attached = true;
+                current.flow_demand |= flow_demand;
                 current.apply_recording(owner);
             }
         }
@@ -543,21 +575,23 @@ mod tests {
                 .patch(&forbidden, &config.experimental.native_api, auto, &id)
                 .is_ok()
         );
-        forbidden.settings.renew(&forbidden);
+        forbidden.settings.renew(&forbidden, true);
         assert!(!forbidden.settings.flow_recording());
         assert_eq!(
             forbidden.settings.snapshot()["recording"]["flows"]["active"],
             false
         );
     }
-    fn stream(owner: &NativeObservation) -> super::super::events::Subscription {
+    fn stream(owner: &NativeObservation, flow_demand: bool) -> super::super::events::Subscription {
         let request = axum::extract::Request::builder()
             .uri("/api/v1/events")
             .body(axum::body::Body::empty())
             .unwrap();
         owner
             .settings
-            .subscribe(owner, || owner.events.subscribe_for_test(&request))
+            .subscribe(owner, flow_demand, || {
+                owner.events.subscribe_for_test(&request)
+            })
             .unwrap()
     }
 
@@ -578,10 +612,10 @@ mod tests {
         assert!(owner.events.buffered_kinds().is_empty());
         owner.events.publish("runtime.updated", json!({}), None);
         assert!(owner.events.buffered_kinds().is_empty());
-        let mut first = stream(&owner);
+        let mut first = stream(&owner, true);
         let ready = first.next().await.unwrap().unwrap();
         active(true);
-        let second = stream(&owner);
+        let second = stream(&owner, true);
         drop(first);
         tokio::time::advance(Duration::from_secs(61)).await;
         owner.settings.maintain(&owner);
@@ -611,40 +645,123 @@ mod tests {
         assert!(
             owner
                 .settings
-                .subscribe(&owner, || owner.events.subscribe_for_test(&request))
+                .subscribe(&owner, true, || owner.events.subscribe_for_test(&request))
                 .is_err()
         );
         active(false);
-        owner.settings.renew(&owner);
+        owner.settings.renew(&owner, true);
         active(true);
         assert_eq!(owner.events.buffered_kinds(), vec!["flow.gap"]);
         tokio::time::advance(Duration::from_secs(60)).await;
         owner.settings.maintain(&owner);
         active(false);
         owner.settings.shutdown(&owner);
-        owner.settings.renew(&owner);
+        owner.settings.renew(&owner, true);
         active(false);
     }
 
     #[tokio::test(start_paused = true)]
     async fn unpolled_and_overflowed_subscriptions_release_attachment_once() {
         let owner = NativeObservation::new(&Config::default());
-        let unpolled = stream(&owner);
+        let unpolled = stream(&owner, true);
         drop(unpolled);
-        assert_eq!(owner.settings.attachment.lock().streams, 0);
-        let overflow = stream(&owner);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        owner.settings.maintain(&owner);
+        assert!(!owner.settings.flow_recording());
+        let overflow = stream(&owner, true);
         for _ in 0..65 {
             owner.events.publish("runtime.updated", json!({}), None);
         }
-        assert_eq!(owner.settings.attachment.lock().streams, 0);
+        assert_eq!(
+            owner.settings.snapshot()["recording"]["grace_remaining_seconds"],
+            60
+        );
         tokio::time::advance(Duration::from_secs(60)).await;
         owner.settings.maintain(&owner);
         assert!(!owner.settings.flow_recording());
         drop(overflow);
-        assert_eq!(owner.settings.attachment.lock().streams, 0);
         assert_eq!(
             owner.settings.snapshot()["recording"]["grace_remaining_seconds"],
             0
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flow_demand_expires_independently_of_activity_and_dns_polls() {
+        let owner = NativeObservation::new(&Config::default());
+        let activity = stream(&owner, false);
+        assert!(!owner.settings.flow_recording());
+        let first = stream(&owner, true);
+        let second = stream(&owner, true);
+        let flow = owner.flows.begin(
+            "tcp",
+            "127.0.0.1:31000".parse().unwrap(),
+            "127.0.0.2:443".parse().unwrap(),
+        );
+        assert!(owner.flows.connection_evidence(flow.id()).is_some());
+        drop(first);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        owner.settings.maintain(&owner);
+        assert!(owner.settings.flow_recording());
+        drop(second);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        owner.settings.renew(&owner, false);
+        owner.settings.maintain(&owner);
+        assert!(owner.flows.connection_evidence(flow.id()).is_some());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        owner.settings.maintain(&owner);
+        assert!(!owner.settings.flow_recording());
+        assert!(owner.flows.connection_evidence(flow.id()).is_none());
+        let settings = owner.settings.snapshot();
+        for recorder in ["logs", "dns_log", "events"] {
+            assert_eq!(settings["recording"][recorder]["active"], true);
+        }
+        owner.settings.renew(&owner, true);
+        assert!(owner.settings.flow_recording());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        owner.settings.renew(&owner, true);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        owner.settings.maintain(&owner);
+        assert!(owner.settings.flow_recording());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        owner.settings.maintain(&owner);
+        assert!(!owner.settings.flow_recording());
+        drop(activity);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recorder_modes_and_activation_preserve_separate_demand() {
+        let config = Config::default();
+        let owner = NativeObservation::new(&config);
+        let id = RequestId("demand-test".into());
+        let activity = stream(&owner, false);
+        let patch = |mode| {
+            owner
+                .settings
+                .patch(
+                    &owner,
+                    &config.experimental.native_api,
+                    serde_json::from_value(json!({"record_flows": mode})).unwrap(),
+                    &id,
+                )
+                .unwrap()
+        };
+        assert_eq!(patch(true)["recording"]["flows"]["active"], true);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        owner.settings.maintain(&owner);
+        assert!(owner.settings.flow_recording());
+        owner.settings.activate(&owner, &config);
+        assert!(!owner.settings.flow_recording());
+        let diagnostic = stream(&owner, true);
+        assert_eq!(patch(false)["recording"]["flows"]["active"], false);
+        owner.settings.renew(&owner, true);
+        assert!(!owner.settings.flow_recording());
+        owner.settings.activate(&owner, &config);
+        assert!(owner.settings.flow_recording());
+        owner.settings.shutdown(&owner);
+        owner.settings.activate(&owner, &config);
+        owner.settings.maintain(&owner);
+        assert!(!owner.settings.flow_recording());
+        drop((activity, diagnostic));
     }
 }

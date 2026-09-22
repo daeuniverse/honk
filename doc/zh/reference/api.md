@@ -75,13 +75,17 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 flow 数据。
 
-客户端通过 GET 建立的 `/events` 或 `/logs` SSE 流仍连接时，视为已连接。最后一条流关闭后，或通过请求校验的 GET 请求访问 `/flows`、`/flows/{id}`、`/dns/log` 后，连接状态保留 60 秒。其他请求不延长此期限。记录从客户端连接时开始，首次读取历史为空是正常情况。
+客户端通过 GET 建立且获准的 `/events` 或 `/logs` SSE 流仍连接时，视为已连接。最后一条流关闭后，或成功的 GET 请求访问 `/flows`、`/flows/{id}`、`/dns/log` 后，连接状态保留 60 秒。其他请求不延长此期限。这种通用连接状态只启用获准的 Auto 日志、DNS 日志和事件捕获，不启用完整 flow trace。
 
-`record_flows` 默认为 true，允许在客户端已连接时记录。显式运行时设置 `record_flows: true` 可在无客户端时持续记录；配置中的 `record_flows: false` 禁止记录，修改后需重启。实际记录停止时释放 flow 记录和快照。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
+Auto flow 记录要求诊断需求：成功的 GET `/flows` 或 `/flows/{id}`，或获准的 GET `/events` 流显式通过 `kinds` 包含 `flow.updated`、`flow.gap` 中任意一个，或使用非空白 `flow_id` 过滤器且有效 kinds 包含 flow 事件。省略 `kinds` 的无过滤流、非 flow 事件流、`/logs` 和 `/dns/log` 不建立或维持 flow 需求。每条流持有独立租约；最后一条诊断流关闭后，或成功读取 flow 后，需求保留 60 秒。通用 Activity 不能延长 flow 宽限期。被拒绝的请求、准入失败的流、HEAD 和运行时设置读取都不建立需求。记录从需求建立时开始，首次读取历史为空是正常情况。
+
+`record_flows` 默认为 true，允许在 flow 诊断需求有效时记录。显式运行时设置 `record_flows: true` 可在无客户端时持续记录；运行时 false 强制关闭，配置中的 `record_flows: false` 禁止记录，修改后需重启。实际记录停止时释放 flow 记录和快照。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
 
 Flow ID 表示 incarnation，不是五元组。TCP/UDP 捕获真实执行的路由谓词与短路、嗅探/校验、群组选择、DNS 子查询、物理尝试、会话复用/重试及终态边界；拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次来自实际使用它们的操作，不按当前配置或路由模拟重建。DNS lookup/parent ID 与 outbound attempt/parent ID 保留因果关系；复用 carrier 记录为 attachment，不伪造新物理拨号。协议请求/确认 milestone 必须有真实协议证据，DNS 子步骤就绪不能成为业务目标确认。TCP/UDP 终态跟随所属清理边界；内核 offload 以 unknown 结束观察，不伪造 closed。
 
 只有该 flow 范围内截至当前进度已执行的决策均被捕获，`trace_status` 与 `trace.status` 才是 `complete`。Active、failed、closed 均可完整；这不代表成功或全局覆盖。来源缺失/歧义、监听凭据值遮蔽及捕获预算耗尽，会保持 `partial` 并列出 `missing` 原因；达到 trace 上限不停止转发。用户态 TCP/UDP 和截获 DNS 的总体覆盖仍为 `partial`，仅内核处理的 direct/block/bypass 仍为 `none`，不开放 `full_transparency`。
+
+每条 flow 的条件表达式使用与编译代次一起缓存的配置来源写法，GeoIP 保留引用而非展开后的网段列表。这避免了仅因展开而发生的截断，不取消真实捕获上限：原始配置文本超限、遮蔽、来源缺失及步骤/字节预算耗尽仍报告为 partial trace。
 
 交接流量的内核规则结果来自编译程序实际执行的分支 witness，不做用户态重算。UDP 还必须使用收到报文携带的 capture ID；五元组、decision token、路由代次与动作均须匹配保留 witness，后来的同元组 incarnation 不能为旧报文提供证据。Capture ID 不回绕。冻结字典最多 16 份、每份 64 KiB、总计 1 MiB，计入 recorder 预留；字典拒绝/淘汰、witness 缺失、TCP 对应歧义及实际执行超出 256 个规则/条件值，都会使证据不完整；仅未执行的规则超出该值上限，不代表执行证据丢失。
 
@@ -174,9 +178,9 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 `PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`record_flows`、`record_logs`、`record_dns_log`（`true`、`false` 或 `"auto"`）、`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界值，或对配置禁止的记录器修改级别、留存上限，均使整次请求返回 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。原生日志级别只影响该 capture layer，不修改控制台/Clash 过滤器。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别和初始留存上限，并将记录模式重置为 `"auto"`；provider/network refresh 保留运行时设置。
 
-顶层记录字段中，`true` 使获准的记录器持续开启，`false` 强制关闭，`"auto"` 按客户端连接状态控制，也是初始模式。省略的字段保持不变；null 被拒绝。配置中的 false 禁止记录，运行时请求开启该记录器会使整次 PATCH 被拒绝。配置权限决定哪些级别和留存控制可用，与记录器是否暂时停止无关。
+顶层记录字段中，`true` 使获准的记录器持续开启，`false` 强制关闭；初始模式 `"auto"` 对 flow 按诊断需求控制，对日志/DNS 日志按通用客户端连接状态控制。省略的字段保持不变；null 被拒绝。配置中的 false 禁止记录，运行时请求开启该记录器会使整次 PATCH 被拒绝。配置权限决定哪些级别和留存控制可用，与记录器是否暂时停止无关。
 
-GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_log` 各含 `{allowed, mode, active}`，其中 `mode` 为 `"auto"`、`"on"` 或 `"off"`；`events.active` 表示事件捕获是否开启，`grace_remaining_seconds` 表示连接宽限期剩余秒数。读取设置不延长连接期限。
+GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_log` 各含 `{allowed, mode, active}`，其中 `mode` 为 `"auto"`、`"on"` 或 `"off"`；`events.active` 表示事件捕获是否开启，`grace_remaining_seconds` 表示通用连接宽限期剩余秒数，不是独立的 flow 需求宽限期。读取设置不延长任何一个期限。
 
 ### 主文件条目与 geodata 管理（M9）
 

@@ -539,7 +539,7 @@ impl EventHub {
         request: &Request,
     ) -> Result<Subscription, ApiError> {
         let id = RequestId("attachment-test".into());
-        let (filter, cursor) = request_options(request, &id)?;
+        let (filter, cursor, _) = request_options(request, &id)?;
         self.subscribe(filter, cursor.as_deref(), &id)
     }
 
@@ -777,7 +777,7 @@ fn invalid(id: &RequestId) -> ApiError {
 fn request_options(
     request: &Request,
     id: &RequestId,
-) -> Result<(Filter, Option<String>), ApiError> {
+) -> Result<(Filter, Option<String>, bool), ApiError> {
     let values = parse_query(request.uri(), &["kinds", "flow_id"], id)?;
     let kinds = if let Some(kinds) = values.get("kinds") {
         let mut mask = 0;
@@ -802,7 +802,14 @@ fn request_options(
     {
         return Err(invalid(id));
     }
-    Ok((Filter::new(kinds, flow_id), request_cursor(request, id)?))
+    let flow_demand = kinds & ((1 << 2) | (1 << 3)) != 0
+        && (values.contains_key("kinds")
+            || flow_id.as_ref().is_some_and(|id| !id.trim().is_empty()));
+    Ok((
+        Filter::new(kinds, flow_id),
+        request_cursor(request, id)?,
+        flow_demand,
+    ))
 }
 
 pub(super) fn request_cursor(
@@ -923,7 +930,7 @@ pub(super) async fn serve(
     request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    let (filter, cursor) = request_options(&request, id)?;
+    let (filter, cursor, flow_demand) = request_options(&request, id)?;
     let admit = || {
         state
             .observation
@@ -934,7 +941,7 @@ pub(super) async fn serve(
         state
             .observation
             .settings
-            .subscribe(&state.observation, admit)?
+            .subscribe(&state.observation, flow_demand, admit)?
     } else {
         admit()?
     };

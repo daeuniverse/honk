@@ -188,14 +188,17 @@ async fn observation_request(
 ) -> Response {
     let get = request.method() == axum::http::Method::GET;
     let path = request.uri().path();
-    let poll = get
-        && (matches!(path, "/api/v1/flows" | "/api/v1/dns/log")
-            || path
-                .strip_prefix("/api/v1/flows/")
-                .is_some_and(|id| !id.is_empty() && !id.contains('/')));
+    let flow_demand = matches!(path, "/api/v1/flows")
+        || path
+            .strip_prefix("/api/v1/flows/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    let poll = get && (flow_demand || path == "/api/v1/dns/log");
     let response = next.run(request).await;
     if poll && response.status().is_success() {
-        state.observation.settings.renew(&state.observation);
+        state
+            .observation
+            .settings
+            .renew(&state.observation, flow_demand);
     }
     response
 }

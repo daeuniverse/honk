@@ -383,12 +383,13 @@ pub(super) async fn serve(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     if request.method() == axum::http::Method::GET {
-        let subscription = state
-            .observation
-            .settings
-            .subscribe(&state.observation, || {
-                state.observation.logs.subscribe(&request, id)
-            })?;
+        let subscription =
+            state
+                .observation
+                .settings
+                .subscribe(&state.observation, false, || {
+                    state.observation.logs.subscribe(&request, id)
+                })?;
         Ok(events::stream_response(subscription))
     } else {
         state.observation.logs.response(&request, id)

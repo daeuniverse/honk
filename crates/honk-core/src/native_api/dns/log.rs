@@ -496,7 +496,7 @@ mod tests {
             crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
         let store = owner.dns.log_for_test();
         capture(store, "disabled.example", None);
-        owner.settings.renew(&owner);
+        owner.settings.renew(&owner, false);
         let query = crate::dns::forwarder::build_dns_query("diagnostic.example", 1);
         let response = crate::dns::response::build_dns_refused(&query);
         let mapped: SocketAddr = "[::ffff:192.0.2.1]:53000".parse().unwrap();
@@ -541,7 +541,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         owner.settings.maintain(&owner);
         assert!(!store.recording());
-        owner.settings.renew(&owner);
+        owner.settings.renew(&owner, false);
         assert!(store.recording());
         assert_eq!(value(store.page_for_test()).await["total"], 0);
     }
