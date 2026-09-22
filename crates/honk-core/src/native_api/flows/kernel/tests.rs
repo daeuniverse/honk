@@ -378,3 +378,72 @@ fn oversized_dictionary_reports_only_executed_evidence_loss() {
                 .all(|condition| condition.result == "skipped")
     }));
 }
+
+#[test]
+fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
+    use crate::native_api::{
+        events::EventHub,
+        flows::{
+            FlowStore,
+            record::{EvaluationInput, StepData},
+        },
+    };
+    use std::sync::Arc;
+
+    let name = format!("{}\u{1f600}", "x".repeat(503));
+    let config = honk_config::parser::parse_dae_config(&format!(
+        "routing {{\n pname('{name}') -> block\n fallback: direct\n}}\n"
+    ))
+    .unwrap();
+    let router = Router::new(&config.routing.rules, "direct").unwrap();
+    let mut plan = RoutingPushPlan::compile(
+        &router,
+        &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
+        "direct",
+        DialMode::Ip,
+    )
+    .unwrap();
+    plan.enable_trace(true);
+    let dictionary =
+        KernelTraceDictionary::prepare("instance", 17, &router, &config, &plan).unwrap();
+    let mut witness = KernelRouteWitness::default();
+    witness.output.flags = ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED | ROUTE_TRACE_COMPLETE;
+    witness.tuple.l4proto = 6;
+    witness.output.input.l4proto = 1;
+    witness.output.input.src_port = 31000;
+    witness.output.input.dst_port = 443;
+    witness.output.decision.rule_id = u32::MAX;
+    witness.output.outcomes[0] = 2 | (2 << 2) | (1 << 4);
+    let capture = dictionary.decode(&witness, 0);
+    assert_eq!(capture.gap, None);
+    let store = Arc::new(FlowStore::new(
+        "instance".into(),
+        Arc::new(EventHub::new("instance".into())),
+    ));
+    let flow = store.begin(
+        "tcp",
+        (capture.input.src_ip, capture.input.src_port).into(),
+        (capture.input.dst_ip, capture.input.dst_port).into(),
+    );
+    flow.step(
+        Some(17),
+        StepData::Route {
+            evaluation_id: capture.evaluation_id,
+            chain: "traffic",
+            plane: "kernel",
+            rule_id: capture.rule_id,
+            outbound: capture.outbound,
+            must: Some(capture.must),
+            mark: Some(capture.mark),
+            input: Some(EvaluationInput::Traffic(capture.input)),
+            rules: capture.rules,
+            dns_action: None,
+        },
+    );
+    let detail = store.test_detail(flow.id());
+    assert_eq!(detail["trace_status"], "partial");
+    assert_eq!(
+        detail["trace"]["missing"],
+        serde_json::json!(["buffer_overflow"])
+    );
+}

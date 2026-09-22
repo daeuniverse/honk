@@ -61,8 +61,6 @@ impl KernelTraceDictionary {
     ) -> Option<Self> {
         let layout = plan.trace_layout()?;
         let mut rules = Vec::new();
-        let mut configured: Vec<_> = config.routing.rules.iter().collect();
-        configured.sort_by_key(|rule| rule.priority);
         for slot in &layout.slots {
             if rules.iter().any(|(id, _)| *id == slot.rule_id) {
                 continue;
@@ -71,14 +69,6 @@ impl KernelTraceDictionary {
             let compiled = slot
                 .rule_id
                 .and_then(|id| router.compiled_routes().iter().find(|rule| rule.id == id));
-            let configured = compiled
-                .and_then(|rule| {
-                    router
-                        .compiled_routes()
-                        .iter()
-                        .position(|candidate| candidate.id == rule.id)
-                })
-                .and_then(|index| configured.get(index));
             let conditions = compiled
                 .map(|rule| {
                     rule.conditions
@@ -90,15 +80,9 @@ impl KernelTraceDictionary {
                                     && slot.condition_ordinal == Some(*ordinal)
                             })
                         })
-                        .map(|(ordinal, condition)| RuleCondition {
+                        .map(|(ordinal, _)| RuleCondition {
                             id: format!("{id}/condition:{ordinal}"),
-                            expression: configured
-                                .map(|configured| {
-                                    router.condition_display(condition, &configured.condition)
-                                })
-                                .unwrap_or_else(|| {
-                                    crate::routing::native::condition_expression(condition)
-                                }),
+                            expression: rule.condition_expressions[ordinal].clone(),
                             result: "indeterminate",
                             missing_inputs: Vec::new(),
                         })
@@ -106,14 +90,7 @@ impl KernelTraceDictionary {
                 })
                 .unwrap_or_default();
             let expression = compiled
-                .map(|rule| {
-                    configured
-                        .map(|configured| {
-                            router
-                                .configured_rule_expression(&rule.conditions, &configured.condition)
-                        })
-                        .unwrap_or_else(|| rule.expression.clone())
-                })
+                .map(|rule| rule.expression.clone())
                 .unwrap_or_else(|| "fallback".into());
             rules.push((
                 slot.rule_id,

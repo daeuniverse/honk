@@ -101,6 +101,99 @@ fn rejected_source_writes_never_authorize_causal_references() {
 }
 
 #[test]
+fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
+    use crate::routing::{ConnectionInfo, GeoSourceSet, Router};
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    // GeoIPList with one category and 128 IPv4 CIDRs, independent of host assets.
+    let mut category = b"\x0a\x04test".to_vec();
+    for subnet in 0..128 {
+        category.extend_from_slice(&[0x12, 8, 0x0a, 4, 198, 51, subnet, 0, 0x10, 24]);
+    }
+    let mut geoip = vec![
+        0x0a,
+        (category.len() as u8 & 0x7f) | 0x80,
+        (category.len() >> 7) as u8,
+    ];
+    geoip.extend(category);
+    let router = Router::new_with_geo_sources(
+        &[RoutingRule {
+            condition: RoutingCondition {
+                geo_ip: vec!["test".into()],
+                port: vec!["443".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("direct".into()),
+            name: String::new(),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }],
+        "block",
+        &GeoSourceSet::from_bytes(Vec::new(), geoip),
+    )
+    .unwrap();
+    let connection = ConnectionInfo {
+        src_ip: "192.0.2.1".parse().unwrap(),
+        src_port: 31000,
+        dst_ip: "198.51.100.20".parse().unwrap(),
+        dst_port: 443,
+        protocol: "tcp",
+        domain: None,
+        process_name: None,
+        mac: None,
+        dscp: None,
+    };
+    let observed = router.route_full_observed(&connection, None, MAX_RULE_VALUES);
+    assert_eq!(observed.matched.unwrap().outbound_name, "direct");
+    let rules =
+        super::super::routing::observed_rule_evaluations("instance", 7, &router, &observed.rules);
+    assert_eq!(rules[0].conditions[0].expression, "dip(geoip: test)");
+    assert_eq!(rules[0].conditions[0].result, "matched");
+    assert_eq!(rules[0].conditions[1].expression, "dport(443)");
+
+    let store = store();
+    let flow = store.begin(
+        "tcp",
+        (connection.src_ip, connection.src_port).into(),
+        (connection.dst_ip, connection.dst_port).into(),
+    );
+    flow.step(
+        Some(7),
+        StepData::Route {
+            evaluation_id: Uuid::new_v4().to_string(),
+            chain: "traffic",
+            plane: "userspace",
+            rule_id: Some(rules[0].rule_id.clone()),
+            outbound: Some("direct".into()),
+            must: Some(false),
+            mark: Some(0),
+            input: Some(record::EvaluationInput::Traffic(record::RouteInput {
+                network: "tcp",
+                src_ip: connection.src_ip,
+                src_port: connection.src_port,
+                dst_ip: connection.dst_ip,
+                dst_port: connection.dst_port,
+                domain: None,
+                pname: None,
+                src_mac: None,
+                dscp: None,
+                mark: (),
+                ingress: None,
+                domain_rule_ids: None,
+                domain_fact_bitmap: None,
+                domain_fact_state: None,
+            })),
+            rules,
+            dns_action: None,
+        },
+    );
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace_status"], "complete");
+    assert_eq!(detail["trace"]["missing"], json!([]));
+}
+
+#[test]
 fn reply_evidence_survives_later_send_bookkeeping_and_terminal_publication() {
     let store = store();
     let flow = begin(&store, "udp");

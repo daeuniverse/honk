@@ -129,7 +129,7 @@ pub(super) fn configured_rule_expression(
     )
 }
 
-fn condition_display(
+pub(super) fn condition_display(
     matchers: &[super::DomainMatcher],
     compiled: &CompiledCondition,
     configured: &honk_config::routing::RoutingCondition,
@@ -308,105 +308,12 @@ pub(crate) fn missing_input(predicate: &CompiledPredicate) -> &'static str {
     }
 }
 
-pub(crate) fn condition_expression(condition: &CompiledCondition) -> String {
-    let ip_display = |net: &ipnet::IpNet| {
-        if net.prefix_len() == if net.addr().is_ipv4() { 32 } else { 128 } {
-            net.addr().to_string()
-        } else {
-            net.to_string()
-        }
-    };
-    let (kind, values) = match &condition.predicate {
-        // Domain matchers hold compiled patterns, not the configured spelling;
-        // routes carry that in `CompiledRoute::expression`.
-        CompiledPredicate::Domain(_) => ("domain", String::new()),
-        CompiledPredicate::DestinationIp(matcher) => (
-            "dip",
-            matcher
-                .nets()
-                .iter()
-                .map(ip_display)
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        CompiledPredicate::SourceIp(matcher) => (
-            "sip",
-            matcher
-                .nets()
-                .iter()
-                .map(ip_display)
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        CompiledPredicate::DestinationPort(ports) | CompiledPredicate::SourcePort(ports) => (
-            if matches!(condition.predicate, CompiledPredicate::DestinationPort(_)) {
-                "dport"
-            } else {
-                "sport"
-            },
-            ports
-                .iter()
-                .map(|port| {
-                    if port.start == port.end {
-                        port.start.to_string()
-                    } else {
-                        format!("{}-{}", port.start, port.end)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        CompiledPredicate::Protocol(mask) => (
-            "l4proto",
-            [(1, "tcp"), (2, "udp")]
-                .into_iter()
-                .filter_map(|(bit, name)| (mask & bit != 0).then_some(name))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        CompiledPredicate::IpVersion(mask) => (
-            "ipversion",
-            [(1, "4"), (2, "6")]
-                .into_iter()
-                .filter_map(|(bit, name)| (mask & bit != 0).then_some(name))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        CompiledPredicate::Dscp(values) => (
-            "dscp",
-            values
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        CompiledPredicate::ProcessName(values) => ("pname", values.join(", ")),
-        CompiledPredicate::Mac(values) => (
-            "mac",
-            values
-                .iter()
-                .map(|mac| {
-                    mac.iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(":")
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-    };
-    let not = if condition.not { "!" } else { "" };
-    if values.is_empty() {
-        return format!("{not}{kind}");
-    }
-    bounded_expression(format!("{not}{kind}({values})"))
-}
-
-fn bounded_expression(mut expression: String) -> String {
+pub(super) fn bounded_expression(mut expression: String) -> String {
     if expression.len() > 512 {
         let mut end = 512;
+        // Truncated displays must stay above the recorder's byte cap, including UTF-8 cuts.
         while !expression.is_char_boundary(end) {
-            end -= 1;
+            end += 1;
         }
         expression.truncate(end);
         expression.push('…');
@@ -414,13 +321,13 @@ fn bounded_expression(mut expression: String) -> String {
     expression
 }
 
-fn join_expressions(expressions: impl Iterator<Item = String>) -> String {
+pub(super) fn join_expressions(expressions: impl Iterator<Item = impl AsRef<str>>) -> String {
     let mut joined = String::new();
     for expression in expressions {
         if !joined.is_empty() {
             joined.push_str(" && ");
         }
-        joined.push_str(&expression);
+        joined.push_str(expression.as_ref());
         if joined.len() > 512 {
             return bounded_expression(joined);
         }

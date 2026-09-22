@@ -50,6 +50,9 @@ pub struct CompiledRoute {
     /// The configured conditions as dae text, bounded; rendered once here so
     /// every API projection shows the same spelling without touching matchers.
     pub expression: String,
+    /// Source-spelled conditions in compiled order; never expanded GeoIP networks.
+    #[cfg(feature = "native-api")]
+    pub condition_expressions: Vec<String>,
 }
 
 impl CompiledRoute {
@@ -438,14 +441,24 @@ impl Router {
                 must: rule.must || outbound_must,
                 mark: rule.mark,
                 expression: String::new(),
+                #[cfg(feature = "native-api")]
+                condition_expressions: Vec::new(),
             });
         }
+        #[cfg(feature = "native-api")]
         for route in &mut compiled {
-            route.expression = native::configured_rule_expression(
-                &registry.0,
-                &route.conditions,
-                &rules[route.id as usize].condition,
-            );
+            route.condition_expressions = route
+                .conditions
+                .iter()
+                .map(|condition| {
+                    native::bounded_expression(native::condition_display(
+                        &registry.0,
+                        condition,
+                        &rules[route.id as usize].condition,
+                    ))
+                })
+                .collect();
+            route.expression = native::join_expressions(route.condition_expressions.iter());
         }
 
         // `sort_by_key` is stable, so equal priorities retain source order.

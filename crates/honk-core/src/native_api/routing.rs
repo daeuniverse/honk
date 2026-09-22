@@ -514,7 +514,7 @@ fn rule_evaluation(
                     };
                     RuleCondition {
                         id: format!("{rule_id}/condition:{index}"),
-                        expression: native::condition_expression(condition),
+                        expression: rule.condition_expressions[index].clone(),
                         result: result_name(result),
                         missing_inputs: condition_missing,
                     }

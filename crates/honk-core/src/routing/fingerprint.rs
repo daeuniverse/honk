@@ -168,6 +168,8 @@ mod tests {
             rule_type: "Match".into(),
             rule_payload: String::new(),
             expression: String::new(),
+            #[cfg(feature = "native-api")]
+            condition_expressions: Vec::new(),
             priority: 0,
             conditions: vec![CompiledCondition {
                 not: false,
