@@ -30,9 +30,9 @@ fn rule(condition: serde_json::Value, outbound: &str) -> RoutingRule {
 }
 
 fn emit(rules: &[RoutingRule]) -> RoutingBytecode {
-    let ids = std::collections::HashMap::from([("direct".to_string(), 0u8), ("proxy".into(), 1)]);
     let router = Router::new(rules, "direct").unwrap();
-    let plan = RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip).unwrap();
+    let ids = std::collections::HashMap::from([("direct".to_string(), 0u8), ("proxy".into(), 1)]);
+    let plan = RoutingPushPlan::compile(&router, &ids, DialMode::Ip).unwrap();
     let fds = RoutingMapFds {
         destination_v4: 11,
         destination_v6: 12,

@@ -1,9 +1,7 @@
 use super::overall_dial_timeout;
-#[cfg(feature = "ebpf")]
-use super::routing::final_udp_rule_mark;
 use super::routing::{RoutingDecision, build_connection_info, connection_chains};
 use crate::control::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
-use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
+use crate::control::udp_endpoint::{RawDnsRoute, UdpEndpoint, UdpInitLease};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
@@ -83,7 +81,7 @@ impl ControlPlaneHandle {
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
         let data = lease.first_payload();
-        let raw_dns_group = lease.raw_dns_group();
+        let raw_dns_route = lease.raw_dns_route();
         #[cfg(feature = "ebpf")]
         let pending = if lease.decision_token() == 0 {
             None
@@ -109,7 +107,7 @@ impl ControlPlaneHandle {
             lease.decision_token()
         );
 
-        let dial_mode = if raw_dns_group.is_some() {
+        let dial_mode = if raw_dns_route.is_some() {
             anyhow::ensure!(
                 original_dst.port() == 53 && lease.decision_token() == 0,
                 "raw DNS ownership requires an unstaged UDP/53 lease"
@@ -148,7 +146,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let handoff = if raw_dns_group.is_some() {
+        let handoff = if raw_dns_route.is_some() {
             None
         } else {
             let tuples = build_tuples_key(
@@ -207,11 +205,18 @@ impl ControlPlaneHandle {
             .await;
 
         let route_started_at = std::time::Instant::now();
-        let route = if let Some(raw_dns_group) = raw_dns_group.as_deref() {
+        let mut route = if let Some(raw_dns_route) = raw_dns_route {
+            let (outbound, mark) = match raw_dns_route {
+                RawDnsRoute::Group(name) => (name.to_string(), None),
+                RawDnsRoute::Direct(mark) => (
+                    "direct".to_owned(),
+                    honk_outbound::proxy::DirectMark::new(mark),
+                ),
+            };
             RoutingDecision {
-                outbound: raw_dns_group.to_owned(),
+                outbound,
                 must: true,
-                mark: 0,
+                mark,
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
             }
@@ -228,11 +233,9 @@ impl ControlPlaneHandle {
         };
         #[cfg(feature = "ebpf")]
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
-        #[cfg(feature = "ebpf")]
-        let routed_direct = route.outbound == "direct";
-        let routed_mark = route.mark;
-        let matched_rule = route.matched_rule;
-        let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
+        let matched_rule = route.matched_rule.take();
+        self.apply_mode_override(&mut route).await;
+        let outbound_name = std::mem::take(&mut route.outbound);
         let target_domain = if matches!(
             outbound_name.as_str(),
             "direct" | "block" | "must_rules" | "control_plane_routing"
@@ -242,10 +245,7 @@ impl ControlPlaneHandle {
             quic_domain.as_deref().map(Arc::<str>::from)
         };
         let target_is_domain = target_domain.is_some();
-        #[cfg(feature = "ebpf")]
-        let final_rule_mark = final_udp_rule_mark(routed_direct, &outbound_name, routed_mark);
-        #[cfg(not(feature = "ebpf"))]
-        let _ = routed_mark;
+        let mark = route.mark;
         self.stats
             .record_udp_route_latency(route_started_at.elapsed());
         #[cfg(feature = "ebpf")]
@@ -253,7 +253,11 @@ impl ControlPlaneHandle {
             match outbound_name.as_str() {
                 "direct" => {
                     verdicts
-                        .activate_direct(*identity, &mut lease, final_rule_mark)
+                        .activate_direct(
+                            *identity,
+                            &mut lease,
+                            mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+                        )
                         .await?;
                     if let Some(domain) = &quic_domain
                         && Self::should_write_sniffed_domain_bitmap(
@@ -284,7 +288,12 @@ impl ControlPlaneHandle {
                 _ => {
                     let final_outbound = self.outbound_name_to_index(&outbound_name).await;
                     verdicts
-                        .activate_proxy(*identity, &lease, final_outbound, final_rule_mark)
+                        .activate_proxy(
+                            *identity,
+                            &lease,
+                            final_outbound,
+                            mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+                        )
                         .await?;
                 }
             }
@@ -350,6 +359,9 @@ impl ControlPlaneHandle {
         let scheduler_ipver = plan.ipver;
         let plan_mode = plan.mode;
         let score_feedback = plan.feedback;
+        // Only a literal direct route keeps a mark, and Cold URLTest is always
+        // a group route, so speculative preparation never needs one.
+        debug_assert!(plan_mode != SelectionPlanMode::ColdUrlTest || mark.is_none());
         let runtime_generation = self.runtime_registry.read().clone();
         let prepare_generation = Arc::clone(&runtime_generation);
         let prepare: UdpPrepare<(
@@ -383,6 +395,32 @@ impl ControlPlaneHandle {
                         .transpose()?
                         .map(crate::group::ScoreBusinessGuard::start);
                     let dial_started_at = std::time::Instant::now();
+                    let flow_transport = async {
+                        (if let Some(mark) = mark {
+                            registry
+                                .dial_udp_transport_runtime_marked(
+                                    Arc::clone(&runtime_generation),
+                                    node.id,
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                    mark,
+                                )
+                                .await
+                        } else {
+                            registry
+                                .dial_udp_transport_runtime(
+                                    Arc::clone(&runtime_generation),
+                                    node.id,
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                )
+                                .await
+                        })
+                        .map(honk_outbound::proxy::PreparedUdpTransport::ready)
+                        .map(PreparedEndpointTransport::Flow)
+                    };
                     let result = {
                         #[cfg(feature = "rprx")]
                         if let Some(path) = vless_source_path(&node, original_dst.port()) {
@@ -420,17 +458,7 @@ impl ControlPlaneHandle {
                                 .await
                                 .map(PreparedEndpointTransport::Flow)
                         } else {
-                            registry
-                                .dial_udp_transport_runtime(
-                                    Arc::clone(&runtime_generation),
-                                    node.id,
-                                    original_dst,
-                                    target_domain.as_deref(),
-                                    connect_timeout,
-                                )
-                                .await
-                                .map(honk_outbound::proxy::PreparedUdpTransport::ready)
-                                .map(PreparedEndpointTransport::Flow)
+                            flow_transport.await
                         }
                         #[cfg(not(feature = "rprx"))]
                         if plan_mode == SelectionPlanMode::ColdUrlTest {
@@ -445,17 +473,7 @@ impl ControlPlaneHandle {
                                 .await
                                 .map(PreparedEndpointTransport::Flow)
                         } else {
-                            registry
-                                .dial_udp_transport_runtime(
-                                    Arc::clone(&runtime_generation),
-                                    node.id,
-                                    original_dst,
-                                    target_domain.as_deref(),
-                                    connect_timeout,
-                                )
-                                .await
-                                .map(honk_outbound::proxy::PreparedUdpTransport::ready)
-                                .map(PreparedEndpointTransport::Flow)
+                            flow_transport.await
                         }
                     };
                     stats.record_udp_dial_latency(dial_started_at.elapsed());

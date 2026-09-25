@@ -229,12 +229,19 @@ fn redirect_track_exhaustion_fails_closed_redirected_dns_but_preserves_native_di
                     &dns_packet(source, source_port + case_index as u16 + 10, protocol, 8),
                     SkbInput::default(),
                 );
-                assert_eq!(result.verdict, TC_ACT_OK, "{side} {label}");
-                assert_eq!(
-                    result.mark,
-                    USER_MARK | if side_index == 0 { CLASSIFIED_MARK } else { 0 },
-                    "{side} {label} mark"
-                );
+                if side_index == 0 {
+                    assert_eq!(result.verdict, TC_ACT_OK, "{side} {label}");
+                    assert_eq!(
+                        result.mark,
+                        USER_MARK | CLASSIFIED_MARK,
+                        "{side} {label} mark"
+                    );
+                } else {
+                    assert_eq!(
+                        result.verdict, TC_ACT_SHOT,
+                        "{side} marked direct needs redirect"
+                    );
+                }
             }
         }
     });

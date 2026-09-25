@@ -2,17 +2,6 @@ use super::*;
 use honk_config::routing::{RoutingCondition, RoutingOutbound};
 
 #[test]
-fn router_clone_shares_compiled_state() {
-    let router = Router::new(&[], "direct").unwrap();
-    let clone = router.clone();
-    assert!(Arc::ptr_eq(&router.routes, &clone.routes));
-    assert!(Arc::ptr_eq(
-        &router.default_outbound,
-        &clone.default_outbound
-    ));
-}
-
-#[test]
 fn test_trie_empty() {
     let trie = BinaryLpmTrie::from_nets(&[]);
     assert!(!trie.matches(&"1.2.3.4".parse().unwrap()));
@@ -807,28 +796,6 @@ fn test_geosite_route() {
 }
 
 #[test]
-fn test_must_flag_on_outbound() {
-    let rules = vec![RoutingRule {
-        name: "must-direct".into(),
-        condition: RoutingCondition {
-            ip: vec!["10.0.0.0/8".into()],
-            ..Default::default()
-        },
-        outbound: RoutingOutbound::Simple("direct(must)".into()),
-        priority: 0,
-        must: false,
-        mark: 0,
-    }];
-
-    let router = Router::new(&rules, "proxy").unwrap();
-    let mut conn = make_conn(None, None);
-    conn.dst_ip = "10.0.0.1".parse().unwrap();
-    let result = router.route_full(&conn).unwrap();
-    assert_eq!(result.outbound_name, "direct");
-    assert!(result.must);
-}
-
-#[test]
 fn test_must_flag_on_rule() {
     let rules = vec![RoutingRule {
         name: "must-rule".into(),
@@ -846,12 +813,12 @@ fn test_must_flag_on_rule() {
     let mut conn = make_conn(None, None);
     conn.dst_ip = "10.0.0.1".parse().unwrap();
     let result = router.route_full(&conn).unwrap();
-    assert_eq!(result.outbound_name, "direct");
-    assert!(result.must);
+    assert_eq!(result.action.outbound, "direct");
+    assert!(result.action.must);
 }
 
 #[test]
-fn test_route_with_must() {
+fn test_route_action_must() {
     let rules = vec![
         RoutingRule {
             name: "must-direct".into(),
@@ -859,9 +826,9 @@ fn test_route_with_must() {
                 ip: vec!["10.0.0.0/8".into()],
                 ..Default::default()
             },
-            outbound: RoutingOutbound::Simple("direct(must)".into()),
+            outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
-            must: false,
+            must: true,
             mark: 0,
         },
         RoutingRule {
@@ -879,17 +846,20 @@ fn test_route_with_must() {
     let router = Router::new(&rules, "proxy").unwrap();
     let mut conn = make_conn(None, None);
 
-    // (must) rule match → flag set.
+    // Must rule match → flag set.
     conn.dst_ip = "10.0.0.1".parse().unwrap();
-    assert_eq!(router.route_with_must(&conn), ("direct", true));
+    let (action, _) = router.route_action(&conn);
+    assert_eq!((&*action.outbound, action.must), ("direct", true));
 
     // Plain rule match → flag clear.
     conn.dst_ip = "192.168.1.1".parse().unwrap();
-    assert_eq!(router.route_with_must(&conn), ("proxy", false));
+    let (action, _) = router.route_action(&conn);
+    assert_eq!((&*action.outbound, action.must), ("proxy", false));
 
     // Default-outbound fallback never carries must.
     conn.dst_ip = "8.8.8.8".parse().unwrap();
-    assert_eq!(router.route_with_must(&conn), ("proxy", false));
+    let (action, _) = router.route_action(&conn);
+    assert_eq!((&*action.outbound, action.must), ("proxy", false));
 }
 
 #[test]
@@ -910,8 +880,126 @@ fn test_mark_propagation() {
     let mut conn = make_conn(None, None);
     conn.dst_port = 443;
     let result = router.route_full(&conn).unwrap();
-    assert_eq!(result.outbound_name, "proxy");
-    assert_eq!(result.mark, 42);
+    assert_eq!(result.action.outbound, "proxy");
+    assert_eq!(result.action.mark.map(DirectMark::get), Some(42));
+}
+
+#[test]
+fn terminal_direct_mark_indexes_are_deduplicated_and_generation_owned() {
+    let config = honk_config::parser::parse_dae_config(
+        "routing {\n dport(53) -> direct(must, mark: 0x3fffffff)\n dport(80) -> direct(must, mark: 512)\n dport(443) -> direct(must, mark: 512)\n dport(22) -> direct(mark: 1024)\n dport(25) -> direct(must, mark: 0)\n}",
+    )
+    .unwrap();
+    let router = Router::new(&config.routing.rules, "direct").unwrap();
+    assert_eq!(router.direct_mark(0), Some(512));
+    assert_eq!(router.direct_mark(1), Some(0x3fff_ffff));
+    assert_eq!(router.direct_mark(2), None);
+    assert_eq!(
+        router.compiled_routes()[0].action.direct_mark_index,
+        Some(1)
+    );
+    assert_eq!(
+        router.compiled_routes()[1].action.direct_mark_index,
+        Some(0)
+    );
+    assert_eq!(router.compiled_routes()[3].action.direct_mark_index, None);
+    assert_eq!(router.compiled_routes()[4].action.direct_mark_index, None);
+    assert!(router.has_direct_marks());
+    let ordinary_only = config.routing.rules[3].clone();
+    assert!(
+        Router::new(&[ordinary_only], "direct")
+            .unwrap()
+            .has_direct_marks()
+    );
+
+    let mut changed = config.routing.rules;
+    changed[0].mark = 1;
+    let replacement = Router::new(&changed, "direct").unwrap();
+    assert_eq!(replacement.direct_mark(0), Some(1));
+    assert_eq!(router.direct_mark(0), Some(512));
+    assert_eq!(router.clone().direct_mark(1), Some(0x3fff_ffff));
+}
+
+#[test]
+fn terminal_direct_mark_capacity_counts_distinct_terminal_marks_only() {
+    let mut rules: Vec<_> = (0..256)
+        .map(|index| RoutingRule {
+            name: format!("marked-{index}"),
+            condition: RoutingCondition {
+                port: vec!["53".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: index,
+            must: true,
+            mark: 0x3fff_ff00 + index,
+        })
+        .collect();
+    let duplicate = rules[0].clone();
+    rules.push(duplicate);
+    for index in 1..=257 {
+        let mut ordinary = rules[0].clone();
+        ordinary.must = false;
+        ordinary.mark = index;
+        rules.push(ordinary);
+        let mut proxy = rules[0].clone();
+        proxy.outbound = RoutingOutbound::Simple("proxy".into());
+        proxy.mark = index;
+        rules.push(proxy);
+    }
+    let router = Router::new(&rules, "direct").unwrap();
+    let ids = std::collections::HashMap::from([("direct".into(), 0), ("proxy".into(), 2)]);
+    let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+        &router,
+        &ids,
+        honk_config::types::DialMode::Ip,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.rules
+            .iter()
+            .find(|rule| rule.action.mark == 0x3fff_ffff)
+            .unwrap()
+            .action
+            .direct_mark_index,
+        Some(255)
+    );
+    assert_eq!(router.direct_mark(0), Some(0x3fff_ff00));
+    assert_eq!(router.direct_mark(255), Some(0x3fff_ffff));
+    let mut excess = rules[0].clone();
+    excess.mark = 1;
+    rules.push(excess);
+    assert!(Router::new(&rules, "direct").is_err());
+}
+
+#[test]
+fn parsed_marked_fallback_routes_unmatched_ipv4_and_ipv6() {
+    let config = honk_config::parser::parse_dae_config(
+        "routing {\n fallback: direct(must, mark: 0x200)\n dport(443) -> block\n}",
+    )
+    .unwrap();
+    let router = Router::from_config(&config.routing).unwrap();
+    assert_eq!(router.fallback().direct_mark_index, Some(0));
+    for address in ["192.0.2.1", "2001:db8::1"] {
+        for protocol in ["tcp", "udp"] {
+            let mut connection = make_conn(None, None);
+            connection.dst_ip = address.parse().unwrap();
+            connection.protocol = protocol;
+            connection.dst_port = 80;
+            let (action, matched) = router.route_action(&connection);
+            assert_eq!(
+                (
+                    action.outbound.as_str(),
+                    action.must,
+                    action.mark.map(DirectMark::get)
+                ),
+                ("direct", true, Some(512))
+            );
+            assert!(matched.is_none());
+            connection.dst_port = 443;
+            assert_eq!(router.route_action(&connection).0.outbound, "block");
+        }
+    }
 }
 
 #[test]
@@ -1005,7 +1093,7 @@ fn test_domain_bitmap_does_not_claim_default_as_match() {
     assert_eq!(
         router
             .route_full_with_domain_bitmap(&conn, Some(&bitmap))
-            .map(|matched| matched.outbound_name),
+            .map(|matched| matched.action.outbound.as_str()),
         Some("direct")
     );
 
@@ -1050,7 +1138,7 @@ fn domain_bitmap_covers_full_regex_and_negative_compound_conditions() {
         assert_eq!(
             router
                 .route_full_with_domain_bitmap(&conn, Some(&bitmap))
-                .map(|matched| matched.outbound_name),
+                .map(|matched| matched.action.outbound.as_str()),
             Some("proxy")
         );
     }
@@ -1297,7 +1385,7 @@ mod negation {
         web_flow.dst_port = 80;
         let m = router.route_full(&web_flow).unwrap();
         assert_eq!(m.rule_name, "host24-not-dns");
-        assert!(m.must);
+        assert!(m.action.must);
     }
 
     #[test]

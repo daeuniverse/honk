@@ -8,7 +8,7 @@
 //! - DoH3: one QUIC+H3 session, POST `application/dns-message`.
 //! - TCP plain: idle stream pool (same shape as DoT without TLS).
 //!
-//! All direct dials use `DAE_BYPASS_MARK` so eBPF does not re-intercept
+//! All direct dials use the configured bypass mark so eBPF does not re-intercept
 //! control-plane DNS. Hostnames resolve via `honk_outbound::bootstrap`.
 
 mod body;

@@ -135,6 +135,7 @@ impl RealEbpfBackend {
 }
 
 mod attach;
+mod btf;
 mod events;
 mod iface_watch;
 mod process_name;
@@ -707,6 +708,24 @@ impl EbpfBackend for RealEbpfBackend {
             };
             if !udp_state_is_legacy_userspace_owned(&state) {
                 return Ok(UdpDecisionCommitResult::Superseded);
+            }
+            if unsafe { state.meta.raw } & ROUTING_META_FLAG_WAN_USERSPACE != 0 {
+                let handoff =
+                    backend.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+                let track_key = RedirectTuple::from_tuples(key);
+                let track =
+                    backend.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+                if handoff.is_some_and(|entry| entry.result.decision_token != 0)
+                    || track.is_some_and(|entry| entry.decision_token != 0)
+                {
+                    return Ok(UdpDecisionCommitResult::TokenMismatch);
+                }
+                if handoff.is_some() {
+                    backend.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+                }
+                if track.is_some() {
+                    backend.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+                }
             }
             if !backend.hash_remove_present::<_, ConnState>("CONN_STATE_MAP", key)? {
                 return Ok(UdpDecisionCommitResult::Missing);

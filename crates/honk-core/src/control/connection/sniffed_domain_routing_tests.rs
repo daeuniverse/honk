@@ -15,10 +15,26 @@ fn handoff(outbound: u8, must: u8) -> HandoffResult {
 }
 
 #[test]
-fn udp_direct_mark_preserves_rule_and_clears_override() {
-    assert_eq!(final_udp_rule_mark(true, "direct", 0x1234), 0x1234);
-    assert_eq!(final_udp_rule_mark(false, "direct", 0x1234), 0);
-    assert_eq!(final_udp_rule_mark(false, "proxy", 0x1234), 0x1234);
+fn direct_mark_preserves_rule_and_clears_override() {
+    let mark = honk_outbound::proxy::DirectMark::new(0x1234);
+    for (routed, replacement, final_outbound, expected) in [
+        ("direct", None, "direct", mark),
+        ("direct", Some("direct"), "direct", mark),
+        ("proxy", Some("direct"), "direct", None),
+        ("direct", Some("proxy"), "proxy", None),
+        ("proxy", None, "proxy", None),
+    ] {
+        let mut decision = RoutingDecision {
+            outbound: routed.to_owned(),
+            must: false,
+            mark,
+            matched_rule: None,
+            reroute_by_sniffed_domain: false,
+        };
+        decision.apply_final_outbound(replacement.map(str::to_owned));
+        assert_eq!(decision.outbound, final_outbound);
+        assert_eq!(decision.mark, expected);
+    }
 }
 
 #[test]

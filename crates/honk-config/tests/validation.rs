@@ -608,3 +608,81 @@ mod share_link_security {
         assert!(!shadowrocket.tls().unwrap().enabled);
     }
 }
+
+mod routing_marks {
+    use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
+
+    #[test]
+    fn invalid_direct_marks_cannot_escape_file_loader_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        for statement in [
+            "dport(443) -> direct(mark: 4294967296)",
+            "dport(443) -> direct(mark: 0x40000000)",
+            "fallback: direct(mark: PRIVATE)",
+        ] {
+            let path = dir.path().join("config.dae");
+            std::fs::write(&path, format!("routing {{\n {statement}\n}}")).unwrap();
+            let mut diagnostics = Vec::new();
+            let error = Config::from_file_with_detailed_diagnostics(
+                path.to_str().unwrap(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+            assert_eq!(error.diagnostic.code, "invalid-routing-mark");
+            assert!(!format!("{error:?}{diagnostics:?}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn reserved_marks_remain_invalid_after_structured_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = parse_dae_config_with_detailed_diagnostics(
+            "routing { dport(443) -> direct(mark: 512) }",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(config.routing.rules[0].mark, 512);
+        for reserved in [0x4000_0000, 0x8000_0000, 0xc000_0000] {
+            for setting in [
+                "routing.rules[1].mark",
+                "global.so_mark_from_dae",
+                "routing.fallback",
+            ] {
+                let value = |owner: &str| if setting == owner { reserved } else { 0 };
+                config.routing.rules[0].mark = value("routing.rules[1].mark");
+                config.global.so_mark_from_dae = value("global.so_mark_from_dae");
+                config.routing.default_mark = value("routing.fallback");
+                for (extension, body) in [
+                    ("json", serde_json::to_string(&config).unwrap()),
+                    ("yaml", serde_yaml::to_string(&config).unwrap()),
+                    ("toml", toml::to_string(&config).unwrap()),
+                ] {
+                    let path = dir.path().join(format!("config.{extension}"));
+                    std::fs::write(&path, body).unwrap();
+                    let restored = Config::from_file(path.to_str().unwrap()).unwrap();
+                    let error = restored.validate_detailed().unwrap_err();
+                    assert_eq!(error.diagnostic.setting.to_string(), setting);
+                    assert_eq!(error.diagnostic.code, "invalid-config-value");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_marks_keep_hex_first_lexing_and_zero_effective_default() {
+        for (value, raw, effective) in [
+            ("0", 0, 0x100),
+            ("10", 16, 16),
+            ("0x200", 512, 512),
+            ("zz", 0, 0x100),
+        ] {
+            let config = parse_dae_config_with_detailed_diagnostics(
+                &format!("global {{ so_mark_from_dae: {value} }}"),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(config.global.so_mark_from_dae, raw);
+            assert_eq!(config.global.effective_so_mark(), effective);
+        }
+    }
+}

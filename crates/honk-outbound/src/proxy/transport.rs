@@ -119,7 +119,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                             }
                             let tcp = crate::util::connect_marked_addr(
                                 peer,
-                                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                                Some(crate::util::bypass_mark()),
                                 connect_timeout.min(remaining),
                             )
                             .await?;

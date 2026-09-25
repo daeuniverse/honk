@@ -75,7 +75,7 @@ UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启�
 | eBPF 目标文件 | 内嵌目标文件或 `--bpf-object PATH` | 启用 `ebpf` feature 时，`build.rs` 提供由 `include_bytes!` 内嵌的目标文件；该参数在运行时替换这些字节。未启用 `ebpf` 的构建使用 mock 后端。 |
 | 内核 BTF | `HONK_VMLINUX_BTF` 或常用路径搜索 | 仅用于解析 `pname` 的内核字段偏移。未覆盖时，honk 先尝试 `/sys/kernel/btf/vmlinux`，再尝试 `/usr/lib/debug/boot/vmlinux`。 |
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
-| Bypass mark | 编译期常量 | `DAE_BYPASS_MARK = 0x100`；控制面拨号、探测与 DNS 上游 socket 使用该值以避免再次拦截。 |
+| Bypass mark | `global.so_mark_from_dae` | 拨号、探测与 DNS 使用的精确 socket mark；零值选择默认 `0x100`。修改需重启，见[套接字 mark](./global.md#套接字-mark)。 |
 | TPROXY mark | 编译期常量与配置校验 | `TPROXY_MARK = 0x08000000`；`global.tproxy_mark` 必须等于该值。 |
 | Geo 资源 | 运行时路径搜索 | 依次检查 `DAE_LOCATION_ASSET`、[`global.data_dir`](./global.md)、旧根目录 `/var/share/honk`、工作目录、`/usr/local/share/honk`、`/usr/share/honk`、`/usr/local/share/dae`、`/usr/share/dae`、`/etc/dae`；每个候选都必须是普通文件。 |
 

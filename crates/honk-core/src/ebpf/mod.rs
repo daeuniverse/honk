@@ -160,7 +160,10 @@ pub(crate) fn udp_state_is_legacy_userspace_owned(state: &ConnState) -> bool {
     }
     let outbound = (raw & 0xff) as u8;
     let must = ((raw >> 40) & 1) != 0;
-    outbound != OutboundIndex::Block as u8 && !(outbound == OutboundIndex::Direct as u8 && must)
+    outbound != OutboundIndex::Block as u8
+        && (outbound != OutboundIndex::Direct as u8
+            || !must
+            || raw & ROUTING_META_FLAG_WAN_USERSPACE != 0)
 }
 
 #[cfg(test)]
@@ -447,9 +450,9 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<UdpDecisionCommitResult>;
 
     /// Retire a userspace-owned flow. Nonzero tokens remove only the matching
-    /// staged/proxy incarnation and auxiliaries; zero removes only a legacy
-    /// published, non-offloaded forward state. Kernel handoffs and superseding
-    /// tuple incarnations are retained.
+    /// staged/proxy incarnation and auxiliaries. Zero removes a legacy published,
+    /// non-offloaded state and, for explicit WAN userspace ownership, its matching
+    /// auxiliaries. Native kernel decisions and superseding incarnations survive.
     fn remove_udp_flow(
         &mut self,
         key: &TuplesKey,

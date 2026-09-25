@@ -40,7 +40,7 @@ pub mod bench_support;
 #[cfg(feature = "ebpf")]
 pub(in crate::control) use admission::OwnedEnqueueError;
 pub(in crate::control) use admission::{
-    DatagramPayload, EndpointReservation, QueuedDatagram, UdpInitLease, queue_now,
+    DatagramPayload, EndpointReservation, QueuedDatagram, RawDnsRoute, UdpInitLease, queue_now,
 };
 use admission::{EndpointEntry, EndpointKey, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY};
 #[cfg(test)]

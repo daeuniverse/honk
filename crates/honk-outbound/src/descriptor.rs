@@ -160,11 +160,13 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::AnyTls,
         share_link_schemes: &["anytls"],
     },
+    // Each direct flow owns a socket carrying its own rule or global mark; a
+    // pooled socket would hand one flow another flow's mark.
     ProtocolDescriptor {
         protocol: NodeProtocol::Direct,
         supports_udp: always,
         pool_ready_streams: never,
-        pool_bare_tcp: always,
+        pool_bare_tcp: never,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },

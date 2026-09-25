@@ -6,7 +6,8 @@
 
 ```text
 condition [&& condition ...] -> outbound[(must)]
-fallback: outbound
+condition [&& condition ...] -> direct(mark: value[, must])
+fallback: outbound[(must)] | direct(mark: value[, must])
 ```
 
 - Rules are evaluated by ascending `priority`; lower values run first. Equal priorities retain stable source order. The dae parser assigns `priority` values `0, 1, ...` in source order. honk does not insert local-interface routing rules.
@@ -67,7 +68,7 @@ For TCP/UDP destination port `53`, traffic-rule ownership is:
 
 | Ordered policy result | DNS ownership |
 | --- | --- |
-| `direct(must)` | Native Linux path, including the configured skb mark; no transparent honk DNS interception. A targeted local resolver can receive the query normally. |
+| `direct(must)` | No DNS controller. LAN traffic and unmarked WAN traffic use native Linux delivery; a nonzero marked WAN result uses a marked direct socket for a new policy-route lookup. |
 | `block(must)` | Drop. |
 | `group(must)` | Carry the original TCP/UDP through the group's normal raw transport, bypassing `DnsController`, cache, hosts, request/response policy, and routing projection. |
 | Any non-`must` result, including ordinary `block` | Valid DNS queries enter `DnsController`; Clash Direct-mode offload cannot take this ownership. |
@@ -75,6 +76,61 @@ For TCP/UDP destination port `53`, traffic-rule ownership is:
 Malformed non-`must` UDP53 payloads retain the generic UDP fallback rather than entering `DnsController`; the controller row is not a claim that every port-53 payload is DNS. Route-metadata admission follows the [TCP/UDP distinction](../design/control-plane.md#transparent-ingress).
 
 LAN local-socket precedence applies only to non-53 destinations, independently per transport; wildcard ownership also requires full FIB `NOT_FWDED`, and the non-DNS TCP pure-SYN probe skip remains. Bound `:53` sockets cannot preempt the policy results above. See [DNS ownership](../design/dns.md#dns-ownership-state-machine) for transparent LAN versus native/loopback delivery.
+
+## Policy-routing marks
+
+`direct(mark: 512)` and `direct(mark: 0x200)` select the same direct mark.
+Unprefixed numbers are decimal (including leading zeroes); `0x`/`0X` selects
+hexadecimal. The range is `0..=0x3fffffff`: bits `0xc0000000` belong to the
+datapath, not user policy. Binary/octal prefixes, underscores, signs, overflow,
+unknown options and duplicate `mark`/`must` options reject the configuration.
+Unlike the global mark scalar, a malformed direct mark never silently becomes zero.
+Marks are supported on `direct`, not proxy/group targets.
+
+`direct(mark: 0x200, must)` and `direct(must, mark: 0x200)` are equivalent;
+whitespace inside the direct option list is allowed; `fallback:`/`default:`
+accept the same forms. The last merged fallback replaces the whole action (a plain
+`direct` clears mark and `must`) and applies after every ordinary rule, even later ones.
+
+For IPv4/IPv6 TCP and UDP, a nonzero direct mark replaces the global socket-mark
+payload; it is **not OR-ed with `so_mark_from_dae` or `0x100`**. On native direct,
+NFQUEUE-approved direct and userspace direct sockets, honk retains
+`CLASSIFIED_MARK` (`0x40000000`) alongside this low-30-bit policy payload.
+For example, a configured `0x200` can appear as `0x40000200`; Linux policy rules
+must mask off the reserved bits. `mark: 0` means unspecified: userspace-originated
+direct sockets use the global mark, while native direct adds no user mark.
+Proxy carriers, bootstrap and DNS-controller upstreams use the global mark,
+not a mark from the intercepted traffic rule.
+
+For example, select two externally configured WAN routing tables:
+
+```dae
+global {
+    so_mark_from_dae: 0x200
+}
+routing {
+    domain(suffix: example.net) -> direct(mark: 0x300)
+    fallback: direct(mark: 0x200)
+}
+```
+
+```sh
+ip -4 rule add pref 10000 fwmark 0x200/0x3fffffff lookup 100
+ip -6 rule add pref 10000 fwmark 0x200/0x3fffffff lookup 100
+ip -4 rule add pref 10001 fwmark 0x300/0x3fffffff lookup 200
+ip -6 rule add pref 10001 fwmark 0x300/0x3fffffff lookup 200
+```
+
+Populate tables `100` and `200` with the appropriate family-specific connected
+and default routes, and configure source addresses/NAT/firewall permissions for
+each WAN. honk does not manage these tables. LAN native direct marks are applied
+before Linux forwarding lookup. A nonzero marked host/WAN direct result uses
+userspace direct relay so the new socket performs a marked route lookup; this
+also applies to `must`, including raw port-53 traffic, and does not preserve the
+client's original source socket. `must` still bypasses the DNS controller.
+Unmarked native `direct(must)` retains its existing source-preserving path.
+Changing the global mark requires restart; traffic rules can be reloaded.
+The compiled policy admits at most 256 distinct nonzero `direct(mark: ..., must)` values, including a marked `must` fallback. WAN raw UDP/53 carries an immutable mark-table index with its routing generation; it never takes a mark from another packet's tuple handoff.
 
 ## Geo assets
 
@@ -109,7 +165,7 @@ dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 This is optional user configuration, not an inserted rule. It leaves port `53` available for transparent DNS unless another terminal `must` result takes ownership. Existing non-53 local-socket ownership remains a pre-routing exclusion, including the non-DNS TCP pure-SYN probe skip; there is no unconditional gateway-management reachability guarantee without explicit routing.
 
 With real LAN bindings, honk warns when the compiled rule order cannot confirm
-unconditional `direct(must)` coverage for the observed addresses of configured
+unconditional `direct(must)` coverage (including a `direct(must)` fallback) for the observed addresses of configured
 LAN/WAN interfaces, for TCP and UDP destination ports `1–65535` except `53`.
 Checks run at startup, after a successful traffic-policy change, and on observed
 network changes; no-op and node-only reloads do not repeat the policy check.

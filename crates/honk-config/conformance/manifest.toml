@@ -1721,7 +1721,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-global-01"
-source = { file = "doc/en/reference/global.md", lines = "131-154" }
+source = { file = "doc/en/reference/global.md", lines = "156-179" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1788,7 +1788,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-01"
-source = { file = "doc/en/reference/routing.md", lines = "23-29" }
+source = { file = "doc/en/reference/routing.md", lines = "24-30" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1799,7 +1799,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-02"
-source = { file = "doc/en/reference/routing.md", lines = "106-106" }
+source = { file = "doc/en/reference/routing.md", lines = "162-162" }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -1811,7 +1811,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-03"
-source = { file = "doc/en/reference/routing.md", lines = "137-158" }
+source = { file = "doc/en/reference/routing.md", lines = "193-214" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1820,6 +1820,17 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'routing{domain(suffix:doubleclick.net)->blockpname(NetworkManager,systemd-resolved)&&l4proto(udp)&&dport(53)->direct(must)dip(geoip:private)->direct(must)sip(10.10.10.24/32,10.10.10.25/32)&&!dport(53)->direct(must)mac(aa:bb:'"
+
+[[case]]
+id = "honk-doc-en-reference-routing-marks"
+source = { file = "doc/en/reference/routing.md", lines = "108-114" }
+wrap = ""
+layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-subscription-01"
@@ -2005,7 +2016,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-global-01"
-source = { file = "doc/zh/reference/global.md", lines = "129-152" }
+source = { file = "doc/zh/reference/global.md", lines = "150-173" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2072,7 +2083,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-01"
-source = { file = "doc/zh/reference/routing.md", lines = "23-29" }
+source = { file = "doc/zh/reference/routing.md", lines = "24-30" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2083,7 +2094,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-02"
-source = { file = "doc/zh/reference/routing.md", lines = "104-104" }
+source = { file = "doc/zh/reference/routing.md", lines = "156-156" }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -2095,7 +2106,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-03"
-source = { file = "doc/zh/reference/routing.md", lines = "133-154" }
+source = { file = "doc/zh/reference/routing.md", lines = "185-206" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2104,6 +2115,17 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'routing{domain(suffix:doubleclick.net)->blockpname(NetworkManager,systemd-resolved)&&l4proto(udp)&&dport(53)->direct(must)dip(geoip:private)->direct(must)sip(10.10.10.24/32,10.10.10.25/32)&&!dport(53)->direct(must)mac(aa:bb:'"
+
+[[case]]
+id = "honk-doc-zh-reference-routing-marks"
+source = { file = "doc/zh/reference/routing.md", lines = "104-110" }
+wrap = ""
+layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-subscription-01"

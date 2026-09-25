@@ -441,7 +441,11 @@ impl AliveDialerSet {
             let start = Instant::now();
             let result = tokio::time::timeout(
                 timeout,
-                crate::util::connect_marked_addr(*a, self.so_mark, timeout),
+                crate::util::connect_marked_addr(
+                    *a,
+                    Some(self.so_mark.unwrap_or_else(crate::util::bypass_mark)),
+                    timeout,
+                ),
             )
             .await;
             let elapsed = start.elapsed();

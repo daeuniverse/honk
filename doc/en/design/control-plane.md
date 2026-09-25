@@ -33,7 +33,7 @@ Configuration diagnostics are collected before tracing setup. An early load or o
 
 Startup keeps kernel admission closed until userspace can receive every redirected flow:
 
-1. Load and validate the configuration, select `global.data_dir`, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
+1. Load and validate the configuration, select `global.data_dir`, initialize the process bypass mark before any network I/O, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
 2. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
 3. Select the backend. Real mode takes `/run/honk-core.lock` and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. Mock mode does not take the process-global lock.
 4. After the real-instance lock handoff, probe the fixed NFQUEUE queue prerequisites. Mock/no-`ebpf` mode or a failed preflight logs a warning and disables NFQUEUE for this process; the preflight does not reject the reserved nftables table because installation reclaims stale owned state.
@@ -50,7 +50,7 @@ Shutdown reverses ownership before resources disappear: fence NFQUEUE, close dat
 
 ## Transparent ingress
 
-Real TCP and UDP listeners are created inside `daens` with transparent socket options and `DAE_BYPASS_MARK` (`0x100`). The mark lets the datapath recognize honk's own listeners rather than treating them as ordinary local services. Accepted TCP sockets inherit the mark, so each accept loop clears it before handling the flow. Mock listeners are ordinary host-namespace sockets without privileged transparent options.
+Real TCP and UDP listeners are created inside `daens` with transparent socket options and the effective `global.so_mark_from_dae` (zero selects `0x100`). The mark lets the datapath recognize honk's own listeners rather than treating them as ordinary local services. Accepted TCP sockets inherit the mark, so each accept loop clears it before handling the flow. Mock listeners are ordinary host-namespace sockets without privileged transparent options.
 
 Original destinations are recovered as follows:
 
@@ -60,7 +60,7 @@ Original destinations are recovered as follows:
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | Transparent socket `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | Guarded provenance rules described below |
 
-For ordinary flows, userspace forms the canonical tuple and consumes `ROUTING_HANDOFF_MAP` with `routing_handoff_take`. A missing handoff, or an outbound of `ControlPlaneRouting`, falls back to `Router::route_with_must`. Final `must` and `block` results cannot be overridden by Clash mode. This fallback is not the transparent DNS ownership boundary.
+For ordinary flows, userspace forms the canonical tuple and consumes `ROUTING_HANDOFF_MAP` with `routing_handoff_take`. A missing handoff, or an outbound of `ControlPlaneRouting`, falls back to `Router::route_action`. Final `must` and `block` results cannot be overridden by Clash mode. This fallback is not the transparent DNS ownership boundary.
 
 Port-53 controller versus raw-transport ownership follows the [ordered traffic-rule contract](../reference/routing.md#outbound-targets-and-must), including the malformed non-`must` UDP fallback.
 
@@ -95,7 +95,7 @@ An authoritative URLTest setup failure retains one retry round over its latency-
 3. Otherwise, only a non-wildcard listener bind can supply the destination.
 4. Missing, malformed, duplicate, truncated, or unspecified metadata is dropped before slow-path reservation or payload retention.
 
-UDP ingress captures the initializer epoch before any awaited validation. Raw UDP53 admission then holds the `Config` read lock followed by the backend read lock to validate the committed routing generation and pin the semantic group. Reservation and enqueue remain under the existing epoch gates. An incompatible ordinary/raw/group owner on the same tuple is rejected, not silently borrowed. Valid non-`must` DNS instead enters its separate query budgets. UDP53 never allocates ordinary conn-state or NFQUEUE decision tokens.
+UDP ingress captures the initializer epoch before any awaited validation. Raw UDP53 admission holds the `Config` read lock followed by the backend read lock; marked-direct admission first holds the Router read lock. It validates the committed routing generation and snapshots either the semantic group or the packet's immutable direct-mark table entry. Reservation and enqueue remain under the existing epoch gates. An incompatible ordinary/raw/group/direct-mark owner on the same tuple is rejected, not silently borrowed. Valid non-`must` DNS instead enters its separate query budgets. UDP53 never allocates ordinary conn-state or NFQUEUE decision tokens.
 
 Reassembled [LAN DNS fragments](./nfqueue.md#fragmented-lan-dns) share this admission through NFQUEUE; work publication follows confirmed removal of the original queued packet.
 
@@ -147,7 +147,7 @@ SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the endpoint l
 
 Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket and cache accepted alternate full-cone sources per endpoint. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid.
 
-Reload advances a cancellation epoch before waiting. Initializers capture that epoch and an incarnation generation; a cancellation that linearizes before `commit_ready` prevents publication. Reload drains `Initializing` leases and their retained resources but preserves `Ready` endpoints. Every retirement, including its `Retiring` tombstone and acknowledgement, names the token and generation, so delayed work cannot remove a replacement mapping.
+Reload advances a cancellation epoch before waiting. Initializers capture that epoch and an incarnation generation; a cancellation that linearizes before `commit_ready` prevents publication. Reload drains `Initializing` leases and their retained resources. A successful compiled traffic-plan change retires direct `Ready` endpoints only when the old or new policy includes direct marks, so later traffic cannot reuse their old socket marks. No-op/unrelated reloads and routing changes with no direct marks in either policy preserve them. Every retirement, including its `Retiring` tombstone and acknowledgement, names the token and generation, so delayed work cannot remove a replacement mapping. Explicitly userspace-owned WAN UDP decisions, including marked `direct(must)`, retire their token-zero conn state, handoff and redirect track together under the tuple/reader fence; native LAN direct/offloaded decisions and newer nonzero tokens survive.
 
 A compatible same-name raw-group `Ready` session may persist across reload. This does not extend initializer lifetime: `Initializing` never survives reload, and stale queued route metadata still fails admission after a compiled-policy publication.
 
@@ -236,7 +236,7 @@ SIGHUP uses an attempt-local diagnostic list. Load and operator-validation warni
 4. Compile the generation's `RoutingPushPlan`, then call `EbpfBackend::publish_routing_plan(&plan, learned_domains)` once. The backend chooses the inactive slot, stages all generation-owned IP/source/MAC/domain fact maps with full 256-bit predicate values, attaches the generated function to every relevant target, and switches `ROUTING_POLICY_ROOT` last. Only after that succeeds does userspace publish the outbound registry, DNS runtime pointer, router, config, groups, and projection snapshot under the same serialization boundary.
 5. Reopen pending admission and NFQUEUE last. Rule-derived feature bits live in the policy descriptor, not a separately published static-flags map.
 
-`RoutingPushPlan::compile` is the only userspace lowering path; there is no caller-selected slot or separate domain-publication handshake. The stable `routing_policy.rs` ABI remains `RoutingInput` 128 bytes, `RoutingDecision` 20 bytes, and `RoutingPolicyDescriptor` 24 bytes. Real eBPF requires Linux 6.12+; generated process-name writes check fixed offsets before pointer construction for the 6.12 verifier.
+`RoutingPushPlan::compile` is the only userspace lowering path; there is no caller-selected slot or separate domain-publication handshake. The `routing_policy.rs` ABI is `RoutingInput` 128 bytes, `RoutingDecision` 24 bytes, and `RoutingPolicyDescriptor` 24 bytes. Real eBPF requires Linux 6.12+; generated process-name writes check fixed offsets before pointer construction for the 6.12 verifier. Loaded routing slots must expose the current output layout in BTF.
 
 Pre-commit failures leave the active code and facts intact. After a fenced publication rejection, the controller restores group connectivity and reopens the old generation. A failed connectivity restoration keeps admission rejected. Once the root has switched, the new generation is committed; a subsequent NFQUEUE-reopen failure keeps that generation published but admission fenced until a later successful reload repairs it.
 

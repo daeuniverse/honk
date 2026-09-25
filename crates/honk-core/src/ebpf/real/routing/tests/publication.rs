@@ -34,8 +34,7 @@ fn publication_failure_recovery_and_frozen_root() {
         })
         .collect::<Vec<_>>();
     let initial_router = Router::new(&initial_rules, "direct").unwrap();
-    let initial_plan =
-        RoutingPushPlan::compile(&initial_router, &ids, "direct", DialMode::Ip).unwrap();
+    let initial_plan = RoutingPushPlan::compile(&initial_router, &ids, DialMode::Ip).unwrap();
     backend.publish_routing_plan(&initial_plan, &[]).unwrap();
 
     let mut active_hit_connection = golden::connection();
@@ -52,6 +51,7 @@ fn publication_failure_recovery_and_frozen_root() {
         must: 0,
         domain_final: 1,
         rule_id: 255,
+        direct_mark_index: u32::MAX,
     };
     let active_miss_decision = RoutingDecision {
         outbound: 0,
@@ -59,6 +59,7 @@ fn publication_failure_recovery_and_frozen_root() {
         must: 0,
         domain_final: 1,
         rule_id: u32::MAX,
+        direct_mark_index: u32::MAX,
     };
     assert_eq!(
         backend.run_routing_test(&active_hit).unwrap().decision,
@@ -84,8 +85,7 @@ fn publication_failure_recovery_and_frozen_root() {
         mark: 0x700,
     };
     let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
-    let recovery =
-        RoutingPushPlan::compile(&recovery_router, &ids, "direct", DialMode::Ip).unwrap();
+    let recovery = RoutingPushPlan::compile(&recovery_router, &ids, DialMode::Ip).unwrap();
     let mut map_fill_candidate = recovery.clone();
     map_fill_candidate
         .facts
@@ -148,6 +148,7 @@ fn publication_failure_recovery_and_frozen_root() {
         must: 0,
         domain_final: 1,
         rule_id: 0,
+        direct_mark_index: u32::MAX,
     };
     assert_eq!(
         backend.run_routing_test(&active_hit).unwrap().decision,
@@ -165,7 +166,7 @@ fn publication_failure_recovery_and_frozen_root() {
     let root_candidate_router =
         Router::new(std::slice::from_ref(&root_candidate_rule), "direct").unwrap();
     let root_candidate =
-        RoutingPushPlan::compile(&root_candidate_router, &ids, "direct", DialMode::Ip).unwrap();
+        RoutingPushPlan::compile(&root_candidate_router, &ids, DialMode::Ip).unwrap();
     let root_candidate_slot = recovered_slot ^ 1;
     let root_candidate_name = ROUTING_SLOT_NAMES[root_candidate_slot as usize];
     let root_candidate_targets = backend.routing_targets(root_candidate_name).unwrap();
@@ -239,9 +240,8 @@ fn routing_generation_ceiling_preserves_the_committed_root() {
     let ids = outbound_ids();
     let old_router = Router::new(&old_rules, "direct").unwrap();
     let replacement_router = Router::new(&replacement_rules, "direct").unwrap();
-    let old = RoutingPushPlan::compile(&old_router, &ids, "direct", DialMode::Ip).unwrap();
-    let replacement =
-        RoutingPushPlan::compile(&replacement_router, &ids, "direct", DialMode::Ip).unwrap();
+    let old = RoutingPushPlan::compile(&old_router, &ids, DialMode::Ip).unwrap();
+    let replacement = RoutingPushPlan::compile(&replacement_router, &ids, DialMode::Ip).unwrap();
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend
@@ -329,7 +329,7 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
         true,
     )];
     let router = Router::new(&rules, "direct").unwrap();
-    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
     let mut connection = golden::connection();
     connection.dst_port = 53;
     let input = input(&connection);

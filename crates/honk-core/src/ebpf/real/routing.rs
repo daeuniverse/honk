@@ -10,7 +10,7 @@ use aya_obj::generated::{
     bpf_attr, bpf_btf_info, bpf_cmd, bpf_func_info, bpf_line_info, bpf_prog_type,
 };
 use std::io;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::os::fd::{FromRawFd, OwnedFd};
 
 const ROUTING_TARGETS: [&str; 4] = [
@@ -108,6 +108,60 @@ fn btf_bytes(fd: &OwnedFd) -> anyhow::Result<Vec<u8>> {
         bytes.truncate(info.btf_size as usize);
         return Ok(bytes);
     }
+}
+
+/// Validate the actual freplace output parameter before writing generated fields.
+fn validate_routing_decision_abi(data: &[u8], slot: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        btf::Btf::parse(data)
+            .and_then(|btf| routing_decision_layout(&btf, slot))
+            .is_some(),
+        "incompatible RoutingDecision ABI for {slot}; rebuild the eBPF object"
+    );
+    Ok(())
+}
+
+fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
+    let read = |offset| btf.u32_at(offset);
+    let prototype = btf.type_by_id(read(btf.find_type(12, slot)? + 8)?)?;
+    if read(prototype + 4)? != (13 << 24) | 2 {
+        return None;
+    }
+    let pointer = btf.type_by_id(read(prototype + 24)?)?;
+    if btf.kind(pointer)? != 2 {
+        return None;
+    }
+    let structure = btf.resolve_composite(read(pointer + 8)?)?;
+    let fields = [
+        ("outbound", offset_of!(RoutingDecision, outbound)),
+        ("mark", offset_of!(RoutingDecision, mark)),
+        ("must", offset_of!(RoutingDecision, must)),
+        ("domain_final", offset_of!(RoutingDecision, domain_final)),
+        ("rule_id", offset_of!(RoutingDecision, rule_id)),
+        (
+            "direct_mark_index",
+            offset_of!(RoutingDecision, direct_mark_index),
+        ),
+    ];
+    if read(structure + 4)? != (4 << 24) | fields.len() as u32
+        || read(structure + 8)? != size_of::<RoutingDecision>() as u32
+    {
+        return None;
+    }
+    for (index, (name, offset)) in fields.into_iter().enumerate() {
+        let member = structure + 12 + index * 12;
+        if btf.string(read(member)?) != Some(name) || read(member + 8)? != offset as u32 * 8 {
+            return None;
+        }
+        let member_type = btf.resolve_modifiers(read(member + 4)?)?;
+        if btf.kind(member_type)? != 1
+            || read(member_type + 8)? != 4
+            || read(member_type + 12)? & 0x00ff_ffff != 32
+        {
+            return None;
+        }
+    }
+    Some(())
 }
 
 fn load_btf(bytes: &[u8]) -> anyhow::Result<OwnedFd> {
@@ -363,7 +417,9 @@ impl RealEbpfBackend {
                 .ok_or_else(|| anyhow::anyhow!("routing target '{name}' has no BTF"))?;
             let fd = program.fd()?.try_clone()?;
             let kernel_btf = btf_fd_by_id(btf_id)?;
-            let btf = Btf::parse(&btf_bytes(&kernel_btf)?, Default::default())?;
+            let bytes = btf_bytes(&kernel_btf)?;
+            validate_routing_decision_abi(&bytes, slot_name)?;
+            let btf = Btf::parse(&bytes, Default::default())?;
             let function_id = btf.id_by_type_name_kind(slot_name, BtfKind::Func)?;
             result.push(Target {
                 fd,

@@ -15,6 +15,7 @@ impl ControlPlaneHandle {
         target: SocketAddr,
         target_domain: Option<String>,
         outbound_name: &str,
+        direct_mark: Option<honk_outbound::proxy::DirectMark>,
         connect_timeout: Duration,
         dial_deadline: tokio::time::Instant,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
@@ -85,6 +86,7 @@ impl ControlPlaneHandle {
                         &node,
                         (target, target_domain.as_deref()),
                         connect_timeout,
+                        direct_mark,
                         &scope,
                     ));
                     // Poll the dial before the timer, and keep its pending
@@ -418,6 +420,7 @@ impl ControlPlaneHandle {
     /// acquire (local pool pop, no network round trip); bare-pool
     /// handshakes, warm logical streams, and fresh dials all perform ≥1
     /// round trip through the node and report true.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn dial_pooled(
         registry: &ProxyRegistry,
         pool: &ConnectionPool,
@@ -425,6 +428,7 @@ impl ControlPlaneHandle {
         node: &Node,
         target: (SocketAddr, Option<&str>),
         connect_timeout: Duration,
+        direct_mark: Option<honk_outbound::proxy::DirectMark>,
         scope: &Arc<honk_outbound::runtime::DialScope>,
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
         anyhow::ensure!(
@@ -432,6 +436,24 @@ impl ControlPlaneHandle {
             "outbound runtime generation is shut down"
         );
         let (target, target_domain) = target;
+        // A marked socket belongs to exactly one flow, so it never touches a pool.
+        if let Some(mark) = direct_mark {
+            return scope
+                .scope(async {
+                    registry
+                        .dial_runtime_marked(
+                            Arc::clone(generation),
+                            node.id,
+                            target,
+                            target_domain,
+                            connect_timeout,
+                            mark,
+                        )
+                        .await
+                        .map(|stream| (stream, true))
+                })
+                .await;
+        }
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")

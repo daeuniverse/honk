@@ -175,6 +175,41 @@ routing {{
 }
 
 #[test]
+fn marked_fallback_follows_all_included_rules_and_last_fallback_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("config.dae"),
+        "include { child.dae }\nrouting {\n fallback: direct(mark: 0x100, must)\n dport(80) -> block\n}",
+    );
+    for (child_fallback, expected_mark, expected_must) in [
+        ("", 0x100, true),
+        ("fallback: direct(mark: 512)", 512, false),
+        ("default: direct(must, mark: 0x300)", 0x300, true),
+        ("fallback: direct", 0, false),
+    ] {
+        write(
+            &root.join("child.dae"),
+            &format!("routing {{\n dport(443) -> direct\n {child_fallback}\n}}"),
+        );
+        let config = Config::from_file(root.join("config.dae").to_str().unwrap()).unwrap();
+        assert_eq!(config.routing.rules.len(), 2);
+        assert_eq!(config.routing.rules[0].condition.port, ["80"]);
+        assert_eq!(config.routing.rules[0].outbound.as_str(), "block");
+        assert_eq!(config.routing.rules[1].condition.port, ["443"]);
+        assert_eq!(config.routing.rules[1].outbound.as_str(), "direct");
+        assert_eq!(
+            (
+                config.routing.default_outbound.as_str(),
+                config.routing.default_mark,
+                config.routing.default_must
+            ),
+            ("direct", expected_mark, expected_must)
+        );
+    }
+}
+
+#[test]
 fn include_rejects_cycles_and_paths_outside_the_entry_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");

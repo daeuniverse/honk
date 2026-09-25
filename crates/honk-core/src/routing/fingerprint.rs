@@ -1,18 +1,18 @@
 use sha2::{Digest, Sha256};
 
-use super::{CompiledCondition, CompiledPredicate, CompiledRoute, DomainMatcher};
+use super::{CompiledCondition, CompiledPredicate, CompiledRoute, DomainMatcher, RouteAction};
 
 /// Hash the policy's semantic inputs without depending on derived compiler state.
 pub(super) fn policy(
     routes: &[CompiledRoute],
     domain_matchers: &[DomainMatcher],
-    default_outbound: &str,
+    fallback: &RouteAction,
     geo_fingerprint: [u8; 32],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"honk.routing-policy.v2\0");
     let mut encoder = Encoder { hash: &mut hash };
-    encoder.string(default_outbound);
+    encode_action(&mut encoder, fallback);
     encoder.fixed(&geo_fingerprint);
     encoder.list(routes, encode_route);
     encoder.list(domain_matchers, encode_domain_key);
@@ -72,9 +72,13 @@ fn encode_route(encoder: &mut Encoder<'_>, route: &CompiledRoute) {
     encoder.string(&route.rule_payload);
     encoder.u32(route.priority);
     encoder.list(&route.conditions, encode_condition);
-    encoder.string(&route.outbound);
-    encoder.bool(route.must);
-    encoder.u32(route.mark);
+    encode_action(encoder, &route.action);
+}
+
+fn encode_action(encoder: &mut Encoder<'_>, action: &RouteAction) {
+    encoder.string(&action.outbound);
+    encoder.bool(action.must);
+    encoder.u32(action.mark.map_or(0, honk_outbound::proxy::DirectMark::get));
 }
 
 fn encode_condition(encoder: &mut Encoder<'_>, condition: &CompiledCondition) {
@@ -172,14 +176,23 @@ mod tests {
                 not: false,
                 predicate: condition,
             }],
-            outbound: "direct".into(),
-            must: false,
-            mark: 0,
+            action: RouteAction {
+                outbound: "direct".into(),
+                must: false,
+                mark: None,
+                direct_mark_index: None,
+            },
         }
     }
 
     fn digest(routes: &[CompiledRoute], matchers: &[DomainMatcher]) -> [u8; 32] {
-        policy(routes, matchers, "direct", [0; 32])
+        let fallback = RouteAction {
+            outbound: "direct".into(),
+            must: false,
+            mark: None,
+            direct_mark_index: None,
+        };
+        policy(routes, matchers, &fallback, [0; 32])
     }
 
     #[test]
@@ -248,7 +261,7 @@ mod tests {
     fn semantic_encoder_keeps_action_metadata_and_geo_distinct() {
         let base = route(CompiledPredicate::Protocol(1));
         let mut changed = base.clone();
-        changed.outbound = "proxy".into();
+        changed.action.outbound = "proxy".into();
         assert_ne!(
             digest(std::slice::from_ref(&base), &[]),
             digest(&[changed], &[])
@@ -256,15 +269,36 @@ mod tests {
 
         let mut changed = base.clone();
         changed.rule_payload = "tcp".into();
-        changed.must = true;
-        changed.mark = 7;
+        changed.action.must = true;
+        changed.action.mark = honk_outbound::proxy::DirectMark::new(7);
         assert_ne!(
             digest(std::slice::from_ref(&base), &[]),
             digest(&[changed], &[])
         );
+        let routes = std::slice::from_ref(&base);
+        let plain = base.action.clone();
+        for fallback in [
+            RouteAction {
+                outbound: "proxy".into(),
+                ..plain.clone()
+            },
+            RouteAction {
+                must: true,
+                ..plain.clone()
+            },
+            RouteAction {
+                mark: honk_outbound::proxy::DirectMark::new(7),
+                ..plain.clone()
+            },
+        ] {
+            assert_ne!(
+                policy(routes, &[], &plain, [0; 32]),
+                policy(routes, &[], &fallback, [0; 32])
+            );
+        }
         assert_ne!(
-            policy(std::slice::from_ref(&base), &[], "direct", [0; 32]),
-            policy(std::slice::from_ref(&base), &[], "direct", [1; 32]),
+            policy(routes, &[], &plain, [0; 32]),
+            policy(routes, &[], &plain, [1; 32])
         );
     }
 

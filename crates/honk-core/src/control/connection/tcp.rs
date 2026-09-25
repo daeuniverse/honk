@@ -143,16 +143,22 @@ impl ControlPlaneHandle {
                 && handoff.routing_generation == backend.routing_policy_generation(),
             "TCP DNS routing generation is stale"
         );
-        let group = handoff
-            .outbound
-            .checked_sub(OutboundIndex::UserBase as u8)
-            .filter(|_| handoff.outbound < OutboundIndex::MustRules as u8)
-            .and_then(|index| config.groups.get(index as usize))
-            .ok_or_else(|| anyhow::anyhow!("invalid terminal TCP DNS outbound"))?;
+        let outbound = if handoff.outbound == OutboundIndex::Direct as u8 {
+            "direct".to_owned()
+        } else {
+            handoff
+                .outbound
+                .checked_sub(OutboundIndex::UserBase as u8)
+                .filter(|_| handoff.outbound < OutboundIndex::MustRules as u8)
+                .and_then(|index| config.groups.get(index as usize))
+                .ok_or_else(|| anyhow::anyhow!("invalid terminal TCP DNS outbound"))?
+                .name
+                .clone()
+        };
         let decision = super::routing::RoutingDecision {
-            outbound: group.name.clone(),
+            outbound,
             must: true,
-            mark: handoff.mark,
+            mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
             matched_rule: None,
             reroute_by_sniffed_domain: false,
         };
@@ -311,7 +317,7 @@ impl ControlPlaneHandle {
             "tcp",
             handoff.as_ref(),
         );
-        let (route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
+        let (mut route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
             (
                 snapshot.decision,
                 Some((snapshot.config, snapshot.group_manager, snapshot.runtime)),
@@ -324,8 +330,9 @@ impl ControlPlaneHandle {
             )
         };
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
-        let matched_rule = route.matched_rule;
-        let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
+        let matched_rule = route.matched_rule.take();
+        self.apply_mode_override(&mut route).await;
+        let outbound_name = std::mem::take(&mut route.outbound);
 
         // Seed current predicate facts so later flows need not repeat sniffing.
         if let Some(domain) = &domain
@@ -336,35 +343,6 @@ impl ControlPlaneHandle {
         }
 
         self.stats.record_connection(&outbound_name);
-        // If eBPF already decided this flow should go direct (not just punted
-        // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
-        // For ControlPlaneRouting handoffs we must relay in userspace even if
-        // the final routing decision is direct, because eBPF has not installed
-        // the flow state needed to forward the accepted socket.
-        let ebpf_offload = outbound_name == "direct"
-            && handoff
-                .as_ref()
-                .map(|ho| {
-                    ho.outbound == OutboundIndex::Direct as u8
-                        && ho.mark != 0
-                        && ho.outbound != OutboundIndex::ControlPlaneRouting as u8
-                })
-                .unwrap_or(false);
-        if ebpf_offload {
-            debug!(
-                network = "tcp",
-                outbound = %outbound_name,
-                ip = %original_dst,
-                src = %client_addr,
-                ebpf_offload = true,
-                "TCP offloaded to eBPF: {} -> {}",
-                client_addr,
-                original_dst,
-            );
-            self.stats.record_close(&outbound_name);
-            return Ok(());
-        }
-
         let ipver = if original_dst.is_ipv6() {
             IpVersion::V6
         } else {
@@ -445,6 +423,7 @@ impl ControlPlaneHandle {
                 original_dst,
                 target_domain.clone(),
                 &outbound_name,
+                route.mark,
                 connect_timeout,
                 dial_deadline,
                 Arc::clone(&runtime_generation),
@@ -521,6 +500,7 @@ impl ControlPlaneHandle {
                                 original_dst,
                                 target_domain.clone(),
                                 &outbound_name,
+                                route.mark,
                                 connect_timeout,
                                 retry_deadline,
                                 Arc::clone(&runtime_generation),

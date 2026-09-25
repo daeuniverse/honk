@@ -113,10 +113,7 @@ impl RuntimeBenchmark {
         let shared = RuntimeShared {
             cache,
             dns_router,
-            router: Arc::new(
-                Router::new(&config.routing.rules, &config.routing.default_outbound)
-                    .expect("benchmark router"),
-            ),
+            router: Arc::new(Router::from_config(&config.routing).expect("benchmark router")),
         };
         let initial = runtime(&shared, 1);
         Self {

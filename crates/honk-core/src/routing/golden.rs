@@ -38,6 +38,12 @@ fn expected(id: Option<usize>, outbound: u32, mark: u32, must: bool) -> RoutingD
         must: must as u32,
         domain_final: 0,
         rule_id: id.map_or(u32::MAX, |id| id as u32),
+        // This fixture has one distinct marked must-direct action.
+        direct_mark_index: if outbound == 0 && must && mark != 0 {
+            0
+        } else {
+            u32::MAX
+        },
     }
 }
 
@@ -487,8 +493,10 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 32,
         ],
     );
+    let mut routing = honk_config::routing::RoutingConfig::default();
+    routing.rules = rules;
     (
-        Router::new_with_geo_sources(&rules, "direct", &sources).unwrap(),
+        Router::from_config_with_geo_sources(&routing, &sources).unwrap(),
         cases,
     )
 }
@@ -502,14 +510,17 @@ fn reference_matches_independent_goldens() {
             |result| {
                 expected(
                     Some(result.rule_id as usize),
-                    match result.outbound_name {
+                    match result.action.outbound.as_str() {
                         "direct" => 0,
                         "block" => 1,
                         "proxy" => 2,
                         other => panic!("unexpected outbound {other}"),
                     },
-                    result.mark,
-                    result.must,
+                    result
+                        .action
+                        .mark
+                        .map_or(0, honk_outbound::proxy::DirectMark::get),
+                    result.action.must,
                 )
             },
         );
@@ -523,11 +534,11 @@ fn reference_matches_independent_goldens() {
         projected.domain = None;
         let projected = router.route_full_with_domain_bitmap(&projected, bitmap.as_ref());
         assert_eq!(
-            projected.map(|result| (result.rule_id, result.mark, result.must)),
+            projected.map(|result| (result.rule_id, result.action.mark, result.action.must)),
             router.route_full(&case.connection).map(|result| (
                 result.rule_id,
-                result.mark,
-                result.must
+                result.action.mark,
+                result.action.must
             )),
             "{} projection",
             case.label

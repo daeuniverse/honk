@@ -82,8 +82,8 @@ UDP-only Xray pool therefore does not make Selector warming open that pool.
 
 | Trait | Operations | Contract |
 | --- | --- | --- |
-| `TcpOutbound` | `dial`, `dial_with_tcp`, `dial_runtime` | Opens a target-bound `ProxyStream`. `dial_with_tcp` may consume an already connected bare server socket. `dial_runtime` pins session-owning work to the captured generation. |
-| `PacketOutbound` | `dial_udp_transport`, `dial_udp_transport_runtime`, `dial_udp_transport_speculative_runtime` | Opens or prepares the ordinary `PacketTransport` contract. Runtime and speculative variants prevent reload or cold-race work from consulting mutable current state. |
+| `TcpOutbound` | `dial`, `dial_with_tcp`, `dial_runtime`, `dial_runtime_marked` | Opens a target-bound `ProxyStream`. `dial_with_tcp` may consume an already connected bare server socket. `dial_runtime` pins session-owning work to the captured generation. `dial_runtime_marked` carries a routed direct flow's `DirectMark`; only Direct applies it, and every other handler refuses it. `ProxyRegistry` runs marked and unmarked dials through the same generation fences. |
+| `PacketOutbound` | `dial_udp_transport`, `dial_udp_transport_runtime`, `dial_udp_transport_runtime_marked`, `dial_udp_transport_speculative_runtime` | Opens or prepares the ordinary `PacketTransport` contract. Runtime and speculative variants prevent reload or cold-race work from consulting mutable current state. The marked variant follows `dial_runtime_marked`. |
 | `WarmableOutbound` | `warm(runtime, timeout, WarmRequirement)` | Establishes only the reusable state named by the requirement. Hysteria2 uses `Udp` to verify server admission; VLESS may map `Session` and `Udp` to different pools. |
 | `ProbeableOutbound` | `test_connectivity` | Tests raw proxy-server reachability. Protocols may override the default marked TCP connect. |
 
@@ -116,14 +116,15 @@ Trojan transport, affect capability or pooling. Trojan and AnyTLS share
 | TUIC | yes | no | no | `Quic` | `tuic` |
 | Juicity | yes | no | no | `Quic` | `juicity` |
 | AnyTLS | when `network` is absent or contains `udp` | no | no | `AnyTls` | `anytls` |
-| Direct | yes | no | yes | `None` | none |
+| Direct | yes | no | no | `None` | none |
 | Block | no | no | yes | `None` | none |
 
 Ready-stream pooling stores a completed target-bound handshake. Bare-TCP
 pooling stores only a connected proxy-server socket and lets `dial_with_tcp`
 perform the per-target protocol handshake. TCP-multiplexed and QUIC protocols
-exclude both because their generation runtime owns reuse. VLESS with direct TCP
-remains bare-poolable even when an independent UDP-only Xray pool exists.
+exclude both because their generation runtime owns reuse. Direct excludes both
+because each flow's socket carries its own rule or global mark. VLESS with direct
+TCP remains bare-poolable even when an independent UDP-only Xray pool exists.
 
 Ready streams are keyed by runtime generation, node identity, and target; only
 flows using the generation that dialed them may acquire them. After a reload
@@ -330,11 +331,12 @@ response-header and body-decoding failures reach the stream owner instead of EOF
 - `connect_outbound` applies the bypass mark for proxy-server TCP; and
 - `udp_marked_bind` and `marked_udp_socket` create bypass-marked UDP sockets.
 
-Every control-plane-originated non-loopback socket must carry
-`DAE_BYPASS_MARK` (`0x100`). Without it, WAN egress classification can redirect
-honk's own proxy, DNS, or probe traffic back into `daens` and create a loop.
-Mark application is best-effort only for unprivileged `EPERM` environments
-without the production datapath; other errors propagate.
+Control-plane sockets use the process-scoped `global.so_mark_from_dae`; zero
+selects `DAE_BYPASS_MARK` (`0x100`). Nonzero direct rule marks instead use
+`rule_mark | CLASSIFIED_MARK`, without leaking the override into bootstrap or
+proxy carriers. WAN egress recognizes both forms. Mark application remains
+best-effort only for unprivileged `EPERM` environments without the production
+datapath; other errors propagate.
 
 Marked UDP sockets request 8 MiB each for `SO_RCVBUF` and `SO_SNDBUF`. Linux
 may clamp and reports twice the configured sysctl accounting value; the core
@@ -344,8 +346,12 @@ raises the corresponding maxima at startup.
 intercepted DNS path. Node dial sites use `bootstrap::resolve` through
 `connect_marked` or the QUIC setup and never call bare `lookup_host` directly.
 The configured bootstrap resolver is queried over bypass-marked UDP/TCP; failure
-falls back to the system resolver. `query_ech_config` uses the same raw path for
-DNS HTTPS records (`qtype 65`) and extracts the SVCB `ech` parameter.
+falls back to `/etc/hosts` and marked DNS to the first numeric nameserver in
+`/etc/resolv.conf`. This does not invoke libc NSS or apply search suffixes.
+A and AAAA are queried concurrently, each within its own 3 s budget, and only a
+response matching the random query ID and the exact question is accepted; a truncated UDP answer is retried over marked TCP.
+`query_ech_config` uses the same raw path for DNS HTTPS records (`qtype 65`)
+and extracts the SVCB `ech` parameter.
 
 After resolution, `src/address_race.rs` schedules proxy-server TCP `connect_marked`
 and shared QUIC `QuicClient` attempts with stable IPv4/IPv6 interleaving and at most

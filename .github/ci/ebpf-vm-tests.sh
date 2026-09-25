@@ -6,6 +6,7 @@ source "${CARGO_TARGET_DIR:?}/kernel-test-bins.env"
 test -x "$HONK_CORE_TEST_BIN"
 test -x "$HONK_DATAPATH_TEST_BIN"
 test -x "$HONK_NFQUEUE_TEST_BIN"
+test -x "$HONK_OUTBOUND_TEST_BIN"
 
 cd "$repo"
 test "$(id -u)" -eq 0
@@ -39,3 +40,11 @@ watcher_test=ebpf::real::iface_watch::tests::route_only_change_wakes_network_sub
 test "$("$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --list --format terse)" = "$watcher_test: test"
 "$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-iface-watch.log"
+race_test=control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks
+test "$("$HONK_CORE_TEST_BIN" "$race_test" --exact --ignored --list --format terse)" = "$race_test: test"
+"$HONK_CORE_TEST_BIN" "$race_test" --exact --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-socket-marks.log"
+mark_test=proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation
+test "$("$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --list --format terse)" = "$mark_test: test"
+"$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-outbound-socket-marks.log"

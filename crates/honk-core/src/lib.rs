@@ -243,7 +243,6 @@ pub struct Cli {
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
-    use std::net::ToSocketAddrs;
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
@@ -283,6 +282,13 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
         }
         ClashCommand::Delay { node, url } => {
             let config = Config::from_file(cli.config.to_str().unwrap())?;
+            config.validate()?;
+            honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+            honk_outbound::bootstrap::set_global(
+                honk_outbound::bootstrap::BootstrapResolver::parse(
+                    &config.global.bootstrap_resolver,
+                ),
+            );
             let target_node = config
                 .nodes
                 .iter()
@@ -297,11 +303,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
 
             let start = std::time::Instant::now();
             let timeout = Duration::from_secs(5);
-            let socket_addrs: Vec<_> = addr.to_socket_addrs()?.collect();
-            if socket_addrs.is_empty() {
-                anyhow::bail!("Could not resolve address: {}", addr);
-            }
-            match std::net::TcpStream::connect_timeout(&socket_addrs[0], timeout) {
+            match honk_outbound::util::connect_outbound(&addr, timeout).await {
                 Ok(stream) => {
                     let elapsed = start.elapsed();
                     drop(stream);
@@ -774,6 +776,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
+    honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular
     // DNS path — without it a restart can deadlock: nodes are unreachable
@@ -1104,11 +1108,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
-    let router = routing::Router::new_with_geo_sources(
-        &config.routing.rules,
-        &config.routing.default_outbound,
-        &geo_sources,
-    )?;
+    let router = routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources)?;
     info!("Router ready with {} compiled routes", router.route_count());
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);

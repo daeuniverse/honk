@@ -4,7 +4,7 @@
 //! freplace prototype, BTF and map lifetime; R1 is `*const RoutingInput` and
 //! R2 is `*mut RoutingDecision`.
 
-use super::{KernelCondition, KernelPredicate, RoutingPushPlan};
+use super::{KernelAction, KernelCondition, KernelPredicate, RoutingPushPlan};
 use anyhow::{Context, ensure};
 use aya_obj::generated::{
     BPF_ALU64, BPF_AND, BPF_B, BPF_CALL, BPF_DW, BPF_EXIT, BPF_IMM, BPF_JA, BPF_JEQ, BPF_JGE,
@@ -51,6 +51,7 @@ const MARK: i16 = std::mem::offset_of!(RoutingDecision, mark) as i16;
 const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
 const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
 const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
+const DIRECT_MARK_INDEX: i16 = std::mem::offset_of!(RoutingDecision, direct_mark_index) as i16;
 
 /// One lookup category. Each owns a 32-byte stack area holding its
 /// `DomainRouting` bitmap once resolved: domain at [-32, -1], destination at
@@ -281,7 +282,8 @@ pub fn emit_routing_program(
     }
     asm.mov_reg(R6, R1)?;
     asm.mov_reg(R7, R2)?;
-    asm.st_imm(R7, OUTBOUND, plan.fallback as i32)?;
+    asm.st_imm(R7, DIRECT_MARK_INDEX, u32::MAX as i32)?;
+    asm.st_imm(R7, OUTBOUND, plan.fallback.outbound as i32)?;
     asm.st_imm(R7, MARK, 0)?;
     asm.st_imm(R7, MUST, 0)?;
     asm.st_imm(
@@ -337,10 +339,7 @@ pub fn emit_routing_program(
             conditional = true;
             asm.bind(pass);
         }
-        asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
-        asm.st_imm(R7, MARK, rule.mark as i32)?;
-        asm.st_imm(R7, MUST, rule.must as i32)?;
-        asm.st_imm(R7, RULE_ID, rule.id as i32)?;
+        emit_action(&mut asm, rule.action, Some(rule.id))?;
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
         if !conditional {
@@ -349,11 +348,41 @@ pub fn emit_routing_program(
         asm.bind(fail);
     }
 
+    // The prologue's zero MARK seeds READY, so fallback options are stored only here.
     asm.source(0, "fallback");
+    emit_action(&mut asm, plan.fallback, None)?;
     asm.mov_imm(R0, 0)?;
     asm.exit()?;
     asm.finish()
 }
+
+fn emit_action(
+    asm: &mut Assembler,
+    action: KernelAction,
+    rule_id: Option<u32>,
+) -> anyhow::Result<()> {
+    if rule_id.is_some() {
+        asm.st_imm(R7, OUTBOUND, action.outbound as i32)?;
+    }
+    if rule_id.is_some() || action.mark != 0 {
+        asm.st_imm(R7, MARK, action.mark as i32)?;
+    }
+    if rule_id.is_some() || action.must {
+        asm.st_imm(R7, MUST, action.must as i32)?;
+    }
+    if let Some(id) = rule_id {
+        asm.st_imm(R7, RULE_ID, id as i32)?;
+    }
+    if rule_id.is_some() || action.direct_mark_index.is_some() {
+        asm.st_imm(
+            R7,
+            DIRECT_MARK_INDEX,
+            action.direct_mark_index.map_or(u32::MAX, u32::from) as i32,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_plan(plan: &RoutingPushPlan) -> anyhow::Result<()> {
     ensure!(
         plan.domain_predicate_count <= ROUTING_FACT_CAPACITY,

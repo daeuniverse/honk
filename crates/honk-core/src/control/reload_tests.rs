@@ -1230,6 +1230,19 @@ async fn build_failure_leaves_live_config_untouched() {
 
 #[tokio::test]
 async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endpoint() {
+    assert_reload_keeps_ready_endpoint(uuid::Uuid::from_u128(0x1ead9), "ready-node", false).await;
+}
+
+#[tokio::test]
+async fn routing_change_without_direct_marks_keeps_ready_direct_endpoint() {
+    assert_reload_keeps_ready_endpoint(honk_config::config::DIRECT_NODE_ID, "direct", true).await;
+}
+
+async fn assert_reload_keeps_ready_endpoint(
+    node_id: uuid::Uuid,
+    node_name: &str,
+    change_routing: bool,
+) {
     use honk_outbound::proxy::PacketTransport;
     use std::io;
     use std::sync::Mutex;
@@ -1301,7 +1314,7 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
     let ready_endpoint = Arc::new(UdpEndpoint::new(
         transport.clone() as Arc<dyn PacketTransport>,
         relay,
-        uuid::Uuid::from_u128(0x1ead9),
+        node_id,
     ));
     let queue_rx = ready_lease.take_queue_receiver().unwrap();
     let reply_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1315,7 +1328,7 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
         reply_socket,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "ready-node".into(),
+        node_name.into(),
     );
     tokio::time::timeout(std::time::Duration::from_secs(1), driver.wait_ready())
         .await
@@ -1357,6 +1370,9 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
 
     let mut new_config = Config::default();
     new_config.global.check_tolerance_ms += 1;
+    if change_routing {
+        new_config.routing.default_outbound = "block".into();
+    }
     let drain = DrainTracker::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -1368,7 +1384,7 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
     assert!(pool.get(initializing_client, dst).is_none());
     assert!(
         Arc::ptr_eq(&pool.get(ready_client, dst).unwrap(), &ready_endpoint),
-        "ordinary reload must not retire Ready endpoint drivers"
+        "a reload without direct marks must not retire Ready endpoint drivers"
     );
 
     // After production reload cancellation the Ready driver must still
@@ -1594,7 +1610,7 @@ async fn semantic_domain_reload_replaces_matching_predicates() {
             .await
     );
     let router = cp.router.read().await;
-    assert_eq!(router.route(&connection), router.default_outbound());
+    assert_eq!(router.route(&connection), router.fallback().outbound);
     connection.domain = Some("second.example".into());
     assert_eq!(router.route(&connection), first);
 }

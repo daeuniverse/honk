@@ -1535,7 +1535,9 @@ mod scan_tests {
         let geoip = geoip_dat(&[("TEST", vec![(&[1, 2, 3, 0], 24)])]);
         let sources =
             GeoSourceSet::from_sources(GeoSource::present(geosite), GeoSource::present(geoip));
-        let router = Router::new_with_geo_sources(&[rule], "direct", &sources).unwrap();
+        let mut routing = honk_config::routing::RoutingConfig::default();
+        routing.rules = vec![rule];
+        let router = Router::from_config_with_geo_sources(&routing, &sources).unwrap();
         let connection = |domain: &str, ip: &str| ConnectionInfo {
             domain: Some(domain.into()),
             dst_ip: ip.parse().unwrap(),

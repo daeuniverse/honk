@@ -611,7 +611,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
         client,
         dst,
         b"first",
-        Some("alpha"),
+        Some(RawDnsRoute::Group("alpha")),
         expected_epoch,
         permit(),
         queue_now(),
@@ -626,7 +626,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             client,
             dst,
             b"wrong group",
-            Some("beta"),
+            Some(RawDnsRoute::Group("beta")),
             expected_epoch,
             permit(),
             queue_now(),
@@ -652,7 +652,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             client,
             dst,
             b"same group",
-            Some("alpha"),
+            Some(RawDnsRoute::Group("alpha")),
             expected_epoch,
             permit(),
             queue_now(),
@@ -667,7 +667,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             client,
             dst,
             b"crossed reload",
-            Some("alpha"),
+            Some(RawDnsRoute::Group("alpha")),
             expected_epoch,
             permit(),
             queue_now(),
@@ -690,7 +690,7 @@ fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
         client,
         dst,
         b"first",
-        Some("alpha"),
+        Some(RawDnsRoute::Group("alpha")),
         expected_epoch,
         permit,
         queue_now(),
@@ -709,19 +709,82 @@ fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
             client,
             dst,
             b"same group",
-            Some("alpha"),
+            Some(RawDnsRoute::Group("alpha")),
             queue_now(),
             &stats,
         ),
         Some(EndpointReservation::Enqueued)
     ));
-    for owner in [None, Some("beta")] {
+    for owner in [None, Some(RawDnsRoute::Group("beta"))] {
         assert!(matches!(
             pool.fast_path_enqueue_at(client, dst, b"wrong owner", owner, queue_now(), &stats,),
             Some(EndpointReservation::IdentityMismatch)
         ));
     }
     drop(lease);
+}
+
+#[test]
+fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = StatsManager::new();
+    let client = make_addr("10.0.0.22", 53000);
+    let dst = make_addr("203.0.113.53", 53);
+    let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let mut lease = match pool.reserve_or_enqueue_at(
+        client,
+        dst,
+        b"first",
+        Some(RawDnsRoute::Direct(0x200)),
+        pool.initialization_epoch(),
+        permit(),
+        queue_now(),
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("first marked DNS packet must reserve its owner"),
+    };
+    for owner in [RawDnsRoute::Direct(0x300), RawDnsRoute::Group("direct")] {
+        assert!(matches!(
+            pool.reserve_or_enqueue_at(
+                client,
+                dst,
+                b"wrong mark",
+                Some(owner),
+                pool.initialization_epoch(),
+                permit(),
+                queue_now(),
+                &stats,
+            ),
+            EndpointReservation::IdentityMismatch
+        ));
+    }
+    assert_eq!(lease.raw_dns_route(), Some(RawDnsRoute::Direct(0x200)));
+    let relay = make_addr("127.0.0.1", 9);
+    let endpoint = driver_test_endpoint(Arc::new(ScriptedPacketTransport::new(relay, [])), relay);
+    assert!(lease.commit_ready(endpoint));
+    assert!(matches!(
+        pool.fast_path_enqueue_at(
+            client,
+            dst,
+            b"wrong mark",
+            Some(RawDnsRoute::Direct(0x300)),
+            queue_now(),
+            &stats,
+        ),
+        Some(EndpointReservation::IdentityMismatch)
+    ));
+    assert!(matches!(
+        pool.fast_path_enqueue_at(
+            client,
+            dst,
+            b"same mark",
+            Some(RawDnsRoute::Direct(0x200)),
+            queue_now(),
+            &stats,
+        ),
+        Some(EndpointReservation::Enqueued)
+    ));
 }
 
 #[test]

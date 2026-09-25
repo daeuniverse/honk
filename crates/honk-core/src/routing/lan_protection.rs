@@ -35,14 +35,16 @@ impl Router {
                         None => certain = false,
                     }
                 }
-                if route.outbound != "direct" || !route.must {
+                if route.action.outbound != "direct" || !route.action.must {
                     return false;
                 }
                 if certain {
                     return true;
                 }
             }
-            false
+            // Reached only when no earlier rule may intercept, like a final catch-all rule.
+            let fallback = self.fallback();
+            fallback.must && fallback.outbound == "direct"
         })
     }
 }
@@ -69,7 +71,7 @@ fn non_dns_ports_match(ranges: &[PortRange]) -> Option<bool> {
 mod tests {
     use super::*;
     use honk_config::routing::{
-        RoutingCondition, RoutingNotCondition, RoutingOutbound, RoutingRule,
+        RoutingCondition, RoutingConfig, RoutingNotCondition, RoutingOutbound, RoutingRule,
     };
 
     fn rule(condition: RoutingCondition, outbound: &str) -> RoutingRule {
@@ -208,5 +210,40 @@ mod tests {
             "block",
             &[(address, true), ("fd00:50::1".parse().unwrap(), false)],
         );
+    }
+
+    fn source_rule(outbound: &str) -> RoutingRule {
+        rule(
+            RoutingCondition {
+                source_ip: vec!["192.168.50.0/25".into()],
+                ..Default::default()
+            },
+            outbound,
+        )
+    }
+
+    #[test]
+    fn must_direct_fallback_covers_only_what_every_rule_leaves_to_it() {
+        for (rules, fallback, must, expected) in [
+            (vec![], "direct", true, true),
+            (vec![source_rule("direct")], "direct", true, true),
+            (vec![], "direct", false, false),
+            (vec![], "block", true, false),
+            (vec![source_rule("block")], "direct", true, false),
+        ] {
+            let mut routing = RoutingConfig::default();
+            routing.rules = rules;
+            routing.default_outbound = fallback.into();
+            routing.default_must = must;
+            routing.default_mark = 0x200;
+            let router = Router::from_config(&routing).unwrap();
+            for address in ["192.168.50.1", "fd00:50::1"] {
+                assert_eq!(
+                    router.confirms_lan_self_protection(address.parse().unwrap()),
+                    expected,
+                    "{address}, fallback={fallback}, must={must}"
+                );
+            }
+        }
     }
 }

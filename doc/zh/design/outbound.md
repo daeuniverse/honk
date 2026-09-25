@@ -77,8 +77,8 @@ downcast 不变量；`PreparedUdpTransport<T>` 以一次消费式 commit 隔离�
 
 | Trait | 操作 | 契约 |
 | --- | --- | --- |
-| `TcpOutbound` | `dial`、`dial_with_tcp`、`dial_runtime` | 打开绑定目标的 `ProxyStream`。`dial_with_tcp` 可以使用已经连接的裸服务器 socket。`dial_runtime` 把拥有 session 的工作固定到捕获的 generation。 |
-| `PacketOutbound` | `dial_udp_transport`、`dial_udp_transport_runtime`、`dial_udp_transport_speculative_runtime` | 打开或准备普通 `PacketTransport` 契约。runtime 与 speculative 变体防止 reload 或冷竞速工作查询可变的当前状态。 |
+| `TcpOutbound` | `dial`、`dial_with_tcp`、`dial_runtime`、`dial_runtime_marked` | 打开绑定目标的 `ProxyStream`。`dial_with_tcp` 可以使用已经连接的裸服务器 socket。`dial_runtime` 把拥有 session 的工作固定到捕获的 generation。`dial_runtime_marked` 携带已路由直连流的 `DirectMark`；只有 Direct 应用它，其他 handler 拒绝该调用。`ProxyRegistry` 让带 mark 与不带 mark 的拨号经过同一组 generation 栅栏。 |
+| `PacketOutbound` | `dial_udp_transport`、`dial_udp_transport_runtime`、`dial_udp_transport_runtime_marked`、`dial_udp_transport_speculative_runtime` | 打开或准备普通 `PacketTransport` 契约。runtime 与 speculative 变体防止 reload 或冷竞速工作查询可变的当前状态。带 mark 变体遵循 `dial_runtime_marked`。 |
 | `WarmableOutbound` | `warm(runtime, timeout, WarmRequirement)` | 只建立 requirement 指定的可复用状态。Hysteria2 用 `Udp` 验证服务端准入；VLESS 可以把 `Session` 与 `Udp` 映射到不同 pool。 |
 | `ProbeableOutbound` | `test_connectivity` | 测试原始代理服务器可达性。协议可以覆盖默认的带 mark TCP 连接。 |
 
@@ -110,12 +110,13 @@ transport 上实现 framing。
 | TUIC | 是 | 否 | 否 | `Quic` | `tuic` |
 | Juicity | 是 | 否 | 否 | `Quic` | `juicity` |
 | AnyTLS | `network` 缺省或包含 `udp` 时 | 否 | 否 | `AnyTls` | `anytls` |
-| Direct | 是 | 否 | 是 | `None` | 无 |
+| Direct | 是 | 否 | 否 | `None` | 无 |
 | Block | 否 | 否 | 是 | `None` | 无 |
 
 Ready-stream pooling 保存已经完成且绑定目标的握手。Bare-TCP pooling
 只保存连接到代理服务器的 socket，再由 `dial_with_tcp` 执行逐目标协议握手。
 TCP multiplex 与 QUIC 协议排除两者，因为 generation runtime 持有复用状态。
+Direct 也排除两者，因为每条流的 socket 携带各自的规则 mark 或全局 mark。
 即使配置了独立的仅 UDP Xray pool，direct TCP 的 VLESS 仍可进入 bare pool。
 
 Ready stream 按 runtime generation、节点身份和目标分别保存，只能由使用
@@ -294,9 +295,10 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 - `connect_outbound` 对代理服务器 TCP 应用 bypass mark；以及
 - `udp_marked_bind` 与 `marked_udp_socket` 创建带 bypass mark 的 UDP socket。
 
-控制面发起的所有非 loopback socket 都必须携带 `DAE_BYPASS_MARK`
-（`0x100`）。否则 WAN egress 分类可能把 honk 自己的代理、DNS 或 probe
-流量重定向回 `daens`，形成环路。只有在没有生产 datapath 的非特权
+控制面 socket 使用进程级 `global.so_mark_from_dae`；零值选择
+`DAE_BYPASS_MARK`（`0x100`）。非零直连规则 mark 改用
+`rule_mark | CLASSIFIED_MARK`，不会把覆盖值传给 bootstrap 或代理载体。
+WAN egress 识别两类标记。只有在没有生产 datapath 的非特权
 `EPERM` 环境中 mark 应用才是 best-effort；其他错误都会传播。
 
 带 mark UDP socket 为 `SO_RCVBUF` 与 `SO_SNDBUF` 分别请求 8 MiB。Linux
@@ -305,8 +307,12 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 `bootstrap.rs` 避免代理主机名解析依赖 honk 自己拦截的 DNS 路径。节点
 拨号点经 `connect_marked` 或 QUIC 建立调用 `bootstrap::resolve`，绝不
 直接调用裸 `lookup_host`。配置的 bootstrap resolver 通过带 bypass mark
-的 UDP/TCP 查询；失败时回退系统 resolver。`query_ech_config` 通过同一
-raw 路径查询 DNS HTTPS 记录（`qtype 65`），并提取 SVCB `ech` 参数。
+的 UDP/TCP 查询；失败时回退 `/etc/hosts` 及 `/etc/resolv.conf` 中第一个
+数字 nameserver，DNS socket 同样带 mark，不调用 libc NSS 或追加搜索后缀。
+A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机查询 ID 及原问题
+完全匹配的响应；被截断的 UDP 应答会改用带 mark 的 TCP 重试。
+`query_ech_config` 通过同一 raw 路径查询 DNS HTTPS 记录（`qtype 65`），
+并提取 SVCB `ech` 参数。
 
 解析完成后，代理服务器 TCP 与共享 QUIC client 会稳定交错两种地址族，并且
 最多同时竞速两个地址。首个地址立即开始；fallback 在 250 ms 后启动。首个

@@ -187,12 +187,10 @@ async fn urltest_request_impl(
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
     validate_runtime(runtime)?;
-    let node = runtime.node.as_ref();
     let target = request_target(request)?;
     let host = target.host();
     let port = target.port();
-    let direct = node.protocol() == honk_config::types::NodeProtocol::Direct;
-    let addr = resolve_urltest_address(host, port, direct).await?;
+    let addr = resolve_urltest_address(host, port).await?;
     measure_http_probe(
         runtime,
         handler,
@@ -206,11 +204,7 @@ async fn urltest_request_impl(
     .await
 }
 
-async fn resolve_urltest_address(
-    host: &str,
-    port: u16,
-    direct: bool,
-) -> anyhow::Result<SocketAddr> {
+async fn resolve_urltest_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
     let hook = URLTEST_RESOLVER.read().clone();
     if let Some(hook) = hook {
         return hook(host.to_string(), port)
@@ -219,19 +213,12 @@ async fn resolve_urltest_address(
             .next()
             .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
     }
-    if direct {
-        return crate::bootstrap::resolve(host)
-            .await
-            .with_context(|| format!("failed to resolve '{host}:{port}'"))?
-            .into_iter()
-            .next()
-            .map(|ip| SocketAddr::new(ip, port))
-            .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
-    }
-    tokio::net::lookup_host((host, port))
+    crate::bootstrap::resolve(host)
         .await
         .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+        .into_iter()
         .next()
+        .map(|ip| SocketAddr::new(ip, port))
         .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))
 }
 

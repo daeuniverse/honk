@@ -74,15 +74,11 @@ fn assert_predicate(
         "routing {{\n{expression} -> proxy(must)\ndefault: block\n}}"
     ))
     .unwrap();
-    let router = Router::new_with_geo_sources(
-        &config.routing.rules,
-        &config.routing.default_outbound,
-        sources,
-    )
-    .unwrap();
+    let router = Router::from_config_with_geo_sources(&config.routing, sources).unwrap();
     for (index, (connection, hit)) in samples.iter().enumerate() {
+        let (action, _) = router.route_action(connection);
         assert_eq!(
-            router.route_with_must(connection),
+            (action.outbound.as_str(), action.must),
             if *hit {
                 ("proxy", true)
             } else {
@@ -99,13 +95,7 @@ fn assert_predicate(
         DialMode::DomainPlus,
         DialMode::DomainPlusPlus,
     ] {
-        let plan = RoutingPushPlan::compile(
-            &router,
-            &outbound_ids(),
-            &config.routing.default_outbound,
-            mode,
-        )
-        .unwrap();
+        let plan = RoutingPushPlan::compile(&router, &outbound_ids(), mode).unwrap();
         backend.publish_routing_plan(&plan, &[]).unwrap();
         let mut present = HashSet::new();
         for (index, (connection, hit)) in samples.iter().enumerate() {

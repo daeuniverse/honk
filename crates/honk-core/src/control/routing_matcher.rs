@@ -4,7 +4,7 @@
 //! publication is delegated to the backend after a complete plan exists.
 
 use crate::ebpf::maps;
-use crate::routing::{CompiledPredicate, CompiledRoute, Router};
+use crate::routing::{CompiledPredicate, CompiledRoute, RouteAction, Router};
 use honk_config::types::DialMode;
 use honk_ebpf_common::{
     DomainRouting, LpmKey, OutboundIndex, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
@@ -43,14 +43,48 @@ pub enum KernelPredicate {
     ProcessName(Vec<Vec<u8>>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelAction {
+    pub outbound: u8,
+    pub must: bool,
+    pub mark: u32,
+    pub direct_mark_index: Option<u8>,
+}
+
+impl KernelAction {
+    fn from_route(
+        action: &RouteAction,
+        outbound_ids: &HashMap<String, u8>,
+        dial_mode: DialMode,
+        conditions: &[KernelCondition],
+    ) -> anyhow::Result<Self> {
+        let outbound = outbound_ids
+            .get(&action.outbound)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("unknown outbound '{}'", action.outbound))?;
+        let punt = !action.must
+            && dial_mode == DialMode::DomainPlusPlus
+            && is_generic_port_rule(conditions)
+            && !matches!(outbound, x if x == OutboundIndex::Direct as u8 || x == OutboundIndex::Block as u8);
+        Ok(Self {
+            outbound: if punt {
+                OutboundIndex::ControlPlaneRouting as u8
+            } else {
+                outbound
+            },
+            must: action.must,
+            mark: action.mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+            direct_mark_index: action.direct_mark_index,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelRule {
     pub id: u32,
     pub source: String,
     pub conditions: Vec<KernelCondition>,
-    pub outbound: u8,
-    pub must: bool,
-    pub mark: u32,
+    pub action: KernelAction,
 }
 
 /// Generation-owned LPM fact maps.  Domain facts are staged by the backend
@@ -69,7 +103,7 @@ pub struct RoutingFactMaps {
 pub struct RoutingPushPlan {
     pub(crate) rules: Vec<KernelRule>,
     pub(crate) facts: RoutingFactMaps,
-    pub(crate) fallback: u8,
+    pub(crate) fallback: KernelAction,
     pub(crate) features: u32,
     pub(crate) fingerprint: [u8; 32],
     pub has_domain_rules: bool,
@@ -91,13 +125,12 @@ impl RoutingPushPlan {
     pub fn compile(
         router: &Router,
         outbound_ids: &HashMap<String, u8>,
-        fallback: &str,
         dial_mode: DialMode,
     ) -> anyhow::Result<Self> {
-        let fallback = outbound_ids
-            .get(fallback)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("unknown fallback outbound '{fallback}'"))?;
+        let fallback = KernelAction::from_route(router.fallback(), outbound_ids, dial_mode, &[])
+            .map_err(|_| {
+                anyhow::anyhow!("unknown fallback outbound '{}'", router.fallback().outbound)
+            })?;
 
         let mut facts = RoutingFactMaps::default();
         let mut dest_fact = FactAllocator::default();
@@ -113,16 +146,6 @@ impl RoutingPushPlan {
         let has_domain = domain_predicate_count != 0;
 
         for route in router.compiled_routes() {
-            let outbound = outbound_ids
-                .get(route.outbound.as_str())
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown outbound '{}' in rule '{}'",
-                        route.outbound,
-                        route.name
-                    )
-                })?;
             let mut conditions = Vec::with_capacity(route.conditions.len());
             for condition in &route.conditions {
                 let predicate = match &condition.predicate {
@@ -196,25 +219,24 @@ impl RoutingPushPlan {
                     predicate,
                 });
             }
+            let action =
+                KernelAction::from_route(&route.action, outbound_ids, dial_mode, &conditions)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "unknown outbound '{}' in rule '{}'",
+                            route.action.outbound,
+                            route.name
+                        )
+                    })?;
             // Empty authored rules never match in userspace and need no code.
             if conditions.is_empty() {
                 continue;
             }
-            let punt = !route.must
-                && dial_mode == DialMode::DomainPlusPlus
-                && is_generic_port_rule(&conditions)
-                && !matches!(outbound, x if x == OutboundIndex::Direct as u8 || x == OutboundIndex::Block as u8);
             rules.push(KernelRule {
                 id: route.id,
                 source: rule_source(route),
                 conditions,
-                outbound: if punt {
-                    OutboundIndex::ControlPlaneRouting as u8
-                } else {
-                    outbound
-                },
-                must: route.must,
-                mark: route.mark,
+                action,
             });
         }
 
@@ -238,7 +260,7 @@ impl RoutingPushPlan {
         hash.update(b"honk.routing.plan.v2\0");
         hash.update(router.policy_fingerprint());
         hash.update([dial_mode as u8]);
-        hash.update([fallback]);
+        hash.update([fallback.outbound]);
         let mut bindings: Vec<_> = outbound_ids.iter().collect();
         bindings.sort_by_key(|(name, _)| *name);
         for (name, id) in bindings {
@@ -434,6 +456,29 @@ fn prefix_contains(parent: &LpmKey, child: &LpmKey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_changes_invalidate_plan_identity() {
+        let ids = HashMap::from([("direct".into(), 0), ("proxy".into(), 2)]);
+        let compile = |fallback: &str| {
+            let config = honk_config::parser::parse_dae_config(&format!(
+                "routing {{\n dport(80) -> direct(must, mark: 0x300)\n fallback: {fallback}\n}}"
+            ))
+            .unwrap();
+            let router = Router::from_config(&config.routing).unwrap();
+            RoutingPushPlan::compile(&router, &ids, DialMode::Ip).unwrap()
+        };
+        let marked = compile("direct(mark: 0x200, must)");
+        for fallback in [
+            "direct",
+            "direct(must)",
+            "direct(mark: 0x200)",
+            "direct(must, mark: 0x201)",
+            "proxy(must)",
+        ] {
+            assert!(!compile(fallback).semantically_eq(&marked), "{fallback}");
+        }
+    }
 
     #[test]
     fn canonical_prefixes_inherit_without_cross_family_matches() {

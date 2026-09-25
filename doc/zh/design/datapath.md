@@ -95,27 +95,33 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `BPF_STATS_MAP` | 五个计数器：UDP/TCP conn-state overflow，以及 redirect、handoff 和 cookie map 插入失败。 |
 | `EVENT_RINGBUF` | 262,144-byte ring buffer，承载固定布局的 blocked、conntrack overflow 和 UDP token exhausted 事件。 |
 | `UDP_DECISION_SEQUENCE` | NFQUEUE 决策身份的单槽 pinned allocator 状态；协议细节见 [NFQUEUE](./nfqueue.md)。 |
-| `UDP_DECISION_EPOCH` | NFQUEUE 决策工作的单槽 grace-period selector；见 [NFQUEUE](./nfqueue.md)。 |
-| `UDP_DECISION_INFLIGHT` | NFQUEUE 决策工作的两槽 per-CPU reader 计数；见 [NFQUEUE](./nfqueue.md)。 |
-| `UDP_DECISION_RETIRE_FENCE` | NFQUEUE retirement 使用的 65,536 项 tuple fence map；见 [NFQUEUE](./nfqueue.md)。 |
+| `UDP_DECISION_EPOCH` | NFQUEUE 决策与 WAN UDP 所有权共用的单槽 grace-period selector；见 [NFQUEUE](./nfqueue.md)。 |
+| `UDP_DECISION_INFLIGHT` | 上述决策路径共用的两槽 per-CPU reader 计数；见 [NFQUEUE](./nfqueue.md)。 |
+| `UDP_DECISION_RETIRE_FENCE` | NFQUEUE 与 WAN 用户态 UDP retirement 共用的 65,536 项 tuple fence map；见 [NFQUEUE](./nfqueue.md)。 |
 
 内核/用户空间共用的 map key 和 value 是 `#[repr(C)]` ABI。共享流结构中的 IPv4 地址都以网络字节序的 IPv4-mapped IPv6 值保存。
 
-TCP SYN handoff 尾部增加 `u64 routing_generation`：`RoutingHandoffEntry` 为 56 字节，`result` 仍在偏移 8，UDP `decision_token` 仍在偏移 44。生成路由函数的 `RoutingInput`/`RoutingDecision` ABI、`ConnState` 和 `UDP_DECISION_SEQUENCE` 不变。旧显式 BPF 对象或不兼容的 handoff map 布局会在原始读取前被拒绝；`honk-tool` 也检查布局，请使用匹配版本的 core、工具和对象。
+TCP SYN handoff 尾部增加 `u64 routing_generation`：`RoutingHandoffEntry` 为 56 字节，`result` 仍在偏移 8，UDP `decision_token` 仍在偏移 44。生成路由函数的 `RoutingInput` ABI、`ConnState` 和 `UDP_DECISION_SEQUENCE` 不变。旧显式 BPF 对象或不兼容的 handoff map 布局会在原始读取前被拒绝；`honk-tool` 也检查布局，请使用匹配版本的 core、工具和对象。
+
+`RoutingMeta` 的 bit 58 显式标记 WAN UDP 用户态所有权，不改变其布局。带 mark 的 WAN direct 决策即使含 `must` 也需要用户态 socket；该 bit 使退役逻辑能将其与原生 LAN direct/must 及 offloaded state 区分。无 mark 的原生 WAN UDP direct 决策则设置 bit 57（`OFFLOAD`），在不改变转发行为的前提下防止旧 endpoint callback 删除它。WAN UDP 的缓存读取和 conn/handoff/redirect 写入都参与共用的 reader epoch，并在访问 tuple 状态前拒绝已安装 fence 的 tuple。
 
 ## Mark 及其所有权
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
 | `TPROXY_MARK` | `0x08000000` | 选择 `daens` 表 100 的 local-delivery 路由，并标记要交给监听器的重定向数据包。`global.tproxy_mark` 必须等于这个编译期值。 |
-| `DAE_BYPASS_MARK` | `0x00000100` | 标记 honk 自身的拨号、探测、DNS 上游、QUIC 套接字和透明监听器，使 WAN egress 不拦截它们。 |
+| `DAE_BYPASS_MARK` | `0x00000100` | `global.so_mark_from_dae` 为零时的默认值；非零时 honk 套接字和监听器识别使用配置值精确匹配。 |
 | `CLASSIFIED_MARK` | `0x40000000` | 防止同时挂在 bridge master 和 slave 上的数据包被重复分类；也标记最终 direct verdict。 |
 | `NFQUEUE_PENDING_MARK` | `0x80000000` | 标识必须在 conntrack/NAT 前持有的流量；有效的暂存 mark 还携带 `CLASSIFIED_MARK` 和非零 token。 |
 | `NFQUEUE_TOKEN_MASK` | `0x3fffffff` | 选取 NFQUEUE 暂存数据包中承载决策 token 的 skb mark 低 30 bit。 |
 
 `SKB_MARK_RESERVED_MASK` 为 `0xc0000000`，即 `CLASSIFIED_MARK` 与 `NFQUEUE_PENDING_MARK` 的并集。配置校验拒绝与这些 bit 重叠的 `global.so_mark_from_dae` 和路由规则 mark。NFQUEUE direct 完成路径在接受规则 mark 前重复相同检查。
 
-真实透明 UDP/53 从 `SO_RCVMARK` 启用的 `SOL_SOCKET`/`SO_MARK` 辅助数据取得逐报文出站及策略代际，不能用最新的 tuple handoff 替代。同一个 skb 的 `cb[2]` 跨链路保存路由编码与不回绕的 20 位已提交策略代际，再由必需的 `dae0peer` TC 恢复。内部可变携带位为 `0x37fffeff`，其余签名匹配掩码为 `0xc8000100`；`daens` 内部 fwmark 规则只忽略这些专用可变位，不改变用户规则 mark 的保留位约束。
+最终带 mark 的直连报文携带 `rule_mark | CLASSIFIED_MARK`，包括 LAN 原生转发、NFQUEUE 接受以及用户态 TCP/UDP socket。Linux 策略路由只匹配用户位：`fwmark 0x200/0x3fffffff`。WAN egress 旁路精确匹配的非零全局 socket mark，或带分类位且不含 `NFQUEUE_PENDING_MARK` 的报文；仅含 `0x100` 位不再构成旁路。宿主发起且带非零直连 mark 的流量交给用户态，因为在 WAN TC 才修改 skb mark 已晚于原始 Linux 路由查询。
+
+真实透明 UDP/53 从 `SO_RCVMARK` 启用的 `SOL_SOCKET`/`SO_MARK` 辅助数据取得逐报文出站及策略代际。同一个 skb 的 `cb[2]` 跨链路保存路由编码与不回绕的 20 位已提交策略代际，再由必需的 `dae0peer` TC 恢复。签名掩码为 `0xc8000000`，可变携带位为 `0x37ffffff`。位 `0x100` 表示 8 位字段为不可变直连 mark 索引，而非出站编号；索引通过当前 Router 的排序 mark 表解析。`daens` 内部 fwmark 规则忽略这些可变位。用户 mark 保留位和 `UDP_DECISION_SEQUENCE` 保持不变。原始直连/分组的归属绝不依赖可变 tuple handoff。
+
+`RoutingInput`、`RoutingDecision`、`RoutingPolicyDescriptor` 的 ABI 分别为 128、24、24 字节。`RoutingDecision` 新增直连 mark 索引（缺省为 `u32::MAX`）；loader 校验路由槽输出的 BTF 布局，拒绝旧版本外部对象。
 
 非 DNS 本地套接字探测通过完整 socket mark 与 `PARAM.dae_socket_mark` 的比较，区分 honk 的透明监听器和普通本地服务。主机网络命名空间中的 `dns.bind` 套接字仍是普通未标记监听器，但它的存在不能绕过 LAN 端口 53 策略。
 

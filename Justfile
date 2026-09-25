@@ -129,6 +129,10 @@ test-netns: test-routing
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --list --format terse)" = "control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-outbound --lib proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation -- --ignored --exact --list --format terse)" = "proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-outbound --lib proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation -- --ignored --exact --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:

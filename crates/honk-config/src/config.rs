@@ -157,6 +157,17 @@ pub struct GlobalConfig {
     pub max_concurrent_dials: usize,
 }
 
+impl GlobalConfig {
+    /// Process socket mark; zero retains the historical bypass mark.
+    pub fn effective_so_mark(&self) -> u32 {
+        if self.so_mark_from_dae == 0 {
+            0x100
+        } else {
+            self.so_mark_from_dae
+        }
+    }
+}
+
 fn default_tproxy_port() -> u16 {
     12345
 }
@@ -713,12 +724,13 @@ impl Config {
             ));
         }
         let reserved = crate::routing::DATAPATH_RESERVED_MARK_MASK;
-        if self.global.so_mark_from_dae & reserved != 0 {
+        // Transparent listeners carry the global mark; daens routes the TPROXY bit to local delivery.
+        if self.global.so_mark_from_dae & (reserved | DEFAULT_TPROXY_MARK) != 0 {
             return Err(config_validation_error(
                 source,
                 SettingPath::new("global").field("so_mark_from_dae"),
                 "invalid-config-value",
-                "so_mark_from_dae overlaps datapath-reserved mark bits",
+                "so_mark_from_dae overlaps datapath-reserved or TPROXY mark bits",
             ));
         }
         for (index, rule) in self.routing.rules.iter().enumerate() {
@@ -733,6 +745,14 @@ impl Config {
                     "routing mark overlaps datapath-reserved mark bits",
                 ));
             }
+        }
+        if self.routing.default_mark & reserved != 0 {
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("routing").field("fallback"),
+                "invalid-config-value",
+                "routing mark overlaps datapath-reserved mark bits",
+            ));
         }
         Ok(())
     }
@@ -1435,14 +1455,21 @@ mod builtin_nodes_tests {
             );
         }
 
+        // Direct rule marks may use the TPROXY bit; the global listener mark may not.
         config.routing.rules[0].mark = 0x3fff_ffff;
-        config.global.so_mark_from_dae = 0x8000_0000;
-        let error = config.validate_detailed().unwrap_err();
-        assert_eq!(
-            error.diagnostic.setting.to_string(),
-            "global.so_mark_from_dae"
-        );
-        config.global.so_mark_from_dae = 0;
+        for global in [
+            0x8000_0000,
+            DEFAULT_TPROXY_MARK,
+            DEFAULT_TPROXY_MARK | 0x100,
+        ] {
+            config.global.so_mark_from_dae = global;
+            let error = config.validate_detailed().unwrap_err();
+            assert_eq!(
+                error.diagnostic.setting.to_string(),
+                "global.so_mark_from_dae"
+            );
+        }
+        config.global.so_mark_from_dae = 0x37ff_ffff;
         assert!(config.validate().is_ok());
     }
 

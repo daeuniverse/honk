@@ -105,7 +105,6 @@ pub(super) fn projection_controller(
     let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
         &router,
         &std::collections::HashMap::from([("direct".to_owned(), 0)]),
-        "direct",
         honk_config::types::DialMode::Domain,
     )
     .unwrap();

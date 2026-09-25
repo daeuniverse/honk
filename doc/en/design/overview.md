@@ -72,10 +72,10 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 ```mermaid
 flowchart TB
   PACKET[LAN-forwarded or host-originated TCP/UDP] --> TC[TC classification]
-  TC -->|special, non-DNS local, direct must, or safe non-DNS direct| NATIVE[Native Linux path]
+  TC -->|special, non-DNS local, LAN or unmarked direct must, or safe non-DNS direct| NATIVE[Native Linux path]
   TC -->|block must or non-DNS block/dead outbound| DROP[Drop]
   TC -->|non-must DNS after ordered policy| DAE0[dae0]
-  TC -->|raw DNS group must, proxy, or userspace decision| DAE0
+  TC -->|raw DNS group must, marked WAN direct, proxy, or userspace decision| DAE0
   TC -->|ambiguous non-DNS LAN UDP, optional| NFQ[NFQUEUE 320]
   DAE0 --> SK[daens sk_lookup]
   SK --> LISTEN[Transparent TCP/UDP listeners]
@@ -84,25 +84,25 @@ flowchart TB
   CP -->|non-must DNS| DNS[DnsController]
   CP -->|ordinary or raw group transport| DECIDE[Sniff when eligible, route fallback, mode, group leaf]
   DECIDE --> DIAL[Outbound dial and relay]
-  DIAL -->|DAE_BYPASS_MARK 0x100| WAN[WAN egress]
+  DIAL -->|configured bypass or classified direct mark| WAN[WAN egress]
   DIAL -->|anyfrom| REPLY[UDP reply from original destination]
 ```
 
 ### Packet walk
 
-1. The [datapath](./datapath.md) classifies LAN-forwarded traffic at LAN TC and host-originated TCP/UDP at WAN TC. Existing ingress and control-plane exclusions run first. Ordinary LAN port-53 traffic cannot bypass policy through a local socket; non-DNS local-socket handling remains unchanged. `direct(must)` and route-time-safe non-DNS direct decisions remain on the native Linux path; decisions that still need userspace are not offloaded.
+1. The [datapath](./datapath.md) classifies LAN-forwarded traffic at LAN TC and host-originated TCP/UDP at WAN TC. Existing ingress and control-plane exclusions run first. Ordinary LAN port-53 traffic cannot bypass policy through a local socket; non-DNS local-socket handling remains unchanged. LAN `direct(must)` and route-time-safe non-DNS direct decisions remain native. Nonzero marked WAN direct decisions instead need a userspace socket for a new marked route lookup.
 2. [Traffic-rule ownership](../reference/routing.md#outbound-targets-and-must) determines which port-53 queries enter the [DNS pipeline](./dns.md). Admitted transparent queries, optional host-netns `dns.bind`, and flow-associated reality/target lookups share generation-pinned DNS policy, cache/singleflight, upstream pools, and routing projection.
 3. The [datapath](./datapath.md) redirects ordinary proxy and userspace decisions through `dae0`; inside `daens`, `sk_lookup` assigns them to the [control plane's](./control-plane.md) transparent TCP or UDP listener.
 4. The [NFQUEUE staging](./nfqueue.md) path is enabled by default through `global.nfqueue_enable` when startup prerequisites pass ([Configuration](../configuration.md)); it holds only ambiguous LAN-forwarded UDP after LAN TC and before conntrack/NAT. Each staged flow allocates a persistent unique decision token and publishes token-bound Pending before fixed queue `320`; host-originated WAN traffic stays on canonical TPROXY. Direct/proxy/block completion follows `honk-core`'s `control/nfqueue.rs`; direct creates no userspace socket/copy/retransmission/endpoint/connection entry.
-5. The [control plane](./control-plane.md) recovers the original destination (`SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` for TCP with transparent-`local_addr` fallback; `IP_RECVORIGDSTADDR` cmsg for UDP). Ordinary flows consume tuple routing handoffs and may fall back to `Router::route_with_must`; port-53 flows use the distinct [TCP handoff and UDP per-packet admission rules](./control-plane.md#transparent-ingress).
+5. The [control plane](./control-plane.md) recovers the original destination (`SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` for TCP with transparent-`local_addr` fallback; `IP_RECVORIGDSTADDR` cmsg for UDP). Ordinary flows consume tuple routing handoffs and may fall back to `Router::route_action`; port-53 flows use the distinct [TCP handoff and UDP per-packet admission rules](./control-plane.md#transparent-ingress).
 6. The [routing path](./routing.md) may sniff TCP TLS SNI / HTTP Host or decrypt UDP QUIC Initial SNI, then runs the userspace `Router` when the kernel result is not final. Sniffing skips must-rules, `dial_mode: ip`, and negative-cache hits; `dial_mode: domain` runs a DNS reality check.
 7. The [group layer](./groups.md) applies the Clash mode override without changing final `must`/`block` results, then `SharedGroupManager` resolves the authoritative policy pick to a leaf. Score ranks only health-eligible members with per-target TCP/UDP evidence. TCP/UDP normally use one authoritative leaf; only cold top-level URLTest initially staggers contenders, and only its winner commits an endpoint or source transport.
 8. The [outbound layer](./outbound.md) dials that leaf through `TcpOutbound` or a fallible prepared UDP commit. Ordinary packet paths bind one `PacketTransport` to the endpoint; XUDP/Mux.Cool may instead commit a core-owned source session shared by several canonical five-tuple endpoint views. Sniffed TCP bytes are forwarded first, then plain TCP uses splice and wrapped streams use copy.
-9. Control-plane egress leaves with `DAE_BYPASS_MARK` (`0x100`) so WAN TC does not intercept it again. Proxied UDP and transparent port-53 replies use [anyfrom sockets](./control-plane.md) bound to the original destination so the [return datapath](./datapath.md) preserves the source address.
+9. Control-plane egress uses `global.so_mark_from_dae` (zero selects the default `0x100`); marked direct flows use their rule mark plus `CLASSIFIED_MARK`. WAN TC recognizes both without adding the default bypass bit. Proxied UDP and transparent port-53 replies use [anyfrom sockets](./control-plane.md) bound to the original destination so the [return datapath](./datapath.md) preserves the source address.
 
 ## Runtime invariants
 
-- **Bypass-mark discipline:** dials, probes, DNS upstreams, QUIC endpoints, and transparent listeners carry `DAE_BYPASS_MARK` (`0x100`) or use loopback. Accepted TCP sockets have the listener mark cleared; ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
+- **Bypass-mark discipline:** dials, probes, DNS upstreams, QUIC endpoints, and transparent listeners carry the process-configured bypass mark. Nonzero direct rule marks replace its low 30 bits and carry `CLASSIFIED_MARK`; policy rules must mask with `0x3fffffff`. Accepted TCP sockets have the listener mark cleared; ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
 - **Anyfrom UDP replies:** proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. Replying from the TPROXY listener exposes the `dae0` source and fails on the return path.
 - **DNS source boundary:** transparent and `dns.bind` adapters derive the logical client source from the socket peer; flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope, while each policy generation's domain-predicate projection remains global and source-independent.
 - **VLESS source boundary:** shared XUDP/Mux.Cool reuse is indexed by reused runtime, normalized client, UDP path, and actual-peer/original-destination reply projection. The full five-tuple endpoint map still owns routing, token/generation, and per-flow Score; the source session owns its one receiver and transport health.

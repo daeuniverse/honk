@@ -121,6 +121,8 @@ Failure or ambiguity in listener, queue, watchdog, cleanup, verdict, or retireme
 
 Retirement inserts `UDP_DECISION_RETIRE_FENCE[tuple] = token` with `BPF_NOEXIST`, so a concurrent newer owner cannot replace the fence. It then flips the epoch, waits out pre-fence readers, and revalidates conn state, token, handoff, and redirect track. Only matching auxiliaries and conn state are deleted; the exact fence is released afterward. A mismatch retains the newer tuple incarnation and fails closed.
 
+WAN userspace UDP shares this fence even with token zero: its explicit `RoutingMeta` ownership bit permits retiring a marked direct/must endpoint without deleting native direct state. Both auxiliary tokens must still be zero before any deletion; missing or superseded conn state preserves all auxiliaries. Legacy LAN token-zero retirement remains conn-state-only.
+
 ## Sequence exhaustion and rotation
 
 Exhaustion uses the lifecycle fence rather than resetting a live allocator:

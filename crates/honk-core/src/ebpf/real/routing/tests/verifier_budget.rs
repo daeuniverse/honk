@@ -55,8 +55,7 @@ fn facts_ahead_of_long_process_chains_stay_within_the_verifier_budget() {
     )
     .unwrap();
     let router = Router::new(&config.routing.rules, "direct").unwrap();
-    let plan =
-        RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Domain).unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Domain).unwrap();
 
     let mut benchmark = golden::connection();
     benchmark.src_ip = "198.18.81.2".parse().unwrap();

@@ -24,6 +24,7 @@ mod outbound;
 mod packet;
 mod registry;
 
+pub use direct::DirectMark;
 pub use error::{
     NodeFailure, PacketErrorClass, PacketRejection, TargetFailure, is_packet_rejection,
     node_failure, packet_error_class, packet_rejection, target_failure,

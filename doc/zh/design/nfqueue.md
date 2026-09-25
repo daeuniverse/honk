@@ -115,6 +115,8 @@ Listener、queue、watchdog、cleanup、verdict 或 retirement 生命周期中�
 
 Retirement 以 `BPF_NOEXIST` 插入 `UDP_DECISION_RETIRE_FENCE[tuple] = token`，因此并发的新 owner 无法替换该 fence。随后翻转 epoch，等待 pre-fence reader 退出，并重新验证 conn state、token、handoff 和 redirect track。只删除匹配的辅助项与 conn state；之后释放精确 fence。不匹配时保留更新的 tuple incarnation 并 fail closed。
 
+WAN 用户态 UDP 即使 token 为零也使用同一 fence：显式 `RoutingMeta` 所有权 bit 允许退役带 mark 的 direct/must endpoint，而不删除原生直连状态。任何删除前都必须确认两类辅助项的 token 仍为零；conn state 缺失或已被替代时保留全部辅助项。旧 LAN token-zero 退役仍只清理 conn state。
+
 ## Sequence 耗尽与 generation 轮转
 
 耗尽使用生命周期 fence，而不会重置仍存活的 allocator：

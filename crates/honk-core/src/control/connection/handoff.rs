@@ -1,3 +1,4 @@
+use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::{HashMap, HashSet};
 
@@ -457,12 +458,15 @@ impl ControlPlaneHandle {
     /// - `block` results and `must` results (dae `(must)` rules / eBPF
     ///   handoff must flag) are never overridden — both are final routing
     ///   decisions that mode switches must not bypass.
-    pub(super) async fn apply_mode_override(&self, outbound_name: String, must: bool) -> String {
-        let Some(ref mode_state) = self.mode_state else {
-            return outbound_name;
-        };
+    pub(super) async fn apply_mode_override(&self, route: &mut RoutingDecision) {
+        let replacement = self.mode_override(&route.outbound, route.must).await;
+        route.apply_final_outbound(replacement);
+    }
+
+    async fn mode_override(&self, outbound_name: &str, must: bool) -> Option<String> {
+        let mode_state = self.mode_state.as_ref()?;
         if must || outbound_name == "block" {
-            return outbound_name;
+            return None;
         }
         let state = { mode_state.read().clone() };
         // The GLOBAL selection needs a config lookup to decide whether it
@@ -482,7 +486,8 @@ impl ControlPlaneHandle {
                 );
             }
         }
-        state.override_outbound(&outbound_name, false, selection_resolvable)
+        let outbound = state.override_outbound(outbound_name, false, selection_resolvable);
+        (outbound != outbound_name).then_some(outbound)
     }
 }
 

@@ -515,9 +515,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return pass_through_classified(ctx);
     }
 
-    if pkt.tuples.five.dst_port == 53 && (pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP)
-    {
-        // A marked backend query must also survive an explicitly LAN-bound lo.
+    if pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP {
+        // An originated socket must also survive an explicitly LAN-bound lo.
         let bypass_mark = PARAM.load().dae_socket_mark;
         if bypass_mark != 0 && unsafe { (*ctx.skb.skb).mark } == bypass_mark {
             return pass_through_classified(ctx);
@@ -822,6 +821,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 pkt.tuples.dscp,
                 None,
                 0,
+                0,
             );
             if let Some(state) = state {
                 state.state = UdpDecisionState::None as u8;
@@ -957,8 +957,18 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        let _ =
-            crate::contrack::mark_udp_seen(&reversed_key, 1u8, None, None, None, None, 0, None, 0);
+        let _ = crate::contrack::mark_udp_seen(
+            &reversed_key,
+            1u8,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            0,
+            0,
+        );
     }
 
     Ok(TC_ACT_PIPE)

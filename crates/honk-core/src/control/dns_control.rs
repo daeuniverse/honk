@@ -93,7 +93,7 @@ impl DnsController {
     ) -> Self {
         let config = honk_config::Config::default();
         let runtime_router = Arc::new(
-            Router::new(&config.routing.rules, &config.routing.default_outbound)
+            Router::from_config(&config.routing)
                 .unwrap_or_else(|_| Router::new(&[], "direct").unwrap()),
         );
         let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {

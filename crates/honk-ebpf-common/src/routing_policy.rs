@@ -40,6 +40,8 @@ pub struct RoutingDecision {
     pub must: u32,
     pub domain_final: u32,
     pub rule_id: u32,
+    /// Index in the generation's canonical table, meaningful for marked direct.
+    pub direct_mark_index: u32,
 }
 
 impl Default for RoutingDecision {
@@ -50,6 +52,7 @@ impl Default for RoutingDecision {
             must: 0,
             domain_final: 0,
             rule_id: u32::MAX,
+            direct_mark_index: u32::MAX,
         }
     }
 }
@@ -109,9 +112,9 @@ pub struct RoutingPolicyDescriptor {
 }
 
 const _: () = assert!(core::mem::size_of::<RoutingInput>() == 128);
-const _: () = assert!(core::mem::size_of::<RoutingDecision>() == 20);
+const _: () = assert!(core::mem::size_of::<RoutingDecision>() == 24);
 const _: () = assert!(core::mem::size_of::<RoutingPolicyDescriptor>() == 24);
-const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 24);
+const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 28);
 const _: () = assert!(core::mem::align_of::<RoutingTestResult>() == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, status) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, decision) == 4);
@@ -134,6 +137,7 @@ const _: () = assert!(core::mem::offset_of!(RoutingDecision, mark) == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, must) == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, domain_final) == 12);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, rule_id) == 16);
+const _: () = assert!(core::mem::offset_of!(RoutingDecision, direct_mark_index) == 20);
 const _: () = assert!(core::mem::align_of::<RoutingPolicyDescriptor>() == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, slot) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, features) == 4);

@@ -11,7 +11,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `tproxy_port` | `tproxy_port` | `12345` | TCP and UDP transparent-listener port programmed into the userspace listeners and eBPF datapath. A change requires restart. |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | Compatibility switch intended to prevent re-interception of the transparent port. The current runtime does not read it. |
 | `pprof_port` | `pprof_port` | `0` | Compatibility pprof HTTP port; `0` means disabled. honk currently starts no pprof server and does not read this field. |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0` | Compatibility socket-mark value. Validation rejects overlap with datapath-reserved mark bits, but the current runtime does not apply it to sockets. |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0` (effective `0x100`) | Process-wide `SO_MARK` for honk-originated sockets and exact datapath bypass. A nonzero value replaces `0x100`, not ORs with it; changing the setting requires restart. Bits `0xc8000000` are reserved and rejected. See [Socket marks](#socket-marks). |
 | `log_level` | `log_level` | `"info"` | Startup log filter. `--debug` takes precedence, followed by `RUST_LOG`, then this value. A SIGHUP change is restart-required. `info` covers runtime state (startup, reloads, health, subscriptions); the per-connection routing lines (`TCP connection`, `UDP connection`, eBPF offload) are `debug`, so a router's syslog is not flooded by traffic. To audit routing decisions, run with `debug` or read `/logs?level=debug` from the API. |
 | `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled. SIGHUP requires restart only when the resolved effective destination changes; `--log-file` shadows this value. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
@@ -35,7 +35,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Compatibility fragmentation-length range. The current TLS connector does not read it. |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Compatibility fragmentation-interval range. The current TLS connector does not read it. |
 | `mptcp` | `mptcp` | `false` | Compatibility MPTCP switch. The current dial path does not read it. |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | Resolver used for node hostnames and control-plane dials, avoiding recursive interception through honk. Empty uses the ordinary bootstrap behavior. |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | Marked UDP/TCP resolver for node hostnames and control-plane dials. Empty or failed bootstrap resolution uses `/etc/hosts`, then marked DNS to the first numeric `/etc/resolv.conf` nameserver; no libc NSS or search suffixes. |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | Compatibility fallback-resolver value. The current runtime does not read it. |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | Compatibility transmit-bandwidth hint, such as `'200 mbps'`. The current runtime does not read it. |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | Compatibility receive-bandwidth hint. The current runtime does not read it. |
@@ -53,6 +53,31 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 HTTP health checks and URLTest send a credential-free authority in `Host`: IPv6 stays bracketed, and non-default ports are retained. Connection and TLS server-name handling use the unbracketed host.
 
 The configured request path and query retain their original dot segments and percent-encoding. URLs with surplus authority slashes, backslashes, or embedded ASCII whitespace/control characters are rejected before building a request; rejected URLs are not echoed in the health-check warning.
+
+## Socket marks
+
+`so_mark_from_dae: 0` (or omission) retains the historical effective mark `0x100`.
+A nonzero value is applied exactly before connect/send, including proxy carriers,
+bootstrap/DNS traffic and health checks. The datapath
+bypass compares this exact configured value: merely containing bit `0x100` is not
+an exemption. Transparent listeners use the same mark for socket recognition;
+accepted TCP client sockets have it cleared. Standalone `dns.bind` ingress stays
+an ordinary unmarked local service.
+
+The dae global scalar keeps honk's existing hexadecimal-first lexical behavior:
+`10` and `0x10` both mean 16; malformed or overflowing text emits a diagnostic and
+falls back to raw `0`, hence effective `0x100`. Prefer explicit `0x` notation.
+This differs from [direct rule marks](./routing.md#policy-routing-marks), where
+unprefixed values are decimal and malformed values reject the configuration.
+Both global and rule marks reject reserved bits `0xc0000000` at validation; the global mark also rejects the TPROXY bit `0x08000000`, which daens routes to its local listeners.
+
+The setting is captured before startup network I/O and is process-scoped; use a
+restart, not SIGHUP, to change it. A nonzero direct-rule mark replaces the global
+mark for that direct flow's policy-routing payload, while proxy carriers and
+bootstrap traffic keep the global value. Direct traffic also carries internal
+classification metadata; use the masked IPv4/IPv6 `ip rule` examples in the
+[routing reference](./routing.md#policy-routing-marks). honk does not install your
+WAN policy tables, routes, source-address rules or NAT configuration.
 
 ## Reloading health checks and TLS mode
 

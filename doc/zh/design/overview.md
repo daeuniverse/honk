@@ -74,10 +74,10 @@ flowchart LR
 flowchart TB
   PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[入口排除与有序策略]
   TC -->|非 DNS 本地 socket 接收| LOCAL[本地服务]
-  TC -->|direct must 或非 DNS 安全 direct| NATIVE[Linux 原生路径]
+  TC -->|LAN 或无 mark 的 direct must，或非 DNS 安全 direct| NATIVE[Linux 原生路径]
   TC -->|block must、非 DNS block 或失活丢包| DROP[丢弃]
   TC -->|非 must DNS :53| DAE0[dae0]
-  TC -->|proxy 或用户态决策| DAE0
+  TC -->|带 mark 的 WAN direct、proxy 或用户态决策| DAE0
   TC -->|有歧义的 LAN UDP，可选| NFQ[NFQUEUE 320]
   DAE0 --> SK[daens sk_lookup]
   SK --> LISTEN[透明 TCP/UDP 监听器]
@@ -86,13 +86,13 @@ flowchart TB
   CP -->|非 must DNS| DNS[DnsController]
   CP -->|其余流量，must 跳过嗅探| DECIDE[嗅探、路由回退、Clash 模式、组叶子]
   DECIDE --> DIAL[出站拨号与中继]
-  DIAL -->|DAE_BYPASS_MARK 0x100| WAN[WAN 出口]
+  DIAL -->|配置的旁路或已分类直连标记| WAN[WAN 出口]
   DIAL -->|anyfrom| REPLY[以原始目的地址发出 UDP 回包]
 ```
 
 ### 报文路径
 
-1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。既有入口与控制平面排除先执行；普通 LAN 端口 53 不能因本地 socket 而跳过策略，非 DNS 本地探测行为不变。`direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径。
+1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。既有入口与控制平面排除先执行；普通 LAN 端口 53 不能因本地 socket 而跳过策略，非 DNS 本地探测行为不变。LAN `direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径；非零 mark 的 WAN 直连改用用户态套接字，重新执行带 mark 的路由查找。
 2. [流量规则所有权](../reference/routing.md#出站目标与-must)决定哪些端口 53 查询进入[DNS 管线](./dns.md)。已准入的透明查询、可选 host-netns `dns.bind` 与流关联 reality/目标查询共用按代固定的 DNS 策略、缓存/singleflight、上游池和路由投影。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
 4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
@@ -100,11 +100,11 @@ flowchart TB
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
 7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威策略选择解析为叶节点。Score 只用逐目标 TCP/UDP 证据在健康合格成员中排名。TCP/UDP 通常只采用一个权威叶节点；只有冷启动顶层 URLTest 会先 stagger 候选，且只有 winner 提交 endpoint 或 source transport。
 8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；XUDP/Mux.Cool 可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source session。嗅探得到的 TCP 字节先于后续流量转发。
-9. 控制面出口携带 `DAE_BYPASS_MARK`（`0x100`），避免再次被 WAN TC 拦截。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
+9. 控制面出口使用 `global.so_mark_from_dae`（零值选择默认 `0x100`）；带 mark 的直连使用规则 mark 加 `CLASSIFIED_MARK`。WAN TC 识别这两类标记，不再额外叠加默认旁路位。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
 ## 运行时不变量
 
-- **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带 `DAE_BYPASS_MARK`（`0x100`）或使用 loopback。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
+- **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带进程配置的旁路 mark。非零直连规则 mark 替换其低 30 位，并携带 `CLASSIFIED_MARK`；策略路由须使用 `0x3fffffff` 掩码。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。
 - **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
 - **VLESS source 边界：** 共享 XUDP/Mux.Cool 按 reused runtime、规范化 client、UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source session 持有唯一 receiver 与 transport health。

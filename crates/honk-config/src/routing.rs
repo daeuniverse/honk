@@ -286,6 +286,12 @@ pub struct RoutingConfig {
     /// Default outbound when no rules match
     #[serde(default = "default_outbound")]
     pub default_outbound: String,
+    /// Makes the fallback action terminal, like a matched `must` rule.
+    #[serde(default)]
+    pub default_must: bool,
+    /// Fallback direct mark (0 = no mark).
+    #[serde(default)]
+    pub default_mark: u32,
     #[serde(skip)]
     complex_rule_sources: HashMap<String, String>,
 }
@@ -299,6 +305,8 @@ impl Default for RoutingConfig {
         Self {
             rules: vec![],
             default_outbound: "direct".to_string(),
+            default_must: false,
+            default_mark: 0,
             complex_rule_sources: HashMap::new(),
         }
     }

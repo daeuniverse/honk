@@ -154,6 +154,9 @@ fn evaluate_policy(
             must: core::ptr::read_volatile(core::ptr::addr_of!(decision.must)),
             domain_final: core::ptr::read_volatile(core::ptr::addr_of!(decision.domain_final)),
             rule_id: core::ptr::read_volatile(core::ptr::addr_of!(decision.rule_id)),
+            direct_mark_index: core::ptr::read_volatile(core::ptr::addr_of!(
+                decision.direct_mark_index
+            )),
         }
     };
     if status == 0

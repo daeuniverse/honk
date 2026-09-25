@@ -138,9 +138,8 @@ enum UiRoute {
     },
 }
 
-/// Run the download target through the same routing pipeline as user
-/// traffic: `Router::route_with_must` for the outbound name, then the
-/// authoritative group/leaf resolution for the node to dial.
+/// Run the download target through the same traffic routing and authoritative
+/// group/leaf resolution as user traffic.
 async fn decide_route(
     ctx: &UiDownloadContext,
     host: &str,
@@ -188,11 +187,9 @@ async fn decide_route(
     let detour_configured = !configured_detour.is_empty();
     let (outbound, rule) = if !detour_configured {
         let router = ctx.router.read().await;
-        let (outbound, _must) = router.route_with_must(&info);
-        let rule = router
-            .route_full(&info)
-            .map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
-        (outbound.to_string(), rule)
+        let (action, matched) = router.route_action(&info);
+        let rule = matched.map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
+        (action.outbound.clone(), rule)
     } else {
         (
             configured_detour,

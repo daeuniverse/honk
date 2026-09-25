@@ -280,17 +280,14 @@ impl ControlPlane {
             }
         };
         let old_plan = self.active_routing_plan.read().clone();
+        let old_has_direct_marks = current_router.has_direct_marks();
         let reuse_routing_state = routing_state_reusable(&current_config, &new_config)
             && current_router.geo_fingerprint() == traffic_geo_fingerprint;
         // Build the candidate completely before mutating live state.
         let new_router = if reuse_routing_state {
             current_router
         } else {
-            match Router::new_with_geo_sources(
-                &new_config.routing.rules,
-                &new_config.routing.default_outbound,
-                &geo_sources,
-            ) {
+            match Router::from_config_with_geo_sources(&new_config.routing, &geo_sources) {
                 Ok(router) => router,
                 Err(error) => {
                     error!(%error, "Failed to build new router");
@@ -300,6 +297,7 @@ impl ControlPlane {
             }
         };
         let pinned_router = Arc::new(new_router.clone());
+        let new_has_direct_marks = new_router.has_direct_marks();
         let old_group_manager = self.group_manager.read().clone();
         let new_group_manager = Arc::new(GroupManager::with_alive_set_and_score_state(
             &new_config.groups,
@@ -615,6 +613,11 @@ impl ControlPlane {
                 return Ok(false);
             }
         };
+        if !old_plan.semantically_eq(&new_plan) && (old_has_direct_marks || new_has_direct_marks) {
+            // Direct sockets retain their policy mark for life, including raw DNS.
+            self.udp_pool
+                .remove_by_node(honk_config::config::DIRECT_NODE_ID);
+        }
 
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);

@@ -788,6 +788,18 @@ impl EbpfBackend for MockEbpfBackend {
         if !udp_state_is_legacy_userspace_owned(&state) {
             return Ok(UdpDecisionCommitResult::Superseded);
         }
+        if unsafe { state.meta.raw } & ROUTING_META_FLAG_WAN_USERSPACE != 0 {
+            let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
+            let track_key = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(key));
+            let track = self.redirect_tracks.get(&track_key).copied();
+            if handoff.is_some_and(|entry| entry.result.decision_token != 0)
+                || track.is_some_and(|entry| entry.decision_token != 0)
+            {
+                return Ok(UdpDecisionCommitResult::TokenMismatch);
+            }
+            self.routing_handoffs.lock().remove(&key_bytes);
+            self.redirect_tracks.remove(&track_key);
+        }
         if self.udp_conn_states.remove(&key_bytes).is_some() {
             super::USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(UdpDecisionCommitResult::Applied)
@@ -1489,6 +1501,91 @@ mod tests {
     }
 
     #[test]
+    fn wan_userspace_removal_retires_only_owned_state_and_auxiliaries() {
+        let key = decision_test_key();
+        let track_key = RedirectTuple::from_tuples(&key);
+        for must in [false, true] {
+            for (state_token, handoff_token, track_token, expected) in [
+                (Some(0), 0, 0, UdpDecisionCommitResult::Applied),
+                (Some(7), 7, 7, UdpDecisionCommitResult::Superseded),
+                (None, 7, 7, UdpDecisionCommitResult::Missing),
+                (Some(0), 7, 0, UdpDecisionCommitResult::TokenMismatch),
+                (Some(0), 0, 7, UdpDecisionCommitResult::TokenMismatch),
+            ] {
+                let mut backend = MockEbpfBackend::new();
+                if let Some(token) = state_token {
+                    backend
+                        .udp_conn_state_store(
+                            &key,
+                            &ConnState {
+                                decision_token: token,
+                                meta: RoutingMeta {
+                                    raw: ROUTING_META_FLAG_PUBLISHED
+                                        | ROUTING_META_FLAG_WAN_USERSPACE
+                                        | (u64::from(must) << 40)
+                                        | (0x200 << 8),
+                                },
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                backend.routing_handoffs.lock().insert(
+                    MockEbpfBackend::tuples_key_bytes(&key),
+                    RoutingHandoffEntry {
+                        result: RoutingResult {
+                            decision_token: handoff_token,
+                            mark: 0x200,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                backend
+                    .redirect_track_store(
+                        &track_key,
+                        &RedirectEntry {
+                            decision_token: track_token,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(backend.remove_udp_flow(&key, 0).unwrap(), expected);
+                if expected == UdpDecisionCommitResult::Applied {
+                    assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+                    assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+                    assert!(backend.redirect_track_lookup(&track_key).unwrap().is_none());
+                } else {
+                    assert_eq!(
+                        backend
+                            .udp_conn_state_lookup(&key)
+                            .unwrap()
+                            .map(|s| s.decision_token),
+                        state_token
+                    );
+                    assert_eq!(
+                        backend
+                            .routing_handoff_lookup(&key)
+                            .unwrap()
+                            .unwrap()
+                            .result
+                            .decision_token,
+                        handoff_token
+                    );
+                    assert_eq!(
+                        backend
+                            .redirect_track_lookup(&track_key)
+                            .unwrap()
+                            .unwrap()
+                            .decision_token,
+                        track_token
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn abort_accounts_state_delete_and_sequence_survives_cleanup() {
         let mut backend = MockEbpfBackend::new();
         let key = decision_test_key();
@@ -1570,7 +1667,6 @@ mod tests {
         crate::control::routing_matcher::RoutingPushPlan::compile(
             &router,
             &HashMap::from([("direct".into(), 0)]),
-            "direct",
             honk_config::types::DialMode::Domain,
         )
         .unwrap()

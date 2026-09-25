@@ -1,7 +1,8 @@
 //! Routing engine: compiles rules and determines outbound for connections.
 
-use honk_config::routing::RoutingRule;
+use honk_config::routing::{RoutingConfig, RoutingRule};
 use honk_ebpf_common::{DomainRouting, ROUTING_FACT_CAPACITY};
+use honk_outbound::proxy::DirectMark;
 use regex::Regex;
 use std::{net::IpAddr, sync::Arc};
 
@@ -30,6 +31,20 @@ fn normalize_process_matcher(name: &str) -> String {
     String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAction {
+    pub outbound: String,
+    pub must: bool,
+    pub mark: Option<DirectMark>,
+    pub direct_mark_index: Option<u8>,
+}
+
+impl RouteAction {
+    pub fn is_terminal_direct_mark(&self) -> bool {
+        self.must && self.outbound == "direct" && self.mark.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub id: u32,
@@ -39,10 +54,7 @@ pub struct CompiledRoute {
     pub rule_payload: String,
     pub priority: u32,
     pub conditions: Vec<CompiledCondition>,
-    pub outbound: String,
-    /// A matching configured must rule is terminal.
-    pub must: bool,
-    pub mark: u32,
+    pub action: RouteAction,
 }
 
 impl CompiledRoute {
@@ -330,21 +342,49 @@ impl AsRef<[CompiledRoute]> for CompiledRoutes {
 #[derive(Debug, Clone)]
 pub struct Router {
     routes: CompiledRoutes,
-    default_outbound: Arc<str>,
+    fallback: RouteAction,
     domain_matchers: Arc<[DomainMatcher]>,
+    direct_marks: Arc<[u32]>,
     policy_fingerprint: [u8; 32],
 }
 
 impl Router {
-    pub fn new(rules: &[RoutingRule], default_outbound: &str) -> anyhow::Result<Self> {
-        let requirements = GeoRequirements::for_traffic(rules);
-        let sources = GeoSourceSet::load(&requirements);
-        Self::new_with_geo_sources(rules, default_outbound, &sources)
+    /// Ad-hoc rule set; its fallback carries no configured `must` or mark.
+    pub fn new(rules: &[RoutingRule], plain_fallback: &str) -> anyhow::Result<Self> {
+        let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(rules));
+        Self::build(
+            rules,
+            RouteAction {
+                outbound: plain_fallback.to_owned(),
+                must: false,
+                mark: None,
+                direct_mark_index: None,
+            },
+            &sources,
+        )
     }
 
-    pub(crate) fn new_with_geo_sources(
+    pub fn from_config(routing: &RoutingConfig) -> anyhow::Result<Self> {
+        let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(&routing.rules));
+        Self::from_config_with_geo_sources(routing, &sources)
+    }
+
+    pub(crate) fn from_config_with_geo_sources(
+        routing: &RoutingConfig,
+        geo_sources: &GeoSourceSet,
+    ) -> anyhow::Result<Self> {
+        let fallback = RouteAction {
+            outbound: routing.default_outbound.clone(),
+            must: routing.default_must,
+            mark: DirectMark::new(routing.default_mark),
+            direct_mark_index: None,
+        };
+        Self::build(&routing.rules, fallback, geo_sources)
+    }
+
+    fn build(
         rules: &[RoutingRule],
-        default_outbound: &str,
+        mut fallback: RouteAction,
         geo_sources: &GeoSourceSet,
     ) -> anyhow::Result<Self> {
         let requirements = GeoRequirements::for_traffic(rules);
@@ -358,7 +398,7 @@ impl Router {
             append_conditions(&mut conditions, false, rule, &assets, &mut registry)?;
             append_conditions(&mut conditions, true, rule, &assets, &mut registry)?;
 
-            let (outbound, outbound_must) = parse_outbound(rule.outbound.as_str());
+            let outbound = rule.outbound.as_str().to_owned();
             let (rule_type, rule_payload) = rule
                 .condition
                 .clash_rule_parts()
@@ -371,9 +411,12 @@ impl Router {
                 rule_payload,
                 priority: rule.priority,
                 conditions,
-                outbound,
-                must: rule.must || outbound_must,
-                mark: rule.mark,
+                action: RouteAction {
+                    outbound,
+                    must: rule.must,
+                    mark: DirectMark::new(rule.mark),
+                    direct_mark_index: None,
+                },
             });
         }
 
@@ -382,20 +425,60 @@ impl Router {
         for (id, route) in compiled.iter_mut().enumerate() {
             route.id = id as u32;
         }
+        let mut direct_marks: Vec<u32> = compiled
+            .iter()
+            .map(|route| &route.action)
+            .chain(std::iter::once(&fallback))
+            .filter(|action| action.is_terminal_direct_mark())
+            .filter_map(|action| action.mark.map(DirectMark::get))
+            .collect();
+        direct_marks.sort_unstable();
+        direct_marks.dedup();
+        anyhow::ensure!(
+            direct_marks.len() <= 256,
+            "terminal direct mark capacity exceeded ({} > 256 distinct nonzero marks)",
+            direct_marks.len()
+        );
+        let index_for = |action: &mut RouteAction| {
+            if action.is_terminal_direct_mark() {
+                action.direct_mark_index = Some(
+                    direct_marks
+                        .binary_search(&action.mark.unwrap().get())
+                        .unwrap() as u8,
+                );
+            }
+        };
+        for route in &mut compiled {
+            index_for(&mut route.action);
+        }
+        index_for(&mut fallback);
 
-        let (default_outbound, _default_must) = parse_outbound(default_outbound);
         let policy_fingerprint =
-            fingerprint::policy(&compiled, &registry.0, &default_outbound, geo_fingerprint);
+            fingerprint::policy(&compiled, &registry.0, &fallback, geo_fingerprint);
         Ok(Self {
             routes: CompiledRoutes::new(compiled, geo_fingerprint, requirements),
-            default_outbound: default_outbound.into(),
+            fallback,
             domain_matchers: registry.0.into(),
+            direct_marks: direct_marks.into(),
             policy_fingerprint,
         })
     }
 
-    pub fn default_outbound(&self) -> &str {
-        self.default_outbound.as_ref()
+    pub fn fallback(&self) -> &RouteAction {
+        &self.fallback
+    }
+
+    /// Resolve a terminal direct packet's mark index in this immutable generation.
+    pub fn direct_mark(&self, index: u8) -> Option<u32> {
+        self.direct_marks.get(usize::from(index)).copied()
+    }
+
+    pub fn has_direct_marks(&self) -> bool {
+        self.fallback.outbound == "direct" && self.fallback.mark.is_some()
+            || self
+                .routes
+                .iter()
+                .any(|route| route.action.outbound == "direct" && route.action.mark.is_some())
     }
 
     pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
@@ -428,23 +511,25 @@ impl Router {
     }
 
     pub fn route(&self, conn: &ConnectionInfo) -> &str {
-        match self.route_full(conn) {
-            Some(result) => result.outbound_name,
-            None => {
-                tracing::debug!(
-                    "Connection {} → default outbound '{}'",
-                    conn_log_id(conn),
-                    self.default_outbound
-                );
-                self.default_outbound.as_ref()
-            }
+        let (action, matched) = self.route_action(conn);
+        if matched.is_none() {
+            tracing::debug!(
+                "Connection {} → default outbound '{}'",
+                conn_log_id(conn),
+                action.outbound
+            );
         }
+        &action.outbound
     }
 
-    pub fn route_with_must(&self, conn: &ConnectionInfo) -> (&str, bool) {
+    /// First matching rule's action, else the configured fallback action.
+    pub fn route_action<'a>(
+        &'a self,
+        conn: &ConnectionInfo,
+    ) -> (&'a RouteAction, Option<RouteMatch<'a>>) {
         match self.route_full(conn) {
-            Some(result) => (result.outbound_name, result.must),
-            None => (self.default_outbound(), false),
+            Some(hit) => (hit.action, Some(hit)),
+            None => (self.fallback(), None),
         }
     }
 
@@ -465,18 +550,16 @@ impl Router {
                 "Connection {} matched rule '{}' → '{}' (must={}, mark={})",
                 conn_log_id(conn),
                 route.name,
-                route.outbound,
-                route.must,
-                route.mark
+                route.action.outbound,
+                route.action.must,
+                route.action.mark.map_or(0, DirectMark::get)
             );
             Some(RouteMatch {
                 rule_id: route.id,
-                outbound_name: &route.outbound,
+                action: &route.action,
                 rule_name: &route.name,
                 rule_type: &route.rule_type,
                 rule_payload: &route.rule_payload,
-                must: route.must,
-                mark: route.mark,
             })
         })
     }
@@ -552,12 +635,10 @@ impl Router {
 #[derive(Debug, Clone)]
 pub struct RouteMatch<'a> {
     pub rule_id: u32,
-    pub outbound_name: &'a str,
+    pub action: &'a RouteAction,
     pub rule_name: &'a str,
     pub rule_type: &'a str,
     pub rule_payload: &'a str,
-    pub must: bool,
-    pub mark: u32,
 }
 
 fn append_conditions(
@@ -757,15 +838,6 @@ fn normalize_mac_bytes(s: &str) -> Option<[u8; 6]> {
         bytes[index] = u8::from_str_radix(value, 16).ok()?;
     }
     Some(bytes)
-}
-
-/// Strip `(must)` suffix from outbound name, returning (name, must_flag).
-fn parse_outbound(outbound: &str) -> (String, bool) {
-    if let Some(stripped) = outbound.strip_suffix("(must)") {
-        (stripped.to_string(), true)
-    } else {
-        (outbound.to_string(), false)
-    }
 }
 
 fn parse_ip_version(s: &str) -> Option<u8> {

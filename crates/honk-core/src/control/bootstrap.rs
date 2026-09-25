@@ -64,15 +64,12 @@ impl ControlPlane {
         resource_budget: ResourceBudget,
     ) -> anyhow::Result<Self> {
         config.validate_assembled()?;
+        honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);
 
-        // Create alive set for node health checking and pass it into the group
-        // manager so dead nodes are excluded from group selection.
-        // Mark probe sockets with DAE_BYPASS_MARK so the eBPF datapath does not
-        // re-route the control plane's own health check traffic.
         let alive_set = Arc::new(
-            crate::outbound::AliveDialerSet::new().with_so_mark(honk_ebpf_common::DAE_BYPASS_MARK),
+            crate::outbound::AliveDialerSet::new().with_so_mark(config.global.effective_so_mark()),
         );
         // Periodic direct health uses a stable bootstrap target; on-demand
         // URL tests still measure their requested URL.

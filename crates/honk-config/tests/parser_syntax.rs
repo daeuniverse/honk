@@ -149,6 +149,93 @@ mod routing_syntax {
         assert!(config.routing.rules[1].must);
     }
 
+    #[test]
+    fn direct_marks_decode_decimal_hex_must_and_fallback() {
+        for (target, mark, must) in [
+            ("direct(mark: 10)", 10, false),
+            ("direct(mark: 010)", 10, false),
+            ("direct(mark: 0x10)", 16, false),
+            ("direct(mark: 0X10)", 16, false),
+            ("direct(mark: '512', must)", 512, true),
+            ("direct(must, mark: 0x200)", 512, true),
+            ("direct ( mark: 0x200 , must )", 512, true),
+            ("direct(mark:\n 0x200,\n must)", 512, true),
+            ("direct(mark: 0x3fffffff)", 0x3fff_ffff, false),
+            ("direct(mark: 0)", 0, false),
+        ] {
+            let config = parse_dae_config_with_detailed_diagnostics(
+                &format!("routing {{\n domain(example.net) -> {target}\n fallback: {target}\n}}"),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let rule = &config.routing.rules[0];
+            assert_eq!(rule.outbound.as_str(), "direct", "{target}");
+            assert_eq!((rule.mark, rule.must), (mark, must), "{target}");
+            let routing = &config.routing;
+            assert_eq!(routing.rules.len(), 1, "{target}");
+            assert_eq!(
+                (
+                    routing.default_outbound.as_str(),
+                    routing.default_mark,
+                    routing.default_must
+                ),
+                ("direct", mark, must),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_mark_options_fail_closed_without_echoing_values() {
+        for target in [
+            "direct(mark: PRIVATE)",
+            "direct(mark: )",
+            "direct(mark: -1)",
+            "direct(mark: +1)",
+            "direct(mark: 4294967296)",
+            "direct(mark: 0x100000000)",
+            "direct(mark: 0x40000000)",
+            "direct(mark: 0x80000000)",
+            "direct(mark: 0xc0000000)",
+            "direct(mark: 0b10)",
+            "direct(mark: 0o10)",
+            "direct(mark: 1_000)",
+            "direct(mark: 1, mark: 2)",
+            "direct(must, must)",
+            "direct(must: true)",
+            "direct(PRIVATE: 1)",
+            "direct(PRIVATE)",
+            "direct(mark: 1,)",
+            "direct(mark: 1)PRIVATE",
+            "direct(mark: (1))",
+        ] {
+            for (statement, setting) in [
+                (
+                    format!("domain(example.net) -> {target}"),
+                    "routing.rules[1]",
+                ),
+                (format!("fallback: {target}"), "routing.fallback"),
+            ] {
+                let mut diagnostics = Vec::new();
+                let error = parse_dae_config_with_detailed_diagnostics(
+                    &format!("routing {{\n {statement}\n}}"),
+                    &mut diagnostics,
+                )
+                .unwrap_err();
+                assert_eq!(error.diagnostic.setting.to_string(), setting, "{target}");
+                assert_eq!(error.diagnostic.line, Some(2), "{target}");
+                assert!(
+                    matches!(
+                        error.diagnostic.code,
+                        "invalid-routing-mark" | "invalid-direct-options"
+                    ),
+                    "{target}: {error:?}",
+                );
+                assert!(!format!("{error:?}{diagnostics:?}").contains("PRIVATE"));
+            }
+        }
+    }
+
     fn input(name: &str) -> String {
         std::fs::read_to_string(format!(
             "{}/tests/fixtures/parser/routing/{name}.dae",

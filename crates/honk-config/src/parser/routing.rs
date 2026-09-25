@@ -207,7 +207,14 @@ pub(super) fn parse_section(
                 .sub(statement.span.start + prefix.len(), statement.span.end)
                 .trim();
             value.warn_glued_hash(diagnostics);
-            config.default_outbound = value.display();
+            let (outbound, must, mark) = parse_outbound(value, ordinal).map_err(|mut error| {
+                error.diagnostic.setting = SettingPath::new("routing").field("fallback");
+                error
+            })?;
+            // A later merged fallback replaces the whole action, including must/mark.
+            config.default_outbound = outbound;
+            config.default_must = must;
+            config.default_mark = mark;
         } else {
             match parse_routing_rule(statement, config.rules.len(), ordinal, diagnostics) {
                 Ok(Some((rule, source))) => {
@@ -260,26 +267,92 @@ fn parse_routing_rule(
                 "additional arrows remain literal outbound data",
             );
     }
-    let mut outbound = right.display();
-    let must = outbound.ends_with("(must)");
-    if must {
-        outbound.truncate(outbound.len() - "(must)".len());
-        outbound.truncate(outbound.trim_end().len());
-    }
+    let (outbound, must, mark) = parse_outbound(right, ordinal)?;
     let mut condition = RoutingCondition::default();
     for matcher in left.split("&&").filter(|matcher| !matcher.is_empty()) {
         parse_route_matcher(&mut condition, matcher, ordinal)?;
     }
-    let complex = must || left.find("&&").is_some() || condition.needs_complex_display();
+    let complex =
+        must || mark != 0 || left.find("&&").is_some() || condition.needs_complex_display();
     let rule = RoutingRule {
         name: format!("rule-{index}"),
         condition,
         outbound: crate::routing::RoutingOutbound::Simple(outbound),
         priority: index as u32,
         must,
-        mark: 0,
+        mark,
     };
     Ok(Some((rule, complex.then(|| statement.display()))))
+}
+
+fn parse_outbound(
+    target: Expression<'_, '_, '_>,
+    ordinal: usize,
+) -> Result<(String, bool, u32), DetailedConfigError> {
+    let invalid_options = || {
+        target.error(
+            "invalid-direct-options",
+            "direct accepts only one mark and one must option",
+            ordinal,
+        )
+    };
+    if target.find("->").is_none()
+        && let Some(open) = target.find("(")
+        && target.sub(target.span.start, open).trim().value() == "direct"
+    {
+        let mut parentheses = target.parentheses();
+        parentheses.next();
+        let Some((close, b')')) = parentheses.next() else {
+            return Err(invalid_options());
+        };
+        if parentheses.next().is_some() || !target.sub(close + 1, target.span.end).trim().is_empty()
+        {
+            return Err(invalid_options());
+        }
+        let options = target.sub(open + 1, close).trim();
+        let mut must = false;
+        let mut mark = None;
+        if !options.is_empty() {
+            for option in options.split(",") {
+                if option.unquote().value() == "must" && !must {
+                    must = true;
+                    continue;
+                }
+                let Some(colon) = option.find(":") else {
+                    return Err(invalid_options());
+                };
+                if option.sub(option.span.start, colon).trim().value() != "mark" || mark.is_some() {
+                    return Err(invalid_options());
+                }
+                let value = option.sub(colon + 1, option.span.end).unquote().value();
+                let (digits, radix) = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .map_or((value.as_ref(), 10), |digits| (digits, 16));
+                mark = Some(
+                    u32::from_str_radix(digits, radix)
+                        .ok()
+                        .filter(|_| !digits.starts_with('+'))
+                        .filter(|mark| mark & crate::routing::DATAPATH_RESERVED_MARK_MASK == 0)
+                        .ok_or_else(|| {
+                            option.error(
+                                "invalid-routing-mark",
+                                "mark must be decimal or 0x hexadecimal without datapath-reserved bits",
+                                ordinal,
+                            )
+                        })?,
+                );
+            }
+        }
+        return Ok(("direct".into(), must, mark.unwrap_or(0)));
+    }
+    let mut outbound = target.display();
+    let must = outbound.ends_with("(must)");
+    if must {
+        outbound.truncate(outbound.len() - "(must)".len());
+        outbound.truncate(outbound.trim_end().len());
+    }
+    Ok((outbound, must, 0))
 }
 
 fn parse_route_matcher(

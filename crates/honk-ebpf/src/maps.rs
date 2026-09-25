@@ -68,8 +68,8 @@ pub fn datapath_flags() -> u32 {
 #[btf_map]
 pub static UDP_DECISION_SEQUENCE: Array<UdpDecisionSequence, 1, 0> = Array::new();
 
-/// Active grace-period slot for token-bound decision work. Userspace flips
-/// this before waiting on the previous per-CPU slot.
+/// Active grace-period slot for token-bound decisions and WAN UDP routing.
+/// Userspace flips this before waiting on the previous per-CPU slot.
 #[btf_map]
 pub static UDP_DECISION_EPOCH: Array<u32, 1, 0> = Array::new();
 

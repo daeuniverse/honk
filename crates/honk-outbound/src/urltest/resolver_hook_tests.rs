@@ -56,12 +56,12 @@ async fn hook_supplies_addresses_and_preserves_rejection() {
     .await;
     assert!(called.load(std::sync::atomic::Ordering::Relaxed));
 
-    let error = resolve_urltest_address("rejected.invalid", 443, false)
+    let error = resolve_urltest_address("rejected.invalid", 443)
         .await
         .expect_err("typed hook rejection");
     assert!(crate::proxy::is_packet_rejection(&error));
 
-    resolve_urltest_address("empty.invalid", 443, false)
+    resolve_urltest_address("empty.invalid", 443)
         .await
         .expect_err("empty hook result");
 }

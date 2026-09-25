@@ -1,6 +1,6 @@
 use super::{assert_route, decision, input, object};
 use crate::control::routing_matcher::{
-    KernelCondition, KernelPredicate, KernelRule, RoutingFactMaps, RoutingPushPlan,
+    KernelAction, KernelCondition, KernelPredicate, KernelRule, RoutingFactMaps, RoutingPushPlan,
 };
 use crate::ebpf::EbpfBackend;
 use crate::ebpf::maps::LpmKey;
@@ -24,9 +24,12 @@ fn kernel_rule(
         id,
         source: format!("readiness-{id}"),
         conditions,
-        outbound,
-        must,
-        mark,
+        action: KernelAction {
+            outbound,
+            must,
+            mark,
+            direct_mark_index: None,
+        },
     }
 }
 
@@ -120,7 +123,12 @@ fn readiness_plan(facts: RoutingFactMaps) -> RoutingPushPlan {
             ),
         ],
         facts,
-        fallback: 0,
+        fallback: KernelAction {
+            outbound: 0,
+            must: false,
+            mark: 0,
+            direct_mark_index: None,
+        },
         features: 0,
         fingerprint: [0; 32],
         has_domain_rules: false,

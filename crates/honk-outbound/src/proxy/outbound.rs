@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{PacketTransport, PreparedUdpTransport, ProxyStream};
+use super::{DirectMark, PacketTransport, PreparedUdpTransport, ProxyStream};
 
 /// Result of requesting reusable protocol state. `Ready` means the state is
 /// usable after the call; `NotApplicable` means the protocol owns no
@@ -61,6 +61,19 @@ pub trait TcpOutbound: Send + Sync {
         )
         .await
     }
+
+    /// Dial a routed direct flow with a nonzero mark. Outbounds that do not
+    /// own the flow's socket cannot apply it and refuse the dial.
+    async fn dial_runtime_marked(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("outbound cannot carry direct mark {:#x}", mark.get())
+    }
 }
 
 /// Framed UDP transports — only protocols with UDP capability (see
@@ -92,6 +105,18 @@ pub trait PacketOutbound: Send + Sync {
             connect_timeout,
         )
         .await
+    }
+
+    /// UDP counterpart of [`TcpOutbound::dial_runtime_marked`].
+    async fn dial_udp_transport_runtime_marked(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        anyhow::bail!("outbound cannot carry direct mark {:#x}", mark.get())
     }
 
     /// Generation-pinned speculative preparation. The default wraps the

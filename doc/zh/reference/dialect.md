@@ -49,10 +49,17 @@ honk 读取 dae 配置语法，形成自己的方言：两者对同一段文本�
 |---|---|---|---|
 | 裸前缀匹配器，`!geosite:cn -> proxy`、`domain:example.com -> proxy` | 不是函数调用，拒绝 | 接受为匹配器（`geosite`、`geoip`、`domain`、`suffix`、`keyword`、`regex`、`full` 前缀）。 | [dialect-routing-01-geosite-prefix](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-01-geosite-prefix.dae), [dialect-routing-01-domain-prefix](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-01-domain-prefix.dae) |
 | 两个箭头，`domain(x) -> proxy->backup` | 拒绝 | 出站为字面文本 `proxy->backup`，产生 `legacy-arrow-target` 警告。保留此兼容写法，仍须通过通常的目标校验。 | [dialect-routing-02-two-arrows](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-02-two-arrows.dae) |
-| `-> proxy( must )` | 带参数 `must` 的调用 | 只有精确后缀 `(must)` 是 must 标记；`proxy( must )` 是名为 `proxy( must )` 的出站。 | [dialect-routing-03-spaced-must](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-03-spaced-must.dae) |
+| `-> proxy( must )` | 带参数 `must` 的调用 | 非 direct 目标仍要求精确后缀 `(must)`；`proxy( must )` 是名为 `proxy( must )` 的出站。direct 会解析选项列表，因此 `direct( must )` 是终局规则。 | [dialect-routing-03-spaced-must](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-03-spaced-must.dae), [直连选项测试](../../../crates/honk-config/tests/parser_syntax.rs) |
 | 括号前有空格，`dport (443) -> proxy` | 接受 | 返回带位置的 `unknown-traffic-predicate` 错误。请删除匹配器名称与左括号之间的空格。 | [dialect-routing-04-spaced-call](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-04-spaced-call.dae) |
 | 合取里的未知匹配器，`dport(443) && domian(x) -> direct` | 文法接受，校验在文法之外 | 返回带位置的 `unknown-traffic-predicate` 错误，取反条件也不例外。请修正匹配器；不再静默丢弃单个条件。 | [dialect-routing-05-unknown](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-05-unknown.dae), [dialect-routing-05-negated](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-05-negated.dae) |
 | 含多个冒号的参数，`dip(2001:db8::/32)`、`mac(00:11:22:33:44:55)` | 不是字面量，需要加引号 | 整体保留：只有识别的 `prefix:`（`geosite:`、`geoip:`、`domain:`、`suffix:`、`keyword:`、`regex:`、`full:`）才在其冒号处拆分。 | [dialect-routing-06-ipv6](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-06-ipv6.dae), [dialect-routing-06-mac](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-06-mac.dae) |
+| `direct(mark: 10)` / `direct(mark: 0x10)` / `direct(mark: 010)` | 函数参数；dae 类型解码使用 Go 的 base-0 `ParseUint`，结果为 10 / 16 / 8 | 只接受十进制或显式 `0x`/`0X` 十六进制，结果为 10 / 16 / 10。拒绝二进制/八进制前缀、下划线、正负号、溢出与保留位 `0xc0000000`。这是有意区别于 dae base-0 解码以及上文 honk **全局** mark 的十六进制优先规则。 | [直连 mark 测试](../../../crates/honk-config/tests/parser_syntax.rs) |
+| `direct(mark: 512, must)` / `direct(must, mark: 512)` 及带 mark 的 `fallback:` | 选项顺序不限 | 直连规则和 fallback 均接受两种顺序及内部空白。未知/重复直连选项安全报错；只有 direct 支持 mark。合并后最终 fallback 的完整动作（含 mark 与 `must`）在全部普通规则之后生效。 | [解析测试](../../../crates/honk-config/tests/parser_syntax.rs), [include 测试](../../../crates/honk-config/tests/include.rs) |
+
+上游 mark 类型与选项行为定义见
+[`routing.ParseOutbound`](https://github.com/daeuniverse/dae/blob/5db27a0028d36e7847bd3796497df952337a20e2/component/routing/matcher_builder.go#L104-L130)。
+运行时低 30 位策略掩码、全局默认值与重启要求见
+[路由 mark](./routing.md#策略路由-mark) 和[套接字 mark](./global.md#套接字-mark)。
 
 ## DNS
 

@@ -3,6 +3,7 @@ use std::io::Write;
 use support::*;
 
 mod fragments;
+mod marks;
 mod support;
 
 const DSCP_ORDINARY: u8 = 0;
@@ -372,8 +373,8 @@ fn dns_l3_tun_v4_v6_udp_local_and_forwarded_policy_carriers() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
-fn dns_marked_loopback_backend_survives_lan_hook_without_exempting_other_marks() {
-    for bypass_mark in [DAE_BYPASS_MARK, 0] {
+fn marked_loopback_backend_survives_lan_hook_without_exempting_other_marks() {
+    for bypass_mark in [DAE_BYPASS_MARK, 0x200, 0] {
         isolated(move || {
             let mut netlink = crate::netlink::NlSock::new().unwrap();
             let (lo, _) = netlink.get_link("lo").unwrap();
@@ -383,9 +384,9 @@ fn dns_marked_loopback_backend_survives_lan_hook_without_exempting_other_marks()
                 ..fixture_param()
             };
             let plan = compile(&[rule(
-                "block-dns",
+                "block-unowned",
                 RoutingCondition {
-                    port: vec!["53".into()],
+                    protocol: vec!["tcp".into(), "udp".into()],
                     ..Default::default()
                 },
                 "block",
@@ -415,10 +416,35 @@ fn dns_marked_loopback_backend_survives_lan_hook_without_exempting_other_marks()
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
                 SocketAddr::from((Ipv6Addr::LOCALHOST, 53)),
             ] {
+                if bypass_mark != 0 {
+                    let non_dns = SocketAddr::new(destination.ip(), 8080);
+                    let local = tcp_listener(non_dns);
+                    nix::sys::socket::setsockopt(
+                        &local,
+                        nix::sys::socket::sockopt::Mark,
+                        &bypass_mark,
+                    )
+                    .unwrap();
+                    let mut stream = tcp_connect(non_dns, DSCP_ORDINARY, bypass_mark).unwrap();
+                    let (mut accepted, _) = accept_connection(&local);
+                    exchange_tcp(&mut stream, &mut accepted, b"global", b"bypass");
+                }
                 let server = udp_socket(destination);
                 let tcp_server = tcp_listener(destination);
                 let client = udp_socket(SocketAddr::new(destination.ip(), 0));
                 if bypass_mark != 0 {
+                    nix::sys::socket::setsockopt(
+                        &server,
+                        nix::sys::socket::sockopt::Mark,
+                        &bypass_mark,
+                    )
+                    .unwrap();
+                    nix::sys::socket::setsockopt(
+                        &tcp_server,
+                        nix::sys::socket::sockopt::Mark,
+                        &bypass_mark,
+                    )
+                    .unwrap();
                     nix::sys::socket::setsockopt(
                         &client,
                         nix::sys::socket::sockopt::Mark,
@@ -444,7 +470,7 @@ fn dns_marked_loopback_backend_survives_lan_hook_without_exempting_other_marks()
                 server
                     .set_read_timeout(Some(Duration::from_millis(100)))
                     .unwrap();
-                for mark in [0, DAE_BYPASS_MARK | 0x200] {
+                for mark in [0, 0x300, 0x1234] {
                     nix::sys::socket::setsockopt(&client, nix::sys::socket::sockopt::Mark, &mark)
                         .unwrap();
                     client.send_to(b"must-drop", destination).unwrap();

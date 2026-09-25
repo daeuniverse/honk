@@ -92,7 +92,7 @@ impl RealEbpfBackend {
             use_redirect_peer,
             has_bpf_get_current_task: matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
                 as u8,
-            dae_socket_mark: DAE_BYPASS_MARK,
+            dae_socket_mark: honk_outbound::util::bypass_mark(),
             control_plane_pid: std::process::id(),
             local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
             ..Default::default()

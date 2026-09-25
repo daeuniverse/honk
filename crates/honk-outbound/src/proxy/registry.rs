@@ -18,8 +18,8 @@ use super::vless::VLessHandler;
 #[cfg(feature = "rprx")]
 use super::vmess::VmessHandler;
 use super::{
-    PacketOutbound, PacketRejection, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
+    DirectMark, PacketOutbound, PacketRejection, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
 };
 
 /// One registered protocol: its descriptor plus the capability objects it
@@ -213,10 +213,8 @@ impl ProxyRegistry {
             .await
     }
 
-    /// Dial through a generation-pinned node runtime. The generation's
-    /// terminal flag is checked before and after the dial so a reload or
-    /// shutdown racing the handshake fails closed instead of publishing a
-    /// stream into a retired generation.
+    /// Dial through a generation-pinned node runtime, refusing a stream from a
+    /// generation retired during the dial.
     pub async fn dial_runtime(
         &self,
         generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -225,6 +223,48 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let tcp = Arc::clone(&entry.tcp);
+            Ok(async move {
+                tcp.dial_runtime(runtime, target, target_domain, connect_timeout)
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// Dial a direct flow with a nonzero mark in the captured generation.
+    pub async fn dial_runtime_marked(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let tcp = Arc::clone(&entry.tcp);
+            Ok(async move {
+                tcp.dial_runtime_marked(runtime, target, target_domain, connect_timeout, mark)
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// Shared admission for every runtime-pinned dial: `dial` validates the
+    /// handler before the dial scope opens, and a generation retired while
+    /// dialing never publishes its result.
+    async fn dial_generation<T, Fut>(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        dial: impl FnOnce(Arc<crate::runtime::NodeRuntime>, &ProtocolEntry) -> anyhow::Result<Fut>,
+    ) -> anyhow::Result<T>
+    where
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation is shut down");
         }
@@ -235,18 +275,13 @@ impl ProxyRegistry {
         let entry = self
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
-        let stream = generation
-            .scope_dials(runtime.transport_quality().scope(entry.tcp.dial_runtime(
-                runtime,
-                target,
-                target_domain,
-                connect_timeout,
-            )))
-            .await?;
+        let quality = runtime.transport_quality();
+        let dial = dial(runtime, entry)?;
+        let result = generation.scope_dials(quality.scope(dial)).await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during dial");
         }
-        Ok(stream)
+        Ok(result)
     }
 
     async fn warm_retained(
@@ -354,9 +389,6 @@ impl ProxyRegistry {
     }
 
     /// Generation-pinned framed UDP transport for an authoritative flow.
-    /// This complements speculative preparation: both paths must retain the
-    /// runtime captured when the flow was admitted, not re-resolve a handler
-    /// cache after reload.
     pub async fn dial_udp_transport_runtime(
         &self,
         generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -365,23 +397,42 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
-        let transport = generation
-            .scope_dials(
-                runtime
-                    .transport_quality()
-                    .scope(packet.dial_udp_transport_runtime(
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let packet = Arc::clone(Self::packet_for_runtime(&runtime, entry, target.port())?);
+            Ok(async move {
+                packet
+                    .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// Generation-pinned direct UDP flow with a nonzero rule mark.
+    pub async fn dial_udp_transport_runtime_marked(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let packet = Arc::clone(Self::packet_for_runtime(&runtime, entry, target.port())?);
+            Ok(async move {
+                packet
+                    .dial_udp_transport_runtime_marked(
                         runtime,
                         target,
                         target_domain,
                         connect_timeout,
-                    )),
-            )
-            .await?;
-        if generation.is_shutdown() {
-            anyhow::bail!("outbound runtime generation shut down during UDP dial");
-        }
-        Ok(transport)
+                        mark,
+                    )
+                    .await
+            })
+        })
+        .await
     }
 
     /// Speculatively prepare a framed UDP transport for a Cold URLTest
@@ -428,6 +479,16 @@ impl ProxyRegistry {
         let entry = self
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+        let packet = Self::packet_for_runtime(&runtime, entry, target_port)?;
+        Ok((runtime, packet))
+    }
+
+    fn packet_for_runtime<'a>(
+        runtime: &crate::runtime::NodeRuntime,
+        entry: &'a ProtocolEntry,
+        target_port: u16,
+    ) -> anyhow::Result<&'a Arc<dyn PacketOutbound>> {
+        let protocol = runtime.node.protocol();
         if protocol != NodeProtocol::Block
             && !crate::descriptor::udp_target_allowed(&runtime.node, target_port)
         {
@@ -436,10 +497,10 @@ impl ProxyRegistry {
         if protocol != NodeProtocol::Block && !runtime.udp_capable {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
-        let packet = entry.packet.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("UDP not supported for protocol {}", protocol.as_str())
-        })?;
-        Ok((runtime, packet))
+        entry
+            .packet
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("UDP not supported for protocol {}", protocol.as_str()))
     }
 
     pub fn handler_count(&self) -> usize {

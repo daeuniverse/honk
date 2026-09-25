@@ -92,7 +92,7 @@ impl DialContext {
         dial_candidates(addresses, deadline, "TCP", |address, budget| async move {
             honk_outbound::util::connect_marked_addr(
                 address,
-                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                Some(honk_outbound::util::bypass_mark()),
                 budget,
             )
             .await

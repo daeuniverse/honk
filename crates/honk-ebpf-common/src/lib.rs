@@ -23,7 +23,8 @@ pub use routing_policy::{
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const TPROXY_MARK: u32 = 0x0800_0000;
-/// Packet has already crossed LAN classification; also used on final direct verdicts.
+/// Final classification flag for native, NFQUEUE and userspace direct packets.
+/// Linux policy rules match the low 30 bits, excluding the reserved flags.
 pub const CLASSIFIED_MARK: u32 = 0x4000_0000;
 /// Packet must be held by the owned NFQUEUE before conntrack and NAT.
 pub const NFQUEUE_PENDING_MARK: u32 = 0x8000_0000;
@@ -40,8 +41,9 @@ pub const UDP_DECISION_GENERATION_MASK: u32 = 0x3;
 
 /// Maximum non-wrapping routing generation, reserved persistently across restarts and queue fences.
 pub const DNS_ROUTE_GENERATION_MAX: u64 = (1 << 20) - 1;
-/// Outbound/generation bits ignored by the daens TPROXY fwmark rule.
-pub const DNS_ROUTE_MARK_MASK: u32 = 0x37ff_feff;
+/// Carrier kind, outbound/index and generation bits ignored by daens routing.
+pub const DNS_ROUTE_MARK_MASK: u32 = 0x37ff_ffff;
+const DNS_DIRECT_MARK_KIND: u32 = 0x100;
 
 /// Per-packet UDP DNS routing authority for dae0 or native host reassembly.
 /// Generation bits occupy 0..7, 9..15, 24..26 and 28..29.
@@ -49,6 +51,7 @@ pub const DNS_ROUTE_MARK_MASK: u32 = 0x37ff_feff;
 pub struct UdpDnsRoute {
     outbound: u8,
     generation: u32,
+    direct_mark: bool,
 }
 
 impl UdpDnsRoute {
@@ -65,13 +68,41 @@ impl UdpDnsRoute {
             Some(Self {
                 outbound,
                 generation: generation as u32,
+                direct_mark: false,
+            })
+        }
+    }
+
+    /// A marked must-direct WAN datagram carries its immutable policy index.
+    #[inline(always)]
+    pub const fn direct(index: u8, generation: u64) -> Option<Self> {
+        if generation == 0 || generation > DNS_ROUTE_GENERATION_MAX {
+            None
+        } else {
+            Some(Self {
+                outbound: index,
+                generation: generation as u32,
+                direct_mark: true,
             })
         }
     }
 
     #[inline(always)]
+    pub const fn direct_mark_index(&self) -> Option<u8> {
+        if self.direct_mark {
+            Some(self.outbound)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
     pub const fn outbound(&self) -> u8 {
-        self.outbound
+        if self.direct_mark {
+            OutboundIndex::Direct as u8
+        } else {
+            self.outbound
+        }
     }
 
     #[inline(always)]
@@ -84,6 +115,11 @@ impl UdpDnsRoute {
         let generation = self.generation;
         TPROXY_MARK
             | (self.outbound as u32) << 16
+            | if self.direct_mark {
+                DNS_DIRECT_MARK_KIND
+            } else {
+                0
+            }
             | generation & 0xff
             | (generation & 0x7f00) << 1
             | (generation & 0x3_8000) << 9
@@ -98,7 +134,11 @@ impl UdpDnsRoute {
         let outbound = (mark >> 16) as u8;
         let generation =
             mark & 0xff | (mark >> 1) & 0x7f00 | (mark >> 9) & 0x3_8000 | (mark >> 10) & 0xc_0000;
-        Self::new(outbound, generation as u64)
+        if mark & DNS_DIRECT_MARK_KIND != 0 {
+            Self::direct(outbound, generation as u64)
+        } else {
+            Self::new(outbound, generation as u64)
+        }
     }
 
     #[inline(always)]
@@ -108,7 +148,9 @@ impl UdpDnsRoute {
 
     #[inline(always)]
     pub const fn from_nfqueue_mark(mark: u32) -> Option<Self> {
-        if mark & NFQUEUE_SIGNATURE_MARK != NFQUEUE_SIGNATURE_MARK {
+        if mark & NFQUEUE_SIGNATURE_MARK != NFQUEUE_SIGNATURE_MARK
+            || mark & DNS_DIRECT_MARK_KIND != 0
+        {
             return None;
         }
         Self::from_mark(mark & !NFQUEUE_SIGNATURE_MARK)
@@ -319,24 +361,25 @@ pub struct RoutingMetaData {
     pub mark: u32,    // offset 1 → u64 bits 8-39
     pub must: u8,     // offset 5 → u64 bit 40
     pub dscp: u8,     // offset 6 → u64 bits 48-55
-    pub _pad: u8,     // offset 7 → u64 bits 56-63 (bit 56 published, bit 57 offload)
+    pub _pad: u8,     // offset 7 → u64 bits 56-63 (published, offload, WAN userspace)
 }
 
-/// Bit 57 of `RoutingMeta::raw`: the per-flow cached kernel-offload
-/// decision, set once at route-decision time when the flow was selected for
-/// direct offload by the mode-based offload policy (see the
-/// `DATAPATH_FLAG_OFFLOAD_*` bits).  `must`-direct flows do not need it —
-/// the `must` bit already encodes their offload — so the flag marks only
-/// non-`must` mode-offloaded flows.  Flows carrying it are normalized to
-/// `outbound == OUTBOUND_DIRECT` at publish time, so the established-packet
-/// fast path only ever checks `outbound == direct && (must || offload)`
-/// and never re-reads the datapath flags per packet.
+/// Bit 57 of `RoutingMeta::raw`: a cached native direct decision. LAN sets
+/// it for mode-based direct offload; WAN UDP sets it for unmarked native direct.
+/// Both publish `outbound == Direct`. Native LAN `must`-direct needs no flag:
+/// its `must` bit already encodes offload. Marked WAN UDP instead carries
+/// `ROUTING_META_FLAG_WAN_USERSPACE`, even with `must`.
 pub const ROUTING_META_FLAG_OFFLOAD: u64 = 1 << 57;
 
 /// Bit 56 of `RoutingMeta::raw`: the datapath published a routing decision
 /// for this flow.  The established-packet fast paths ignore the meta
 /// entirely until this bit is set.
 pub const ROUTING_META_FLAG_PUBLISHED: u64 = 1 << 56;
+
+/// Bit 58 of `RoutingMeta::raw`: a WAN UDP decision relayed through userspace.
+/// Unlike native LAN direct/must decisions, its endpoint owns retirement of
+/// conn state and token-zero handoff/redirect metadata under the UDP reader fence.
+pub const ROUTING_META_FLAG_WAN_USERSPACE: u64 = 1 << 58;
 
 impl RoutingMeta {
     /// Whether the datapath has published a routing decision (bit 56).
@@ -617,7 +660,7 @@ mod udp_dns_route_tests {
 
     #[test]
     fn carrier_round_trips_every_bit_range() {
-        assert_eq!(DNS_ROUTE_MARK_MASK, 0x37ff_feff);
+        assert_eq!(DNS_ROUTE_MARK_MASK, 0x37ff_ffff);
         for (generation, carrier_bit) in [
             (1, 1),
             (1 << 7, 1 << 7),
@@ -674,7 +717,6 @@ mod udp_dns_route_tests {
         let mark = UdpDnsRoute::new(2, 1).unwrap().to_mark();
         for invalid in [
             mark & !TPROXY_MARK,
-            mark | DAE_BYPASS_MARK,
             mark | CLASSIFIED_MARK,
             mark | NFQUEUE_PENDING_MARK,
         ] {
@@ -701,6 +743,26 @@ mod udp_dns_route_tests {
             let invalid = (mark & !(0xff << 16)) | (outbound << 16);
             assert_eq!(UdpDnsRoute::from_nfqueue_mark(invalid), None);
         }
+    }
+
+    #[test]
+    fn direct_mark_carrier_preserves_index_and_generation_without_tuple_state() {
+        for index in 0..=u8::MAX {
+            for generation in [1, 0x100, 0x8000, DNS_ROUTE_GENERATION_MAX] {
+                let route = UdpDnsRoute::direct(index, generation).unwrap();
+                assert_eq!(route.direct_mark_index(), Some(index));
+                assert_eq!(route.outbound(), OutboundIndex::Direct as u8);
+                assert_eq!(UdpDnsRoute::from_mark(route.to_mark()), Some(route));
+                assert_eq!(route.to_mark() & !DNS_ROUTE_MARK_MASK, TPROXY_MARK);
+                assert_eq!(
+                    UdpDnsRoute::from_nfqueue_mark(route.to_nfqueue_mark()),
+                    None
+                );
+            }
+        }
+        assert_eq!(UdpDnsRoute::direct(0, 0), None);
+        assert_eq!(UdpDnsRoute::direct(255, DNS_ROUTE_GENERATION_MAX + 1), None);
+        assert_eq!(UdpDnsRoute::new(2, 1).unwrap().direct_mark_index(), None);
     }
 }
 

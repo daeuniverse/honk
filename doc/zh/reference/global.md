@@ -11,7 +11,7 @@
 | `tproxy_port` | `tproxy_port` | `12345` | 同时写入用户态监听器和 eBPF 数据路径的 TCP/UDP 透明监听端口；修改后需重启。 |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关；当前运行时不读取该字段。 |
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0` | 套接字 mark 兼容值。校验会拒绝与数据路径保留 mark 位重叠的值，但当前运行时不会将其应用到套接字。 |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
 | `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为 `--debug`、`RUST_LOG`、该值。通过 SIGHUP 修改需重启。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
@@ -35,7 +35,7 @@
 | `tls_fragment_length` | `tls_fragment_length` | `""` | 分片长度范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | 分片间隔范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `mptcp` | `mptcp` | `false` | MPTCP 兼容开关；当前拨号路径不读取该字段。 |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 解析节点主机名和控制面拨号目标的 resolver，用于避免经 honk 递归拦截。空值使用普通 bootstrap 行为。 |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 使用带 mark 的 UDP/TCP 解析节点主机名和控制面拨号目标。为空或查询失败时先查 `/etc/hosts`，再向 `/etc/resolv.conf` 第一个数字 nameserver 发送带 mark 的 DNS；不调用 libc NSS 或追加搜索后缀。 |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | 回退 resolver 兼容值；当前运行时不读取该字段。 |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | 发送带宽提示兼容值，例如 `'200 mbps'`；当前运行时不读取该字段。 |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | 接收带宽提示兼容值；当前运行时不读取该字段。 |
@@ -53,6 +53,27 @@
 HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：IPv6 保留方括号，非默认端口不会省略。建立连接和处理 TLS 服务端名称时仍使用不带方括号的主机。
 
 请求路径和查询字符串保留配置中的原始点路径段和百分号编码。在构造请求前拒绝 authority 含多余斜杠、包含反斜杠或内嵌 ASCII 空白／控制字符的 URL；健康检查警告不回显被拒绝的 URL。
+
+## 套接字 mark
+
+`so_mark_from_dae: 0` 或省略该项时，保留历史实际 mark `0x100`。
+非零值会在 connect/send 之前原样应用，包括代理承载连接、bootstrap/DNS、
+健康检查。数据路径按配置值精确匹配旁路；仅含有 `0x100`
+这一位并不能免于拦截。透明监听套接字使用相同 mark 供内核识别；
+accept 得到的 TCP 客户端套接字会清除此 mark。独立 `dns.bind` 入口仍是
+普通的无 mark 本地服务。
+
+dae 全局标量保留 honk 既有的十六进制优先规则：`10` 与 `0x10` 都表示 16；
+格式错误或溢出文本会产生诊断，并回退到原始值 `0`，即实际 `0x100`。
+建议显式写 `0x`。这与[直连规则 mark](./routing.md#策略路由-mark) 不同：
+后者无前缀时按十进制解析，错误值直接拒绝配置。
+全局与规则 mark 校验均拒绝保留位 `0xc0000000`；全局 mark 还拒绝 TPROXY 位 `0x08000000`，daens 会把该位路由到其本地监听器。
+
+该值在启动网络 I/O 前确定，作用于整个进程；修改需要重启，不能通过 SIGHUP
+切换。非零直连规则 mark 会替换该直连流的全局策略路由有效位，而代理承载连接
+与 bootstrap 仍使用全局值。直连流还携带内部分类元数据；请使用
+[路由参考](./routing.md#策略路由-mark) 中带掩码的 IPv4/IPv6 `ip rule` 示例。
+honk 不负责安装用户的 WAN 策略路由表、路由、源地址规则或 NAT 配置。
 
 ## 重载健康检查与 TLS 模式
 

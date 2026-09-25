@@ -14,7 +14,7 @@
 
 启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
 
-1. 加载并校验配置、选择 `global.data_dir`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
+1. 加载并校验配置、选择 `global.data_dir`，在任何网络 I/O 前初始化进程旁路 mark，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
 2. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 3. 选择后端。真实模式取得 `/run/honk-core.lock`，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。Mock 模式不取得进程全局锁。
 4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
@@ -30,7 +30,7 @@
 
 ## 透明代理入口
 
-真实 TCP 和 UDP listener 在 `daens` 内创建，并设置透明 socket 选项和 `DAE_BYPASS_MARK` (`0x100`)。该 mark 使数据路径把它们识别为 honk 自己的 listener，而不是普通本地服务。已接受 TCP socket 会继承 mark，因此每个 accept loop 在处理流前将其清零。Mock listener 是宿主命名空间内不带特权透明选项的普通 socket。
+真实 TCP 和 UDP listener 在 `daens` 内创建，并设置透明 socket 选项和有效的 `global.so_mark_from_dae`（零值选择 `0x100`）。该 mark 使数据路径把它们识别为 honk 自己的 listener，而不是普通本地服务。已接受 TCP socket 会继承 mark，因此每个 accept loop 在处理流前将其清零。Mock listener 是宿主命名空间内不带特权透明选项的普通 socket。
 
 原始目的地址按下表恢复：
 
@@ -40,7 +40,7 @@
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | 透明 socket 的 `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | 下文所述的受约束 provenance 规则 |
 
-形成规范 tuple 后，普通非 DNS 流通过 `routing_handoff_take` 消费 `ROUTING_HANDOFF_MAP`。没有 handoff，或出站为 `ControlPlaneRouting` 时，回退到 `Router::route_with_must`。最终的 `must` 和 `block` 结果不能被 Clash mode 覆盖。
+形成规范 tuple 后，普通非 DNS 流通过 `routing_handoff_take` 消费 `ROUTING_HANDOFF_MAP`。没有 handoff，或出站为 `ControlPlaneRouting` 时，回退到 `Router::route_action`。最终的 `must` 和 `block` 结果不能被 Clash mode 覆盖。
 
 端口 53 的控制器与原始转发归属遵循[有序流量规则契约](../reference/routing.md#出站目标与-must)，包括畸形非 `must` UDP 的通用回退。
 
@@ -71,7 +71,7 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 3. 其他情况只有非 wildcard listener bind 可以提供目的地址。
 4. 缺失、畸形、重复、截断或未指定的元数据，会在 slow-path 预留或 payload 保留前被丢弃。
 
-UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP/53 随后按 Config → backend 读锁顺序，在一致快照下验证策略代际并固定语义分组名，再通过既有 epoch gate 预留和入队。同一 tuple 的不兼容普通/原始/其他分组报文被拒绝，而不是借用错误的 transport。非 `must` 有效 DNS 保留独立查询预算；UDP/53 不创建普通 UDP conn-state 或 decision token。重组后的分片通过 [NFQUEUE](./nfqueue.md#lan-dns-分片) 共用该准入，原包确认丢弃后才发布工作。
+UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP/53 按 Config → backend 读锁顺序验证；带 mark 的直连先取得 Router 读锁。在一致快照下校验策略代际，并固定语义分组或报文携带的不可变直连 mark 表项，再通过既有 epoch gate 预留和入队。同一 tuple 的不兼容普通/原始/其他分组/直连 mark 报文被拒绝，而不是借用错误的 transport。非 `must` 有效 DNS 保留独立查询预算；UDP/53 不创建普通 UDP conn-state 或 decision token。重组后的分片通过 [NFQUEUE](./nfqueue.md#lan-dns-分片) 共用该准入，原包确认丢弃后才发布工作。
 
 归控制器所有的畸形 UDP/53 可保留兼容的 controller handoff 事实用于通用路由，但会丢弃不兼容的终局原始 handoff 及其过期报文事实。
 
@@ -119,6 +119,7 @@ SOCKS5 UDP 在 endpoint 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制�
 回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket，并按 endpoint 缓存已接受的其他 full-cone 来源。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。
 
 Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 取消并排空 `Initializing` lease 及其保留资源，`Ready` endpoint 仍遵循既有生命周期。已有原始 UDP `Ready` 会话在语义分组名相同且符合该生命周期时可以保留，但 `Initializing` 不能跨 reload 存活。每次 retirement 和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
+编译后的流量计划成功变更，且旧策略或新策略包含直连 mark 时，才会退役直连 `Ready` endpoint，避免后续流量复用旧 socket mark；无变化、不相关重载，以及新旧策略均无直连 mark 的路由变更，都会保留这些端点。显式标记为用户态所有的 WAN UDP 决策（包括带 mark 的 `direct(must)`）会在 tuple/reader fence 下同时清理 token 为零的 conn state、handoff 与 redirect track；原生 LAN direct/offloaded 决策及更新的非零 token 保持不变。
 
 ## Queue 与描述符预算
 

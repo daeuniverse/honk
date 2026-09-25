@@ -1,6 +1,6 @@
 //! Transparent UDP provenance, bounded admission, and receive-loop dispatch.
 
-use super::udp_endpoint::DatagramPayload;
+use super::udp_endpoint::{DatagramPayload, RawDnsRoute};
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +40,7 @@ pub(super) enum UdpSlowPathWork {
     #[cfg(feature = "ebpf")]
     QueuedDatagram {
         data: Bytes,
-        raw_dns_group: Option<String>,
+        raw_dns_route: Option<RawDnsRoute>,
         expected_epoch: u64,
         enqueued_at: u32,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -98,7 +98,7 @@ pub(super) fn begin_udp_slow_path_at(
     src_addr: SocketAddr,
     original_dst: SocketAddr,
     data: &[u8],
-    raw_dns_group: Option<&str>,
+    raw_dns_route: Option<RawDnsRoute<&str>>,
     expected_epoch: u64,
     enqueued_at: u32,
 ) -> UdpSlowPathWork {
@@ -119,7 +119,7 @@ pub(super) fn begin_udp_slow_path_at(
         src_addr,
         original_dst,
         data,
-        raw_dns_group,
+        raw_dns_route,
         expected_epoch,
         permit,
         enqueued_at,
@@ -255,6 +255,12 @@ impl UdpLoopState {
         enqueued_at: u32,
     ) -> UdpSlowPathWork {
         let expected_epoch = self.udp_pool.initialization_epoch();
+        // Match reload's router -> config -> backend publication order.
+        let router = if route.direct_mark_index().is_some() {
+            Some(self.handle.router.read().await)
+        } else {
+            None
+        };
         let config = self.handle.config.read().await;
         let backend = self.handle.ebpf.read().await;
         if backend.routing_policy_generation() != u64::from(route.generation()) {
@@ -262,7 +268,13 @@ impl UdpLoopState {
                 "Dropping UDP/53 from a stale routing generation");
             return UdpSlowPathWork::Done;
         }
-        let raw_dns_group = if route.outbound() == OutboundIndex::ControlPlaneRouting as u8 {
+        let raw_dns_route = if let Some(index) = route.direct_mark_index() {
+            let Some(mark) = router.as_ref().and_then(|router| router.direct_mark(index)) else {
+                debug!(%src_addr, %original_dst, index, "Dropping UDP/53 with no direct mark owner");
+                return UdpSlowPathWork::Done;
+            };
+            Some(RawDnsRoute::Direct(mark))
+        } else if route.outbound() == OutboundIndex::ControlPlaneRouting as u8 {
             None
         } else {
             let Some(group) = route
@@ -274,7 +286,7 @@ impl UdpLoopState {
                     "Dropping UDP/53 with no current route owner");
                 return UdpSlowPathWork::Done;
             };
-            Some(group.name.as_str())
+            Some(RawDnsRoute::Group(group.name.as_str()))
         };
         drop(backend);
         if self.drain.should_reject() || !self.udp_pool.initialization_epoch_is(expected_epoch) {
@@ -284,7 +296,7 @@ impl UdpLoopState {
         if udp_ingress_excluded(src_addr, original_dst) {
             return UdpSlowPathWork::Done;
         }
-        let validated_dns = raw_dns_group
+        let validated_dns = raw_dns_route
             .is_none()
             .then(|| validate_exact_dns_query(data.as_slice()))
             .flatten();
@@ -298,7 +310,7 @@ impl UdpLoopState {
                 src_addr,
                 original_dst,
                 None,
-                raw_dns_group,
+                raw_dns_route,
                 Some(expected_epoch),
                 enqueued_at,
             ),
@@ -312,7 +324,7 @@ impl UdpLoopState {
                 // Ready endpoints can send immediately: retain privately until NF_DROP succeeds.
                 UdpSlowPathWork::QueuedDatagram {
                     data,
-                    raw_dns_group: raw_dns_group.map(str::to_owned),
+                    raw_dns_route: raw_dns_route.map(RawDnsRoute::into_owned),
                     expected_epoch,
                     enqueued_at,
                     permit,
@@ -330,7 +342,7 @@ impl UdpLoopState {
         src_addr: SocketAddr,
         original_dst: SocketAddr,
         validated_dns: Option<ValidatedDnsQuery>,
-        raw_dns_group: Option<&str>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
         expected_epoch: Option<u64>,
         enqueued_at: u32,
     ) -> UdpSlowPathWork {
@@ -347,7 +359,7 @@ impl UdpLoopState {
             src_addr,
             original_dst,
             validated_dns,
-            raw_dns_group,
+            raw_dns_route,
             enqueued_at,
         ) {
             return UdpSlowPathWork::Done;
@@ -360,7 +372,7 @@ impl UdpLoopState {
             src_addr,
             original_dst,
             data,
-            raw_dns_group,
+            raw_dns_route,
             expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch()),
             enqueued_at,
         )
@@ -377,7 +389,7 @@ impl UdpLoopState {
             #[cfg(feature = "ebpf")]
             UdpSlowPathWork::QueuedDatagram {
                 data,
-                raw_dns_group,
+                raw_dns_route,
                 expected_epoch,
                 enqueued_at,
                 permit,
@@ -393,7 +405,7 @@ impl UdpLoopState {
                         src_addr,
                         original_dst,
                         DatagramPayload::Owned(data),
-                        raw_dns_group.as_deref(),
+                        raw_dns_route.as_ref().map(RawDnsRoute::as_ref),
                         expected_epoch,
                         permit,
                         enqueued_at,
@@ -603,7 +615,7 @@ fn udp_fast_path_at(
     client_addr: SocketAddr,
     original_dst: SocketAddr,
     validated_dns: Option<ValidatedDnsQuery>,
-    raw_dns_group: Option<&str>,
+    raw_dns_route: Option<RawDnsRoute<&str>>,
     enqueued_at: u32,
 ) -> bool {
     if udp_ingress_excluded(client_addr, original_dst) {
@@ -616,7 +628,7 @@ fn udp_fast_path_at(
         client_addr,
         original_dst,
         data,
-        raw_dns_group,
+        raw_dns_route,
         enqueued_at,
         stats,
     ) else {

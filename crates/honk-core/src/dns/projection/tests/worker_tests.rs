@@ -271,7 +271,6 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
         let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
             &new.matcher,
             &std::collections::HashMap::from([("direct".to_owned(), 0)]),
-            "direct",
             honk_config::types::DialMode::Domain,
         )
         .unwrap();

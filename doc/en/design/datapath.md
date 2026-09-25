@@ -106,16 +106,18 @@ A changed link/address/route/interface role updates topology observations, clear
 | `BPF_STATS_MAP` | Five counters for UDP/TCP conn-state overflow and redirect, handoff, and cookie-map insertion failures. |
 | `EVENT_RINGBUF` | 262,144-byte ring buffer for fixed-layout blocked, conntrack-overflow, and UDP-token-exhaustion events. |
 | `UDP_DECISION_SEQUENCE` | Persistent one-slot pinned, spin-locked allocator state for NFQUEUE decision identities; protocol details live in [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_EPOCH` | One-slot grace-period selector for NFQUEUE decision work; see [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_INFLIGHT` | Two-slot per-CPU reader counts for NFQUEUE decision work; see [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_RETIRE_FENCE` | 65,536-entry tuple fence map used during NFQUEUE retirement; see [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_EPOCH` | One-slot grace-period selector for NFQUEUE decisions and WAN UDP ownership; see [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_INFLIGHT` | Two-slot per-CPU reader counts for those decision paths; see [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_RETIRE_FENCE` | 65,536-entry tuple fence map used during NFQUEUE and WAN userspace UDP retirement; see [NFQUEUE](./nfqueue.md). |
 
 Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in shared flow structures are IPv4-mapped IPv6 values in network byte order.
 
-`RoutingHandoffEntry` appends `routing_generation: u64` and is 56 bytes; `result` remains at offset 8 and the UDP decision token at offset 44. The generated-slot `RoutingInput`/`RoutingDecision`, `ConnState`, and `UDP_DECISION_SEQUENCE` ABIs are unchanged. Old explicit BPF objects and incompatible pinned handoff layouts are rejected before raw reads; `honk-tool` validates the layout too. Use matching core/tool/object versions, not a compatibility shim.
+`RoutingHandoffEntry` appends `routing_generation: u64` and is 56 bytes; `result` remains at offset 8 and the UDP decision token at offset 44. The generated-slot `RoutingInput`, `ConnState`, and `UDP_DECISION_SEQUENCE` ABIs are unchanged. Old explicit BPF objects and incompatible pinned handoff layouts are rejected before raw reads; `honk-tool` validates the layout too. Use matching core/tool/object versions, not a compatibility shim.
+
+`RoutingMeta` bit 58 explicitly marks WAN UDP userspace ownership without changing its layout. Marked WAN direct decisions need a userspace socket even with `must`; the bit distinguishes their retirement from native LAN direct/must and offloaded state. Unmarked native WAN UDP direct decisions instead carry bit 57 (`OFFLOAD`), preserving them against stale endpoint callbacks without changing forwarding. WAN UDP cached readers and conn/handoff/redirect writers participate in the shared reader epoch and reject a fenced tuple before touching its state.
 
 `crates/honk-ebpf-common/src/lib.rs` — shared marks and NFQUEUE token packing, `OutboundIndex`, `RoutingMeta`, `DaeParam`, and `OutboundStatsCounters`/map constants.
-`crates/honk-ebpf-common/src/routing_policy.rs` — fixed `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI (128/20/24 bytes), feature bits, and process-name normalization limits.
+`crates/honk-ebpf-common/src/routing_policy.rs` — fixed `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI (128/24/24 bytes), feature bits, and process-name normalization limits. `RoutingDecision` includes a direct-mark index (`u32::MAX` when absent); the loader rejects older external objects by checking the slot's BTF output layout.
 `crates/honk-ebpf-common/src/redirect_need.rs` — `TuplesKey`, `Tuples`, token-carrying `RoutingResult`/`RoutingHandoffEntry`, 256-bit `DomainRouting`, and `PIDName`.
 `crates/honk-ebpf-common/src/conn.rs` — `ConnState` (including `UdpDecisionState` and `decision_token`), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, and `TcpState`.
 `crates/honk-ebpf/src/maps.rs` — static TC map declarations and their kernel-side capacities.
@@ -128,14 +130,16 @@ Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in sha
 | Constant | Value | Meaning |
 | --- | --- | --- |
 | `TPROXY_MARK` | `0x08000000` | Selects the `daens` table-100 local-delivery route and tags redirected packets for listener delivery. `global.tproxy_mark` must equal this compiled value. |
-| `DAE_BYPASS_MARK` | `0x00000100` | Marks honk's own dials, probes, DNS upstreams, QUIC sockets, and transparent listeners so WAN egress does not intercept them. |
+| `DAE_BYPASS_MARK` | `0x00000100` | Default when `global.so_mark_from_dae` is zero; otherwise honk sockets and listener recognition use the configured value exactly. |
 | `CLASSIFIED_MARK` | `0x40000000` | Prevents a packet attached at both bridge master and slave from being classified twice; also marks final direct verdicts. |
 | `NFQUEUE_PENDING_MARK` | `0x80000000` | Identifies traffic that must be held before conntrack/NAT; a valid staged mark also carries `CLASSIFIED_MARK` and a nonzero token. |
 | `NFQUEUE_TOKEN_MASK` | `0x3fffffff` | Selects the low 30 skb-mark bits that carry a decision token on NFQUEUE-staged packets. |
 
 `SKB_MARK_RESERVED_MASK` is `0xc0000000`, the union of `CLASSIFIED_MARK` and `NFQUEUE_PENDING_MARK`. Configuration validation rejects `global.so_mark_from_dae` and routing-rule marks that overlap those bits. NFQUEUE direct completion repeats the same check before accepting a rule mark.
 
-Real transparent UDP53 uses `SO_RCVMARK` and per-packet `SOL_SOCKET`/`SO_MARK` ancillary data for DNS/raw ownership, not a tuple handoff. The same skb carries the route code and nonwrapping 20-bit committed routing generation through `cb[2]` across link scrub; mandatory `dae0peer` TC restores it. The internal carrier signature mask is `0xc8000100` and variable carrier bits are `0x37fffeff`. Owned `daens` fwmark routing ignores only those variable bits. User routing-mark reservations are unchanged.
+Final marked direct packets carry `rule_mark | CLASSIFIED_MARK`, including native LAN, NFQUEUE acceptance and userspace TCP/UDP sockets. Match only user-owned bits in Linux policy rules: `fwmark 0x200/0x3fffffff`. WAN egress bypasses the exact nonzero configured socket mark or a classified mark without `NFQUEUE_PENDING_MARK`; merely containing bit `0x100` is not a bypass. Host-originated nonzero direct marks are sent through userspace, since changing an skb mark at WAN TC is too late for the original Linux route lookup.
+
+Real transparent UDP53 uses `SO_RCVMARK` and per-packet `SOL_SOCKET`/`SO_MARK` ancillary data for DNS/raw ownership. The same skb carries the route code and nonwrapping 20-bit committed routing generation through `cb[2]` across link scrub; mandatory `dae0peer` TC restores it. The signature mask is `0xc8000000` and variable carrier bits are `0x37ffffff`. Bit `0x100` selects an immutable direct-mark index instead of an outbound code; the 8-bit index resolves through the active Router's sorted mark table. Owned `daens` fwmark routing ignores these variable bits. User mark reservations and `UDP_DECISION_SEQUENCE` remain unchanged. Raw direct/group ownership never takes authority from a mutable tuple handoff.
 
 For non-DNS traffic, local-socket probing distinguishes honk's transparent listeners from ordinary local services by comparing the full socket mark with `PARAM.dae_socket_mark`. Host-namespace `dns.bind` sockets are ordinary unmarked listeners, but their presence does not bypass LAN port-53 policy.
 

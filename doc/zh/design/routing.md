@@ -64,7 +64,7 @@ LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，
 ### 源码组织
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  用户态 `Router`、按优先级排序的编译规则、`route_with_must`、`GeositeMatcher`
+  用户态 `Router`、按优先级排序的编译规则、`route_action`、`GeositeMatcher`
   以及 `BinaryLpmTrie`/Geo 资源辅助代码。`geo.rs` 在每次构建 `Router` 时只解析
   一次 `geoip.dat`/`geosite.dat`，且只解码被引用的类别。`category@attr` 在首个
   `@` 处分隔，并以不区分大小写的方式筛选属性键。
@@ -158,6 +158,9 @@ mask 共享 scalar id；若直接把 mask 寄存器存进去，二者被关联�
 时两份策略为 53,741 与 100,645 条处理指令，接近规则入口无条件解析；常数 mask 上只改
 `jset` 没有变化。运行时每处事实使用都在解析完成之后。这些是 Linux 6.12.107 的测量；
 若 verifier 能沿存储追踪内存内容，mask 会重新变成常数。
+由于 mask 从 `mark` 读回，入口从不向该字段写入配置值。带 mark 或 `must` 的 fallback
+只在全部规则都失败后到达的 fallback 出口写入 mark、`must` 与直连 mark 索引；普通
+fallback 不增加写入。
 
 这样做是为了 verifier。指针的类型取决于 lookup 结果，verifier 不会把 NULL 和
 map 指针合并成一个状态，于是跨越后续规则仍然存活的事实指针，会让它后面所有指令的

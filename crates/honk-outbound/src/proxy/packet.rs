@@ -326,3 +326,6 @@ impl PacketTransport for UdpSocketTransport {
         self.socket.recv_from(buf).await
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod socket_mark_tests;

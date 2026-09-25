@@ -2,10 +2,32 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 const EINPROGRESS: i32 = libc::EINPROGRESS;
+
+static BYPASS_MARK: OnceLock<u32> = OnceLock::new();
+
+/// Process-wide mark for originated sockets; initialize before startup network I/O.
+pub fn init_bypass_mark(mark: u32) -> io::Result<()> {
+    if *BYPASS_MARK.get_or_init(|| mark) != mark {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "socket bypass mark is already initialized to a different value",
+        ));
+    }
+    Ok(())
+}
+
+/// Effective process mark, retaining the legacy default for standalone users.
+pub fn bypass_mark() -> u32 {
+    BYPASS_MARK
+        .get()
+        .copied()
+        .unwrap_or(honk_ebpf_common::DAE_BYPASS_MARK)
+}
 
 /// Set `SO_MARK` best-effort. In production honk runs as root (eBPF load
 /// requires it) so the mark always applies; unprivileged environments (CI,
@@ -139,12 +161,7 @@ pub async fn connect_marked(
 
 /// Connect to a proxy server from the control plane, bypassing eBPF re-routing.
 pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Result<TcpStream> {
-    connect_marked(
-        addr,
-        Some(honk_ebpf_common::DAE_BYPASS_MARK),
-        connect_timeout,
-    )
-    .await
+    connect_marked(addr, Some(bypass_mark()), connect_timeout).await
 }
 
 /// Bind a UDP socket with `SO_MARK` set so the local eBPF datapath treats it
@@ -154,6 +171,13 @@ pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Resu
 /// classify and redirect the packets back into daens, creating a loop.
 /// Single bypass-mark implementation shared with `quic::marked_udp_socket`.
 pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    marked_udp_socket_with_mark(bind_addr, bypass_mark())
+}
+
+pub(crate) fn marked_udp_socket_with_mark(
+    bind_addr: SocketAddr,
+    mark: u32,
+) -> io::Result<std::net::UdpSocket> {
     let domain = if bind_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -162,7 +186,7 @@ pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocke
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
-    set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+    set_mark_best_effort(&socket, mark)?;
     // QUIC throughput is buffer-bound: the default 208 KiB rmem caps a
     // ~1ms-RTT path at ~2 Gbps (quic-go sets ~7 MiB and lands dae at ~3
     // Gbps). Request 8 MiB; the kernel clamps to 2×rmem_max, and honk-core

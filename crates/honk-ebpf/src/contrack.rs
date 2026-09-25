@@ -486,6 +486,7 @@ fn __mark_udp_seen(
     key: *const TuplesKey,
     is_wan_ingress_direction: u8,
     args: *const ConntrackArgs,
+    routing_meta_flags: u64,
 ) -> *mut ConnState {
     let key = unsafe { &*key };
     let args = unsafe { &*args };
@@ -494,7 +495,8 @@ fn __mark_udp_seen(
     if let Some(state) = lookup_udp_seen_at(key, now) {
         // Update routing only when the caller publishes a complete decision.
         if args.has_routing() {
-            let meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
+            let mut meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
+            unsafe { meta.raw |= routing_meta_flags };
             if args.has_mac() {
                 state.mac.copy_from_slice(&args.mac);
             }
@@ -517,6 +519,7 @@ fn __mark_udp_seen(
 
     if has_rt {
         new_state.meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
+        unsafe { new_state.meta.raw |= routing_meta_flags };
         if args.has_mac() {
             new_state.mac.copy_from_slice(&args.mac);
         }
@@ -567,6 +570,7 @@ pub fn mark_udp_seen(
     dscp: u8,
     pname: Option<&[u8; 16]>,
     pid: u32,
+    routing_meta_flags: u64,
 ) -> Option<&'static mut ConnState> {
     let zero: u32 = 0;
     let args = unsafe { CONNTRACK_ARGS_MAP.get_ptr_mut(zero).map(|ptr| &mut *ptr)? };
@@ -580,7 +584,12 @@ pub fn mark_udp_seen(
     args.set(dscp, pid, routing, mac, pname);
     let key_ptr: *const TuplesKey = key;
     let args_ptr: *const ConntrackArgs = args;
-    let result = __mark_udp_seen(key_ptr, is_wan_ingress_direction, args_ptr);
+    let result = __mark_udp_seen(
+        key_ptr,
+        is_wan_ingress_direction,
+        args_ptr,
+        routing_meta_flags,
+    );
     if result.is_null() {
         None
     } else {

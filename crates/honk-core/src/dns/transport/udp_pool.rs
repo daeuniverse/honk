@@ -11,7 +11,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use honk_ebpf_common::DAE_BYPASS_MARK;
 use honk_outbound::SharedError;
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
@@ -101,7 +100,7 @@ impl UdpPool {
         let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
         socket.set_nonblocking(true)?;
         #[cfg(target_os = "linux")]
-        honk_outbound::util::set_mark_best_effort(&socket, DAE_BYPASS_MARK)?;
+        honk_outbound::util::set_mark_best_effort(&socket, honk_outbound::util::bypass_mark())?;
         #[cfg(target_os = "linux")]
         error_queue::enable(&socket, address.is_ipv6())?;
         let unspecified = if address.is_ipv4() {

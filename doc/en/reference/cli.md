@@ -75,7 +75,7 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 | eBPF object | Embedded object or `--bpf-object PATH` | With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`; the option replaces those bytes at runtime. Builds without `ebpf` use the mock backend. |
 | Kernel BTF | `HONK_VMLINUX_BTF` or common-path search | Used only to resolve `pname` kernel-field offsets. Without an override, honk tries `/sys/kernel/btf/vmlinux` followed by `/usr/lib/debug/boot/vmlinux`. |
 | Pin root | `--bpf-pin-root PATH` | Defaults to `/sys/fs/bpf` and is passed to the real backend for pinned maps. |
-| Bypass mark | Compiled constant | `DAE_BYPASS_MARK = 0x100`; control-plane dials, probes, and DNS upstream sockets use it to avoid re-interception. |
+| Bypass mark | `global.so_mark_from_dae` | Exact socket mark for dials, probes and DNS; zero selects the default `0x100`. Changes require restart. See [socket marks](./global.md#socket-marks). |
 | TPROXY mark | Compiled constant plus validated config | `TPROXY_MARK = 0x08000000`; `global.tproxy_mark` must equal this value. |
 | Geo assets | Runtime path search | `DAE_LOCATION_ASSET` first, then `global.data_dir`, legacy `/var/share/honk`, the working directory, `/usr/local/share/honk`, `/usr/share/honk`, `/usr/local/share/dae`, `/usr/share/dae`, and `/etc/dae`; each candidate must be a regular file. See the [global configuration reference](./global.md). |
 

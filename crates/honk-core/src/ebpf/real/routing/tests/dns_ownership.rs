@@ -164,7 +164,7 @@ fn fixture_param() -> DaeParam {
 
 fn compile(rules: &[honk_config::routing::RoutingRule]) -> RoutingPushPlan {
     let router = Router::new(rules, "direct").unwrap();
-    RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap()
+    RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap()
 }
 
 fn publish(
@@ -177,6 +177,9 @@ fn publish(
     let listeners = TproxyListeners::new();
     listeners.publish(&mut backend).unwrap();
     backend.set_datapath_ready(true).unwrap();
+    for key in 0..6 {
+        set_array(&mut backend, "OUTBOUND_CONNECTIVITY_MAP", key, 1u64);
+    }
     for key in 2 * 6..3 * 6 {
         set_array(&mut backend, "OUTBOUND_CONNECTIVITY_MAP", key, 1u64);
     }
@@ -426,7 +429,7 @@ fn dns_ordering_rules() -> Vec<honk_config::routing::RoutingRule> {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
-fn dns_direct_must_is_native_for_v4_v6_tcp_udp_and_cached_tcp() {
+fn dns_direct_must_marks_keep_lan_native_and_reroute_wan_v4_v6_tcp_udp() {
     isolated(|| {
         let destinations = [
             (IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53)), 0),
@@ -457,7 +460,13 @@ fn dns_direct_must_is_native_for_v4_v6_tcp_udp_and_cached_tcp() {
                     }
                     IpAddr::V6(_) => format!("2001:db9::{:x}", index + 2).parse().unwrap(),
                 };
-                let expected_mark = if wan { mark } else { mark | CLASSIFIED_MARK };
+                let redirected = wan && mark != 0;
+                let expected_verdict = if redirected {
+                    TC_ACT_REDIRECT
+                } else {
+                    TC_ACT_OK
+                };
+                let expected_mark = if wan { 0 } else { mark | CLASSIFIED_MARK };
                 let before_conn = hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
                 let before_handoff =
                     hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
@@ -472,7 +481,10 @@ fn dns_direct_must_is_native_for_v4_v6_tcp_udp_and_cached_tcp() {
                     0,
                 );
                 let udp_run = run(&backend, side, &udp, SkbInput::default());
-                assert_eq!(udp_run.verdict, TC_ACT_OK, "{side} UDP {destination}");
+                assert_eq!(
+                    udp_run.verdict, expected_verdict,
+                    "{side} UDP {destination}"
+                );
                 assert_eq!(udp_run.mark, expected_mark, "{side} UDP {destination}");
                 assert_eq!(
                     hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
@@ -482,12 +494,18 @@ fn dns_direct_must_is_native_for_v4_v6_tcp_udp_and_cached_tcp() {
                 assert_eq!(
                     hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
                     before_handoff,
-                    "native DNS UDP must not publish a handoff"
+                    "must DNS UDP ownership is per-packet, never a tuple handoff"
                 );
                 assert_eq!(
                     backend.udp_decision_sequence_status().unwrap(),
                     before_sequence
                 );
+                if redirected {
+                    assert_eq!(
+                        UdpDnsRoute::from_mark(udp_run.cb[2]),
+                        UdpDnsRoute::direct(0, backend.routing_policy_generation())
+                    );
+                }
 
                 let source_port = 41000 + index as u16 + (wan as u16) * 100;
                 let syn = packet(source, destination, IPPROTO_TCP, source_port, 53, 0, 0x02);
@@ -495,7 +513,7 @@ fn dns_direct_must_is_native_for_v4_v6_tcp_udp_and_cached_tcp() {
                 for (phase, packet) in [("SYN", syn), ("following", following)] {
                     let tcp_run = run(&backend, side, &packet, SkbInput::default());
                     assert_eq!(
-                        tcp_run.verdict, TC_ACT_OK,
+                        tcp_run.verdict, expected_verdict,
                         "{side} TCP {phase} {destination}"
                     );
                     assert_eq!(

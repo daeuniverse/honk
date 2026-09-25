@@ -149,6 +149,30 @@ impl DatagramPayload<'_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::control) enum RawDnsRoute<S = Arc<str>> {
+    Group(S),
+    Direct(u32),
+}
+
+impl<S: AsRef<str>> RawDnsRoute<S> {
+    pub(in crate::control) fn as_ref(&self) -> RawDnsRoute<&str> {
+        match self {
+            Self::Group(name) => RawDnsRoute::Group(name.as_ref()),
+            Self::Direct(mark) => RawDnsRoute::Direct(*mark),
+        }
+    }
+}
+
+impl RawDnsRoute<&str> {
+    pub(in crate::control) fn into_owned(self) -> RawDnsRoute {
+        match self {
+            Self::Group(name) => RawDnsRoute::Group(Arc::from(name)),
+            Self::Direct(mark) => RawDnsRoute::Direct(mark),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketAdmissionError {
     FlowQueueFull,
     GlobalPayloadFull,
@@ -157,7 +181,7 @@ pub(super) struct InitializingEndpoint {
     pub(super) decision_token: u32,
     pub(super) generation: u64,
     pub(super) epoch: u64,
-    pub(super) raw_dns_group: Option<Arc<str>>,
+    pub(super) raw_dns_route: Option<RawDnsRoute>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
     pub(super) flow_slots: Arc<Semaphore>,
@@ -227,7 +251,7 @@ impl InitializingEndpoint {
 pub(super) struct ReadyEndpoint {
     pub(super) decision_token: u32,
     pub(super) generation: u64,
-    pub(super) raw_dns_group: Option<Arc<str>>,
+    pub(super) raw_dns_route: Option<RawDnsRoute>,
     pub(super) endpoint: Arc<UdpEndpoint>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) flow_slots: Arc<Semaphore>,
@@ -333,8 +357,8 @@ impl UdpInitLease {
         self.decision_token
     }
 
-    pub(in crate::control) fn raw_dns_group(&self) -> Option<Arc<str>> {
-        self.initializer.raw_dns_group.clone()
+    pub(in crate::control) fn raw_dns_route(&self) -> Option<RawDnsRoute> {
+        self.initializer.raw_dns_route.clone()
     }
 
     #[cfg(test)]
@@ -497,7 +521,7 @@ impl UdpInitLease {
             _endpoint_permit: endpoint_permit,
             _connection_guard: self.connection_guard.take(),
             alive: AtomicBool::new(true),
-            raw_dns_group: initializing.raw_dns_group.clone(),
+            raw_dns_route: initializing.raw_dns_route.clone(),
         })));
         self.committed = true;
         true
@@ -709,7 +733,7 @@ impl UdpEndpointPool {
         vacant: dashmap::mapref::entry::VacantEntry<'_, EndpointKey, EndpointEntry>,
         data: DatagramPayload<'_>,
         decision_token: u32,
-        raw_dns_group: Option<&str>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
         expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
@@ -745,7 +769,7 @@ impl UdpEndpointPool {
                 return EndpointReservation::QueueFull;
             }
         };
-        let raw_dns_group = raw_dns_group.map(Arc::<str>::from);
+        let raw_dns_route = raw_dns_route.map(RawDnsRoute::into_owned);
         let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let epoch_gate = self.initialization_epoch.lock();
@@ -758,7 +782,7 @@ impl UdpEndpointPool {
             decision_token,
             generation,
             epoch,
-            raw_dns_group,
+            raw_dns_route,
             queue_tx,
             queue_rx: Mutex::new(Some(queue_rx)),
             flow_slots,
@@ -818,7 +842,7 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: &[u8],
-        raw_dns_group: Option<&str>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
         expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
@@ -828,7 +852,7 @@ impl UdpEndpointPool {
             client,
             dst,
             DatagramPayload::Borrowed(data),
-            raw_dns_group,
+            raw_dns_route,
             expected_epoch,
             slow_permit,
             enqueued_at,
@@ -842,7 +866,7 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: DatagramPayload<'_>,
-        raw_dns_group: Option<&str>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
         expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
@@ -858,7 +882,9 @@ impl UdpEndpointPool {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
                     let (stale_token, stale_generation) = match occupied.get() {
                         EndpointEntry::Initializing(initializing) => {
-                            if initializing.raw_dns_group.as_deref() != raw_dns_group {
+                            if initializing.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
+                                != raw_dns_route
+                            {
                                 return EndpointReservation::IdentityMismatch;
                             }
                             let epoch_gate = self.initialization_epoch.lock();
@@ -885,7 +911,9 @@ impl UdpEndpointPool {
                             if ready.alive.load(Ordering::Acquire)
                                 && !ready.endpoint.dead.load(Ordering::Acquire) =>
                         {
-                            if ready.raw_dns_group.as_deref() != raw_dns_group {
+                            if ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
+                                != raw_dns_route
+                            {
                                 return EndpointReservation::IdentityMismatch;
                             }
                             match self.enqueue_at(
@@ -915,7 +943,7 @@ impl UdpEndpointPool {
                         vacant,
                         data,
                         0,
-                        raw_dns_group,
+                        raw_dns_route,
                         expected_epoch,
                         slow_permit,
                         enqueued_at,
@@ -1146,7 +1174,7 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: &[u8],
-        raw_dns_group: Option<&str>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
         enqueued_at: u32,
         stats: &StatsManager,
     ) -> Option<EndpointReservation> {
@@ -1162,7 +1190,7 @@ impl UdpEndpointPool {
                 if ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
-                if ready.raw_dns_group.as_deref() != raw_dns_group {
+                if ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref) != raw_dns_route {
                     return Some(EndpointReservation::IdentityMismatch);
                 }
                 (

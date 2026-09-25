@@ -62,7 +62,7 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     if transparent {
         set_ip_transparent(&socket, addr.is_ipv6())?;
         // Accepted sockets inherit the listener mark; the accept loop clears it.
-        set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+        set_so_mark(&socket, honk_outbound::util::bypass_mark())?;
     }
     #[cfg(not(target_os = "linux"))]
     let _ = transparent;
@@ -82,10 +82,7 @@ pub(super) fn set_so_mark_zero(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
     set_so_mark(fd, 0)
 }
 
-/// Set SO_MARK on a socket. TPROXY listeners carry `DAE_BYPASS_MARK` so the
-/// eBPF NAT-loopback probe (`bpf_sock_is_dae_socket`, which compares against
-/// `PARAM.dae_socket_mark`) recognizes them as proxy-engine sockets instead
-/// of misreading them as local services to pass through.
+/// Set SO_MARK, including the configured bypass identity on TPROXY listeners.
 #[cfg(target_os = "linux")]
 pub(super) fn set_so_mark(fd: &impl std::os::fd::AsFd, mark: u32) -> io::Result<()> {
     nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &mark)
@@ -191,7 +188,7 @@ fn build_tproxy_udp(
                 )
                 .map_err(io::Error::from)?;
             }
-            set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+            set_so_mark(&socket, honk_outbound::util::bypass_mark())?;
         }
         if addr.is_ipv4() {
             nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)

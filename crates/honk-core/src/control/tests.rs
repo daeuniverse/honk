@@ -609,6 +609,86 @@ async fn ready_udp_endpoint(
     endpoint
 }
 
+#[tokio::test]
+async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserves_them() {
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "direct".into();
+    let mut plane = control_plane(config.clone());
+    plane.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+        8,
+        Arc::new(support::UdpTestReplySocketFactory),
+    ));
+    let handle = plane.spawn_handle();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = server.local_addr().unwrap();
+    let client = addr("10.0.0.2:53000");
+    serve_test_udp_to(&handle, client, target, b"first")
+        .await
+        .unwrap();
+    let mut packet = [0; 32];
+    let (len, source) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&packet[..len], b"first");
+    let first = plane.udp_pool.get(client, target).unwrap();
+    assert!(
+        plane
+            .reload_runtime_config(config.clone(), Default::default())
+            .await
+    );
+    config.global.check_tolerance_ms += 1;
+    assert!(
+        plane
+            .reload_runtime_config(config.clone(), Default::default())
+            .await
+    );
+    serve_test_udp_to(&handle, client, target, b"same socket")
+        .await
+        .unwrap();
+    let (len, same_source) =
+        tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(&packet[..len], b"same socket");
+    assert_eq!(source, same_source);
+
+    config
+        .routing
+        .rules
+        .push(honk_config::routing::RoutingRule {
+            name: "marked-direct".into(),
+            condition: Default::default(),
+            outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0x321,
+        });
+    assert!(
+        plane
+            .reload_runtime_config(config, Default::default())
+            .await
+    );
+    assert!(plane.udp_pool.get(client, target).is_none());
+    serve_test_udp_to(&handle, client, target, b"new mark")
+        .await
+        .unwrap();
+    let (len, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&packet[..len], b"new mark");
+    assert!(!Arc::ptr_eq(
+        &first,
+        &plane.udp_pool.get(client, target).unwrap()
+    ));
+    assert!(plane.udp_pool.shutdown().await);
+}
+
 #[test]
 fn udp_original_dst_exact_dns_predicate_matches_controller_condition() {
     // Real query: consumed by the DNS controller.
@@ -1796,7 +1876,7 @@ async fn tcp_dns_write_error_is_returned_without_tcp_fallthrough() -> anyhow::Re
         RoutingHandoffEntry {
             result: RoutingResult {
                 outbound: OutboundIndex::Direct as u8,
-                mark: DAE_BYPASS_MARK,
+                mark: 0x321,
                 ..Default::default()
             },
             routing_generation: 0,
@@ -1852,10 +1932,11 @@ async fn tcp_dns_write_error_is_returned_without_tcp_fallthrough() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn tcp_ebpf_direct_offload_skips_dial_and_balances_stats() -> anyhow::Result<()> {
+async fn tcp_marked_direct_handoff_relays_and_balances_stats() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let original_dst = listener.local_addr()?;
-    let client = TcpStream::connect(original_dst).await?;
+    let mut client = TcpStream::connect(original_dst).await?;
     let (accepted, client_addr) = listener.accept().await?;
     let tuples = build_tuples_key(
         original_dst.ip(),
@@ -1879,7 +1960,7 @@ async fn tcp_ebpf_direct_offload_skips_dial_and_balances_stats() -> anyhow::Resu
         RoutingHandoffEntry {
             result: RoutingResult {
                 outbound: OutboundIndex::Direct as u8,
-                mark: DAE_BYPASS_MARK,
+                mark: 0x321,
                 ..Default::default()
             },
             routing_generation: 0,
@@ -1904,19 +1985,28 @@ async fn tcp_ebpf_direct_offload_skips_dial_and_balances_stats() -> anyhow::Resu
     let task_handle = handle.clone();
     let task =
         tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
-    task.await??;
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err()
-    );
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(2), listener.accept()).await??;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        client.write_all(b"request").await?;
+        let mut request = [0; 7];
+        upstream.read_exact(&mut request).await?;
+        assert_eq!(&request, b"request");
+        upstream.write_all(b"response").await?;
+        let mut response = [0; 8];
+        client.read_exact(&mut response).await?;
+        assert_eq!(&response, b"response");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(2), task).await???;
     let mut stats = handle.stats.snapshot();
     let direct = stats.remove("direct").expect("direct stats");
     assert_eq!(direct.total_conns, 1);
     assert_eq!(direct.active_conns, 0);
     assert!(handle.connection_tracker.snapshot().is_empty());
-    drop(client);
     Ok(())
 }
 

@@ -675,3 +675,117 @@ async fn queued_dns_config_wait_obeys_receipt_deadline_and_admission_drain() {
     assert!(state.udp_pool.shutdown().await);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn direct_dns_carrier_pins_packet_mark_not_latest_tuple_handoff() {
+    use crate::control::udp_endpoint::{DatagramPayload, RawDnsRoute};
+    use crate::control::udp_ingress::{UdpLoopState, UdpSlowPathWork};
+
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    config.routing.rules = [("8", 0x200), ("16", 0x300)]
+        .into_iter()
+        .map(|(dscp, mark)| RoutingRule {
+            name: format!("mark-{mark}"),
+            condition: RoutingCondition {
+                dscp: vec![dscp.into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: true,
+            mark,
+        })
+        .collect();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let client = super::addr("10.0.0.23:53000");
+    let target = super::addr("203.0.113.53:53");
+    let tuples = build_tuples_key(target.ip(), target.port(), client.ip(), client.port(), 17);
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let key: [u8; 40] = super::bytes_of(&tuples).try_into().unwrap();
+    backend.routing_handoffs.lock().insert(
+        key,
+        RoutingHandoffEntry {
+            routing_generation: backend.routing_policy_generation() + 1,
+            result: RoutingResult {
+                outbound: OutboundIndex::Direct as u8,
+                must: 1,
+                mark: 0x300,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let plane = ControlPlane::new(
+        config,
+        Box::new(backend),
+        router,
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        super::support::udp_test_forwarder(),
+    )
+    .unwrap();
+    let state = UdpLoopState::new(&plane, true);
+    let generation = state.handle.ebpf.read().await.routing_policy_generation();
+    let first = UdpDnsRoute::direct(0, generation).unwrap();
+    let second = UdpDnsRoute::direct(1, generation).unwrap();
+    let UdpSlowPathWork::Initialize(lease) = state
+        .admit_routed_dns_at(
+            DatagramPayload::Borrowed(b"first"),
+            client,
+            target,
+            first,
+            udp_endpoint::queue_now(),
+        )
+        .await
+    else {
+        panic!("first direct carrier must admit its packet");
+    };
+    assert_eq!(lease.raw_dns_route(), Some(RawDnsRoute::Direct(0x200)));
+    assert!(matches!(
+        state
+            .admit_routed_dns_at(
+                DatagramPayload::Borrowed(b"different mark"),
+                client,
+                target,
+                second,
+                udp_endpoint::queue_now(),
+            )
+            .await,
+        UdpSlowPathWork::Done
+    ));
+    assert_eq!(lease.raw_dns_route(), Some(RawDnsRoute::Direct(0x200)));
+    drop(lease);
+    let UdpSlowPathWork::Initialize(lease) = state
+        .admit_routed_dns_at(
+            DatagramPayload::Borrowed(b"next flow"),
+            client,
+            target,
+            second,
+            udp_endpoint::queue_now(),
+        )
+        .await
+    else {
+        panic!("retired tuple must accept its next direct owner");
+    };
+    assert_eq!(lease.raw_dns_route(), Some(RawDnsRoute::Direct(0x300)));
+    drop(lease);
+    for invalid in [
+        UdpDnsRoute::direct(2, generation).unwrap(),
+        UdpDnsRoute::direct(0, generation + 1).unwrap(),
+    ] {
+        assert!(matches!(
+            state
+                .admit_routed_dns_at(
+                    DatagramPayload::Borrowed(b"invalid"),
+                    client,
+                    target,
+                    invalid,
+                    udp_endpoint::queue_now(),
+                )
+                .await,
+            UdpSlowPathWork::Done
+        ));
+    }
+}

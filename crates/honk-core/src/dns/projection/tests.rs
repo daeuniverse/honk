@@ -486,7 +486,6 @@ fn backend_for_test(snapshot: &RoutingProjectionSnapshot) -> MockEbpfBackend {
     let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
         &snapshot.matcher,
         &std::collections::HashMap::from([("direct".to_owned(), 0)]),
-        "direct",
         honk_config::types::DialMode::Domain,
     )
     .unwrap();

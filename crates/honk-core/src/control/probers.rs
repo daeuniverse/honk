@@ -720,9 +720,13 @@ pub(super) async fn resolve_udp_check_target(
                 }
                 Err(_) => Vec::new(),
             },
-            None => tokio::net::lookup_host((host, port))
+            None => honk_outbound::bootstrap::resolve(host)
                 .await
-                .map(|it| it.collect())
+                .map(|ips| {
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         if let Some(addr) = addrs.into_iter().next() {
@@ -774,9 +778,13 @@ pub(super) async fn resolve_quic_score_target(
                     return Ok(None);
                 }
             },
-            None => tokio::net::lookup_host((host.as_str(), port))
+            None => honk_outbound::bootstrap::resolve(&host)
                 .await
-                .map(|addrs| addrs.collect())
+                .map(|ips| {
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     };

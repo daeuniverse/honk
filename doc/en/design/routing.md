@@ -76,7 +76,7 @@ predicate ID within one policy.
 ### Source organization
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  userspace `Router`, priority-ordered compiled routes, `route_with_must`,
+  userspace `Router`, priority-ordered compiled routes, `route_action`,
   `GeositeMatcher`, and the `BinaryLpmTrie`/geo-asset helpers. `geo.rs` parses
   `geoip.dat`/`geosite.dat` once per `Router` build and decodes only referenced
   codes; `category@attr` splits at the first `@` and filters attribute keys
@@ -203,6 +203,10 @@ rule-entry resolution; `jset` alone on a constant mask changes nothing. At
 runtime every fact use follows a completed resolution. These are measurements
 of Linux 6.12.107; a verifier that tracked memory contents through the store
 would make the mask a constant again.
+Because the mask is loaded from `mark`, the prologue never writes a configured
+value there. A marked or `must` fallback stores its mark, `must` and direct-mark
+index only on the fallback exit reached after every rule; a plain fallback adds
+no stores.
 
 The verifier is why. A pointer's type depends on the lookup outcome, and the
 verifier never merges a NULL with a map pointer, so a fact pointer kept live
