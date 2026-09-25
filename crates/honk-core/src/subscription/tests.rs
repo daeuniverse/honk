@@ -325,6 +325,100 @@ fn test_parse_subscription_skips_proxy_plugins() {
 }
 
 #[tokio::test]
+async fn subscription_redirects_retain_same_origin_auth_and_strip_it_permanently() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    let other_address = other.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let hops = [
+            (
+                &origin,
+                "/start",
+                Some(format!("http://{address}/same")),
+                true,
+            ),
+            (
+                &origin,
+                "/same",
+                Some(format!("http://{address}/again")),
+                true,
+            ),
+            (
+                &origin,
+                "/again",
+                Some(format!("http://{other_address}/cross")),
+                true,
+            ),
+            (&other, "/cross", Some("/still-cross".into()), false),
+            (
+                &other,
+                "/still-cross",
+                Some(format!("http://us%40er:p%3Ass@{address}/back")),
+                false,
+            ),
+            (&origin, "/back", None, false),
+        ];
+        for (listener, path, location, authenticated) in hops {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 256];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+            let authorization = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim())
+            });
+            let expected = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("us@er:p:ss")
+            );
+            assert_eq!(
+                authorization,
+                authenticated.then_some(expected.as_str()),
+                "{path}"
+            );
+            assert!(!request.contains("us%40er") && !request.contains("p%3Ass"));
+            assert!(!request.contains("us@er") && !request.contains("p:ss"));
+            let response = if let Some(location) = location {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                let body = "socks5://127.0.0.1:1080#authenticated";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let sub = Subscription {
+        url: format!("http://us%40er:p%3Ass@{address}/start"),
+        ..Default::default()
+    };
+    let nodes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        SubscriptionManager::new().unwrap().fetch(&sub),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].name, "authenticated");
+}
+
+#[tokio::test]
 async fn configured_subscription_user_agent_reaches_fetch_request() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 

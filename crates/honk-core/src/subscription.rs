@@ -286,52 +286,16 @@ fn has_private_literal_host(url: &reqwest::Url) -> bool {
     }
 }
 
-/// reqwest's default follows ten hops, allows an https-to-http downgrade, and
-/// does not restrict the destination, so a subscription origin could move the
-/// fetch onto plaintext or onto an address the operator never published it to.
-fn subscription_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let origin_https = attempt
-            .previous()
-            .first()
-            .is_some_and(|url| url.scheme() == "https");
-        let origin_private = attempt
-            .previous()
-            .first()
-            .is_some_and(has_private_literal_host);
-        let refusal = if attempt.previous().len() > MAX_SUBSCRIPTION_REDIRECTS {
-            Some("redirected too many times")
-        } else if origin_https && attempt.url().scheme() != "https" {
-            Some("redirected from https to plaintext")
-        } else if has_private_literal_host(attempt.url()) && !origin_private {
-            Some("redirected to a private address")
-        } else {
-            None
-        };
-        match refusal {
-            Some(reason) => attempt.error(anyhow::anyhow!("subscription {reason}")),
-            None => attempt.follow(),
-        }
-    })
-}
-
-/// reqwest DNS resolver backed by honk's bootstrap resolver
-/// (bypass-marked UDP/TCP), so subscription fetches do not depend on the
-/// system resolver — which on a polluted network can hand back poisoned
-/// answers and kill the subscription download.
-struct BootstrapDnsResolve;
-
-impl reqwest::dns::Resolve for BootstrapDnsResolve {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let ips = honk_outbound::bootstrap::resolve(&host).await?;
-            let addrs: Vec<std::net::SocketAddr> = ips
-                .into_iter()
-                .map(|ip| std::net::SocketAddr::new(ip, 0))
-                .collect();
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
+fn subscription_redirect_error(
+    previous: &reqwest::Url,
+    next: &reqwest::Url,
+) -> Option<&'static str> {
+    if previous.scheme() == "https" && next.scheme() != "https" {
+        Some("subscription redirected from https to plaintext")
+    } else if has_private_literal_host(next) && !has_private_literal_host(previous) {
+        Some("subscription redirected to a private address")
+    } else {
+        None
     }
 }
 
@@ -363,17 +327,81 @@ async fn read_capped_body(mut response: reqwest::Response) -> anyhow::Result<Vec
 
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
-    client: reqwest::Client,
+    client: crate::marked_http::Client,
 }
 
 impl SubscriptionManager {
     pub fn new() -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .dns_resolver(std::sync::Arc::new(BootstrapDnsResolve))
-            .redirect(subscription_redirect_policy())
-            .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            client: crate::marked_http::Client::new()?,
+        })
+    }
+
+    /// Redirects are followed here, not by the client, so each hop is checked
+    /// against the original origin and cross-origin hops drop credentials.
+    async fn fetch_body(
+        &self,
+        mut url: reqwest::Url,
+        mut headers: http::HeaderMap,
+    ) -> anyhow::Result<Vec<u8>> {
+        use http::header;
+
+        crate::marked_http::normalize_url(&mut url, &mut headers)?;
+        let origin = url.clone();
+        for hop in 0..=MAX_SUBSCRIPTION_REDIRECTS {
+            let response = self
+                .client
+                .get(&url, &headers, std::time::Duration::from_secs(30))
+                .await?;
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+                && let Some(location) = response.headers().get(header::LOCATION)
+            {
+                anyhow::ensure!(
+                    hop < MAX_SUBSCRIPTION_REDIRECTS,
+                    "subscription redirected too many times"
+                );
+                let mut next = url.join(location.to_str()?)?;
+                // Redirect userinfo must not restore credentials after an origin change.
+                let _ = next.set_username("");
+                let _ = next.set_password(None);
+                if let Some(reason) = subscription_redirect_error(&origin, &next) {
+                    anyhow::bail!(reason);
+                }
+                let previous = std::mem::replace(&mut url, next);
+                if previous.host_str() != url.host_str()
+                    || previous.port_or_known_default() != url.port_or_known_default()
+                    || previous.scheme() != url.scheme()
+                {
+                    for name in [
+                        header::AUTHORIZATION,
+                        header::COOKIE,
+                        header::HeaderName::from_static("cookie2"),
+                        header::WWW_AUTHENTICATE,
+                        header::PROXY_AUTHORIZATION,
+                        header::HOST,
+                    ] {
+                        headers.remove(name);
+                    }
+                }
+                if previous.scheme() != "https" || url.scheme() == "https" {
+                    let mut referer = previous;
+                    let _ = referer.set_username("");
+                    let _ = referer.set_password(None);
+                    referer.set_fragment(None);
+                    if let Ok(value) = header::HeaderValue::from_str(referer.as_str()) {
+                        headers.insert(header::REFERER, value);
+                    }
+                }
+                continue;
+            }
+            return read_capped_body(
+                response
+                    .error_for_status()
+                    .map_err(reqwest::Error::without_url)?,
+            )
+            .await;
+        }
+        unreachable!("redirect bound checked before following");
     }
 
     /// Fetch a subscription URL and parse its contents into a list of nodes.
@@ -400,20 +428,24 @@ impl SubscriptionManager {
         store: Option<&SubscriptionStore>,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Vec<Node>> {
-        let mut request = self
-            .client
-            .get(&sub.url)
-            .header("User-Agent", effective_subscription_user_agent(sub));
-
+        let url = reqwest::Url::parse(&sub.url)?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            effective_subscription_user_agent(sub).parse()?,
+        );
         for header in &sub.headers {
-            request = request.header(&header.key, &header.value);
+            headers.append(
+                http::HeaderName::from_bytes(header.key.as_bytes())?,
+                header.value.parse()?,
+            );
         }
-
-        let response = request.send().await.map_err(reqwest::Error::without_url)?;
-        let response = response
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?;
-        let body = read_capped_body(response).await?;
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.fetch_body(url, headers),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("subscription HTTP request timed out"))??;
         let content = finish_attempt(
             String::from_utf8(body).map_err(|_| {
                 subscription_error(

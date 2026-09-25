@@ -281,7 +281,7 @@ timer is created.
 
 `max_concurrent_dials` defaults to 64 and creates a generation-local semaphore for physical proxied connects and protocol handshakes. The configured value is clamped to the immutable process-wide descriptor gate computed at startup. Reload may change the replacement generation's local limit, but overlapping old and new generations still share that same process gate.
 
-Ready-pool hits and logical streams opened on an already warm generation transport are exempt. `block` never dials; `DirectHandler::dial` goes through `admit_physical_dial` like other physical connects. Datapath-offloaded direct flows and direct UI downloads through reqwest do not use this handler's gate. A bare-TCP pool hit still runs its protocol handshake and therefore remains admitted by the dial budget.
+Ready-pool hits and logical streams opened on an already warm generation transport are exempt. `block` never dials; `DirectHandler::dial` goes through `admit_physical_dial` like other physical connects. Datapath-offloaded direct flows and direct UI downloads through the marked HTTP client do not use this handler's gate. A bare-TCP pool hit still runs its protocol handshake and therefore remains admitted by the dial budget.
 
 Each VLESS physical carrier also takes a permit from the startup-sized process
 carrier gate shared by reload generations and DNS forks. The permit remains

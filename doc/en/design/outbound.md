@@ -338,6 +338,16 @@ proxy carriers. WAN egress recognizes both forms. Mark application remains
 best-effort only for unprivileged `EPERM` environments without the production
 datapath; other errors propagate.
 
+Subscription and direct UI downloads use the same marked TCP dialer before
+Hyper HTTP/1 framing and the existing rustls/platform-verifier TLS policy. This
+includes the first subscription fetch before eBPF attachment; TLS setup failures
+return download errors rather than panicking. Subscription URL credentials become
+sensitive Basic Authorization headers unless explicitly overridden. They survive
+same-origin redirects but are permanently removed on a host, port, or scheme
+change, even if a later hop returns to the original origin. Redirect userinfo
+does not supply new credentials. Body limits and HTTP(S) environment proxy
+connections retain their download boundaries.
+
 Marked UDP sockets request 8 MiB each for `SO_RCVBUF` and `SO_SNDBUF`. Linux
 may clamp and reports twice the configured sysctl accounting value; the core
 raises the corresponding maxima at startup.

@@ -51,6 +51,10 @@ toml.workspace = true
 
 # Networking
 reqwest.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio-rustls.workspace = true
+rustls-platform-verifier.workspace = true
 socket2.workspace = true
 bytes.workspace = true
 pin-project-lite.workspace = true
@@ -66,7 +70,7 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true
 
 # Encoding
 base64.workspace = true
-percent-encoding = { workspace = true, optional = true }
+percent-encoding.workspace = true
 aho-corasick.workspace = true
 
 # DNS transports (DoH H2 / DoQ / DoH3)
@@ -108,7 +112,7 @@ default = ["clash-api", "mimalloc", "rprx"]
 # Enable real eBPF support (requires Linux kernel 6.12+)
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
-clash-api = ["dep:axum", "dep:tower-http", "dep:percent-encoding", "dep:zip"]
+clash-api = ["dep:axum", "dep:tower-http", "dep:zip"]
 # Route the shipped binary's allocations through mimalloc (see main.rs)
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
@@ -129,8 +133,6 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
-# rustls: test-only — mock TLS/QUIC servers prove interop with the BoringSSL client stack
-tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }

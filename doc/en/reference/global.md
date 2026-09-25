@@ -58,7 +58,7 @@ The configured request path and query retain their original dot segments and per
 
 `so_mark_from_dae: 0` (or omission) retains the historical effective mark `0x100`.
 A nonzero value is applied exactly before connect/send, including proxy carriers,
-bootstrap/DNS traffic and health checks. The datapath
+bootstrap/DNS traffic, health checks, subscriptions and UI downloads. The datapath
 bypass compares this exact configured value: merely containing bit `0x100` is not
 an exemption. Transparent listeners use the same mark for socket recognition;
 accepted TCP client sockets have it cleared. Standalone `dns.bind` ingress stays

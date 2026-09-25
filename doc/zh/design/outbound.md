@@ -301,6 +301,14 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 WAN egress 识别两类标记。只有在没有生产 datapath 的非特权
 `EPERM` 环境中 mark 应用才是 best-effort；其他错误都会传播。
 
+订阅与直连 UI 下载也先经相同的带 mark TCP 拨号，再使用 Hyper HTTP/1
+帧处理和既有 rustls/platform-verifier TLS 策略，包括挂载 eBPF 前的首次订阅抓取；
+TLS 初始化失败返回下载错误而不是 panic。订阅 URL 凭据会转换为标记为敏感的
+Basic Authorization header，显式配置的 Authorization 优先。同源重定向保留
+认证信息；host、端口或 scheme 变化时永久移除，即使后续跳转回原始源也不会恢复。
+重定向 URL 的 userinfo 不会提供新凭据。响应体上限及 HTTP(S) 环境代理连接
+仍受各自下载边界约束。
+
 带 mark UDP socket 为 `SO_RCVBUF` 与 `SO_SNDBUF` 分别请求 8 MiB。Linux
 可能 clamp，并以配置 sysctl 记账值的两倍报告；core 在启动时提高对应上限。
 

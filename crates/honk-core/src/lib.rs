@@ -17,6 +17,7 @@ pub mod connection_tracker;
 pub mod control;
 pub mod dns;
 pub mod ebpf;
+mod marked_http;
 pub mod mode;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;

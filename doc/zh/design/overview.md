@@ -104,7 +104,7 @@ flowchart TB
 
 ## 运行时不变量
 
-- **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带进程配置的旁路 mark。非零直连规则 mark 替换其低 30 位，并携带 `CLASSIFIED_MARK`；策略路由须使用 `0x3fffffff` 掩码。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
+- **旁路标记纪律：** 拨号、探测、DNS 上游、HTTP 下载、QUIC endpoint 和透明监听器携带进程配置的旁路 mark。非零直连规则 mark 替换其低 30 位，并携带 `CLASSIFIED_MARK`；策略路由须使用 `0x3fffffff` 掩码。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。
 - **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
 - **VLESS source 边界：** 共享 XUDP/Mux.Cool 按 reused runtime、规范化 client、UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source session 持有唯一 receiver 与 transport health。

@@ -10,8 +10,8 @@
 //!
 //! A non-empty `external_ui_download_detour` forces every request and
 //! redirect through that node or group. Otherwise each URL host follows the
-//! normal traffic routing decision: `direct` uses reqwest, `block` aborts,
-//! and other results use the selected node's tunnel.
+//! normal traffic routing decision: `direct` uses a bypass-marked socket,
+//! `block` aborts, and other results use the selected node's tunnel.
 //!
 //! The download URL defaults to [`DEFAULT_UI_DOWNLOAD_URL`].
 //! `external_ui_download_url` configures it, while `HONK_UI_DOWNLOAD_URL`
@@ -341,21 +341,21 @@ async fn fetch_routed(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<Vec<
     anyhow::bail!("external UI download: too many redirects")
 }
 
-/// Direct fetch: plain reqwest (the control-plane PID bypass keeps the
-/// gateway's own traffic out of the datapath), streaming with the archive
-/// size cap.
+/// Direct fetch on a bypass-marked socket, with the archive size cap.
 async fn fetch_direct(url: &str, feedback: Option<ScoreAttempt>) -> anyhow::Result<ProxiedFetch> {
     let reporter = feedback
         .as_ref()
         .map(ScoreAttempt::begin)
         .transpose()?
         .map(ScoreBusinessGuard::start);
-    let result = async {
-        let client = reqwest::Client::builder()
-            .timeout(DOWNLOAD_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let mut response = client.get(url).send().await?;
+    let result = tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
+        let mut response = crate::marked_http::Client::new()?
+            .get(
+                &reqwest::Url::parse(url)?,
+                &http::HeaderMap::new(),
+                DOWNLOAD_TIMEOUT,
+            )
+            .await?;
         if let Some(reporter) = &reporter {
             reporter.setup_succeeded();
             reporter.first_response();
@@ -387,8 +387,10 @@ async fn fetch_direct(url: &str, feedback: Option<ScoreAttempt>) -> anyhow::Resu
             bytes.extend_from_slice(&chunk);
         }
         Ok(ProxiedFetch::Body(bytes))
-    }
-    .await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("external UI download timed out"))
+    .and_then(|result| result);
     if let Some(reporter) = &reporter {
         reporter.finish(match &result {
             Ok(_) => ScoreOutcome::Success,
@@ -1232,6 +1234,71 @@ mod tests {
             .unwrap()
             .start()
             .setup_failed(ScoreOutcome::Timeout);
+    }
+
+    /// The rustls default provider is process-global, so only a child may break it.
+    #[test]
+    fn direct_fetch_reports_tls_setup_failure() {
+        const CHILD: &str = "HONK_UI_TLS_SETUP_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "clash_api::ui::tests::direct_fetch_reports_tls_setup_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use tokio_rustls::rustls::{
+            self,
+            crypto::{CryptoProvider, aws_lc_rs},
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        let mut byte = [0];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            stream.read_exact(&mut byte).await.unwrap();
+                            request.push(byte[0]);
+                        }
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone").await.unwrap();
+                    }
+                });
+                let url = format!("http://{address}/ui.zip");
+                let healthy = fetch_direct(&url, None).await.unwrap();
+                assert!(matches!(healthy, ProxiedFetch::Body(bytes) if bytes == b"done"));
+                CryptoProvider {
+                    cipher_suites: Vec::new(),
+                    ..aws_lc_rs::default_provider()
+                }
+                .install_default()
+                .unwrap();
+                let error = fetch_direct(&url, None)
+                    .await
+                    .err()
+                    .expect("invalid TLS provider must fail even for a reachable HTTP endpoint");
+                assert!(error.downcast_ref::<rustls::Error>().is_some(), "{error:?}");
+                server.abort();
+                assert!(server.await.unwrap_err().is_cancelled());
+            });
     }
 
     #[tokio::test]

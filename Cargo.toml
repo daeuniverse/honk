@@ -55,6 +55,8 @@ reqwest = { version = "0.13", features = [
 ], default-features = false }
 h2 = "0.4"
 http = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-proxy"] }
 
 # eBPF / Aya
 aya = "0.14"
@@ -76,6 +78,7 @@ brotli = "9"
 webpki-root-certs = "1"
 foreign-types = "0.5"
 tokio-rustls = "0.26"
+rustls-platform-verifier = "0.7"
 rustls-pemfile = "2.2"
 webpki-roots = "1"
 aes-gcm = "0.11"
