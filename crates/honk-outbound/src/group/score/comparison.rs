@@ -5,14 +5,14 @@ use super::{AggregateKey, ExactKey, ScoreSelectionContext, ScoreSnapshot, StateI
 use honk_config::node::Node;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use uuid::Uuid;
 
 mod store;
 use store::{Bucket, Cell, Key, Timing};
 pub(super) use store::{Store, observe, target_bytes};
 mod summary;
-pub(super) use summary::{Summary, dominated, failure_excluded, summarize};
+pub(super) use summary::{Summary, failure_excluded, summarize};
 
 pub(super) const MAX_CELLS: usize = 256;
 pub(super) const MAX_TARGETS: usize = 8;
@@ -29,6 +29,14 @@ pub(super) fn next_reporter_id() -> u64 {
     .unwrap_or(0)
 }
 
+/// Inclusive symmetric 10% band: `high - low <= 0.1 × low`.
+pub(super) fn equivalent(left: f64, right: f64) -> bool {
+    let low = left.min(right);
+    let high = left.max(right);
+    // Averaging and unit conversion can round an inclusive boundary by a few ulps.
+    high - low <= low * super::PERFORMANCE_SWITCH_MARGIN + high * f64::EPSILON * 8.0
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Basis {
     #[default]
@@ -43,11 +51,8 @@ pub(super) struct MetricPair {
     pub incumbent: f64,
     pub candidate: f64,
     pub reporters: u8,
-    pub span: Duration,
-    pub oldest_at: Instant,
     pub latest_at: Instant,
     pub expires_at: Instant,
-    pub dispersion: f64,
     // Fingerprints describe selected keys/blocks, never measured values or raw API targets.
     pub support: u64,
 }
@@ -86,9 +91,6 @@ impl PairCohort {
 struct Accumulator {
     sum: f64,
     count: u64,
-    min: Option<f64>,
-    max: f64,
-    first: Option<Instant>,
     last: Option<Instant>,
     reporters: [u64; BLOCKS * REPORTERS],
     distinct: usize,
@@ -99,11 +101,6 @@ impl Accumulator {
         // Both nodes receive the same time-block weight despite different offered load.
         self.sum += bucket.sum / f64::from(bucket.count);
         self.count += 1;
-        self.min = Some(self.min.map_or(bucket.min, |value| value.min(bucket.min)));
-        self.max = self.max.max(bucket.max);
-        if let Some(at) = bucket.first {
-            self.first = Some(self.first.map_or(at, |old| old.min(at)));
-        }
         if let Some(at) = bucket.last {
             self.last = Some(self.last.map_or(at, |old| old.max(at)));
         }
@@ -164,20 +161,12 @@ fn metric_pair(
     if now >= expires_at {
         return None;
     }
-    let left = a.sum / a.count as f64;
-    let right = b.sum / b.count as f64;
     Some(MetricPair {
-        incumbent: left,
-        candidate: right,
+        incumbent: a.sum / a.count as f64,
+        candidate: b.sum / b.count as f64,
         reporters: reporters as u8,
-        span: a
-            .last?
-            .saturating_duration_since(a.first?)
-            .min(b.last?.saturating_duration_since(b.first?)),
-        oldest_at: a.first?.min(b.first?),
         latest_at,
         expires_at,
-        dispersion: ((a.max - a.min?) / left.max(1.0)).max((b.max - b.min?) / right.max(1.0)),
         support: support.finish(),
     })
 }
@@ -205,11 +194,8 @@ fn merge_metric(acc: &mut Option<MetricPair>, next: Option<MetricPair>, count: u
                 incumbent: old.incumbent + next.incumbent,
                 candidate: old.candidate + next.candidate,
                 reporters: old.reporters.min(next.reporters),
-                span: old.span.min(next.span),
-                oldest_at: old.oldest_at.min(next.oldest_at),
                 latest_at: old.latest_at.min(next.latest_at),
                 expires_at: old.expires_at.min(next.expires_at),
-                dispersion: old.dispersion.max(next.dispersion),
                 support: support.finish(),
             })
         }
@@ -405,9 +391,7 @@ fn timed(
     .map(|pair| TimedMetric {
         value: pair.incumbent,
         reporters: pair.reporters,
-        observed_at: pair.oldest_at,
         latest_at: pair.latest_at,
-        expires_at: pair.expires_at,
     })
 }
 
@@ -484,7 +468,7 @@ impl<'a> View<'a> {
     }
 
     /// Adds covered members' joint common-block projection when their original pairs disagree.
-    /// Optional evidence can veto a claim, but cannot constrain covered members' alignment.
+    /// Optional evidence cannot constrain covered members' alignment.
     pub(super) fn join(&self, cohort: &mut PairCohort, membership: &super::evaluation::Membership) {
         let covered: Vec<_> = (0..cohort.pairs.len())
             .filter(|&index| membership.covered[index] && cohort.pairs[index].is_some())
@@ -618,8 +602,6 @@ impl<'a> View<'a> {
                 match &cell.key {
                     Key::Traffic(_) => {
                         evidence.response = timed(&cell.metrics[0], origin, now, timing);
-                        evidence.upload = timed(&cell.metrics[1], origin, now, timing);
-                        evidence.download = timed(&cell.metrics[2], origin, now, timing);
                     }
                     Key::Probe { scope, .. } if *scope == snapshots[index].probe_scope => {
                         evidence.probe = timed(&cell.metrics[0], origin, now, timing);

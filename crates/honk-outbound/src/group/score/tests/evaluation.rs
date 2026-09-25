@@ -130,11 +130,11 @@ fn ranked_members_join_coverage_at_their_first_qualification() {
     // Qualification cannot gate coverage before any member is qualified.
     let cold = derive(None, &idle);
     assert_eq!(covered(&cold, false), [true, true, true]);
-    // Once one is, members still acquiring evidence are evaluated but cannot stall a claim.
+    // Once one is, members still acquiring evidence are evaluated but cannot stall alignment.
     let first = derive(Some(&cold), &[qualified, qualified, unknown]);
     assert_eq!(covered(&first, true), [true, true, false]);
     assert!(first.membership(&refs, 0, true).evaluated[2]);
-    // Admission outlives a later lapse, so the lapse reopens the claim instead of shrinking it.
+    // Admission outlives a later lapse, so coverage does not shrink with it.
     let lapsed = derive(Some(&first), &[qualified, unknown, unknown]);
     assert_eq!(covered(&lapsed, true), [true, true, false]);
 }
@@ -230,7 +230,7 @@ fn unevaluated_members_keep_probes_out_of_comparison_cells() {
 }
 
 #[test]
-fn a_hundred_members_reach_a_bounded_claim_at_moderate_traffic() {
+fn a_hundred_members_reach_bounded_comparisons_at_moderate_traffic() {
     let nodes = members(100);
     let refs: Vec<_> = nodes.iter().collect();
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -241,7 +241,7 @@ fn a_hundred_members_reach_a_bounded_claim_at_moderate_traffic() {
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let latency = |index: usize| 40 + (index as u64 * 37) % 400;
     let start = Instant::now();
-    let mut confirmed = None;
+    let mut compared = None;
     let mut widest = 0;
     // About 1.5 business flows per second for 25 minutes, with 30-second configured probes.
     for step in 0..2250u64 {
@@ -271,12 +271,12 @@ fn a_hundred_members_reach_a_bounded_claim_at_moderate_traffic() {
                 .unwrap();
             widest = widest.max(snapshot.evaluated_count);
             assert!(snapshot.pending_count <= snapshot.evaluated_count);
-            if snapshot.comparison != ScoreComparison::Unconfirmed {
-                confirmed.get_or_insert(snapshot);
+            if !snapshot.challengers.is_empty() {
+                compared.get_or_insert(snapshot);
             }
         }
     }
-    let snapshot = confirmed.expect("a bounded evaluation set must be able to confirm");
+    let snapshot = compared.expect("a bounded evaluation set must be able to compare");
     assert!(snapshot.evaluated_count < snapshot.candidate_count);
     assert!(widest <= 26, "{widest}");
     let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
@@ -301,7 +301,22 @@ fn filtered_views_cannot_disable_evaluation_bounds() {
         .unwrap();
     assert_eq!(report.candidate_count, 100);
     assert!(report.evaluated_count <= 4);
-    assert!(report.covered_count <= report.evaluated_count);
+    assert!(covered(&state, &target, &all, now + Duration::from_secs(1)) <= report.evaluated_count);
+}
+
+fn covered(
+    state: &ScorePolicyState,
+    target: &ScoreSelectionContext,
+    refs: &[&Node],
+    at: Instant,
+) -> usize {
+    let inner = state.inner.lock();
+    super::super::ranking::decision(&inner, "score", target, refs, at, false)
+        .membership
+        .covered
+        .iter()
+        .filter(|covered| **covered)
+        .count()
 }
 
 #[test]
@@ -350,17 +365,14 @@ fn qualified_readonly_bootstrap_waits_for_committed_participants() {
     }
     let state = manager.score_state();
     let at = now + Duration::from_secs(2);
-    let pending = state
-        .verification_snapshot_at("score", &target, &refs, at)
-        .unwrap();
-    assert_eq!(pending.covered_count, 1);
-    assert_eq!(pending.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(covered(&state, &target, &refs, at), 1);
     rank_at(&manager, &nodes, &target, at);
+    assert_eq!(covered(&state, &target, &refs, at), 2);
     let committed = state
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
-    assert_eq!(committed.covered_count, 2);
-    assert_eq!(committed.comparison, ScoreComparison::Equivalent);
+    let relations: Vec<_> = committed.challengers.iter().map(|c| c.relation).collect();
+    assert_eq!(relations, [ScoreRelation::Equivalent]);
 }
 
 #[test]
@@ -388,32 +400,18 @@ fn live_recovery_admits_coverage_before_settlement() {
     }
     let state = manager.score_state();
     let at = now + Duration::from_secs(3);
-    assert_eq!(
-        state
-            .verification_snapshot_at("score", &target, &refs, at)
-            .unwrap()
-            .covered_count,
-        2
-    );
+    assert_eq!(covered(&state, &target, &refs, at), 2);
     let reporters: Vec<_> = (0..4).map(|_| feedback.start_at(at)).collect();
     for reporter in &reporters {
         reporter.setup_succeeded_at(at);
         reporter.first_response_at(at);
         reporter.transfer_at(1, 1, at);
     }
-    assert_eq!(
-        state
-            .verification_snapshot_at("score", &target, &refs, at)
-            .unwrap()
-            .covered_count,
-        3
-    );
+    assert_eq!(covered(&state, &target, &refs, at), 3);
     let expired = at + PERFORMANCE_MAX_AGE + Duration::from_secs(1);
-    let report = state
-        .verification_snapshot_at("score", &target, &refs, expired)
-        .unwrap();
-    assert_eq!(report.covered_count, 3);
-    assert_eq!(report.blockers.qualification, 1);
+    assert_eq!(covered(&state, &target, &refs, expired), 3);
+    let lapsed = score_snapshot(&state.inner.lock(), "score", &target, nodes[2].id, expired);
+    assert!(!lapsed.qualified());
     for reporter in reporters {
         reporter.finish_at(ScoreOutcome::Cancelled, false, expired);
     }

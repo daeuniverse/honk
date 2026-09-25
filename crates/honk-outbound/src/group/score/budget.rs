@@ -642,7 +642,6 @@ fn question_mask(question: ScoreEvidenceQuestion) -> u8 {
         ScoreEvidenceQuestion::Availability | ScoreEvidenceQuestion::Recovery => 1,
         ScoreEvidenceQuestion::Response => 2,
         ScoreEvidenceQuestion::Qualification => 4,
-        ScoreEvidenceQuestion::Transfer => 8,
         ScoreEvidenceQuestion::None => 0,
     }
 }

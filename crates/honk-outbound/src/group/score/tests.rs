@@ -222,6 +222,28 @@ fn rank_at(
         .rank_at("score", target, &nodes.iter().collect::<Vec<_>>(), now)
 }
 
+/// Usability ends exactly sixty seconds after the cohort's latest eligible receive.
+fn assert_usable_until(
+    manager: &GroupManager,
+    nodes: &[Node],
+    target: &ScoreSelectionContext,
+    expires: Instant,
+) {
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let state = |at| {
+        manager
+            .score_state()
+            .verification_snapshot_at("score", target, &refs, at)
+            .unwrap()
+            .state
+    };
+    assert_eq!(
+        state(expires - Duration::from_millis(1)),
+        ScoreVerificationState::ObservedUsable
+    );
+    assert_eq!(state(expires), ScoreVerificationState::Provisional);
+}
+
 /// A decision's pairs with the covered joint projection, as `ranking::decision` builds them.
 fn pairs_at(
     inner: &StateInner,

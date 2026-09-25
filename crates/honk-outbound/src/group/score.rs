@@ -18,9 +18,9 @@ pub use feedback::{
 };
 pub(in crate::group) use pressure::TransportQualitySource;
 pub use verification::{
-    ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreEvidenceQuestion,
-    ScoreLocalComparison, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
-    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
+    ScoreChallenger, ScoreEvidenceBasis, ScoreEvidenceQuestion, ScoreRelation, ScoreTrialSource,
+    ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
+    ScoreVerificationState, ScoreWaitReason,
 };
 
 use super::{
@@ -324,7 +324,6 @@ struct SelectionHistory {
     /// Committed non-exploration selections seen by this target scope.
     selections: u64,
     switched_at: u64,
-    verification: Option<verification::VerificationHistory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,27 +551,17 @@ impl ScorePolicyState {
         }
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
         verification_counters.retain(|key, _| valid_groups.contains(&key.group));
+        // A removed winner must no longer participate in incumbent/flap protection.
         let invalid_history: Vec<_> = selection_history
             .iter()
             .filter(|(key, history)| {
                 !valid_groups.contains(&key.group)
-                    || (!valid.contains(&(key.group.clone(), history.current))
-                        && history
-                            .verification
-                            .is_none_or(|verification| verification.claims == 0))
+                    || !valid.contains(&(key.group.clone(), history.current))
             })
             .map(|(key, _)| key.clone())
             .collect();
         for key in invalid_history {
             selection_history.pop(&key);
-        }
-        // Preserve only pending claim revocation until the next authorized Apply;
-        // a removed winner must no longer participate in incumbent/flap protection.
-        for (key, history) in selection_history.iter_mut() {
-            if !valid.contains(&(key.group.clone(), history.current)) {
-                history.selections = 0;
-                history.previous = None;
-            }
         }
         let stale_previous: Vec<_> = selection_history
             .iter()
@@ -677,7 +666,6 @@ impl ScorePolicyState {
                     previous: None,
                     selections: 1,
                     switched_at: 0,
-                    verification: None,
                 },
             );
             return;

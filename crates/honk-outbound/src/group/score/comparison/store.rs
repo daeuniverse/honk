@@ -19,9 +19,6 @@ pub(super) struct Bucket {
     pub(super) block: u64,
     pub(super) count: u32,
     pub(super) sum: f64,
-    pub(super) min: f64,
-    pub(super) max: f64,
-    pub(super) first: Option<Instant>,
     pub(super) last: Option<Instant>,
     pub(super) reporters: [u64; REPORTERS],
 }
@@ -31,9 +28,6 @@ impl Bucket {
         if self.count == 0 || self.block != block {
             *self = Self {
                 block,
-                min: value,
-                max: value,
-                first: Some(now),
                 ..Self::default()
             };
         }
@@ -42,9 +36,6 @@ impl Bucket {
         }
         self.count += 1;
         self.sum += value;
-        self.min = self.min.min(value);
-        self.max = self.max.max(value);
-        self.first = Some(self.first.map_or(now, |at| at.min(now)));
         self.last = Some(self.last.map_or(now, |at| at.max(now)));
         if !self.reporters.contains(&reporter)
             && let Some(slot) = self.reporters.iter_mut().find(|id| **id == 0)

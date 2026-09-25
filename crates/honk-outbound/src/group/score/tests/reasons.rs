@@ -252,7 +252,6 @@ fn score_reload_prunes_removed_switch_history_members() {
                 previous: Some(second),
                 selections: 1,
                 switched_at: 1,
-                verification: None,
             },
         );
         inner.selection_history.push(
@@ -262,7 +261,6 @@ fn score_reload_prunes_removed_switch_history_members() {
                 previous: Some(first),
                 selections: 1,
                 switched_at: 1,
-                verification: None,
             },
         );
     }

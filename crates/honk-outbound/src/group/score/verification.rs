@@ -1,18 +1,9 @@
 use super::ranking::decision;
 use super::*;
 use honk_config::node::Node;
-use std::hash::{Hash, Hasher};
 
-mod claim;
-use claim::milliseconds;
-pub(super) use claim::{CandidateQuestion, evaluate, startup_index, usable};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScoreEvidenceKind {
-    Availability,
-    Response,
-    Transfer,
-}
+mod question;
+pub(super) use question::{CandidateQuestion, evaluate, startup_index, usable};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreVerificationState {
@@ -20,37 +11,40 @@ pub enum ScoreVerificationState {
     ObservedUsable,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ScoreComparison {
-    #[default]
-    Unconfirmed,
-    Equivalent,
-    Supported,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Which retained response evidence a pairwise comparison reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreEvidenceBasis {
-    #[default]
-    None,
     ConfiguredProbe,
     TargetResponse,
     CommonTargets,
-    Upload,
-    Download,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScoreEvidenceGaps {
-    pub availability: bool,
-    pub response: bool,
-    pub transfer: bool,
+/// Paired response values within 10% of each other are practically equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreRelation {
+    SelectedFaster,
+    Equivalent,
+    ChallengerFaster,
+}
+
+/// One fresh qualified response pair between the ordinary selection and an evaluated challenger.
+/// It describes measured response time only; it is not a promotion or reliability verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreChallenger {
+    /// Member display tag, which need not be unique across nested paths.
+    pub name: String,
+    pub basis: ScoreEvidenceBasis,
+    pub relation: ScoreRelation,
+    /// Weaker side's distinct retained reporters.
+    pub reporters: u8,
+    pub valid_for_ms: u64,
+    pub(crate) index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreValidationAction {
     None,
     NextBusinessFlow,
-    AwaitTransfer,
     Backoff,
 }
 
@@ -62,7 +56,6 @@ pub enum ScoreEvidenceQuestion {
     Response,
     Qualification,
     Recovery,
-    Transfer,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -72,7 +65,6 @@ pub enum ScoreWaitReason {
     Budget,
     ComparableTraffic,
     InFlight,
-    Transfer,
     Backoff,
 }
 
@@ -85,59 +77,17 @@ pub enum ScoreTrialSource {
     Recovery,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScoreLocalComparison {
-    pub comparison: ScoreComparison,
-    pub basis: ScoreEvidenceBasis,
-    pub compared_candidates: usize,
-    pub reporter_count: usize,
-    pub span_ms: u64,
-    pub evidence_age_ms: Option<u64>,
-    pub valid_for_ms: Option<u64>,
-    pub dispersion_ppm: u64,
-    pub upload_known: bool,
-    pub download_known: bool,
-    pub directional_tradeoff: bool,
-}
-
-/// Counts of current candidate blockers, not cumulative failures or dispatched work.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScoreVerificationBlockers {
-    pub recovery: usize,
-    pub backoff: usize,
-    pub qualification: usize,
-    pub availability: usize,
-    pub response_missing: usize,
-    pub response_unpaired: usize,
-    pub response_misaligned: usize,
-    pub probe_scope: usize,
-    pub response_degraded: usize,
-    pub node_failure: usize,
-    pub target_failure: usize,
-    pub excluded: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoreVerificationSnapshot {
     pub state: ScoreVerificationState,
-    pub comparison: ScoreComparison,
-    pub basis: ScoreEvidenceBasis,
-    pub missing: ScoreEvidenceGaps,
     pub next_action: ScoreValidationAction,
     pub question: ScoreEvidenceQuestion,
     pub wait_reason: ScoreWaitReason,
-    pub local_comparison: ScoreLocalComparison,
+    pub challengers: Vec<ScoreChallenger>,
     pub candidate_count: usize,
-    /// Members receiving comparisons; smaller than `candidate_count` when the claim is bounded.
+    /// Members receiving comparisons; smaller than `candidate_count` when the set is bounded.
     pub evaluated_count: usize,
-    /// Members a claim covers: the selection plus evaluated members admitted by qualification.
-    pub covered_count: usize,
-    pub compared_count: usize,
     pub pending_count: usize,
-    pub blockers: ScoreVerificationBlockers,
-    pub target_limited: bool,
-    pub evidence_age_ms: Option<u64>,
-    pub valid_for_ms: Option<u64>,
     pub health_family: IpVersion,
     pub network: SelectionNetwork,
     pub target_family: Option<IpVersion>,
@@ -149,27 +99,19 @@ pub struct ScoreVerificationCounters {
     pub provisional_selections: u64,
     pub usable_selections: u64,
     pub validation_selections: u64,
-    pub confirmations: u64,
-    pub expired: u64,
-    pub contradicted: u64,
-    pub confirmation_millis: u64,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct TimedMetric {
     pub value: f64,
     pub reporters: u8,
-    pub observed_at: Instant,
     pub latest_at: Instant,
-    pub expires_at: Instant,
 }
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct VerificationEvidence {
     pub business: Option<TimedMetric>,
     pub response: Option<TimedMetric>,
-    pub upload: Option<TimedMetric>,
-    pub download: Option<TimedMetric>,
     pub probe: Option<TimedMetric>,
     pub failed_at: Option<Instant>,
 }
@@ -183,12 +125,10 @@ impl VerificationEvidence {
                 .filter(|at| {
                     *at <= now && now < *at + LIVE_QUALIFICATION_TTL && availability.reporters > 0
                 })
-                .map(|observed_at| TimedMetric {
+                .map(|latest_at| TimedMetric {
                     value: 1.0,
                     reporters: availability.reporters,
-                    observed_at,
-                    latest_at: observed_at,
-                    expires_at: observed_at + LIVE_QUALIFICATION_TTL,
+                    latest_at,
                 }),
             failed_at: stats.failed_at,
             ..Self::default()
@@ -196,22 +136,10 @@ impl VerificationEvidence {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct VerificationHistory {
-    started_at: Instant,
-    pub(super) claims: u8,
-    comparison: ScoreComparison,
-    support: u64,
-    expires_at: Option<Instant>,
-}
-
 pub(super) struct Evaluation {
     pub snapshot: ScoreVerificationSnapshot,
     pub validation_index: Option<usize>,
     pub candidates: Vec<CandidateQuestion>,
-    claims: u8,
-    support: u64,
-    expires_at: Option<Instant>,
 }
 
 impl ScorePolicyState {
@@ -288,29 +216,7 @@ impl ScorePolicyState {
         selected: Uuid,
         selected_usable: bool,
         validation: bool,
-        evaluation: &Evaluation,
-        now: Instant,
     ) {
-        let previous = inner
-            .selection_history
-            .peek(key)
-            .and_then(|history| history.verification);
-        let mut started_at = previous.map_or(now, |history| history.started_at);
-        let changed_support = previous.is_some_and(|history| history.support != evaluation.support);
-        let lost = previous.is_some_and(|history| {
-            history.claims != 0
-                && (changed_support
-                    || history.claims & !evaluation.claims != 0
-                    || (history.comparison != ScoreComparison::Unconfirmed
-                        && history.comparison != evaluation.snapshot.comparison))
-        });
-        let gained = evaluation.claims != 0
-            && previous.is_none_or(|history| {
-                changed_support
-                    || evaluation.claims & !history.claims != 0
-                    || (evaluation.snapshot.comparison != ScoreComparison::Unconfirmed
-                        && history.comparison != evaluation.snapshot.comparison)
-            });
         let counts = inner
             .verification_counters
             .entry(SelectionReasonKey::new(&key.group, key.network))
@@ -324,34 +230,8 @@ impl ScorePolicyState {
         if validation {
             counts.validation_selections = counts.validation_selections.saturating_add(1);
         }
-        if lost {
-            let counter = if previous
-                .and_then(|history| history.expires_at)
-                .is_some_and(|at| now >= at)
-            {
-                &mut counts.expired
-            } else {
-                &mut counts.contradicted
-            };
-            *counter = counter.saturating_add(1);
-            started_at = now;
-        }
-        if gained {
-            counts.confirmations = counts.confirmations.saturating_add(1);
-            counts.confirmation_millis = counts
-                .confirmation_millis
-                .saturating_add(milliseconds(now.saturating_duration_since(started_at)));
-        }
-        let verification = Some(VerificationHistory {
-            started_at,
-            claims: evaluation.claims,
-            comparison: evaluation.snapshot.comparison,
-            support: evaluation.support,
-            expires_at: evaluation.expires_at,
-        });
-        if let Some(history) = inner.selection_history.get_mut(key) {
-            history.verification = verification;
-        } else {
+        // Every authorized rank, including trials, keeps its target history resident in the LRU.
+        if inner.selection_history.get_mut(key).is_none() {
             inner.selection_history.push(
                 key.clone(),
                 SelectionHistory {
@@ -359,7 +239,6 @@ impl ScorePolicyState {
                     previous: None,
                     selections: 0,
                     switched_at: 0,
-                    verification,
                 },
             );
         }

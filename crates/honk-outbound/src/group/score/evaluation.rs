@@ -1,6 +1,6 @@
-//! Bounded evaluation set: which members one whole-group comparison claim covers. Its size follows
-//! the optional work earned from offered business, so large groups get bounded claims instead of an
-//! unreachable all-member requirement.
+//! Bounded evaluation set: which members receive comparisons and optional validation. Its size
+//! follows the optional work earned from offered business, so large groups get a bounded set
+//! instead of an unreachable all-member requirement.
 use super::ranking::utility;
 use super::*;
 use honk_config::node::Node;
@@ -13,7 +13,7 @@ const MIN_MEMBERS: usize = 3;
 const MAX_MEMBERS: usize = 25;
 /// Share of earned optional work spent keeping members qualified; the rest aligns responses.
 const QUALIFICATION_SHARE: f64 = 0.5;
-/// Ranked members keep their place until they fall this far below the cut, so ties cannot churn claims.
+/// Ranked members keep their place until they fall this far below the cut, so ties cannot churn it.
 const RANK_HYSTERESIS: usize = 2;
 /// Recent Apply winners whose configured-probe cells stay admissible outside the ranked set.
 const ANCHORS: usize = 4;
@@ -34,7 +34,7 @@ pub(super) struct EvaluationSet {
 pub(super) struct Membership {
     /// May receive comparison pairs, evidence and optional work.
     pub evaluated: Vec<bool>,
-    /// Must be compared or resolved before a claim is complete.
+    /// Only these members' response alignment can request response validation.
     pub covered: Vec<bool>,
 }
 

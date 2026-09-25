@@ -9,11 +9,8 @@ fn metric(left: f64, right: f64, now: Instant) -> MetricPair {
         incumbent: left,
         candidate: right,
         reporters: 4,
-        span: Duration::from_secs(3),
-        oldest_at: now,
         latest_at: now,
         expires_at: now + Duration::from_secs(60),
-        dispersion: 0.0,
         support: 0,
     }
 }

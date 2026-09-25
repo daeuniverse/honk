@@ -259,25 +259,14 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
         for (network, candidates) in [("tcp", 2), ("udp", 1)] {
             let summary = &verification[network];
             assert_eq!(summary["state"], "provisional");
-            assert_eq!(summary["comparison"], "unconfirmed");
-            assert_eq!(summary["basis"], "none");
+            assert_eq!(summary["challengers"], serde_json::json!([]));
             assert_eq!(summary["coverage"]["candidates"], candidates);
-            assert_eq!(summary["coverage"]["compared"], 0);
-            assert_eq!(summary["blockers"]["availability"], candidates);
-            assert_eq!(summary["blockers"]["nodeFailure"], 0);
-            assert_eq!(summary["blockers"]["targetFailure"], 0);
-            assert_eq!(
-                summary["missing"],
-                serde_json::json!({
-                    "availability": true, "response": true, "transfer": true,
-                })
-            );
+            assert_eq!(summary["coverage"]["pending"], candidates);
+            assert_eq!(summary["question"], "availability");
             assert_eq!(summary["nextAction"], "nextBusinessFlow");
             assert_eq!(summary["network"], network);
             assert_eq!(summary["targetSpecific"], false);
             assert!(summary["targetFamily"].is_null());
-            assert!(summary["evidenceAgeMs"].is_null());
-            assert!(summary["validForMs"].is_null());
         }
         let encoded = verification.to_string();
         assert!(!encoded.contains("private-target.example"));
@@ -299,13 +288,13 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
             for network in ["tcp", "udp"] {
                 let summary = &empty["scoreVerification"][network];
                 assert_eq!(summary["state"], "provisional");
-                assert_eq!(summary["comparison"], "unconfirmed");
+                assert_eq!(summary["challengers"], serde_json::json!([]));
                 assert_eq!(summary["nextAction"], "none");
                 assert_eq!(
                     summary["coverage"],
                     serde_json::json!({
-                        "scope": "all", "candidates": 0, "evaluated": 0, "unevaluated": 0, "covered": 0,
-                        "compared": 0, "pending": 0, "targetLimited": false, "excluded": 0,
+                        "scope": "all", "candidates": 0, "evaluated": 0, "unevaluated": 0,
+                        "pending": 0,
                     })
                 );
             }
@@ -350,10 +339,11 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
     let probes = get_json(&app, "/proxies/auto").await;
     let verification = &probes["scoreVerification"]["tcp"];
     assert_eq!(verification["state"], "provisional");
-    assert_eq!(verification["comparison"], "supported");
-    assert_eq!(verification["basis"], "configuredProbe");
-    assert_eq!(verification["missing"]["availability"], true);
-    assert_eq!(verification["missing"]["transfer"], true);
+    let challenger = &verification["challengers"][0];
+    assert_eq!(challenger["name"], "slow");
+    assert_eq!(challenger["basis"], "configuredProbe");
+    assert_eq!(challenger["relation"], "selectedFaster");
+    assert_eq!(verification["question"], "availability");
     assert_eq!(verification["nextAction"], "nextBusinessFlow");
 
     for node in &nodes {
@@ -361,38 +351,28 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
             business_success(&manager, node, &context, false);
         }
     }
-    let pending = get_json(&app, "/proxies/auto").await;
-    assert_eq!(
-        pending["scoreVerification"]["tcp"]["comparison"],
-        "unconfirmed"
-    );
-    assert_eq!(
-        pending["scoreVerification"]["tcp"]["coverage"]["covered"],
-        1
-    );
     manager.selection_plan_for_target("auto", &context);
     let observed = get_json(&app, "/proxies/auto").await;
     let verification = &observed["scoreVerification"]["tcp"];
     assert_eq!(observed["now"], "fast");
     assert_eq!(verification["state"], "observedUsable");
-    assert_eq!(verification["comparison"], "supported");
-    assert_eq!(verification["basis"], "configuredProbe");
+    assert_eq!(
+        verification["challengers"],
+        serde_json::json!([{
+            "name": "slow", "basis": "configuredProbe", "relation": "selectedFaster",
+            "reporters": 4, "validForMs": verification["challengers"][0]["validForMs"],
+        }])
+    );
     assert_eq!(
         verification["coverage"],
         serde_json::json!({
-            "scope": "all", "candidates": 2, "evaluated": 2, "unevaluated": 0, "covered": 2,
-            "compared": 2, "pending": 0, "targetLimited": false, "excluded": 0,
+            "scope": "all", "candidates": 2, "evaluated": 2, "unevaluated": 0, "pending": 0,
         })
     );
-    assert_eq!(
-        verification["missing"],
-        serde_json::json!({
-            "availability": false, "response": false, "transfer": true,
-        })
-    );
-    assert_eq!(verification["nextAction"], "awaitTransfer");
-    assert!(verification["evidenceAgeMs"].as_u64().unwrap() < 120_000);
-    let validity = verification["validForMs"].as_u64().unwrap();
+    assert_eq!(verification["nextAction"], "none");
+    let validity = verification["challengers"][0]["validForMs"]
+        .as_u64()
+        .unwrap();
     assert!(validity > 0 && validity <= 120_000);
     assert_eq!(observed["scoreVerification"]["udp"]["state"], "provisional");
 
@@ -417,9 +397,8 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
     let reloaded = get_json(&app, "/proxies/auto").await;
     let verification = &reloaded["scoreVerification"]["tcp"];
     assert_eq!(verification["state"], "provisional");
-    assert_eq!(verification["comparison"], "unconfirmed");
-    assert_eq!(verification["basis"], "none");
-    assert_eq!(verification["missing"]["response"], true);
+    assert_eq!(verification["challengers"], serde_json::json!([]));
+    assert_eq!(verification["question"], "availability");
     assert_eq!(verification["nextAction"], "nextBusinessFlow");
 
     let manager = app.state.group_manager.read().clone();
@@ -432,10 +411,7 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
     }
     let failed = get_json(&app, "/proxies/auto").await;
     assert_eq!(failed["scoreVerification"]["tcp"]["state"], "provisional");
-    assert_eq!(
-        failed["scoreVerification"]["tcp"]["missing"]["availability"],
-        true
-    );
+    assert_eq!(failed["scoreVerification"]["tcp"]["question"], "recovery");
 }
 
 #[tokio::test]
@@ -480,19 +456,12 @@ async fn score_verification_keeps_singleton_aggregate_availability_separate_from
     for network in ["tcp", "udp"] {
         let verification = &observed["scoreVerification"][network];
         assert_eq!(verification["state"], "observedUsable");
-        assert_eq!(verification["comparison"], "unconfirmed");
-        assert_eq!(verification["basis"], "none");
+        assert_eq!(verification["challengers"], serde_json::json!([]));
         assert_eq!(verification["coverage"]["candidates"], 1);
-        assert_eq!(
-            verification["missing"],
-            serde_json::json!({
-                "availability": false, "response": true, "transfer": true,
-            })
-        );
+        assert_eq!(verification["question"], "response");
         assert_eq!(verification["nextAction"], "nextBusinessFlow");
         assert_eq!(verification["targetSpecific"], false);
         assert!(verification["targetFamily"].is_null());
-        assert!(verification["validForMs"].as_u64().unwrap() > 0);
     }
     assert!(
         !observed["scoreVerification"]

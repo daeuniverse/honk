@@ -52,8 +52,6 @@ fn a_fresh_sample_does_not_rejuvenate_old_blocks_or_diversity() {
         .response
         .unwrap();
     assert_eq!(before.expires_at, now + Duration::from_secs(60));
-    assert_eq!(before.oldest_at, now);
-    assert_eq!(before.span, Duration::from_secs(45));
     assert!(
         pair(&inner, &nodes, &target, now + Duration::from_secs(60))
             .response
@@ -275,7 +273,6 @@ fn disjoint_time_blocks_do_not_compare_even_when_both_nodes_are_fresh() {
             .all(|evidence| evidence.response.is_some())
     );
     assert!(scores.pairs.get(1).unwrap().response.is_none());
-    assert!(!comparison::summarize(&scores, now + Duration::from_secs(16)).complete);
 }
 
 #[test]
@@ -325,8 +322,11 @@ fn ordinary_probe_streams_qualify_through_block_rotation_and_expire_on_weaker_su
                 "interval={seconds} cycle={cycle}"
             );
             if cycle >= 3 {
-                let summary = comparison::summarize(&decision, at + Duration::from_secs(3));
-                assert!(summary.complete && summary.equivalent);
+                let response = response.unwrap();
+                assert!(comparison::equivalent(
+                    response.incumbent,
+                    response.candidate
+                ));
             }
         }
         let last = now + Duration::from_secs(11 * seconds + 1);
@@ -449,7 +449,13 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
         let decision = scores(&inner, &nodes, &target, at);
         assert!(decision.evidence[1].business.is_none());
         assert!(decision.evidence[1].response.is_none());
-        assert!(!comparison::summarize(&decision, at).complete);
+        assert!(
+            decision
+                .pairs
+                .get(1)
+                .and_then(|pair| pair.response)
+                .is_none()
+        );
         assert!(
             comparison::response_progress(&inner, "score", &target, nodes[0].id, nodes[1].id, at)
                 .is_none()
@@ -489,7 +495,13 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
         now + Duration::from_secs(9),
     );
     assert!(decision.evidence[1].business.is_some() && decision.evidence[1].response.is_some());
-    assert!(comparison::summarize(&decision, now + Duration::from_secs(9)).complete);
+    assert!(
+        decision
+            .pairs
+            .get(1)
+            .and_then(|pair| pair.response)
+            .is_some()
+    );
 }
 
 #[test]
@@ -584,5 +596,11 @@ fn failed_probe_cannot_requalify_from_its_prior_samples() {
         now + Duration::from_secs(3),
     );
     assert!(decision.evidence[1].probe.is_none());
-    assert!(!comparison::summarize(&decision, now + Duration::from_secs(3)).complete);
+    assert!(
+        decision
+            .pairs
+            .get(1)
+            .and_then(|pair| pair.response)
+            .is_none()
+    );
 }

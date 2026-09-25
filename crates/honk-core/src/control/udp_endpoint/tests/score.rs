@@ -2,7 +2,8 @@ use super::*;
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 use honk_outbound::group::{
-    GroupManager, ScoreSelectionContext, ScoreVerificationState, SelectionNetwork,
+    GroupManager, ScoreEvidenceQuestion, ScoreSelectionContext, ScoreVerificationState,
+    SelectionNetwork,
 };
 
 #[tokio::test]
@@ -359,7 +360,7 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
             let (_, report) = manager
                 .score_verification_for_network("score", SelectionNetwork::Udp)
                 .unwrap();
-            assert!(report.blockers.recovery > 0);
+            assert_eq!(report.question, ScoreEvidenceQuestion::Recovery);
         }
         if flow == 0 {
             let before = manager.score_budget_counters("score", SelectionNetwork::Udp);
@@ -407,7 +408,7 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
     let (_, report) = manager
         .score_verification_for_network("score", SelectionNetwork::Udp)
         .unwrap();
-    assert_eq!(report.blockers.recovery, 0);
+    assert_ne!(report.question, ScoreEvidenceQuestion::Recovery);
     assert_eq!(pool.driver_count(), 4);
     assert!(
         endpoints

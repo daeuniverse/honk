@@ -1,8 +1,8 @@
 use honk_outbound::alive::IpVersion;
 use honk_outbound::group::{
-    GroupManager, ScoreBudgetCounters, ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps,
-    ScoreEvidenceQuestion, ScoreLocalComparison, ScoreValidationAction, ScoreVerificationCounters,
-    ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason, SelectionNetwork,
+    GroupManager, ScoreBudgetCounters, ScoreChallenger, ScoreEvidenceBasis, ScoreEvidenceQuestion,
+    ScoreRelation, ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
+    ScoreVerificationState, ScoreWaitReason, SelectionNetwork,
 };
 
 pub(super) fn verification(
@@ -33,26 +33,13 @@ fn snapshot(
     // No eligible ordinary candidate is not evidence about a final or last resort.
     let snapshot = snapshot.unwrap_or(ScoreVerificationSnapshot {
         state: ScoreVerificationState::Provisional,
-        comparison: ScoreComparison::Unconfirmed,
-        basis: ScoreEvidenceBasis::None,
-        missing: ScoreEvidenceGaps {
-            availability: true,
-            response: true,
-            transfer: true,
-        },
         next_action: ScoreValidationAction::None,
         question: ScoreEvidenceQuestion::None,
         wait_reason: ScoreWaitReason::None,
-        local_comparison: ScoreLocalComparison::default(),
+        challengers: Vec::new(),
         candidate_count: 0,
         evaluated_count: 0,
-        covered_count: 0,
-        compared_count: 0,
         pending_count: 0,
-        blockers: Default::default(),
-        target_limited: false,
-        evidence_age_ms: None,
-        valid_for_ms: None,
         network,
         target_family: None,
         health_family: IpVersion::V4,
@@ -64,17 +51,10 @@ fn snapshot(
             ScoreVerificationState::Provisional => "provisional",
             ScoreVerificationState::ObservedUsable => "observedUsable",
         },
-        "comparison": comparison_name(snapshot.comparison),
-        "basis": basis_name(snapshot.basis),
-        "missing": {
-            "availability": snapshot.missing.availability,
-            "response": snapshot.missing.response,
-            "transfer": snapshot.missing.transfer,
-        },
+        "challengers": snapshot.challengers.iter().map(challenger).collect::<Vec<_>>(),
         "nextAction": match snapshot.next_action {
             ScoreValidationAction::None => "none",
             ScoreValidationAction::NextBusinessFlow => "nextBusinessFlow",
-            ScoreValidationAction::AwaitTransfer => "awaitTransfer",
             ScoreValidationAction::Backoff => "backoff",
         },
         "question": match snapshot.question {
@@ -83,43 +63,21 @@ fn snapshot(
             ScoreEvidenceQuestion::Response => "response",
             ScoreEvidenceQuestion::Qualification => "qualification",
             ScoreEvidenceQuestion::Recovery => "recovery",
-            ScoreEvidenceQuestion::Transfer => "transfer",
         },
         "waitReason": match snapshot.wait_reason {
             ScoreWaitReason::None => "none",
             ScoreWaitReason::Budget => "budget",
             ScoreWaitReason::ComparableTraffic => "comparableTraffic",
             ScoreWaitReason::InFlight => "inFlight",
-            ScoreWaitReason::Transfer => "transfer",
             ScoreWaitReason::Backoff => "backoff",
         },
-        "localComparison": local_comparison(snapshot.local_comparison),
         "coverage": {
             "scope": if snapshot.evaluated_count < snapshot.candidate_count { "bounded" } else { "all" },
             "candidates": snapshot.candidate_count,
             "evaluated": snapshot.evaluated_count,
             "unevaluated": snapshot.candidate_count - snapshot.evaluated_count,
-            "covered": snapshot.covered_count,
-            "compared": snapshot.compared_count,
             "pending": snapshot.pending_count,
-            "targetLimited": snapshot.target_limited,
-            "excluded": snapshot.blockers.excluded,
         },
-        "blockers": {
-            "recovery": snapshot.blockers.recovery,
-            "backoff": snapshot.blockers.backoff,
-            "qualification": snapshot.blockers.qualification,
-            "availability": snapshot.blockers.availability,
-            "responseMissing": snapshot.blockers.response_missing,
-            "responseUnpaired": snapshot.blockers.response_unpaired,
-            "responseMisaligned": snapshot.blockers.response_misaligned,
-            "probeScope": snapshot.blockers.probe_scope,
-            "responseDegraded": snapshot.blockers.response_degraded,
-            "nodeFailure": snapshot.blockers.node_failure,
-            "targetFailure": snapshot.blockers.target_failure,
-        },
-        "evidenceAgeMs": snapshot.evidence_age_ms,
-        "validForMs": snapshot.valid_for_ms,
         "network": match snapshot.network {
             SelectionNetwork::Tcp => "tcp",
             SelectionNetwork::Udp => "udp",
@@ -141,47 +99,25 @@ pub(super) fn counters(counters: ScoreVerificationCounters) -> serde_json::Value
         "provisionalSelections": counters.provisional_selections,
         "usableSelections": counters.usable_selections,
         "validationSelections": counters.validation_selections,
-        "confirmations": counters.confirmations,
-        "expired": counters.expired,
-        "contradicted": counters.contradicted,
-        "confirmationMillis": counters.confirmation_millis,
     })
 }
 
-fn local_comparison(value: ScoreLocalComparison) -> serde_json::Value {
+fn challenger(value: &ScoreChallenger) -> serde_json::Value {
     serde_json::json!({
-        "scope": "activeChallengers",
-        "comparison": comparison_name(value.comparison),
-        "basis": basis_name(value.basis),
-        "comparedCandidates": value.compared_candidates,
-        "reporters": value.reporter_count,
-        "spanMs": value.span_ms,
-        "evidenceAgeMs": value.evidence_age_ms,
+        "name": value.name,
+        "basis": match value.basis {
+            ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
+            ScoreEvidenceBasis::TargetResponse => "targetResponse",
+            ScoreEvidenceBasis::CommonTargets => "commonTargets",
+        },
+        "relation": match value.relation {
+            ScoreRelation::SelectedFaster => "selectedFaster",
+            ScoreRelation::Equivalent => "equivalent",
+            ScoreRelation::ChallengerFaster => "challengerFaster",
+        },
+        "reporters": value.reporters,
         "validForMs": value.valid_for_ms,
-        "dispersionPpm": value.dispersion_ppm,
-        "uploadKnown": value.upload_known,
-        "downloadKnown": value.download_known,
-        "directionalTradeoff": value.directional_tradeoff,
     })
-}
-
-fn comparison_name(comparison: ScoreComparison) -> &'static str {
-    match comparison {
-        ScoreComparison::Unconfirmed => "unconfirmed",
-        ScoreComparison::Equivalent => "equivalent",
-        ScoreComparison::Supported => "supported",
-    }
-}
-
-fn basis_name(basis: ScoreEvidenceBasis) -> &'static str {
-    match basis {
-        ScoreEvidenceBasis::None => "none",
-        ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
-        ScoreEvidenceBasis::TargetResponse => "targetResponse",
-        ScoreEvidenceBasis::CommonTargets => "commonTargets",
-        ScoreEvidenceBasis::Upload => "upload",
-        ScoreEvidenceBasis::Download => "download",
-    }
 }
 
 pub(super) fn budget(value: ScoreBudgetCounters) -> serde_json::Value {

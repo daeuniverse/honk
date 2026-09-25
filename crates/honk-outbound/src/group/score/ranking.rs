@@ -294,8 +294,6 @@ impl ScorePolicyState {
             nodes[ordinary.index].id,
             super::verification::usable(&decision.evidence[selection.index]),
             selection.reason.is_exploration(),
-            &evaluation,
-            now,
         );
         if nodes.len() > 1 {
             let streak_excluded = snapshots

@@ -421,8 +421,8 @@ fn bound_run_keeps_unfinished_pair_but_releases_completed_pair() {
     let snapshot = state
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
-    assert_eq!(snapshot.comparison, ScoreComparison::Supported);
-    assert!(!snapshot.missing.response);
+    let relations: Vec<_> = snapshot.challengers.iter().map(|c| c.relation).collect();
+    assert_eq!(relations, [ScoreRelation::SelectedFaster]);
     assert_eq!(snapshot.pending_count, 0);
 }
 

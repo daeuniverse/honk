@@ -192,8 +192,7 @@ R = {
   failStreakExcluded, exploreBackedOff, carrierPressure, carrierRttPressure,
   carrierLossPressure, carrierValidation
 } // R 的每个值均为 u64 计数
-V = { provisionalSelections, usableSelections, validationSelections,
-      confirmations, expired, contradicted, confirmationMillis }
+V = { provisionalSelections, usableSelections, validationSelections }
 B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
       reserved, spent, budgetBlocked, inFlightBlocked, refunded, expired,
       coldAllowance, coldAvailable, earnedAvailable, earningPeriod, scopes,
@@ -241,24 +240,20 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | --- | --- |
 | `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
 | `state` | `provisional` 或 `observedUsable`；后者要求连续 cohort 中四个不同的定向 Traffic reporter 在 setup/TX 后收到 RX，最近合格 RX 不足 60 秒。适用失败／reload 或 60 秒间隔重置 cohort，clone／重复回包不能增加信用。这不授予冷启动资格；真正失败后的 cohort 可独立用同样四份信用取得作用域恢复，聚合可用性不代表每个精确目标合格。 |
-| `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`；证据依据为 `none`、`configuredProbe`、`targetResponse`、`commonTargets`、`upload` 或 `download`。`commonTargets` 使用有界等权共同目标，不是无关聚合均值；setup／预热不是证明。不代表误判概率或保证最优。 |
-| `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
-| `nextAction` | `nextBusinessFlow` 表示未来真实工作补充证据、普通资格或恢复的需求，不是已预留或已派发 I/O；需同时查看 `waitReason`。`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
-| `question` | `none`、`availability`、`response`、`qualification`、`recovery` 或 `transfer`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
-| `waitReason` | `none`；`budget` 表示没有可用额度；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`transfer` 等待真实传输负载；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
-| `localComparison` | 下述对已比较合格挑战者的摘要；不能把不完整的评估集覆盖升级为组比较。 |
-| `coverage` | `scope`（`all` 或 `bounded`）、`candidates`、`evaluated`、`unevaluated`、`covered`、`compared`、`pending`、`excluded` 数量。评估成员由显式有界身份决定，跨过滤视图也不例外。当前基线存在合格成员时，结论覆盖所选成员与已准入排名成员；否则覆盖全部排名成员。资格失效不撤销准入，直到被排名移出或 reload。已评估但未覆盖成员可接受可选工作并贡献合格否决／区间，不阻碍完整性或对齐。未评估成员既不算已比较、已排除，也不算被击败。其余数量针对已评估成员；`targetLimited` 标记部分共同目标支持（尚未合格的已匹配目标或超过八个规范目标）。即使已有响应支持或已被排除，pending 仍可包含资格／恢复工作。`excluded` 通过近期失败排除，或不具普通资格且双方都有四个有效完成时的较低实际可靠性，结清未配对成员；其未配对指标不表示近似等价。完整结论需要一个被覆盖挑战者，仅单节点可用还不够。 |
-| `blockers` | 固定数量字段：`recovery`、`backoff`、`qualification`、`availability`、`responseMissing`、`responseUnpaired`、`responseMisaligned`、`probeScope`、`responseDegraded`、`nodeFailure`、`targetFailure`。原因可重叠，不是额外失败或累积计数器。当前基线存在合格成员时，`qualification` 统计未结清且被覆盖的未合格成员，不受问题优先级影响。被排除候选单独计数，节点／目标失败数量包含这些候选。不导出目标键。 |
-| `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
+| `challengers` | `selected` 与已评估挑战者之间新鲜的成对响应比较；见下文。 |
+| `nextAction` | `nextBusinessFlow` 表示未来真实工作补充证据、普通资格或恢复的需求，不是已预留或已派发 I/O；需同时查看 `waitReason`。`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。缺少传输证据不会创建工作；方向 goodput 等待真实负载。 |
+| `question` | `none`、`availability`、`response`、`qualification` 或 `recovery`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
+| `waitReason` | `none`；`budget` 表示没有可用额度；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
+| `coverage` | `scope`（`all` 或 `bounded`）、`candidates`、`evaluated`、`unevaluated`、`pending` 数量。评估成员由显式有界身份决定，跨过滤视图也不例外。未评估成员不参与比较。`pending` 统计仍有未决问题的已评估成员，包括已有比较但仍需资格或恢复工作的成员。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
-Readonly／Peek 使用已提交参与者，不重新排名或纳入成员。Apply 初始化／刷新参与者并纳入当前合格排名成员；已接纳业务反馈也为已在排名中的成员锁存资格。初始化前，已有合格成员的多节点结论须等待 Apply，冷启动配置探测则可使用临时有界投影。冷门控取决于当前资格，不是历史上是否曾有成员合格。见[评估集生命周期](../design/groups.md#有条件的验证结论)。
+Readonly／Peek 使用已提交参与者，不重新排名或纳入成员。Apply 初始化／刷新参与者并纳入当前合格排名成员；已接纳业务反馈也为已在排名中的成员锁存资格。初始化前，只读查询使用不能纳入合格成员的临时有界投影。见[评估集生命周期](../design/groups.md#有条件的验证结论)。
 
-`localComparison.scope` 为 `activeChallengers`；`comparison` 和 `basis` 使用上述词汇。`comparedCandidates` 包含所选成员和有支持的挑战者。`reporters` 是双方已保留的不同 reporter 支持量中的最弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`spanMs`、`evidenceAgeMs`、`validForMs` 与 `dispersionPpm` 描述这些支持，不代表统计独立或误判概率。`uploadKnown`、`downloadKnown` 明确保留未知方向；`directionalTradeoff` 标记相反的合格方向变化。业务证明使用共同 15 秒块，在块起点后 60 秒到期；配置探测按生产者周期 `I` 使用 `max(15s, 2I)` 块，有效期同时受最早支持块的四块保留期限与“较弱一侧最近支持加 `max(60s, 2I)`”限制。失败／reload／incarnation 边界保持不变。合格共同目标子集可以保留局部支持，但跳过尚未合格或因上限截断的已匹配目标时，`missing.response` 仍为 true，顶层仍为 `comparison: "unconfirmed"`；精确目标不能继承该子集的认证。
+`challengers` 列出所选成员当前的原始比较对（即普通晋升读取的同一批比较对）中具有新鲜合格响应指标的项；没有该指标的成员不出现，都没有时为空列表。每项包含 `name`（公开成员 tag，仅作显示，嵌套路径下可能重名）、`basis`（`targetResponse`、`commonTargets` 或 `configuredProbe`）、`relation`（`selectedFaster`、`equivalent` 或 `challengerFaster`）、`reporters` 与 `validForMs`。`equivalent` 对实际响应值使用包含边界的对称区间 `high - low <= 0.1 × low`，包括零与亚毫秒值。`reporters` 是双方已保留的不同 reporter 支持量中的较弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`validForMs` 是该响应指标的剩余有效期。业务块为 15 秒，在块起点后 60 秒到期；配置探测按生产者周期 `I` 使用 `max(15s, 2I)` 块，有效期同时受最早支持块的四块保留期限与“较弱一侧最近支持加 `max(60s, 2I)`”限制。失败／reload／incarnation 边界保持不变。`commonTargets` 最多使用八个规范、等权、响应合格的共同目标，不是无关聚合均值；setup 与预热不是比较证据。
 
-比较标签描述经验性证据，不表示是否跨过切换门槛；被保持的成员或测量取舍可在不缺样本时仍为 `unconfirmed`。强制联合时间块对齐仅使用被覆盖的合格成员。可选原始比较对不能造成缺失对齐，但其合格不利证据与区间仍受身份和有效期检查，包括联合子集外的否决，或另一成员缺少该方向时的否决。方向 known 标志要求支持一致；所有实际参与判断的合格支持都约束指纹与有效期。被覆盖成员对齐不足时请求预算内可比流量；读取不创建工作，也不保证完成。
+关系只描述测得的响应时间：它不是晋升决定，不是可靠性或带宽结论，不代表误判概率或保证最优，也不能证明所选成员优于列表之外的成员。普通切换仍使用自身依赖完成数的门槛，以及可靠性、可用性与方向保护。查询不派发验证，也不改变计数。
 
-`/stats.score.groups[].verification.tcp` 与 `.udp` 增加饱和计数：`provisionalSelections`、`usableSelections`、`validationSelections`、`confirmations`、`expired`、`contradicted`、`confirmationMillis`。确认计数包括新成立的配置探测比较等经验性结论，不表示所有维度的业务或带宽认证；`confirmationMillis / confirmations` 是这些结论的累计平均确认耗时，不是网络延迟。只读查询立即反映过期，转移计数只在后续授权 Apply 时推进。没有流量或预算不能授予确认；查询不派发验证，也不改变计数。10% 比较容差表示实际意义上的近似等价，不是已校准的误判概率。
+`/stats.score.groups[].verification.tcp` 与 `.udp` 增加饱和计数：`provisionalSelections`、`usableSelections`、`validationSelections`，只在授权 Apply 时推进。
 
 ### Score 工作预算与观测成本
 

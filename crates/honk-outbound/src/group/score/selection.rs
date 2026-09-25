@@ -754,9 +754,13 @@ impl super::GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        self.score_state
-            .verification_selection(group_name, &context, &nodes)
-            .map(|(index, snapshot)| (unique[index].tag().to_owned(), snapshot))
+        let (index, mut snapshot) = self
+            .score_state
+            .verification_selection(group_name, &context, &nodes)?;
+        for challenger in &mut snapshot.challengers {
+            challenger.name = unique[challenger.index].tag().to_owned();
+        }
+        Some((unique[index].tag().to_owned(), snapshot))
     }
 
     /// Group/network counters advance only during authorized selections.

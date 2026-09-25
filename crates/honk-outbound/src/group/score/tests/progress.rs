@@ -93,7 +93,6 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
         )
         .unwrap();
     assert_eq!(verification.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(verification.evidence_age_ms, Some(0));
     let reasons = state.selection_reason_counts("score", SelectionNetwork::Udp);
     assert_eq!(reasons.incumbent_ineligible, 0);
     assert_eq!(reasons.ordinary_switch, 0);

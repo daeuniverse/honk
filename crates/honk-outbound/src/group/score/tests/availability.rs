@@ -47,7 +47,6 @@ fn distinct_live_udp_flows_establish_usability_without_terminal_successes() {
     reporters[3].transfer_at(0, 1, observed);
     let report = availability_at(&manager, &nodes, &target, observed);
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
     let state = manager.score_state();
     let score = score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, observed);
     assert_eq!(score.completed, 0.0);
@@ -91,8 +90,12 @@ fn confirmed_sends_reconcile_four_live_replies_at_their_receive_time() {
     reporters[3].tx_completed_at(1, started, completed);
     let report = availability_at(&manager, &nodes, &target, completed);
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(report.evidence_age_ms, Some(500));
-    assert_eq!(report.valid_for_ms, Some(59_500));
+    assert_usable_until(
+        &manager,
+        &nodes,
+        &target,
+        received + Duration::from_secs(60),
+    );
     let state = manager.score_state();
     let score = score_snapshot(
         &state.inner.lock(),
@@ -469,8 +472,7 @@ fn continuous_rx_keeps_live_availability_but_idle_settlement_cannot_refresh_it()
         reporters[0].transfer_at(0, 1, at);
         let report = availability_at(&manager, &nodes, &target, at);
         assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
-        assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
-        assert_eq!(report.valid_for_ms, Some(60_000));
+        assert_usable_until(&manager, &nodes, &target, at + Duration::from_secs(60));
     }
     let state = manager.score_state();
     let at = now + Duration::from_secs(150);
@@ -497,7 +499,6 @@ fn continuous_rx_keeps_live_availability_but_idle_settlement_cannot_refresh_it()
     }
     let report = availability_at(&manager, &nodes, &target, retired);
     assert_eq!(report.state, ScoreVerificationState::Provisional);
-    assert_eq!(report.evidence_age_ms, None);
     let settled = score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, retired);
     assert_eq!(settled.completed, 4.0);
     assert_eq!(settled.useful_completed, 4.0);
@@ -632,8 +633,12 @@ fn failure_fences_live_rx_without_requiring_survivors_to_settle() {
         recovered + Duration::from_secs(1),
     );
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(report.evidence_age_ms, Some(1000));
-    assert_eq!(report.valid_for_ms, Some(59_000));
+    assert_usable_until(
+        &manager,
+        &nodes,
+        &target,
+        recovered + Duration::from_secs(60),
+    );
     let before = score_snapshot(
         &state.inner.lock(),
         "score",
@@ -703,8 +708,12 @@ fn neutral_settlement_flushes_throttled_eligible_rx_at_its_event_time() {
     }
     let report = availability_at(&manager, &nodes, &target, finished);
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(report.evidence_age_ms, Some(800));
-    assert_eq!(report.valid_for_ms, Some(59_200));
+    assert_usable_until(
+        &manager,
+        &nodes,
+        &target,
+        received + Duration::from_secs(60),
+    );
     let after = score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, finished);
     assert_close(after.completed, before.completed);
     assert_close(after.useful_completed, before.useful_completed);

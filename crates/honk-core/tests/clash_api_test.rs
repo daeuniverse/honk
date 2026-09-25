@@ -688,10 +688,6 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "provisionalSelections",
                     "usableSelections",
                     "validationSelections",
-                    "confirmations",
-                    "expired",
-                    "contradicted",
-                    "confirmationMillis",
                 ],
             );
             assert!(

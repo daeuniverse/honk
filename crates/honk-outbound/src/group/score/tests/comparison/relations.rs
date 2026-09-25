@@ -37,66 +37,6 @@ fn common_targets_do_not_promote_a_simpson_mixture() {
 }
 
 #[test]
-fn more_than_five_members_confirm_and_revoke_with_their_weakest_support() {
-    let start = Instant::now();
-    let nodes: Vec<_> = (0..7).map(|index| node(&format!("wide {index}"))).collect();
-    let target = context("wide.example", IpVersion::V4);
-    let mut inner = StateInner::default();
-    for leaf in &nodes {
-        response(&mut inner, leaf, &target, 4, 100, start);
-    }
-    // Only the last member misses the later block, so its support expires first.
-    for leaf in &nodes[..6] {
-        response(
-            &mut inner,
-            leaf,
-            &target,
-            4,
-            100,
-            start + Duration::from_secs(30),
-        );
-    }
-    let confirmed = comparison::summarize(
-        &scores(&inner, &nodes, &target, start + Duration::from_secs(31)),
-        start + Duration::from_secs(31),
-    );
-    assert_eq!(confirmed.compared_candidates, nodes.len());
-    assert!(confirmed.complete && confirmed.equivalent);
-    let revoked_at = start + Duration::from_secs(61);
-    let revoked = comparison::summarize(&scores(&inner, &nodes, &target, revoked_at), revoked_at);
-    assert_eq!(revoked.compared_candidates, nodes.len() - 1);
-    assert!(!revoked.complete, "{revoked:?}");
-}
-
-#[test]
-fn global_equivalence_checks_the_full_response_range() {
-    let nodes = [node("center"), node("low"), node("high")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("range", IpVersion::V4);
-    let now = Instant::now();
-    for (index, latency) in [(1, 91), (0, 100), (2, 109)] {
-        train_at(&manager, &nodes[index], &target, 8, latency, 1, now);
-    }
-    let at = now + Duration::from_secs(2);
-    let state = manager.score_state();
-    let decision = scores(&state.inner.lock(), &nodes, &target, at);
-    assert_eq!(decision.ordinary.index, 0);
-    let summary = comparison::summarize(&decision, at);
-    assert!(summary.complete);
-    assert!(!summary.equivalent && !summary.supported && !summary.response_misaligned);
-    let report = evaluate(
-        &decision,
-        &nodes.iter().collect::<Vec<_>>(),
-        &target,
-        None,
-        at,
-    )
-    .snapshot;
-    assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
-    assert!(!report.missing.response);
-}
-
-#[test]
 fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_cohort() {
     let nodes: Vec<_> = (0..10)
         .map(|index| node(&format!("bounded {index}")))
@@ -143,10 +83,11 @@ fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_coh
             assert_close(pair.response.unwrap().incumbent, 100.0);
             assert_close(pair.response.unwrap().candidate, 100.0);
             assert!(pair.upload.is_none() && pair.download.is_none());
+            assert!(
+                pair.partial,
+                "capped common targets keep the response gap pending"
+            );
         }
-        let summary = comparison::summarize(&decision, now);
-        assert_eq!(summary.compared_candidates, nodes.len());
-        assert!(summary.equivalent && !summary.complete && summary.target_limited);
     }
     let exact = pair(&inner, &nodes, &context("16.target", IpVersion::V4), now);
     assert_eq!(exact.basis, Basis::ExactTarget);
@@ -155,56 +96,16 @@ fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_coh
 }
 
 #[test]
-fn response_support_is_independent_of_completion_maturity() {
-    for samples in [4, 8, 16] {
-        let nodes = [node("faster"), node("slower")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("maturity.example", IpVersion::V4);
-        let now = Instant::now();
-        rank_at(&manager, &nodes, &target, now);
-        for (leaf, latency) in nodes.iter().zip([100, 115]) {
-            train_at(&manager, leaf, &target, samples, latency, 1, now);
-        }
-        let at = now + Duration::from_secs(2);
-        let state = manager.score_state();
-        for reference in [0, 1] {
-            let decision = decision_at(&state.inner.lock(), &nodes, &target, reference, at);
-            assert!(decision.scores.iter().all(ScoreSnapshot::qualified));
-            assert_close(
-                decision.scores[0].observed_reliability,
-                decision.scores[1].observed_reliability,
-            );
-            let summary = comparison::summarize(&decision, at);
-            assert!(summary.complete && !summary.equivalent);
-            assert_eq!(
-                summary.supported,
-                reference == 0,
-                "samples={samples} reference={reference}"
-            );
-        }
-        let report = state
-            .verification_snapshot_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at)
-            .unwrap();
-        assert_eq!(
-            report.comparison,
-            ScoreComparison::Supported,
-            "samples={samples}"
-        );
-        assert!(!report.missing.availability && !report.missing.response);
-    }
-}
-
-#[test]
 fn response_equivalence_uses_actual_symmetric_tolerance_including_zero() {
-    for (left, right, expected) in [
-        (100_000_000, 109_999_000, ScoreComparison::Equivalent),
-        (100_000_000, 110_000_000, ScoreComparison::Equivalent),
-        (100_000_000, 110_001_000, ScoreComparison::Supported),
-        (100_000, 109_999, ScoreComparison::Equivalent),
-        (100_000, 110_000, ScoreComparison::Equivalent),
-        (100_000, 110_001, ScoreComparison::Supported),
-        (0, 0, ScoreComparison::Equivalent),
-        (0, 1, ScoreComparison::Supported),
+    for (left, right, equivalent) in [
+        (100_000_000, 109_999_000, true),
+        (100_000_000, 110_000_000, true),
+        (100_000_000, 110_001_000, false),
+        (100_000, 109_999, true),
+        (100_000, 110_000, true),
+        (100_000, 110_001, false),
+        (0, 0, true),
+        (0, 1, false),
     ] {
         let nodes = [node("lower"), node("higher")];
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -225,18 +126,6 @@ fn response_equivalence_uses_actual_symmetric_tolerance_including_zero() {
         let state = manager.score_state();
         for reference in [0, 1] {
             let decision = decision_at(&state.inner.lock(), &nodes, &target, reference, at);
-            let summary = comparison::summarize(&decision, at);
-            assert!(summary.complete && !summary.response_misaligned);
-            assert_eq!(
-                summary.equivalent,
-                expected == ScoreComparison::Equivalent,
-                "{left}/{right}"
-            );
-            assert_eq!(
-                summary.supported,
-                reference == 0 && expected == ScoreComparison::Supported,
-                "{left}/{right} reference={reference}"
-            );
             assert_eq!(decision.ordinary.index, reference);
             let report = evaluate(
                 &decision,
@@ -246,13 +135,15 @@ fn response_equivalence_uses_actual_symmetric_tolerance_including_zero() {
                 at,
             )
             .snapshot;
-            let expected_selected = if expected == ScoreComparison::Equivalent || reference == 0 {
-                expected
-            } else {
-                ScoreComparison::Unconfirmed
+            let expected = match (equivalent, reference) {
+                (true, _) => ScoreRelation::Equivalent,
+                (false, 0) => ScoreRelation::SelectedFaster,
+                _ => ScoreRelation::ChallengerFaster,
             };
+            let relations: Vec<_> = report.challengers.iter().map(|c| c.relation).collect();
             assert_eq!(
-                report.comparison, expected_selected,
+                relations,
+                [expected],
                 "{left}/{right} reference={reference}"
             );
         }
@@ -260,7 +151,7 @@ fn response_equivalence_uses_actual_symmetric_tolerance_including_zero() {
 }
 
 #[test]
-fn a_held_incumbent_cannot_hide_a_materially_faster_rival() {
+fn a_held_incumbent_reports_a_materially_faster_rival() {
     let nodes = [node("held"), node("faster"), node("slower")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("held.example", IpVersion::V4);
@@ -272,9 +163,6 @@ fn a_held_incumbent_cannot_hide_a_materially_faster_rival() {
     let state = manager.score_state();
     let decision = scores(&state.inner.lock(), &nodes, &target, at);
     assert_eq!(decision.ordinary.index, 0);
-    let summary = comparison::summarize(&decision, at);
-    assert!(summary.complete && !summary.response_misaligned);
-    assert!(!summary.supported && !summary.equivalent);
     let report = evaluate(
         &decision,
         &nodes.iter().collect::<Vec<_>>(),
@@ -283,108 +171,22 @@ fn a_held_incumbent_cannot_hide_a_materially_faster_rival() {
         at,
     )
     .snapshot;
-    assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
-    assert!(!report.missing.response);
-}
-
-#[test]
-fn qualified_reliability_cannot_buy_a_material_response_regression() {
-    for slower in [105, 115] {
-        let nodes = [node("faster less reliable"), node("slower reliable")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("reliability.example", IpVersion::V4);
-        let now = Instant::now();
-        let failed = manager
-            .feedback_for_group_node("score", nodes[0].id, target.clone())
-            .unwrap()
-            .start_at(now);
-        failed.setup_succeeded_at(now);
-        failed.finish_at(ScoreOutcome::Timeout, true, now);
-        for (leaf, latency) in nodes.iter().zip([100, slower]) {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                32,
-                latency,
-                1,
-                now + Duration::from_secs(1),
-            );
-        }
-        let at = now + Duration::from_secs(3);
-        let state = manager.score_state();
-        for reference in [0, 1] {
-            let decision = decision_at(&state.inner.lock(), &nodes, &target, reference, at);
-            assert!(decision.scores.iter().all(ScoreSnapshot::qualified));
-            assert!(
-                decision.scores[0].observed_reliability < decision.scores[1].observed_reliability
-            );
-            let summary = comparison::summarize(&decision, at);
-            assert!(summary.complete && !summary.response_misaligned);
-            assert_eq!(summary.supported, reference == 1 && slower == 105);
-            if slower == 115 {
-                assert!(!summary.equivalent);
-            }
-        }
-        if slower == 115 {
-            let report = state
-                .verification_snapshot_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at)
-                .unwrap();
-            assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
-            assert!(!report.missing.response);
-        }
-    }
-}
-
-#[test]
-fn unqualified_upload_noise_cannot_revoke_response_support() {
-    let mut baseline = None;
-    for noise in [false, true] {
-        let nodes = [node("selected"), node("second"), node("third")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("unqualified.example", IpVersion::V4);
-        let now = Instant::now();
-        rank_at(&manager, &nodes, &target, now);
-        for (index, (leaf, latency)) in nodes.iter().zip([100, 200, 300]).enumerate() {
-            train_transfers(
-                &manager,
-                leaf,
-                &target,
-                (4, usize::from(noise && index < 2)),
-                Duration::from_millis(latency),
-                (MIN_THROUGHPUT_BYTES, 1),
-                now,
-            );
-        }
-        let at = now + Duration::from_secs(3);
-        let state = manager.score_state();
-        let decision = scores(&state.inner.lock(), &nodes, &target, at);
-        for index in [1, 2] {
-            let pair = decision.pairs.get(index).unwrap();
-            assert!(pair.response.is_some() && pair.upload.is_none() && pair.download.is_none());
-        }
-        let summary = comparison::summarize(&decision, at);
-        assert!(summary.complete && summary.supported && !summary.response_misaligned);
-        let identity = (
-            summary.support,
-            summary.expires_at.map(|until| until.duration_since(at)),
-        );
-        if let Some(baseline) = baseline {
-            assert_eq!(identity, baseline);
-        } else {
-            baseline = Some(identity);
-        }
-        let report = state
-            .verification_snapshot_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at)
-            .unwrap();
-        assert_eq!(report.comparison, ScoreComparison::Supported);
-        assert!(!report.missing.response && !report.local_comparison.upload_known);
-    }
+    let relations: Vec<_> = report
+        .challengers
+        .iter()
+        .map(|c| (c.index, c.relation))
+        .collect();
+    assert_eq!(
+        relations,
+        [
+            (1, ScoreRelation::ChallengerFaster),
+            (2, ScoreRelation::SelectedFaster),
+        ]
+    );
 }
 
 #[test]
 fn common_target_aggregation_discards_lost_direction_identity() {
-    let mut baseline = None;
     for noise in [false, true] {
         let nodes = [node("selected"), node("second"), node("third")];
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -428,274 +230,19 @@ fn common_target_aggregation_discards_lost_direction_identity() {
             let pair = decision.pairs.get(index).unwrap();
             assert!(pair.upload.is_none() && pair.download.is_none());
         }
-        let summary = comparison::summarize(&decision, at);
-        assert!(summary.complete && summary.supported && !summary.response_misaligned);
-        let identity = (
-            summary.support,
-            summary.expires_at.map(|until| until.duration_since(at)),
-        );
-        if let Some(baseline) = baseline {
-            assert_eq!(identity, baseline);
-        } else {
-            baseline = Some(identity);
-        }
-        let report = evaluate(
-            &decision,
-            &nodes.iter().collect::<Vec<_>>(),
-            &aggregate,
-            None,
-            at,
-        )
-        .snapshot;
-        assert_eq!(report.comparison, ScoreComparison::Supported);
-        assert_eq!(report.basis, ScoreEvidenceBasis::CommonTargets);
-        assert!(!report.missing.response && !report.local_comparison.upload_known);
+        assert!(!comparison::summarize(&decision, at).response_misaligned);
     }
 }
 
 #[test]
-fn incoherent_upload_cannot_supply_a_win_or_hide_a_measured_tradeoff() {
-    for crossed in [false, true] {
-        let nodes = [node("selected"), node("second"), node("third")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("direction-cohorts.example", IpVersion::V4);
-        let now = Instant::now();
-        let reporters: Vec<Vec<_>> = nodes
-            .iter()
-            .map(|leaf| {
-                let feedback = manager
-                    .feedback_for_group_node("score", leaf.id, target.clone())
-                    .unwrap();
-                (0..4).map(|_| feedback.start_at(now)).collect()
-            })
-            .collect();
-        for (index, reporters) in reporters.iter().enumerate() {
-            for reporter in reporters {
-                reporter.setup_succeeded_at(now);
-                reporter.first_response_at(now + Duration::from_millis(100));
-                let upload = match index {
-                    0 => 1_048_576,
-                    1 => 524_288,
-                    _ => 1,
-                };
-                let download = if crossed && index == 0 {
-                    1_048_576
-                } else {
-                    524_288
-                };
-                reporter.transfer_at(upload, download, now + Duration::from_secs(1));
-            }
-        }
-        for index in [0, 2] {
-            for reporter in &reporters[index] {
-                reporter.transfer_at(1, 1, now + Duration::from_secs(16));
-                let upload = if index == 2 && crossed {
-                    2_097_152
-                } else if index == 0 {
-                    1_048_576
-                } else {
-                    524_288
-                };
-                reporter.transfer_at(upload, 1, now + Duration::from_secs(17));
-            }
-        }
-        for reporters in reporters {
-            for reporter in reporters {
-                reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(17));
-            }
-        }
-        let at = now + Duration::from_secs(18);
-        let state = manager.score_state();
-        let decision = scores(&state.inner.lock(), &nodes, &target, at);
-        let second = decision.pairs.get(1).unwrap();
-        let third = decision.pairs.get(2).unwrap();
-        assert_eq!(
-            second.response.unwrap().support,
-            third.response.unwrap().support
-        );
-        assert_ne!(
-            second.upload.unwrap().support,
-            third.upload.unwrap().support
-        );
-        let summary = comparison::summarize(&decision, at);
-        assert!(summary.complete && !summary.response_misaligned);
-        assert!(!summary.upload_known && summary.download_known);
-        assert_eq!(summary.directional_tradeoff, crossed);
-        assert!(!summary.supported && !summary.equivalent);
-        assert_eq!(decision.ordinary.index, 0);
-        let report = evaluate(
-            &decision,
-            &nodes.iter().collect::<Vec<_>>(),
-            &target,
-            None,
-            at,
-        )
-        .snapshot;
-        assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
-        assert!(!report.missing.response && !report.missing.transfer);
-        assert_eq!(report.next_action, ScoreValidationAction::None);
-    }
-}
-
-#[test]
-fn response_win_against_another_peer_cannot_hide_a_qualified_rate_defeat() {
-    let nodes = [
-        node("held rate"),
-        node("better rate"),
-        node("slower response"),
-    ];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("held-rate.example", IpVersion::V4);
-    let now = Instant::now();
-    for (leaf, (response, upload)) in nodes.iter().zip([(100, 524_288), (100, 589_824), (200, 1)]) {
-        train_transfers(
-            &manager,
-            leaf,
-            &target,
-            (8, 8),
-            Duration::from_millis(response),
-            (upload, 1),
-            now,
-        );
-    }
-    let at = now + Duration::from_secs(3);
-    let state = manager.score_state();
-    let decision = scores(&state.inner.lock(), &nodes, &target, at);
-    assert_eq!(decision.ordinary.index, 0);
-    assert!(decision.pairs.get(1).unwrap().upload.is_some());
-    assert!(decision.pairs.get(2).unwrap().upload.is_none());
-    let summary = comparison::summarize(&decision, at);
-    assert!(summary.complete && !summary.response_misaligned);
-    assert!(!summary.upload_known);
-    assert!(!summary.supported && !summary.equivalent, "{summary:?}");
-}
-
-#[test]
-fn later_challenger_direction_controls_claim_identity_and_expiry() {
-    let nodes = [node("selected"), node("second"), node("third")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("claim-support.example", IpVersion::V4);
-    let now = Instant::now();
-    let reporters: Vec<Vec<_>> = nodes
-        .iter()
-        .map(|leaf| {
-            let feedback = manager
-                .feedback_for_group_node("score", leaf.id, target.clone())
-                .unwrap();
-            (0..4).map(|_| feedback.start_at(now)).collect()
-        })
-        .collect();
-    for reporters in &reporters {
-        for reporter in reporters {
-            reporter.setup_succeeded_at(now);
-            reporter.first_response_at(now + Duration::from_millis(100));
-            reporter.transfer_at(1, 1, now + Duration::from_secs(1));
-        }
-    }
-    for index in [0, 2] {
-        for reporter in &reporters[index] {
-            reporter.transfer_at(1, 1, now + Duration::from_secs(16));
-            reporter.transfer_at(524_288, 1, now + Duration::from_secs(17));
-        }
-    }
-    for (leaf, latency) in nodes.iter().zip([100, 200, 300]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            8,
-            latency,
-            1,
-            now + Duration::from_secs(32),
-        );
-    }
-    let at = now + Duration::from_secs(63);
-    let state = manager.score_state();
-    let before = scores(&state.inner.lock(), &nodes, &target, at);
-    let response_support = before.pairs.get(2).unwrap().response.unwrap().support;
-    let expiry = before.pairs.get(2).unwrap().upload.unwrap().expires_at;
-    assert!(before.pairs.get(1).unwrap().upload.is_none());
-    let before = comparison::summarize(&before, at);
-    assert!(before.complete && before.supported && !before.response_misaligned);
-    assert_eq!(before.expires_at, Some(expiry));
-    for index in [0, 2] {
-        for reporter in &reporters[index] {
-            reporter.transfer_at(1, 1, now + Duration::from_secs(61));
-            reporter.transfer_at(524_288, 1, now + Duration::from_secs(62));
-        }
-    }
-    for reporters in reporters {
-        for reporter in reporters {
-            reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(62));
-        }
-    }
-    let decision = scores(&state.inner.lock(), &nodes, &target, at);
-    assert_eq!(
-        decision.pairs.get(2).unwrap().response.unwrap().support,
-        response_support
-    );
-    let after = comparison::summarize(&decision, at);
-    assert!(after.complete && after.supported && !after.response_misaligned);
-    assert_ne!(after.support, before.support);
-    assert_eq!(after.expires_at, before.expires_at);
-    let report = evaluate(
-        &decision,
-        &nodes.iter().collect::<Vec<_>>(),
-        &target,
-        None,
-        at,
-    )
-    .snapshot;
-    assert_eq!(report.comparison, ScoreComparison::Supported);
-    assert_eq!(
-        report.local_comparison.valid_for_ms,
-        Some(expiry.duration_since(at).as_millis() as u64)
-    );
-    assert!(report.valid_for_ms.unwrap() <= report.local_comparison.valid_for_ms.unwrap());
-
-    let decision = scores(&state.inner.lock(), &nodes, &target, expiry);
-    let response = decision.pairs.get(2).unwrap().response.unwrap();
-    assert_eq!(response.support, response_support);
-    let expired = comparison::summarize(&decision, expiry);
-    assert!(expired.complete && expired.supported && !expired.response_misaligned);
-    assert_ne!(expired.support, after.support);
-    assert_eq!(expired.expires_at, Some(response.expires_at));
-}
-
-#[test]
-fn rotation_evidence_can_neither_complete_nor_block_covered_members() {
+fn rotation_evidence_cannot_misalign_covered_members() {
     let nodes: Vec<_> = (0..4)
         .map(|index| node(&format!("evaluated {index}")))
         .collect();
     let refs = nodes.iter().collect::<Vec<_>>();
     let target = context("rotation.example", IpVersion::V4);
-    let with_rotation = |decision: &mut ranking::Decision, inner: &StateInner, at| {
-        decision.membership.covered[3] = false;
-        decision.pairs = pairs_at(
-            inner,
-            &target,
-            &refs,
-            (&decision.scores, decision.baseline),
-            (&decision.membership, 0),
-            at,
-        );
-    };
     let early = Instant::now();
     let late = early + Duration::from_secs(20);
-    // A compared rotation member cannot stand in for a covered member without evidence.
-    let mut inner = StateInner::default();
-    for index in [0, 1, 3] {
-        response(&mut inner, &nodes[index], &target, 4, 100, early);
-    }
-    let at = early + Duration::from_secs(1);
-    let mut decision = scores(&inner, &nodes, &target, at);
-    with_rotation(&mut decision, &inner, at);
-    assert!(!comparison::summarize(&decision, at).complete);
-    // Nor can uncovered comparisons alone complete a claim that covers only the selection.
-    decision.membership.covered[1] = false;
-    decision.membership.covered[2] = false;
-    assert!(!comparison::summarize(&decision, at).complete);
-    // Nor can its disjoint blocks hold back complete covered evidence.
     let mut inner = StateInner::default();
     for at in [early, late] {
         response(&mut inner, &nodes[0], &target, 4, 100, at);
@@ -706,15 +253,21 @@ fn rotation_evidence_can_neither_complete_nor_block_covered_members() {
     response(&mut inner, &nodes[3], &target, 4, 100, late);
     let at = late + Duration::from_secs(1);
     let mut decision = scores(&inner, &nodes, &target, at);
-    let all = comparison::summarize(&decision, at);
-    assert!(all.response_misaligned && !all.complete);
-    with_rotation(&mut decision, &inner, at);
-    let bounded = comparison::summarize(&decision, at);
-    assert!(bounded.complete && !bounded.response_misaligned);
+    assert!(comparison::summarize(&decision, at).response_misaligned);
+    decision.membership.covered[3] = false;
+    decision.pairs = pairs_at(
+        &inner,
+        &target,
+        &refs,
+        (&decision.scores, decision.baseline),
+        (&decision.membership, 0),
+        at,
+    );
+    assert!(!comparison::summarize(&decision, at).response_misaligned);
 }
 
 #[test]
-fn optional_response_cannot_destroy_covered_joint_support() {
+fn optional_response_cannot_misalign_covered_joint_support() {
     let nodes: Vec<_> = (0..4)
         .map(|index| node(&format!("joint {index}")))
         .collect();
@@ -752,38 +305,6 @@ fn optional_response_cannot_destroy_covered_joint_support() {
             (&decision.membership, 0),
             at,
         );
-        let summary = comparison::summarize(&decision, at);
-        assert!(summary.complete && summary.equivalent && !summary.response_misaligned);
-    }
-}
-
-#[test]
-fn dominance_is_relative_to_the_selection_and_needs_completed_qualification() {
-    let member = |observed: f64, completed: f64, fail_streak: u32| ScoreSnapshot {
-        reliability: observed,
-        reliability_upper: observed,
-        observed_reliability: observed,
-        useful_completed: completed,
-        fail_streak,
-        ..Default::default()
-    };
-    let selection = member(0.96, 8.0, 0);
-    let above_selection = member(0.97, 8.0, SCORE_FAIL_STREAK_EXCLUDE);
-    let below = member(0.9, 8.0, 0);
-    let unproven = member(0.9, 3.9, 0);
-    let baseline = performance_baseline(&[
-        selection,
-        member(1.0, 8.0, 0),
-        above_selection,
-        below,
-        unproven,
-    ]);
-    // Below the best member is not enough: only lower reliability than the selection vetoes.
-    for (candidate, dominated) in [(above_selection, false), (below, true), (unproven, false)] {
-        assert!(!ranking::normal_eligible(&candidate, baseline));
-        assert_eq!(
-            comparison::dominated(&selection, &candidate, baseline),
-            dominated
-        );
+        assert!(!comparison::summarize(&decision, at).response_misaligned);
     }
 }
