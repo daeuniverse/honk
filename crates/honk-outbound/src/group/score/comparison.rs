@@ -1,18 +1,15 @@
 use super::evidence::CellStamp;
 use super::ranking::normal_eligible;
-use super::verification::{TimedMetric, VerificationEvidence};
+use super::verification::VerificationEvidence;
 use super::{AggregateKey, ExactKey, ScoreSelectionContext, ScoreSnapshot, StateInner, Stats};
 use honk_config::node::Node;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 use uuid::Uuid;
 
 mod store;
 use store::{Bucket, Cell, Key, Timing};
-pub(super) use store::{Store, observe, target_bytes};
-mod summary;
-pub(super) use summary::{Summary, failure_excluded, summarize};
+pub(super) use store::{Store, observe};
 
 pub(super) const MAX_CELLS: usize = 256;
 pub(super) const MAX_TARGETS: usize = 8;
@@ -53,8 +50,6 @@ pub(super) struct MetricPair {
     pub reporters: u8,
     pub latest_at: Instant,
     pub expires_at: Instant,
-    // Fingerprints describe selected keys/blocks, never measured values or raw API targets.
-    pub support: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -64,26 +59,21 @@ pub(super) struct PairEvidence {
     pub upload: Option<MetricPair>,
     pub download: Option<MetricPair>,
     pub partial: bool,
+    /// Challenger reporters sharing live blocks with the reference on the exact target, up to
+    /// the four a pair needs, and the latest of their reports.
+    pub progress: u8,
+    pub progress_at: Option<Instant>,
 }
 
 /// Pairs indexed by node position; the reference and ineligible members have none.
 pub(super) struct PairCohort {
     pub reference: usize,
     pub pairs: Vec<Option<PairEvidence>>,
-    /// Covered members' joint common-block projection, with the same indexing, when one applies.
-    pub joint: Option<Vec<Option<PairEvidence>>>,
 }
 
 impl PairCohort {
     pub fn get(&self, index: usize) -> Option<PairEvidence> {
         self.pairs.get(index).copied().flatten()
-    }
-
-    pub fn summary_pair(&self, index: usize) -> Option<PairEvidence> {
-        self.joint
-            .as_ref()
-            .and_then(|joint| joint.get(index).copied().flatten())
-            .or_else(|| self.get(index))
     }
 }
 
@@ -115,24 +105,21 @@ impl Accumulator {
     }
 }
 
-/// Same-block accumulation shared by pair metrics and run progress; each caller keeps its scope.
+/// Same-block accumulation of both sides, with the earliest block deadline.
 fn accumulate_common(
     left: &[Bucket; BLOCKS],
     right: &[Bucket; BLOCKS],
     origin: Instant,
     now: Instant,
     timing: Timing,
-    blocks: u8,
-    mut on_block: impl FnMut(u64),
 ) -> Option<([Accumulator; 2], Option<Instant>)> {
     let mut sides = [Accumulator::default(), Accumulator::default()];
     let mut expires = None;
-    for (index, (left, right)) in left.iter().zip(right).enumerate() {
-        if blocks & (1 << index) == 0 || !timing.common(left, right, origin, now) {
+    for (left, right) in left.iter().zip(right) {
+        if !timing.common(left, right, origin, now) {
             continue;
         }
         let until = timing.deadline(origin, left.block)?;
-        on_block(left.block);
         sides[0].add(left);
         sides[1].add(right);
         expires = Some(expires.map_or(until, |old: Instant| old.min(until)));
@@ -141,17 +128,10 @@ fn accumulate_common(
 }
 
 fn metric_pair(
-    left: &[Bucket; BLOCKS],
-    right: &[Bucket; BLOCKS],
-    origin: Instant,
+    ([a, b], expires): ([Accumulator; 2], Option<Instant>),
     now: Instant,
     timing: Timing,
-    blocks: u8,
-    mut support: std::collections::hash_map::DefaultHasher,
 ) -> Option<MetricPair> {
-    let ([a, b], expires) = accumulate_common(left, right, origin, now, timing, blocks, |block| {
-        block.hash(&mut support)
-    })?;
     let reporters = a.distinct.min(b.distinct);
     if reporters < REPORTERS {
         return None;
@@ -167,7 +147,6 @@ fn metric_pair(
         reporters: reporters as u8,
         latest_at,
         expires_at,
-        support: support.finish(),
     })
 }
 
@@ -187,18 +166,13 @@ fn has_common_block(left: &Cell, right: &Cell, origin: Instant, now: Instant) ->
 fn merge_metric(acc: &mut Option<MetricPair>, next: Option<MetricPair>, count: usize) {
     *acc = match (*acc, next) {
         (_, Some(next)) if count == 0 => Some(next),
-        (Some(old), Some(next)) => {
-            let mut support = std::collections::hash_map::DefaultHasher::new();
-            (old.support, next.support).hash(&mut support);
-            Some(MetricPair {
-                incumbent: old.incumbent + next.incumbent,
-                candidate: old.candidate + next.candidate,
-                reporters: old.reporters.min(next.reporters),
-                latest_at: old.latest_at.min(next.latest_at),
-                expires_at: old.expires_at.min(next.expires_at),
-                support: support.finish(),
-            })
-        }
+        (Some(old), Some(next)) => Some(MetricPair {
+            incumbent: old.incumbent + next.incumbent,
+            candidate: old.candidate + next.candidate,
+            reporters: old.reporters.min(next.reporters),
+            latest_at: old.latest_at.min(next.latest_at),
+            expires_at: old.expires_at.min(next.expires_at),
+        }),
         _ => None,
     };
 }
@@ -209,7 +183,6 @@ fn paired_cell(
     origin: Instant,
     now: Instant,
     basis: Basis,
-    blocks: [u8; 3],
 ) -> PairEvidence {
     let mut result = PairEvidence {
         basis,
@@ -218,30 +191,22 @@ fn paired_cell(
     let Some(timing) = left.key.timing() else {
         return result;
     };
-    let mut support = std::collections::hash_map::DefaultHasher::new();
-    match &left.key {
-        Key::Traffic(key) => {
-            key.target.hash(&mut support);
-            (key.family as u8).hash(&mut support);
-        }
-        Key::Probe { scope, slot, .. } => {
-            scope.hash(&mut support);
-            slot.hash(&mut support);
-        }
+    let [response, upload, download] = std::array::from_fn(|metric| {
+        accumulate_common(
+            &left.metrics[metric],
+            &right.metrics[metric],
+            origin,
+            now,
+            timing,
+        )
+    });
+    if let Some(([_, challenger], _)) = &response {
+        result.progress = challenger.distinct.min(REPORTERS) as u8;
+        result.progress_at = challenger.last;
     }
-    for (index, ((a, b), output)) in left
-        .metrics
-        .iter()
-        .zip(&right.metrics)
-        .zip([
-            &mut result.response,
-            &mut result.upload,
-            &mut result.download,
-        ])
-        .enumerate()
-    {
-        *output = metric_pair(a, b, origin, now, timing, blocks[index], support.clone());
-    }
+    result.response = response.and_then(|sides| metric_pair(sides, now, timing));
+    result.upload = upload.and_then(|sides| metric_pair(sides, now, timing));
+    result.download = download.and_then(|sides| metric_pair(sides, now, timing));
     result
 }
 
@@ -298,7 +263,7 @@ impl PairScan {
                     self.common.partial = true;
                     return;
                 }
-                let pair = paired_cell(left, right, origin, now, Basis::ExactTarget, [u8::MAX; 3]);
+                let pair = paired_cell(left, right, origin, now, Basis::ExactTarget);
                 if context.target.as_ref() == Some(&key.target) {
                     self.exact = Some(pair);
                 }
@@ -321,7 +286,6 @@ impl PairScan {
                     origin,
                     now,
                     Basis::ConfiguredProbe,
-                    [u8::MAX; 3],
                 ));
             }
             _ => {}
@@ -345,6 +309,9 @@ impl PairScan {
             metric.incumbent /= self.count as f64;
             metric.candidate /= self.count as f64;
         }
+        let (progress, progress_at) = self
+            .exact
+            .map_or((0, None), |exact| (exact.progress, exact.progress_at));
         let mut result = self.exact.unwrap_or_default();
         if result.response.is_none() && result.upload.is_none() && result.download.is_none() {
             result = self.common;
@@ -355,44 +322,9 @@ impl PairScan {
             // Do not combine business rates with an unrelated proxy-probe response.
             result = pair;
         }
+        (result.progress, result.progress_at) = (progress, progress_at);
         result
     }
-}
-
-fn global_stats<'a>(
-    inner: &'a StateInner,
-    group: &str,
-    network: super::SelectionNetwork,
-    node: Uuid,
-) -> Option<&'a Stats> {
-    inner.aggregate.peek(&AggregateKey {
-        group: group.to_owned(),
-        network,
-        family: None,
-        node_id: node,
-    })
-}
-
-fn timed(
-    buckets: &[Bucket; BLOCKS],
-    origin: Instant,
-    now: Instant,
-    timing: Timing,
-) -> Option<TimedMetric> {
-    metric_pair(
-        buckets,
-        buckets,
-        origin,
-        now,
-        timing,
-        u8::MAX,
-        std::collections::hash_map::DefaultHasher::new(),
-    )
-    .map(|pair| TimedMetric {
-        value: pair.incumbent,
-        reporters: pair.reporters,
-        latest_at: pair.latest_at,
-    })
 }
 
 /// One decision's borrowed view of comparison evidence. Node positions and their current global
@@ -440,16 +372,16 @@ impl<'a> View<'a> {
     }
 
     /// Original pairs of evaluated eligible challengers against `reference`, as ordinary
-    /// selection compares them; the joint projection is a separate verification step.
+    /// selection compares them.
     pub(super) fn pairs(
         &self,
         (snapshots, baseline): (&[ScoreSnapshot], super::PerformanceBaseline),
-        (membership, reference): (&super::evaluation::Membership, usize),
+        (evaluated, reference): (&[bool], usize),
     ) -> PairCohort {
         let challengers: Vec<_> = (0..snapshots.len())
             .filter(|&index| {
                 index != reference
-                    && membership.evaluated[index]
+                    && evaluated[index]
                     && normal_eligible(&snapshots[index], baseline)
             })
             .collect();
@@ -460,62 +392,10 @@ impl<'a> View<'a> {
         {
             pairs[index] = Some(pair);
         }
-        PairCohort {
-            reference,
-            pairs,
-            joint: None,
-        }
+        PairCohort { reference, pairs }
     }
 
-    /// Adds covered members' joint common-block projection when their original pairs disagree.
-    /// Optional evidence cannot constrain covered members' alignment.
-    pub(super) fn join(&self, cohort: &mut PairCohort, membership: &super::evaluation::Membership) {
-        let covered: Vec<_> = (0..cohort.pairs.len())
-            .filter(|&index| membership.covered[index] && cohort.pairs[index].is_some())
-            .collect();
-        let original = |index: usize| cohort.pairs[index].expect("covered challengers are paired");
-        let mut identity = None;
-        let needs_joint = covered.len() > 1
-            && covered.iter().any(|&index| {
-                let pair = original(index);
-                let Some(response) = pair.response else {
-                    return true;
-                };
-                let next = (pair.basis, response.support);
-                let differs = identity.is_some_and(|old| old != next);
-                identity = Some(next);
-                differs
-            });
-        if !needs_joint {
-            return;
-        }
-        let business_response = covered.iter().any(|&index| {
-            let pair = original(index);
-            matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets)
-                && pair.response.is_some()
-        });
-        let Some(joint) = [
-            Basis::ExactTarget,
-            Basis::CommonTargets,
-            Basis::ConfiguredProbe,
-        ]
-        .into_iter()
-        .filter(|basis| *basis != Basis::ConfiguredProbe || !business_response)
-        .find_map(|basis| self.joint_pairs(cohort.reference, &covered, basis)) else {
-            return;
-        };
-        let mut by_node = vec![None; cohort.pairs.len()];
-        for (&index, pair) in covered.iter().zip(joint) {
-            by_node[index] = Some(pair);
-        }
-        cohort.joint = Some(by_node);
-    }
-
-    pub(super) fn node_evidence(
-        &self,
-        snapshots: &[ScoreSnapshot],
-        evaluated: &[bool],
-    ) -> Vec<VerificationEvidence> {
+    pub(super) fn node_evidence(&self, evaluated: &[bool]) -> Vec<VerificationEvidence> {
         let (inner, context, now) = (self.inner, self.context, self.now);
         let mut family_key = AggregateKey {
             group: self.group.to_owned(),
@@ -534,8 +414,7 @@ impl<'a> View<'a> {
                     target,
                     node_id: Uuid::nil(),
                 });
-        let mut evidence: Vec<_> = self
-            .nodes
+        self.nodes
             .iter()
             .zip(evaluated)
             .zip(&self.parents)
@@ -575,42 +454,7 @@ impl<'a> View<'a> {
                     .max(parent.and_then(|parent| parent.failed_at));
                 evidence
             })
-            .collect();
-        let Some(origin) = inner.comparisons.origin else {
-            return evidence;
-        };
-        let slot = super::evidence::probe_slot(context);
-        // One scope pass; each node still sees its own cells in store order.
-        for cell in inner.comparisons.scope(self.group, context.network) {
-            let wanted = match &cell.key {
-                Key::Traffic(key) => {
-                    Some(key.family) == context.target_family
-                        && Some(&key.target) == context.target.as_ref()
-                }
-                Key::Probe {
-                    slot: cell_slot, ..
-                } => *cell_slot == slot,
-            };
-            let Some(timing) = cell.key.timing().filter(|_| wanted) else {
-                continue;
-            };
-            for index in self.slots.of(cell.key.node()) {
-                if !evaluated[index] || !cell.valid(inner, self.parents[index]) {
-                    continue;
-                }
-                let evidence = &mut evidence[index];
-                match &cell.key {
-                    Key::Traffic(_) => {
-                        evidence.response = timed(&cell.metrics[0], origin, now, timing);
-                    }
-                    Key::Probe { scope, .. } if *scope == snapshots[index].probe_scope => {
-                        evidence.probe = timed(&cell.metrics[0], origin, now, timing);
-                    }
-                    Key::Probe { .. } => {}
-                }
-            }
-        }
-        evidence
+            .collect()
     }
 
     /// Pairs every challenger with the reference; results follow `challengers`.
@@ -654,17 +498,8 @@ impl<'a> View<'a> {
         results.into_iter().map(Option::unwrap_or_default).collect()
     }
 
-    /// Each node position's slot within `members`, which lists positions without repeats.
-    fn member_slots(&self, members: &[usize]) -> Vec<Option<usize>> {
-        let mut slots = vec![None; self.nodes.len()];
-        for (slot, &index) in members.iter().enumerate() {
-            slots[index] = Some(slot);
-        }
-        slots
-    }
-
     /// Visits valid reference/member cells of each wanted cohort in store order; `visit`
-    /// receives each member's position within `members`.
+    /// receives each member's position within `members`, which lists positions without repeats.
     fn for_each_pair(
         &self,
         reference: usize,
@@ -672,7 +507,10 @@ impl<'a> View<'a> {
         wanted: &dyn Fn(&Key) -> bool,
         mut visit: impl FnMut(usize, (&'a Cell, &'a Cell)),
     ) {
-        let member_slot = self.member_slots(members);
+        let mut member_slot = vec![None; self.nodes.len()];
+        for (slot, &index) in members.iter().enumerate() {
+            member_slot[index] = Some(slot);
+        }
         let reference_id = self.nodes[reference].id;
         // Keys are unique per node within a sorted cohort, so each cohort pairs at most once.
         for cohort in self
@@ -699,204 +537,4 @@ impl<'a> View<'a> {
             }
         }
     }
-
-    fn joint_pairs(
-        &self,
-        reference: usize,
-        covered: &[usize],
-        basis: Basis,
-    ) -> Option<Vec<PairEvidence>> {
-        let (inner, context, now) = (self.inner, self.context, self.now);
-        let origin = inner.comparisons.origin?;
-        let members: Vec<_> = std::iter::once(reference)
-            .chain(covered.iter().copied())
-            .collect();
-        let count = covered.len();
-        let mut result = vec![
-            PairEvidence {
-                basis,
-                ..PairEvidence::default()
-            };
-            count
-        ];
-        let mut targets = 0;
-        let mut partial = false;
-        let member_slot = self.member_slots(&members);
-        // A duplicated node id resolves to its first member slot.
-        let slot_of = |cell: &Cell| {
-            self.slots
-                .of(cell.key.node())
-                .filter_map(|index| member_slot[index])
-                .min()
-                .filter(|slot| cell.valid(inner, self.parents[members[*slot]]))
-        };
-        let reference_id = self.nodes[reference].id;
-        let reference_parent = self.parents[reference];
-        let mut selected = vec![None; members.len()];
-        let mut next = vec![PairEvidence::default(); count];
-        for current in inner.comparisons.cohorts(self.group, context.network) {
-            let eligible = match (&current[0].key, basis) {
-                (Key::Traffic(key), Basis::ExactTarget) => {
-                    Some(key.family) == context.target_family
-                        && Some(&key.target) == context.target.as_ref()
-                }
-                (Key::Traffic(key), Basis::CommonTargets) => context
-                    .target_family
-                    .is_none_or(|family| family == key.family),
-                (Key::Probe { slot, .. }, Basis::ConfiguredProbe) => {
-                    *slot == super::evidence::probe_slot(context)
-                }
-                _ => false,
-            };
-            if !eligible {
-                continue;
-            }
-            // Keys are unique per node within a cohort: fewer cells than members cannot be complete.
-            if current.len() < members.len() {
-                partial |= current
-                    .iter()
-                    .find(|cell| {
-                        cell.key.node() == reference_id && cell.valid(inner, reference_parent)
-                    })
-                    .is_some_and(|left| {
-                        current.iter().any(|right| {
-                            right.key.node() != reference_id
-                                && slot_of(right).is_some()
-                                && has_common_block(left, right, origin, now)
-                        })
-                    });
-                continue;
-            }
-            selected.fill(None);
-            for cell in current {
-                if let Some(slot) = slot_of(cell) {
-                    selected[slot] = Some(cell);
-                }
-            }
-            if selected.iter().any(Option::is_none) {
-                partial |= selected[0].is_some_and(|left| {
-                    selected[1..]
-                        .iter()
-                        .flatten()
-                        .any(|right| has_common_block(left, right, origin, now))
-                });
-                continue;
-            }
-            let left = selected[0]?;
-            let timing = left.key.timing()?;
-            let mut blocks = [0_u8; 3];
-            for (metric, mask) in blocks.iter_mut().enumerate() {
-                for block in 0..BLOCKS {
-                    if selected.iter().flatten().all(|cell| {
-                        timing.common(
-                            &left.metrics[metric][block],
-                            &cell.metrics[metric][block],
-                            origin,
-                            now,
-                        )
-                    }) {
-                        *mask |= 1 << block;
-                    }
-                }
-            }
-            blocks[1] &= blocks[0];
-            blocks[2] &= blocks[0];
-            for (slot, pair) in next.iter_mut().enumerate() {
-                *pair = paired_cell(left, selected[slot + 1]?, origin, now, basis, blocks);
-            }
-            if next.iter().any(|pair| pair.response.is_none()) {
-                partial |= selected[1..]
-                    .iter()
-                    .flatten()
-                    .any(|right| has_common_block(left, right, origin, now));
-                continue;
-            }
-            if targets == MAX_TARGETS {
-                partial = true;
-                continue;
-            }
-            for (pair, next) in result.iter_mut().zip(&next) {
-                merge_metric(&mut pair.response, next.response, targets);
-                merge_metric(&mut pair.upload, next.upload, targets);
-                merge_metric(&mut pair.download, next.download, targets);
-            }
-            targets += 1;
-            if basis != Basis::CommonTargets {
-                break;
-            }
-        }
-        if targets == 0 {
-            return None;
-        }
-        for pair in &mut result {
-            pair.partial = basis == Basis::CommonTargets && partial;
-            for metric in [&mut pair.response, &mut pair.upload, &mut pair.download]
-                .into_iter()
-                .flatten()
-            {
-                metric.incumbent /= targets as f64;
-                metric.candidate /= targets as f64;
-            }
-        }
-        Some(result)
-    }
-}
-
-pub(super) fn response_progress(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    reference: Uuid,
-    candidate: Uuid,
-    now: Instant,
-) -> Option<([u8; 2], u64)> {
-    let family = context.target_family?;
-    let target = context.target.as_ref()?;
-    if group.len().saturating_add(target_bytes(target)) > MAX_KEY_BYTES {
-        return None;
-    }
-    let mut key = ExactKey {
-        group: group.to_owned(),
-        network: context.network,
-        family,
-        target: target.clone(),
-        node_id: reference,
-    };
-    let mut identity = std::collections::hash_map::DefaultHasher::new();
-    let mut cells = [None; 2];
-    for (side, node) in [reference, candidate].into_iter().enumerate() {
-        let parent = global_stats(inner, group, context.network, node)?;
-        key.node_id = node;
-        let stats = inner.exact.peek(&key)?;
-        let stamp = CellStamp::current(stats, Some(parent))?;
-        (
-            parent.incarnation,
-            stats.incarnation,
-            stamp.invalidated_through,
-        )
-            .hash(&mut identity);
-        cells[side] = inner
-            .comparisons
-            .scope(group, context.network)
-            .iter()
-            .find(|cell| {
-                matches!(&cell.key, Key::Traffic(current) if current == &key)
-                    && cell.valid(inner, Some(parent))
-            });
-    }
-    let mut counts = [0; 2];
-    if let (Some(origin), [Some(left), Some(right)]) = (inner.comparisons.origin, cells) {
-        let timing = left.key.timing()?;
-        let (sides, _) = accumulate_common(
-            &left.metrics[0],
-            &right.metrics[0],
-            origin,
-            now,
-            timing,
-            u8::MAX,
-            |_| {},
-        )?;
-        counts = sides.map(|side| side.distinct.min(REPORTERS) as u8);
-    }
-    Some((counts, identity.finish()))
 }

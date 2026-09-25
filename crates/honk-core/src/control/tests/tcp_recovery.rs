@@ -52,6 +52,7 @@ async fn cold_urltest_refunds_unscheduled_score_work_before_relay_closes() -> an
             groups: groups.iter().map(|group| group.name.clone()).collect(),
             ..Default::default()
         });
+        let selections: Vec<_> = nodes.iter().step_by(2).map(|node| node.id).collect();
         let mut config = udp_test_config("cold", nodes, groups);
         config.global.dial_mode = "ip".into();
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -65,6 +66,25 @@ async fn cold_urltest_refunds_unscheduled_score_work_before_relay_closes() -> an
             1,
         );
         let manager = handle.group_manager.read().clone();
+        // Trials only serve challengers trailing the selection's completions, so each child's
+        // selection needs one before its sibling can hold cold work.
+        for leaf in selections {
+            let reporter = manager
+                .feedback_for_node(
+                    leaf,
+                    crate::group::ScoreSelectionContext::aggregate(
+                        SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        IpVersion::V4,
+                    ),
+                )
+                .unwrap()
+                .start();
+            reporter.setup_succeeded();
+            reporter.tx(1);
+            reporter.rx(1);
+            reporter.finish(crate::group::ScoreOutcome::Success);
+        }
         let counts = |group| manager.score_budget_counters(group, SelectionNetwork::Tcp);
         let mut client = TcpStream::connect(target).await?;
         let (accepted, client_addr) = listener.accept().await?;
@@ -392,7 +412,9 @@ fn train_score_setup(
         target_family: Some(IpVersion::V4),
         ..ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4)
     };
-    for (node, successes, latency) in [(preferred, 1000, 1), (alternate, 20, 500)] {
+    // The probe prefers `preferred`; the alternate's unanswered response question would take the
+    // first flow as a trial if its completions trailed the selection's.
+    for (node, successes, latency) in [(preferred, 1000, 1), (alternate, 1010, 500)] {
         let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
         for _ in 0..successes {
             let reporter = feedback.start();

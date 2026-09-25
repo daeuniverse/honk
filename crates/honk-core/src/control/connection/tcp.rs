@@ -857,6 +857,22 @@ mod score_tests {
             ..Default::default()
         };
         let manager = crate::group::GroupManager::new(&[group], &nodes);
+        // Trials only serve challengers trailing the selection's completions.
+        let seed = manager
+            .feedback_for_node(
+                nodes[0].id,
+                crate::group::ScoreSelectionContext::aggregate(
+                    SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .unwrap()
+            .start();
+        seed.setup_succeeded();
+        seed.tx(1);
+        seed.rx(1);
+        seed.finish(crate::group::ScoreOutcome::Success);
         let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
         let mut plan = manager.selection_plan_for_target("score", &context);
         let attempt = plan.entries[0].feedback.take().unwrap();
@@ -935,10 +951,6 @@ mod score_tests {
                 };
                 let before = snapshot();
                 assert_eq!(before.state, ScoreVerificationState::ObservedUsable);
-                assert_eq!(
-                    before.next_action,
-                    crate::group::ScoreValidationAction::NextBusinessFlow
-                );
                 drop(manager.selection_plan_for_target("score", &context));
                 let before_counts =
                     manager.score_verification_counters("score", SelectionNetwork::Tcp);
@@ -1005,10 +1017,6 @@ mod score_tests {
                 let after = snapshot();
                 // A target reset cannot erase the node's factual aggregate RX.
                 assert_eq!(after.state, ScoreVerificationState::ObservedUsable);
-                assert_eq!(
-                    after.next_action,
-                    crate::group::ScoreValidationAction::NextBusinessFlow
-                );
                 drop(manager.selection_plan_for_target("score", &context));
                 let after_counts =
                     manager.score_verification_counters("score", SelectionNetwork::Tcp);

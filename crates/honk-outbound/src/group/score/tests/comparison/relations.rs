@@ -125,16 +125,10 @@ fn response_equivalence_uses_actual_symmetric_tolerance_including_zero() {
         let at = now + Duration::from_secs(2);
         let state = manager.score_state();
         for reference in [0, 1] {
-            let decision = decision_at(&state.inner.lock(), &nodes, &target, reference, at);
+            let inner = state.inner.lock();
+            let decision = decision_at(&inner, &nodes, &target, reference, at);
             assert_eq!(decision.ordinary.index, reference);
-            let report = evaluate(
-                &decision,
-                &nodes.iter().collect::<Vec<_>>(),
-                &target,
-                None,
-                at,
-            )
-            .snapshot;
+            let report = report(&inner, &nodes, &target, &decision, at);
             let expected = match (equivalent, reference) {
                 (true, _) => ScoreRelation::Equivalent,
                 (false, 0) => ScoreRelation::SelectedFaster,
@@ -161,26 +155,20 @@ fn a_held_incumbent_reports_a_materially_faster_rival() {
     }
     let at = now + Duration::from_secs(2);
     let state = manager.score_state();
-    let decision = scores(&state.inner.lock(), &nodes, &target, at);
+    let inner = state.inner.lock();
+    let decision = scores(&inner, &nodes, &target, at);
     assert_eq!(decision.ordinary.index, 0);
-    let report = evaluate(
-        &decision,
-        &nodes.iter().collect::<Vec<_>>(),
-        &target,
-        None,
-        at,
-    )
-    .snapshot;
+    let report = report(&inner, &nodes, &target, &decision, at);
     let relations: Vec<_> = report
         .challengers
         .iter()
-        .map(|c| (c.index, c.relation))
+        .map(|c| (c.name.as_str(), c.relation))
         .collect();
     assert_eq!(
         relations,
         [
-            (1, ScoreRelation::ChallengerFaster),
-            (2, ScoreRelation::SelectedFaster),
+            ("faster", ScoreRelation::ChallengerFaster),
+            ("slower", ScoreRelation::SelectedFaster),
         ]
     );
 }
@@ -230,81 +218,5 @@ fn common_target_aggregation_discards_lost_direction_identity() {
             let pair = decision.pairs.get(index).unwrap();
             assert!(pair.upload.is_none() && pair.download.is_none());
         }
-        assert!(!comparison::summarize(&decision, at).response_misaligned);
-    }
-}
-
-#[test]
-fn rotation_evidence_cannot_misalign_covered_members() {
-    let nodes: Vec<_> = (0..4)
-        .map(|index| node(&format!("evaluated {index}")))
-        .collect();
-    let refs = nodes.iter().collect::<Vec<_>>();
-    let target = context("rotation.example", IpVersion::V4);
-    let early = Instant::now();
-    let late = early + Duration::from_secs(20);
-    let mut inner = StateInner::default();
-    for at in [early, late] {
-        response(&mut inner, &nodes[0], &target, 4, 100, at);
-    }
-    for index in [1, 2] {
-        response(&mut inner, &nodes[index], &target, 4, 100, early);
-    }
-    response(&mut inner, &nodes[3], &target, 4, 100, late);
-    let at = late + Duration::from_secs(1);
-    let mut decision = scores(&inner, &nodes, &target, at);
-    assert!(comparison::summarize(&decision, at).response_misaligned);
-    decision.membership.covered[3] = false;
-    decision.pairs = pairs_at(
-        &inner,
-        &target,
-        &refs,
-        (&decision.scores, decision.baseline),
-        (&decision.membership, 0),
-        at,
-    );
-    assert!(!comparison::summarize(&decision, at).response_misaligned);
-}
-
-#[test]
-fn optional_response_cannot_misalign_covered_joint_support() {
-    let nodes: Vec<_> = (0..4)
-        .map(|index| node(&format!("joint {index}")))
-        .collect();
-    let refs = nodes.iter().collect::<Vec<_>>();
-    let target = context("joint.example", IpVersion::V4);
-    let mut inner = StateInner::default();
-    let start = Instant::now();
-    // Covered pairs share B: {A, B} and {B, C}; the optional pair has only C.
-    for (seconds, members) in [(0, &[0, 1][..]), (20, &[0, 1, 2][..]), (40, &[0, 2, 3][..])] {
-        for &index in members {
-            response(
-                &mut inner,
-                &nodes[index],
-                &target,
-                4,
-                100,
-                start + Duration::from_secs(seconds),
-            );
-        }
-    }
-    let at = start + Duration::from_secs(41);
-    let mut decision = scores(&inner, &nodes, &target, at);
-    for score in &mut decision.scores {
-        assert!(score.qualified());
-        score.observed_reliability = 1.0;
-    }
-    decision.membership.covered[3] = false;
-    for evaluated in [false, true] {
-        decision.membership.evaluated[3] = evaluated;
-        decision.pairs = pairs_at(
-            &inner,
-            &target,
-            &refs,
-            (&decision.scores, decision.baseline),
-            (&decision.membership, 0),
-            at,
-        );
-        assert!(!comparison::summarize(&decision, at).response_misaligned);
     }
 }

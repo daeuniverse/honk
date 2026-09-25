@@ -73,7 +73,6 @@ fn context(host: &str, family: IpVersion) -> ScoreSelectionContext {
 
 fn trained_stats(successes: f64, latency_ms: f64, now: Instant) -> Stats {
     Stats {
-        attempts: successes,
         setup_success: successes,
         useful_success: successes,
         availability: Availability {
@@ -244,19 +243,16 @@ fn assert_usable_until(
     assert_eq!(state(expires), ScoreVerificationState::Provisional);
 }
 
-/// A decision's pairs with the covered joint projection, as `ranking::decision` builds them.
+/// A decision's original pairs, as `ranking::decision` builds them.
 fn pairs_at(
     inner: &StateInner,
     target: &ScoreSelectionContext,
     refs: &[&Node],
     scores: (&[ScoreSnapshot], PerformanceBaseline),
-    membership: (&super::evaluation::Membership, usize),
+    membership: (&[bool], usize),
     now: Instant,
 ) -> super::comparison::PairCohort {
-    let view = super::comparison::View::new(inner, "score", target, refs, now);
-    let mut pairs = view.pairs(scores, membership);
-    view.join(&mut pairs, membership.0);
-    pairs
+    super::comparison::View::new(inner, "score", target, refs, now).pairs(scores, membership)
 }
 
 fn decision_at(
@@ -273,9 +269,9 @@ fn decision_at(
         .collect::<Vec<_>>();
     let baseline = ranking::performance_baseline(&scores);
     // Comparison unit tests exercise every member; bounding is covered by evaluation tests.
-    let membership = super::evaluation::Membership::all(nodes.len());
-    let evidence = super::comparison::View::new(inner, "score", target, &refs, now)
-        .node_evidence(&scores, &membership.evaluated);
+    let membership = vec![true; nodes.len()];
+    let evidence =
+        super::comparison::View::new(inner, "score", target, &refs, now).node_evidence(&membership);
     let pairs = pairs_at(
         inner,
         target,

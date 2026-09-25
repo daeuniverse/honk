@@ -1,4 +1,5 @@
 use super::super::verification;
+use super::budget::complete_ordinary;
 use super::*;
 
 #[test]
@@ -30,16 +31,10 @@ fn settled_cohorts_stop_sampling_and_expiry_spends_only_business_funding() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
+    // Challengers hold less evidence than the selection, so expiry reopens trials for them.
     for (index, leaf) in nodes.iter().enumerate() {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            if index == 0 { 10 } else { 600 },
-            1,
-            now,
-        );
+        let (samples, response_ms) = if index == 0 { (24, 10) } else { (20, 600) };
+        train_at(&manager, leaf, &target, samples, response_ms, 1, now);
     }
     let state = manager.score_state();
     for _ in 0..32 {
@@ -92,6 +87,8 @@ fn settled_cohorts_stop_sampling_and_expiry_spends_only_business_funding() {
 fn new_targets_cannot_mint_exploration_and_peek_cannot_spend_it() {
     let nodes: Vec<_> = (0..8).map(|i| node(&format!("node-{i}"))).collect();
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    // Cancelled flows never complete, so the selection's seeded completion keeps trials offered.
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let now = Instant::now();
     let state = manager.score_state();
     for request in 0..64 {
@@ -115,7 +112,30 @@ fn new_targets_cannot_mint_exploration_and_peek_cannot_spend_it() {
     let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     assert_eq!(counts.business_starts, 64);
     assert_eq!(counts.scopes, 1);
-    assert!(counts.spent <= exploration_target(nodes.len()) as u64 + 63 / SCORE_EXPLORATION_PERIOD);
+    assert_eq!(
+        counts.spent,
+        exploration_target(nodes.len()) as u64 + 63 / SCORE_EXPLORATION_PERIOD
+    );
+}
+
+#[test]
+fn answered_unfinished_trial_holds_the_challenger_at_the_selection_ceiling() {
+    let nodes = [node("selection"), node("challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
+    let target = context("ceiling.example", IpVersion::V4);
+    let state = manager.score_state();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let now = Instant::now();
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, now);
+    assert_eq!(index, 1);
+    let reporter = attempt.begin_at(now).unwrap().start_at(now);
+    reporter.setup_succeeded_at(now);
+    // The reply answers the availability question, so the in-flight gate would admit another.
+    reporter.transfer_at(1, 1, now);
+    assert_eq!(state.rank_plan_at("score", &target, &refs, now).0, 0);
+    reporter.finish_at(ScoreOutcome::Cancelled, true, now);
+    assert_eq!(state.rank_plan_at("score", &target, &refs, now).0, 1);
 }
 
 #[test]
@@ -124,6 +144,16 @@ fn sparse_selection_without_started_business_cannot_earn_currency() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
+    // Selection evidence makes every rank offer a trial to the ledger.
+    manager.score_state().inner.lock().aggregate.put(
+        AggregateKey {
+            group: "score".into(),
+            network: SelectionNetwork::Tcp,
+            family: None,
+            node_id: nodes[0].id,
+        },
+        trained_stats(1.0, 100.0, now),
+    );
     for hour in 0..128 {
         rank_at(
             &manager,
@@ -280,9 +310,8 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
             decision.ordinary.reason,
             SelectionReason::FreshFailureBypass
         );
-        let evaluation = verification::evaluate(&decision, &refs, &target, None, later);
-        assert_eq!(evaluation.validation_index, Some(1));
-        assert!(evaluation.candidates[1].actionable());
+        let (_, order) = verification::questions(&decision, &target, &[0.0; 2], later);
+        assert_eq!(order.first(), Some(&1));
     }
     let mut challenger_trials = 0;
     let mut total_trials = 0;
@@ -375,8 +404,8 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
             decision.ordinary.reason,
             SelectionReason::FreshFailureBypass
         );
-        let evaluation = verification::evaluate(&decision, &refs, &target, None, escape_at);
-        assert_eq!(evaluation.validation_index, Some(0));
+        let (_, order) = verification::questions(&decision, &target, &[0.0; 2], escape_at);
+        assert_eq!(order.first(), Some(&0));
     }
     let (index, attempt) = state.rank_plan_at("score", &target, &refs, escape_at);
     assert_eq!(
@@ -542,10 +571,7 @@ fn cancelled_cold_trials_keep_alternative_coverage() {
     assert_eq!(counts.refunded, 0);
     for leaf in &nodes[1..] {
         let score = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
-        assert_eq!(
-            (score.attempts, score.completed, score.unresolved_failure),
-            (0.0, 0.0, false)
-        );
+        assert_eq!((score.completed, score.unresolved_failure), (0.0, false));
     }
 }
 
@@ -555,8 +581,9 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    for (leaf, latency) in nodes.iter().zip([100, 105]) {
-        train_at(&manager, leaf, &target, 20, latency, 1, now);
+    // The trial needs the incumbent ahead of the challenger's evidence.
+    for (leaf, samples, latency) in [(&nodes[0], 21, 100), (&nodes[1], 20, 105)] {
+        train_at(&manager, leaf, &target, samples, latency, 1, now);
     }
     let state = manager.score_state();
     let node_refs = [&nodes[0], &nodes[1]];
@@ -579,17 +606,6 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
             .finish_at(ScoreOutcome::Cancelled, false, at);
     }
     at += PERFORMANCE_MAX_AGE;
-    let before_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    let (index, control) = state.rank_plan_at("score", &target, &node_refs, at);
-    assert_eq!(index, 0);
-    control
-        .begin_at(at)
-        .unwrap()
-        .start_at(at)
-        .finish_at(ScoreOutcome::Cancelled, false, at);
-    let after_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    assert_eq!(after_control.spent, before_control.spent);
-    assert_eq!(after_control.trial_starts, before_control.trial_starts);
     let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, at);
     assert_eq!(index, 1);
     feedback

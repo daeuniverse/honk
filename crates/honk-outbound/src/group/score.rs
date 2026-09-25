@@ -8,7 +8,6 @@ mod ranking;
 pub(in crate::group) mod selection;
 #[cfg(test)]
 mod tests;
-mod validation;
 mod verification;
 
 pub use budget::ScoreBudgetCounters;
@@ -240,7 +239,6 @@ struct Stats {
     incarnation: u64,
     node_incarnation: u64,
     last_node_failure_episode: u64,
-    attempts: f64,
     setup_success: f64,
     setup_failure: f64,
     useful_success: f64,
@@ -253,7 +251,6 @@ struct Stats {
     qualified_until: Option<Instant>,
     warm_setup_ms: WeightedMean,
     probes: [evidence::ProbeMetric; 6],
-    last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
     carrier_pressure: [Option<crate::transport_quality::TransportPressure>; 2],
     fail_streak: u32,
@@ -288,11 +285,6 @@ impl SelectionCadenceKey {
             family: context.target_family,
         }
     }
-}
-
-struct SelectionCadence {
-    revalidated_at: Instant,
-    run: Option<validation::ValidationRun>,
 }
 
 /// Flap history is scoped to the same target the pick was ranked for:
@@ -419,7 +411,7 @@ struct StateInner {
     budgets: HashMap<SelectionCadenceKey, budget::Scope>,
     root_business_starts: u64,
     comparisons: comparison::Store,
-    selection_counts: HashMap<SelectionCadenceKey, SelectionCadence>,
+    revalidated_at: HashMap<SelectionCadenceKey, Instant>,
     evaluation: HashMap<SelectionReasonKey, evaluation::EvaluationSet>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
@@ -445,7 +437,7 @@ impl Default for StateInner {
             budgets: HashMap::new(),
             root_business_starts: 0,
             comparisons: comparison::Store::default(),
-            selection_counts: HashMap::new(),
+            revalidated_at: HashMap::new(),
             evaluation: HashMap::new(),
             selection_history: LruCache::new(
                 // SAFE-EXPECT: the capacity is a positive compile-time constant.
@@ -530,7 +522,7 @@ impl ScorePolicyState {
         inner.valid_groups = groups.into_iter().collect();
         inner.comparisons.clear();
         let StateInner {
-            selection_counts,
+            revalidated_at,
             evaluation,
             selection_reasons,
             verification_counters,
@@ -540,7 +532,7 @@ impl ScorePolicyState {
             valid_groups,
             ..
         } = &mut *inner;
-        selection_counts.clear();
+        revalidated_at.clear();
         evaluation.retain(|key, _| valid_groups.contains(&key.group));
         for set in evaluation.values_mut() {
             set.reset_members();
@@ -670,11 +662,6 @@ impl ScorePolicyState {
             );
             return;
         };
-        if history.selections == 0 {
-            history.current = node_id;
-            history.selections = 1;
-            return;
-        }
         history.selections = history.selections.saturating_add(1);
         if history.current == node_id {
             return;
@@ -766,7 +753,7 @@ impl ScorePolicyState {
         group: &str,
         context: &ScoreSelectionContext,
         node_id: Uuid,
-    ) -> Option<(u64, u64, u64)> {
+    ) -> Option<(u64, u64)> {
         let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) else {
             return None;
         };
@@ -782,7 +769,6 @@ impl ScorePolicyState {
             })
             .map(|stats| {
                 (
-                    stats.attempts.round() as u64,
                     stats.setup_success.round() as u64,
                     stats.setup_failure.round() as u64,
                 )
@@ -818,7 +804,7 @@ impl ScorePolicyState {
         group: &str,
         network: SelectionNetwork,
         node_id: Uuid,
-    ) -> Option<(u64, u64, u64)> {
+    ) -> Option<(u64, u64)> {
         self.inner
             .lock()
             .aggregate
@@ -830,7 +816,6 @@ impl ScorePolicyState {
             })
             .map(|stats| {
                 (
-                    stats.attempts.round() as u64,
                     stats.setup_success.round() as u64,
                     stats.setup_failure.round() as u64,
                 )
@@ -840,7 +825,6 @@ impl ScorePolicyState {
 
 #[derive(Clone, Copy, Default)]
 struct ScoreSnapshot {
-    attempts: f64,
     completed: f64,
     reliability: f64,
     reliability_upper: f64,
@@ -854,13 +838,10 @@ struct ScoreSnapshot {
     warm_setup: MetricSnapshot,
     probe_scope: u64,
     observed_reliability: f64,
-    last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
     carrier_pressure_at: Option<Instant>,
     unresolved_failure: bool,
     explore_backed_off: bool,
-    node_failure: bool,
-    target_failure: bool,
     fail_streak: u32,
     selected_at: u64,
 }
@@ -891,6 +872,5 @@ struct FlowSample {
     tx: u64,
     rx: u64,
     eligible_rx_at: Option<Instant>,
-    elapsed: Duration,
     count_usefulness: bool,
 }

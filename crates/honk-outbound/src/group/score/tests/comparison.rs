@@ -1,10 +1,8 @@
 use super::super::comparison::{self, Basis, MAX_CELLS, MAX_KEY_BYTES, PairEvidence};
 use super::super::evidence::Observation;
 use super::super::ranking::{ordinary_selection, performance_baseline};
-use super::super::verification::evaluate;
 use super::*;
 
-mod joint;
 mod relations;
 mod storage_timing;
 
@@ -146,6 +144,19 @@ fn scores(
     now: Instant,
 ) -> super::super::ranking::Decision {
     decision_at(inner, nodes, target, 0, now)
+}
+
+/// The readonly report of `decision`, with members named by node.
+fn report(
+    inner: &StateInner,
+    nodes: &[Node],
+    target: &ScoreSelectionContext,
+    decision: &super::super::ranking::Decision,
+    now: Instant,
+) -> ScoreVerificationSnapshot {
+    let refs: Vec<_> = nodes.iter().collect();
+    let names: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
+    super::super::verification::report(inner, ("score", target), decision, (&refs, &names), now)
 }
 
 fn pair(

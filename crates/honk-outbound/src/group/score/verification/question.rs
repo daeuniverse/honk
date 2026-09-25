@@ -1,7 +1,7 @@
-//! Each member's open evidence question, the next optional validation target, and the readonly
-//! pairwise comparisons of the ordinary selection.
-use super::super::comparison::{Basis, Summary, equivalent};
-use super::super::ranking::Decision;
+//! Each member's open evidence question, the dispatch walk that funds optional work for them,
+//! and the readonly report of the ordinary selection's pairwise comparisons.
+use super::super::comparison::{Basis, equivalent};
+use super::super::ranking::{Decision, normal_eligible};
 use super::*;
 
 fn qualified(metric: Option<TimedMetric>) -> bool {
@@ -12,25 +12,17 @@ pub(in crate::group::score) fn usable(evidence: &VerificationEvidence) -> bool {
     qualified(evidence.business)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResponseGap {
-    None,
-    Missing,
-    Unpaired,
-    Availability,
-    ProbeScope,
-    Degraded,
-    Misaligned,
-}
-
 #[derive(Clone, Copy)]
 pub(in crate::group::score) struct CandidateQuestion {
-    pub question: ScoreEvidenceQuestion,
-    pub required: usize,
+    question: ScoreEvidenceQuestion,
+    /// A trial can still advance this question; otherwise it waits for ordinary traffic.
+    fundable: bool,
+    /// Evidence already gathered toward an unfinished question; finishing it first keeps its
+    /// reporters inside the windows they expire from.
+    partial: f64,
     excluded: bool,
     evaluated: bool,
     backed_off: bool,
-    response_gap: ResponseGap,
 }
 
 impl CandidateQuestion {
@@ -38,194 +30,97 @@ impl CandidateQuestion {
         self.evaluated && !self.excluded && self.question != ScoreEvidenceQuestion::None
     }
 
-    pub fn actionable(&self) -> bool {
-        self.pending() && !self.backed_off
-    }
-
-    pub fn needs_alignment(&self) -> bool {
-        self.response_gap == ResponseGap::Misaligned
+    fn actionable(&self) -> bool {
+        self.pending() && !self.backed_off && self.fundable
     }
 }
 
-pub(super) fn milliseconds(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
+/// A recent failure excludes an ineligible member until its performance evidence expires.
+fn failure_excluded(decision: &Decision, index: usize, now: Instant) -> bool {
+    !normal_eligible(&decision.scores[index], decision.baseline)
+        && decision.evidence[index]
+            .failed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE)
 }
 
-fn untried_hint(decision: &Decision, left: usize, right: usize) -> std::cmp::Ordering {
-    let scores = &decision.scores;
-    if scores[left].selected_at != 0 || scores[right].selected_at != 0 {
-        return std::cmp::Ordering::Equal;
-    }
-    let evidence = &decision.evidence;
-    let (left_metric, right_metric) =
-        if evidence[left].response.is_some() || evidence[right].response.is_some() {
-            (evidence[left].response, evidence[right].response)
-        } else if scores[left].probe_scope == scores[right].probe_scope {
-            (evidence[left].probe, evidence[right].probe)
-        } else {
-            return std::cmp::Ordering::Equal;
-        };
-    left_metric
-        .map_or(f64::INFINITY, |metric| metric.value)
-        .total_cmp(&right_metric.map_or(f64::INFINITY, |metric| metric.value))
+/// The selection's original pair with this member holds fresh business response evidence of
+/// this scope, newer than the selection's latest degradation. Probes never settle it.
+fn paired(
+    decision: &Decision,
+    context: &ScoreSelectionContext,
+    index: usize,
+    now: Instant,
+) -> bool {
+    let wanted = if context.target.is_some() {
+        Basis::ExactTarget
+    } else {
+        Basis::CommonTargets
+    };
+    let degraded_at = decision.scores[decision.pairs.reference].degraded_at;
+    decision.pairs.get(index).is_some_and(|pair| {
+        pair.basis == wanted
+            && !pair.partial
+            && pair.response.is_some_and(|metric| {
+                now < metric.expires_at && degraded_at.is_none_or(|at| metric.latest_at >= at)
+            })
+    })
 }
 
-pub(in crate::group::score) fn startup_index(decision: &Decision) -> Option<usize> {
-    (decision.scores.len() > 1)
-        .then(|| {
-            decision
-                .scores
-                .iter()
-                .enumerate()
-                .filter(|(index, score)| {
-                    decision.membership.evaluated[*index]
-                        && score.completed < MIN_TRAINED_EVIDENCE
-                        && !score.explore_backed_off
-                })
-                .min_by(|(left_index, left), (right_index, right)| {
-                    left.attempts
-                        .total_cmp(&right.attempts)
-                        .then_with(|| untried_hint(decision, *left_index, *right_index))
-                        .then_with(|| left.selected_at.cmp(&right.selected_at))
-                        .then_with(|| left_index.cmp(right_index))
-                })
-                .map(|(index, _)| index)
-        })
-        .flatten()
-}
-
-/// Which response metric validation reads: configured probes stand in only for targetless
-/// scopes whose comparison has no business response basis.
-#[derive(Clone, Copy)]
-struct Responses<'a> {
-    evidence: &'a [VerificationEvidence],
-    probe: bool,
-}
-
-impl<'a> Responses<'a> {
-    fn new(decision: &'a Decision, context: &ScoreSelectionContext, summary: &Summary) -> Self {
-        let probe = context.target.is_none()
-            && match summary.basis {
-                Basis::ConfiguredProbe => true,
-                Basis::None => qualified(decision.evidence[decision.ordinary.index].probe),
-                Basis::ExactTarget | Basis::CommonTargets => false,
-            };
-        Self {
-            evidence: &decision.evidence,
-            probe,
-        }
-    }
-
-    fn get(self, index: usize) -> Option<TimedMetric> {
-        if self.probe {
-            self.evidence[index].probe
-        } else {
-            self.evidence[index].response
-        }
-    }
-}
-
-/// One member's open question and why its response evidence cannot yet support a comparison.
 fn candidate_question(
     decision: &Decision,
     context: &ScoreSelectionContext,
-    summary: &Summary,
-    responses: Responses<'_>,
     index: usize,
     now: Instant,
 ) -> CandidateQuestion {
-    let snapshots = &decision.scores;
-    let evidence = &decision.evidence;
+    let score = &decision.scores[index];
+    let evidence = &decision.evidence[index];
     let selected = decision.ordinary.index;
-    let winner = &snapshots[selected];
-    let score = &snapshots[index];
-    let excluded = super::comparison::failure_excluded(decision, index, now);
-    let pair = decision.pairs.summary_pair(index);
-    let paired_at = if context.target.is_none() && !responses.probe {
-        pair.and_then(|pair| pair.response)
-            .map(|metric| metric.latest_at)
-            .or_else(|| {
-                (index == selected)
-                    .then_some(summary.response_latest_at)
-                    .flatten()
-            })
-    } else {
-        None
-    };
-    let availability_missing = !usable(&evidence[index]);
-    let response_gap = if !qualified(responses.get(index)) && paired_at.is_none() {
-        ResponseGap::Missing
-    } else if pair.is_some_and(|pair| pair.partial || pair.response.is_none()) {
-        ResponseGap::Unpaired
-    } else if !responses.probe && availability_missing {
-        ResponseGap::Availability
-    } else if responses.probe && score.probe_scope != winner.probe_scope {
-        ResponseGap::ProbeScope
-    } else if winner.degraded_at.is_some_and(|at| {
-        responses
-            .get(index)
-            .map(|metric| metric.latest_at)
-            .or(paired_at)
-            .is_none_or(|seen| seen < at)
-    }) {
-        ResponseGap::Degraded
-    } else if summary.response_misaligned
-        && !excluded
-        && (index == selected
-            || pair
-                .and_then(|pair| pair.response)
-                .is_some_and(|metric| now < metric.expires_at))
-    {
-        ResponseGap::Misaligned
-    } else {
-        ResponseGap::None
-    };
-    let question = if score.fail_streak > 0 {
-        ScoreEvidenceQuestion::Recovery
-    } else if availability_missing {
-        ScoreEvidenceQuestion::Availability
-    } else if response_gap != ResponseGap::None {
-        ScoreEvidenceQuestion::Response
+    let degraded_at = decision.scores[decision.pairs.reference].degraded_at;
+    // Reporters from before the selection degraded cannot refresh the pair, so they are no progress.
+    let progress = decision
+        .pairs
+        .get(index)
+        .filter(|pair| degraded_at.is_none_or(|at| pair.progress_at.is_some_and(|last| last >= at)))
+        .map_or(0, |pair| pair.progress);
+    // Only members ordinary selection could compare can be asked for a pair.
+    let unpaired = index != selected
+        && normal_eligible(score, decision.baseline)
+        && !paired(decision, context, index, now);
+    let (question, gathered) = if score.fail_streak > 0 {
+        (ScoreEvidenceQuestion::Recovery, None)
+    } else if !usable(evidence) {
+        (
+            ScoreEvidenceQuestion::Availability,
+            Some(
+                evidence
+                    .business
+                    .map_or(0.0, |metric| f64::from(metric.reporters)),
+            ),
+        )
+    } else if unpaired {
+        (ScoreEvidenceQuestion::Response, Some(f64::from(progress)))
     } else if decision.baseline.any_qualified && !score.qualified() {
-        ScoreEvidenceQuestion::Qualification
+        (
+            ScoreEvidenceQuestion::Qualification,
+            Some(score.useful_completed),
+        )
     } else {
-        ScoreEvidenceQuestion::None
-    };
-    let supported = match question {
-        ScoreEvidenceQuestion::Availability => evidence[index]
-            .business
-            .map_or(0.0, |metric| f64::from(metric.reporters)),
-        ScoreEvidenceQuestion::Response
-            if matches!(
-                response_gap,
-                ResponseGap::Missing
-                    | ResponseGap::Unpaired
-                    | ResponseGap::ProbeScope
-                    | ResponseGap::Misaligned
-            ) =>
-        {
-            0.0
-        }
-        ScoreEvidenceQuestion::Response => responses
-            .get(index)
-            .map_or(0.0, |metric| f64::from(metric.reporters)),
-        ScoreEvidenceQuestion::Qualification => score.useful_completed,
-        _ => PERFORMANCE_VALIDATION_SAMPLES,
+        (ScoreEvidenceQuestion::None, None)
     };
     CandidateQuestion {
         question,
-        required: (PERFORMANCE_VALIDATION_SAMPLES - supported)
-            .ceil()
-            .clamp(1.0, 4.0) as usize,
-        excluded,
-        evaluated: decision.membership.evaluated[index],
+        fundable: gathered.is_none_or(|gathered| gathered < PERFORMANCE_VALIDATION_SAMPLES),
+        partial: gathered
+            .filter(|gathered| *gathered < PERFORMANCE_VALIDATION_SAMPLES)
+            .unwrap_or(0.0),
+        excluded: failure_excluded(decision, index, now),
+        evaluated: decision.membership[index],
         backed_off: score.explore_backed_off,
-        response_gap,
     }
 }
 
 /// The ordinary selection's original pairs, as promotion reads them, with a fresh response.
-fn challengers(decision: &Decision, now: Instant) -> Vec<ScoreChallenger> {
+fn challengers(decision: &Decision, names: &[&str], now: Instant) -> Vec<ScoreChallenger> {
     let pairs = &decision.pairs;
     (0..pairs.pairs.len())
         .filter(|index| *index != pairs.reference)
@@ -246,57 +141,79 @@ fn challengers(decision: &Decision, now: Instant) -> Vec<ScoreChallenger> {
                 ScoreRelation::SelectedFaster
             };
             Some(ScoreChallenger {
-                name: String::new(),
+                name: names[index].to_owned(),
                 basis,
                 relation,
                 reporters: response.reporters,
-                valid_for_ms: milliseconds(response.expires_at.saturating_duration_since(now)),
-                index,
+                valid_for_ms: u64::try_from(
+                    response
+                        .expires_at
+                        .saturating_duration_since(now)
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             })
         })
         .collect()
 }
 
-/// The member optional validation should serve next, if any is actionable.
-fn validation_index(
+/// Actionable challengers in the order optional work serves them: untrained members first, then
+/// the most progress toward an unfinished question, so its reporters land inside the windows they
+/// expire from, then the least recently selected. Never-selected members prefer a faster probe of
+/// the selection's measurement scope. Except for recovery, a trial never lifts a challenger's
+/// completions above the selection's, counting its unfinished work as completions already on
+/// their way: first choice follows evidence, so trials that train a challenger first would
+/// displace the probe-preferred selection.
+fn dispatch_order(
     decision: &Decision,
-    nodes: &[&Node],
     candidates: &[CandidateQuestion],
-    focused: Option<Uuid>,
-) -> Option<usize> {
+    unfinished: &[f64],
+) -> Vec<usize> {
+    let scores = &decision.scores;
     let selected = decision.ordinary.index;
-    decision
-        .scores
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != selected && candidates[*index].actionable())
-        .min_by(|(left_index, left), (right_index, right)| {
-            // A short run resolves one real question; no-progress/cancelled work
-            // rotates by recency instead of pinning that run indefinitely.
-            let focus = |index: usize| {
-                focused == Some(nodes[index].id) && decision.evidence[index].business.is_some()
-            };
-            focus(*right_index)
-                .cmp(&focus(*left_index))
-                .then_with(|| untried_hint(decision, *left_index, *right_index))
-                .then_with(|| left.selected_at.cmp(&right.selected_at))
-                .then_with(|| left.last_attempt.cmp(&right.last_attempt))
-                .then_with(|| right.reliability_upper.total_cmp(&left.reliability_upper))
-                .then_with(|| left_index.cmp(right_index))
+    let ceiling = scores[selected].completed;
+    let scope = scores[selected].probe_scope;
+    let hint = |index: usize| {
+        (scores[index].selected_at == 0 && scores[index].probe_scope == scope)
+            .then_some(scores[index].probe.value)
+            .flatten()
+            .unwrap_or(f64::INFINITY)
+    };
+    let trained = |index: usize| scores[index].completed >= MIN_TRAINED_EVIDENCE;
+    let mut order: Vec<_> = (0..candidates.len())
+        .filter(|&index| {
+            index != selected
+                && candidates[index].actionable()
+                && (candidates[index].question == ScoreEvidenceQuestion::Recovery
+                    || scores[index].completed + unfinished[index] < ceiling)
         })
-        .map(|(index, _)| index)
+        .collect();
+    order.sort_by(|&left, &right| {
+        trained(left)
+            .cmp(&trained(right))
+            .then_with(|| {
+                candidates[right]
+                    .partial
+                    .total_cmp(&candidates[left].partial)
+            })
+            .then_with(|| scores[left].selected_at.cmp(&scores[right].selected_at))
+            .then_with(|| hint(left).total_cmp(&hint(right)))
+            .then_with(|| left.cmp(&right))
+    });
+    order
 }
 
 fn next_step(
     candidates: &[CandidateQuestion],
-    validation_index: Option<usize>,
+    order: &[usize],
 ) -> (
     ScoreValidationAction,
     ScoreEvidenceQuestion,
     ScoreWaitReason,
 ) {
-    let question_index = validation_index
-        .or_else(|| candidates.iter().position(CandidateQuestion::actionable))
+    let question_index = order
+        .first()
+        .copied()
         .or_else(|| candidates.iter().position(CandidateQuestion::pending));
     match question_index.map(|index| candidates[index]) {
         Some(candidate) if candidate.backed_off => (
@@ -317,50 +234,91 @@ fn next_step(
     }
 }
 
-pub(in crate::group::score) fn evaluate(
+/// Each member's open question, and the actionable members in dispatch order.
+pub(in crate::group::score) fn questions(
+    decision: &Decision,
+    context: &ScoreSelectionContext,
+    unfinished: &[f64],
+    now: Instant,
+) -> (Vec<CandidateQuestion>, Vec<usize>) {
+    let candidates: Vec<_> = (0..decision.scores.len())
+        .map(|index| candidate_question(decision, context, index, now))
+        .collect();
+    let order = dispatch_order(decision, &candidates, unfinished);
+    (candidates, order)
+}
+
+/// Reserves one credit for the first member in dispatch order the ledger admits. A budget
+/// refusal ends the walk; an in-flight refusal tries the next member.
+pub(in crate::group::score) fn plan(
+    state: &Arc<ScorePolicyState>,
+    inner: &mut StateInner,
+    (group, context): (&str, &ScoreSelectionContext),
     decision: &Decision,
     nodes: &[&Node],
-    context: &ScoreSelectionContext,
-    cadence: Option<&SelectionCadence>,
     now: Instant,
-) -> Evaluation {
-    let selected = decision.ordinary.index;
-    let summary = super::comparison::summarize(decision, now);
-    let responses = Responses::new(decision, context, &summary);
-    let candidates: Vec<_> = (0..decision.scores.len())
-        .map(|index| candidate_question(decision, context, &summary, responses, index, now))
-        .collect();
-    let focused = cadence
-        .and_then(|cadence| cadence.run.as_ref())
-        .and_then(|run| run.focused(context, now));
-    let validation_index = validation_index(decision, nodes, &candidates, focused);
-    let (next_action, question, wait_reason) = next_step(&candidates, validation_index);
-    Evaluation {
-        snapshot: ScoreVerificationSnapshot {
-            state: if usable(&decision.evidence[selected]) {
-                ScoreVerificationState::ObservedUsable
-            } else {
-                ScoreVerificationState::Provisional
-            },
-            next_action,
-            question,
-            wait_reason,
-            challengers: challengers(decision, now),
-            candidate_count: decision.scores.len(),
-            evaluated_count: candidates
-                .iter()
-                .filter(|candidate| candidate.evaluated)
-                .count(),
-            pending_count: candidates
-                .iter()
-                .filter(|candidate| candidate.pending())
-                .count(),
-            network: context.network,
-            target_family: context.target_family,
-            health_family: context.health_family,
-            target_specific: context.target.is_some(),
+) -> (RankedSelection, Option<Arc<budget::Work>>) {
+    let unfinished = budget::unfinished(inner, group, context, nodes, now);
+    let (candidates, order) = questions(decision, context, &unfinished, now);
+    for index in order {
+        let question = candidates[index].question;
+        match budget::reserve(state, inner, group, context, nodes[index].id, question, now) {
+            Ok(work) => {
+                let reason = if work.is_cold() {
+                    SelectionReason::ColdExplore
+                } else {
+                    SelectionReason::PeriodicExplore
+                };
+                return (RankedSelection { index, reason }, Some(work));
+            }
+            Err(ScoreWaitReason::Budget) => break,
+            Err(_) => {}
+        }
+    }
+    (decision.ordinary, None)
+}
+
+/// The readonly report: the question dispatch serves next with the ledger's wait for it, and the
+/// ordinary selection's fresh response relations under the members' display `names`.
+pub(in crate::group::score) fn report(
+    inner: &StateInner,
+    (group, context): (&str, &ScoreSelectionContext),
+    decision: &Decision,
+    (nodes, names): (&[&Node], &[&str]),
+    now: Instant,
+) -> ScoreVerificationSnapshot {
+    let unfinished = budget::unfinished(inner, group, context, nodes, now);
+    let (candidates, order) = questions(decision, context, &unfinished, now);
+    let (next_action, question, mut wait_reason) = next_step(&candidates, &order);
+    if let Some(&index) = order.first() {
+        let question = candidates[index].question;
+        let wait = budget::wait_reason(inner, group, context, nodes[index].id, question, now);
+        if wait != ScoreWaitReason::None {
+            wait_reason = wait;
+        }
+    }
+    ScoreVerificationSnapshot {
+        state: if usable(&decision.evidence[decision.ordinary.index]) {
+            ScoreVerificationState::ObservedUsable
+        } else {
+            ScoreVerificationState::Provisional
         },
-        validation_index,
-        candidates,
+        next_action,
+        question,
+        wait_reason,
+        challengers: challengers(decision, names, now),
+        candidate_count: decision.scores.len(),
+        evaluated_count: candidates
+            .iter()
+            .filter(|candidate| candidate.evaluated)
+            .count(),
+        pending_count: candidates
+            .iter()
+            .filter(|candidate| candidate.pending())
+            .count(),
+        network: context.network,
+        target_family: context.target_family,
+        health_family: context.health_family,
+        target_specific: context.target.is_some(),
     }
 }

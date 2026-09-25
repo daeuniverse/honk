@@ -1289,6 +1289,22 @@ mod tests {
             ..Default::default()
         };
         let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &nodes));
+        // Trials only serve challengers trailing the selection's completions.
+        let seed = manager
+            .feedback_for_node(
+                nodes[0].id,
+                ScoreSelectionContext::aggregate(
+                    SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .unwrap()
+            .start();
+        seed.setup_succeeded();
+        seed.tx(1);
+        seed.rx(1);
+        seed.finish(ScoreOutcome::Success);
         let mut registry = ProxyRegistry::new();
         registry.register(ProtocolEntry::new(
             NodeProtocol::Socks5,

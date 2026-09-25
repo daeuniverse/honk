@@ -86,17 +86,26 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
             target_family: Some(IpVersion::V4),
             ..context(network)
         };
-        for node in &nodes {
-            let trial = manager.selection_plan_for_target("auto", &context);
-            assert_eq!(trial.entries[0].node.id, node.id);
-            trial.entries[0]
+        for (index, node) in nodes.iter().enumerate() {
+            let plan = manager.selection_plan_for_target("auto", &context);
+            assert_eq!(plan.entries[0].node.id, node.id);
+            let reporter = plan.entries[0]
                 .feedback
                 .as_ref()
                 .unwrap()
                 .begin()
                 .unwrap()
-                .start()
-                .finish(ScoreOutcome::Cancelled);
+                .start();
+            // Cold exploration reaches the challenger only once the selection has evidence.
+            if index == 0 {
+                reporter.setup_succeeded();
+                reporter.tx(1);
+                reporter.first_response();
+                reporter.rx(1);
+                reporter.finish(ScoreOutcome::Success);
+            } else {
+                reporter.finish(ScoreOutcome::Cancelled);
+            }
             assert_eq!(
                 get_json(&app, "/stats").await["score"]["groups"][0][label]["ordinarySwitch"],
                 0
@@ -363,13 +372,15 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
             "reporters": 4, "validForMs": verification["challengers"][0]["validForMs"],
         }])
     );
+    // Configured probes never settle a pair question, so the slower member stays pending.
     assert_eq!(
         verification["coverage"],
         serde_json::json!({
-            "scope": "all", "candidates": 2, "evaluated": 2, "unevaluated": 0, "pending": 0,
+            "scope": "all", "candidates": 2, "evaluated": 2, "unevaluated": 0, "pending": 1,
         })
     );
-    assert_eq!(verification["nextAction"], "none");
+    assert_eq!(verification["question"], "response");
+    assert_eq!(verification["nextAction"], "nextBusinessFlow");
     let validity = verification["challengers"][0]["validForMs"]
         .as_u64()
         .unwrap();
@@ -458,8 +469,8 @@ async fn score_verification_keeps_singleton_aggregate_availability_separate_from
         assert_eq!(verification["state"], "observedUsable");
         assert_eq!(verification["challengers"], serde_json::json!([]));
         assert_eq!(verification["coverage"]["candidates"], 1);
-        assert_eq!(verification["question"], "response");
-        assert_eq!(verification["nextAction"], "nextBusinessFlow");
+        assert_eq!(verification["question"], "none");
+        assert_eq!(verification["nextAction"], "none");
         assert_eq!(verification["targetSpecific"], false);
         assert!(verification["targetFamily"].is_null());
     }

@@ -58,7 +58,7 @@ fn a_fresh_sample_does_not_rejuvenate_old_blocks_or_diversity() {
             .is_none()
     );
     let expired = scores(&inner, &nodes, &target, now + Duration::from_secs(60));
-    assert!(expired.evidence[0].response.is_none());
+    assert_eq!(expired.pairs.get(1).unwrap().progress, 1);
     assert!(
         expired.scores[0]
             .target_performance
@@ -216,25 +216,13 @@ fn comparison_memory_cap_counts_keys_and_container_capacity_and_eviction_loses_s
     assert_eq!(store.evicted, 1);
     assert!(store.logical_bytes() <= comparison::Store::logical_capacity_bound());
     assert!(store.logical_bytes() >= MAX_CELLS * 1024);
-    response(
-        &mut inner,
-        &leaf,
-        &first,
-        1,
-        100,
-        now + Duration::from_secs(1),
-    );
-    assert!(
-        scores(
-            &inner,
-            std::slice::from_ref(&leaf),
-            &first,
-            now + Duration::from_secs(1)
-        )
-        .evidence[0]
-            .response
-            .is_none()
-    );
+    let nodes = [node("capacity reference"), leaf.clone()];
+    let at = now + Duration::from_secs(1);
+    response(&mut inner, &nodes[0], &first, 4, 100, at);
+    response(&mut inner, &leaf, &first, 1, 100, at);
+    let evicted = pair(&inner, &nodes, &first, at);
+    assert!(evicted.response.is_none());
+    assert_eq!(evicted.progress, 1);
     let oversize = context(&"z".repeat(MAX_KEY_BYTES), IpVersion::V4);
     let before = inner.comparisons.logical_bytes();
     response(
@@ -268,10 +256,11 @@ fn disjoint_time_blocks_do_not_compare_even_when_both_nodes_are_fresh() {
     let scores = scores(&inner, &nodes, &target, now + Duration::from_secs(16));
     assert!(
         scores
-            .evidence
+            .scores
             .iter()
-            .all(|evidence| evidence.response.is_some())
+            .all(|score| score.target_performance.response.value.is_some())
     );
+    assert_eq!(scores.pairs.get(1).unwrap().progress, 0);
     assert!(scores.pairs.get(1).unwrap().response.is_none());
 }
 
@@ -409,14 +398,9 @@ fn changed_probe_cohorts_and_invalid_cadences_cannot_inherit_comparison_support(
             for index in 0..2 {
                 publish(index, uri, invalid, 4, later);
             }
-            let decision = scores(&state.inner.lock(), &nodes, &target, later);
-            assert!(decision.pairs.get(1).unwrap().response.is_none());
-            assert!(
-                decision
-                    .evidence
-                    .iter()
-                    .all(|evidence| evidence.probe.is_none())
-            );
+            let pair = pair(&state.inner.lock(), &nodes, &target, later);
+            assert!(pair.response.is_none());
+            assert_eq!(pair.basis, Basis::None);
         }
     }
 }
@@ -448,7 +432,6 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
         let inner = state.inner.lock();
         let decision = scores(&inner, &nodes, &target, at);
         assert!(decision.evidence[1].business.is_none());
-        assert!(decision.evidence[1].response.is_none());
         assert!(
             decision
                 .pairs
@@ -456,10 +439,7 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
                 .and_then(|pair| pair.response)
                 .is_none()
         );
-        assert!(
-            comparison::response_progress(&inner, "score", &target, nodes[0].id, nodes[1].id, at)
-                .is_none()
-        );
+        assert_eq!(decision.pairs.get(1).map_or(0, |pair| pair.progress), 0);
     };
     assert_missing(now + Duration::from_secs(3));
     let replacement = manager
@@ -494,7 +474,7 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
         &target,
         now + Duration::from_secs(9),
     );
-    assert!(decision.evidence[1].business.is_some() && decision.evidence[1].response.is_some());
+    assert!(decision.evidence[1].business.is_some());
     assert!(
         decision
             .pairs
@@ -524,15 +504,13 @@ fn target_failure_preserves_other_targets_and_probe_but_node_failure_invalidates
             }
         }
         let state = manager.score_state();
-        let before = comparison::response_progress(
+        let before = scores(
             &state.inner.lock(),
-            "score",
+            &nodes,
             &good,
-            nodes[0].id,
-            nodes[1].id,
             now + Duration::from_secs(2),
-        )
-        .unwrap();
+        );
+        assert_eq!(before.pairs.get(1).map_or(0, |pair| pair.progress), 4);
         let failed = manager
             .feedback_for_group_node("score", nodes[1].id, bad.clone())
             .unwrap()
@@ -542,26 +520,29 @@ fn target_failure_preserves_other_targets_and_probe_but_node_failure_invalidates
         let inner = state.inner.lock();
         let at = now + Duration::from_secs(4);
         let survives = outcome == ScoreOutcome::TargetFailure;
+        // The failed member leaves normal eligibility, so its cells are read as the reference.
+        let against_failed = |target: &ScoreSelectionContext| {
+            decision_at(&inner, &nodes, target, 1, at)
+                .pairs
+                .get(0)
+                .unwrap()
+        };
+        assert_eq!(
+            against_failed(&good)
+                .response
+                .map(|metric| metric.reporters),
+            survives.then(|| before.pairs.get(1).unwrap().response.unwrap().reporters)
+        );
+        // Another target family shares the probe slot but none of the traffic cohorts.
+        let probe_only = against_failed(&context("probe-only.example", IpVersion::V6));
+        assert_eq!(probe_only.basis == Basis::ConfiguredProbe, survives);
+        assert_eq!(probe_only.response.is_some(), survives);
+        assert_ne!(against_failed(&bad).basis, Basis::ExactTarget);
         let good = scores(&inner, &nodes, &good, at);
         assert_eq!(good.evidence[1].business.is_some(), survives);
-        assert_eq!(good.evidence[1].response.is_some(), survives);
-        assert_eq!(good.evidence[1].probe.is_some(), survives);
-        assert!(
-            scores(&inner, &nodes, &bad, at).evidence[1]
-                .response
-                .is_none()
-        );
-        let progress = comparison::response_progress(
-            &inner,
-            "score",
-            &context("good.example", IpVersion::V4),
-            nodes[0].id,
-            nodes[1].id,
-            at,
-        )
-        .unwrap();
-        assert_eq!(progress == before, survives);
-        assert_eq!(progress.0, if survives { [4, 4] } else { [0, 0] });
+        // Either failure drops the challenger's observed reliability out of normal eligibility,
+        // so ordinary selection holds no pair to report progress on.
+        assert!(good.pairs.get(1).is_none());
     }
 }
 
@@ -589,18 +570,17 @@ fn failed_probe_cannot_requalify_from_its_prior_samples() {
     fresh.probe_latency_at(Duration::from_millis(100), now + Duration::from_secs(2));
     fresh.finish_at(ScoreOutcome::Success, false, now + Duration::from_secs(2));
     let state = manager.score_state();
-    let decision = scores(
+    // The failed member leaves normal eligibility, so its probe cell is read as the reference.
+    let pair = decision_at(
         &state.inner.lock(),
         &nodes,
         &context,
+        1,
         now + Duration::from_secs(3),
-    );
-    assert!(decision.evidence[1].probe.is_none());
-    assert!(
-        decision
-            .pairs
-            .get(1)
-            .and_then(|pair| pair.response)
-            .is_none()
-    );
+    )
+    .pairs
+    .get(0)
+    .unwrap();
+    assert_eq!(pair.basis, Basis::ConfiguredProbe);
+    assert!(pair.response.is_none());
 }

@@ -11,7 +11,6 @@ fn metric(left: f64, right: f64, now: Instant) -> MetricPair {
         reporters: 4,
         latest_at: now,
         expires_at: now + Duration::from_secs(60),
-        support: 0,
     }
 }
 
@@ -224,7 +223,6 @@ fn first_choice_and_real_failure_escape_need_no_comparison_evidence() {
     let pairs = comparison::PairCohort {
         reference: 0,
         pairs: vec![None; 2],
-        joint: None,
     };
     let mut scores = [incumbent, candidate];
     let baseline = performance_baseline(&scores);

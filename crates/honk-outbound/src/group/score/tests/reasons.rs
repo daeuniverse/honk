@@ -138,6 +138,8 @@ fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
     for (leaf, latency) in nodes.iter().zip([200, 50]) {
         train_at(&manager, leaf, &context, 8, latency, 1, now);
     }
+    // The later trial needs the selection ahead of its challenger's evidence.
+    train_at(&manager, &nodes[1], &context, 1, 50, 1, now);
     let now = now + Duration::from_secs(1);
     let before_peek = state.selection_reason_counts("score", SelectionNetwork::Tcp);
     assert_eq!(state.peek_rank_at("score", &context, &node_refs, now), 1);
@@ -165,17 +167,6 @@ fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
             .finish_at(ScoreOutcome::Cancelled, false, now);
     }
     let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(1);
-    let before_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    let (index, control) = state.rank_plan_at("score", &context, &node_refs, expired);
-    assert_eq!(index, 1);
-    control
-        .begin_at(expired)
-        .unwrap()
-        .start_at(expired)
-        .finish_at(ScoreOutcome::Cancelled, false, expired);
-    let after_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    assert_eq!(after_control.spent, before_control.spent);
-    assert_eq!(after_control.trial_starts, before_control.trial_starts);
     let (index, feedback) = state.rank_plan_at("score", &context, &node_refs, expired);
     assert_eq!(index, 0);
     feedback
@@ -311,6 +302,34 @@ fn selection_reason_precedence_is_stable() {
         .collect();
     let manager = GroupManager::new(&groups, &all_nodes);
     let state = manager.score_state();
+    {
+        let mut inner = state.inner.lock();
+        // Trials only go to challengers with less evidence than the selection.
+        for (index, node) in periodic.iter().enumerate() {
+            inner.aggregate.put(
+                AggregateKey {
+                    group: "periodic".into(),
+                    network: SelectionNetwork::Tcp,
+                    family: None,
+                    node_id: node.id,
+                },
+                Stats {
+                    selected_at: u64::from(index == 0),
+                    availability: Availability::default(),
+                    ..trained_stats(if index == 0 { 9.0 } else { 8.0 }, 100.0, now)
+                },
+            );
+        }
+        inner.aggregate.put(
+            AggregateKey {
+                group: "cold".into(),
+                network: SelectionNetwork::Tcp,
+                family: None,
+                node_id: cold[0].id,
+            },
+            trained_stats(1.0, 100.0, now),
+        );
+    }
     for _ in 0..exploration_target(periodic.len()) {
         let (_, feedback) = state.rank_plan_at(
             "periodic",
@@ -336,21 +355,6 @@ fn selection_reason_precedence_is_stable() {
         inner
             .selection_reasons
             .remove(&SelectionReasonKey::new("periodic", SelectionNetwork::Tcp));
-        for (index, node) in periodic.iter().enumerate() {
-            inner.aggregate.put(
-                AggregateKey {
-                    group: "periodic".into(),
-                    network: SelectionNetwork::Tcp,
-                    family: None,
-                    node_id: node.id,
-                },
-                Stats {
-                    selected_at: u64::from(index == 0),
-                    availability: Availability::default(),
-                    ..trained_stats(8.0, 100.0, now)
-                },
-            );
-        }
         for (group, nodes, stats) in [
             (
                 "held",
@@ -368,7 +372,6 @@ fn selection_reason_precedence_is_stable() {
                 bypass.as_slice(),
                 [
                     Stats {
-                        attempts: 257.0,
                         useful_failure: 1.0,
                         failed_at: Some(now),
                         fail_streak: 1,
@@ -384,7 +387,6 @@ fn selection_reason_precedence_is_stable() {
                 [
                     trained_stats(8.0, 100.0, now),
                     Stats {
-                        attempts: 8.0,
                         useful_failure: 4.0,
                         ..trained_stats(4.0, 50.0, now)
                     },
@@ -478,7 +480,7 @@ fn selection_reason_precedence_is_stable() {
     assert_eq!(
         winners.map(|(group, index)| (group, index == 0)),
         [
-            ("cold", true),
+            ("cold", false),
             ("periodic", false),
             ("held", true),
             ("bypass", false),
@@ -578,45 +580,38 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
     let _ = manager.selection_plan_for_target("singleton", &target);
     let _ = manager.selection_plan_for_target("last-resort", &target);
     let state = manager.score_state();
-    let applied = [
-        ("target-top", 1, 0, 1),
-        ("target-child", 1, 0, 1),
-        ("aggregate-top", 0, 1, 1),
-        ("aggregate-child", 0, 1, 1),
-    ];
-    for (group, cold_explore, performance_winner, dead_filtered) in applied {
-        let counts = state.selection_reason_counts(group, SelectionNetwork::Tcp);
-        assert_eq!(counts.cold_explore, cold_explore, "{group} cold_explore");
+    // Unfinished plans leave every group without evidence, so none of them can be explored.
+    for group in [
+        "target-top",
+        "target-child",
+        "aggregate-top",
+        "aggregate-child",
+    ] {
         assert_eq!(
-            counts.performance_winner, performance_winner,
-            "{group} performance_winner"
+            state.selection_reason_counts(group, SelectionNetwork::Tcp),
+            ScoreReasonCounters {
+                performance_winner: 1,
+                dead_filtered: 1,
+                ..Default::default()
+            },
+            "{group}"
         );
         let budget = manager.score_budget_counters(group, SelectionNetwork::Tcp);
         assert_eq!(
-            (budget.business_starts, budget.trial_starts, budget.reserved),
-            (0, 0, 0)
-        );
-        assert_eq!(budget.refunded, cold_explore);
-        assert_eq!(counts.dead_filtered, dead_filtered, "{group} dead_filtered");
-        assert_eq!(
-            counts.periodic_explore
-                + counts.reliability_winner
-                + counts.incumbent_held
-                + counts.fresh_failure_bypass
-                + counts.incumbent_ineligible
-                + counts.insufficient_evidence_held
-                + counts.ordinary_switch,
-            0
+            (
+                budget.business_starts,
+                budget.trial_starts,
+                budget.reserved,
+                budget.refunded
+            ),
+            (0, 0, 0, 0)
         );
     }
-    for (group, cold_explore, performance_winner) in
-        [("target-top", 1, 0), ("aggregate-child", 0, 1)]
-    {
+    for group in ["target-top", "aggregate-child"] {
         assert_eq!(
             state.selection_reason_counts(group, SelectionNetwork::Udp),
             ScoreReasonCounters {
-                cold_explore,
-                performance_winner,
+                performance_winner: 1,
                 dead_filtered: 1,
                 ..Default::default()
             }
@@ -677,7 +672,7 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
     assert_eq!(
         stale_state.selection_reason_counts("stale", SelectionNetwork::Tcp),
         ScoreReasonCounters {
-            cold_explore: 1,
+            performance_winner: 1,
             dead_filtered: 1,
             ..Default::default()
         }
@@ -751,8 +746,8 @@ fn nested_score_groups_count_reasons_independently() {
     let child_counts = state.selection_reason_counts("child", SelectionNetwork::Tcp);
     let parent_counts = state.selection_reason_counts("parent", SelectionNetwork::Tcp);
     assert_eq!(selected, nodes[0].id);
-    assert_eq!(child_counts.cold_explore, 1);
-    assert_eq!(parent_counts.cold_explore, 1);
+    assert_eq!(child_counts.performance_winner, 1);
+    assert_eq!(parent_counts.performance_winner, 1);
     assert_eq!(child_counts.dead_filtered, 0);
     assert_eq!(parent_counts.dead_filtered, 0);
 }
@@ -766,7 +761,7 @@ fn private_reason_counts_follow_committed_name_lifecycle() {
     let target = context("private-lifecycle.example", IpVersion::V4);
     let _ = manager.selection_plan_for_target("lifecycle", &target);
     let recorded = state.selection_reason_counts("lifecycle", SelectionNetwork::Tcp);
-    assert_eq!(recorded.cold_explore, 1);
+    assert_eq!(recorded.performance_winner, 1);
 
     let selector = Group {
         policy: GroupPolicy::Selector,
@@ -848,14 +843,14 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
     assert_eq!(
         snapshot[0].udp,
         ScoreReasonCounters {
-            cold_explore: 1,
+            performance_winner: 1,
             ..Default::default()
         }
     );
     assert_eq!(
         snapshot[1].tcp,
         ScoreReasonCounters {
-            cold_explore: 1,
+            performance_winner: 1,
             ..Default::default()
         }
     );
@@ -888,8 +883,8 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
         &context("private-target.internal", IpVersion::V4),
     );
     let later = manager.score_reason_snapshot();
-    assert_eq!(snapshot[1].tcp.cold_explore, 1);
-    assert_eq!(later[1].tcp.cold_explore, 2);
+    assert_eq!(snapshot[1].tcp.performance_winner, 1);
+    assert_eq!(later[1].tcp.performance_winner, 2);
 }
 
 #[test]
@@ -901,7 +896,7 @@ fn score_reason_snapshot_reload_policy_is_name_based() {
     let target = context("private-reload-target.internal", IpVersion::V4);
     let _ = manager.selection_plan_for_target("persist", &target);
     let recorded = manager.score_reason_snapshot();
-    assert_eq!(recorded[0].tcp.cold_explore, 1);
+    assert_eq!(recorded[0].tcp.performance_winner, 1);
 
     let selector = Group {
         policy: GroupPolicy::Selector,
@@ -919,7 +914,7 @@ fn score_reason_snapshot_reload_policy_is_name_based() {
     assert_eq!(
         state.selection_reason_counts("persist", SelectionNetwork::Tcp),
         ScoreReasonCounters {
-            cold_explore: 1,
+            performance_winner: 1,
             ..Default::default()
         }
     );
@@ -954,7 +949,7 @@ fn score_reason_snapshot_reload_policy_is_name_based() {
     assert_eq!(recreated.score_reason_snapshot(), reset);
     let _ = recreated.selection_plan_for_target("persist", &target);
     let current = recreated.score_reason_snapshot();
-    assert_eq!(current[0].tcp.cold_explore, 1);
+    assert_eq!(current[0].tcp.performance_winner, 1);
 
     let empty = super::super::super::GroupManager::new(&[], &nodes);
     assert!(empty.score_reason_snapshot().is_empty());

@@ -1,5 +1,6 @@
 //! Business-funded optional work. Currency is independent of evidence and target LRUs.
 use super::*;
+use honk_config::node::Node;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{OnceLock, Weak};
 
@@ -67,34 +68,16 @@ impl std::fmt::Debug for Opportunity {
 }
 
 #[derive(Default)]
-pub(super) struct Life {
+struct Life {
     status: AtomicU8,
     setup: AtomicBool,
     token: Option<Token>,
     started_at: OnceLock<Instant>,
     answered: AtomicU8,
     source: ScoreTrialSource,
-    original: AtomicBool,
-    deadline: OnceLock<Instant>,
 }
 
 impl Life {
-    pub(super) fn original_started(&self) -> bool {
-        self.original.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn pending(&self) -> bool {
-        self.status.load(Ordering::Relaxed) == PENDING
-    }
-
-    pub(super) fn finished(&self) -> bool {
-        self.status.load(Ordering::Relaxed) >= FINISHED
-    }
-
-    pub(super) fn deadline(&self) -> Option<Instant> {
-        self.deadline.get().copied()
-    }
-
     fn elapsed_millis(&self, now: Instant) -> u64 {
         self.started_at.get().map_or(0, |started| {
             u64::try_from(now.saturating_duration_since(*started).as_millis()).unwrap_or(u64::MAX)
@@ -275,7 +258,7 @@ pub(in crate::group) struct Work {
     pub(super) key: SelectionCadenceKey,
     scope: Option<Arc<()>>,
     node: Uuid,
-    pub(super) life: Arc<Life>,
+    life: Arc<Life>,
 }
 
 impl std::fmt::Debug for Work {
@@ -306,6 +289,10 @@ impl Work {
 
     pub(super) fn has_started(&self) -> bool {
         self.life.started_at.get().is_some()
+    }
+
+    pub(super) fn is_cold(&self) -> bool {
+        self.life.source == ScoreTrialSource::Cold
     }
 
     fn scope_matches(&self, scope: &Scope) -> bool {
@@ -355,38 +342,44 @@ fn ensure_scope<'a>(inner: &'a mut StateInner, key: &SelectionCadenceKey) -> &'a
     inner.budgets.get_mut(key).expect("scope inserted above")
 }
 
-pub(super) fn bind_deadline(
-    inner: &mut StateInner,
-    work: &Arc<Work>,
-    deadline: Instant,
-) -> Arc<Life> {
-    let _ = work.life.deadline.set(deadline);
-    if let Some(scope) = inner.budgets.get_mut(&work.key) {
-        for entry in &mut scope.in_flight {
-            if entry.life.ptr_eq(&Arc::downgrade(&work.life)) {
-                entry.expires = entry.expires.min(deadline);
-                break;
-            }
-        }
-    }
-    Arc::clone(&work.life)
+/// Ledger scopes behind a read: a targeted context's own, or both target families for an
+/// aggregate read, since only targeted work reaches the ledger.
+fn read_scopes<'a>(
+    inner: &'a StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+) -> impl Iterator<Item = Option<&'a Scope>> {
+    let aggregate = context.target.is_none() && context.target_family.is_none();
+    let families = if aggregate {
+        [Some(IpVersion::V4), Some(IpVersion::V6)]
+    } else {
+        [context.target_family; 2]
+    };
+    let mut key = SelectionCadenceKey::new(group, context);
+    families
+        .into_iter()
+        .take(1 + usize::from(aggregate))
+        .map(move |family| {
+            key.family = family;
+            inner.budgets.get(&key)
+        })
 }
 
-pub(super) fn available_credit(
+/// Reserved or begun work per member that has not finished in the scopes behind this read.
+pub(super) fn unfinished(
     inner: &StateInner,
     group: &str,
     context: &ScoreSelectionContext,
+    nodes: &[&Node],
     now: Instant,
-) -> u64 {
-    let Some(scope) = inner.budgets.get(&SelectionCadenceKey::new(group, context)) else {
-        return exploration_target(inner.valid.iter().filter(|(name, _)| name == group).count())
-            as u64;
-    };
-    if !scope.available(now) {
-        return 0;
+) -> Vec<f64> {
+    let mut unfinished = vec![0.0; nodes.len()];
+    for scope in read_scopes(inner, group, context).flatten() {
+        for (count, node) in unfinished.iter_mut().zip(nodes) {
+            *count += scope.active(node.id, ScoreEvidenceQuestion::None, None, now) as f64;
+        }
     }
-    let (cold, earned, _) = scope.effective_credit(now);
-    cold.saturating_add(earned)
+    unfinished
 }
 
 pub(super) fn reserve(
@@ -395,21 +388,23 @@ pub(super) fn reserve(
     group: &str,
     context: &ScoreSelectionContext,
     node: Uuid,
-    (question, required): (ScoreEvidenceQuestion, usize),
+    question: ScoreEvidenceQuestion,
     now: Instant,
-) -> Option<Arc<Work>> {
+) -> Result<Arc<Work>, ScoreWaitReason> {
     let key = SelectionCadenceKey::new(group, context);
     let scope = ensure_scope(inner, &key);
     scope.expire(now);
-    if scope.active(node, question, context.target.as_ref(), now) >= required
+    // One unanswered trial per question and target: a burst would give a member more evidence
+    // than the selection it is compared against before either result is known.
+    if scope.active(node, question, context.target.as_ref(), now) > 0
         || scope.active(node, ScoreEvidenceQuestion::None, None, now) >= 4
     {
         scope.counters.in_flight_blocked = scope.counters.in_flight_blocked.saturating_add(1);
-        return None;
+        return Err(ScoreWaitReason::InFlight);
     }
     if !scope.available(now) {
         scope.counters.budget_blocked = scope.counters.budget_blocked.saturating_add(1);
-        return None;
+        return Err(ScoreWaitReason::Budget);
     }
     let token = if scope.counters.cold_available > 0 {
         scope.counters.cold_available -= 1;
@@ -434,58 +429,33 @@ pub(super) fn reserve(
         }),
     });
     scope.track(node, context.target.as_ref(), &work.life, now);
-    Some(work)
+    Ok(work)
 }
 
+/// Why the ledger would refuse this member's next trial. An aggregate read waits only while
+/// every target family refuses, and on the budget only while every family is exhausted.
 pub(super) fn wait_reason(
     inner: &StateInner,
     group: &str,
     context: &ScoreSelectionContext,
     node: Uuid,
     question: ScoreEvidenceQuestion,
-    required: usize,
     now: Instant,
 ) -> ScoreWaitReason {
-    let mut key = SelectionCadenceKey::new(group, context);
-    let mut scope_wait = |family| {
-        key.family = family;
-        let Some(scope) = inner.budgets.get(&key) else {
+    let mut wait = ScoreWaitReason::Budget;
+    for scope in read_scopes(inner, group, context) {
+        let Some(scope) = scope else {
             return ScoreWaitReason::None;
         };
-        if scope.active(node, question, context.target.as_ref(), now) >= required
+        if scope.active(node, question, context.target.as_ref(), now) > 0
             || scope.active(node, ScoreEvidenceQuestion::None, None, now) >= 4
         {
-            ScoreWaitReason::InFlight
-        } else if !scope.available(now) {
-            ScoreWaitReason::Budget
-        } else {
-            ScoreWaitReason::None
-        }
-    };
-    if context.target.is_some() || context.target_family.is_some() {
-        scope_wait(context.target_family)
-    } else {
-        match (
-            scope_wait(Some(IpVersion::V4)),
-            scope_wait(Some(IpVersion::V6)),
-        ) {
-            (ScoreWaitReason::Budget, ScoreWaitReason::Budget) => ScoreWaitReason::Budget,
-            (ScoreWaitReason::None, _) | (_, ScoreWaitReason::None) => ScoreWaitReason::None,
-            _ => ScoreWaitReason::InFlight,
+            wait = ScoreWaitReason::InFlight;
+        } else if scope.available(now) {
+            return ScoreWaitReason::None;
         }
     }
-}
-
-pub(super) fn cold_available(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    now: Instant,
-) -> bool {
-    inner
-        .budgets
-        .get(&SelectionCadenceKey::new(group, context))
-        .is_none_or(|scope| scope.effective_credit(now).0 > 0)
+    wait
 }
 
 pub(super) fn begin_unscored(
@@ -495,9 +465,7 @@ pub(super) fn begin_unscored(
     now: Instant,
 ) -> bool {
     if work.iter().any(|item| {
-        item.life.token.is_some()
-            || item.life.deadline().is_some()
-            || item.life.status.load(Ordering::Relaxed) != PENDING
+        item.life.token.is_some() || item.life.status.load(Ordering::Relaxed) != PENDING
     }) {
         for item in work {
             item.cancel_pending(inner);
@@ -580,7 +548,6 @@ pub(super) fn begin(
         }
         return false;
     }
-    let original = !progress.begun;
     if !progress.begun {
         inner.root_business_starts += 1;
         progress.begun = true;
@@ -609,7 +576,6 @@ pub(super) fn begin(
         if item.life.status.load(Ordering::Relaxed) == PENDING {
             item.life.status.store(STARTED, Ordering::Relaxed);
             let _ = item.life.started_at.set(now);
-            item.life.original.store(original, Ordering::Relaxed);
             if item.life.token.is_some() {
                 scope.counters.reserved -= 1;
                 scope.counters.spent += 1;

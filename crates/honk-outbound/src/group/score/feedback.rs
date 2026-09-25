@@ -2,7 +2,7 @@ use super::evidence::Observation;
 use super::{
     FlowSample, LIVE_RX_INTERVAL, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES,
     MIN_THROUGHPUT_DURATION, ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState,
-    ScoreSelectionContext, ScoreSource, StartedCells, budget, comparison, validation,
+    ScoreSelectionContext, ScoreSource, StartedCells, budget, comparison,
 };
 use parking_lot::Mutex;
 use std::hash::{Hash, Hasher};
@@ -147,12 +147,6 @@ impl ScoreAttempt {
             } else {
                 Err(crate::proxy::PacketRejection::Cancelled)
             };
-        }
-        if !validation::admissible(&inner, &self.feedback.context, &self.work, now) {
-            for work in self.work.iter() {
-                work.cancel_pending(&mut inner);
-            }
-            return Err(crate::proxy::PacketRejection::Cancelled);
         }
         if !budget::begin(
             &mut inner,
@@ -654,7 +648,6 @@ impl ScoreReporter {
             tx: progress.tx,
             rx: progress.rx,
             eligible_rx_at: progress.eligible_rx_at,
-            elapsed: now.saturating_duration_since(self.shared.started),
             count_usefulness,
         };
         if feedback.source == ScoreSource::HealthProbe

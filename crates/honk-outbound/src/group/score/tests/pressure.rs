@@ -32,6 +32,7 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         let start = Instant::now();
         let state = manager.score_state();
         let refs = nodes.iter().collect::<Vec<_>>();
+        train_at(&manager, &nodes[0], &target, 20, 100, 1, start);
         for _ in 0..exploration_target(nodes.len()) {
             let (_, feedback) = state.rank_plan_at("score", &target, &refs, start);
             let guard = feedback.begin_at(start).unwrap();
@@ -39,9 +40,8 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
                 .start_at(start)
                 .finish_at(ScoreOutcome::Cancelled, false, start);
         }
-        for leaf in &nodes {
-            train_at(&manager, leaf, &target, 20, 100, 1, start);
-        }
+        // Trailing the selection's completions keeps the challenger under the trial ceiling.
+        train_at(&manager, &nodes[1], &target, 16, 100, 1, start);
         let ready = start + Duration::from_secs(2);
         for _ in 0..16 {
             assert_eq!(rank_at(&manager, &nodes, &target, ready), 0);
@@ -161,6 +161,7 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
         let start = Instant::now();
         let state = manager.score_state();
         let refs: Vec<_> = nodes.iter().collect();
+        train_at(&manager, &nodes[0], &target, 64, 100, download, start);
         for _ in 0..exploration_target(nodes.len()) {
             let (_, attempt) = state.rank_plan_at("score", &target, &refs, start);
             attempt.begin_at(start).unwrap().start_at(start).finish_at(
@@ -169,9 +170,8 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
                 start,
             );
         }
-        for leaf in &nodes {
-            train_at(&manager, leaf, &target, 64, 100, download, start);
-        }
+        // Trailing the selection's completions keeps the challenger under the trial ceiling.
+        train_at(&manager, &nodes[1], &target, 60, 100, download, start);
         let at = start + Duration::from_secs(3);
         assert_eq!(state.rank_at("score", &target, &refs, at), 0);
         pressure_at(&manager, nodes[0].id, IpVersion::V4, at);
@@ -201,13 +201,6 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
             reporter.first_response_at(began + Duration::from_millis(100));
             reporter.transfer_at(1, 1, began + Duration::from_millis(100));
             open.push(reporter);
-            let answered = began + Duration::from_millis(200);
-            let (_, ordinary) = state.rank_plan_at("score", &target, &refs, answered);
-            ordinary
-                .begin_at(answered)
-                .unwrap()
-                .start_at(answered)
-                .finish_at(ScoreOutcome::Cancelled, false, answered);
             assert_eq!(
                 state
                     .budget_counters("score", target.network)

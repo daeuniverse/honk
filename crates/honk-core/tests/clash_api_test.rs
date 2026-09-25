@@ -743,14 +743,15 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     .all(|(_, value)| value.is_u64())
             );
         }
-        assert_eq!(group["tcp"]["coldExplore"], 1);
+        // A fresh group has no selection evidence yet, so its first plan funds no exploration.
+        assert_eq!(group["tcp"]["coldExplore"], 0);
         assert_eq!(group["tcp"]["ordinarySwitch"], 0);
         let budget = &group["budget"]["tcp"];
         assert_eq!(budget["businessStarts"], 0);
         assert_eq!(budget["trialStarts"], 0);
         assert_eq!(budget["reserved"], 0);
-        assert_eq!(budget["refunded"], 1);
-        assert_eq!(group["verification"]["tcp"]["validationSelections"], 1);
+        assert_eq!(budget["refunded"], 0);
+        assert_eq!(group["verification"]["tcp"]["validationSelections"], 0);
     }
     assert!(first["outbounds"].is_array());
     let connections = client

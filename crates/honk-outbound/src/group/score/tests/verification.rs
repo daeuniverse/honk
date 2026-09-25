@@ -1,3 +1,4 @@
+use super::budget::complete_ordinary;
 use super::*;
 
 fn verification_at(
@@ -10,6 +11,25 @@ fn verification_at(
         .score_state()
         .verification_snapshot_at("score", target, &nodes.iter().collect::<Vec<_>>(), now)
         .unwrap()
+}
+
+/// Replies that establish availability without publishing response reporters.
+fn replies_without_response_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    target: &ScoreSelectionContext,
+    samples: usize,
+    now: Instant,
+) {
+    for _ in 0..samples {
+        let reporter = manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap()
+            .start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.transfer_at(1, 1, now);
+        reporter.finish_at(ScoreOutcome::Success, true, now);
+    }
 }
 
 #[test]
@@ -267,7 +287,7 @@ fn real_flow_gaps_become_usable_and_compared_with_measured_exposure() {
 }
 
 #[test]
-fn funded_large_group_focuses_promising_contender_until_graduation() {
+fn funded_large_group_serves_promising_contender_until_graduation() {
     let nodes: Vec<_> = (0..32)
         .map(|index| node(&format!("leaf-{index}")))
         .collect();
@@ -287,7 +307,7 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
     }
     let state = manager.score_state();
     let mut graduate = None;
-    let mut focused_trials = 0;
+    let mut contender_trials = 0;
     for step in 20..900 {
         let at = now + Duration::from_millis(step * 100);
         let before = state.verification_counters("score", SelectionNetwork::Tcp);
@@ -302,7 +322,7 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
         }
         let validation = after.validation_selections > before.validation_selections;
         if validation && index == 31 {
-            focused_trials += 1;
+            contender_trials += 1;
         }
         if index == 31 && !validation {
             graduate = Some(step);
@@ -320,9 +340,10 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
                     + budget.business_starts / SCORE_EXPLORATION_PERIOD
         );
     }
-    let step = graduate
-        .expect("bounded focus must not strand a promising leaf under sufficient offered load");
-    assert!((5..=8).contains(&focused_trials));
+    let step = graduate.expect(
+        "bounded validation must not strand a promising leaf under sufficient offered load",
+    );
+    assert!((5..=8).contains(&contender_trials));
     let snapshot = verification_at(
         &manager,
         &nodes,
@@ -468,6 +489,32 @@ fn probe_and_common_target_pairs_keep_their_basis() {
 }
 
 #[test]
+fn configured_probe_pairs_never_settle_the_response_question() {
+    let nodes = [node("probe a"), node("probe b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        replies_without_response_at(&manager, leaf, &target, 4, now);
+        probe_at(
+            &manager,
+            leaf,
+            &context("health.example", IpVersion::V4),
+            100,
+            now,
+        );
+    }
+    for read in [&target, &aggregate] {
+        let snapshot = verification_at(&manager, &nodes, read, now);
+        let bases: Vec<_> = snapshot.challengers.iter().map(|c| c.basis).collect();
+        assert_eq!(bases, [ScoreEvidenceBasis::ConfiguredProbe]);
+        assert_eq!(snapshot.question, ScoreEvidenceQuestion::Response);
+    }
+}
+
+#[test]
 fn one_unrelated_probe_cannot_suppress_comparable_http_pair() {
     let nodes = [node("raw-direct"), node("http-slow"), node("http-fast")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -498,12 +545,12 @@ fn one_unrelated_probe_cannot_suppress_comparable_http_pair() {
     let relations: Vec<_> = snapshot
         .challengers
         .iter()
-        .map(|c| (c.index, c.basis, c.relation))
+        .map(|c| (c.name.as_str(), c.basis, c.relation))
         .collect();
     assert_eq!(
         relations,
         [(
-            1,
+            "http-slow",
             ScoreEvidenceBasis::ConfiguredProbe,
             ScoreRelation::SelectedFaster
         )]
@@ -567,6 +614,8 @@ fn sparse_cancellations_rotate_without_unbounded_exposure() {
 fn exhausted_budget_and_retired_authority_leave_counters_unchanged() {
     let nodes = [node("unknown-a"), node("unknown-b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    // Cancelled flows never complete, so the selection's seeded completion keeps trials offered.
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     let state = manager.score_state();
@@ -589,7 +638,7 @@ fn exhausted_budget_and_retired_authority_leave_counters_unchanged() {
     let before = state.verification_counters("score", SelectionNetwork::Tcp);
     let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     assert_eq!(budget.business_starts, 64);
-    assert!(budget.trial_starts + budget.reserved <= 2 + 64 / 16);
+    assert_eq!(budget.trial_starts + budget.reserved, 2 + 63 / 16);
     let authority = state.inner.lock().active_authority.clone().unwrap();
     state.publish_membership(nodes.iter().map(|node| ("score".to_owned(), node.id)));
     state.rank(
@@ -628,10 +677,13 @@ fn stale_failure_keeps_recovery_work_outside_comparisons() {
             snapshot
                 .challengers
                 .iter()
-                .map(|c| (c.index, c.relation))
+                .map(|c| (c.name.clone(), c.relation))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(relations(&snapshot), [(1, ScoreRelation::SelectedFaster)]);
+        assert_eq!(
+            relations(&snapshot),
+            [("slower".to_owned(), ScoreRelation::SelectedFaster)]
+        );
         assert_eq!(snapshot.candidate_count, 3);
         assert_eq!(snapshot.pending_count, 0);
         let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
@@ -642,7 +694,7 @@ fn stale_failure_keeps_recovery_work_outside_comparisons() {
         // Unknown history and a failed member never become comparisons.
         assert_eq!(
             relations(&snapshot),
-            [(1, ScoreRelation::Equivalent)],
+            [("slower".to_owned(), ScoreRelation::Equivalent)],
             "history={history}"
         );
         // Stale failure never withdraws the failed member's recovery work.
@@ -696,7 +748,7 @@ fn cross_target_latency_is_not_node_degradation() {
     assert_eq!(report.question, ScoreEvidenceQuestion::Response);
 }
 #[test]
-fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
+fn partial_success_cannot_pin_cancelled_trials_forever() {
     let nodes = [node("working"), node("partial"), node("other")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
@@ -708,9 +760,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
         state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
     assert_eq!(index, 1);
     respond_at(feedback, Duration::from_millis(10), at);
-    let mut run = 0;
-    let mut max_run = 0;
-    let mut other_trials = 0;
+    let mut trials = [0; 3];
     for _ in 0..SCORE_EXPLORATION_PERIOD * 12 {
         let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
         let (index, feedback) =
@@ -719,13 +769,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
         if after.periodic_explore + after.cold_explore
             > before.periodic_explore + before.cold_explore
         {
-            if index == 1 {
-                run += 1;
-                max_run = max_run.max(run);
-            } else {
-                run = 0;
-                other_trials += 1;
-            }
+            trials[index] += 1;
         }
         if index != 0 {
             feedback.begin_at(at).unwrap().start_at(at).finish_at(
@@ -737,8 +781,9 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
             respond_at(feedback, Duration::from_millis(100), at);
         }
     }
-    assert!(max_run <= 8);
-    assert!(other_trials > 0);
+    // Partial progress never outranks a challenger without any completion.
+    assert_eq!(trials[1], 0);
+    assert!(trials[2] > 0);
 }
 
 #[test]
@@ -799,26 +844,102 @@ fn removed_winner_leaves_no_flap_history() {
     );
 }
 #[test]
-fn singleton_response_expires_with_its_support_block() {
-    let nodes = [node("only")];
+fn response_pair_expires_with_its_support_block() {
+    let nodes = [node("only"), node("peer")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("response.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(&manager, &nodes[0], &target, 8, 50, 1, now);
-    let later = now + Duration::from_secs(59);
-    for _ in 0..8 {
-        let reporter = manager
-            .feedback_for_group_node("score", nodes[0].id, target.clone())
-            .unwrap()
-            .start_at(later);
-        reporter.setup_succeeded_at(later);
-        reporter.transfer_at(1, 1, later);
-        reporter.finish_at(ScoreOutcome::Success, true, later);
+    for leaf in &nodes {
+        train_at(&manager, leaf, &target, 8, 50, 1, now);
     }
+    let later = now + Duration::from_secs(59);
+    replies_without_response_at(&manager, &nodes[0], &target, 8, later);
+    let response = |at| {
+        decision_at(&manager.score_state().inner.lock(), &nodes, &target, 0, at)
+            .pairs
+            .get(1)
+            .and_then(|pair| pair.response)
+            .is_some()
+    };
     let report = verification_at(&manager, &nodes, &target, later);
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
     assert_eq!(report.question, ScoreEvidenceQuestion::None);
-    let expired = verification_at(&manager, &nodes, &target, now + Duration::from_secs(61));
-    assert_eq!(expired.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(expired.question, ScoreEvidenceQuestion::Response);
+    assert!(response(later));
+    let expired = now + Duration::from_secs(61);
+    let report = verification_at(&manager, &nodes, &target, expired);
+    assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
+    assert!(!response(expired));
+}
+
+#[test]
+fn partial_pair_progress_is_served_before_less_recently_selected_challengers() {
+    let nodes = [node("selection"), node("progressing"), node("rival")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("progress.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(&manager, &nodes[0], &target, 20, 10, 1, now);
+    // Replying first leaves the rival the less recently selected challenger.
+    replies_without_response_at(
+        &manager,
+        &nodes[2],
+        &target,
+        5,
+        now + Duration::from_secs(1),
+    );
+    let progress_at = now + Duration::from_secs(2);
+    replies_without_response_at(&manager, &nodes[1], &target, 3, progress_at);
+    // Two response reporters share the selection's block: progress, not yet a pair.
+    train_at(&manager, &nodes[1], &target, 2, 100, 1, progress_at);
+    let at = now + Duration::from_secs(4);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at).question,
+        ScoreEvidenceQuestion::Response
+    );
+    let refs = nodes.iter().collect::<Vec<_>>();
+    assert_eq!(
+        manager
+            .score_state()
+            .rank_plan_at("score", &target, &refs, at)
+            .0,
+        1
+    );
+}
+
+#[test]
+fn only_reporters_after_the_selection_degraded_count_as_pair_progress() {
+    for after_degradation in [false, true] {
+        let nodes = [node("degrading"), node("progressing"), node("rival")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("degraded.example", IpVersion::V4);
+        let now = Instant::now();
+        train_at(&manager, &nodes[0], &target, 20, 10, 1, now);
+        replies_without_response_at(
+            &manager,
+            &nodes[2],
+            &target,
+            5,
+            now + Duration::from_secs(1),
+        );
+        let replies_at = now + Duration::from_secs(2);
+        replies_without_response_at(&manager, &nodes[1], &target, 3, replies_at);
+        // A tenfold slower reply degrades the selection on this target.
+        let degraded = now + Duration::from_secs(5);
+        train_at(&manager, &nodes[0], &target, 1, 100, 1, degraded);
+        let progress_at = if after_degradation {
+            degraded + Duration::from_secs(1)
+        } else {
+            replies_at
+        };
+        train_at(&manager, &nodes[1], &target, 2, 100, 1, progress_at);
+        let at = now + Duration::from_secs(8);
+        let refs = nodes.iter().collect::<Vec<_>>();
+        let (index, _) = manager
+            .score_state()
+            .rank_plan_at("score", &target, &refs, at);
+        assert_eq!(
+            index,
+            if after_degradation { 1 } else { 2 },
+            "after_degradation={after_degradation}"
+        );
+    }
 }

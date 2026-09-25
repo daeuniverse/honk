@@ -754,13 +754,11 @@ impl super::GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        let (index, mut snapshot) = self
+        let names: Vec<_> = unique.iter().map(|candidate| candidate.tag()).collect();
+        let (index, snapshot) = self
             .score_state
-            .verification_selection(group_name, &context, &nodes)?;
-        for challenger in &mut snapshot.challengers {
-            challenger.name = unique[challenger.index].tag().to_owned();
-        }
-        Some((unique[index].tag().to_owned(), snapshot))
+            .verification_selection(group_name, &context, &nodes, &names)?;
+        Some((names[index].to_owned(), snapshot))
     }
 
     /// Group/network counters advance only during authorized selections.
@@ -841,6 +839,20 @@ mod tests {
             ..Default::default()
         };
         let manager = GroupManager::new(std::slice::from_ref(&group), &nodes);
+        // Trials only serve challengers with fewer completions than the ordinary selection.
+        manager.score_state().inner.lock().aggregate.put(
+            AggregateKey {
+                group: "score".into(),
+                network: SelectionNetwork::Tcp,
+                family: None,
+                node_id: nodes[0].id,
+            },
+            Stats {
+                setup_success: 1.0,
+                updated_at: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
         let context = ScoreSelectionContext {
             network: SelectionNetwork::Tcp,
             probe_domain: ProbeDomain::Tcp,

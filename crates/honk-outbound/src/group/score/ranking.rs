@@ -4,8 +4,8 @@ use super::{
     PerformanceBaseline, PerformanceSnapshot, RELIABILITY_CLOSE, RankedSelection,
     SCORE_EXPLORE_BACKOFF_BASE, SCORE_EXPLORE_BACKOFF_MAX, SCORE_FAIL_STREAK_EXCLUDE,
     SCORE_SWITCH_FULL_EVIDENCE, ScoreAuthority, ScorePolicyState, ScoreSelectionContext,
-    ScoreSnapshot, SelectionCadence, SelectionCadenceKey, SelectionHistoryKey, SelectionReason,
-    SelectionReasonKey, StateInner, Stats, budget, comparison,
+    ScoreSnapshot, SelectionCadenceKey, SelectionHistoryKey, SelectionReason, SelectionReasonKey,
+    StateInner, Stats, budget, comparison,
 };
 use honk_config::node::Node;
 use std::sync::Arc;
@@ -25,7 +25,9 @@ pub(super) struct Decision {
     pub baseline: PerformanceBaseline,
     pub ordinary: RankedSelection,
     pub evaluation: Option<super::evaluation::EvaluationSet>,
-    pub membership: super::evaluation::Membership,
+    /// Aligned with `scores`: members that may receive comparison pairs, evidence and optional
+    /// work.
+    pub membership: Vec<bool>,
 }
 
 pub(super) fn decision(
@@ -39,19 +41,14 @@ pub(super) fn decision(
     let view = comparison::View::new(inner, group, context, nodes, now);
     let (mut decision, evaluation) = ordinary_decision(&view, apply);
     if decision.ordinary.index != decision.pairs.reference {
-        // The winner is always covered, even when it was outside the stored set.
-        decision.membership = evaluation.membership(
-            nodes,
-            decision.ordinary.index,
-            decision.baseline.any_qualified,
-        );
+        // The winner is always evaluated, even when it was outside the stored set.
+        decision.membership = evaluation.membership(nodes, decision.ordinary.index);
         decision.pairs = view.pairs(
             (&decision.scores, decision.baseline),
             (&decision.membership, decision.ordinary.index),
         );
     }
-    view.join(&mut decision.pairs, &decision.membership);
-    decision.evidence = view.node_evidence(&decision.scores, &decision.membership.evaluated);
+    decision.evidence = view.node_evidence(&decision.membership);
     decision.evaluation = apply.then(|| evaluation.into_owned());
     decision
 }
@@ -71,7 +68,6 @@ fn ordinary_decision<'a>(
     let incumbent = inner
         .selection_history
         .peek(&SelectionHistoryKey::new(group, context))
-        .filter(|history| history.selections > 0)
         .and_then(|history| nodes.iter().position(|node| node.id == history.current));
     let reference = incumbent.unwrap_or_else(|| best_index(&scores, nodes, baseline).index);
     let evaluation = super::evaluation::derive(
@@ -84,7 +80,7 @@ fn ordinary_decision<'a>(
         now,
         apply,
     );
-    let membership = evaluation.membership(nodes, reference, baseline.any_qualified);
+    let membership = evaluation.membership(nodes, reference);
     let pairs = view.pairs((&scores, baseline), (&membership, reference));
     let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
     (
@@ -225,27 +221,18 @@ impl ScorePolicyState {
         let ordinary = decision.ordinary;
         let cadence_key = SelectionCadenceKey::new(group, context);
         set.anchor(nodes[ordinary.index].id);
-        super::validation::drop_runs_outside(&mut inner, group, context.network, &set);
         inner
             .evaluation
             .insert(SelectionReasonKey::new(group, context.network), set);
         let history_key = SelectionHistoryKey::new(group, context);
         inner
-            .selection_counts
+            .revalidated_at
             .entry(cadence_key.clone())
-            .or_insert(SelectionCadence {
-                revalidated_at: now,
-                run: None,
-            });
-        let evaluation = super::verification::evaluate(
-            &decision,
-            nodes,
-            context,
-            inner.selection_counts.get(&cadence_key),
-            now,
-        );
+            .or_insert(now);
         let mut selection = ordinary;
         let mut reservation = None;
+        // An ordinary escape to a different leaf serves the business instead of a trial; a
+        // bypass label alone must not starve funded validation of alternatives.
         let escaping = matches!(
             ordinary.reason,
             SelectionReason::IncumbentIneligible | SelectionReason::FreshFailureBypass
@@ -253,17 +240,12 @@ impl ScorePolicyState {
             .selection_history
             .peek(&history_key)
             .is_some_and(|history| history.current != nodes[ordinary.index].id);
-        if escaping {
-            super::validation::cancel_run(&mut inner, &cadence_key, context);
-        }
-        // A bypass label alone must not starve funded validation of alternatives.
         if allow_trials && context.target.is_some() && !escaping {
-            (selection, reservation) = super::validation::plan(
+            (selection, reservation) = super::verification::plan(
                 self,
                 &mut inner,
-                (&cadence_key, context),
+                (group, context),
                 &decision,
-                &evaluation,
                 nodes,
                 now,
             );
@@ -273,9 +255,9 @@ impl ScorePolicyState {
                 .carrier_pressure_at
                 .is_some_and(|at| {
                     inner
-                        .selection_counts
+                        .revalidated_at
                         .get(&cadence_key)
-                        .is_some_and(|cadence| at > cadence.revalidated_at)
+                        .is_some_and(|revalidated_at| at > *revalidated_at)
                 })
             {
                 let counts = inner
@@ -284,14 +266,13 @@ impl ScorePolicyState {
                     .or_default();
                 counts.carrier_validation = counts.carrier_validation.saturating_add(1);
             }
-            if let Some(cadence) = inner.selection_counts.get_mut(&cadence_key) {
-                cadence.revalidated_at = now;
+            if let Some(revalidated_at) = inner.revalidated_at.get_mut(&cadence_key) {
+                *revalidated_at = now;
             }
         }
         Self::record_verification(
             &mut inner,
             &history_key,
-            nodes[ordinary.index].id,
             super::verification::usable(&decision.evidence[selection.index]),
             selection.reason.is_exploration(),
         );
@@ -626,7 +607,6 @@ pub(super) fn score_snapshots(
                 || snapshot(&Stats::default(), now),
                 |stats| snapshot(stats, now),
             );
-            score.node_failure = score.unresolved_failure;
             let family_stats = context.target_family.and_then(|family| {
                 layer.family = Some(family);
                 inner.aggregate.peek(&layer)
@@ -648,13 +628,11 @@ pub(super) fn score_snapshots(
                 score.useful_completed = score.useful_completed.max(family.useful_completed);
                 score.qualified_until = score.qualified_until.max(family.qualified_until);
                 score.recovered_qualification |= family.recovered_qualification;
-                score.attempts = score.attempts.max(family.attempts);
                 score.performance = prefer_specific(score.performance, family.performance);
                 score.unresolved_failure |= family.unresolved_failure;
                 score.fail_streak = score.fail_streak.max(family.fail_streak);
                 score.explore_backed_off |= family.explore_backed_off;
                 score.selected_at = score.selected_at.max(family.selected_at);
-                score.last_attempt = score.last_attempt.max(family.last_attempt);
             }
             // Proxy health-family and probe protocol are independent of target family.
             if let Some(stats) = global_stats {
@@ -701,8 +679,6 @@ pub(super) fn score_snapshots(
                 score.target_performance = exact.performance;
                 score.unresolved_failure |= exact.unresolved_failure;
                 score.fail_streak = score.fail_streak.max(exact.fail_streak);
-                score.target_failure = exact.fail_streak > 0
-                    && stats.failed_at > global_stats.and_then(|global| global.failed_at);
                 score.explore_backed_off |= exact.explore_backed_off;
                 score.selected_at = score.selected_at.max(exact.selected_at);
                 score.degraded_at = score.degraded_at.max(exact.degraded_at);
@@ -722,7 +698,6 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
     let failures = stats.useful_failure + stats.setup_failure * 2.0;
     let observations = stats.useful_success + failures;
     ScoreSnapshot {
-        attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
         useful_completed: stats.useful_completed() * factor,
         qualified_until: stats.qualified_until.filter(|until| now < *until),
@@ -746,7 +721,6 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
             .filter(|at| now.saturating_duration_since(*at) < super::PERFORMANCE_MAX_AGE),
         fail_streak: stats.fail_streak,
         selected_at: stats.selected_at,
-        last_attempt: stats.last_attempt,
         ..Default::default()
     }
 }

@@ -3,7 +3,9 @@ use super::*;
 use honk_config::node::Node;
 
 mod question;
-pub(super) use question::{CandidateQuestion, evaluate, startup_index, usable};
+pub(super) use question::{plan, usable};
+#[cfg(test)]
+pub(super) use question::{questions, report};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreVerificationState {
@@ -38,7 +40,6 @@ pub struct ScoreChallenger {
     /// Weaker side's distinct retained reporters.
     pub reporters: u8,
     pub valid_for_ms: u64,
-    pub(crate) index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +104,6 @@ pub struct ScoreVerificationCounters {
 
 #[derive(Clone, Copy)]
 pub(super) struct TimedMetric {
-    pub value: f64,
     pub reporters: u8,
     pub latest_at: Instant,
 }
@@ -111,8 +111,6 @@ pub(super) struct TimedMetric {
 #[derive(Clone, Copy, Default)]
 pub(super) struct VerificationEvidence {
     pub business: Option<TimedMetric>,
-    pub response: Option<TimedMetric>,
-    pub probe: Option<TimedMetric>,
     pub failed_at: Option<Instant>,
 }
 
@@ -126,30 +124,24 @@ impl VerificationEvidence {
                     *at <= now && now < *at + LIVE_QUALIFICATION_TTL && availability.reporters > 0
                 })
                 .map(|latest_at| TimedMetric {
-                    value: 1.0,
                     reporters: availability.reporters,
                     latest_at,
                 }),
             failed_at: stats.failed_at,
-            ..Self::default()
         }
     }
 }
 
-pub(super) struct Evaluation {
-    pub snapshot: ScoreVerificationSnapshot,
-    pub validation_index: Option<usize>,
-    pub candidates: Vec<CandidateQuestion>,
-}
-
 impl ScorePolicyState {
+    /// `names` are the members' display tags, aligned with `nodes`.
     pub(in crate::group) fn verification_selection(
         &self,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
+        names: &[&str],
     ) -> Option<(usize, ScoreVerificationSnapshot)> {
-        self.verification_selection_at(group, context, nodes, Instant::now())
+        self.verification_selection_at(group, context, (nodes, names), Instant::now())
     }
 
     #[cfg(test)]
@@ -160,7 +152,8 @@ impl ScorePolicyState {
         nodes: &[&Node],
         now: Instant,
     ) -> Option<ScoreVerificationSnapshot> {
-        self.verification_selection_at(group, context, nodes, now)
+        let names: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
+        self.verification_selection_at(group, context, (nodes, &names), now)
             .map(|(_, snapshot)| snapshot)
     }
 
@@ -168,33 +161,16 @@ impl ScorePolicyState {
         &self,
         group: &str,
         context: &ScoreSelectionContext,
-        nodes: &[&Node],
+        members: (&[&Node], &[&str]),
         now: Instant,
     ) -> Option<(usize, ScoreVerificationSnapshot)> {
-        if nodes.is_empty() {
+        if members.0.is_empty() {
             return None;
         }
         let inner = self.inner.lock();
-        let decision = decision(&inner, group, context, nodes, now, false);
-        let mut evaluation = evaluate(
-            &decision,
-            nodes,
-            context,
-            inner
-                .selection_counts
-                .get(&SelectionCadenceKey::new(group, context)),
-            now,
-        );
-        super::validation::apply_budget_wait(
-            &inner,
-            group,
-            context,
-            nodes,
-            decision.ordinary.index,
-            now,
-            &mut evaluation,
-        );
-        Some((decision.ordinary.index, evaluation.snapshot))
+        let decision = decision(&inner, group, context, members.0, now, false);
+        let report = question::report(&inner, (group, context), &decision, members, now);
+        Some((decision.ordinary.index, report))
     }
 
     pub(in crate::group) fn verification_counters(
@@ -213,7 +189,6 @@ impl ScorePolicyState {
     pub(super) fn record_verification(
         inner: &mut StateInner,
         key: &SelectionHistoryKey,
-        selected: Uuid,
         selected_usable: bool,
         validation: bool,
     ) {
@@ -231,16 +206,6 @@ impl ScorePolicyState {
             counts.validation_selections = counts.validation_selections.saturating_add(1);
         }
         // Every authorized rank, including trials, keeps its target history resident in the LRU.
-        if inner.selection_history.get_mut(key).is_none() {
-            inner.selection_history.push(
-                key.clone(),
-                SelectionHistory {
-                    current: selected,
-                    previous: None,
-                    selections: 0,
-                    switched_at: 0,
-                },
-            );
-        }
+        inner.selection_history.promote(key);
     }
 }

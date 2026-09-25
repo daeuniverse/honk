@@ -21,8 +21,8 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
     let (scores, baseline) = idle_scores(nodes.len());
     let now = Instant::now();
     let idle = evaluation::derive(None, &refs, &scores, baseline, now, true).into_owned();
-    let idle_membership = idle.membership(&refs, 0, baseline.any_qualified);
-    assert_eq!(idle_membership.evaluated.iter().filter(|v| **v).count(), 4);
+    let idle_membership = idle.membership(&refs, 0);
+    assert_eq!(idle_membership.iter().filter(|v| **v).count(), 4);
     let mut busy = idle;
     for second in 0..240 {
         busy.record_demand(now + Duration::from_secs(second));
@@ -38,8 +38,7 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
     .into_owned();
     assert_eq!(
         before_refresh
-            .membership(&refs, 0, baseline.any_qualified)
-            .evaluated
+            .membership(&refs, 0)
             .iter()
             .filter(|v| **v)
             .count(),
@@ -59,8 +58,7 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
     )
     .into_owned();
     let evaluated = refreshed
-        .membership(&refs, 0, baseline.any_qualified)
-        .evaluated
+        .membership(&refs, 0)
         .iter()
         .filter(|v| **v)
         .count();
@@ -77,10 +75,9 @@ fn members_missing_from_one_view_keep_their_place() {
     let now = Instant::now();
     let set = evaluation::derive(None, &refs, &scores, baseline, now, true).into_owned();
     let ranked = set
-        .membership(&refs, usize::MAX, baseline.any_qualified)
-        .covered
+        .membership(&refs, usize::MAX)
         .iter()
-        .position(|covered| *covered)
+        .position(|evaluated| *evaluated)
         .unwrap();
     let absent = refs[ranked].id;
     let view: Vec<_> = refs
@@ -105,41 +102,6 @@ fn members_missing_from_one_view_keep_their_place() {
 }
 
 #[test]
-fn ranked_members_join_coverage_at_their_first_qualification() {
-    let nodes = members(3);
-    let refs: Vec<_> = nodes.iter().collect();
-    let now = Instant::now();
-    let (idle, _) = idle_scores(3);
-    let qualified = ScoreSnapshot {
-        useful_completed: PERFORMANCE_VALIDATION_SAMPLES,
-        ..Default::default()
-    };
-    let unknown = ScoreSnapshot::default();
-    let derive = |stored: Option<&EvaluationSet>, scores: &[ScoreSnapshot]| {
-        evaluation::derive(
-            stored,
-            &refs,
-            scores,
-            performance_baseline(scores),
-            now,
-            true,
-        )
-        .into_owned()
-    };
-    let covered = |set: &EvaluationSet, qualified| set.membership(&refs, 0, qualified).covered;
-    // Qualification cannot gate coverage before any member is qualified.
-    let cold = derive(None, &idle);
-    assert_eq!(covered(&cold, false), [true, true, true]);
-    // Once one is, members still acquiring evidence are evaluated but cannot stall alignment.
-    let first = derive(Some(&cold), &[qualified, qualified, unknown]);
-    assert_eq!(covered(&first, true), [true, true, false]);
-    assert!(first.membership(&refs, 0, true).evaluated[2]);
-    // Admission outlives a later lapse, so coverage does not shrink with it.
-    let lapsed = derive(Some(&first), &[qualified, unknown, unknown]);
-    assert_eq!(covered(&lapsed, true), [true, true, false]);
-}
-
-#[test]
 fn rotation_visits_every_member_outside_the_ranked_set() {
     let nodes = members(10);
     let refs: Vec<_> = nodes.iter().collect();
@@ -157,26 +119,17 @@ fn rotation_visits_every_member_outside_the_ranked_set() {
             true,
         )
         .into_owned();
-        let membership = derived.membership(&refs, usize::MAX, baseline.any_qualified);
+        let membership = derived.membership(&refs, usize::MAX);
+        assert_eq!(membership.iter().filter(|v| **v).count(), 3);
         for (index, node) in refs.iter().enumerate() {
-            if membership.evaluated[index] && !membership.covered[index] {
+            if membership[index] {
                 visited.insert(node.id);
             }
         }
         set = Some(derived);
     }
-    let final_set = set.unwrap();
-    let outside = refs
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            !final_set
-                .membership(&refs, usize::MAX, baseline.any_qualified)
-                .covered[*index]
-        })
-        .count();
-    assert_eq!(outside, 8);
-    assert_eq!(visited.len(), outside);
+    // Two ranked members plus one ten-minute rotation slot reach all ten in ten slots.
+    assert_eq!(visited.len(), 10);
 }
 
 #[test]
@@ -301,22 +254,6 @@ fn filtered_views_cannot_disable_evaluation_bounds() {
         .unwrap();
     assert_eq!(report.candidate_count, 100);
     assert!(report.evaluated_count <= 4);
-    assert!(covered(&state, &target, &all, now + Duration::from_secs(1)) <= report.evaluated_count);
-}
-
-fn covered(
-    state: &ScorePolicyState,
-    target: &ScoreSelectionContext,
-    refs: &[&Node],
-    at: Instant,
-) -> usize {
-    let inner = state.inner.lock();
-    super::super::ranking::decision(&inner, "score", target, refs, at, false)
-        .membership
-        .covered
-        .iter()
-        .filter(|covered| **covered)
-        .count()
 }
 
 #[test]
@@ -351,68 +288,4 @@ fn readonly_refresh_does_not_replace_committed_participants() {
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
     assert_eq!(applied.evaluated_count, 17);
-}
-
-#[test]
-fn qualified_readonly_bootstrap_waits_for_committed_participants() {
-    let nodes = members(2);
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("bootstrap.example", IpVersion::V4);
-    let refs: Vec<_> = nodes.iter().collect();
-    let now = Instant::now();
-    for leaf in &nodes {
-        train_at(&manager, leaf, &target, 8, 100, 1, now);
-    }
-    let state = manager.score_state();
-    let at = now + Duration::from_secs(2);
-    assert_eq!(covered(&state, &target, &refs, at), 1);
-    rank_at(&manager, &nodes, &target, at);
-    assert_eq!(covered(&state, &target, &refs, at), 2);
-    let committed = state
-        .verification_snapshot_at("score", &target, &refs, at)
-        .unwrap();
-    let relations: Vec<_> = committed.challengers.iter().map(|c| c.relation).collect();
-    assert_eq!(relations, [ScoreRelation::Equivalent]);
-}
-
-#[test]
-fn live_recovery_admits_coverage_before_settlement() {
-    let nodes = members(3);
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("live-admission.example", IpVersion::V4);
-    let refs: Vec<_> = nodes.iter().collect();
-    let now = Instant::now();
-    rank_at(&manager, &nodes, &target, now);
-    for leaf in &nodes[..2] {
-        train_at(&manager, leaf, &target, 8, 100, 1, now);
-    }
-    let feedback = manager
-        .feedback_for_group_node("score", nodes[2].id, target.clone())
-        .unwrap();
-    for _ in 0..3 {
-        let reporter = feedback.start_at(now + Duration::from_secs(2));
-        reporter.setup_succeeded_at(now + Duration::from_secs(2));
-        reporter.finish_at(
-            ScoreOutcome::TargetFailure,
-            true,
-            now + Duration::from_secs(2),
-        );
-    }
-    let state = manager.score_state();
-    let at = now + Duration::from_secs(3);
-    assert_eq!(covered(&state, &target, &refs, at), 2);
-    let reporters: Vec<_> = (0..4).map(|_| feedback.start_at(at)).collect();
-    for reporter in &reporters {
-        reporter.setup_succeeded_at(at);
-        reporter.first_response_at(at);
-        reporter.transfer_at(1, 1, at);
-    }
-    assert_eq!(covered(&state, &target, &refs, at), 3);
-    let expired = at + PERFORMANCE_MAX_AGE + Duration::from_secs(1);
-    assert_eq!(covered(&state, &target, &refs, expired), 3);
-    let lapsed = score_snapshot(&state.inner.lock(), "score", &target, nodes[2].id, expired);
-    assert!(!lapsed.qualified());
-    for reporter in reporters {
-        reporter.finish_at(ScoreOutcome::Cancelled, false, expired);
-    }
 }

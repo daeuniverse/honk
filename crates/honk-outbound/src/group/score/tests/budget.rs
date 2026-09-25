@@ -5,10 +5,34 @@ fn counts(manager: &GroupManager, group: &str) -> ScoreBudgetCounters {
     manager.score_budget_counters(group, SelectionNetwork::Tcp)
 }
 
+/// Trials only serve challengers whose completions, counting unfinished work, stay below the
+/// ordinary selection's, so a cold group funds none.
+pub(super) fn complete_ordinary(
+    manager: &GroupManager,
+    group: &str,
+    leaf: &Node,
+    completions: f64,
+) {
+    manager.score_state().inner.lock().aggregate.put(
+        AggregateKey {
+            group: group.into(),
+            network: SelectionNetwork::Tcp,
+            family: None,
+            node_id: leaf.id,
+        },
+        Stats {
+            setup_success: completions,
+            updated_at: Some(Instant::now()),
+            ..Default::default()
+        },
+    );
+}
+
 #[test]
 fn unstarted_plans_refund_once_after_last_clone_without_minting_business() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("pending.example", IpVersion::V4);
     let plan = manager.selection_plan_for_target("score", &target);
     let first = plan.entries[0].feedback.as_ref().unwrap().clone();
@@ -31,6 +55,7 @@ fn unstarted_plans_refund_once_after_last_clone_without_minting_business() {
 fn concurrent_begin_clones_spend_once_and_cancel_without_refund() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("clones.example", IpVersion::V4);
     let plan = manager.selection_plan_for_target("score", &target);
     let feedback = plan.entries[0].feedback.as_ref().unwrap().clone();
@@ -84,6 +109,7 @@ fn concurrent_begin_clones_spend_once_and_cancel_without_refund() {
 fn stale_generation_start_refunds_and_never_publishes_root_or_scope_counts() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("reload.example", IpVersion::V4);
     let plan = manager.selection_plan_for_target("score", &target);
     let state = manager.score_state();
@@ -134,6 +160,13 @@ fn nested_losers_refund_and_selected_chain_shares_one_original_business() {
         ],
         &nodes,
     );
+    for (group, leaf) in [
+        ("left", &nodes[0]),
+        ("right", &nodes[2]),
+        ("score", &nodes[1]),
+    ] {
+        complete_ordinary(&manager, group, leaf, 1.0);
+    }
     let target = context("nested.example", IpVersion::V4);
     let plan = manager.selection_plan_for_target("score", &target);
     let feedback = plan.entries[0].feedback.as_ref().unwrap();
@@ -154,6 +187,7 @@ fn nested_losers_refund_and_selected_chain_shares_one_original_business() {
 fn retry_and_related_context_preserve_original_identity_without_optional_cost() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("retry.example", IpVersion::V4);
     let original = manager.selection_plan_for_target("score", &target);
     let entry = &original.entries[0];
@@ -200,6 +234,7 @@ fn retry_and_related_context_preserve_original_identity_without_optional_cost() 
 fn trial_outcomes_and_setup_histogram_do_not_change_terminal_reliability_units() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("telemetry.example", IpVersion::V4);
     let plan = manager.selection_plan_for_target("score", &target);
     let start = Instant::now();
@@ -240,7 +275,7 @@ fn trial_outcomes_and_setup_histogram_do_not_change_terminal_reliability_units()
         manager
             .score_state()
             .exact_stats("score", &target, plan.entries[0].node.id),
-        Some((0, 0, 0))
+        Some((0, 0))
     );
 }
 
@@ -298,11 +333,11 @@ fn sparse_arrivals_obey_spent_plus_reserved_bound_without_clock_currency() {
                 "score",
                 &target,
                 nodes[0].id,
-                (ScoreEvidenceQuestion::Availability, 4),
+                ScoreEvidenceQuestion::Availability,
                 now,
             )
         }
-        .unwrap_or_else(|| {
+        .unwrap_or_else(|_| {
             budget::Work::new(
                 &state,
                 "score",
@@ -363,7 +398,7 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
         "score",
         &target,
         nodes[0].id,
-        (ScoreEvidenceQuestion::Availability, 1),
+        ScoreEvidenceQuestion::Availability,
         now,
     )
     .unwrap();
@@ -374,7 +409,6 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
             &target,
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            1,
             now
         ),
         ScoreWaitReason::InFlight
@@ -386,7 +420,7 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
         "score",
         &target,
         nodes[0].id,
-        (ScoreEvidenceQuestion::Availability, 1),
+        ScoreEvidenceQuestion::Availability,
         later,
     )
     .unwrap();
@@ -420,7 +454,7 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
         "score",
         &target,
         nodes[0].id,
-        (ScoreEvidenceQuestion::Availability, 1),
+        ScoreEvidenceQuestion::Availability,
         expired,
     )
     .unwrap();
@@ -460,7 +494,7 @@ fn setup_cost_includes_pre_reporter_work_and_local_refusal_is_neutral() {
         "score",
         &target,
         nodes[0].id,
-        (ScoreEvidenceQuestion::Availability, 4),
+        ScoreEvidenceQuestion::Availability,
         start,
     )
     .unwrap();
@@ -516,7 +550,6 @@ fn accepted_reporters_no_longer_suppress_missing_distinct_support() {
             &target,
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            1,
             now + Duration::from_millis(10)
         ),
         ScoreWaitReason::None
@@ -528,7 +561,6 @@ fn accepted_reporters_no_longer_suppress_missing_distinct_support() {
             &target,
             nodes[0].id,
             ScoreEvidenceQuestion::Qualification,
-            1,
             now + Duration::from_millis(10)
         ),
         ScoreWaitReason::InFlight
@@ -545,7 +577,6 @@ fn accepted_reporters_no_longer_suppress_missing_distinct_support() {
             &target,
             nodes[0].id,
             ScoreEvidenceQuestion::Qualification,
-            1,
             now + Duration::from_millis(20)
         ),
         ScoreWaitReason::None
@@ -580,6 +611,7 @@ fn reusable_factory_stays_independent_after_explicit_business_admission() {
 fn related_route_selections_do_not_reserve_optional_work_with_cold_credit_remaining() {
     let nodes = [node("a"), node("b"), node("c")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let target = context("first.example", IpVersion::V4);
     let plan = manager.selection_plan_for_target_with_health_fallback("score", &target, None);
     let original = plan.entries[0].feedback.as_ref().unwrap();
@@ -707,30 +739,33 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
     let nodes: Vec<_> = (0..5).map(|index| node(&format!("leaf-{index}"))).collect();
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let state = manager.score_state();
-    let target = context("reload-cap.example", IpVersion::V4);
+    // One trial per target, so reaching the per-node cap takes distinct targets.
+    let targets: Vec<_> = (0..6)
+        .map(|index| context(&format!("reload-cap-{index}.example"), IpVersion::V4))
+        .collect();
     let now = Instant::now();
     let attribution = [ScoreAttribution {
         group: "score".into(),
         node_id: nodes[0].id,
     }];
-    let reserve = |at| {
+    let reserve = |index: usize, at| {
         budget::reserve(
             &state,
             &mut state.inner.lock(),
             "score",
-            &target,
+            &targets[index],
             nodes[0].id,
-            (ScoreEvidenceQuestion::Availability, 4),
+            ScoreEvidenceQuestion::Availability,
             at,
         )
     };
     let mut running = Vec::new();
-    for _ in 0..3 {
-        let work = reserve(now).unwrap();
+    for (index, target) in targets.iter().enumerate().take(3) {
+        let work = reserve(index, now).unwrap();
         assert!(budget::begin(
             &mut state.inner.lock(),
             &manager.score_authority,
-            &target,
+            target,
             &attribution,
             &budget::Opportunity::default(),
             std::slice::from_ref(&work),
@@ -738,7 +773,7 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
         ));
         running.push(work);
     }
-    let pending = reserve(now).unwrap();
+    let pending = reserve(3, now).unwrap();
     let replacement = GroupManager::with_alive_set_and_score_state(
         &[group("score", &nodes[..2])],
         &nodes,
@@ -760,17 +795,17 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
     assert!(!budget::begin(
         &mut state.inner.lock(),
         &replacement.score_authority,
-        &target,
+        &targets[3],
         &attribution,
         &budget::Opportunity::default(),
         std::slice::from_ref(&pending),
         now,
     ));
-    let fourth = reserve(now).unwrap();
+    let fourth = reserve(4, now).unwrap();
     assert!(budget::begin(
         &mut state.inner.lock(),
         &replacement.score_authority,
-        &target,
+        &targets[4],
         &attribution,
         &budget::Opportunity::default(),
         std::slice::from_ref(&fourth),
@@ -780,15 +815,14 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
         budget::wait_reason(
             &state.inner.lock(),
             "score",
-            &target,
+            &targets[5],
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            4,
             now,
         ),
         ScoreWaitReason::InFlight
     );
-    assert!(reserve(now).is_none());
+    assert!(reserve(5, now).is_err());
     budget::finish(
         &state,
         std::slice::from_ref(&running[0]),
@@ -799,10 +833,9 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
         budget::wait_reason(
             &state.inner.lock(),
             "score",
-            &target,
+            &targets[5],
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            4,
             now,
         ),
         ScoreWaitReason::Budget
@@ -812,10 +845,9 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
         budget::wait_reason(
             &state.inner.lock(),
             "score",
-            &target,
+            &targets[5],
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            1,
             later,
         ),
         ScoreWaitReason::Budget
@@ -843,7 +875,7 @@ fn targetless_reserved_work_is_refunded_and_cannot_start_for_free() {
         "score",
         &target,
         nodes[0].id,
-        (ScoreEvidenceQuestion::Availability, 4),
+        ScoreEvidenceQuestion::Availability,
         now,
     )
     .unwrap();
@@ -947,44 +979,5 @@ fn stale_ordinary_begin_and_retry_preserve_traffic_without_publishing_or_earning
         ),
         (0, 0, 0, 0)
     );
-    assert_eq!(state.root_business_starts(), 0);
-}
-
-#[test]
-fn stale_run_bound_ordinary_work_cannot_downgrade_to_unscored() {
-    let nodes = [node("a"), node("b")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let state = manager.score_state();
-    let target = context("stale-control.example", IpVersion::V4);
-    let now = Instant::now();
-    let work = budget::Work::new(
-        &state,
-        "score",
-        &target,
-        nodes[0].id,
-        ScoreTrialSource::None,
-    );
-    budget::bind_deadline(
-        &mut state.inner.lock(),
-        &work,
-        now + Duration::from_secs(45),
-    );
-    let attempt = ScoreAttempt::planned(
-        manager
-            .feedback_for_group_node("score", nodes[0].id, target)
-            .unwrap(),
-        Arc::new(budget::Opportunity::default()),
-        vec![work],
-        ScoreTrialSource::None,
-    );
-    let replacement = GroupManager::with_alive_set_and_score_state(
-        &[group("score", &nodes)],
-        &nodes,
-        None,
-        Arc::clone(&state),
-    );
-    replacement.publish_score_membership();
-    assert!(attempt.begin_at(now).is_err());
-    assert!(attempt.continuation().is_err());
     assert_eq!(state.root_business_starts(), 0);
 }

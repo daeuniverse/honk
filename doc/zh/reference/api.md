@@ -247,7 +247,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | `coverage` | `scope`（`all` 或 `bounded`）、`candidates`、`evaluated`、`unevaluated`、`pending` 数量。评估成员由显式有界身份决定，跨过滤视图也不例外。未评估成员不参与比较。`pending` 统计仍有未决问题的已评估成员，包括已有比较但仍需资格或恢复工作的成员。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
-Readonly／Peek 使用已提交参与者，不重新排名或纳入成员。Apply 初始化／刷新参与者并纳入当前合格排名成员；已接纳业务反馈也为已在排名中的成员锁存资格。初始化前，只读查询使用不能纳入合格成员的临时有界投影。见[评估集生命周期](../design/groups.md#有条件的验证结论)。
+Readonly／Peek 使用已提交参与者，不重新排名。Apply 初始化并刷新参与者。初始化前，只读查询使用临时有界投影。见[评估集生命周期](../design/groups.md#有条件的验证结论)。
 
 `challengers` 列出所选成员当前的原始比较对（即普通晋升读取的同一批比较对）中具有新鲜合格响应指标的项；没有该指标的成员不出现，都没有时为空列表。每项包含 `name`（公开成员 tag，仅作显示，嵌套路径下可能重名）、`basis`（`targetResponse`、`commonTargets` 或 `configuredProbe`）、`relation`（`selectedFaster`、`equivalent` 或 `challengerFaster`）、`reporters` 与 `validForMs`。`equivalent` 对实际响应值使用包含边界的对称区间 `high - low <= 0.1 × low`，包括零与亚毫秒值。`reporters` 是双方已保留的不同 reporter 支持量中的较弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`validForMs` 是该响应指标的剩余有效期。业务块为 15 秒，在块起点后 60 秒到期；配置探测按生产者周期 `I` 使用 `max(15s, 2I)` 块，有效期同时受最早支持块的四块保留期限与“较弱一侧最近支持加 `max(60s, 2I)`”限制。失败／reload／incarnation 边界保持不变。`commonTargets` 最多使用八个规范、等权、响应合格的共同目标，不是无关聚合均值；setup 与预热不是比较证据。
 

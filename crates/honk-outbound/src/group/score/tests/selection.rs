@@ -1,3 +1,4 @@
+use super::budget::complete_ordinary;
 use super::*;
 
 #[test]
@@ -269,6 +270,8 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     };
     let manager = super::super::super::GroupManager::new(&[sub_a, sub_b, parent], &nodes);
     let state = manager.score_state();
+    complete_ordinary(&manager, "sel-sub-a", &nodes[0], 1.0);
+    complete_ordinary(&manager, "sel-sub-b", &nodes[2], 1.0);
 
     // Default choice is the first member: only sub-a commits a rank.
     let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);

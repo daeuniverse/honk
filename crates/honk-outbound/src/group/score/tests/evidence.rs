@@ -191,7 +191,7 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
         let inner = state.inner.lock();
         (
             inner.tick,
-            inner.selection_counts.len(),
+            inner.revalidated_at.len(),
             inner.aggregate.len(),
             inner.exact.len(),
         )
@@ -214,7 +214,7 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
         let inner = state.inner.lock();
         (
             inner.tick,
-            inner.selection_counts.len(),
+            inner.revalidated_at.len(),
             inner.aggregate.len(),
             inner.exact.len(),
         )
@@ -226,7 +226,7 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     assert!(current.entries[0].feedback.is_some());
     {
         let planned = state.inner.lock();
-        assert_eq!(planned.selection_counts.len(), 1);
+        assert_eq!(planned.revalidated_at.len(), 1);
         // An unbegun plan is not an opportunity: no discovery state or tick changes yet.
         assert_eq!((planned.tick, planned.aggregate.len()), (before.0, 0));
     }
@@ -409,7 +409,7 @@ fn shared_carrier_failure_counts_flows_but_only_one_hard_episode() {
         leaf.id,
         now + Duration::from_secs(3),
     );
-    assert_eq!(state.exact_stats("score", &target, leaf.id).unwrap().2, 8);
+    assert_eq!(state.exact_stats("score", &target, leaf.id).unwrap().1, 8);
     assert_eq!(score.fail_streak, 0);
     assert!(!score.unresolved_failure);
     assert!(!score.explore_backed_off);

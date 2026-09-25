@@ -44,7 +44,7 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
         manager
             .score_state()
             .exact_stats("score", &context, nodes[0].id),
-        Some((0, 0, 0))
+        Some((0, 0))
     );
     assert_eq!(
         manager
@@ -53,21 +53,11 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
         0
     );
     let next = manager.selection_plan_for_target("score", &context);
-    assert_ne!(next.entries[0].node.id, first.entries[0].node.id);
+    // A trial never outpaces the selection's evidence, so exploration waits for its completion.
+    assert_eq!(next.entries[0].node.id, nodes[0].id);
     finish_success(&next);
-    let mut tried_other = false;
-    for _ in 0..=SCORE_EXPLORATION_PERIOD {
-        let plan = manager.selection_plan_for_target("score", &context);
-        if plan.entries[0].node.id == nodes[1].id {
-            tried_other = true;
-            break;
-        }
-        finish_success(&plan);
-    }
-    assert!(
-        tried_other,
-        "cancellation stays neutral without renewing the startup allowance"
-    );
+    let explore = manager.selection_plan_for_target("score", &context);
+    assert_eq!(explore.entries[0].node.id, nodes[1].id);
 }
 
 #[test]
@@ -91,7 +81,7 @@ fn rejected_exact_attempt_is_neutral() {
             .score_state()
             .exact_stats("score", &context, nodes[0].id)
             .unwrap_or_default(),
-        (0, 0, 0)
+        (0, 0)
     );
     assert_eq!(
         manager
@@ -132,7 +122,7 @@ fn cancelled_exact_attempt_does_not_hide_aggregate_failure() {
             .score_state()
             .exact_stats("score", &context, nodes[0].id)
             .unwrap_or_default(),
-        (0, 0, 0)
+        (0, 0)
     );
     assert_eq!(selected(&manager, &context), nodes[1].id);
 }
@@ -437,7 +427,7 @@ fn aggregate_feedback_completion_and_cancellation_are_accounted_once() {
             .score_state()
             .aggregate_stats("score", SelectionNetwork::Tcp, leaf.id)
             .unwrap_or_default(),
-        (0, 0, 0)
+        (0, 0)
     );
     let reporter = feedback.start();
     reporter.setup_succeeded();
@@ -446,7 +436,7 @@ fn aggregate_feedback_completion_and_cancellation_are_accounted_once() {
         manager
             .score_state()
             .aggregate_stats("score", SelectionNetwork::Tcp, leaf.id),
-        Some((1, 1, 0))
+        Some((1, 0))
     );
 }
 
@@ -667,7 +657,7 @@ fn network_target_and_family_buckets_are_isolated() {
 
     assert_eq!(
         state.exact_stats("score", &tcp_a_v4, nodes[0].id),
-        Some((1, 0, 1))
+        Some((0, 1))
     );
     for untouched in [&udp_a_v4, &tcp_b_v4, &tcp_a_v6] {
         assert_eq!(state.exact_stats("score", untouched, nodes[0].id), None);
@@ -675,7 +665,7 @@ fn network_target_and_family_buckets_are_isolated() {
     finish_success(&manager.selection_plan_for_target("score", &tcp_b_v4));
     assert_eq!(
         state.exact_stats("score", &tcp_b_v4, nodes[1].id),
-        Some((1, 1, 0))
+        Some((1, 0))
     );
     assert_eq!(state.exact_stats("score", &tcp_a_v4, nodes[1].id), None);
 }
@@ -749,7 +739,7 @@ fn stale_exact_completion_does_not_mutate_recreated_cell() {
         manager
             .score_state()
             .exact_stats("score", &evicted, node.id),
-        Some((1, 0, 0))
+        Some((0, 0))
     );
     replacement.setup_succeeded();
     replacement.tx(1);
@@ -759,7 +749,7 @@ fn stale_exact_completion_does_not_mutate_recreated_cell() {
         manager
             .score_state()
             .exact_stats("score", &evicted, node.id),
-        Some((1, 1, 0))
+        Some((1, 0))
     );
 }
 
@@ -796,7 +786,6 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
         tx: 1,
         rx: 1,
         eligible_rx_at: Some(rx_at),
-        elapsed: Duration::from_millis(1),
         count_usefulness: true,
     };
     state.finish(
@@ -808,7 +797,7 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
     assert_eq!(state.inner.lock().aggregate.len(), AGGREGATE_CAPACITY);
     assert_eq!(
         state.aggregate_stats(&evicted.group, SelectionNetwork::Tcp, node_id),
-        Some((1, 0, 0))
+        Some((0, 0))
     );
     state.finish(
         &context,
@@ -818,7 +807,7 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
     );
     assert_eq!(
         state.aggregate_stats(&evicted.group, SelectionNetwork::Tcp, node_id),
-        Some((1, 1, 0))
+        Some((1, 0))
     );
 }
 

@@ -400,10 +400,7 @@ fn setup_quality_survives_neutral_completion_without_a_response() {
             now + Duration::from_secs(1),
         );
         assert_eq!(score.target_performance.setup.value, Some(60.0));
-        assert_eq!(
-            (score.attempts, score.completed, score.unresolved_failure),
-            (0.0, 0.0, false)
-        );
+        assert_eq!((score.completed, score.unresolved_failure), (0.0, false));
         assert_eq!(
             state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
             1,
@@ -438,10 +435,7 @@ fn concurrent_failed_probe_cannot_retire_successful_probe_evidence() {
     let state = manager.score_state();
     let score = score_snapshot(&state.inner.lock(), "score", &target, nodes[1].id, now);
     assert_eq!(score.probe.value, Some(5.0));
-    assert_eq!(
-        (score.attempts, score.completed, score.unresolved_failure),
-        (0.0, 0.0, false)
-    );
+    assert_eq!((score.completed, score.unresolved_failure), (0.0, false));
     assert_eq!(
         state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
         1
@@ -633,7 +627,7 @@ fn new_target_live_recovery_requires_node_failure_not_reload_fence() {
             before.baseline
         ));
         let counts = state.aggregate_stats("score", target.network, nodes[0].id);
-        assert_eq!(counts.unwrap().2, if node_failed { 9 } else { 0 });
+        assert_eq!(counts.unwrap().1, if node_failed { 9 } else { 0 });
         for (index, reporter) in open.iter().enumerate() {
             reporter.transfer_at(1, 1, at);
             let current = decision_at(&state.inner.lock(), &nodes, &target, 0, at);
@@ -664,7 +658,7 @@ fn new_target_live_recovery_requires_node_failure_not_reload_fence() {
             );
             assert_eq!(
                 state.exact_stats("score", &target, nodes[0].id),
-                Some((4, 0, 0))
+                Some((0, 0))
             );
         }
         for reporter in open {

@@ -241,7 +241,6 @@ fn publishable_business_rx_opens_recovery_without_settling_the_flow() {
     active.transfer_at(0, 1, at);
     let recovered = snapshots(&manager, &nodes, &target, at);
     assert!(recovered.scores[0].unresolved_failure);
-    assert_close(recovered.scores[0].attempts, before.scores[0].attempts);
     assert_close(recovered.scores[0].completed, before.scores[0].completed);
     assert_close(
         recovered.scores[0].useful_completed,
@@ -300,10 +299,6 @@ fn publishable_business_rx_opens_recovery_without_settling_the_flow() {
     assert_close(
         cancelled.scores[0].useful_completed,
         published.scores[0].useful_completed,
-    );
-    assert_close(
-        cancelled.scores[0].attempts,
-        published.scores[0].attempts - (-1.0_f64 / 1800.0).exp2(),
     );
     assert!(!super::super::verification::usable(&cancelled.evidence[0]));
 
@@ -556,7 +551,6 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
         tx: 1,
         rx: 1,
         eligible_rx_at: Some(now + Duration::from_secs(1851)),
-        elapsed: terminal_at.duration_since(started),
         count_usefulness: true,
     };
     state.finish_at(

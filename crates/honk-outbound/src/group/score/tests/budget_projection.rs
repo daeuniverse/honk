@@ -1,3 +1,4 @@
+use super::budget::complete_ordinary;
 use super::*;
 
 fn assert_readonly_wait(manager: &GroupManager, expected: ScoreWaitReason) {
@@ -20,6 +21,9 @@ fn assert_readonly_wait(manager: &GroupManager, expected: ScoreWaitReason) {
 fn aggregate_budget_wait_requires_both_target_families_exhausted_and_is_readonly() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    // Unfinished flows count as a challenger's completions; the selection must stay ahead of the
+    // four that fill a challenger's in-flight slots, or dispatch never reaches the ledger's wait.
+    complete_ordinary(&manager, "score", &nodes[0], 5.0);
     assert_readonly_wait(&manager, ScoreWaitReason::ComparableTraffic);
     for family in [IpVersion::V4, IpVersion::V6] {
         let target = context("budget.example", family);
@@ -65,6 +69,9 @@ fn aggregate_budget_wait_requires_both_target_families_exhausted_and_is_readonly
 fn aggregate_inflight_wait_keeps_missing_or_free_target_family_available() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    // An aggregate read counts unfinished flows of both target families; the selection must stay
+    // ahead of the eight that fill a challenger's in-flight slots in both.
+    complete_ordinary(&manager, "score", &nodes[0], 9.0);
     let mut pending = Vec::new();
     for family in [IpVersion::V4, IpVersion::V6] {
         assert_readonly_wait(&manager, ScoreWaitReason::ComparableTraffic);
@@ -123,14 +130,20 @@ fn unrelated_inflight_work_cannot_fill_a_target_availability_gap() {
 fn expired_pending_credit_is_visible_without_refunding_on_read() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    // Pending trials count as the challenger's completions, so two selection completions let
+    // it hold one unanswered trial per target; the second target exhausts each family.
+    complete_ordinary(&manager, "score", &nodes[0], 2.0);
     let state = manager.score_state();
     let refs = nodes.iter().collect::<Vec<_>>();
     let now = Instant::now();
     let mut pending = Vec::new();
     for family in [IpVersion::V4, IpVersion::V6] {
-        let target = context("pending.example", family);
-        for _ in 0..2 {
-            pending.push(state.rank_plan_at("score", &target, &refs, now).1);
+        for host in ["pending.example", "queued.example"] {
+            pending.push(
+                state
+                    .rank_plan_at("score", &context(host, family), &refs, now)
+                    .1,
+            );
         }
     }
     let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
@@ -173,6 +186,7 @@ fn expired_pending_credit_is_visible_without_refunding_on_read() {
 fn expired_earned_reservation_is_available_but_started_work_never_refunds() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
     let state = manager.score_state();
     let refs = nodes.iter().collect::<Vec<_>>();
     let target = context("earned.example", IpVersion::V4);
@@ -218,17 +232,6 @@ fn expired_earned_reservation_is_available_but_started_work_never_refunds() {
         manager.score_budget_counters("score", SelectionNetwork::Tcp),
         before
     );
-    let ordinary = state.rank_plan_at("score", &target, &refs, later).1;
-    ordinary
-        .begin_at(later)
-        .unwrap()
-        .finish(ScoreOutcome::Cancelled);
-    assert_eq!(
-        manager
-            .score_budget_counters("score", SelectionNetwork::Tcp)
-            .spent,
-        before.spent
-    );
     let attempt = state.rank_plan_at("score", &target, &refs, later).1;
     let started = attempt.begin_at(later).unwrap();
     assert!(pending.begin_at(later).is_err());
@@ -250,13 +253,16 @@ fn expired_earned_reservation_is_available_but_started_work_never_refunds() {
 
 #[test]
 fn targeted_unknown_family_uses_its_own_budget_and_inflight_scope() {
-    let nodes = [node("a"), node("b")];
+    let nodes = [node("a"), node("b"), node("c")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    // Unfinished flows count as a challenger's completions; the selection must stay ahead of the
+    // four that fill a challenger's in-flight slots, or dispatch never reaches the ledger's wait.
+    complete_ordinary(&manager, "score", &nodes[0], 5.0);
     let state = manager.score_state();
     let refs = nodes.iter().collect::<Vec<_>>();
     let now = Instant::now();
     for family in [IpVersion::V4, IpVersion::V6] {
-        for _ in 0..2 {
+        for _ in 0..3 {
             state
                 .rank_plan_at("score", &context("known.example", family), &refs, now)
                 .1
@@ -294,14 +300,72 @@ fn targeted_unknown_family_uses_its_own_budget_and_inflight_scope() {
             .wait_reason,
         ScoreWaitReason::InFlight
     );
-    active.pop().unwrap().finish(ScoreOutcome::Cancelled);
+    for work in active.drain(8..) {
+        work.finish(ScoreOutcome::Cancelled);
+    }
+    assert_eq!(
+        state
+            .verification_snapshot_at("score", &target, &refs, now)
+            .unwrap()
+            .wait_reason,
+        ScoreWaitReason::InFlight
+    );
     let (index, attempt) = state.rank_plan_at("score", &target, &refs, now);
     assert_eq!(
-        index, 1,
+        index, 2,
         "a blocked unknown-family candidate must not hide a reservable sibling"
     );
     attempt
         .begin_at(now)
         .unwrap()
         .finish(ScoreOutcome::Cancelled);
+}
+
+#[test]
+fn aggregate_read_skips_a_challenger_its_begun_trial_holds_at_the_selection() {
+    let nodes = [node("selection"), node("progressing"), node("behind")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let state = manager.score_state();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let now = Instant::now();
+    // The progressing member is further along its availability question than the usable member
+    // behind is on its response pair, so progress alone would serve it first.
+    for (leaf, completed, reporters) in [(0, 4.0, 4), (1, 3.0, 3), (2, 1.0, 4)] {
+        state.inner.lock().aggregate.put(
+            AggregateKey {
+                group: "score".into(),
+                network: SelectionNetwork::Tcp,
+                family: None,
+                node_id: nodes[leaf].id,
+            },
+            Stats {
+                setup_success: completed,
+                availability: Availability {
+                    reporters,
+                    latest_rx_at: Some(now),
+                    ..Default::default()
+                },
+                updated_at: Some(now),
+                ..Default::default()
+            },
+        );
+    }
+    let target = context("ceiling.example", IpVersion::V4);
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, now);
+    assert_eq!(index, 1);
+    let _begun = attempt.begin_at(now).unwrap();
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let snapshot = state
+        .verification_snapshot_at("score", &aggregate, &refs, now)
+        .unwrap();
+    assert_eq!(
+        (snapshot.question, snapshot.next_action),
+        (
+            ScoreEvidenceQuestion::Response,
+            ScoreValidationAction::NextBusinessFlow
+        ),
+        "three completions and one begun trial already match the selection's four"
+    );
+    assert_eq!(state.rank_plan_at("score", &target, &refs, now).0, 2);
 }

@@ -1,6 +1,6 @@
 //! Bounded evaluation set: which members receive comparisons and optional validation. Its size
-//! follows the optional work earned from offered business, so large groups get a bounded set
-//! instead of an unreachable all-member requirement.
+//! follows the optional work earned from offered business, so a large group only evaluates as
+//! many challengers as that business can fund.
 use super::ranking::utility;
 use super::*;
 use honk_config::node::Node;
@@ -11,7 +11,7 @@ const DEMAND_HALF_LIFE: Duration = Duration::from_secs(5 * 60);
 const MIN_MEMBERS: usize = 3;
 /// Bounds per-group evaluation work; comparison storage has its own independent limit.
 const MAX_MEMBERS: usize = 25;
-/// Share of earned optional work spent keeping members qualified; the rest aligns responses.
+/// Share of earned optional work spent keeping members qualified; the rest funds response pairs.
 const QUALIFICATION_SHARE: f64 = 0.5;
 /// Ranked members keep their place until they fall this far below the cut, so ties cannot churn it.
 const RANK_HYSTERESIS: usize = 2;
@@ -20,32 +20,13 @@ const ANCHORS: usize = 4;
 
 #[derive(Clone, Default)]
 pub(super) struct EvaluationSet {
-    /// Explicit ranked identities and their sticky qualification admission.
-    ranked: Vec<(Uuid, bool)>,
+    /// Explicit ranked identities.
+    ranked: Vec<Uuid>,
     rotation: Option<(Uuid, Instant)>,
     anchors: Vec<Uuid>,
     refreshed_at: Option<Instant>,
     limit: usize,
     demand: Option<(Instant, f64)>,
-}
-
-/// Flags aligned with the decision's node order.
-#[derive(Clone, Default)]
-pub(super) struct Membership {
-    /// May receive comparison pairs, evidence and optional work.
-    pub evaluated: Vec<bool>,
-    /// Only these members' response alignment can request response validation.
-    pub covered: Vec<bool>,
-}
-
-#[cfg(test)]
-impl Membership {
-    pub(super) fn all(len: usize) -> Self {
-        Self {
-            evaluated: vec![true; len],
-            covered: vec![true; len],
-        }
-    }
 }
 
 impl EvaluationSet {
@@ -75,8 +56,7 @@ impl EvaluationSet {
 
     /// Whether this member may receive comparisons and optional work under the stored set.
     pub(super) fn evaluates(&self, node: Uuid) -> bool {
-        self.ranked.iter().any(|(id, _)| *id == node)
-            || self.rotation.is_some_and(|(id, _)| id == node)
+        self.ranked.contains(&node) || self.rotation.is_some_and(|(id, _)| id == node)
     }
 
     /// Whether probe comparison cells for this member are outside the bounded store budget.
@@ -98,40 +78,18 @@ impl EvaluationSet {
         };
     }
 
-    pub(super) fn pending_qualification(&mut self, node: Uuid) -> Option<&mut bool> {
-        self.ranked
-            .iter_mut()
-            .find(|(id, admitted)| *id == node && !*admitted)
-            .map(|(_, admitted)| admitted)
-    }
-
-    pub(super) fn membership(
-        &self,
-        nodes: &[&Node],
-        reference: usize,
-        any_qualified: bool,
-    ) -> Membership {
-        let covered: Vec<_> = nodes
+    /// Evaluated flags aligned with `nodes`; the decision reference is evaluated even when it sits
+    /// outside the stored set.
+    pub(super) fn membership(&self, nodes: &[&Node], reference: usize) -> Vec<bool> {
+        nodes
             .iter()
             .enumerate()
-            .map(|(index, node)| {
-                index == reference
-                    || self
-                        .ranked
-                        .iter()
-                        .any(|(id, admitted)| *id == node.id && (!any_qualified || *admitted))
-            })
-            .collect();
-        let evaluated = nodes
-            .iter()
-            .zip(&covered)
-            .map(|(node, covered)| *covered || self.evaluates(node.id))
-            .collect();
-        Membership { evaluated, covered }
+            .map(|(index, node)| index == reference || self.evaluates(node.id))
+            .collect()
     }
 }
 
-/// Only Apply refreshes committed participants; readonly bootstrap cannot admit qualified members.
+/// Only Apply refreshes committed participants.
 pub(super) fn derive<'a>(
     stored: Option<&'a EvaluationSet>,
     nodes: &[&Node],
@@ -186,40 +144,29 @@ pub(super) fn derive<'a>(
         let rank = |id: &Uuid| order.iter().position(|&index| nodes[index].id == *id);
         // A member missing from this filtered or retry view keeps its place; absence is not removal.
         set.ranked
-            .retain(|(id, _)| rank(id).is_none_or(|rank| rank < ranked_len + RANK_HYSTERESIS));
-        set.ranked
-            .sort_by_key(|(id, _)| rank(id).unwrap_or(usize::MAX));
+            .retain(|id| rank(id).is_none_or(|rank| rank < ranked_len + RANK_HYSTERESIS));
+        set.ranked.sort_by_key(|id| rank(id).unwrap_or(usize::MAX));
         set.ranked.truncate(ranked_len);
         for &index in &order {
             if set.ranked.len() == ranked_len {
                 break;
             }
-            if !set.ranked.iter().any(|(id, _)| *id == nodes[index].id) {
-                set.ranked.push((nodes[index].id, false));
+            if !set.ranked.contains(&nodes[index].id) {
+                set.ranked.push(nodes[index].id);
             }
         }
         set.refreshed_at = Some(now);
     }
-    if apply {
-        for (node, score) in nodes.iter().zip(snapshots) {
-            if score.qualified()
-                && let Some(admitted) = set.pending_qualification(node.id)
-            {
-                *admitted = true;
-            }
-        }
-    }
     if set.ranked.len() == set.limit {
         set.rotation = None;
     } else if set.rotation.is_none_or(|(id, since)| {
-        set.ranked.iter().any(|(ranked, _)| *ranked == id)
-            || now.saturating_duration_since(since) >= ROTATION_SLOT
+        set.ranked.contains(&id) || now.saturating_duration_since(since) >= ROTATION_SLOT
     }) {
         let previous = set.rotation.map(|(id, _)| id);
         set.rotation = nodes
             .iter()
             .map(|node| node.id)
-            .filter(|id| !set.ranked.iter().any(|(ranked, _)| ranked == id))
+            .filter(|id| !set.ranked.contains(id))
             .min_by_key(|id| (previous.is_some_and(|old| *id <= old), *id))
             .map(|id| (id, now));
     }

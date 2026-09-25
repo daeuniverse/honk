@@ -188,7 +188,7 @@ impl Timing {
     }
 }
 
-pub(in crate::group::score) fn target_bytes(target: &ScoreTarget) -> usize {
+fn target_bytes(target: &ScoreTarget) -> usize {
     match target {
         ScoreTarget::Domain { host, .. } => host.capacity(),
         ScoreTarget::Socket(_) => 0,
@@ -265,7 +265,7 @@ impl Store {
     }
 
     /// Cells are ordered by group, then network.
-    pub(super) fn scope(&self, group: &str, network: SelectionNetwork) -> &[Cell] {
+    fn scope(&self, group: &str, network: SelectionNetwork) -> &[Cell] {
         fn key(cell: &Cell) -> (&str, u8) {
             (cell.key.group(), cell.key.network() as u8)
         }
