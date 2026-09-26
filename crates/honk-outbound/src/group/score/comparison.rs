@@ -11,7 +11,7 @@ mod store;
 use store::{Bucket, Cell, Key, Timing};
 pub(super) use store::{Store, observe};
 
-pub(super) const MAX_CELLS: usize = 256;
+pub(super) const MAX_CELLS: usize = 512;
 pub(super) const MAX_TARGETS: usize = 8;
 pub(super) const MAX_LOGICAL_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_KEY_BYTES: usize = 1024;

@@ -100,7 +100,7 @@ Carrier 压力提示独立于业务结果和性能评分。与 Score 绑定的 r
 
 共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。精确目标证据衡量 transport 质量，并不是语义解锁能力的结果；需要这种粗粒度 cohort 时，可用已有 routing 或 geosite 规则选择专用服务 Score 组。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
 
-独立比较存储最多保留 256 个 cell，逻辑记账分配上限为 1 MiB，包含存储／vector 容量及持有键的容量。这个界限不是进程 RSS：分配器开销、其他 Score 状态和进程其余部分均不在其中。淘汰或拒绝后，比较证据保持未知，不回退为无关均值。
+独立比较存储最多保留 512 个 cell，逻辑记账分配上限为 1 MiB，包含存储／vector 容量及持有键的容量。这个界限不是进程 RSS：分配器开销、其他 Score 状态和进程其余部分均不在其中。淘汰或拒绝后，比较证据保持未知，不回退为无关均值。
 
 中性 cell 保留在有界 LRU 中，不在其他 reporter 仍持有 incarnation 时提前删除。reload 清空配置探测基线并拒绝旧代探测观测；已准入业务 flow 对存续成员和匹配 incarnation 仍可报告。淘汰后的旧 reporter 不能重建 cell。
 

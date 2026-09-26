@@ -95,7 +95,7 @@ setup/TX 后的定向 Traffic RX 可在 flow 结束前打开有额度的半开�
 
 全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
-独立比较存储最多有 256 个 cell，逻辑分配上限为 1 MiB，包含所持有键与 vector 的容量。这不是进程 RSS 上限，分配器开销和其他状态不在其中；缺失或被淘汰的支持保持未知。
+独立比较存储最多有 512 个 cell，逻辑分配上限为 1 MiB，包含所持有键与 vector 的容量。这不是进程 RSS 上限，分配器开销和其他状态不在其中；缺失或被淘汰的支持保持未知。
 
 可重试的 TCP 建立失败后，Score 所属请求至多顺序尝试一个不同的合格叶节点，不要求普通评分先改选。两次尝试共享 deadline 和既有拨号准入；Selector 边界与首选实际经过的 final 边保持权威，不新增 direct/final 兜底或重放应用负载。提交 reload 时清空探测基线，但保留有效在途业务证据；中性 cell 仍受既有 LRU 容量约束。
 

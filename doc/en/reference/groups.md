@@ -95,7 +95,7 @@ Sustained measured carrier pressure may reopen bounded comparison without adding
 
 Score state is memory-only and process-local, with one 4,096-entry LRU for exact node-target cells and another 4,096-entry LRU for aggregate cells. Exact-target evidence measures observed transport quality, not whether a service is semantically unlocked; use existing routing or geosite rules to select a dedicated service-specific Score group when that coarse cohort is needed. A successful in-process reload shares the same state and removes cells for deleted groups or members; process restart clears it. Score cells and scorer-only domain/IP keys are never logged, persisted, or returned by Clash APIs. Established connection metadata is unaffected.
 
-The separate comparison store has at most 256 cells and a 1 MiB logical-allocation limit, including owned key and vector capacity. This is not a process RSS limit; allocator overhead and other state are outside it. Missing or evicted support remains unknown.
+The separate comparison store has at most 512 cells and a 1 MiB logical-allocation limit, including owned key and vector capacity. This is not a process RSS limit; allocator overhead and other state are outside it. Missing or evicted support remains unknown.
 
 After a retryable TCP setup failure, a Score-owned request may try one different permitted leaf even if ordinary ranking still prefers the failed node. Both attempts share a deadline and existing dial admission. Selector boundaries and actual primary final-edge provenance remain authoritative; no new direct/final route or application payload replay is introduced. A committed reload invalidates probe baselines while retaining valid in-flight business evidence; neutral cells stay within the existing bounded LRUs.
 

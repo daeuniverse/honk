@@ -271,7 +271,7 @@ Readonly／Peek 使用已提交参与者，不重新排名。Apply 初始化并�
 | `trialSuccess`、`trialFailure`、`trialCancelled` | 已开始可选试用的 exactly-once 终态；拒绝／关闭／中性取消归入 `trialCancelled`。`trialFailure` 是实际观测失败，不是相对于未观测替代路径、因选择试用而额外造成的失败。 |
 | `trialSetupHistogram`、`trialSetupMillis`、`trialElapsedMillis` | 八个固定 log2 毫秒 setup 桶（slot 0 包含 0–1 ms，末槽包含 128 ms 及以上）、已观测 setup 时长之和，以及开始至终态时长之和。它们是实际试用成本，不是因果额外延迟或开销。 |
 
-`/stats.score.cache.comparisonCells` 上限为 256。`comparisonLogicalBytes` 计入比较存储、vector 容量及所持有键容量；`comparisonLogicalCapacity` 是按实现结构大小计算的最坏分配界限，不超过 1 MiB。两者均不是实测进程 RSS 或全部 Score 状态大小，均不包含分配器开销与进程其他分配。`comparisonEvictions`、`comparisonExpired`、`comparisonRejected` 统计存储移除／准入事件；只读过期可以先使支持失效，实际移除后才增加计数。既有精确／聚合 LRU 字段不变。
+`/stats.score.cache.comparisonCells` 上限为 512。`comparisonLogicalBytes` 计入比较存储、vector 容量及所持有键容量；`comparisonLogicalCapacity` 是按实现结构大小计算的最坏分配界限，不超过 1 MiB。两者均不是实测进程 RSS 或全部 Score 状态大小，均不包含分配器开销与进程其他分配。`comparisonEvictions`、`comparisonExpired`、`comparisonRejected` 统计存储移除／准入事件；只读过期可以先使支持失效，实际移除后才增加计数。既有精确／聚合 LRU 字段不变。
 
 ### 出站与 ready pool 字段
 
