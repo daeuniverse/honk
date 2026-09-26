@@ -151,10 +151,16 @@ fn recv_hop(fd: std::os::fd::RawFd) -> io::Result<HopReply> {
     Ok(HopReply::Other)
 }
 
+// The US Department of Defense /8 blocks. Carriers, notably in China, route them inside their own networks as
+// private space, so a traceroute there meets them before the first real public hop; and wherever such an address
+// comes from, an ECS subnet in it places the client in the US.
+const DOD_BLOCKS: [u8; 13] = [6, 7, 11, 21, 22, 26, 28, 29, 30, 33, 55, 214, 215];
+
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
     let [a, b, c, _] = address.octets();
     !(a == 0
         || a == 10
+        || DOD_BLOCKS.contains(&a)
         || a == 127
         || (a == 100 && (64..=127).contains(&b))
         || (a == 169 && b == 254)
@@ -578,5 +584,16 @@ mod tests {
             assert!(!is_public_ipv4(private.parse().unwrap()), "{private}");
         }
         assert!(is_public_ipv4("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_hop_filter_skips_dod_blocks_carriers_route_internally() {
+        // A carrier hop seen from a Chinese home router; as ECS it geolocates to the US.
+        for hop in ["30.253.255.1", "11.0.0.1", "33.1.2.3", "215.0.0.1"] {
+            assert!(!is_public_ipv4(hop.parse().unwrap()), "{hop}");
+        }
+        for hop in ["31.0.0.1", "116.228.111.1", "223.5.5.5"] {
+            assert!(is_public_ipv4(hop.parse().unwrap()), "{hop}");
+        }
     }
 }
