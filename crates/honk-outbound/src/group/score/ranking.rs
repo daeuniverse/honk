@@ -607,6 +607,7 @@ pub(super) fn score_snapshots(
                 || snapshot(&Stats::default(), now),
                 |stats| snapshot(stats, now),
             );
+            score.node_fail_streak = score.fail_streak;
             let family_stats = context.target_family.and_then(|family| {
                 layer.family = Some(family);
                 inner.aggregate.peek(&layer)

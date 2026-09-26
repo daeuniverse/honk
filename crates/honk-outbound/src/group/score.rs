@@ -843,6 +843,7 @@ struct ScoreSnapshot {
     unresolved_failure: bool,
     explore_backed_off: bool,
     fail_streak: u32,
+    node_fail_streak: u32,
     selected_at: u64,
 }
 

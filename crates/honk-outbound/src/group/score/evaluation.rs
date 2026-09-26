@@ -49,13 +49,19 @@ impl EvaluationSet {
     }
 
     /// Members the earned currency can keep qualified: each needs four effective completions under
-    /// the evidence half-life, funded by one optional start per base earning period.
-    fn target_limit(&self, now: Instant) -> usize {
+    /// the evidence half-life, funded by one optional start per base earning period. The group's
+    /// exploration target (about √n) caps it, so trials concentrate on few enough members to
+    /// reach comparisons.
+    fn target_limit(&self, now: Instant, candidates: usize) -> usize {
         let sustained = self.demand_now(now) * SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()
             / DEMAND_HALF_LIFE.as_secs_f64();
         let challengers = QUALIFICATION_SHARE * sustained
             / (PERFORMANCE_VALIDATION_SAMPLES * SCORE_EXPLORATION_PERIOD as f64);
-        (1 + challengers as usize).clamp(MIN_MEMBERS, MAX_MEMBERS)
+        // A filtered view cannot reduce committed capacity; only falling demand or reload can.
+        let cap = super::budget::exploration_target(candidates)
+            .clamp(MIN_MEMBERS, MAX_MEMBERS)
+            .max(self.limit);
+        (1 + challengers as usize).clamp(MIN_MEMBERS, cap)
     }
 
     /// Whether this member may receive comparisons and optional work under the stored set.
@@ -106,13 +112,32 @@ pub(super) fn derive<'a>(
         return std::borrow::Cow::Borrowed(set);
     }
     let mut set = stored.cloned().unwrap_or_default();
-    if set
+    // A member on a failure streak is replaced now instead of at the next refresh. Without a
+    // substitute it keeps the slot, which preserves its recovery.
+    let failing = |score: &ScoreSnapshot| score.node_fail_streak >= SCORE_FAIL_STREAK_EXCLUDE;
+    let failing_member = |id: &Uuid| {
+        nodes
+            .iter()
+            .position(|node| node.id == *id)
+            .is_some_and(|index| failing(&snapshots[index]))
+    };
+    let substitute = |set: &EvaluationSet| {
+        nodes
+            .iter()
+            .zip(snapshots)
+            .any(|(node, score)| failing(score) && set.ranked.contains(&node.id))
+            && nodes
+                .iter()
+                .zip(snapshots)
+                .any(|(node, score)| !failing(score) && !set.ranked.contains(&node.id))
+    };
+    let due = set
         .refreshed_at
-        .is_none_or(|at| now.saturating_duration_since(at) >= REFRESH)
-    {
-        let target = set.target_limit(now);
+        .is_none_or(|at| now.saturating_duration_since(at) >= REFRESH);
+    if due || substitute(&set) {
+        let target = set.target_limit(now, nodes.len());
         // Growth waits for a refresh; shrinking also needs a two-member margin.
-        if target > set.limit || target + 2 <= set.limit {
+        if due && (target > set.limit || target + 2 <= set.limit) {
             set.limit = target;
         }
         let utilities: Vec<_> = snapshots
@@ -149,8 +174,23 @@ pub(super) fn derive<'a>(
         // A member missing from this filtered or retry view keeps its place; absence is not removal.
         set.ranked
             .retain(|id| rank(id).is_none_or(|rank| rank < ranked_len + RANK_HYSTERESIS));
-        set.ranked.sort_by_key(|id| rank(id).unwrap_or(usize::MAX));
+        set.ranked
+            .sort_by_key(|id| (failing_member(id), rank(id).unwrap_or(usize::MAX)));
         set.ranked.truncate(ranked_len);
+        let mut healthy = set.ranked.partition_point(|id| !failing_member(id));
+        for &index in &order {
+            if healthy == ranked_len {
+                break;
+            }
+            if !failing(&snapshots[index]) && !set.ranked.contains(&nodes[index].id) {
+                if set.ranked.len() == ranked_len {
+                    set.ranked.pop();
+                }
+                set.ranked.insert(healthy, nodes[index].id);
+                healthy += 1;
+            }
+        }
+        // Without enough replacements, failing members retain access to funded recovery.
         for &index in &order {
             if set.ranked.len() == ranked_len {
                 break;
@@ -159,7 +199,9 @@ pub(super) fn derive<'a>(
                 set.ranked.push(nodes[index].id);
             }
         }
-        set.refreshed_at = Some(now);
+        if due {
+            set.refreshed_at = Some(now);
+        }
     }
     if set.ranked.len() == set.limit {
         set.rotation = None;

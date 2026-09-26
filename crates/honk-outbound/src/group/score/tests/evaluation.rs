@@ -16,7 +16,7 @@ fn idle_scores(count: usize) -> (Vec<ScoreSnapshot>, PerformanceBaseline) {
 
 #[test]
 fn evaluation_limit_follows_offered_business_only_at_refresh() {
-    let nodes = members(40);
+    let nodes = members(400);
     let refs: Vec<_> = nodes.iter().collect();
     let (scores, baseline) = idle_scores(nodes.len());
     let now = Instant::now();
@@ -63,8 +63,9 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
         .filter(|v| **v)
         .count();
     // 600 one-per-second starts decay to 324 under the five-minute half-life, sizing 16
-    // members; undecayed demand would reach the 25-member cap.
-    assert_eq!(evaluated, 16);
+    // members below this group's √n cap, plus the decision reference; undecayed demand would
+    // reach the 25-member cap.
+    assert_eq!(evaluated, 17);
 }
 
 #[test]
@@ -287,5 +288,75 @@ fn readonly_refresh_does_not_replace_committed_participants() {
     let applied = state
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
-    assert_eq!(applied.evaluated_count, 17);
+    // Demand sizes 16 members, but a hundred-member group caps at ⌈√100⌉ + 1 = 11, plus the
+    // decision reference.
+    assert_eq!(applied.evaluated_count, 12);
+}
+
+#[test]
+fn only_node_failure_streaks_replace_shared_evaluation_members() {
+    let mut nodes = members(12);
+    nodes.sort_by_key(|node| node.id);
+    let refs: Vec<_> = nodes.iter().collect();
+    let good = context("healthy.example", IpVersion::V4);
+    let bad = context("failing.example", IpVersion::V6);
+    let start = Instant::now();
+    let key = SelectionReasonKey::new("score", SelectionNetwork::Tcp);
+    for outcome in [ScoreOutcome::TargetFailure, ScoreOutcome::NodeFailure] {
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let state = manager.score_state();
+        state.rank_at("score", &good, &refs, start);
+        let retained = || state.inner.lock().evaluation[&key].evaluates(nodes[1].id);
+        assert!(retained());
+        for streak in 1..=SCORE_FAIL_STREAK_EXCLUDE {
+            let at = start + Duration::from_secs(u64::from(streak));
+            let reporter = manager
+                .feedback_for_group_node("score", nodes[1].id, bad.clone())
+                .unwrap()
+                .start_at(at);
+            reporter.setup_succeeded_at(at);
+            reporter.finish_at(outcome, true, at);
+            state.peek_rank_at("score", &bad, &refs, at);
+            assert!(retained(), "readonly cannot commit failure substitution");
+            state.rank_at("score", &bad, &refs, at);
+            assert_eq!(
+                retained(),
+                outcome == ScoreOutcome::TargetFailure || streak < SCORE_FAIL_STREAK_EXCLUDE,
+                "{outcome:?}, streak {streak}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_short_retry_view_cannot_reduce_funded_capacity() {
+    let nodes = members(100);
+    let refs: Vec<_> = nodes.iter().collect();
+    let (scores, baseline) = idle_scores(nodes.len());
+    let start = Instant::now();
+    let mut set = EvaluationSet::default();
+    for _ in 0..4096 {
+        set.record_demand(start);
+    }
+    let set = evaluation::derive(Some(&set), &refs, &scores, baseline, start, true).into_owned();
+    let (retry_scores, retry_baseline) = idle_scores(1);
+    let retry = evaluation::derive(
+        Some(&set),
+        &refs[..1],
+        &retry_scores,
+        retry_baseline,
+        start + Duration::from_secs(300),
+        true,
+    )
+    .into_owned();
+    // The funded hundred-member view retains ten ranked members plus its rotation slot.
+    // A one-member retry cannot remove those ranked identities merely by hiding them.
+    assert!(
+        retry
+            .membership(&refs, usize::MAX)
+            .iter()
+            .filter(|&&value| value)
+            .count()
+            >= 10
+    );
 }
