@@ -260,9 +260,11 @@ pub(in crate::group::score) fn plan(
 ) -> (RankedSelection, Option<Arc<budget::Work>>) {
     let unfinished = budget::unfinished(inner, group, context, nodes, now);
     let (candidates, order) = questions(decision, context, &unfinished, now);
+    let guarded = usable(&decision.evidence[decision.ordinary.index]);
     for index in order {
         let question = candidates[index].question;
-        match budget::reserve(state, inner, group, context, nodes[index].id, question, now) {
+        let node = nodes[index].id;
+        match budget::reserve(state, inner, (group, context), node, question, guarded, now) {
             Ok(work) => {
                 let reason = if work.is_cold() {
                     SelectionReason::ColdExplore
@@ -290,15 +292,17 @@ pub(in crate::group::score) fn report(
     let unfinished = budget::unfinished(inner, group, context, nodes, now);
     let (candidates, order) = questions(decision, context, &unfinished, now);
     let (next_action, question, mut wait_reason) = next_step(&candidates, &order);
+    let guarded = usable(&decision.evidence[decision.ordinary.index]);
     if let Some(&index) = order.first() {
         let question = candidates[index].question;
-        let wait = budget::wait_reason(inner, group, context, nodes[index].id, question, now);
+        let node = nodes[index].id;
+        let wait = budget::wait_reason(inner, (group, context), node, question, guarded, now);
         if wait != ScoreWaitReason::None {
             wait_reason = wait;
         }
     }
     ScoreVerificationSnapshot {
-        state: if usable(&decision.evidence[decision.ordinary.index]) {
+        state: if guarded {
             ScoreVerificationState::ObservedUsable
         } else {
             ScoreVerificationState::Provisional

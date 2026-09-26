@@ -330,10 +330,10 @@ fn sparse_arrivals_obey_spent_plus_reserved_bound_without_clock_currency() {
             budget::reserve(
                 &state,
                 &mut inner,
-                "score",
-                &target,
+                ("score", &target),
                 nodes[0].id,
                 ScoreEvidenceQuestion::Availability,
+                false,
                 now,
             )
         }
@@ -395,20 +395,20 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
     let pending = budget::reserve(
         &state,
         &mut state.inner.lock(),
-        "score",
-        &target,
+        ("score", &target),
         nodes[0].id,
         ScoreEvidenceQuestion::Availability,
+        false,
         now,
     )
     .unwrap();
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &target,
+            ("score", &target),
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
+            false,
             now
         ),
         ScoreWaitReason::InFlight
@@ -417,10 +417,10 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
     let next = budget::reserve(
         &state,
         &mut state.inner.lock(),
-        "score",
-        &target,
+        ("score", &target),
         nodes[0].id,
         ScoreEvidenceQuestion::Availability,
+        false,
         later,
     )
     .unwrap();
@@ -451,10 +451,10 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
     let replacement = budget::reserve(
         &state,
         &mut state.inner.lock(),
-        "score",
-        &target,
+        ("score", &target),
         nodes[0].id,
         ScoreEvidenceQuestion::Availability,
+        false,
         expired,
     )
     .unwrap();
@@ -491,10 +491,10 @@ fn setup_cost_includes_pre_reporter_work_and_local_refusal_is_neutral() {
     let work = budget::reserve(
         &state,
         &mut state.inner.lock(),
-        "score",
-        &target,
+        ("score", &target),
         nodes[0].id,
         ScoreEvidenceQuestion::Availability,
+        false,
         start,
     )
     .unwrap();
@@ -546,10 +546,10 @@ fn accepted_reporters_no_longer_suppress_missing_distinct_support() {
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &target,
+            ("score", &target),
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
+            false,
             now + Duration::from_millis(10)
         ),
         ScoreWaitReason::None
@@ -557,10 +557,10 @@ fn accepted_reporters_no_longer_suppress_missing_distinct_support() {
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &target,
+            ("score", &target),
             nodes[0].id,
             ScoreEvidenceQuestion::Qualification,
+            false,
             now + Duration::from_millis(10)
         ),
         ScoreWaitReason::InFlight
@@ -573,10 +573,10 @@ fn accepted_reporters_no_longer_suppress_missing_distinct_support() {
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &target,
+            ("score", &target),
             nodes[0].id,
             ScoreEvidenceQuestion::Qualification,
+            false,
             now + Duration::from_millis(20)
         ),
         ScoreWaitReason::None
@@ -752,10 +752,10 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
         budget::reserve(
             &state,
             &mut state.inner.lock(),
-            "score",
-            &targets[index],
+            ("score", &targets[index]),
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
+            false,
             at,
         )
     };
@@ -814,11 +814,11 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &targets[5],
+            ("score", &targets[5]),
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            now,
+            false,
+            now
         ),
         ScoreWaitReason::InFlight
     );
@@ -832,11 +832,11 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &targets[5],
+            ("score", &targets[5]),
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            now,
+            false,
+            now
         ),
         ScoreWaitReason::Budget
     );
@@ -844,11 +844,11 @@ fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl(
     assert_eq!(
         budget::wait_reason(
             &state.inner.lock(),
-            "score",
-            &targets[5],
+            ("score", &targets[5]),
             nodes[0].id,
             ScoreEvidenceQuestion::Availability,
-            later,
+            false,
+            later
         ),
         ScoreWaitReason::Budget
     );
@@ -872,10 +872,10 @@ fn targetless_reserved_work_is_refunded_and_cannot_start_for_free() {
     let work = budget::reserve(
         &state,
         &mut state.inner.lock(),
-        "score",
-        &target,
+        ("score", &target),
         nodes[0].id,
         ScoreEvidenceQuestion::Availability,
+        false,
         now,
     )
     .unwrap();

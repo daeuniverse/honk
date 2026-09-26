@@ -1,4 +1,5 @@
 //! Business-funded optional work. Currency is independent of evidence and target LRUs.
+use super::evidence::decay;
 use super::*;
 use honk_config::node::Node;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -6,6 +7,22 @@ use std::sync::{OnceLock, Weak};
 
 const EARNED_CAP: u64 = 8;
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+const YIELD_HALF_LIFE: Duration = Duration::from_secs(10 * 60);
+/// Trial-yield thresholds on decayed outcome weight. Each outcome decays from one, so `n` recent
+/// outcomes weigh above `n - 0.5` for a while rather than exactly `n` at one instant.
+const PRODUCTIVE_WEIGHT: f64 = 2.5;
+const PRODUCTIVE_SHARE: f64 = 0.8;
+const PAUSE_WEIGHT: f64 = 1.5;
+const HALF_OPEN_WEIGHT: f64 = 0.5;
+const FAILING_SHARE: f64 = 0.2;
+/// Busy scopes whose trials keep succeeding earn twice as fast: evidence needs a fixed number of
+/// trials, so heavier offered load can fund them sooner (a quarter share lost more flows than it
+/// gained in replay).
+const BUSY_EXPLORATION_PERIOD: u64 = 8;
+const _: () = assert!(SCORE_EXPLORATION_PERIOD.is_multiple_of(BUSY_EXPLORATION_PERIOD));
+/// Offered original business, in flows per second, from which productive scopes earn at the busy
+/// rate (at 1.2 flows per second the busy rate lost more replay flows than it saved).
+const BUSY_RATE: f64 = 2.0;
 const PENDING: u8 = 0;
 const STARTED: u8 = 1;
 const FINISHED: u8 = 2;
@@ -92,10 +109,50 @@ struct InFlight {
     expires: Instant,
 }
 
+impl InFlight {
+    fn live(&self, now: Instant) -> Option<Arc<Life>> {
+        (self.expires > now)
+            .then(|| self.life.upgrade())
+            .flatten()
+            .filter(|life| life.status.load(Ordering::Relaxed) < FINISHED)
+    }
+}
+
 pub(super) struct Scope {
     identity: Arc<()>,
     counters: ScoreBudgetCounters,
+    /// Earned currency; one token is `SCORE_EXPLORATION_PERIOD` credit, and each original
+    /// business adds `SCORE_EXPLORATION_PERIOD / q` for the q it earned at.
+    credit: u64,
     in_flight: Vec<InFlight>,
+    outcomes: Yield,
+}
+
+/// Recent begun-trial successes and outcome weight, decayed so funding follows what trials yield
+/// now.
+#[derive(Default)]
+struct Yield {
+    at: Option<Instant>,
+    success: f64,
+    weight: f64,
+}
+
+impl Yield {
+    fn decayed(&self, now: Instant) -> (f64, f64) {
+        let factor = self.at.map_or(1.0, |at| {
+            decay(now.saturating_duration_since(at), YIELD_HALF_LIFE)
+        });
+        (self.success * factor, self.weight * factor)
+    }
+
+    fn record(&mut self, success: bool, now: Instant) {
+        let (successes, weight) = self.decayed(now);
+        *self = Self {
+            at: Some(now),
+            success: successes + f64::from(u8::from(success)),
+            weight: weight + 1.0,
+        };
+    }
 }
 
 impl Scope {
@@ -110,7 +167,38 @@ impl Scope {
                 ..Default::default()
             },
             in_flight: Vec::new(),
+            credit: 0,
+            outcomes: Yield::default(),
         }
+    }
+
+    /// Whether recent trials keep failing. While the selection is healthy such trials only fail
+    /// real flows, so optional work waits for their failures to decay, then tests the scope with
+    /// one trial at a time until one succeeds.
+    fn paused(&self, now: Instant) -> bool {
+        let (success, weight) = self.outcomes.decayed(now);
+        weight > HALF_OPEN_WEIGHT
+            && success < FAILING_SHARE * weight
+            && (weight > PAUSE_WEIGHT || self.trials_in_flight(now))
+    }
+
+    fn trials_in_flight(&self, now: Instant) -> bool {
+        self.in_flight
+            .iter()
+            .any(|entry| entry.live(now).is_some_and(|life| life.token.is_some()))
+    }
+
+    fn earning_period(&self, busy: bool, now: Instant) -> u64 {
+        let (success, weight) = self.outcomes.decayed(now);
+        if busy && weight > PRODUCTIVE_WEIGHT && success >= PRODUCTIVE_SHARE * weight {
+            BUSY_EXPLORATION_PERIOD
+        } else {
+            SCORE_EXPLORATION_PERIOD
+        }
+    }
+
+    fn earned(&self) -> u64 {
+        self.credit / SCORE_EXPLORATION_PERIOD
     }
 
     fn effective_credit(&self, now: Instant) -> (u64, u64, u64) {
@@ -138,18 +226,19 @@ impl Scope {
         (cold, earned, reserved)
     }
 
-    fn available(&self, now: Instant) -> bool {
+    /// `guarded`: the ordinary selection is usable. Failing trials pause only then, since without
+    /// one exploring is how Score escapes.
+    fn available(&self, now: Instant, guarded: bool) -> bool {
         let c = &self.counters;
         let (cold, earned, reserved) = self.effective_credit(now);
         c.business_starts < u64::MAX
             && c.spent < u64::MAX
             && reserved < u64::MAX
             && (cold > 0 || earned > 0)
-            && c.spent.checked_add(reserved).is_some_and(|used| {
-                used < c
-                    .cold_allowance
-                    .saturating_add(c.business_starts / SCORE_EXPLORATION_PERIOD)
-            })
+            && c.spent
+                .checked_add(reserved)
+                .is_some_and(|used| used < c.cold_allowance.saturating_add(self.earned()))
+            && !(guarded && self.paused(now))
     }
 
     fn refund(&mut self, token: Token) {
@@ -221,10 +310,8 @@ impl Scope {
                         question,
                         ScoreEvidenceQuestion::None | ScoreEvidenceQuestion::Qualification
                     ) || target.is_none_or(|target| entry.target.as_ref() == Some(target)))
-                    && entry.expires > now
-                    && entry.life.upgrade().is_some_and(|life| {
-                        life.status.load(Ordering::Relaxed) < FINISHED
-                            && life.answered.load(Ordering::Relaxed) & question_mask(question) == 0
+                    && entry.live(now).is_some_and(|life| {
+                        life.answered.load(Ordering::Relaxed) & question_mask(question) == 0
                     })
             })
             .count()
@@ -248,8 +335,11 @@ impl Scope {
         }
     }
 
-    pub(super) fn invalidate_pending(&mut self) {
+    /// A reload refunds unbegun work and forgets trial yield: it may replace the members whose
+    /// trials failed. Currency and started work survive.
+    pub(super) fn reload(&mut self) {
         self.drop_in_flight(|_, status| status == STARTED);
+        self.outcomes = Yield::default();
     }
 }
 
@@ -385,10 +475,10 @@ pub(super) fn unfinished(
 pub(super) fn reserve(
     state: &Arc<ScorePolicyState>,
     inner: &mut StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
+    (group, context): (&str, &ScoreSelectionContext),
     node: Uuid,
     question: ScoreEvidenceQuestion,
+    guarded: bool,
     now: Instant,
 ) -> Result<Arc<Work>, ScoreWaitReason> {
     let key = SelectionCadenceKey::new(group, context);
@@ -402,7 +492,7 @@ pub(super) fn reserve(
         scope.counters.in_flight_blocked = scope.counters.in_flight_blocked.saturating_add(1);
         return Err(ScoreWaitReason::InFlight);
     }
-    if !scope.available(now) {
+    if !scope.available(now, guarded) {
         scope.counters.budget_blocked = scope.counters.budget_blocked.saturating_add(1);
         return Err(ScoreWaitReason::Budget);
     }
@@ -433,13 +523,13 @@ pub(super) fn reserve(
 }
 
 /// Why the ledger would refuse this member's next trial. An aggregate read waits only while
-/// every target family refuses, and on the budget only while every family is exhausted.
+/// every target family refuses, and on the budget only while no family has credit it would spend.
 pub(super) fn wait_reason(
     inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
+    (group, context): (&str, &ScoreSelectionContext),
     node: Uuid,
     question: ScoreEvidenceQuestion,
+    guarded: bool,
     now: Instant,
 ) -> ScoreWaitReason {
     let mut wait = ScoreWaitReason::Budget;
@@ -451,7 +541,7 @@ pub(super) fn wait_reason(
             || scope.active(node, ScoreEvidenceQuestion::None, None, now) >= 4
         {
             wait = ScoreWaitReason::InFlight;
-        } else if scope.available(now) {
+        } else if scope.available(now, guarded) {
             return ScoreWaitReason::None;
         }
     }
@@ -553,6 +643,7 @@ pub(super) fn begin(
         progress.begun = true;
     }
     for item in work {
+        let busy = busy(inner, &item.key.group, item.key.network, now);
         let scope = ensure_scope(inner, &item.key);
         let counted = item.life.source != ScoreTrialSource::Recovery
             && !progress
@@ -561,11 +652,11 @@ pub(super) fn begin(
                 .any(|(key, identity)| *key == item.key && Arc::ptr_eq(identity, &scope.identity));
         if counted {
             scope.counters.business_starts += 1;
-            if scope
-                .counters
-                .business_starts
-                .is_multiple_of(SCORE_EXPLORATION_PERIOD)
-            {
+            let before = scope.earned();
+            scope.credit = scope
+                .credit
+                .saturating_add(SCORE_EXPLORATION_PERIOD / scope.earning_period(busy, now));
+            if scope.earned() > before {
                 scope.counters.earned_available =
                     (scope.counters.earned_available + 1).min(EARNED_CAP);
             }
@@ -601,6 +692,14 @@ pub(super) fn begin(
         }
     }
     true
+}
+
+/// Whether this group's recent offered load on `network` reaches the busy rate.
+fn busy(inner: &StateInner, group: &str, network: SelectionNetwork, now: Instant) -> bool {
+    inner
+        .evaluation
+        .get(&SelectionReasonKey::new(group, network))
+        .is_some_and(|set| set.offered_rate(now) >= BUSY_RATE)
 }
 
 fn question_mask(question: ScoreEvidenceQuestion) -> u8 {
@@ -693,11 +792,19 @@ fn settle(inner: &mut StateInner, item: &Work, outcome: ScoreOutcome, now: Insta
     {
         let c = &mut scope.counters;
         match outcome {
-            ScoreOutcome::Success => c.trial_success = c.trial_success.saturating_add(1),
+            ScoreOutcome::Success => {
+                c.trial_success = c.trial_success.saturating_add(1);
+                scope.outcomes.record(true, now);
+            }
             ScoreOutcome::Cancelled | ScoreOutcome::Rejected | ScoreOutcome::Shutdown => {
                 c.trial_cancelled = c.trial_cancelled.saturating_add(1)
             }
-            _ => c.trial_failure = c.trial_failure.saturating_add(1),
+            // A refusing target says nothing about the scope's other targets.
+            ScoreOutcome::TargetFailure => c.trial_failure = c.trial_failure.saturating_add(1),
+            _ => {
+                c.trial_failure = c.trial_failure.saturating_add(1);
+                scope.outcomes.record(false, now);
+            }
         }
         c.trial_elapsed_millis = c
             .trial_elapsed_millis
@@ -730,6 +837,8 @@ impl ScorePolicyState {
     ) -> ScoreBudgetCounters {
         let inner = self.inner.lock();
         let mut total = ScoreBudgetCounters::default();
+        let now = Instant::now();
+        let busy = busy(&inner, group, network, now);
         for (_, scope) in inner
             .budgets
             .iter()
@@ -759,7 +868,10 @@ impl ScorePolicyState {
                 trial_setup_millis,
                 trial_elapsed_millis
             );
-            total.earning_period = SCORE_EXPLORATION_PERIOD;
+            let period = scope.earning_period(busy, now);
+            if total.earning_period == 0 || period < total.earning_period {
+                total.earning_period = period;
+            }
             for (out, count) in total
                 .trial_setup_histogram
                 .iter_mut()

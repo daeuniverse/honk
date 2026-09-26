@@ -1,6 +1,7 @@
 //! Bounded evaluation set: which members receive comparisons and optional validation. Its size
 //! follows the optional work earned from offered business, so a large group only evaluates as
 //! many challengers as that business can fund.
+use super::evidence::decay;
 use super::ranking::utility;
 use super::*;
 use honk_config::node::Node;
@@ -35,17 +36,20 @@ impl EvaluationSet {
         self.demand = Some((now, self.demand_now(now) + 1.0));
     }
 
+    /// This group's recent offered original business in flows per second.
+    pub(super) fn offered_rate(&self, now: Instant) -> f64 {
+        // A decayed count with half-life h approximates rate × h / ln 2 under steady load.
+        self.demand_now(now) * std::f64::consts::LN_2 / DEMAND_HALF_LIFE.as_secs_f64()
+    }
+
     fn demand_now(&self, now: Instant) -> f64 {
         self.demand.map_or(0.0, |(at, starts)| {
-            starts
-                * (-now.saturating_duration_since(at).as_secs_f64()
-                    / DEMAND_HALF_LIFE.as_secs_f64())
-                .exp2()
+            starts * decay(now.saturating_duration_since(at), DEMAND_HALF_LIFE)
         })
     }
 
     /// Members the earned currency can keep qualified: each needs four effective completions under
-    /// the evidence half-life, funded by one optional start per earning period.
+    /// the evidence half-life, funded by one optional start per base earning period.
     fn target_limit(&self, now: Instant) -> usize {
         let sustained = self.demand_now(now) * SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()
             / DEMAND_HALF_LIFE.as_secs_f64();

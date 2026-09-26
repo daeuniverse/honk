@@ -539,7 +539,7 @@ impl ScorePolicyState {
         }
         budgets.retain(|key, _| valid_groups.contains(&key.group));
         for scope in budgets.values_mut() {
-            scope.invalidate_pending();
+            scope.reload();
         }
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
         verification_counters.retain(|key, _| valid_groups.contains(&key.group));

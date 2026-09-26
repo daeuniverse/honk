@@ -243,7 +243,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | `challengers` | `selected` 与已评估挑战者之间新鲜的成对响应比较；见下文。 |
 | `nextAction` | `nextBusinessFlow` 表示未来真实工作补充证据、普通资格或恢复的需求，不是已预留或已派发 I/O；需同时查看 `waitReason`。`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。缺少传输证据不会创建工作；方向 goodput 等待真实负载。 |
 | `question` | `none`、`availability`、`response`、`qualification` 或 `recovery`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
-| `waitReason` | `none`；`budget` 表示没有可用额度；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
+| `waitReason` | `none`；`budget` 表示没有可用额度，或选择可用时试用因反复失败而暂停；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
 | `coverage` | `scope`（`all` 或 `bounded`）、`candidates`、`evaluated`、`unevaluated`、`pending` 数量。评估成员由显式有界身份决定，跨过滤视图也不例外。未评估成员不参与比较。`pending` 统计仍有未决问题的已评估成员，包括已有比较但仍需资格或恢复工作的成员。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
@@ -263,11 +263,11 @@ Readonly／Peek 使用已提交参与者，不重新排名。Apply 初始化并�
 
 | 字段 | 含义 |
 | --- | --- |
-| `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及固定赚取周期 `q = 16`（尚无作用域时为 0）。它不能作为合并作用域预算公式的分母：每个作用域在创建时固定冷启动额度 `B`；`spent + reserved <= B + floor(businessStarts/q)` 按作用域成立。 |
+| `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及各作用域中最快的当前赚取周期 `q`：通常为 16；若该组近期每秒至少两条业务且作用域近期试用大多成功则为 8（尚无作用域时为 0）。它不能作为合并作用域预算公式的分母：每个作用域在创建时固定冷启动额度 `B`，每个原始开始按当时的 `q` 累积 `1/q`；每个作用域的 `spent + reserved` 不超过 `B` 加已赚额度的整数部分。 |
 | `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、不增加可选额度的延续尝试。`recovery` 包含 TCP 替代、DNS 改路／UDP 转 TCP 和 UI 重定向，不限于出错后的重试；它既不是可选试用，也不是新原始业务。普通非试用没有来源桶。 |
 | `trialStarts`、`spent`、`reserved` | 已开始可选试用、累计已支出 token，以及尚未开始的 token 预留。开始只支出一次，开始后取消不退款。 |
 | `coldAllowance`、`coldAvailable`、`earnedAvailable` | 固定初始额度与当前可用额度的合计。每作用域最多保留八个未花费已赚 token。时间、读取、目标变动与证据过期不赚额度，保留作用域在 reload／成员变化后不重置。 |
-| `budgetBlocked`、`inFlightBlocked`、`refunded`、`expired` | 预留被拒计数、最后引用释放／未开始失效的退款数，以及在途跟踪项过期数。只有未开始预留可退款；跟踪过期不退回已开始工作的支出。 |
+| `budgetBlocked`、`inFlightBlocked`、`refunded`、`expired` | 预留被拒计数（`budgetBlocked` 也计入作用域因试用反复失败而暂停时拒绝的候选）、最后引用释放／未开始失效的退款数，以及在途跟踪项过期数。只有未开始预留可退款；跟踪过期不退回已开始工作的支出。 |
 | `trialSuccess`、`trialFailure`、`trialCancelled` | 已开始可选试用的 exactly-once 终态；拒绝／关闭／中性取消归入 `trialCancelled`。`trialFailure` 是实际观测失败，不是相对于未观测替代路径、因选择试用而额外造成的失败。 |
 | `trialSetupHistogram`、`trialSetupMillis`、`trialElapsedMillis` | 八个固定 log2 毫秒 setup 桶（slot 0 包含 0–1 ms，末槽包含 128 ms 及以上）、已观测 setup 时长之和，以及开始至终态时长之和。它们是实际试用成本，不是因果额外延迟或开销。 |
 

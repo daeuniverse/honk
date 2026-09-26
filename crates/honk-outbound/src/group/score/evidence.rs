@@ -383,7 +383,11 @@ impl Stats {
 }
 
 pub(super) fn evidence_decay(elapsed: Duration) -> f64 {
-    (-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()).exp2()
+    decay(elapsed, SCORE_EVIDENCE_HALF_LIFE)
+}
+
+pub(super) fn decay(elapsed: Duration, half_life: Duration) -> f64 {
+    (-elapsed.as_secs_f64() / half_life.as_secs_f64()).exp2()
 }
 
 #[derive(Clone, Copy)]
