@@ -152,9 +152,9 @@ impl ScorePolicyState {
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(active, authority))
         }) && inner.valid_groups.contains(group);
-        if !authorized {
+        if !authorized || origins.preview {
             let view = comparison::View::new(&inner, group, context, nodes, now);
-            return ordinary_decision(&view, origins, false)
+            return ordinary_decision(&view, origins, authorized && origins.preview)
                 .map(|(decision, _)| (decision.ordinary.index, None));
         }
         let mut decision = decision(&inner, group, context, nodes, origins, now, true)?;

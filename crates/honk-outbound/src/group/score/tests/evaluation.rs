@@ -13,7 +13,7 @@ fn idle_scores(count: usize) -> Vec<ScoreSnapshot> {
 
 #[test]
 fn evaluation_limit_follows_offered_business_only_at_refresh() {
-    let nodes = members(400);
+    let nodes = members(1024);
     let refs: Vec<_> = nodes.iter().collect();
     let scores = idle_scores(nodes.len());
     let now = Instant::now();
@@ -63,6 +63,28 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
     // 600 one-per-second starts decay to 324 under the five-minute half-life, sizing 16
     // members below this group's √n cap; undecayed demand would reach the 25-member cap.
     assert_eq!(evaluated, 16);
+    let mut saturated = refreshed;
+    let at = now + Duration::from_secs(900);
+    for _ in 0..10_000 {
+        saturated.record_demand(at);
+    }
+    let saturated = evaluation::derive(
+        Some(&saturated),
+        &refs,
+        &scores,
+        at,
+        true,
+        std::iter::empty(),
+        |_| false,
+    );
+    assert_eq!(
+        saturated
+            .membership(&refs)
+            .iter()
+            .filter(|member| **member)
+            .count(),
+        25
+    );
 }
 
 #[test]
@@ -234,7 +256,7 @@ fn a_hundred_members_reach_bounded_comparisons_at_moderate_traffic() {
     }
     let snapshot = compared.expect("a bounded evaluation set must be able to compare");
     assert!(snapshot.evaluated_count < snapshot.candidate_count);
-    assert!(widest <= 26, "{widest}");
+    assert!(widest <= 11, "{widest}");
     let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     assert!(
         budget.trial_starts
@@ -256,7 +278,7 @@ fn filtered_views_cannot_disable_evaluation_bounds() {
         .verification_snapshot_at("score", &target, &all, now + Duration::from_secs(1))
         .unwrap();
     assert_eq!(report.candidate_count, 100);
-    assert!(report.evaluated_count <= 4);
+    assert_eq!(report.evaluated_count, 2);
 }
 
 #[test]

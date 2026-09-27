@@ -89,11 +89,12 @@ fn ordinary_decision<'a>(
                 candidate.via.map(|group| group.name.as_str()),
             )
         }),
-        |node| {
+        |(node, via)| {
             failure_key.node_id = node;
             origins
                 .health_filtered
                 .is_some_and(|ids| ids.contains(node))
+                || via.is_some_and(|owner| origins.withdrawn.contains(&owner))
                 || inner
                     .aggregate
                     .peek(&failure_key)

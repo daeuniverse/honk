@@ -128,6 +128,8 @@ enum SelectionEffects {
     Peek,
     ApplyWithHealthFallback,
     PeekWithHealthFallback,
+    /// Internal full-view preflight; derive Score membership without committing it.
+    Preview,
 }
 
 impl SelectionEffects {
@@ -135,11 +137,15 @@ impl SelectionEffects {
         matches!(self, Self::Apply | Self::ApplyWithHealthFallback)
     }
 
+    fn prepares_score(self) -> bool {
+        self.applies() || self == Self::Preview
+    }
+
     fn peek(self) -> Self {
-        if self.health_fallback() {
-            Self::PeekWithHealthFallback
-        } else {
-            Self::Peek
+        match self {
+            Self::Preview => Self::Preview,
+            _ if self.health_fallback() => Self::PeekWithHealthFallback,
+            _ => Self::Peek,
         }
     }
 
@@ -195,6 +201,8 @@ struct Candidate<'a> {
 struct ScoreView<'a, 'node> {
     origins: &'a [Candidate<'node>],
     health_filtered: Option<&'a UniqueCandidateIds>,
+    withdrawn: &'a [&'a str],
+    preview: bool,
 }
 
 impl<'a> Candidate<'a> {

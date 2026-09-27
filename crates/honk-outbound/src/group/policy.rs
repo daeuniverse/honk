@@ -98,13 +98,13 @@ impl GroupManager {
 
     pub(super) fn pick_score<'a>(
         &self,
-        candidates: &[Candidate<'a>],
+        view: ScoreView<'_, 'a>,
         group: &Group,
         context: &ScoreSelectionContext,
         effects: SelectionEffects,
         allow_trials: bool,
-        health_filtered: Option<&UniqueCandidateIds>,
     ) -> Option<Candidate<'a>> {
+        let candidates = view.origins;
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if !unique
@@ -115,11 +115,7 @@ impl GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        let view = ScoreView {
-            origins: candidates,
-            health_filtered,
-        };
-        let (index, work) = if effects.applies() {
+        let (index, work) = if effects.prepares_score() {
             self.score_state.rank(
                 &self.score_authority,
                 &group.name,

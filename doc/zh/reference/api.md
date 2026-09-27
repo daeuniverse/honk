@@ -244,7 +244,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | `nextAction` | `nextBusinessFlow` 表示未来真实工作补充证据、普通资格或恢复的需求，不是已预留或已派发 I/O；需同时查看 `waitReason`。`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。缺少传输证据不会创建工作；方向 goodput 等待真实负载。 |
 | `question` | `none`、`availability`、`response`、`qualification` 或 `recovery`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
 | `waitReason` | `none`；`budget` 表示没有可用额度，或选择可用时试用因反复失败而暂停；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
-| `coverage` | `scope`（`all` 或 `bounded`）、`candidates`、`evaluated`、`unevaluated`、`pending` 数量。这些数量对应共享服务池在当前视图中可见的成员，胜者不额外占位。父组入口与 target 共用该池，TCP／UDP 分开。池外成员不接受普通或可选策略工作；这不是所有存量连接涉及的节点总数。`pending` 统计仍有未决问题的已评估成员，包括已有比较但仍需资格或恢复工作的成员。 |
+| `coverage` | `scope`（`all` 或 `bounded`）；`candidates` 统计当前可见候选全体，`evaluated` 是该视图与共享服务池的交集，`unevaluated` 是两者之差。胜者不额外占位。父组入口与 target 共用该池，TCP／UDP 分开。池外成员不接受普通或可选策略工作；这些数量不是所有存量连接涉及的节点总数。`pending` 统计仍有未决问题的已评估成员，包括已有比较但仍需资格或恢复工作的成员。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
 Readonly／Peek 使用已提交参与者，不重新排名。Apply 初始化并刷新参与者。初始化前，只读查询使用临时有界投影。见[评估集生命周期](../design/groups.md#有条件的验证结论)。

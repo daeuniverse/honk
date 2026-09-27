@@ -119,7 +119,7 @@ impl EvaluationSet {
     }
 }
 
-/// Only Apply refreshes committed participants.
+/// Prepare membership; the caller commits it only for authorized Apply.
 pub(super) fn derive<'a, 'view>(
     stored: Option<&'a EvaluationSet>,
     nodes: &[&Node],
@@ -127,7 +127,7 @@ pub(super) fn derive<'a, 'view>(
     now: Instant,
     apply: bool,
     representatives: impl Clone + Iterator<Item = (Uuid, Option<&'view str>)>,
-    mut replaceable: impl FnMut(Uuid) -> bool,
+    mut replaceable: impl FnMut((Uuid, Option<&str>)) -> bool,
 ) -> std::borrow::Cow<'a, EvaluationSet> {
     if !apply && let Some(set) = stored.filter(|set| set.refreshed_at.is_some()) {
         return std::borrow::Cow::Borrowed(set);
@@ -173,7 +173,7 @@ pub(super) fn derive<'a, 'view>(
     }
     let failing = |score: &ScoreSnapshot| score.node_fail_streak >= SCORE_FAIL_STREAK_EXCLUDE;
     // A failed or health-unavailable owner can already be absent from the current view.
-    let mut failing_member = |member: &Member| replaceable(member.node);
+    let mut failing_member = |member: &Member| replaceable((member.node, member.via.as_deref()));
     let substitute = set.ranked.iter().any(&mut failing_member)
         && nodes.iter().zip(snapshots).any(|(node, score)| {
             !failing(score) && !set.ranked.iter().any(|member| member.node == node.id)

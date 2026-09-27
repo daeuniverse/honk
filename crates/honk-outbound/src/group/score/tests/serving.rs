@@ -529,3 +529,205 @@ fn an_ordinary_winner_survives_rotation_and_comparison_expiry() {
         .finish(ScoreOutcome::Cancelled);
     assert_eq!(committed_ids(&manager, "score", &nodes).len(), 3);
 }
+
+fn withdrawn_children_are_replaced(change_choice: bool) {
+    let nodes = members(8);
+    let children: Vec<_> = (0..4)
+        .map(|index| {
+            selector_with_children(
+                &format!("child-{index}"),
+                &nodes[index * 2..index * 2 + 2],
+                &[],
+            )
+        })
+        .collect();
+    let mut groups = vec![group_with_children(
+        "score",
+        &[],
+        &children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect::<Vec<_>>(),
+    )];
+    groups.extend(children);
+    let alive = Arc::new(crate::alive::AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&groups, &nodes, Some(Arc::clone(&alive)));
+    let target = ScoreSelectionContext {
+        network: SelectionNetwork::Udp,
+        probe_domain: ProbeDomain::DataUdp,
+        ..context("withdrawn.example", IpVersion::V4)
+    };
+    let pool = || {
+        let state = manager.score_state();
+        let inner = state.inner.lock();
+        let set = inner.evaluation("score", target.network).unwrap();
+        nodes
+            .iter()
+            .filter(|node| set.evaluates(node.id))
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>()
+    };
+    drop(manager.selection_plan_for_target("score", &target));
+    let before = pool();
+    assert_eq!(before.len(), 3);
+    let mut survivor = None;
+    for (index, pair) in nodes.as_chunks::<2>().0.iter().enumerate() {
+        if before.contains(&pair[0].id) {
+            let unavailable = &pair[usize::from(change_choice)];
+            for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+                alive.report_unavailable_forced(unavailable.id, domain, IpVersion::V4);
+            }
+            if change_choice {
+                manager.set_selector_choice(&format!("child-{index}"), &unavailable.name);
+                assert!(manager.is_node_selectable_for_domain(
+                    pair[0].id,
+                    ProbeDomain::DataUdp,
+                    IpVersion::V4
+                ));
+            }
+        } else {
+            survivor = Some(pair[0].id);
+        }
+    }
+    let plan = manager.selection_plan_for_target("score", &target);
+    let entry = plan
+        .entries
+        .first()
+        .expect("a healthy child must replace withdrawn slots");
+    assert_eq!(Some(entry.node.id), survivor);
+    assert!(pool().contains(&entry.node.id));
+    assert!(pool().len() <= before.len());
+    entry
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    assert_eq!(manager.score_state().root_business_starts(), 1);
+}
+
+#[test]
+fn nested_udp_health_withdrawal_replaces_serving_slots() {
+    withdrawn_children_are_replaced(false);
+}
+
+#[test]
+fn nested_selector_withdrawal_replaces_still_healthy_old_leaves() {
+    withdrawn_children_are_replaced(true);
+}
+
+#[test]
+fn ipv4_pool_reconciliation_precedes_explicit_final() {
+    let nodes = members(8);
+    let mut score = group("score", &nodes);
+    score.final_outbound = Some("direct".into());
+    let alive = Arc::new(crate::alive::AliveDialerSet::new());
+    for (index, node) in nodes.iter().enumerate() {
+        alive.report_unavailable_forced(
+            node.id,
+            ProbeDomain::Tcp,
+            if index < 3 {
+                IpVersion::V4
+            } else {
+                IpVersion::V6
+            },
+        );
+    }
+    let manager = GroupManager::with_alive_set(
+        &[score, selector_with_children("outer", &[], &["score"])],
+        &nodes,
+        Some(Arc::clone(&alive)),
+    );
+    let target = ScoreSelectionContext {
+        health_family: IpVersion::V6,
+        ..context("ipv6.example", IpVersion::V6)
+    };
+    let first = manager.selection_plan_for_target_with_health_fallback("outer", &target, None);
+    first.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    let before = committed_ids(&manager, "score", &nodes);
+    assert_eq!(before.len(), 3);
+    for id in &before {
+        alive.report_unavailable_forced(*id, ProbeDomain::Tcp, IpVersion::V6);
+    }
+    let plan = manager.selection_plan_for_target_with_health_fallback("outer", &target, None);
+    assert_eq!(
+        plan.health_family,
+        IpVersion::V4,
+        "ordinary IPv4 proxies must precede final"
+    );
+    let entry = &plan.entries[0];
+    assert!(nodes[3..].iter().any(|node| node.id == entry.node.id));
+    assert_eq!(
+        entry.selection_chain,
+        ["outer", "score", entry.node.name.as_str()]
+    );
+    entry
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    let after = committed_ids(&manager, "score", &nodes);
+    assert_eq!(after.len(), 3);
+    assert!(after.is_disjoint(&before));
+    let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(
+        (counts.business_starts, counts.reserved, counts.trial_starts),
+        (2, 0, 0)
+    );
+}
+
+#[test]
+fn pool_preflight_is_readonly_and_rejects_stale_authority() {
+    use crate::group::SelectionEffects;
+    let nodes = members(8);
+    let groups = [group("score", &nodes)];
+    let alive = Arc::new(crate::alive::AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&groups, &nodes, Some(Arc::clone(&alive)));
+    let target = context("preflight.example", IpVersion::V4);
+    drop(manager.selection_plan_for_target("score", &target));
+    let before = committed_ids(&manager, "score", &nodes);
+    for id in &before {
+        alive.report_unavailable_forced(*id, ProbeDomain::Tcp, IpVersion::V4);
+    }
+    let pick = |manager: &GroupManager, effects| {
+        manager
+            .pick_candidate_for_target(
+                &manager.groups["score"],
+                &target,
+                &mut Vec::new(),
+                0,
+                effects,
+                super::super::selection::ScoreSelectionRules::default(),
+            )
+            .map(|candidate| candidate.node.id)
+    };
+    let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    let reasons = manager.score_reason_snapshot();
+    assert_eq!(pick(&manager, SelectionEffects::Peek), None);
+    let prospective = pick(&manager, SelectionEffects::Preview).unwrap();
+    assert!(!before.contains(&prospective));
+    assert_eq!(committed_ids(&manager, "score", &nodes), before);
+    assert_eq!(
+        manager.score_budget_counters("score", SelectionNetwork::Tcp),
+        counts
+    );
+    assert_eq!(manager.score_reason_snapshot(), reasons);
+    assert_eq!(manager.score_state().root_business_starts(), 0);
+    let replacement =
+        GroupManager::with_alive_set_and_score_state(&groups, &nodes, None, manager.score_state());
+    replacement.publish_score_membership();
+    drop(replacement.selection_plan_for_target("score", &target));
+    assert_eq!(committed_ids(&replacement, "score", &nodes), before);
+    assert_eq!(pick(&manager, SelectionEffects::Preview), None);
+    assert_eq!(committed_ids(&replacement, "score", &nodes), before);
+    assert_eq!(replacement.score_state().root_business_starts(), 0);
+}

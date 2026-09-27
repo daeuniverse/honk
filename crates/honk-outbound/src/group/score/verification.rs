@@ -177,7 +177,7 @@ impl ScorePolicyState {
             members.0,
             super::super::ScoreView {
                 origins,
-                health_filtered: None,
+                ..Default::default()
             },
             now,
             false,
