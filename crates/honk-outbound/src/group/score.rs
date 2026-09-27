@@ -25,7 +25,7 @@ pub use verification::{
 use super::{
     Candidate, GroupManager, IpVersion, MAX_GROUP_DEPTH, ProbeDomain, ScoreSelectionEntry,
     ScoreSelectionPlan, SelectionEffects, SelectionNetwork, SelectionPlanMode,
-    removed_unique_candidate_count, unique_candidate_ids,
+    removed_unique_candidates, unique_candidate_ids,
 };
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -412,7 +412,7 @@ struct StateInner {
     root_business_starts: u64,
     comparisons: comparison::Store,
     revalidated_at: HashMap<SelectionCadenceKey, Instant>,
-    evaluation: HashMap<SelectionReasonKey, evaluation::EvaluationSet>,
+    evaluation: HashMap<String, [evaluation::EvaluationSet; 2]>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
     verification_counters: HashMap<SelectionReasonKey, ScoreVerificationCounters>,
@@ -451,6 +451,32 @@ impl Default for StateInner {
             exact_evictions: 0,
             aggregate_evictions: 0,
         }
+    }
+}
+
+impl StateInner {
+    fn evaluation(
+        &self,
+        group: &str,
+        network: SelectionNetwork,
+    ) -> Option<&evaluation::EvaluationSet> {
+        self.evaluation
+            .get(group)
+            .map(|pools| &pools[network.slot()])
+    }
+
+    fn evaluation_mut(
+        &mut self,
+        group: &str,
+        network: SelectionNetwork,
+    ) -> &mut evaluation::EvaluationSet {
+        if !self.evaluation.contains_key(group) {
+            self.evaluation.insert(group.to_owned(), Default::default());
+        }
+        &mut self
+            .evaluation
+            .get_mut(group)
+            .expect("inserted group pools")[network.slot()]
     }
 }
 
@@ -533,8 +559,8 @@ impl ScorePolicyState {
             ..
         } = &mut *inner;
         revalidated_at.clear();
-        evaluation.retain(|key, _| valid_groups.contains(&key.group));
-        for set in evaluation.values_mut() {
+        evaluation.retain(|group, _| valid_groups.contains(group));
+        for set in evaluation.values_mut().flatten() {
             set.reset_members();
         }
         budgets.retain(|key, _| valid_groups.contains(&key.group));

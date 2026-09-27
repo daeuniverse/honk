@@ -17,6 +17,7 @@ pub struct ScoreFeedback {
     authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
+    pool_bound: u8,
     source: ScoreSource,
     probe_scope: u64,
     probe_interval: Option<Duration>,
@@ -124,7 +125,7 @@ impl ScoreAttempt {
         }
     }
 
-    /// Admit before node DNS or physical-dial admission waits; stale ordinary work proceeds unscored.
+    /// Admit before node DNS or physical-dial waits, rechecking captured serving-pool obligations.
     pub fn begin(&self) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
         self.begin_at(Instant::now())
     }
@@ -134,6 +135,22 @@ impl ScoreAttempt {
         now: Instant,
     ) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
         let mut inner = self.feedback.state.inner.lock();
+        let mut pool_bound = self.feedback.pool_bound;
+        if pool_bound != 0
+            && self.feedback.attributions.iter().any(|attribution| {
+                let bound = pool_bound & 1 != 0;
+                pool_bound >>= 1;
+                bound
+                    && !inner
+                        .evaluation(&attribution.group, self.feedback.context.network)
+                        .is_some_and(|set| set.initialized() && set.evaluates(attribution.node_id))
+            })
+        {
+            for work in self.work.iter() {
+                work.cancel_pending(&mut inner);
+            }
+            return Err(crate::proxy::PacketRejection::Cancelled);
+        }
         if !inner
             .active_authority
             .as_ref()
@@ -222,10 +239,16 @@ impl ScoreFeedback {
             authority,
             context,
             attributions: attributions.into(),
+            pool_bound: 0,
             source: ScoreSource::Traffic,
             probe_scope: 0,
             probe_interval: None,
         }
+    }
+
+    pub(in crate::group) fn with_pool_bound(mut self, pool_bound: u8) -> Self {
+        self.pool_bound = pool_bound;
+        self
     }
 
     /// Create one independent business, without changing this factory or any clone.

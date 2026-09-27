@@ -64,7 +64,15 @@ fn unilateral_upload_and_download_gains_promote_without_max_direction_masking() 
         let scores = &decision.scores;
         let baseline = decision.baseline;
         assert_eq!(
-            ordinary_selection(scores, &refs, None, baseline, &decision.pairs).index,
+            ordinary_selection(
+                scores,
+                &refs,
+                None,
+                baseline,
+                &decision.pairs,
+                &decision.membership
+            )
+            .index,
             0
         );
         let result = promotion_result(
@@ -77,7 +85,15 @@ fn unilateral_upload_and_download_gains_promote_without_max_direction_masking() 
         );
         assert!(result.gain > switch_margin(scores[0].completed));
         assert_eq!(
-            ordinary_selection(scores, &refs, Some(0), baseline, &decision.pairs).index,
+            ordinary_selection(
+                scores,
+                &refs,
+                Some(0),
+                baseline,
+                &decision.pairs,
+                &decision.membership
+            )
+            .index,
             1
         );
     }
@@ -225,14 +241,15 @@ fn first_choice_and_real_failure_escape_need_no_comparison_evidence() {
         pairs: vec![None; 2],
     };
     let mut scores = [incumbent, candidate];
-    let baseline = performance_baseline(&scores);
+    let baseline = performance_baseline(scores.iter());
     assert_eq!(
         ordinary_selection(
             &scores,
             &nodes.iter().collect::<Vec<_>>(),
             None,
             baseline,
-            &pairs
+            &pairs,
+            &[true; 2],
         )
         .index,
         1
@@ -244,6 +261,7 @@ fn first_choice_and_real_failure_escape_need_no_comparison_evidence() {
             Some(0),
             baseline,
             &pairs,
+            &[true; 2],
         )
         .index,
         0
@@ -255,6 +273,7 @@ fn first_choice_and_real_failure_escape_need_no_comparison_evidence() {
         Some(0),
         baseline,
         &pairs,
+        &[true; 2],
     );
     assert_eq!(escaped.index, 1);
     assert_eq!(escaped.reason, SelectionReason::FreshFailureBypass);

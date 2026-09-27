@@ -679,7 +679,7 @@ async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyho
 }
 
 #[tokio::test]
-async fn tcp_urltest_retry_after_score_reload_still_reaches_alternate() -> anyhow::Result<()> {
+async fn tcp_urltest_retry_after_score_reload_requires_committed_pool() -> anyhow::Result<()> {
     use crate::group::SelectionNetwork;
     let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
     for (index, node) in nodes.iter().enumerate() {
@@ -706,21 +706,15 @@ async fn tcp_urltest_retry_after_score_reload_still_reaches_alternate() -> anyho
     let before = replacement.score_budget_counters("proxy", SelectionNetwork::Tcp);
     let root_before = replacement.score_state().root_business_starts();
     release.notify_one();
-    let reached = tokio::time::timeout(Duration::from_secs(1), async {
-        while let Some(node) = attempts.recv().await {
-            if node == nodes[1].id {
-                return true;
-            }
-            assert_eq!(node, nodes[0].id);
-            release.notify_one();
-        }
-        false
-    })
-    .await?;
-    assert!(
-        reached,
-        "Score authority replacement must not cancel an ordinary retry on the admitted generation"
+    let error = tokio::time::timeout(Duration::from_secs(1), serve)
+        .await??
+        .unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_rejection(&error),
+        Some(honk_outbound::proxy::PacketRejection::Cancelled),
+        "the admitted primary does not authorize an unbegun retry outside a committed pool"
     );
+    assert!(attempts.try_recv().is_err());
     assert_eq!(
         replacement.score_state().root_business_starts(),
         root_before
@@ -729,7 +723,5 @@ async fn tcp_urltest_retry_after_score_reload_still_reaches_alternate() -> anyho
         replacement.score_budget_counters("proxy", SelectionNetwork::Tcp),
         before
     );
-    serve.abort();
-    let _ = serve.await;
     Ok(())
 }

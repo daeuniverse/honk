@@ -80,6 +80,7 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
             Some(0),
             baseline,
             &scores.pairs,
+            &scores.membership,
         );
         assert_eq!(ordinary.index, 0);
     }
@@ -117,6 +118,7 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
         Some(0),
         expired.baseline,
         &expired.pairs,
+        &expired.membership,
     );
     assert_eq!(ordinary.index, 1);
     assert_eq!(ordinary.reason, SelectionReason::IncumbentIneligible);
@@ -234,6 +236,7 @@ fn publishable_business_rx_opens_recovery_without_settling_the_flow() {
         Some(0),
         baseline,
         &before.pairs,
+        &before.membership,
     );
     assert_eq!(bypass.index, 1);
     assert_eq!(bypass.reason, SelectionReason::FreshFailureBypass);
@@ -267,6 +270,7 @@ fn publishable_business_rx_opens_recovery_without_settling_the_flow() {
         Some(0),
         recovered.baseline,
         &recovered.pairs,
+        &recovered.membership,
     );
     assert_eq!(held.index, 1);
     assert_eq!(held.reason, SelectionReason::FreshFailureBypass);
@@ -374,6 +378,7 @@ fn stale_terminal_rx_preserves_failure_and_cannot_refresh_verification() {
         Some(0),
         baseline,
         &after.pairs,
+        &after.membership,
     );
     assert_eq!(ordinary.index, 1);
     assert_eq!(ordinary.reason, SelectionReason::FreshFailureBypass);
@@ -570,6 +575,7 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
         Some(0),
         bridged.baseline,
         &bridged.pairs,
+        &bridged.membership,
     );
     assert_eq!(ordinary.index, 0);
     let expires_at = now + Duration::from_secs(1931);

@@ -1,6 +1,4 @@
-//! Bounded evaluation set: which members receive comparisons and optional validation. Its size
-//! follows the optional work earned from offered business, so a large group only evaluates as
-//! many challengers as that business can fund.
+//! One bounded serving pool per Score group/network, shared by ordinary and optional work.
 use super::evidence::decay;
 use super::ranking::utility;
 use super::*;
@@ -19,11 +17,17 @@ const RANK_HYSTERESIS: usize = 2;
 /// Recent Apply winners whose configured-probe cells stay admissible outside the ranked set.
 const ANCHORS: usize = 4;
 
+#[derive(Clone)]
+struct Member {
+    node: Uuid,
+    via: Option<Arc<str>>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct EvaluationSet {
     /// Explicit ranked identities.
-    ranked: Vec<Uuid>,
-    rotation: Option<(Uuid, Instant)>,
+    ranked: Vec<Member>,
+    rotation: Option<(Member, Instant)>,
     anchors: Vec<Uuid>,
     refreshed_at: Option<Instant>,
     limit: usize,
@@ -64,9 +68,17 @@ impl EvaluationSet {
         (1 + challengers as usize).clamp(MIN_MEMBERS, cap)
     }
 
-    /// Whether this member may receive comparisons and optional work under the stored set.
+    /// Whether this member belongs to the committed serving pool.
     pub(super) fn evaluates(&self, node: Uuid) -> bool {
-        self.ranked.contains(&node) || self.rotation.is_some_and(|(id, _)| id == node)
+        self.ranked.iter().any(|member| member.node == node)
+            || self
+                .rotation
+                .as_ref()
+                .is_some_and(|(member, _)| member.node == node)
+    }
+
+    pub(super) fn initialized(&self) -> bool {
+        self.refreshed_at.is_some()
     }
 
     /// Whether probe comparison cells for this member are outside the bounded store budget.
@@ -74,10 +86,24 @@ impl EvaluationSet {
         self.refreshed_at.is_some() && !self.evaluates(node) && !self.anchors.contains(&node)
     }
 
-    pub(super) fn anchor(&mut self, node: Uuid) {
+    pub(super) fn anchor(&mut self, node: Uuid, now: Instant) {
         self.anchors.retain(|id| *id != node);
         self.anchors.insert(0, node);
         self.anchors.truncate(ANCHORS);
+        if self
+            .rotation
+            .as_ref()
+            .is_some_and(|(member, _)| member.node == node)
+        {
+            // A serving winner trades places with a ranked member instead of expiring as a trial.
+            let (mut winner, _) = self.rotation.take().expect("matching rotation member");
+            if let Some(last) = self.ranked.last_mut() {
+                std::mem::swap(last, &mut winner);
+                self.rotation = Some((winner, now));
+            } else {
+                self.ranked.push(winner);
+            }
+        }
     }
 
     /// Membership changes keep only the decayed demand, which reflects offered business.
@@ -88,61 +114,88 @@ impl EvaluationSet {
         };
     }
 
-    /// Evaluated flags aligned with `nodes`; the decision reference is evaluated even when it sits
-    /// outside the stored set.
-    pub(super) fn membership(&self, nodes: &[&Node], reference: usize) -> Vec<bool> {
-        nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| index == reference || self.evaluates(node.id))
-            .collect()
+    pub(super) fn membership(&self, nodes: &[&Node]) -> Vec<bool> {
+        nodes.iter().map(|node| self.evaluates(node.id)).collect()
     }
 }
 
 /// Only Apply refreshes committed participants.
-pub(super) fn derive<'a>(
+pub(super) fn derive<'a, 'view>(
     stored: Option<&'a EvaluationSet>,
     nodes: &[&Node],
     snapshots: &[ScoreSnapshot],
-    baseline: PerformanceBaseline,
     now: Instant,
     apply: bool,
+    representatives: impl Clone + Iterator<Item = (Uuid, Option<&'view str>)>,
+    mut replaceable: impl FnMut(Uuid) -> bool,
 ) -> std::borrow::Cow<'a, EvaluationSet> {
     if !apply && let Some(set) = stored.filter(|set| set.refreshed_at.is_some()) {
         return std::borrow::Cow::Borrowed(set);
     }
     let mut set = stored.cloned().unwrap_or_default();
-    // A member on a failure streak is replaced now instead of at the next refresh. Without a
-    // substitute it keeps the slot, which preserves its recovery.
-    let failing = |score: &ScoreSnapshot| score.node_fail_streak >= SCORE_FAIL_STREAK_EXCLUDE;
-    let failing_member = |id: &Uuid| {
-        nodes
-            .iter()
-            .position(|node| node.id == *id)
-            .is_some_and(|index| failing(&snapshots[index]))
+    let member = |node| Member {
+        node,
+        via: representatives
+            .clone()
+            .find(|(id, _)| *id == node)
+            .and_then(|(_, via)| via)
+            .map(Arc::from),
     };
-    let substitute = |set: &EvaluationSet| {
-        nodes
-            .iter()
-            .zip(snapshots)
-            .any(|(node, score)| failing(score) && set.ranked.contains(&node.id))
-            && nodes
+    let mut replaced = false;
+    for slot in set
+        .ranked
+        .iter_mut()
+        .chain(set.rotation.iter_mut().map(|(slot, _)| slot))
+    {
+        if let Some(via) = slot.via.as_deref()
+            && let Some((node, _)) = representatives
+                .clone()
+                .find(|(_, owner)| *owner == Some(via))
+            && slot.node != node
+        {
+            slot.node = node;
+            replaced = true;
+        }
+    }
+    if replaced {
+        // Subgroups can converge on one leaf; at most 25 slots need in-place deduplication.
+        let mut index = 0;
+        while index < set.ranked.len() {
+            if set.ranked[..index]
                 .iter()
-                .zip(snapshots)
-                .any(|(node, score)| !failing(score) && !set.ranked.contains(&node.id))
-    };
+                .any(|member| member.node == set.ranked[index].node)
+            {
+                set.ranked.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    let failing = |score: &ScoreSnapshot| score.node_fail_streak >= SCORE_FAIL_STREAK_EXCLUDE;
+    // A failed or health-unavailable owner can already be absent from the current view.
+    let mut failing_member = |member: &Member| replaceable(member.node);
+    let substitute = set.ranked.iter().any(&mut failing_member)
+        && nodes.iter().zip(snapshots).any(|(node, score)| {
+            !failing(score) && !set.ranked.iter().any(|member| member.node == node.id)
+        });
     let due = set
         .refreshed_at
         .is_none_or(|at| now.saturating_duration_since(at) >= REFRESH);
-    if due || substitute(&set) {
+    if due || substitute || replaced {
         let target = set.target_limit(now, nodes.len());
         // Growth waits for a refresh; shrinking also needs a two-member margin.
         if due && (target > set.limit || target + 2 <= set.limit) {
             set.limit = target;
         }
+        let baseline = super::ranking::performance_baseline(snapshots.iter());
         let utilities: Vec<_> = snapshots
             .iter()
-            .map(|score| utility(score, baseline))
+            .map(|score| {
+                (
+                    super::ranking::normal_eligible(score, baseline),
+                    utility(score, baseline),
+                )
+            })
             .collect();
         // Untried members tie on utility; the configured probe then hints the promising ones.
         // Only one measurement scope is comparable, so use the members' most common one.
@@ -161,16 +214,31 @@ pub(super) fn derive<'a>(
         let mut order: Vec<_> = (0..nodes.len()).collect();
         order.sort_by(|&left, &right| {
             utilities[right]
-                .total_cmp(&utilities[left])
+                .0
+                .cmp(&utilities[left].0)
+                .then_with(|| utilities[right].1.total_cmp(&utilities[left].1))
                 .then_with(|| probe(left).total_cmp(&probe(right)))
                 .then_with(|| nodes[left].id.cmp(&nodes[right].id))
         });
+        if !set.initialized() && !nodes.is_empty() {
+            // The first ordinary winner occupies a ranked slot, never an extra member slot.
+            let first = super::ranking::best_index(snapshots, nodes, baseline, |_| true).index;
+            let position = order
+                .iter()
+                .position(|index| *index == first)
+                .expect("winner in candidate order");
+            order[..=position].rotate_right(1);
+        }
         let ranked_len = if nodes.len() > set.limit {
             set.limit - 1
         } else {
             set.limit
         };
-        let rank = |id: &Uuid| order.iter().position(|&index| nodes[index].id == *id);
+        let rank = |member: &Member| {
+            order
+                .iter()
+                .position(|&index| nodes[index].id == member.node)
+        };
         // A member missing from this filtered or retry view keeps its place; absence is not removal.
         set.ranked
             .retain(|id| rank(id).is_none_or(|rank| rank < ranked_len + RANK_HYSTERESIS));
@@ -182,11 +250,16 @@ pub(super) fn derive<'a>(
             if healthy == ranked_len {
                 break;
             }
-            if !failing(&snapshots[index]) && !set.ranked.contains(&nodes[index].id) {
+            if !failing(&snapshots[index])
+                && !set
+                    .ranked
+                    .iter()
+                    .any(|member| member.node == nodes[index].id)
+            {
                 if set.ranked.len() == ranked_len {
                     set.ranked.pop();
                 }
-                set.ranked.insert(healthy, nodes[index].id);
+                set.ranked.insert(healthy, member(nodes[index].id));
                 healthy += 1;
             }
         }
@@ -195,26 +268,54 @@ pub(super) fn derive<'a>(
             if set.ranked.len() == ranked_len {
                 break;
             }
-            if !set.ranked.contains(&nodes[index].id) {
-                set.ranked.push(nodes[index].id);
+            if !set
+                .ranked
+                .iter()
+                .any(|member| member.node == nodes[index].id)
+            {
+                set.ranked.push(member(nodes[index].id));
             }
         }
         if due {
             set.refreshed_at = Some(now);
         }
     }
+    let replace_rotation = set
+        .rotation
+        .as_ref()
+        .is_some_and(|(slot, _)| failing_member(slot))
+        && nodes.iter().zip(snapshots).any(|(node, score)| {
+            !failing(score) && !set.ranked.iter().any(|member| member.node == node.id)
+        });
     if set.ranked.len() == set.limit {
         set.rotation = None;
-    } else if set.rotation.is_none_or(|(id, since)| {
-        set.ranked.contains(&id) || now.saturating_duration_since(since) >= ROTATION_SLOT
+    } else if set.rotation.as_ref().is_none_or(|(slot, since)| {
+        replace_rotation
+            || set.ranked.iter().any(|member| member.node == slot.node)
+            || now.saturating_duration_since(*since) >= ROTATION_SLOT
     }) {
-        let previous = set.rotation.map(|(id, _)| id);
+        let previous = set.rotation.as_ref().map(|(member, _)| member.node);
         set.rotation = nodes
             .iter()
-            .map(|node| node.id)
-            .filter(|id| !set.ranked.contains(id))
+            .zip(snapshots)
+            .filter(|(node, score)| {
+                (!replace_rotation || !failing(score))
+                    && !set.ranked.iter().any(|member| member.node == node.id)
+            })
+            .map(|(node, _)| node.id)
             .min_by_key(|id| (previous.is_some_and(|old| *id <= old), *id))
-            .map(|id| (id, now));
+            .map(|id| (member(id), now));
+    }
+    for slot in set
+        .ranked
+        .iter_mut()
+        .chain(set.rotation.iter_mut().map(|(slot, _)| slot))
+    {
+        if let Some((_, via)) = representatives.clone().find(|(node, _)| *node == slot.node)
+            && slot.via.as_deref() != via
+        {
+            slot.via = via.map(Arc::from);
+        }
     }
     std::borrow::Cow::Owned(set)
 }

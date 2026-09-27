@@ -50,6 +50,7 @@ pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 /// per-resolution visited set) is defense in depth against pathological
 /// configs.
 pub const MAX_GROUP_DEPTH: usize = 8;
+const _: () = assert!(MAX_GROUP_DEPTH <= u8::BITS as usize);
 
 /// Network dimension for per-network group selections.
 ///
@@ -183,9 +184,17 @@ struct Candidate<'a> {
     /// Leaf node that would actually be dialed.
     node: &'a Node,
     attribution: Vec<&'a str>,
+    /// Pool obligations aligned with `attribution`, excluding each owner's explicit final.
+    pool_bound: u8,
     selection_chain: Vec<&'a str>,
     final_owners: Vec<&'a str>,
     score_work: Vec<Arc<score::budget::Work>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScoreView<'a, 'node> {
+    origins: &'a [Candidate<'node>],
+    health_filtered: Option<&'a UniqueCandidateIds>,
 }
 
 impl<'a> Candidate<'a> {
@@ -206,6 +215,22 @@ enum UniqueCandidateIds {
     Multiple(HashSet<uuid::Uuid>),
 }
 
+impl UniqueCandidateIds {
+    fn contains(&self, node: uuid::Uuid) -> bool {
+        match self {
+            Self::Single(id) => *id == node,
+            Self::Multiple(ids) => ids.contains(&node),
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Single(_) => 1,
+            Self::Multiple(ids) => ids.len() as u64,
+        }
+    }
+}
+
 fn unique_candidate_ids(candidates: &[Candidate<'_>]) -> Option<UniqueCandidateIds> {
     let mut ids = candidates.iter().map(|candidate| candidate.node.id);
     let first = ids.next()?;
@@ -221,18 +246,26 @@ fn unique_candidate_ids(candidates: &[Candidate<'_>]) -> Option<UniqueCandidateI
     })
 }
 
-fn removed_unique_candidate_count(mut before: UniqueCandidateIds, after: &[Candidate<'_>]) -> u64 {
+fn removed_unique_candidates(
+    mut before: UniqueCandidateIds,
+    after: &[Candidate<'_>],
+) -> Option<UniqueCandidateIds> {
     match &mut before {
         UniqueCandidateIds::Single(id) => {
-            u64::from(!after.iter().any(|candidate| candidate.node.id == *id))
+            if after.iter().any(|candidate| candidate.node.id == *id) {
+                return None;
+            }
         }
         UniqueCandidateIds::Multiple(ids) => {
             for candidate in after {
                 ids.remove(&candidate.node.id);
             }
-            u64::try_from(ids.len()).unwrap_or(u64::MAX)
+            if ids.is_empty() {
+                return None;
+            }
         }
     }
+    Some(before)
 }
 
 pub struct GroupManager {

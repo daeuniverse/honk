@@ -199,7 +199,7 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     assert_eq!((before.1, before.2, before.3), (0, 0, 0));
 
     let stale = old.selection_plan_for_target("score", &context("stale.example", IpVersion::V4));
-    finish_success(&stale);
+    assert!(stale.entries[0].feedback.as_ref().unwrap().begin().is_err());
     assert!(
         old.feedback_for_group_node("score", survivor.id, seeded_context.clone())
             .is_none(),

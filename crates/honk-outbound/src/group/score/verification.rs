@@ -140,8 +140,9 @@ impl ScorePolicyState {
         context: &ScoreSelectionContext,
         nodes: &[&Node],
         names: &[&str],
+        origins: &[super::super::Candidate<'_>],
     ) -> Option<(usize, ScoreVerificationSnapshot)> {
-        self.verification_selection_at(group, context, (nodes, names), Instant::now())
+        self.verification_selection_at(group, context, (nodes, names), origins, Instant::now())
     }
 
     #[cfg(test)]
@@ -153,7 +154,7 @@ impl ScorePolicyState {
         now: Instant,
     ) -> Option<ScoreVerificationSnapshot> {
         let names: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
-        self.verification_selection_at(group, context, (nodes, &names), now)
+        self.verification_selection_at(group, context, (nodes, &names), &[], now)
             .map(|(_, snapshot)| snapshot)
     }
 
@@ -162,13 +163,25 @@ impl ScorePolicyState {
         group: &str,
         context: &ScoreSelectionContext,
         members: (&[&Node], &[&str]),
+        origins: &[super::super::Candidate<'_>],
         now: Instant,
     ) -> Option<(usize, ScoreVerificationSnapshot)> {
         if members.0.is_empty() {
             return None;
         }
         let inner = self.inner.lock();
-        let decision = decision(&inner, group, context, members.0, now, false);
+        let decision = decision(
+            &inner,
+            group,
+            context,
+            members.0,
+            super::super::ScoreView {
+                origins,
+                health_filtered: None,
+            },
+            now,
+            false,
+        )?;
         let report = question::report(&inner, (group, context), &decision, members, now);
         Some((decision.ordinary.index, report))
     }

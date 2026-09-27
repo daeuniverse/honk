@@ -685,9 +685,7 @@ pub(super) fn begin(
         }
         if counted {
             inner
-                .evaluation
-                .entry(SelectionReasonKey::new(&item.key.group, item.key.network))
-                .or_default()
+                .evaluation_mut(&item.key.group, item.key.network)
                 .record_demand(now);
         }
     }
@@ -697,8 +695,7 @@ pub(super) fn begin(
 /// Whether this group's recent offered load on `network` reaches the busy rate.
 fn busy(inner: &StateInner, group: &str, network: SelectionNetwork, now: Instant) -> bool {
     inner
-        .evaluation
-        .get(&SelectionReasonKey::new(group, network))
+        .evaluation(group, network)
         .is_some_and(|set| set.offered_rate(now) >= BUSY_RATE)
 }
 

@@ -49,7 +49,13 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
     assert_eq!(
         manager
             .score_state()
-            .peek_rank("score", &context, &nodes.iter().collect::<Vec<_>>()),
+            .peek_rank(
+                "score",
+                &context,
+                &nodes.iter().collect::<Vec<_>>(),
+                Default::default()
+            )
+            .unwrap(),
         0
     );
     let next = manager.selection_plan_for_target("score", &context);
@@ -86,7 +92,13 @@ fn rejected_exact_attempt_is_neutral() {
     assert_eq!(
         manager
             .score_state()
-            .peek_rank("score", &context, &nodes.iter().collect::<Vec<_>>()),
+            .peek_rank(
+                "score",
+                &context,
+                &nodes.iter().collect::<Vec<_>>(),
+                Default::default()
+            )
+            .unwrap(),
         0
     );
 }
@@ -514,7 +526,13 @@ fn setup_only_exact_samples_keep_aggregate_reliability() {
     assert_eq!(
         manager
             .score_state()
-            .peek_rank("score", &target, &[&nodes[0], &nodes[1]]),
+            .peek_rank(
+                "score",
+                &target,
+                &[&nodes[0], &nodes[1]],
+                Default::default()
+            )
+            .unwrap(),
         0
     );
 }
@@ -558,11 +576,15 @@ fn setup_only_family_samples_keep_global_reliability() {
     reporter.finish_setup_only();
 
     assert_eq!(
-        manager.score_state().peek_rank(
-            "score",
-            &context("fresh.example", IpVersion::V4),
-            &[&nodes[0], &nodes[1]],
-        ),
+        manager
+            .score_state()
+            .peek_rank(
+                "score",
+                &context("fresh.example", IpVersion::V4),
+                &[&nodes[0], &nodes[1]],
+                Default::default(),
+            )
+            .unwrap(),
         0
     );
 }

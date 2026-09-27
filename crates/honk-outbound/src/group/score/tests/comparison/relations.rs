@@ -30,8 +30,9 @@ fn common_targets_do_not_promote_a_simpson_mixture() {
         &snapshots.scores,
         &nodes.iter().collect::<Vec<_>>(),
         Some(0),
-        performance_baseline(&snapshots.scores),
+        performance_baseline(snapshots.scores.iter()),
         &snapshots.pairs,
+        &snapshots.membership,
     );
     assert_eq!(chosen.index, 0);
 }

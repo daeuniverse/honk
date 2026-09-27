@@ -538,7 +538,13 @@ fn one_unrelated_probe_cannot_suppress_comparable_http_pair() {
     assert_eq!(
         manager
             .score_state()
-            .peek_rank("score", &aggregate, &nodes.iter().collect::<Vec<_>>()),
+            .peek_rank(
+                "score",
+                &aggregate,
+                &nodes.iter().collect::<Vec<_>>(),
+                Default::default()
+            )
+            .unwrap(),
         2
     );
     let snapshot = verification_at(&manager, &nodes, &aggregate, now);
@@ -646,6 +652,7 @@ fn exhausted_budget_and_retired_authority_leave_counters_unchanged() {
         "score",
         &target,
         &nodes.iter().collect::<Vec<_>>(),
+        Default::default(),
         true,
     );
     assert_eq!(

@@ -2,7 +2,7 @@ use super::super::evidence::{CellStamp, Observation};
 use super::super::{
     AggregateKey, ExactKey, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION,
     ScoreAttribution, ScoreSelectionContext, ScoreSource, ScoreTarget, SelectionNetwork,
-    SelectionReasonKey, StartedCells, StateInner, Stats,
+    StartedCells, StateInner, Stats,
 };
 use super::{BLOCKS, MAX_CELLS, MAX_KEY_BYTES, MAX_LOGICAL_BYTES, REPORTERS};
 use lru::LruCache;
@@ -464,11 +464,7 @@ pub(in crate::group::score) fn observe(
         // Unevaluated members keep probe baselines in their stats, not bounded comparison cells.
         if matches!(observation, Observation::Probe { .. })
             && inner
-                .evaluation
-                .get(&SelectionReasonKey::new(
-                    &attribution.group,
-                    context.network,
-                ))
+                .evaluation(&attribution.group, context.network)
                 .is_some_and(|set| set.excludes(attribution.node_id))
         {
             continue;

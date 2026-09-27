@@ -30,10 +30,7 @@ fn run_business(
 fn seed_demand(manager: &GroupManager, starts: usize, at: Instant) {
     let state = manager.score_state();
     let mut inner = state.inner.lock();
-    let set = inner
-        .evaluation
-        .entry(SelectionReasonKey::new("score", SelectionNetwork::Tcp))
-        .or_default();
+    let set = inner.evaluation_mut("score", SelectionNetwork::Tcp);
     for _ in 0..starts {
         set.record_demand(at);
     }
@@ -115,22 +112,24 @@ fn busy_scopes_with_productive_trials_earn_twice_as_fast() {
     }
 }
 
-/// Half an hour of one flow per second where every challenger trial fails; returns the trials,
-/// the reads that waited on the budget and the budget refusals.
-fn run_failing_trials(live: bool) -> (u64, u32, u64) {
+/// Exercise pause and half-open recovery while only the ordinary incumbent succeeds.
+fn run_failing_trials(live: bool) -> (u32, u64, bool) {
     let nodes: Vec<_> = (0..8).map(|index| node(&format!("m{index}"))).collect();
     let refs: Vec<_> = nodes.iter().collect();
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let state = manager.score_state();
     let target = context("pause.example", IpVersion::V4);
     let start = Instant::now();
-    let (mut trials, mut budget_reads) = (0, 0);
+    let (mut trials, mut budget_reads, mut resumed) = (0, 0, false);
     // The first plan has no completed selection to explore against, so it is ordinary.
     let mut incumbent = None;
     for step in 0..1800 {
         let at = start + Duration::from_secs(step);
         let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
         let reporter = attempt.begin_at(at).unwrap().start_at(at);
+        let started = manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .trial_starts;
         if *incumbent.get_or_insert(index) == index {
             reporter.setup_succeeded_at(at);
             // Live replies keep the selection usable; completions alone do not.
@@ -139,27 +138,33 @@ fn run_failing_trials(live: bool) -> (u64, u32, u64) {
             }
             reporter.finish_at(ScoreOutcome::Success, true, at);
         } else {
-            trials += 1;
+            assert!(
+                started > trials,
+                "healthy incumbent lost ordinary service at step {step}, live={live}"
+            );
             reporter.finish_at(ScoreOutcome::Timeout, false, at);
         }
+        resumed |= budget_reads > 0 && started > trials;
+        trials = started;
         let report = state.verification_snapshot_at("score", &target, &refs, at);
         budget_reads +=
             u32::from(report.is_some_and(|report| report.wait_reason == ScoreWaitReason::Budget));
     }
     let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    assert_eq!(counters.trial_failure, trials);
-    (trials, budget_reads, counters.budget_blocked)
+    (budget_reads, counters.budget_blocked, resumed)
 }
 
 #[test]
 fn failing_trials_pause_only_behind_a_usable_selection() {
     // Backoff alone retries each failed member later; the pause also waits for the scope's
     // failures to decay.
-    let (live, live_paused, live_blocked) = run_failing_trials(true);
-    let (dead, dead_paused, dead_blocked) = run_failing_trials(false);
-    // Decayed failures lift the pause, so a live selection still retests its scope.
-    assert!(3 < live && live < dead, "live {live}, dead {dead}");
+    let (live_paused, live_blocked, resumed) = run_failing_trials(true);
+    let (dead_paused, dead_blocked, _) = run_failing_trials(false);
     assert!(live_paused > 0);
+    assert!(
+        resumed,
+        "decayed failures must reopen funded trials after pausing"
+    );
     // Credit never runs out here, so only the pause reads and counts as a budget refusal.
     assert_eq!((dead_paused, dead_blocked), (0, 0));
     assert!(live_blocked > 0);

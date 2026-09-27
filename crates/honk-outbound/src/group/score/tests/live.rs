@@ -402,7 +402,14 @@ fn setup_quality_survives_neutral_completion_without_a_response() {
         assert_eq!(score.target_performance.setup.value, Some(60.0));
         assert_eq!((score.completed, score.unresolved_failure), (0.0, false));
         assert_eq!(
-            state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
+            state
+                .peek_rank(
+                    "score",
+                    &target,
+                    &nodes.iter().collect::<Vec<_>>(),
+                    Default::default()
+                )
+                .unwrap(),
             1,
             "neutral completion must retain measured setup quality: {outcome:?}"
         );
@@ -437,7 +444,14 @@ fn concurrent_failed_probe_cannot_retire_successful_probe_evidence() {
     assert_eq!(score.probe.value, Some(5.0));
     assert_eq!((score.completed, score.unresolved_failure), (0.0, false));
     assert_eq!(
-        state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
+        state
+            .peek_rank(
+                "score",
+                &target,
+                &nodes.iter().collect::<Vec<_>>(),
+                Default::default()
+            )
+            .unwrap(),
         1
     );
 }
@@ -515,7 +529,14 @@ fn warmup_setup_quality_remains_available_without_business_completions() {
     );
     assert_eq!(score.completed, 0.0);
     assert_eq!(
-        state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
+        state
+            .peek_rank(
+                "score",
+                &target,
+                &nodes.iter().collect::<Vec<_>>(),
+                Default::default()
+            )
+            .unwrap(),
         1
     );
 }

@@ -18,6 +18,7 @@ fn ordinary_at(
         incumbent,
         decision.baseline,
         &decision.pairs,
+        &decision.membership,
     )
 }
 
@@ -197,7 +198,13 @@ fn unsupported_global_best_cannot_mask_comparable_third_challenger() {
     assert_eq!(
         manager
             .score_state()
-            .peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
+            .peek_rank(
+                "score",
+                &target,
+                &nodes.iter().collect::<Vec<_>>(),
+                Default::default()
+            )
+            .unwrap(),
         2
     );
 }
@@ -606,7 +613,9 @@ fn http_probe_path_query_and_method_define_distinct_comparison_cohorts() {
         let state = manager.score_state();
         let refs = nodes.iter().collect::<Vec<_>>();
         assert_eq!(
-            state.peek_rank("score", &target, &refs),
+            state
+                .peek_rank("score", &target, &refs, Default::default())
+                .unwrap(),
             0,
             "{uri} {method} is not the same workload"
         );
@@ -619,7 +628,12 @@ fn http_probe_path_query_and_method_define_distinct_comparison_cohorts() {
             Duration::from_millis(1),
             now,
         );
-        assert_eq!(state.peek_rank("score", &target, &refs), 1);
+        assert_eq!(
+            state
+                .peek_rank("score", &target, &refs, Default::default())
+                .unwrap(),
+            1
+        );
     }
 }
 
@@ -647,7 +661,12 @@ fn same_host_probe_url_reload_discards_baselines_at_commit_before_new_samples() 
     }
     let state = old.score_state();
     let refs = nodes.iter().collect::<Vec<_>>();
-    assert_eq!(state.peek_rank("score", &target, &refs), 0);
+    assert_eq!(
+        state
+            .peek_rank("score", &target, &refs, Default::default())
+            .unwrap(),
+        0
+    );
     configured.check_url = Some(new_uri.into());
     let replacement = GroupManager::with_alive_set_and_score_state(
         &[configured],
@@ -700,7 +719,12 @@ fn same_host_probe_url_reload_discards_baselines_at_commit_before_new_samples() 
             .value,
         Some(600.0)
     );
-    assert_eq!(state.peek_rank("score", &target, &refs), 1);
+    assert_eq!(
+        state
+            .peek_rank("score", &target, &refs, Default::default())
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
