@@ -178,7 +178,6 @@ fn a_failing_scope_tests_one_trial_at_a_time_below_the_pause() {
     let state = manager.score_state();
     let target = context("half-open.example", IpVersion::V4);
     let start = Instant::now();
-    // Enough recent demand to evaluate every member, so more than two challengers could be tried.
     seed_demand(&manager, 1000, start);
     // A usable selection before any trial, so the pause rules apply from the first failure.
     train_at(&manager, &nodes[0], &target, 20, 50, 1, start);
@@ -256,4 +255,92 @@ fn trial_yield_ignores_refusing_targets_and_resets_on_reload() {
         .score_state()
         .publish_membership(nodes.iter().map(|node| ("score".to_owned(), node.id)));
     assert_eq!(wait(&failed, &nodes[0], &target), ScoreWaitReason::None);
+}
+
+#[test]
+fn removed_members_settle_cost_without_changing_replacement_yield() {
+    let mut results = Vec::new();
+    for (keep, outcome) in [
+        (false, ScoreOutcome::Success),
+        (false, ScoreOutcome::Timeout),
+        (true, ScoreOutcome::Success),
+        (true, ScoreOutcome::Timeout),
+    ] {
+        let nodes: Vec<_> = (0..5)
+            .map(|index| node(&format!("reload-{index}")))
+            .collect();
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let state = manager.score_state();
+        let now = Instant::now();
+        let target = context("removed-yield.example", IpVersion::V4);
+        seed_demand(&manager, 1000, now);
+        let reporters: Vec<_> = nodes[..3]
+            .iter()
+            .map(|node| {
+                let work = budget::reserve(
+                    &state,
+                    &mut state.inner.lock(),
+                    ("score", &target),
+                    node.id,
+                    ScoreEvidenceQuestion::Availability,
+                    false,
+                    now,
+                )
+                .unwrap();
+                ScoreAttempt::planned(
+                    manager
+                        .feedback_for_group_node("score", node.id, target.clone())
+                        .unwrap(),
+                    Arc::new(budget::Opportunity::default()),
+                    vec![work],
+                    ScoreTrialSource::None,
+                )
+                .begin_at(now)
+                .unwrap()
+                .start_at(now)
+            })
+            .collect();
+        let retained = if keep { &nodes[..] } else { &nodes[3..] };
+        let replacement = GroupManager::with_alive_set_and_score_state(
+            &[group("score", retained)],
+            retained,
+            None,
+            Arc::clone(&state),
+        );
+        replacement.publish_score_membership();
+        for reporter in reporters {
+            reporter.finish_at(outcome, false, now + Duration::from_secs(1));
+        }
+        let counters = replacement.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            (counters.trial_starts, counters.spent, counters.reserved),
+            (3, 3, 0)
+        );
+        assert_eq!(
+            (counters.trial_success, counters.trial_failure),
+            if outcome == ScoreOutcome::Success {
+                (3, 0)
+            } else {
+                (0, 3)
+            }
+        );
+        let wait = budget::wait_reason(
+            &state.inner.lock(),
+            ("score", &target),
+            nodes[3].id,
+            ScoreEvidenceQuestion::Availability,
+            true,
+            now + Duration::from_secs(2),
+        );
+        results.push((counters.earning_period, wait));
+    }
+    assert_eq!(
+        results,
+        [
+            (16, ScoreWaitReason::None),
+            (16, ScoreWaitReason::None),
+            (8, ScoreWaitReason::None),
+            (16, ScoreWaitReason::Budget),
+        ]
+    );
 }

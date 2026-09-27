@@ -788,24 +788,34 @@ fn settle(inner: &mut StateInner, item: &Work, outcome: ScoreOutcome, now: Insta
         .filter(|scope| item.scope_matches(scope))
     {
         let c = &mut scope.counters;
-        match outcome {
+        let yield_success = match outcome {
             ScoreOutcome::Success => {
                 c.trial_success = c.trial_success.saturating_add(1);
-                scope.outcomes.record(true, now);
+                Some(true)
             }
             ScoreOutcome::Cancelled | ScoreOutcome::Rejected | ScoreOutcome::Shutdown => {
-                c.trial_cancelled = c.trial_cancelled.saturating_add(1)
+                c.trial_cancelled = c.trial_cancelled.saturating_add(1);
+                None
             }
             // A refusing target says nothing about the scope's other targets.
-            ScoreOutcome::TargetFailure => c.trial_failure = c.trial_failure.saturating_add(1),
+            ScoreOutcome::TargetFailure => {
+                c.trial_failure = c.trial_failure.saturating_add(1);
+                None
+            }
             _ => {
                 c.trial_failure = c.trial_failure.saturating_add(1);
-                scope.outcomes.record(false, now);
+                Some(false)
             }
-        }
+        };
         c.trial_elapsed_millis = c
             .trial_elapsed_millis
             .saturating_add(item.life.elapsed_millis(now));
+        // Removed members still settle historical costs, not replacement members' funding.
+        if let Some(success) = yield_success
+            && inner.valid.contains(&(item.key.group.clone(), item.node))
+        {
+            scope.outcomes.record(success, now);
+        }
     }
 }
 
