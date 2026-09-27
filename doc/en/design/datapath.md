@@ -176,7 +176,7 @@ For non-DNS traffic, the decision to keep a non-`must` flow in kernel direct rou
 | Effective mode | Route-time policy |
 | --- | --- |
 | `Rule` (also no Clash mode override) | A non-`must` `direct` result is offloaded only when SNI cannot change it: no domain-class reevaluation is possible, or DNS learning supplied the flow's domain bitmap. Otherwise userspace re-routes after sniffing. |
-| `Direct` | Every non-final, non-`block` flow is normalized to `direct` and offloaded because userspace would choose direct anyway. |
+| `Direct` | LAN ingress, WAN TCP and WAN UDP normalize every non-`must`, non-`block` flow to `direct` and offload it; no proxy health gate applies. A rule mark is kept only when the rule itself routed `direct`. Unlike the userspace override, SNI is not consulted, so a `block` or `must` rule reachable only through a sniffed domain does not apply. |
 | `Global` | An exact global selection of `direct` uses the same all-direct policy. Other global selections keep non-final flows in userspace for the selected outbound. |
 
 `direct(must)` always stays direct and needs no bit-57 flag. Ordinary non-DNS `block` and `block(must)` remain final; non-`must` DNS instead retains controller ownership. Full rule evaluation and mode semantics are documented in [Routing](./routing.md).

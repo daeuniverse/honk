@@ -697,7 +697,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         ip_version,
         false,
     );
-    let (decision, routing_generation) = match crate::route::route(&mut pkt.routing_input, None) {
+    let (mut decision, routing_generation) = match crate::route::route(&mut pkt.routing_input, None)
+    {
         Ok(result) => result,
         Err(_error) => {
             error!(ctx, target: "honk", "lan_ingress route fail: {}", _error);
@@ -707,6 +708,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return Err(TC_ACT_SHOT);
         }
     };
+    decision.apply_mode_flags(flags, pkt.tuples.five.dst_port);
 
     let outbound = decision.outbound as u8;
     let mark = decision.mark;

@@ -70,6 +70,28 @@ impl RoutingDecision {
             self.outbound as u8
         }
     }
+
+    /// Clash all-direct mode (`DATAPATH_FLAG_OFFLOAD_ALL`): DNS, `must` and
+    /// `block` stay as routed; every other flow becomes a final `direct`,
+    /// keeping the rule mark only when the rule itself routed `direct`. Unlike
+    /// userspace, this skips sniffed-domain rerouting, so a `block` or `must`
+    /// rule reachable only through SNI does not apply.
+    #[inline(always)]
+    pub fn apply_mode_flags(&mut self, flags: u32, dst_port: u16) {
+        if flags & crate::DATAPATH_FLAG_OFFLOAD_ALL == 0
+            || dst_port == 53
+            || self.must != 0
+            || self.outbound == crate::OutboundIndex::Block as u32
+        {
+            return;
+        }
+        if self.outbound != crate::OutboundIndex::Direct as u32 {
+            self.outbound = crate::OutboundIndex::Direct as u32;
+            self.mark = 0;
+        }
+        // Final by mode: offload skips sniffed-domain rerouting.
+        self.domain_final = 1;
+    }
 }
 
 #[cfg(test)]
@@ -90,6 +112,39 @@ fn unresolved_direct_handoff_keeps_sniffing_authority() {
             ..Default::default()
         };
         assert_eq!(decision.handoff_outbound(), expected as u8);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn all_direct_mode_matches_userspace_override() {
+    use crate::OutboundIndex::{Block, Direct, UserBase};
+    use crate::{DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE};
+    // (flags, dport, routed outbound, mark, must) -> (outbound, mark, handoff)
+    for (flags, dport, outbound, mark, must, expected) in [
+        (ALL, 443, UserBase, 0x400, 0, (Direct, 0, Direct)),
+        (ALL, 443, Direct, 0x10, 0, (Direct, 0x10, Direct)),
+        (ALL, 443, UserBase, 0x400, 1, (UserBase, 0x400, UserBase)),
+        (ALL, 443, Block, 0x400, 0, (Block, 0x400, Block)),
+        (ALL, 53, UserBase, 0x400, 0, (UserBase, 0x400, UserBase)),
+        (RULE, 443, UserBase, 0x400, 0, (UserBase, 0x400, UserBase)),
+    ] {
+        let mut decision = RoutingDecision {
+            outbound: outbound as u32,
+            mark,
+            must,
+            ..Default::default()
+        };
+        decision.apply_mode_flags(flags, dport);
+        assert_eq!(
+            (
+                decision.outbound,
+                decision.mark,
+                decision.handoff_outbound()
+            ),
+            (expected.0 as u32, expected.1, expected.2 as u8),
+            "{flags:#x} {dport} {outbound:?} must={must}"
+        );
     }
 }
 

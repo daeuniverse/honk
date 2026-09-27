@@ -411,18 +411,14 @@ fn do_tproxy_wan_egress_tcp(
             ip_version,
             true,
         );
-        let (decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
+        let (mut decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
             Ok(result) => result,
             Err(_) => return Err(TC_ACT_SHOT),
         };
         routing_generation = generation;
 
-        outbound =
-            if crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0 {
-                decision.outbound as u8
-            } else {
-                decision.handoff_outbound()
-            };
+        decision.apply_mode_flags(crate::maps::datapath_flags(), tuples.five.dst_port);
+        outbound = decision.handoff_outbound();
         mark = decision.mark;
         must = decision.must != 0;
         let must_val = must as u8;
@@ -684,8 +680,8 @@ fn do_tproxy_wan_egress_udp(
 ) -> Verdict {
     let tuples = &pkt.tuples;
     let ethh = &pkt.ethh;
-    let mut outbound: u8;
-    let mut mark: u32;
+    let outbound: u8;
+    let mark: u32;
     let must: bool;
     let mut mac: [u8; 6] = [0; 6];
     let mut handoff_pname: Option<&[u8; TASK_COMM_LEN]> = None;
@@ -766,27 +762,16 @@ fn do_tproxy_wan_egress_udp(
         ip_version,
         true,
     );
-    let (decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
+    let (mut decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
         Ok(result) => result,
         Err(_) => return Err(TC_ACT_SHOT),
     };
     let routing_generation = generation;
 
-    let force_direct = tuples.five.dst_port != 53
-        && crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0;
-    outbound = if force_direct {
-        decision.outbound as u8
-    } else {
-        decision.handoff_outbound()
-    };
+    decision.apply_mode_flags(crate::maps::datapath_flags(), tuples.five.dst_port);
+    outbound = decision.handoff_outbound();
     mark = decision.mark;
     must = decision.must != 0;
-    if !must && outbound != OUTBOUND_BLOCK && force_direct {
-        if outbound != OUTBOUND_DIRECT {
-            mark = 0;
-        }
-        outbound = OUTBOUND_DIRECT;
-    }
 
     if !is_short_lived_udp_traffic(&tuples.five) {
         let must_u8 = must as u8;

@@ -495,7 +495,7 @@ const _REDIRECT_ENTRY_TOKEN_OFFSET: () =
 /// Bits of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
 /// at runtime (unlike `DaeParam`, which is fixed at load time).  They encode
 /// the mode-based direct-offload policy and are read **once per new flow**
-/// in `lan_ingress`, at route-decision time; the resulting offload decision
+/// in `lan_ingress` and `wan_egress`, at route-decision time; the resulting decision
 /// is cached per flow in `ROUTING_META_FLAG_OFFLOAD`, so established packets
 /// never touch this map.
 ///
@@ -507,11 +507,10 @@ pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
 
 /// `DATAPATH_FLAG_OFFLOAD_ALL`: the effective clash policy always selects
 /// direct (`Direct` mode, or `Global` with the exact `direct` selection).
-/// The userspace override would re-decide every non-`must`/non-`block` flow
-/// to `direct` anyway, so the kernel offloads all of them (including
-/// flows routed to a proxy), normalizing their cached outbound to
-/// `OUTBOUND_DIRECT`.  The SNI constraint does not apply here: no sniffed
-/// domain can change an always-direct outcome.
+/// The kernel offloads every non-`must`/non-`block` flow (including flows
+/// routed to a proxy) as `OUTBOUND_DIRECT` without the SNI constraint, so a
+/// `block` or `must` rule reachable only through a sniffed domain does not
+/// apply, unlike the userspace override.
 pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
 
 /// NFQUEUE staging is configured; without readiness, eligible new flows fail closed.

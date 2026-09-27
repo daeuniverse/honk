@@ -160,7 +160,7 @@ LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 N
 | 有效模式 | 路由时策略 |
 | --- | --- |
 | `Rule`（也包括没有 Clash 模式覆盖） | 仅当 SNI 不可能改变结果时，才卸载非 `must` 的 `direct` 结果：不存在域名类重新求值，或 DNS 学习已提供该流的域名 bitmap。否则用户空间在 sniff 后重新路由。 |
-| `Direct` | 每个非 final、非 `block` 流都归一化为 `direct` 并卸载，因为用户空间最终也会选择 direct。 |
+| `Direct` | LAN ingress、WAN TCP 与 WAN UDP 都把每个非 `must`、非 `block` 流归一化为 `direct` 并卸载；不经过代理健康门控。仅当规则本身路由到 `direct` 时才保留规则 mark。与用户空间模式覆盖不同，这里不参考 SNI，因此只能靠 sniff 域名命中的 `block` 或 `must` 规则不会生效。 |
 | `Global` | 全局选择恰为 `direct` 时使用相同的全 direct 策略。其他全局选择让非 final 流留在用户空间，以应用所选出站。 |
 
 `direct(must)` 始终保持 direct，不需要 bit 57 标志。非 DNS 的 `block` 与 DNS 的 `block(must)` 保持 final；普通非 `must` DNS `block` 仍交给 DNS 控制器。完整规则求值与模式语义见[路由设计](./routing.md)。
