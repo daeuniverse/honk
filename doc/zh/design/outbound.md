@@ -584,8 +584,8 @@ wire addon 始终是基础 Vision flow。
 **上行 Vision。** 拨号时，VLESS 请求与 Vision 首帧一起发出：UUID 加一个
 内容为空、带长 padding 的 Continue 帧，与 Xray 客户端在尚无 payload 时的做法
 一致。因此请求仍处于拨号的失败与 deadline 范围内。此后的上传按 Xray 默认
-padding 逐帧填充。padding 何时结束由内层 TLS 判断决定，依据的是 TLS record
-结构，而不是读写调用边界。非 TLS payload 在第一帧即结束 padding。出现
+padding 逐帧填充。已识别的 application-data 终止位置遵循内层 TLS record
+边界，而不是读写调用边界。非 TLS payload 在完成分类后使用 End。出现
 ClientHello 时，padding 持续到第一个完整 application-data record 结束；若下行
 ServerHello 选择了 TLS 1.3 且 cipher 属于 Xray 接受的范围（0x1301–0x1304），
 并且 codec 具备 direct writer，该帧携带 Direct，否则携带 End。每个方向的检查

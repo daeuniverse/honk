@@ -1,8 +1,8 @@
 //! Inner TLS observation for Vision.
 //!
-//! Decides where uplink padding ends and whether that end may switch to
-//! Direct. Decisions follow TLS record structure, never read or write call
-//! boundaries, so relay chunking cannot move or hide a switch point.
+//! Chooses uplink padding termination and Direct eligibility. Recognized
+//! application-data termination follows the complete TLS record boundary;
+//! non-TLS, malformed input and inspection-budget exhaustion use End.
 
 const INSPECT_LIMIT: usize = 64 * 1024;
 // X25519MLKEM768 key shares make a ServerHello about 1.2 KiB.
@@ -61,8 +61,8 @@ enum ClientKind {
 impl InnerTls {
     /// Plans the next padded frame from the head of `data`.
     ///
-    /// A terminal frame always ends exactly where a complete client
-    /// application-data record ends, as Xray's `IsCompleteRecord` requires.
+    /// Application-data termination ends at its complete record boundary;
+    /// classification and inspection-budget fallbacks use End instead.
     pub(super) fn plan_uplink(&mut self, data: &[u8], direct_capable: bool) -> UplinkFrame {
         let data = &data[..data.len().min(MAX_FRAME_CONTENT)];
         let end = |take, long_padding| UplinkFrame {

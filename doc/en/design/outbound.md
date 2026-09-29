@@ -660,9 +660,9 @@ protocol fallback. The wire addon remains the base Vision flow.
 first frame: the UUID and an empty long-padded Continue frame, as Xray's client
 does when no payload is ready. The request therefore stays inside the dial's
 failure and deadline scope. Later uploads are padded frame by frame with Xray's
-default padding. Padding ends on an inner-TLS decision taken from TLS record
-structure, never from read or write call boundaries. Non-TLS payload ends it on
-its first frame. A ClientHello keeps it until the first complete
+default padding. Recognized application-data termination follows the inner TLS
+record boundary, not read/write call boundaries. Non-TLS payload uses End once
+classified. A ClientHello keeps padding until the first complete
 application-data record ends; that frame carries Direct when the downstream
 ServerHello chose TLS 1.3 with a cipher Xray accepts (0x1301–0x1304) and the
 codec has a direct writer, otherwise End. A 64 KiB inspection budget per

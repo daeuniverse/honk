@@ -15,10 +15,10 @@
 //! direction drains until its own EOF — bounded by [`DRAIN_DEADLINE`] so a
 //! silent peer cannot pin the relay forever.
 //!
-//! The first splice of each direction doubles as a capability probe: a
-//! failed `splice(2)` moves no bytes, so if it returns EINVAL/ENOSYS/EXDEV
-//! the whole connection falls back to the userspace copy relay without
-//! losing data, and a global flag skips probing for future connections.
+//! Capability probes that find unsupported or policy-denied `splice(2)`
+//! before staging any bytes permit lossless copy fallback and disable
+//! future probes. Pipe creation failure permits the same fallback for
+//! the current connection only.
 //!
 //! Go ref: `tcp_copy_linux.go` (340L), `tcp_copy_engine.go` (118L)
 
@@ -274,7 +274,7 @@ pub(crate) const DRAIN_DEADLINE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(30)
 };
 
-/// Shared engine behind [`splice_bidirectional`] and [`relay_splice`].
+/// Shared engine for plain TCP relays and lent Vision sockets.
 pub(super) async fn run(
     client: &TcpStream,
     upstream: &TcpStream,
@@ -283,17 +283,14 @@ pub(super) async fn run(
     let pipe_c2p = Pipe::new().map_err(SpliceError::NoPipe)?;
     let pipe_p2c = Pipe::new().map_err(SpliceError::NoPipe)?;
 
-    // The probes run before any byte reaches a destination socket, so an
-    // `Unsupported` verdict here still allows a lossless copy fallback.
+    // Fallback is safe only when neither probe removed bytes from a socket.
     let staged_c2p = probe(client, &pipe_c2p, true)?;
     let staged_p2c = match probe(upstream, &pipe_p2c, false) {
         Ok(n) => n,
         Err(SpliceError::Unsupported) if staged_c2p == 0 => return Err(SpliceError::Unsupported),
         Err(SpliceError::Unsupported) => {
-            // Unreachable in practice (the first probe already succeeded on
-            // the same kind of fds), but bytes have left the client socket,
-            // so a copy fallback would lose them. Fail instead of silently
-            // corrupting the stream.
+            // The first probe already removed bytes from the client socket,
+            // so a copy fallback would lose them.
             return Err(SpliceError::Io(super::RelayError::new(
                 io::Error::other("splice probe failed after staging bytes"),
                 false,
@@ -383,10 +380,9 @@ pub async fn splice_bidirectional(
 /// Relay two plain TCP sockets, using zero-copy `splice(2)` when the kernel
 /// supports it and falling back to the userspace copy relay otherwise.
 ///
-/// Produces the exact same [`RelayStats`] accounting as [`relay_tcp`]; the
-/// fallback is lossless because the capability probe runs before any byte
-/// is moved, and it is latched process-wide so later connections go
-/// straight to the copy path.
+/// Produces the exact same [`RelayStats`] accounting as [`relay_tcp`].
+/// Unavailable capability probes fall back only before staging bytes and
+/// disable future probes; pipe setup failures fall back without that latch.
 pub async fn relay_splice(
     client: &mut TcpStream,
     upstream: TcpStream,
