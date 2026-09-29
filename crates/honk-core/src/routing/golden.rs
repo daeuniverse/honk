@@ -1,3 +1,5 @@
+pub(crate) mod parsed;
+
 use super::{ConnectionInfo, Router, geo::GeoSourceSet};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use honk_ebpf_common::RoutingDecision;
