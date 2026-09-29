@@ -1,3 +1,4 @@
+use super::test_hook::{StateGuard, TEST_LOCK};
 use super::*;
 use std::sync::{
     Arc,
@@ -6,24 +7,6 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-
-/// The probe fallback mutates process-global state, so all tests that
-/// go through `run()` serialize on this lock.
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Reset global splice state even when a test panics.
-struct StateGuard;
-impl StateGuard {
-    fn new() -> Self {
-        test_hook::reset();
-        StateGuard
-    }
-}
-impl Drop for StateGuard {
-    fn drop(&mut self) {
-        test_hook::reset();
-    }
-}
 
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
@@ -129,6 +112,7 @@ fn test_is_unsupported_errno() {
 /// cannot expose staged bytes to another one.
 #[test]
 fn test_full_duplex_pipe_resource_bound() {
+    let _lock = TEST_LOCK.blocking_lock();
     let client_to_upstream = Pipe::new().expect("create client pipe");
     let upstream_to_client = Pipe::new().expect("create upstream pipe");
     assert_ne!(
@@ -380,6 +364,42 @@ async fn test_relay_auto_live_progress_matches_stats() {
     assert_eq!(down.load(Ordering::Relaxed), stats.proxy_to_client);
     assert_eq!(accepted.0.load(Ordering::Relaxed), stats.client_to_proxy);
     assert_eq!(accepted.1.load(Ordering::Relaxed), stats.proxy_to_client);
+}
+
+/// Pipe exhaustion happens before any byte moves: the connection copies
+/// instead of failing, and later connections still try splice.
+#[tokio::test]
+async fn missing_pipes_fall_back_to_copy_without_latching() {
+    let _lock = TEST_LOCK.lock().await;
+    let _state = StateGuard::new();
+    let echo = spawn_echo().await;
+    test_hook::fail_pipes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = listener.local_addr().unwrap();
+    let (progress, accepted) = observed_progress();
+    let relay = tokio::spawn(async move {
+        let (mut client, client_addr) = listener.accept().await.unwrap();
+        let upstream = TcpStream::connect(echo).await.unwrap();
+        relay_splice(&mut client, upstream, client_addr, echo, Some(progress)).await
+    });
+
+    let mut client = TcpStream::connect(front).await.unwrap();
+    let payload = pattern(96 * 1024);
+    client.write_all(&payload).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut echoed = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut echoed))
+        .await
+        .expect("pipe fallback hung")
+        .unwrap();
+    assert!(echoed == payload);
+    let stats = relay.await.unwrap().unwrap();
+    assert_eq!(stats.client_to_proxy, payload.len() as u64);
+    assert_eq!(stats.proxy_to_client, payload.len() as u64);
+    assert_eq!(accepted.0.load(Ordering::Relaxed), payload.len() as u64);
+    assert_eq!(test_hook::probe_calls(), 0);
+    assert!(splice_available());
 }
 
 /// A probe that fails with an unsupported errno must fall back to the

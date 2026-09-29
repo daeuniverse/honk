@@ -4,7 +4,9 @@
 //! proxy connection. Wrapped streams (TLS/protocol) use async I/O with
 //! a pair of frame-sized async copy loops; when both ends are plain `TcpStream`s
 //! (direct connections), the `splice` module relays them zero-copy via
-//! `splice(2)` with automatic fallback to the copy path.
+//! `splice(2)` with automatic fallback to the copy path. An unencrypted Vision
+//! carrier starts in the copy loops and may lend its socket to the same
+//! splice engine once both directions are Direct (`vision`).
 //!
 //! ## Architecture
 //!
@@ -14,13 +16,60 @@
 //! ```
 
 pub mod splice;
+#[cfg(feature = "rprx")]
+mod vision;
 
 #[cfg(test)]
 mod progress_tests;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing::{debug, warn};
+
+/// Relay a transparent client connection through a dialed proxy stream.
+///
+/// A direct dial yields a plain `TcpStream` and relays through `splice(2)`;
+/// an unencrypted Vision carrier copies until both directions are Direct and
+/// may then splice its socket. Every other wrapped stream uses the copy relay.
+/// All paths update the connection's live byte counters as data flows.
+pub async fn relay_proxy(
+    client: &mut TcpStream,
+    proxy: honk_outbound::ProxyStream,
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+    progress: RelayProgress,
+) -> anyhow::Result<RelayStats> {
+    let proxy = match proxy.into_tcp_stream() {
+        Ok(upstream) => {
+            return splice::relay_splice(
+                client,
+                upstream,
+                client_addr,
+                target_addr,
+                Some(progress),
+            )
+            .await;
+        }
+        Err(proxy) => proxy,
+    };
+    #[cfg(feature = "rprx")]
+    let proxy = match proxy.into_vision_splice() {
+        Ok(vision) => {
+            return vision::relay_vision(client, vision, client_addr, target_addr, progress).await;
+        }
+        Err(proxy) => proxy,
+    };
+    splice::relay_auto(
+        client,
+        proxy.stream,
+        client_addr,
+        target_addr,
+        Some(progress),
+    )
+    .await
+}
 
 /// Check whether a connection error is ignorable (normal connection closure).
 ///
@@ -144,6 +193,31 @@ impl<S> RelayIo<S> {
     }
 }
 
+/// Pairs the relay ends so client reads count as upload and proxy reads as
+/// download; only the proxy side reports the first upstream byte.
+fn relay_io_pair<S1, S2>(
+    client: S1,
+    proxy: S2,
+    progress: &RelayProgress,
+) -> (RelayIo<S1>, RelayIo<S2>) {
+    (
+        RelayIo::wrap(
+            client,
+            progress.upload.clone(),
+            None,
+            progress.on_transfer.clone(),
+            false,
+        ),
+        RelayIo::wrap(
+            proxy,
+            progress.download.clone(),
+            progress.first_response.clone(),
+            progress.on_transfer.clone(),
+            true,
+        ),
+    )
+}
+
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RelayIo<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -211,15 +285,55 @@ const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 // A saturated read fits one AnyTLS frame without a one-byte tail.
 const RELAY_BUF_SIZE: usize = u16::MAX as usize;
 
+/// Stops both copy directions where neither holds unwritten bytes, so the
+/// relay can hand the connection to another engine without cancelling a
+/// write.
+///
+/// A direction parks only at its read boundary and only while the other is
+/// suspended in a read, which drops nothing. Both copy futures run in one
+/// task, so the flags change only between their polls.
+struct Park<'a> {
+    /// The owner's own condition for handing over, on top of the read boundary.
+    gate: &'a (dyn Fn() -> bool + Sync),
+    waiting: [AtomicBool; 2],
+    taken: AtomicBool,
+}
+
+impl Park<'_> {
+    fn side(upload: bool) -> usize {
+        usize::from(!upload)
+    }
+
+    /// Claims the park for the direction at its read boundary.
+    fn take(&self, upload: bool) -> bool {
+        let claim = !self.taken()
+            && self.waiting[Self::side(!upload)].load(Ordering::Relaxed)
+            && (self.gate)();
+        if claim {
+            self.taken.store(true, Ordering::Relaxed);
+        }
+        claim
+    }
+
+    fn set_waiting(&self, upload: bool, waiting: bool) {
+        self.waiting[Self::side(upload)].store(waiting, Ordering::Relaxed);
+    }
+
+    fn taken(&self) -> bool {
+        self.taken.load(Ordering::Relaxed)
+    }
+}
+
 /// Copy one direction until EOF, then half-close the destination's write
 /// side (same contract as `copy_bidirectional`). Bytes read are counted
 /// into `progress` so the drain supervisor can tell a stalled survivor
-/// from an active one.
+/// from an active one. A taken `park` returns early without closing.
 async fn copy_way<R, W>(
     rd: &mut R,
     wr: &mut W,
     progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     upload: bool,
+    park: Option<&Park<'_>>,
 ) -> Result<u64, RelayError>
 where
     R: AsyncRead + Unpin,
@@ -234,6 +348,9 @@ where
     let mut buffer = vec![0; RELAY_BUF_SIZE];
     let mut n = 0;
     loop {
+        if park.is_some_and(|park| park.take(upload)) {
+            return Ok(n);
+        }
         let read = std::future::poll_fn(|cx| {
             use std::pin::Pin;
             use std::task::{Poll, ready};
@@ -241,11 +358,18 @@ where
             let mut chunk = tokio::io::ReadBuf::new(&mut buffer);
             match Pin::new(&mut rd).poll_read(cx, &mut chunk) {
                 Poll::Ready(result) => {
+                    if let Some(park) = park {
+                        park.set_waiting(upload, false);
+                    }
                     Poll::Ready(result.map(|()| chunk.filled().len()).map_err(read_error))
                 }
                 Poll::Pending => {
                     // copy_buf waits here without flushing buffered protocol writes.
-                    ready!(Pin::new(&mut *wr).poll_flush(cx)).map_err(write_error)?;
+                    let flushed = Pin::new(&mut *wr).poll_flush(cx);
+                    if let Some(park) = park {
+                        park.set_waiting(upload, matches!(flushed, Poll::Ready(Ok(()))));
+                    }
+                    ready!(flushed).map_err(write_error)?;
                     Poll::Pending
                 }
             }
@@ -315,37 +439,63 @@ where
 
     debug!("TCP relay started: {} → {}", client_addr, target_addr);
 
-    let (mut cr, mut cw) = tokio::io::split(&mut client);
-    let (mut pr, mut pw) = tokio::io::split(&mut proxy);
+    let result = copy_phase(&mut client, &mut proxy, None).await;
+    let _ = client.shutdown().await;
+    let _ = proxy.shutdown().await;
+    relay_outcome(result, start, client_addr, target_addr)
+}
+
+/// Copies both directions until they finish or, with an armed `park`, until
+/// one direction takes it. A parked phase shuts nothing down.
+async fn copy_phase<S1, S2>(
+    client: &mut S1,
+    proxy: &mut S2,
+    park: Option<&Park<'_>>,
+) -> Result<(u64, u64), RelayError>
+where
+    S1: AsyncRead + AsyncWrite + Send + Unpin,
+    S2: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let (mut cr, mut cw) = tokio::io::split(client);
+    let (mut pr, mut pw) = tokio::io::split(proxy);
     let c2p_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let p2c_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // Boxed so dropping them actually releases the stream borrows before
-    // the final shutdown calls.
-    let mut c2p = Box::pin(copy_way(&mut cr, &mut pw, c2p_progress.clone(), true));
-    let mut p2c = Box::pin(copy_way(&mut pr, &mut cw, p2c_progress.clone(), false));
+    let mut c2p = Box::pin(copy_way(&mut cr, &mut pw, c2p_progress.clone(), true, park));
+    let mut p2c = Box::pin(copy_way(
+        &mut pr,
+        &mut cw,
+        p2c_progress.clone(),
+        false,
+        park,
+    ));
+    let parked = || park.is_some_and(Park::taken);
 
     // The first direction to finish half-closes the other (inside
     // copy_way); the survivor then drains until its own EOF or until it
     // stalls for a full DRAIN_DEADLINE. An error in either direction
-    // cancels the whole relay, mirroring `copy_bidirectional`.
-    let result: Result<(u64, u64), RelayError> = tokio::select! {
+    // cancels the whole relay, mirroring `copy_bidirectional`. A parked
+    // direction left the other suspended in a read, so dropping it is safe.
+    tokio::select! {
         r = &mut c2p => match r {
             Err(e) => Err(e),
+            Ok(first_n) if parked() => Ok((first_n, p2c_progress.load(Ordering::Relaxed))),
             Ok(first_n) => drain_wait(&mut p2c, &p2c_progress).await.map(|second_n| (first_n, second_n)),
         },
         r = &mut p2c => match r {
             Err(e) => Err(e),
+            Ok(first_n) if parked() => Ok((c2p_progress.load(Ordering::Relaxed), first_n)),
             Ok(first_n) => drain_wait(&mut c2p, &c2p_progress).await.map(|second_n| (second_n, first_n)),
         },
-    };
-    drop(c2p);
-    drop(p2c);
+    }
+}
 
-    let _ = client.shutdown().await;
-    let _ = proxy.shutdown().await;
-
+fn relay_outcome(
+    result: Result<(u64, u64), RelayError>,
+    start: tokio::time::Instant,
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> anyhow::Result<RelayStats> {
     let duration_ms = start.elapsed().as_millis() as u64;
-
     match result {
         Ok((c2p_bytes, p2c_bytes)) => {
             let stats = RelayStats {
@@ -436,7 +586,7 @@ mod tests {
                 pending: false,
             };
             let progress = Arc::new(AtomicU64::new(0));
-            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress), true)
+            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress), true, None)
                 .await
                 .unwrap();
             assert_eq!(writer.bytes, payload);

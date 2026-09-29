@@ -63,10 +63,13 @@ fn is_unsupported_errno(err: &io::Error) -> bool {
 
 /// Outcome of a failed splice operation.
 #[derive(Debug)]
-enum SpliceError {
+pub(super) enum SpliceError {
     /// `splice(2)` is unsupported for these fds (EINVAL/ENOSYS/EXDEV on the
     /// capability probe, before any byte was moved).
     Unsupported,
+    /// The pipes could not be created, before any byte was moved; unlike
+    /// `Unsupported` this says nothing about later connections.
+    NoPipe(io::Error),
     /// A regular I/O error.
     Io(super::RelayError),
 }
@@ -78,6 +81,21 @@ impl SpliceError {
         } else {
             SpliceError::Io(super::RelayError::new(err, client_side))
         }
+    }
+
+    /// Verdicts reached before any byte moved leave both streams intact, so
+    /// the caller resumes on the copy relay. Only `Unsupported` disables
+    /// splice for later connections.
+    pub(super) fn into_fallback(self) -> Result<(), super::RelayError> {
+        match self {
+            SpliceError::Unsupported => {
+                SPLICE_UNSUPPORTED.store(true, Ordering::Relaxed);
+                debug!("splice(2) unsupported on this host; falling back to copy relay");
+            }
+            SpliceError::NoPipe(error) => debug!("splice pipes unavailable ({error}); copying"),
+            SpliceError::Io(error) => return Err(error),
+        }
+        Ok(())
     }
 }
 
@@ -112,6 +130,10 @@ struct Pipe {
 
 impl Pipe {
     fn new() -> io::Result<Self> {
+        #[cfg(test)]
+        if test_hook::pipes_fail() {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
         let (read, write) =
             nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC)
                 .map_err(io::Error::from)?;
@@ -253,15 +275,13 @@ pub(crate) const DRAIN_DEADLINE: std::time::Duration = if cfg!(test) {
 };
 
 /// Shared engine behind [`splice_bidirectional`] and [`relay_splice`].
-async fn run(
+pub(super) async fn run(
     client: &TcpStream,
     upstream: &TcpStream,
     progress: super::OptionalRelayProgress,
 ) -> Result<(u64, u64), SpliceError> {
-    let pipe_c2p =
-        Pipe::new().map_err(|error| SpliceError::Io(super::RelayError::new(error, false)))?;
-    let pipe_p2c =
-        Pipe::new().map_err(|error| SpliceError::Io(super::RelayError::new(error, false)))?;
+    let pipe_c2p = Pipe::new().map_err(SpliceError::NoPipe)?;
+    let pipe_p2c = Pipe::new().map_err(SpliceError::NoPipe)?;
 
     // The probes run before any byte reaches a destination socket, so an
     // `Unsupported` verdict here still allows a lossless copy fallback.
@@ -355,6 +375,7 @@ pub async fn splice_bidirectional(
             io::ErrorKind::Unsupported,
             "splice(2) not supported for these sockets",
         )),
+        Err(SpliceError::NoPipe(error)) => Err(error),
         Err(SpliceError::Io(e)) => Err(e.error),
     }
 }
@@ -401,25 +422,20 @@ pub async fn relay_splice(
             );
             Ok(stats)
         }
-        Err(SpliceError::Unsupported) => {
-            SPLICE_UNSUPPORTED.store(true, Ordering::Relaxed);
-            debug!(
-                "splice(2) unsupported on this host; falling back to copy relay for {} → {}",
-                client_addr, target_addr
-            );
-            relay_auto(client, upstream, client_addr, target_addr, progress).await
-        }
-        Err(SpliceError::Io(e)) => {
-            shutdown_write(client);
-            shutdown_write(&upstream);
-            if !is_ignorable_connection_error(&e.error) {
-                warn!(
-                    "TCP splice relay error for {} → {}: {}",
-                    client_addr, target_addr, e.error
-                );
+        Err(error) => match error.into_fallback() {
+            Ok(()) => relay_auto(client, upstream, client_addr, target_addr, progress).await,
+            Err(e) => {
+                shutdown_write(client);
+                shutdown_write(&upstream);
+                if !is_ignorable_connection_error(&e.error) {
+                    warn!(
+                        "TCP splice relay error for {} → {}: {}",
+                        client_addr, target_addr, e.error
+                    );
+                }
+                Err(e.into_anyhow())
             }
-            Err(e.into_anyhow())
-        }
+        },
     }
 }
 
@@ -443,26 +459,8 @@ where
 {
     match progress {
         Some(progress) => {
-            let first_response = progress.first_response.clone();
-            relay_tcp(
-                super::RelayIo::wrap(
-                    client,
-                    progress.upload,
-                    None,
-                    progress.on_transfer.clone(),
-                    false,
-                ),
-                super::RelayIo::wrap(
-                    proxy,
-                    progress.download,
-                    first_response,
-                    progress.on_transfer,
-                    true,
-                ),
-                client_addr,
-                target_addr,
-            )
-            .await
+            let (client, proxy) = super::relay_io_pair(client, proxy, &progress);
+            relay_tcp(client, proxy, client_addr, target_addr).await
         }
         None => relay_tcp(client, proxy, client_addr, target_addr).await,
     }
@@ -470,8 +468,28 @@ where
 
 /// Deterministic capability and partial-write failures around real splice I/O.
 #[cfg(test)]
-mod test_hook {
-    use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicUsize, Ordering};
+pub(super) mod test_hook {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
+
+    /// The hooks are process-global, so every test driving `run()` holds
+    /// this lock.
+    pub static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Resets global splice state even when a test panics.
+    pub struct StateGuard;
+
+    impl StateGuard {
+        pub fn new() -> Self {
+            reset();
+            StateGuard
+        }
+    }
+
+    impl Drop for StateGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
 
     /// When non-zero, `probe()` fails with this errno instead of splicing.
     static FORCED_PROBE_ERRNO: AtomicI32 = AtomicI32::new(0);
@@ -481,6 +499,15 @@ mod test_hook {
     static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static WRITE_REMAINING: AtomicIsize = AtomicIsize::new(-1);
     static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+    static PIPES_FAIL: AtomicBool = AtomicBool::new(false);
+
+    pub fn fail_pipes() {
+        PIPES_FAIL.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pipes_fail() -> bool {
+        PIPES_FAIL.load(Ordering::Relaxed)
+    }
 
     pub fn fail_write_after(fd: i32, bytes: isize) {
         WRITE_REMAINING.store(bytes, Ordering::Relaxed);
@@ -531,6 +558,7 @@ mod test_hook {
         PROBE_CALLS.store(0, Ordering::Relaxed);
         WRITE_REMAINING.store(-1, Ordering::Relaxed);
         WRITE_FD.store(-1, Ordering::Relaxed);
+        PIPES_FAIL.store(false, Ordering::Relaxed);
         super::SPLICE_UNSUPPORTED.store(false, Ordering::Relaxed);
     }
 }
