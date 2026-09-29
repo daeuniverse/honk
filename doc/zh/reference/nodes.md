@@ -186,10 +186,10 @@ VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不
 
 VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。未加密 Vision 的 direct-copy 路径是使用 TLS 1.3 或 REALITY 的裸 TCP，而不是 WS/gRPC；加密 Vision 遵循下文的组合规则。
 
-Vision 两个方向都会 padding。上传在内层 TLS 握手完成前保持 padding；内层会话为
-TLS 1.3 且 cipher 可用于 Direct 时，未启用 Encryption 的 TLS/REALITY carrier
-把上传切换到 raw TCP，启用 VLESS Encryption 时只移除 AEAD framing。两个方向
-各自独立切换。参见
+Vision 添加上行 padding 并移除下行 padding。上行 Direct 要求在第一个完整的
+application-data record 前已观察到符合条件的 TLS 1.3 ServerHello；early data
+或检查预算耗尽但仍未决定时，会改用 End 结束 padding 并保留 outer transport。
+两个方向各自独立切换。参见
 [Vision 支持边界](../design/outbound.md)。
 
 ### Shadowrocket VLESS

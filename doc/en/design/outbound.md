@@ -666,7 +666,10 @@ its first frame. A ClientHello keeps it until the first complete
 application-data record ends; that frame carries Direct when the downstream
 ServerHello chose TLS 1.3 with a cipher Xray accepts (0x1301–0x1304) and the
 codec has a direct writer, otherwise End. A 64 KiB inspection budget per
-direction bounds the observation.
+direction is checked after each frame or read.
+Early application data without an observed eligible ServerHello, or inspection
+budget expiry before an application-record decision, ends padding with End and
+retains the selected outer transport for the rest of the uplink.
 
 After an uplink Direct frame has left the outer codec and been flushed, uploads
 bypass it. On TLS/REALITY the SSL write half is marked closed without sending

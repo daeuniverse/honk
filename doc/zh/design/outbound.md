@@ -589,7 +589,10 @@ padding 逐帧填充。padding 何时结束由内层 TLS 判断决定，依据�
 ClientHello 时，padding 持续到第一个完整 application-data record 结束；若下行
 ServerHello 选择了 TLS 1.3 且 cipher 属于 Xray 接受的范围（0x1301–0x1304），
 并且 codec 具备 direct writer，该帧携带 Direct，否则携带 End。每个方向的检查
-以 64 KiB 为上限。
+预算为 64 KiB，在每帧或每次 read 后检查。
+在已观察到符合条件的 ServerHello 前出现 early application data，或检查预算
+在 application-record 决定前耗尽时，会改用 End 结束 padding，并在后续上行中
+保留所选 outer transport。
 
 上行 Direct 帧离开 outer codec 并 flush 之后，上传绕过该 codec。在 TLS/REALITY
 上，SSL 写半部被标记为关闭但不发送任何数据，因此之后的 fatal alert 或 KeyUpdate
