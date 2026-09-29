@@ -88,6 +88,9 @@ jobs:
               - 'crates/honk-core/src/ebpf/**'
               - 'crates/honk-core/src/control/routing_matcher/**'
               - 'crates/honk-core/src/control/routing_matcher.rs'
+              - 'crates/honk-core/src/routing/**'
+              - 'crates/honk-config/src/routing.rs'
+              - 'crates/honk-config/src/parser/routing.rs'
               - 'crates/honk-core/build.rs'
               - 'crates/honk-core/tests/**'
               - 'crates/honk-outbound/src/util.rs'
@@ -394,6 +397,10 @@ jobs:
           mkdir -p target/ci-report
           cargo nextest list --workspace --profile ci --message-format json \
             > target/ci-report/nextest-list.json
+      # Named first so a PR shows rule-matching failures on their own; the
+      # root-gated kernel half runs in the ebpf lane from the same tables.
+      - name: Routing rule-matching goldens
+        run: cargo nextest run -p honk-core --lib --profile ci --no-tests=fail -E 'test(/^routing::golden::/)'
       - run: cargo nextest run --workspace --profile ci
       - name: Upload workspace JUnit
         if: failure()
