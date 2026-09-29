@@ -85,6 +85,43 @@ impl ObservedTcp {
             self.pressure.observe(&self.inner);
         }
     }
+
+    /// Lends the socket to a relay that bypasses this wrapper's I/O while
+    /// keeping its pressure sampler attached to the same carrier.
+    #[cfg(feature = "rprx")]
+    pub(crate) fn raw_parts(&mut self) -> (&TcpStream, RawObserver<'_>) {
+        let Self {
+            inner,
+            pressure,
+            active,
+        } = self;
+        (
+            inner,
+            RawObserver {
+                socket: inner,
+                pressure,
+                active: *active,
+            },
+        )
+    }
+}
+
+/// Pressure sampling for I/O performed directly on a lent [`ObservedTcp`] socket.
+#[cfg(feature = "rprx")]
+pub struct RawObserver<'a> {
+    socket: &'a TcpStream,
+    pressure: &'a mut TcpPressure,
+    active: bool,
+}
+
+#[cfg(feature = "rprx")]
+impl RawObserver<'_> {
+    /// Call after the lent socket made progress; sampling keeps its one-second gate.
+    pub fn observe(&mut self) {
+        if self.active {
+            self.pressure.observe(self.socket);
+        }
+    }
 }
 
 impl AsyncRead for ObservedTcp {

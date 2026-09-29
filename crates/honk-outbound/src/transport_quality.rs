@@ -8,6 +8,9 @@ use parking_lot::Mutex;
 
 pub(crate) mod tcp;
 
+#[cfg(feature = "rprx")]
+pub use tcp::RawObserver;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressureReason {
     Rtt,

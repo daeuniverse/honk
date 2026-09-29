@@ -219,6 +219,109 @@ async fn direct_random_xor_continues_across_partial_headers() {
     assert_eq!(output, plaintext);
 }
 
+struct DirectWriter<'a>(&'a mut EncryptedStream);
+
+impl AsyncWrite for DirectWriter<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().0.poll_direct_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+fn ready_stream(inner: tokio::io::DuplexStream, send_xor: Option<AesCtr>) -> EncryptedStream {
+    let key = vec![23_u8; 96];
+    EncryptedStream::new(
+        Box::new(inner),
+        key.clone(),
+        true,
+        StreamAead::new(b"client", &key, true).unwrap(),
+        Some(StreamAead::new(b"server", &key, true).unwrap()),
+        send_xor,
+        None,
+        None,
+        PeerInit::Ready,
+        None,
+        false,
+    )
+}
+
+#[tokio::test]
+async fn native_direct_write_passes_bytes_through_unframed() {
+    let (client_io, mut server_io) = tokio::io::duplex(4096);
+    let mut stream = ready_stream(client_io, None);
+    DirectWriter(&mut stream)
+        .write_all(b"raw-inner-tls")
+        .await
+        .unwrap();
+    DirectWriter(&mut stream).shutdown().await.unwrap();
+    let mut received = Vec::new();
+    server_io.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, b"raw-inner-tls");
+    assert_eq!(stream.direct_wire.capacity(), 0);
+}
+
+/// Xray `XorConn.Write` skips any body whose plaintext header starts
+/// 23,3,3 — even an invalid length — and skips nothing after other types.
+#[tokio::test]
+async fn random_direct_write_xors_headers_exactly_once_across_partial_writes() {
+    let key = vec![17_u8; 96];
+    let iv = [29_u8; IV_LEN];
+    let mut plaintext = vec![23, 3, 3, 0, 5];
+    plaintext.extend_from_slice(b"short");
+    plaintext.extend_from_slice(&[23, 3, 3, 0, 17]);
+    plaintext.extend_from_slice(&[0x42; 17]);
+    plaintext.extend_from_slice(&[22, 3, 3, 0, 3]);
+    plaintext.extend_from_slice(&[23, 3, 3, 0, 0]);
+    let mut expected = plaintext.clone();
+    let mut oracle = AesCtr::new(&key, &iv);
+    for range in [0..5, 10..15, 32..37, 37..42] {
+        oracle.apply(&mut expected[range]);
+    }
+
+    // A 3-byte pipe makes the outer writer accept short writes and return
+    // Pending, so every caller retry goes through the pending-wire resend.
+    let (client_io, mut server_io) = tokio::io::duplex(3);
+    let mut stream = ready_stream(client_io, Some(AesCtr::new(&key, &iv)));
+    let write = async {
+        for chunk in plaintext.chunks(7) {
+            DirectWriter(&mut stream).write_all(chunk).await.unwrap();
+        }
+        DirectWriter(&mut stream).shutdown().await.unwrap();
+    };
+    let mut received = Vec::new();
+    let read = server_io.read_to_end(&mut received);
+    let ((), read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(write, read)
+    })
+    .await
+    .expect("Direct write must finish every resend");
+    read.unwrap();
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
+async fn direct_write_refuses_before_the_first_frame() {
+    let (client_io, _server_io) = tokio::io::duplex(4096);
+    let mut stream = ready_stream(client_io, None);
+    stream.prewrite = Some(b"0-rtt-prologue".to_vec());
+    let error = DirectWriter(&mut stream)
+        .write_all(b"raw")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
 #[tokio::test]
 #[ignore = "requires HONK_VLESS_ENCRYPTION_SERVER and an Xray VLESS Encryption server"]
 async fn xray_interop_covers_1rtt_then_0rtt() {

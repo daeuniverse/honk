@@ -1,10 +1,10 @@
 use honk_config::node::Node;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use super::{CMD_TCP, ResponseHeaderStrip, VLessHandler, VisionStream};
+use super::stream::start;
+use super::{CMD_TCP, VLessHandler};
 use crate::proxy::{AsyncReadWrite, ProxyStream};
 
 impl VLessHandler {
@@ -12,18 +12,20 @@ impl VLessHandler {
     /// concrete `EncryptedStream` through response and Vision wrapping so
     /// Direct bypasses only AEAD while its boxed outer transport stays intact.
     /// Unencrypted raw TCP/TLS keeps its concrete type for the existing raw switch.
-    async fn dial_stream(
+    async fn dial_carrier(
         &self,
         node: &Node,
         uuid: [u8; 16],
+        header: Vec<u8>,
         tcp: Option<TcpStream>,
         connect_timeout: std::time::Duration,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let vless = node.vless().unwrap();
+        let vision = vless.is_vision().then_some(uuid);
         let encryption = self.encryption_config(node)?;
         if encryption.is_none()
-            && vless.is_vision()
+            && vision.is_some()
             && matches!(vless.transport.transport.as_str(), "" | "tcp")
         {
             let stream: Box<dyn AsyncReadWrite> =
@@ -34,7 +36,7 @@ impl VLessHandler {
                         if tls.ssl().version2() != Some(boring::ssl::SslVersion::TLS1_3) {
                             anyhow::bail!("VLESS Vision requires negotiated TLS 1.3");
                         }
-                        Box::new(VisionStream::new(ResponseHeaderStrip::new(tls), uuid))
+                        start(tls, &header, vision).await?
                     }
                     crate::proxy::transport::MaybeTls::Plain(_) => {
                         anyhow::bail!("unencrypted VLESS Vision requires TLS or REALITY");
@@ -59,45 +61,9 @@ impl VLessHandler {
         };
         let stream = crate::proxy::transport::wrap_after_tls(node, stream).await?;
         if let Some(config) = encryption {
-            let encrypted = config.connect(stream).await?;
-            let stripped = ResponseHeaderStrip::new(encrypted);
-            return if vless.is_vision() {
-                Ok(Box::new(VisionStream::new(stripped, uuid)))
-            } else {
-                Ok(Box::new(stripped))
-            };
+            return Ok(start(config.connect(stream).await?, &header, vision).await?);
         }
-        Ok(Self::wrap_response_stream(node, uuid, stream))
-    }
-
-    fn wrap_response_stream(
-        node: &Node,
-        uuid: [u8; 16],
-        stream: Box<dyn AsyncReadWrite>,
-    ) -> Box<dyn AsyncReadWrite> {
-        let stripped = ResponseHeaderStrip::new(stream);
-        if node.vless().unwrap().is_vision() {
-            Box::new(VisionStream::new(stripped, uuid))
-        } else {
-            Box::new(stripped)
-        }
-    }
-
-    async fn dial_carrier(
-        &self,
-        node: &Node,
-        uuid: [u8; 16],
-        header: Vec<u8>,
-        tcp: Option<TcpStream>,
-        connect_timeout: std::time::Duration,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let mut stream = self
-            .dial_stream(node, uuid, tcp, connect_timeout, permit)
-            .await?;
-        stream.write_all(&header).await?;
-        stream.flush().await?;
-        Ok(stream)
+        Ok(start(stream, &header, vision).await?)
     }
 
     pub(super) async fn dial_base(

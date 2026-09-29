@@ -45,9 +45,11 @@ use super::cool::VlessXudpTransport;
 use super::{cool, mux};
 #[cfg(test)]
 use crate::proxy::{PacketRejection, ProxyRegistry, WarmOutcome, is_packet_rejection, uot};
+pub use stream::VisionSplice;
 #[cfg(test)]
-use stream::{DirectRead, VISION_COMMAND_DIRECT, VISION_COMMAND_END};
-use stream::{ResponseHeaderStrip, VisionStream};
+use stream::{
+    DirectIo, ResponseHeaderStrip, VISION_COMMAND_DIRECT, VISION_COMMAND_END, VisionStream,
+};
 
 use async_trait::async_trait;
 use honk_config::node::{Node, VlessTcpPath, VlessUdpPath};

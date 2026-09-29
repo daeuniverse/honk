@@ -1,22 +1,33 @@
-//! Lazy VLESS response-header stripping and XTLS Vision response unpadding.
+//! Lazy VLESS response-header stripping and XTLS Vision framing.
 
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, ready};
 
+use crate::transport_quality::RawObserver;
 use crate::transport_quality::tcp::ObservedTcp;
-use bytes::{Buf, BytesMut};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use bytes::{Buf, BufMut, BytesMut};
+use rand::RngExt as _;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::TcpStream;
 
 use super::super::encryption::EncryptedStream;
-use crate::proxy::AsyncReadWrite;
+use crate::proxy::{AsyncReadWrite, ProxyStream};
 
-/// A read path a Vision Direct command may select without changing writes.
+mod tls;
+use tls::{InnerTls, Terminal};
+
+/// Paths a Vision Direct command selects for one direction.
 ///
-/// `None` keeps reading the ordinary outer stream. The concrete TLS impl below
-/// preserves the unencrypted Vision raw-TCP switch. EncryptedStream instead
-/// bypasses only AEAD and continues reading its ordinary boxed outer stream.
-pub(super) trait DirectRead {
+/// Reads return `None` to keep the ordinary outer stream. The concrete TLS
+/// impl switches to the raw TCP socket under the TLS session. EncryptedStream
+/// bypasses only AEAD and keeps its ordinary boxed outer stream.
+pub(super) trait DirectIo {
+    /// Without Direct writes the uplink ends padding with End, never Direct.
+    const DIRECT_WRITE: bool = false;
+
     fn poll_direct_read(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -24,9 +35,33 @@ pub(super) trait DirectRead {
     ) -> Option<Poll<io::Result<()>>> {
         None
     }
+
+    fn poll_direct_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(no_direct_writer()))
+    }
+
+    fn poll_direct_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(no_direct_writer()))
+    }
+
+    /// Keeps the outer codec from emitting anything once the uplink is Direct.
+    fn seal_outer_write(&mut self) {}
+
+    /// Plaintext the outer codec decoded ahead of the raw stream.
+    fn has_buffered_input(&self) -> bool {
+        false
+    }
 }
 
-impl DirectRead for ObservedTcp {
+fn no_direct_writer() -> io::Error {
+    io::Error::other("Vision Direct write without a direct writer")
+}
+
+impl DirectIo for ObservedTcp {
     fn poll_direct_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -36,18 +71,57 @@ impl DirectRead for ObservedTcp {
     }
 }
 
-impl DirectRead for tokio_boring::SslStream<ObservedTcp> {
+impl DirectIo for tokio_boring::SslStream<ObservedTcp> {
+    const DIRECT_WRITE: bool = true;
+
     fn poll_direct_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Option<Poll<io::Result<()>>> {
+        if self.has_buffered_input() {
+            return Some(AsyncRead::poll_read(self, cx, buf));
+        }
         Some(Pin::new(self.get_mut().get_mut()).poll_read(cx, buf))
+    }
+
+    fn poll_direct_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().get_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_direct_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().get_mut()).poll_shutdown(cx)
+    }
+
+    // Reads may still dispatch a fatal alert or flush a queued KeyUpdate
+    // acknowledgement; marking the write half closed makes BoringSSL drop
+    // both instead of writing a TLS record into the raw uplink. It sends no
+    // close_notify and leaves the read half working.
+    fn seal_outer_write(&mut self) {
+        use foreign_types::ForeignTypeRef as _;
+
+        let ssl = self.ssl_mut().as_ptr();
+        unsafe {
+            boring_sys::SSL_set_shutdown(
+                ssl,
+                boring_sys::SSL_get_shutdown(ssl) | boring_sys::SSL_SENT_SHUTDOWN,
+            );
+        }
+    }
+
+    fn has_buffered_input(&self) -> bool {
+        self.ssl().pending() > 0
     }
 }
 
 // Do not delegate into the boxed inner transport: Encryption Direct retains it.
-impl DirectRead for EncryptedStream {
+impl DirectIo for EncryptedStream {
+    const DIRECT_WRITE: bool = true;
+
     fn poll_direct_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -55,19 +129,25 @@ impl DirectRead for EncryptedStream {
     ) -> Option<Poll<io::Result<()>>> {
         Some(self.get_mut().poll_direct_read(cx, buf))
     }
-}
 
-impl DirectRead for Box<dyn AsyncReadWrite> {}
-
-impl<T: DirectRead + Unpin + ?Sized> DirectRead for Box<T> {
-    fn poll_direct_read(
+    fn poll_direct_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Option<Poll<io::Result<()>>> {
-        Pin::new(&mut **self.get_mut()).poll_direct_read(cx, buf)
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().poll_direct_write(cx, buf)
+    }
+
+    fn poll_direct_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_shutdown(self, cx)
+    }
+
+    fn has_buffered_input(&self) -> bool {
+        self.has_buffered_plaintext()
     }
 }
+
+impl DirectIo for Box<dyn AsyncReadWrite> {}
 
 /// Real servers emit the response prefix with the target's first downstream
 /// bytes. Stripping it on the first read avoids deadlocking targets that wait
@@ -179,7 +259,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ResponseHeaderStrip<S> {
     }
 }
 
-impl<S: DirectRead + Unpin> DirectRead for ResponseHeaderStrip<S> {
+impl<S: DirectIo + Unpin> DirectIo for ResponseHeaderStrip<S> {
+    const DIRECT_WRITE: bool = S::DIRECT_WRITE;
+
     fn poll_direct_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -187,13 +269,34 @@ impl<S: DirectRead + Unpin> DirectRead for ResponseHeaderStrip<S> {
     ) -> Option<Poll<io::Result<()>>> {
         Pin::new(&mut self.get_mut().inner).poll_direct_read(cx, buf)
     }
+
+    fn poll_direct_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_direct_write(cx, buf)
+    }
+
+    fn poll_direct_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_direct_shutdown(cx)
+    }
+
+    fn seal_outer_write(&mut self) {
+        self.inner.seal_outer_write();
+    }
+
+    fn has_buffered_input(&self) -> bool {
+        self.inner.has_buffered_input()
+    }
 }
 
-/// XTLS Vision response-side unpadding.
+/// XTLS Vision framing in both directions.
 ///
-/// A Direct command changes only the read path. Bytes already accepted through
-/// Vision and the selected outer codec are returned before the direct reader;
-/// writes continue through every original wrapper.
+/// Each direction switches independently: a downstream Direct command
+/// changes only reads, and this side's own End or Direct frame changes only
+/// writes. Bytes already accepted through Vision and the outer codec always
+/// leave before the switched path carries anything.
 #[derive(Debug)]
 pub(super) struct VisionStream<S> {
     inner: S,
@@ -201,6 +304,10 @@ pub(super) struct VisionStream<S> {
     inbox: BytesMut,
     state: VisionState,
     inner_eof: bool,
+    tls: InnerTls,
+    write: WriteState,
+    /// Accepted uplink frame bytes the outer codec has not taken yet.
+    outbox: BytesMut,
 }
 
 #[derive(Debug)]
@@ -216,10 +323,80 @@ enum VisionState {
     Failed,
 }
 
-pub(super) const VISION_COMMAND_END: u8 = 1;
-pub(super) const VISION_COMMAND_DIRECT: u8 = 2;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteState {
+    Padding,
+    /// The terminal frame is queued; the switch happens once it has left.
+    Draining {
+        direct: bool,
+    },
+    Outer,
+    Direct,
+}
+
+pub(super) const VISION_COMMAND_END: u8 = Terminal::End as u8;
+pub(super) const VISION_COMMAND_DIRECT: u8 = Terminal::Direct as u8;
+/// UUID, command and both length fields, as Xray budgets its 8 KiB buffer.
+const FRAME_OVERHEAD: usize = 21;
+const FRAME_LIMIT: usize = 8192;
+
+/// Sends the VLESS request before the carrier is handed out, so its failures
+/// and deadline stay inside the dial, then wraps `inner` for the response.
+/// A Vision flow adds its first frame to the same write.
+pub(super) async fn start<S>(
+    mut inner: S,
+    header: &[u8],
+    vision: Option<[u8; 16]>,
+) -> io::Result<Box<dyn AsyncReadWrite>>
+where
+    S: AsyncReadWrite + DirectIo + 'static,
+{
+    let Some(uuid) = vision else {
+        inner.write_all(header).await?;
+        inner.flush().await?;
+        return Ok(Box::new(ResponseHeaderStrip::new(inner)));
+    };
+    inner.write_all(&vision_request(header, uuid)).await?;
+    inner.flush().await?;
+    Ok(Box::new(VisionStream::new(
+        ResponseHeaderStrip::new(inner),
+        uuid,
+    )))
+}
+
+/// The VLESS request followed by Vision's first frame.
+///
+/// Xray's client sends an empty long-padded frame when no payload is ready,
+/// so the request length never appears on its own.
+fn vision_request(header: &[u8], uuid: [u8; 16]) -> BytesMut {
+    // An empty long-padded frame is at most 5 + 1399 bytes.
+    let mut request = BytesMut::with_capacity(header.len() + uuid.len() + 1404);
+    request.extend_from_slice(header);
+    request.extend_from_slice(&uuid);
+    encode_frame(&mut request, Terminal::Continue, &[], true);
+    request
+}
+
+/// Appends one Vision frame with Xray's default `testseed` padding.
+fn encode_frame(out: &mut BytesMut, terminal: Terminal, content: &[u8], long_padding: bool) {
+    let mut rng = rand::rng();
+    let padding = if long_padding && content.len() < 900 {
+        rng.random_range(0..500) + 900 - content.len()
+    } else {
+        rng.random_range(0..256)
+    }
+    .min(FRAME_LIMIT - FRAME_OVERHEAD - content.len());
+    out.reserve(5 + content.len() + padding);
+    out.put_u8(terminal as u8);
+    out.put_u16(content.len() as u16);
+    out.put_u16(padding as u16);
+    out.put_slice(content);
+    out.resize(out.len() + padding, 0);
+}
 
 impl<S> VisionStream<S> {
+    /// Wraps a stream for Vision framing. [`start`] writes the request and
+    /// first Vision frame, including the UUID prefix, before calling this.
     pub(super) fn new(inner: S, uuid: [u8; 16]) -> Self {
         Self {
             inner,
@@ -227,12 +404,126 @@ impl<S> VisionStream<S> {
             inbox: BytesMut::new(),
             state: VisionState::Detect,
             inner_eof: false,
+            tls: InnerTls::default(),
+            write: WriteState::Padding,
+            outbox: BytesMut::new(),
         }
     }
 }
 
-impl<S: AsyncRead + DirectRead + Unpin> AsyncRead for VisionStream<S> {
+impl<S: DirectIo> VisionStream<S> {
+    /// Both directions are Direct and nothing waits in Vision or the codec,
+    /// so the raw socket alone carries the rest of the connection.
+    fn raw_ready(&self) -> bool {
+        self.write == WriteState::Direct
+            && matches!(self.state, VisionState::Direct)
+            && self.inbox.is_empty()
+            && !self.inner_eof
+            && !self.inner.has_buffered_input()
+    }
+}
+
+impl<S: AsyncWrite + DirectIo + Unpin> VisionStream<S> {
+    /// Hands queued frame bytes to the outer codec, then completes a pending
+    /// End or Direct switch.
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.outbox.is_empty() {
+            let written = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.outbox))?;
+            if written == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.outbox.advance(written);
+        }
+        let WriteState::Draining { direct } = self.write else {
+            return Poll::Ready(Ok(()));
+        };
+        if direct {
+            // The peer switches its reader after this frame: every outer
+            // byte must precede the first raw one.
+            ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+            self.inner.seal_outer_write();
+            self.write = WriteState::Direct;
+        } else {
+            self.write = WriteState::Outer;
+        }
+        self.outbox = BytesMut::new();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + DirectIo + Unpin> AsyncWrite for VisionStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        ready!(this.poll_drain(cx))?;
+        match this.write {
+            WriteState::Outer => Pin::new(&mut this.inner).poll_write(cx, buf),
+            WriteState::Direct => Pin::new(&mut this.inner).poll_direct_write(cx, buf),
+            WriteState::Padding | WriteState::Draining { .. } if buf.is_empty() => {
+                Poll::Ready(Ok(0))
+            }
+            WriteState::Padding | WriteState::Draining { .. } => {
+                let frame = this.tls.plan_uplink(buf, S::DIRECT_WRITE);
+                encode_frame(
+                    &mut this.outbox,
+                    frame.terminal,
+                    &buf[..frame.take],
+                    frame.long_padding,
+                );
+                if frame.terminal != Terminal::Continue {
+                    this.write = WriteState::Draining {
+                        direct: frame.terminal == Terminal::Direct,
+                    };
+                }
+                // The frame is accepted either way; a Pending drain resumes
+                // on the next write or flush.
+                if let Poll::Ready(Err(error)) = this.poll_drain(cx) {
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Ok(frame.take))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_drain(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_drain(cx))?;
+        match this.write {
+            // The outer session no longer owns the uplink: close_notify
+            // would reach the target as payload.
+            WriteState::Direct => Pin::new(&mut this.inner).poll_direct_shutdown(cx),
+            _ => Pin::new(&mut this.inner).poll_shutdown(cx),
+        }
+    }
+}
+
+impl<S: AsyncRead + DirectIo + Unpin> AsyncRead for VisionStream<S> {
     fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let start = buf.filled().len();
+        let poll = Pin::new(&mut *this).poll_unpadded(cx, buf);
+        if let Poll::Ready(Ok(())) = poll {
+            this.tls.observe_downlink(&buf.filled()[start..]);
+        }
+        poll
+    }
+}
+
+impl<S: AsyncRead + DirectIo + Unpin> VisionStream<S> {
+    fn poll_unpadded(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
@@ -434,21 +725,99 @@ impl<S: AsyncRead + DirectRead + Unpin> AsyncRead for VisionStream<S> {
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
+type VisionTls = VisionStream<ResponseHeaderStrip<crate::tls::TlsStream<ObservedTcp>>>;
+
+/// An unencrypted Vision TLS/REALITY carrier whose TCP socket a relay may
+/// borrow once both directions are Direct.
+///
+/// The whole Vision and TLS stack stays owned here while the socket is lent,
+/// so a relay that cannot splice resumes through the same stream.
+#[derive(Debug)]
+pub struct VisionSplice {
+    stream: Box<VisionTls>,
+    ready: Arc<AtomicBool>,
+}
+
+impl ProxyStream {
+    /// Returns the carrier as a [`VisionSplice`] when it is an unencrypted
+    /// Vision TLS/REALITY stream owned by nothing else.
+    pub fn into_vision_splice(self) -> Result<VisionSplice, Self> {
+        // Vtable dispatch required — see `into_tcp_stream`.
+        if !(*self.stream).as_any().is::<VisionTls>() {
+            return Err(self);
+        }
+        let stream = self
+            .stream
+            .into_any()
+            .downcast::<VisionTls>()
+            .expect("Vision carrier type checked above");
+        Ok(VisionSplice {
+            stream,
+            ready: Arc::default(),
+        })
+    }
+}
+
+impl VisionSplice {
+    /// Set after every I/O call that leaves [`Self::raw_parts`] available.
+    pub fn ready_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.ready)
+    }
+
+    /// Lends the raw socket and its pressure sampler while nothing is
+    /// buffered above it in either direction. Vision must not be polled
+    /// until the borrow ends.
+    pub fn raw_parts(&mut self) -> Option<(&TcpStream, RawObserver<'_>)> {
+        if !self.stream.raw_ready() {
+            return None;
+        }
+        Some(self.stream.inner.inner.get_mut().raw_parts())
+    }
+
+    /// Which directions have switched to Direct: `(uplink, downlink)`.
+    #[cfg(test)]
+    pub(in crate::proxy::vless) fn direct_state(&self) -> (bool, bool) {
+        (
+            self.stream.write == WriteState::Direct,
+            matches!(self.stream.state, VisionState::Direct),
+        )
+    }
+
+    fn publish<T>(&self, poll: Poll<T>) -> Poll<T> {
+        self.ready.store(self.stream.raw_ready(), Ordering::Relaxed);
+        poll
+    }
+}
+
+impl AsyncRead for VisionSplice {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut *self.stream).poll_read(cx, buf);
+        self.publish(poll)
+    }
+}
+
+impl AsyncWrite for VisionSplice {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let poll = Pin::new(&mut *self.stream).poll_write(cx, buf);
+        self.publish(poll)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let poll = Pin::new(&mut *self.stream).poll_flush(cx);
+        self.publish(poll)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let poll = Pin::new(&mut *self.stream).poll_shutdown(cx);
+        self.publish(poll)
     }
 }
 
@@ -486,7 +855,7 @@ mod tests {
         }
     }
 
-    impl DirectRead for SplitDirectReader {
+    impl DirectIo for SplitDirectReader {
         fn poll_direct_read(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,

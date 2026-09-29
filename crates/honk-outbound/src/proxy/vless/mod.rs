@@ -10,4 +10,4 @@ pub(crate) mod mux;
 #[cfg(feature = "rprx")]
 pub use cool::{VlessXudpTransport, is_vless_source_post_admission_cancel};
 #[cfg(feature = "rprx")]
-pub use handler::VLessHandler;
+pub use handler::{VLessHandler, VisionSplice};

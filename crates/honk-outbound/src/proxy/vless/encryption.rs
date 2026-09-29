@@ -682,9 +682,11 @@ pub(crate) struct EncryptedStream {
     read_plaintext_offset: usize,
     read_eof: bool,
     direct_read: bool,
-    direct_xor_header: [u8; FRAME_HEADER_LEN],
-    direct_xor_header_len: usize,
-    direct_xor_skip: usize,
+    recv_header_xor: direct::HeaderXor,
+    direct_write: bool,
+    send_header_xor: direct::HeaderXor,
+    /// Reused random-mode Direct wire buffer; native modes never allocate it.
+    direct_wire: Vec<u8>,
     ticket_use: Option<TicketUse>,
 }
 
@@ -727,9 +729,10 @@ impl EncryptedStream {
             read_plaintext_offset: 0,
             read_eof: false,
             direct_read: false,
-            direct_xor_header: [0; FRAME_HEADER_LEN],
-            direct_xor_header_len: 0,
-            direct_xor_skip: 0,
+            recv_header_xor: direct::HeaderXor::default(),
+            direct_write: false,
+            send_header_xor: direct::HeaderXor::default(),
+            direct_wire: Vec::new(),
             ticket_use,
         }
     }
@@ -778,12 +781,14 @@ impl EncryptedStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        let plaintext_len = self
+        let done = self
             .pending_write
             .take()
-            .expect("completed pending write exists")
-            .plaintext_len;
-        Poll::Ready(Ok(plaintext_len))
+            .expect("completed pending write exists");
+        if self.direct_write {
+            self.direct_wire = done.wire;
+        }
+        Poll::Ready(Ok(done.plaintext_len))
     }
 
     fn copy_plaintext(&mut self, output: &mut ReadBuf<'_>) -> bool {
@@ -802,73 +807,6 @@ impl EncryptedStream {
             self.read_plaintext_offset = 0;
         }
         true
-    }
-
-    /// Bypass Encryption framing after an authenticated Vision Direct command.
-    /// Pending authenticated plaintext remains ahead of the underlying outer
-    /// transport, and random mode keeps XORing only each TLS-like header.
-    pub(super) fn poll_direct_read(
-        &mut self,
-        cx: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if output.remaining() == 0 || self.copy_plaintext(output) {
-            return Poll::Ready(Ok(()));
-        }
-        if !self.direct_read {
-            if !matches!(self.read_phase, ReadPhase::Header) || self.read_offset != 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "VLESS Encryption Direct switch outside a frame boundary",
-                )));
-            }
-            self.direct_read = true;
-        }
-
-        let start = output.filled().len();
-        let poll = Pin::new(&mut *self.inner).poll_read(cx, output);
-        if let Poll::Ready(Ok(())) = &poll {
-            let end = output.filled().len();
-            self.apply_direct_xor(&mut output.filled_mut()[start..end]);
-        }
-        poll
-    }
-
-    // Xray unwraps CommonConn at Direct but deliberately leaves XorConn in place.
-    fn apply_direct_xor(&mut self, data: &mut [u8]) {
-        let Some(xor) = self.recv_xor.as_mut() else {
-            return;
-        };
-        let mut offset = 0;
-        while offset < data.len() {
-            if self.direct_xor_skip > 0 {
-                let count = self.direct_xor_skip.min(data.len() - offset);
-                self.direct_xor_skip -= count;
-                offset += count;
-                continue;
-            }
-
-            let count = (FRAME_HEADER_LEN - self.direct_xor_header_len).min(data.len() - offset);
-            xor.apply(&mut data[offset..offset + count]);
-            self.direct_xor_header[self.direct_xor_header_len..self.direct_xor_header_len + count]
-                .copy_from_slice(&data[offset..offset + count]);
-            self.direct_xor_header_len += count;
-            offset += count;
-
-            if self.direct_xor_header_len == FRAME_HEADER_LEN {
-                let length =
-                    u16::from_be_bytes([self.direct_xor_header[3], self.direct_xor_header[4]])
-                        as usize;
-                self.direct_xor_skip = if self.direct_xor_header[..3] == [23, 3, 3]
-                    && (TAG_LEN + 1..=MAX_FRAME_CIPHERTEXT).contains(&length)
-                {
-                    length
-                } else {
-                    0
-                };
-                self.direct_xor_header_len = 0;
-            }
-        }
     }
 
     fn invalidate_ticket(&mut self) {
@@ -1335,5 +1273,9 @@ mod raw_blake3 {
     }
 }
 
+mod direct;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(in crate::proxy::vless) mod testutil;
