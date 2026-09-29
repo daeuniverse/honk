@@ -47,8 +47,9 @@ routing {
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
 
-普通 domain pattern/suffix/keyword 互为同一条件内的备选；同一规则另有 `geosite`
-字段时，它仍是一个独立的 AND 条件。
+domain pattern/suffix/keyword/regex 与 `geosite` 都是同一条件内的备选，
+因此 `domain(geosite: netflix, suffix: imgur.com)` 命中任一即可。同一规则中
+多个 `domain(...)` 调用写入相同字段，同样互为备选。
 
 `mac(...)` 与其他流量条件一样，可以通过终局 `direct(must)` 规则绕过透明 DNS；普通 `direct` 不会取消 DNS 接管。LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，执行一次正常有序流量策略，不单独扫描 must 规则。LAN 端口 `53` 跳过本地套接字探测，即使 dnsmasq 或 `dns.bind` 已监听该目的地址也不例外。
 

@@ -324,8 +324,8 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             ],
         },
         CompoundCase {
-            name: "ordinary-geosite-conjunction",
-            condition: json!({"source_port":["60001"], "domain":["other.test"], "domain_suffix":["geo.test"], "geosite":["lab"]}),
+            name: "ordinary-geosite-alternatives",
+            condition: json!({"source_port":["60001"], "domain":["other.test"], "domain_suffix":["imgur.test"], "geosite":["lab"]}),
             must: false,
             #[cfg(feature = "ebpf")]
             generic_port_punt: false,
@@ -341,6 +341,20 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                     sample(|c| {
                         c.src_port = 60001;
                         c.domain = Some("other.test".into());
+                    }),
+                    true,
+                ),
+                (
+                    sample(|c| {
+                        c.src_port = 60001;
+                        c.domain = Some("i.imgur.test".into());
+                    }),
+                    true,
+                ),
+                (
+                    sample(|c| {
+                        c.src_port = 60001;
+                        c.domain = Some("miss.test".into());
                     }),
                     false,
                 ),

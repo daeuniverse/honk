@@ -47,8 +47,9 @@ routing {
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
 
-Ordinary domain pattern/suffix/keyword alternatives share one condition. When the
-same rule also populates `geosite`, that field remains a separate AND-ed condition.
+All domain pattern/suffix/keyword/regex and `geosite` alternatives share one
+condition, so `domain(geosite: netflix, suffix: imgur.com)` matches either. Separate
+`domain(...)` calls in one rule fill the same fields and are alternatives too.
 
 A matching `mac(...) -> direct(must)` can exempt a client from transparent DNS; ordinary `direct` does not. LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered traffic policy once after existing ingress and control-plane exclusions, not a separate must-only scan. LAN port `53` skips local-socket probing, even when dnsmasq or `dns.bind` listens on the destination.
 
