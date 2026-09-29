@@ -1799,7 +1799,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-02"
-source = { file = "doc/en/reference/routing.md", lines = "162-162" }
+source = { file = "doc/en/reference/routing.md", lines = "163-163" }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -1811,7 +1811,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-03"
-source = { file = "doc/en/reference/routing.md", lines = "193-214" }
+source = { file = "doc/en/reference/routing.md", lines = "194-215" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1823,7 +1823,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-marks"
-source = { file = "doc/en/reference/routing.md", lines = "108-114" }
+source = { file = "doc/en/reference/routing.md", lines = "109-115" }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
@@ -2094,7 +2094,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-02"
-source = { file = "doc/zh/reference/routing.md", lines = "156-156" }
+source = { file = "doc/zh/reference/routing.md", lines = "157-157" }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -2106,7 +2106,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-03"
-source = { file = "doc/zh/reference/routing.md", lines = "185-206" }
+source = { file = "doc/zh/reference/routing.md", lines = "186-207" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2118,7 +2118,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-marks"
-source = { file = "doc/zh/reference/routing.md", lines = "104-110" }
+source = { file = "doc/zh/reference/routing.md", lines = "105-111" }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
