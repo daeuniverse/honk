@@ -99,7 +99,7 @@ jobs:
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
 
   public-vless-loopback:
-    name: Public VLESS loopback interop (2 cases)
+    name: Public VLESS loopback interop (3 cases)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -171,6 +171,19 @@ jobs:
           ' "$RUNNER_TEMP/public-vless-tests.json"
           cargo nextest run -p honk-outbound --features rprx --test vless_udp --profile ci \
             --run-ignored only -E "$filter" --no-tests fail
+      - name: Run the official Vision uplink Direct case
+        run: |
+          set -euo pipefail
+          vision_test=proxy::vless::handler::tests::interop::official_vision_peers_switch_inner_tls_to_direct
+          cargo nextest list -p honk-outbound --features rprx --lib --profile ci \
+            --run-ignored only -E "test(=$vision_test)" --message-format json > "$RUNNER_TEMP/public-vision-tests.json"
+          jq -e --arg vision "$vision_test" '
+            [."rust-suites"[].testcases | to_entries[]
+              | select(.value["filter-match"].status == "matches" and .value.ignored) | .key]
+            == [$vision]
+          ' "$RUNNER_TEMP/public-vision-tests.json"
+          cargo nextest run -p honk-outbound --features rprx --lib --profile ci \
+            --run-ignored only -E "test(=$vision_test)" --no-tests fail
       - name: Upload public loopback JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
