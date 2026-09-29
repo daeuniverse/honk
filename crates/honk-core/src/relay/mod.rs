@@ -460,14 +460,10 @@ where
     let (mut pr, mut pw) = tokio::io::split(proxy);
     let c2p_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let p2c_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut c2p = Box::pin(copy_way(&mut cr, &mut pw, c2p_progress.clone(), true, park));
-    let mut p2c = Box::pin(copy_way(
-        &mut pr,
-        &mut cw,
-        p2c_progress.clone(),
-        false,
-        park,
-    ));
+    let c2p = copy_way(&mut cr, &mut pw, c2p_progress.clone(), true, park);
+    let p2c = copy_way(&mut pr, &mut cw, p2c_progress.clone(), false, park);
+    tokio::pin!(c2p);
+    tokio::pin!(p2c);
     let parked = || park.is_some_and(Park::taken);
 
     // The first direction to finish half-closes the other (inside
