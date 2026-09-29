@@ -452,7 +452,7 @@ async fn unsupported_splice_resumes_the_same_vision_stream() {
     let _lock = TEST_LOCK.lock().await;
     let _state = StateGuard::new();
     run_case(Script::new(1024 * 1024, 512 * 1024), || {
-        test_hook::set_forced_errno(libc::EINVAL, -1);
+        test_hook::set_forced_errno(libc::EPERM, -1);
     })
     .await;
     assert_eq!(test_hook::probe_calls(), 1);

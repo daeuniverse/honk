@@ -57,15 +57,15 @@ pub fn splice_available() -> bool {
 fn is_unsupported_errno(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EXDEV)
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EXDEV) | Some(libc::EPERM)
     )
 }
 
 /// Outcome of a failed splice operation.
 #[derive(Debug)]
 pub(super) enum SpliceError {
-    /// `splice(2)` is unsupported for these fds (EINVAL/ENOSYS/EXDEV on the
-    /// capability probe, before any byte was moved).
+    /// `splice(2)` is unavailable for these fds or denied by policy, before
+    /// any byte was moved.
     Unsupported,
     /// The pipes could not be created, before any byte was moved; unlike
     /// `Unsupported` this says nothing about later connections.

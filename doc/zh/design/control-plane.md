@@ -173,7 +173,7 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 
 当两端都是普通 `TcpStream` 时，`relay_splice` 运行两个并发 `splice(2)` pump。每个方向持有一条最多 64 KiB 的非阻塞 pipe，因此全双工中继最多请求四个 pipe FD 和 128 KiB pipe page。EOF 对另一端 write side 执行 half-close，并允许反向继续排空。
 
-每个方向的首次 splice 同时是 capability probe。在任何字节到达目的 socket 前返回 `EINVAL`、`ENOSYS` 或 `EXDEV`，即可无损回退到用户态 copy，并设置进程全局 latch；后续连接跳过 probe。pipe 创建失败同样发生在任何字节移动之前，因此只让当前连接改用 copy，不设置 latch。其他错误，或字节已经暂存后返回 unsupported，会使中继失败，而不是冒数据丢失风险。TLS 或协议包装流使用 `relay_auto`，它始终使用基于 select 的 copy loop。
+每个方向的首次 splice 同时是 capability probe。在任何字节暂存前返回 `EINVAL`、`ENOSYS`、`EXDEV` 或策略拒绝（`EPERM`），即可无损回退到用户态 copy，并设置进程全局 latch；后续连接跳过 probe。pipe 创建失败同样发生在任何字节移动之前，因此只让当前连接改用 copy，不设置 latch。其他错误，或字节已经暂存后返回 unsupported，会使中继失败，而不是冒数据丢失风险。TLS 或协议包装流使用 `relay_auto`，它始终使用基于 select 的 copy loop。
 
 未启用 Encryption 的 Vision TLS/REALITY carrier 先走 copy loop；两个方向都进入 Direct 且连接已转发 256 KiB 后，relay 在两个方向都不持有未写出字节的位置交接：一个方向处于读边界，另一个方向挂起在读取上。此时 relay 把 carrier 的 TCP socket 借给同一个双向 splice 引擎，Vision/TLS 栈仍归 relay 所有，carrier pressure 采样在借出的 socket 上继续。probe 不支持或 pipe 创建失败时，任何字节尚未移动，relay 恢复同一个 Vision 流的 copy loop；每条连接只尝试一次交接。两个阶段共用连接计数器，统计覆盖整条连接，first-response 回调只触发一次。
 
