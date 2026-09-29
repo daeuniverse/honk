@@ -65,7 +65,9 @@ flowchart LR
 没有实现该 capability；分派会拒绝，而不是静默替换。
 
 `src/proxy/mod.rs` 中，`ProxyStream::into_tcp_stream` 保持 zero-copy splice
-downcast 不变量；`PreparedUdpTransport<T>` 以一次消费式 commit 隔离推测式
+downcast 不变量；`proxy/vless/handler/stream.rs` 的 `ProxyStream::into_vision_splice`
+对未包装的 Vision TLS/REALITY carrier 类型遵循同一 vtable 分派规则，因此给该 carrier
+新增任何包装都会使其无法交接给 splice；`PreparedUdpTransport<T>` 以一次消费式 commit 隔离推测式
 发布并返回精确选中的 `Arc<T>`；`WarmAttempt` 在建立期间持有 retention lock，
 失败或取消只回滚自己插入的 bit。
 
@@ -579,12 +581,24 @@ XUDP 访问 UDP/443，包括 `mux=off`；用户可通过路由规则阻断 QUIC�
 基础 Vision。显式 Xray `reject` 仍是终态，`skip` 使用协议回退。
 wire addon 始终是基础 Vision flow。
 
-**当前限制：Vision 只实现下行。** Honk 移除 response padding 并处理下行 Direct
-命令，但不为客户端上行添加 Vision padding，也不执行上行 Direct 切换。
-即使收到下行 Direct，上行仍经过原有 outer stack；在 TLS/REALITY carrier 中
-承载内层 TLS 时，上行仍有 TLS-in-TLS 开销。明文流量或没有 outer TLS 的
-Encryption 组合不应称为双层 TLS。互通 echo 成功不代表具有 Xray 的上行整形、
-隐蔽性或上传性能保证。
+**上行 Vision。** 拨号时，VLESS 请求与 Vision 首帧一起发出：UUID 加一个
+内容为空、带长 padding 的 Continue 帧，与 Xray 客户端在尚无 payload 时的做法
+一致。因此请求仍处于拨号的失败与 deadline 范围内。此后的上传按 Xray 默认
+padding 逐帧填充。padding 何时结束由内层 TLS 判断决定，依据的是 TLS record
+结构，而不是读写调用边界。非 TLS payload 在第一帧即结束 padding。出现
+ClientHello 时，padding 持续到第一个完整 application-data record 结束；若下行
+ServerHello 选择了 TLS 1.3 且 cipher 属于 Xray 接受的范围（0x1301–0x1304），
+并且 codec 具备 direct writer，该帧携带 Direct，否则携带 End。每个方向的检查
+以 64 KiB 为上限。
+
+上行 Direct 帧离开 outer codec 并 flush 之后，上传绕过该 codec。在 TLS/REALITY
+上，SSL 写半部被标记为关闭但不发送任何数据，因此之后的 fatal alert 或 KeyUpdate
+确认不会写入 raw 上行；shutdown 关闭 TCP 写方向，而不发送 close_notify。
+下行 Direct 命令仍只切换读取，SSL 会话已解码的明文先于 raw 字节交付。两个方向
+各自独立切换。padding 会为每条 Vision 连接增加字节。与引入上行前的 relay 做
+loopback A/B 时，短 Vision 连接（上行 1 KiB、下行 4 KiB）的 relay CPU 约增加
+2.6%，几乎全部来自 padding；交接记账的开销在噪声范围内。足够长、能进入 Direct
+与 splice 的连接开销更低；非 Vision relay 不变。
 
 `src/proxy/vless/encryption.rs` 在 VLESS 请求前包装所选 transport。实现的协议
 是 `mlkem768x25519plus`，wire mode 为 `native`、`xorpub` 与 `random`。它接受
@@ -593,9 +607,10 @@ ML-KEM-768 与 X25519，认证 record 使用选定 AEAD。可选 0-RTT cache 按
 节点 identity 建 key，并使被拒绝的 ticket path 失效。
 
 Encryption 可以包装 direct 与 Xray/Mux.Cool path，包括受支持的 Vision 组合，
-但不能使用 H2 或 UoT framing。Vision direct-copy response 只移除 AEAD read
-layer；outer transport 与 random-XOR layer 保持不变，write 侧也保留既有 outer
-stack。这不表示 encrypted Vision 会 cut over 到 raw socket。
+但不能使用 H2 或 UoT framing。任一方向的 Vision Direct 都只移除 AEAD framing；
+outer transport 与 random 模式逐 record 的 header XOR 保持不变，并遵循 Xray
+`XorConn`，包括其对 TLS 形态 header 的跳过规则。这不表示 encrypted Vision 会
+cut over 到 raw socket。
 
 ## QUIC 栈
 

@@ -38,7 +38,7 @@ VLESS 现由三个独立选项组合：`udp=0|1` 控制 packet 权限，`packetE
 
 Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。默认允许 UDP/443，包括 Vision；是否阻断 QUIC 由用户路由规则决定，显式 Xray `reject` 仍是终态。VLESS Encryption 可在 direct-TCP 与合法 XUDP/关闭 UDP 的路径规则下和 Vision 组合。Carrier 容量来自进程级文件描述符预算；容量耗尽属于本地且不影响健康的拒绝，不会触发回退或 packet 重放。XUDP Global ID 使用有作用域的所有权边界，不具备进程级无碰撞 NAT 语义。规范链接、迁移、组合及 REALITY 握手/pool 行为见[节点参考](doc/zh/reference/nodes.md#vless-udp-and-multiplexing)，生命周期及所有权见规范的 [VLESS 出站设计](doc/zh/design/outbound.md#sourcesession-ownership-and-capacity)。
 
-当前 Vision 只实现下行 unpadding 与 Direct 处理；上行不添加 Vision padding，也不执行 Direct 切换，仍保留所选 outer transport。参见[支持边界](doc/zh/design/outbound.md)。
+Vision 两个方向都会 padding，并各自独立切换到 Direct：上传在内层 TLS 握手完成前保持 padding，之后若内层会话为 TLS 1.3 且 cipher 可用于 Direct，则绕过外层 TLS/REALITY 会话；启用 VLESS Encryption 时，Direct 只移除 AEAD framing，保留外层 transport。未启用 Encryption 的 TLS/REALITY carrier 两个方向都进入 Direct 且连接已转发 256 KiB 后，relay 改用 `splice(2)` 继续转发。参见[支持边界](doc/zh/design/outbound.md)。
 
 **升级注意：**`vless_mode` 已删除，所有 VLESS 节点 ID 都会重新派生。升级前请迁移静态链接与缓存/provider 内容，尤其是离线升级。按名称保存的 Selector 选择及近期持久化延迟样本可继续使用，不要删除它们。见[迁移说明](doc/zh/reference/nodes.md#从-vless_mode-迁移)。
 

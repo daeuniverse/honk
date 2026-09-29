@@ -72,7 +72,7 @@ optional packet, warm, and probe capability slots. A `None` slot means that the
 protocol does not implement that capability; dispatch is refused rather than
 silently substituted.
 
-- `src/proxy/mod.rs`: `ProxyStream::into_tcp_stream` preserves the zero-copy splice downcast invariant. `PreparedUdpTransport<T>` keeps speculative publication behind one consuming commit and returns the exact selected `Arc<T>`. `WarmAttempt` holds the retention lock across establishment; failure or cancellation rolls back only its inserted bit.
+- `src/proxy/mod.rs`: `ProxyStream::into_tcp_stream` preserves the zero-copy splice downcast invariant; `proxy/vless/handler/stream.rs`'s `ProxyStream::into_vision_splice` follows the same vtable-dispatch rule for the unwrapped Vision TLS/REALITY carrier type, so any new wrapper around that carrier disables its splice handover. `PreparedUdpTransport<T>` keeps speculative publication behind one consuming commit and returns the exact selected `Arc<T>`. `WarmAttempt` holds the retention lock across establishment; failure or cancellation rolls back only its inserted bit.
 
 ### Capability traits
 
@@ -656,14 +656,29 @@ with `mux=off`; users can block QUIC with routing rules. The input spelling
 reuse decisions. An explicit Xray `reject` remains terminal; `skip` uses the
 protocol fallback. The wire addon remains the base Vision flow.
 
-**Current limitation: Vision is downstream-only.** Honk removes response
-padding and honors downstream Direct commands, but does not add client-uplink
-Vision padding or perform uplink Direct cutover. Uploads keep the selected
-outer stack even after a downstream Direct command. Inner TLS traffic therefore
-retains TLS-in-TLS upload overhead on a TLS/REALITY carrier; plaintext and
-non-TLS Encryption compositions are not two TLS sessions. Do not infer Xray's
-uplink shaping, camouflage or upload-performance guarantees from a successful
-interop echo.
+**Uplink Vision.** The dial sends the VLESS request together with Vision's
+first frame: the UUID and an empty long-padded Continue frame, as Xray's client
+does when no payload is ready. The request therefore stays inside the dial's
+failure and deadline scope. Later uploads are padded frame by frame with Xray's
+default padding. Padding ends on an inner-TLS decision taken from TLS record
+structure, never from read or write call boundaries. Non-TLS payload ends it on
+its first frame. A ClientHello keeps it until the first complete
+application-data record ends; that frame carries Direct when the downstream
+ServerHello chose TLS 1.3 with a cipher Xray accepts (0x1301–0x1304) and the
+codec has a direct writer, otherwise End. A 64 KiB inspection budget per
+direction bounds the observation.
+
+After an uplink Direct frame has left the outer codec and been flushed, uploads
+bypass it. On TLS/REALITY the SSL write half is marked closed without sending
+anything, so a later fatal alert or KeyUpdate acknowledgement is never written
+into the raw uplink, and shutdown closes the TCP write side instead of sending
+close_notify. A downstream Direct command still switches only reads, and
+plaintext the SSL session already decoded is delivered before raw bytes. Each
+direction switches independently. Padding adds bytes to every Vision
+connection. On a loopback A/B against the pre-uplink relay, short Vision flows
+(1 KiB up, 4 KiB down) cost about 2.6% more relay CPU, nearly all of it
+padding; the handover bookkeeping is within noise. Flows long enough to reach
+Direct and splice use less; non-Vision relays are unchanged.
 
 `src/proxy/vless/encryption.rs` wraps the selected transport before the VLESS
 request. The implemented protocol is `mlkem768x25519plus`, with `native`,
@@ -674,10 +689,10 @@ cache remains keyed by normalized node identity and invalidates a rejected
 ticket path.
 
 Encryption can wrap direct and Xray/Mux.Cool paths, including supported Vision
-combinations, but not H2 or UoT framing. On a Vision direct-copy response, only
-the AEAD read layer is removed; the outer transport and random-XOR layer remain.
-The write side retains its existing outer stack. This is not a raw-socket
-cutover claim for encrypted Vision.
+combinations, but not H2 or UoT framing. Vision Direct in either direction
+removes only AEAD framing; the outer transport and random mode's per-record
+header XOR remain, following Xray `XorConn` including its skip rule for
+TLS-shaped headers. This is not a raw-socket cutover claim for encrypted Vision.
 
 ## QUIC stack
 

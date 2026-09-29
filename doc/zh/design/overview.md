@@ -99,7 +99,7 @@ flowchart TB
 5. [控制面](./control-plane.md)恢复原始目的地址；普通流消费 eBPF 路由 handoff，缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。端口 53 流量遵循不同的[TCP handoff 与 UDP 逐报文准入规则](./control-plane.md#透明代理入口)。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
 7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威策略选择解析为叶节点。Score 只用逐目标 TCP/UDP 证据在健康合格成员中排名。TCP/UDP 通常只采用一个权威叶节点；只有冷启动顶层 URLTest 会先 stagger 候选，且只有 winner 提交 endpoint 或 source transport。
-8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；XUDP/Mux.Cool 可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source session。嗅探得到的 TCP 字节先于后续流量转发。
+8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；XUDP/Mux.Cool 可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source session。嗅探得到的 TCP 字节先于后续流量转发；普通 TCP 使用 splice，包装流使用 copy；未启用 Encryption 的 Vision TLS/REALITY carrier 在两个方向都进入 Direct 后可把 socket 借给 splice。
 9. 控制面出口使用 `global.so_mark_from_dae`（零值选择默认 `0x100`）；带 mark 的直连使用规则 mark 加 `CLASSIFIED_MARK`。WAN TC 识别这两类标记，不再额外叠加默认旁路位。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
 ## 运行时不变量
