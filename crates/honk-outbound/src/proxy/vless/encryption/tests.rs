@@ -311,6 +311,44 @@ async fn random_direct_write_xors_headers_exactly_once_across_partial_writes() {
 }
 
 #[tokio::test]
+async fn random_direct_large_write_keeps_bounded_chunks_and_xor_state() {
+    let key = vec![17_u8; 96];
+    let iv = [29_u8; IV_LEN];
+    let mut plaintext = vec![23, 3, 3, 0x23, 0x28];
+    plaintext.extend_from_slice(&[0x42; 9000]);
+    plaintext.extend_from_slice(&[23, 3, 3, 0x23, 0x28]);
+    plaintext.extend_from_slice(&[0x43; 9000]);
+    let mut expected = plaintext.clone();
+    let mut oracle = AesCtr::new(&key, &iv);
+    oracle.apply(&mut expected[..5]);
+    oracle.apply(&mut expected[9005..9010]);
+
+    let (client_io, mut server_io) = tokio::io::duplex(7);
+    let mut stream = ready_stream(client_io, Some(AesCtr::new(&key, &iv)));
+    let write = async {
+        let mut offset = 0;
+        while offset < plaintext.len() {
+            let written = DirectWriter(&mut stream)
+                .write(&plaintext[offset..])
+                .await
+                .unwrap();
+            assert!((1..=MAX_FRAME_PLAINTEXT).contains(&written));
+            offset += written;
+        }
+        DirectWriter(&mut stream).shutdown().await.unwrap();
+    };
+    let mut received = Vec::new();
+    let read = server_io.read_to_end(&mut received);
+    let ((), read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(write, read)
+    })
+    .await
+    .expect("large Direct write did not finish");
+    read.unwrap();
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
 async fn direct_write_refuses_before_the_first_frame() {
     let (client_io, _server_io) = tokio::io::duplex(4096);
     let mut stream = ready_stream(client_io, None);

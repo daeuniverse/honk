@@ -116,8 +116,9 @@ impl EncryptedStream {
         if input.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // The XOR keystream advances once per byte, so retries must resend
-        // these exact bytes instead of re-encoding the caller's buffer.
+        let input = &input[..input.len().min(super::MAX_FRAME_PLAINTEXT)];
+        // Header XOR advances the keystream, so retries must resend these
+        // exact bytes instead of re-encoding the caller's buffer.
         let mut wire = std::mem::take(&mut self.direct_wire);
         wire.clear();
         wire.extend_from_slice(input);

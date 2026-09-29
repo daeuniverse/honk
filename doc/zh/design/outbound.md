@@ -614,6 +614,9 @@ Encryption 可以包装 direct 与 Xray/Mux.Cool path，包括受支持的 Visio
 outer transport 与 random 模式逐 record 的 header XOR 保持不变，并遵循 Xray
 `XorConn`，包括其对 TLS 形态 header 的跳过规则。这不表示 encrypted Vision 会
 cut over 到 raw socket。
+random-mode Direct 每次 write 最多确认并复制 8 KiB，保留 codec 既有的有界
+pending-write buffer。Header XOR 状态跨这些短写保留；native Direct 不增加
+wire-copy buffer。
 
 ## QUIC 栈
 

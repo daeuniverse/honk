@@ -696,6 +696,9 @@ combinations, but not H2 or UoT framing. Vision Direct in either direction
 removes only AEAD framing; the outer transport and random mode's per-record
 header XOR remain, following Xray `XorConn` including its skip rule for
 TLS-shaped headers. This is not a raw-socket cutover claim for encrypted Vision.
+Random-mode Direct acknowledges and copies at most 8 KiB per write, preserving
+the codec's existing bounded pending-write buffer. Header XOR state survives
+those short writes; native Direct adds no wire-copy buffer.
 
 ## QUIC stack
 
