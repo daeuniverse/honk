@@ -69,6 +69,13 @@ fn addr_response(query: &[u8], ips: &[IpAddr]) -> Vec<u8> {
 /// Loopback UDP DNS stub sending every datagram of `replies(query)` per query.
 async fn spawn_udp_stub(replies: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static) -> SocketAddr {
     let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    spawn_udp_stub_on(server, replies)
+}
+
+fn spawn_udp_stub_on(
+    server: tokio::net::UdpSocket,
+    replies: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
+) -> SocketAddr {
     let addr = server.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = [0u8; 512];
@@ -121,14 +128,31 @@ async fn silent_aaaa_keeps_a_answer_within_family_budget() {
 async fn truncated_udp_answer_retries_over_tcp() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
+    let (tcp, udp) = async {
+        const MAX_ATTEMPTS: usize = 8;
+        let mut last_error = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            match tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                Ok(udp) => return (tcp, udp),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_error = Some(error);
+                }
+                Err(error) => panic!("bind UDP DNS stub: {error}"),
+            }
+        }
+        panic!(
+            "could not reserve TCP/UDP DNS stub after {MAX_ATTEMPTS} attempts: {}",
+            last_error.unwrap()
+        );
+    }
+    .await;
     // UDP only returns an empty truncated reply; the answer exists only over TCP.
-    let server = spawn_udp_stub(|query| {
+    let server = spawn_udp_stub_on(udp, |query| {
         let mut truncated = addr_response(query, &[]);
         truncated[2] |= 0x02;
         vec![truncated]
-    })
-    .await;
-    let tcp = tokio::net::TcpListener::bind(server).await.unwrap();
+    });
     tokio::spawn(async move {
         loop {
             let (mut stream, _) = tcp.accept().await.unwrap();

@@ -9,6 +9,7 @@ Read with: `AGENTS.md` (Testing instructions); `real-ebpf.md` for the root-gated
 - Name test modules and fixture directories for behavior, not PR numbers or investigation IDs. Keep byte-sensitive/file-loading fixtures in `tests/fixtures/<subsystem>/`; preserve their contents when moving them.
 - Put shared helpers at the nearest common test-module owner. Do not import fixtures from another test-case suite; keep single-suite helpers with that suite.
 - Preserve process isolation where global tracing, environment, or allocator state requires it. `honk-config/tests/logging.rs` contains only scoped-subscriber logging checks with independent capture buffers; data-only tests stay in other executables so `NoSubscriber` cannot poison shared callsite interest.
+- DNS fixtures that require TCP and UDP on one port must retain both bound sockets before starting either server. Retry only port collisions with a bounded attempt count; a UDP reservation alone does not reserve TCP.
 
 ### Suite map
 
