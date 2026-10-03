@@ -83,9 +83,9 @@ impl VLessHandler {
             target_domain,
             vless.wire_flow(),
         )?;
-        let stream = self
-            .dial_carrier(node, uuid, header, tcp, connect_timeout, None)
-            .await?;
+        let operation = self.dial_carrier(node, uuid, header, tcp, connect_timeout, None);
+        let stream =
+            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -102,15 +102,14 @@ impl VLessHandler {
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let permit = runtime.acquire_vless_carrier()?;
         runtime
-            .transport_quality()
-            .scope(self.dial_carrier(
+            .scope_tasks(runtime.transport_quality().scope(self.dial_carrier(
                 &runtime.node,
                 uuid,
                 header,
                 None,
                 connect_timeout,
                 Some(permit),
-            ))
+            )))
             .await
     }
 

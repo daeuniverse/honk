@@ -287,6 +287,9 @@ pub(super) async fn open_tcp(
             OpenError::Session(anyhow::Error::new(error.failure.io()))
         });
     }
+    if let Some(observer) = crate::runtime::flow_observation::current() {
+        observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+    }
     cancellation.disarm();
     Ok(VlessCoolStream {
         writer: session.writer.clone(),
@@ -459,6 +462,11 @@ impl VlessXudpTransport {
         match result {
             Ok(()) => {
                 cancellation.complete();
+                if let Some(observer) = crate::runtime::flow_observation::current() {
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                    );
+                }
                 Ok(())
             }
             Err(error) => {

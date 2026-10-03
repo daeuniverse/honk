@@ -29,7 +29,8 @@ impl BinaryLpmTrie {
                 IpAddr::V6(ip) => Self::insert(&mut trie.v6_nodes, &ip.octets(), prefix),
             }
         }
-
+        trie.v4_nodes.shrink_to_fit();
+        trie.v6_nodes.shrink_to_fit();
         trie
     }
 
@@ -94,6 +95,21 @@ impl BinaryLpmTrie {
         match ip {
             IpAddr::V4(ip) => Self::matches_nodes(&self.v4_nodes, &ip.octets(), 32),
             IpAddr::V6(ip) => Self::matches_nodes(&self.v6_nodes, &ip.octets(), 128),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn built_trie_keeps_no_spare_node_capacity() {
+        let nets = [
+            "192.0.2.0/24".parse().unwrap(),
+            "2001:db8::/33".parse().unwrap(),
+        ];
+        let trie = super::BinaryLpmTrie::from_nets(&nets);
+        for nodes in [&trie.v4_nodes, &trie.v6_nodes] {
+            assert_eq!(nodes.capacity(), nodes.len());
         }
     }
 }

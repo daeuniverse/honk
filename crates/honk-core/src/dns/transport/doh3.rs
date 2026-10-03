@@ -16,7 +16,7 @@ use tracing::debug;
 
 use super::DialContext;
 use super::framing::force_dns_id_zero;
-use super::lifecycle::{LifecycleSlot, SessionFailure};
+use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::owned_task::OwnedTask;
 use super::quic::with_packet_cause;
 use super::{
@@ -176,30 +176,43 @@ impl Doh3Client {
     /// A sender on a live QUIC connection; one that closed between queries
     /// is rebuilt before the query goes out rather than failing it.
     async fn get_sender(&self) -> anyhow::Result<(Arc<H3Session>, H3Sender)> {
-        for attempt in 0..2 {
-            let session = self.session.acquire(|| self.handshake()).await?;
-            match session.connection.close_reason() {
-                None => {
-                    let sender = session.sender.lock().await.clone().ok_or_else(|| {
-                        SessionFailure::new(
-                            Arc::clone(&session),
-                            anyhow::anyhow!("DoH3 session is closing"),
-                        )
-                    })?;
-                    return Ok((session, sender));
-                }
-                Some(reason) if attempt == 0 => {
-                    debug!(error = %reason, transport = "doh3", "DoH3 connection is closed; rebuilding");
-                    self.retire_session(&session).await;
-                }
-                Some(reason) => {
-                    let error = with_packet_cause(session.endpoint.as_ref(), reason.into())
-                        .context("DoH3 connection closed");
-                    return Err(SessionFailure::new(session, error).into());
+        let observation = SessionObservation::start();
+        let result = async {
+            for attempt in 0..2 {
+                let (session, reused) = self.session.acquire(|| self.handshake()).await?;
+                match session.connection.close_reason() {
+                    None => {
+                        let sender = session.sender.lock().await.clone().ok_or_else(|| {
+                            SessionFailure::new(
+                                Arc::clone(&session),
+                                anyhow::anyhow!("DoH3 session is closing"),
+                            )
+                        })?;
+                        if reused {
+                            super::lifecycle::attached();
+                        }
+                        return Ok((session, sender));
+                    }
+                    Some(reason) if attempt == 0 => {
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed);
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted);
+                        debug!(error = %reason, transport = "doh3", "DoH3 connection is closed; rebuilding");
+                        self.retire_session(&session).await;
+                    }
+                    Some(reason) => {
+                        let error = with_packet_cause(session.endpoint.as_ref(), reason.into())
+                            .context("DoH3 connection closed");
+                        return Err(SessionFailure::new(session, error).into());
+                    }
                 }
             }
+            unreachable!("the loop returns or fails on its second pass")
         }
-        unreachable!("the loop returns or fails on its second pass")
+        .await;
+        observation.finish(
+            result,
+            honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadySucceeded,
+        )
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {
@@ -257,6 +270,10 @@ impl Doh3Client {
         self.session
             .retire(session, move |session| session.close(timeout))
             .await;
+    }
+
+    pub(crate) fn tasks_failed(&self) -> bool {
+        self.quic_ep.tasks_failed()
     }
 
     pub(crate) async fn close(&self) {

@@ -30,7 +30,10 @@ where
     }
     let taken = idle.lock().pop();
     let mut stream = match taken {
-        Some(s) => s,
+        Some(s) => {
+            super::lifecycle::attached();
+            s
+        }
         None => dial().await?,
     };
     if let Some(reporter) = reporter {

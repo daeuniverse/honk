@@ -231,7 +231,7 @@ async fn packet_rejection_survives_no_fallback_and_source_resolution() {
         DnsStrategy::Ipv4Only,
         ScriptedPool::new(Reply::Rejection, Reply::Failure),
     )
-    .resolve_name_for_source("example.com", "192.0.2.1".parse().unwrap())
+    .resolve_name_for_source("example.com", "192.0.2.1:12345".parse().unwrap())
     .await
     .expect_err("source-specific packet rejection");
     assert!(honk_outbound::proxy::is_packet_rejection(&error));
@@ -319,11 +319,11 @@ async fn source_specific_resolution_is_strict_and_uses_sip() {
     let resolver = resolver_with_config(pool.clone(), &config);
 
     let resolved = resolver
-        .resolve_for_source("example.com", "192.0.2.10".parse().unwrap())
+        .resolve_for_source("example.com", "192.0.2.10:12345".parse().unwrap())
         .await
         .expect("matching source");
     let rejected = resolver
-        .resolve_for_source("example.com", "198.51.100.10".parse().unwrap())
+        .resolve_for_source("example.com", "198.51.100.10:12345".parse().unwrap())
         .await;
 
     assert_eq!(resolved.ipv4, ["192.0.2.10".parse::<IpAddr>().unwrap()]);
@@ -335,7 +335,7 @@ async fn source_specific_resolution_is_strict_and_uses_sip() {
         honk_config::dns::DnsRequestAction::Upstream("default".into());
     let asis_pool = ScriptedPool::new(Reply::Address(300), Reply::Failure);
     let asis = resolver_with_config(asis_pool.clone(), &config)
-        .resolve_for_source("example.com", "192.0.2.10".parse().unwrap())
+        .resolve_for_source("example.com", "192.0.2.10:12345".parse().unwrap())
         .await;
     assert!(asis.is_err());
     assert_eq!(asis_pool.counts(), [0, 0]);
@@ -365,7 +365,7 @@ async fn source_resolution_rejects_asis_from_either_family() {
         honk_config::dns::DnsRequestAction::Upstream("default".into());
 
     let error = resolver_with_config(pool.clone(), &config)
-        .resolve_for_source("example.com", "192.0.2.10".parse().unwrap())
+        .resolve_for_source("example.com", "192.0.2.10:12345".parse().unwrap())
         .await
         .expect_err("A asis without an original destination must fail the whole lookup");
 

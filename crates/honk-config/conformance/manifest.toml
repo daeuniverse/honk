@@ -1551,7 +1551,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-configuration-01"
-source = { file = "doc/en/configuration.md", lines = "34-37" }
+source = { file = "doc/en/configuration.md", lines = "35-38" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1562,7 +1562,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-configuration-02"
-source = { file = "doc/en/configuration.md", lines = "61-118" }
+source = { file = "doc/en/configuration.md", lines = "62-119" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1574,7 +1574,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-configuration-03"
-source = { file = "doc/en/configuration.md", lines = "126-195" }
+source = { file = "doc/en/configuration.md", lines = "127-205" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1582,11 +1582,11 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input '->'"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input '{'"
 
 [[case]]
 id = "honk-doc-en-configuration-04"
-source = { file = "doc/en/configuration.md", lines = "240-252" }
+source = { file = "doc/en/configuration.md", lines = "250-262" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1710,13 +1710,24 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
-source = { file = "doc/en/reference/experimental.md", lines = "69-85" }
+source = { file = "doc/en/reference/experimental.md", lines = "146-157" }
 wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
 honk_diagnostics = []
 compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-experimental-02"
+source = { file = "doc/en/reference/experimental.md", lines = "161-166" }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+differences = [{ path = "sections[0]", dae = { absent = true }, honk = { items = [], name = "assets" }, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }, { path = "unknown_sections", dae = 1, honk = 0, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }]
 unknown_sections = 0
 
 [[case]]
@@ -1842,11 +1853,11 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub'compatible:'https://example.net/sub'('"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub''https://example.com/no_tag_link'detailed:'https://example.org/sub'{'"
 
 [[case]]
 id = "honk-doc-zh-configuration-01"
-source = { file = "doc/zh/configuration.md", lines = "34-37" }
+source = { file = "doc/zh/configuration.md", lines = "35-38" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1857,7 +1868,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-configuration-02"
-source = { file = "doc/zh/configuration.md", lines = "61-117" }
+source = { file = "doc/zh/configuration.md", lines = "62-118" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1869,7 +1880,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-03"
-source = { file = "doc/zh/configuration.md", lines = "125-193" }
+source = { file = "doc/zh/configuration.md", lines = "126-203" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1877,11 +1888,11 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input '->'"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input '{'"
 
 [[case]]
 id = "honk-doc-zh-configuration-04"
-source = { file = "doc/zh/configuration.md", lines = "240-252" }
+source = { file = "doc/zh/configuration.md", lines = "250-262" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2005,13 +2016,24 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
-source = { file = "doc/zh/reference/experimental.md", lines = "69-85" }
+source = { file = "doc/zh/reference/experimental.md", lines = "149-160" }
 wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
 honk_diagnostics = []
 compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-experimental-02"
+source = { file = "doc/zh/reference/experimental.md", lines = "164-169" }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+differences = [{ path = "sections[0]", dae = { absent = true }, honk = { items = [], name = "assets" }, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }, { path = "unknown_sections", dae = 1, honk = 0, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }]
 unknown_sections = 0
 
 [[case]]
@@ -2137,7 +2159,7 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub'compatible:'https://example.net/sub'('"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub''https://example.com/no_tag_link'detailed:'https://example.org/sub'{'"
 
 [[case]]
 id = "dae-docs-en-README-194-195"

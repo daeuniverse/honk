@@ -10,6 +10,7 @@ use super::{OutboundRuntimeRegistry, ProtocolRuntime};
 struct DialAdmission {
     generation: Arc<tokio::sync::Semaphore>,
     process: Arc<tokio::sync::Semaphore>,
+    endpoint: Option<Arc<(String, std::net::IpAddr)>>,
 }
 
 impl DialAdmission {
@@ -17,6 +18,7 @@ impl DialAdmission {
         Self {
             generation: Arc::clone(&registry.dial_semaphore),
             process: Arc::clone(&registry.dial_ceiling_semaphore),
+            endpoint: None,
         }
     }
 
@@ -52,6 +54,7 @@ static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| Dia
     process: Arc::new(tokio::sync::Semaphore::new(
         tokio::sync::Semaphore::MAX_PERMITS,
     )),
+    endpoint: None,
 });
 
 #[derive(Default)]
@@ -174,53 +177,127 @@ pub struct DialPermit {
 /// Captured logical operation state for spawned child work. Clones share
 /// successful permits and the first-dial callback with their parent.
 #[derive(Clone)]
-pub(crate) struct CapturedDialScope(Arc<DialScope>);
+pub(crate) struct CapturedDialScope(
+    Arc<DialScope>,
+    Option<super::flow_observation::FlowObserver>,
+    #[cfg(feature = "owned-tasks")] Option<std::sync::Weak<super::tasks::TaskOwner>>,
+);
 
 impl CapturedDialScope {
-    fn standalone() -> Self {
-        Self(DialScope::new(DialAdmission::standalone(), None))
+    pub(crate) fn without_observer(mut self) -> Self {
+        self.1 = None;
+        self
     }
 
-    pub(crate) async fn scope<F>(self, future: F) -> F::Output
+    fn standalone() -> Self {
+        Self(
+            DialScope::new(DialAdmission::standalone(), None),
+            super::flow_observation::current(),
+            #[cfg(feature = "owned-tasks")]
+            super::tasks::capture_owner(),
+        )
+    }
+
+    pub(crate) fn scope<F>(self, future: F) -> impl Future<Output = F::Output>
     where
         F: Future,
     {
-        DIAL_SCOPE.scope(self.0, future).await
+        let suppressed = super::flow_observation::is_suppressed();
+        let captured = if suppressed {
+            self.without_observer()
+        } else {
+            self
+        };
+        async move {
+            let future = DIAL_SCOPE.scope(captured.0, future);
+            // Inert builds skip this wrapper so the dial future gains no state.
+            #[cfg(feature = "flow-observation")]
+            let future = async {
+                if suppressed || super::flow_observation::is_suppressed() {
+                    super::flow_observation::without(future).await
+                } else {
+                    super::flow_observation::scope(captured.1, future).await
+                }
+            };
+            #[cfg(feature = "owned-tasks")]
+            return super::tasks::scope_owner(captured.2, future).await;
+            #[cfg(not(feature = "owned-tasks"))]
+            future.await
+        }
     }
 }
 
 /// Reusable admission identity for autonomous dial operations. Each scoped
 /// future receives its own permit-holding operation scope.
 #[derive(Clone)]
-pub(crate) struct CapturedDialAdmission(DialAdmission);
+pub(crate) struct CapturedDialAdmission(
+    DialAdmission,
+    #[cfg(feature = "owned-tasks")] Option<std::sync::Weak<super::tasks::TaskOwner>>,
+);
 
 impl CapturedDialAdmission {
     fn standalone() -> Self {
-        Self(DialAdmission::standalone())
+        Self(
+            DialAdmission::standalone(),
+            #[cfg(feature = "owned-tasks")]
+            super::tasks::capture_owner(),
+        )
     }
 
     pub(crate) async fn scope<F>(self, future: F) -> F::Output
     where
         F: Future,
     {
-        DIAL_SCOPE.scope(DialScope::new(self.0, None), future).await
+        let future = DIAL_SCOPE.scope(DialScope::new(self.0, None), future);
+        let future = super::flow_observation::without(future);
+        #[cfg(feature = "owned-tasks")]
+        return super::tasks::scope_owner(self.1, future).await;
+        #[cfg(not(feature = "owned-tasks"))]
+        future.await
     }
 }
 
 pub(crate) fn capture_dial_scope() -> CapturedDialScope {
     DIAL_SCOPE
-        .try_with(|scope| CapturedDialScope(Arc::clone(scope)))
+        .try_with(|scope| {
+            CapturedDialScope(
+                Arc::clone(scope),
+                super::flow_observation::current(),
+                #[cfg(feature = "owned-tasks")]
+                super::tasks::capture_owner(),
+            )
+        })
         .unwrap_or_else(|_| CapturedDialScope::standalone())
 }
 
 pub(crate) fn try_capture_dial_admission() -> Option<CapturedDialAdmission> {
     DIAL_SCOPE
-        .try_with(|scope| CapturedDialAdmission(scope.admission.clone()))
+        .try_with(|scope| {
+            CapturedDialAdmission(
+                scope.admission.clone(),
+                #[cfg(feature = "owned-tasks")]
+                super::tasks::capture_owner(),
+            )
+        })
         .ok()
 }
 
 pub(crate) fn capture_dial_admission() -> CapturedDialAdmission {
     try_capture_dial_admission().unwrap_or_else(CapturedDialAdmission::standalone)
+}
+
+pub(crate) fn pinned_server_address(host: &str) -> Option<std::net::IpAddr> {
+    DIAL_SCOPE
+        .try_with(|scope| {
+            scope.admission.endpoint.as_ref().and_then(|endpoint| {
+                endpoint
+                    .0
+                    .eq_ignore_ascii_case(host.trim_matches(['[', ']']))
+                    .then_some(endpoint.1)
+            })
+        })
+        .ok()
+        .flatten()
 }
 
 pub(crate) async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
@@ -282,6 +359,24 @@ impl OutboundRuntimeRegistry {
         DialAdmission::for_registry(self).acquire().await
     }
 
+    /// Pin the configured server without changing its identity or TLS/transport authority.
+    /// Captured dial scopes carry this pin into autonomous session factories.
+    #[cfg(feature = "owned-tasks")]
+    pub async fn scope_pinned_dials<F>(
+        &self,
+        host: &str,
+        ip: std::net::IpAddr,
+        future: F,
+    ) -> F::Output
+    where
+        F: Future,
+    {
+        let mut admission = DialAdmission::for_registry(self);
+        admission.endpoint = Some(Arc::new((host.trim_matches(['[', ']']).to_owned(), ip)));
+        DIAL_SCOPE
+            .scope(DialScope::new(admission, None), future)
+            .await
+    }
     /// Bind physical attempts made by `future` to this generation's gates.
     /// Nested dispatch through the same registry keeps the existing scope.
     pub async fn scope_dials<F>(&self, future: F) -> F::Output
@@ -312,10 +407,14 @@ impl OutboundRuntimeRegistry {
     /// Rebind autonomous AnyTLS replacement dials after this generation is
     /// published. Reused pools must stop consulting the predecessor's gate.
     pub fn activate_background_dial_admission(&self) {
-        let admission = CapturedDialAdmission(DialAdmission::for_registry(self));
+        let admission = DialAdmission::for_registry(self);
         for runtime in self.nodes.values() {
             if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
-                anytls.pool.set_dial_admission(admission.clone());
+                anytls.pool.set_dial_admission(CapturedDialAdmission(
+                    admission.clone(),
+                    #[cfg(feature = "owned-tasks")]
+                    runtime.task_owner.as_ref().map(Arc::downgrade),
+                ));
             }
         }
     }

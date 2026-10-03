@@ -163,7 +163,9 @@ impl<T> LifecycleSlot<T> {
         }
     }
 
-    pub(crate) async fn acquire<F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
+    /// The reuse flag includes callers coalesced behind another caller's build.
+    /// Acquiring a pool wrapper is not evidence of a physical connection.
+    pub(crate) async fn acquire<F, Fut>(&self, build: F) -> anyhow::Result<(Arc<T>, bool)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<T>>,
@@ -182,7 +184,7 @@ impl<T> LifecycleSlot<T> {
                     return Err(anyhow::Error::new(failure.error.clone()));
                 }
                 match &inner.state {
-                    SlotState::Ready(value) => return Ok(Arc::clone(value)),
+                    SlotState::Ready(value) => return Ok((Arc::clone(value), true)),
                     SlotState::Building { generation } => {
                         waited_generation = Some(*generation);
                         None
@@ -217,7 +219,7 @@ impl<T> LifecycleSlot<T> {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("initializer was already consumed"))?;
             match initializer().await {
-                Ok(value) => return Ok(guard.publish(value)),
+                Ok(value) => return Ok((guard.publish(value), false)),
                 Err(error) => {
                     let error = SharedError::fanout(error);
                     guard.fail(error.clone());
@@ -282,6 +284,69 @@ impl<T> LifecycleSlot<T> {
             notified.await;
         };
         self.finish_close(value, teardown).await;
+    }
+}
+
+pub(super) fn attached() {
+    if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
+        observer.publish(
+            honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
+                server_addr: None,
+                resolution_location:
+                    honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
+            },
+        );
+    }
+}
+
+use honk_outbound::runtime::flow_observation::SessionEvent;
+
+pub(super) struct SessionObservation {
+    observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
+    finished: bool,
+}
+
+impl SessionObservation {
+    pub(super) fn start() -> Self {
+        Self {
+            observer: honk_outbound::runtime::flow_observation::current(),
+            finished: false,
+        }
+    }
+
+    pub(super) fn record(&self, event: SessionEvent) {
+        if let Some(observer) = &self.observer {
+            observer.publish(honk_outbound::runtime::flow_observation::FlowEvent::Session(event));
+        }
+    }
+
+    pub(super) fn finish<T>(
+        mut self,
+        result: anyhow::Result<T>,
+        success: SessionEvent,
+    ) -> anyhow::Result<T> {
+        if self.observer.is_some() {
+            self.record(match &result {
+                Ok(_) => success,
+                Err(error) => match honk_outbound::proxy::packet_rejection(error) {
+                    Some(honk_outbound::proxy::PacketRejection::Cancelled) => {
+                        SessionEvent::DnsSessionReadyCancelled
+                    }
+                    Some(_) => SessionEvent::DnsSessionReadyRefused,
+                    None => SessionEvent::DnsSessionReadyFailed,
+                },
+            });
+        }
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for SessionObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record(SessionEvent::DnsSessionReadyCancelled);
+        }
     }
 }
 

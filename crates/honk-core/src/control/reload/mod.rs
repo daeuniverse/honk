@@ -5,12 +5,17 @@ mod policy;
 mod subscription;
 mod transaction;
 mod warm;
+pub(in crate::control) use warm::WarmTask;
 
 pub(in crate::control) use fingerprint::{
-    dns_routing_state_reusable, effective_config_unchanged, routing_state_reusable,
-    subscription_nodes_unchanged,
+    declaring_sources_replaced, dns_routing_state_reusable, effective_config_unchanged,
+    routing_state_reusable, subscription_nodes_unchanged,
 };
-pub(in crate::control) use policy::restart_required_changes;
+pub(crate) use policy::{LogFiles, restart_required_fields};
+#[cfg(test)]
+pub(in crate::control) use policy::{RestartField, restart_required_changes};
+#[cfg(feature = "native-api")]
+pub(crate) use transaction::rebase_subscription_nodes;
 
 #[cfg(test)]
 pub(in crate::control) use warm::{
@@ -28,7 +33,6 @@ pub(in crate::control) use connectivity::{
     urltest_group_registrations,
 };
 
-#[cfg(feature = "clash-api")]
 pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
@@ -78,6 +82,16 @@ pub(crate) fn resolve_outbound_nodes(
     vec![Config::builtin_direct_node()]
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::control) enum OutboundConstraint {
+    #[default]
+    Any,
+    #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+    Node(uuid::Uuid),
+    #[cfg(feature = "native-api")]
+    Unavailable,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedScorePlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
@@ -86,6 +100,8 @@ pub(super) struct ResolvedScorePlan {
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreAttempt>>,
     pub(super) selection_chains: Vec<Vec<String>>,
     pub(super) final_owners: Vec<Vec<String>>,
+    #[cfg(feature = "native-api")]
+    pub(super) observation: Option<Arc<honk_outbound::group::observation::SelectionObservation>>,
 }
 
 fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> ResolvedScorePlan {
@@ -106,6 +122,8 @@ fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> Resolve
         feedback,
         selection_chains,
         final_owners,
+        #[cfg(feature = "native-api")]
+        observation: plan.observation,
     }
 }
 
@@ -140,8 +158,29 @@ pub(super) fn resolve_outbound_plan_for_target(
     group_manager: &GroupManager,
     outbound_name: &str,
     context: &honk_outbound::group::ScoreSelectionContext,
+    constraint: OutboundConstraint,
 ) -> ResolvedScorePlan {
-    if let Some(node) = config.builtin_node(outbound_name) {
+    #[cfg(feature = "native-api")]
+    if match constraint {
+        OutboundConstraint::Unavailable => true,
+        #[cfg(any(feature = "clash-api", test))]
+        OutboundConstraint::Node(id) => !config.nodes.iter().any(|node| node.id == id),
+        OutboundConstraint::Any => false,
+    } {
+        return ResolvedScorePlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: Vec::new(),
+            health_family: context.health_family,
+            feedback: Vec::new(),
+            selection_chains: Vec::new(),
+            final_owners: Vec::new(),
+            #[cfg(feature = "native-api")]
+            observation: None,
+        };
+    }
+    if matches!(constraint, OutboundConstraint::Any)
+        && let Some(node) = config.builtin_node(outbound_name)
+    {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![node],
@@ -149,9 +188,17 @@ pub(super) fn resolve_outbound_plan_for_target(
             feedback: vec![None],
             selection_chains: vec![vec![outbound_name.to_owned()]],
             final_owners: vec![Vec::new()],
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
-    if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
+    if let Some(node) = config.nodes.iter().find(|node| match constraint {
+        OutboundConstraint::Any => node.name == outbound_name,
+        #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+        OutboundConstraint::Node(id) => node.id == id,
+        #[cfg(feature = "native-api")]
+        OutboundConstraint::Unavailable => false,
+    }) {
         let health_family = if group_manager.is_node_selectable_for_domain(
             node.id,
             context.probe_domain,
@@ -179,6 +226,8 @@ pub(super) fn resolve_outbound_plan_for_target(
                 .into_iter()
                 .collect(),
             final_owners: health_family.map(|_| Vec::new()).into_iter().collect(),
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
     if !config
@@ -193,6 +242,8 @@ pub(super) fn resolve_outbound_plan_for_target(
             feedback: vec![None],
             selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
             final_owners: vec![Vec::new()],
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
     own_score_plan(
@@ -209,6 +260,8 @@ pub(super) struct ResolvedUdpPlan {
     pub(super) ipver: IpVersion,
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreAttempt>>,
     pub(super) selection_chains: Vec<Vec<String>>,
+    #[cfg(feature = "native-api")]
+    pub(super) observation: Option<Arc<honk_outbound::group::observation::SelectionObservation>>,
 }
 
 pub(super) fn resolve_udp_outbound_plan_for_target(
@@ -216,13 +269,17 @@ pub(super) fn resolve_udp_outbound_plan_for_target(
     group_manager: &GroupManager,
     outbound_name: &str,
     context: &honk_outbound::group::ScoreSelectionContext,
+    constraint: OutboundConstraint,
 ) -> ResolvedUdpPlan {
-    let plan = resolve_outbound_plan_for_target(config, group_manager, outbound_name, context);
+    let plan =
+        resolve_outbound_plan_for_target(config, group_manager, outbound_name, context, constraint);
     ResolvedUdpPlan {
         mode: plan.mode,
         nodes: plan.nodes,
         ipver: plan.health_family,
         feedback: plan.feedback,
         selection_chains: plan.selection_chains,
+        #[cfg(feature = "native-api")]
+        observation: plan.observation,
     }
 }

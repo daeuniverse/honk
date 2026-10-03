@@ -349,6 +349,7 @@ fn __mark_tcp_seen(
                 state.pname.copy_from_slice(&args.pname);
             }
             state.pid = args.pid;
+            state.trace_id = args.trace_id;
             publish_routing_meta(&mut state.meta, meta);
         }
 
@@ -367,6 +368,14 @@ fn __mark_tcp_seen(
         new_state.state = TcpState::TcpStateActive as u8;
         new_state.last_seen_ns = now;
         new_state.pid = args.pid;
+        // A replacement cannot prove which SYN was accepted, even after sidecar eviction.
+        new_state.trace_id = if has_rt {
+            args.trace_id
+        } else if ptr_opt.is_some() {
+            u32::MAX
+        } else {
+            0
+        };
 
         if has_rt {
             new_state.meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
@@ -425,6 +434,7 @@ pub fn mark_tcp_seen(
     dscp: u8,
     pname: Option<&[u8; 16]>,
     pid: u32,
+    trace_id: u32,
 ) -> Option<&'static mut ConnState> {
     let zero: u32 = 0;
     let args = unsafe { CONNTRACK_ARGS_MAP.get_ptr_mut(zero).map(|ptr| &mut *ptr)? };
@@ -436,6 +446,7 @@ pub fn mark_tcp_seen(
     };
 
     args.set(dscp, pid, routing, mac, pname);
+    args.trace_id = trace_id;
 
     // Encode tcp_flags: bit 0 = pure SYN, bit 1 = FIN || RST
     let mut tcp_flags: u8 = 0;
@@ -504,6 +515,7 @@ fn __mark_udp_seen(
                 state.pname.copy_from_slice(&args.pname);
             }
             state.pid = args.pid;
+            state.trace_id = args.trace_id;
             publish_routing_meta(&mut state.meta, meta);
         }
         return state as *mut ConnState;
@@ -516,6 +528,7 @@ fn __mark_udp_seen(
     new_state.state = UdpDecisionState::None as u8;
     new_state.last_seen_ns = now;
     new_state.pid = args.pid;
+    new_state.trace_id = args.trace_id;
 
     if has_rt {
         new_state.meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
@@ -570,6 +583,7 @@ pub fn mark_udp_seen(
     dscp: u8,
     pname: Option<&[u8; 16]>,
     pid: u32,
+    trace_id: u32,
     routing_meta_flags: u64,
 ) -> Option<&'static mut ConnState> {
     let zero: u32 = 0;
@@ -582,6 +596,7 @@ pub fn mark_udp_seen(
     };
 
     args.set(dscp, pid, routing, mac, pname);
+    args.trace_id = trace_id;
     let key_ptr: *const TuplesKey = key;
     let args_ptr: *const ConntrackArgs = args;
     let result = __mark_udp_seen(

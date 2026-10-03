@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
 use super::framing::force_dns_id_zero;
-use super::lifecycle::{LifecycleSlot, SessionFailure};
+use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::owned_task::OwnedTask;
 use super::{
     DialContext, DnsMessageBody, build_doh_request, check_doh_status, doh_content_length,
@@ -154,30 +154,45 @@ impl DohClient {
     /// fails; `ready` catches that, and the session is rebuilt once before
     /// the query goes out, instead of the query spending its retry on it.
     async fn get_sender(&self) -> anyhow::Result<(Arc<H2Session>, H2Sender)> {
-        for attempt in 0..2 {
-            let session = self.session.acquire(|| self.handshake()).await?;
-            let sender = session.sender.lock().clone().ok_or_else(|| {
-                SessionFailure::new(
-                    Arc::clone(&session),
-                    anyhow::anyhow!("DoH session is closing"),
-                )
-            })?;
-            match sender.ready().await {
-                Ok(sender) => return Ok((session, sender)),
-                Err(error) if attempt == 0 => {
-                    debug!(error = %error, transport = "doh", "DoH session is dead; rebuilding");
-                    self.retire_session(&session).await;
-                }
-                Err(error) => {
-                    return Err(SessionFailure::new(
-                        session,
-                        anyhow::anyhow!("DoH session unusable: {error}"),
+        let observation = SessionObservation::start();
+        let result = async {
+            for attempt in 0..2 {
+                let (session, reused) = self.session.acquire(|| self.handshake()).await?;
+                let sender = session.sender.lock().clone().ok_or_else(|| {
+                    SessionFailure::new(
+                        Arc::clone(&session),
+                        anyhow::anyhow!("DoH session is closing"),
                     )
-                    .into());
+                })?;
+                match sender.ready().await {
+                    Ok(sender) => {
+                        if reused {
+                            super::lifecycle::attached();
+                        }
+                        return Ok((session, sender));
+                    }
+                    Err(error) if attempt == 0 => {
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed);
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted);
+                        debug!(error = %error, transport = "doh", "DoH session is dead; rebuilding");
+                        self.retire_session(&session).await;
+                    }
+                    Err(error) => {
+                        return Err(SessionFailure::new(
+                            session,
+                            anyhow::anyhow!("DoH session unusable: {error}"),
+                        )
+                        .into());
+                    }
                 }
             }
+            unreachable!("the loop returns or fails on its second pass")
         }
-        unreachable!("the loop returns or fails on its second pass")
+        .await;
+        observation.finish(
+            result,
+            honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadySucceeded,
+        )
     }
 
     async fn handshake(&self) -> anyhow::Result<H2Session> {
@@ -251,6 +266,175 @@ mod tests {
         DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE, doh_content_length,
     };
 
+    #[cfg(feature = "native-api")]
+    #[tokio::test]
+    async fn native_h2_reuse_and_stale_readiness_keep_inner_retry_evidence() {
+        use super::*;
+        use crate::dns::{endpoint::DnsEndpoint, forwarder::build_dns_query};
+        use crate::native_api::events::EventHub;
+        use crate::observe::flows::FlowStore;
+        use honk_config::types::DnsProtocol;
+        use uuid::Uuid;
+
+        let (mut config, _) = super::super::tests_proto::self_signed_server_config();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for count in [2, 1] {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = acceptor.accept(tcp).await.unwrap();
+                let mut connection = h2::server::handshake(tls).await.unwrap();
+                let mut responses = tokio::task::JoinSet::new();
+                for _ in 0..count {
+                    let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                    responses.spawn(async move {
+                        let mut request = request.into_body();
+                        let mut answer = Vec::new();
+                        while let Some(chunk) = request.data().await {
+                            let chunk = chunk.unwrap();
+                            answer.extend_from_slice(&chunk);
+                            request
+                                .flow_control()
+                                .release_capacity(chunk.len())
+                                .unwrap();
+                        }
+                        answer[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+                        let response = http::Response::builder().status(200).body(()).unwrap();
+                        respond
+                            .send_response(response, false)
+                            .unwrap()
+                            .send_data(Bytes::from(answer), true)
+                            .unwrap();
+                    });
+                }
+                if let Some(Ok(_)) = connection.accept().await {
+                    panic!("unexpected query replay");
+                }
+                while let Some(result) = responses.join_next().await {
+                    result.unwrap();
+                }
+            }
+        });
+        let mut client = DohClient::new(DialContext {
+            endpoint: DnsEndpoint::parse(
+                &format!("{address}/dns-query"),
+                DnsProtocol::Https,
+                Some("localhost"),
+            )
+            .unwrap(),
+            query_timeout: Duration::from_secs(2),
+            dial_timeout: Duration::from_secs(2),
+            proxy: None,
+        })
+        .unwrap();
+        Arc::get_mut(&mut client).unwrap().connector =
+            honk_outbound::tls::build_dns_connector(true, DOH_ALPN_WIRE).unwrap();
+        let instance = Uuid::new_v4().to_string();
+        let store = Arc::new(FlowStore::new(
+            instance.clone(),
+            Arc::new(EventHub::new(instance)),
+        ));
+        for (index, name) in ["cold.example", "warm.example", "recovered.example"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 2 {
+                let (session, _) = client
+                    .session
+                    .acquire(|| async { panic!("warm session") })
+                    .await
+                    .unwrap();
+                session.driver.shutdown(Duration::ZERO).await;
+            }
+            let flow = Arc::new(
+                store
+                    .begin(
+                        crate::observe::vocab::Network::Udp,
+                        "127.0.0.1:31000".parse().unwrap(),
+                        address,
+                    )
+                    .unwrap(),
+            );
+            let observer = flow.observer(11, None, "intercepted_query").unwrap();
+            let query = build_dns_query(name, 1);
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                observer.scope(client.exchange(&query, None)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(super::super::is_valid_response(&query, &response));
+            let view = store.test_detail(flow.id());
+            assert_eq!(view["trace"]["status"], "complete", "{view:#}");
+            let steps = view["trace"]["steps"].as_array().unwrap();
+            let lookup = steps
+                .iter()
+                .find(|step| step["stage"] == "dns" && step["data"]["status"] == "succeeded")
+                .unwrap();
+            let physical: Vec<_> = steps
+                .iter()
+                .filter(|step| step["stage"] == "outbound" && step["data"]["kind"] == "transport")
+                .collect();
+            assert_eq!(physical.len(), if index == 1 { 0 } else { 2 }, "{view:#}");
+            let attached: Vec<_> = steps
+                .iter()
+                .filter(|step| step["data"]["reason"] == "dns_transport_attached")
+                .collect();
+            assert_eq!(attached.len(), usize::from(index == 1), "{view:#}");
+            let session: Vec<_> = steps
+                .iter()
+                .filter(|step| {
+                    step["data"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.starts_with("dns_session_"))
+                })
+                .collect();
+            let reasons: Vec<_> = session
+                .iter()
+                .map(|step| step["data"]["reason"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                reasons,
+                if index == 2 {
+                    vec![
+                        "dns_session_ready_failed",
+                        "dns_session_retry_started",
+                        "dns_session_ready_succeeded",
+                    ]
+                } else {
+                    vec!["dns_session_ready_succeeded"]
+                },
+                "{view:#}"
+            );
+            assert!(session.iter().chain(attached.iter()).all(|step| {
+                step["data"]["attempt_id"].is_null()
+                    && step["data"]["lookup_id"] == lookup["data"]["lookup_id"]
+                    && step["generation_id"] == lookup["generation_id"]
+            }));
+            assert!(
+                session
+                    .iter()
+                    .all(|step| step["data"]["milestone"] == "unknown")
+            );
+            if index == 2 {
+                assert!(session[0]["seq"].as_u64().unwrap() < physical[0]["seq"].as_u64().unwrap());
+            }
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| step["data"]["reason"] == "target_confirmed"
+                        || step["data"]["milestone"] == "first_reply")
+            );
+        }
+        client.close().await;
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     #[tokio::test]
     async fn deterministic_responses_preserve_the_live_session() {
         use super::*;

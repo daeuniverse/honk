@@ -1,7 +1,7 @@
 use super::*;
 use honk_config::group::GroupPolicy;
 use honk_outbound::group::{
-    ScoreOutcome, ScoreSelectionContext, ScoreSource, ScoreTarget, SelectionNetwork,
+    GroupManager, ScoreOutcome, ScoreSelectionContext, ScoreSource, ScoreTarget, SelectionNetwork,
 };
 
 async fn get_json(app: &TestApp, path: &str) -> serde_json::Value {

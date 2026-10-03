@@ -133,6 +133,7 @@ fn readiness_plan(facts: RoutingFactMaps) -> RoutingPushPlan {
         fingerprint: [0; 32],
         has_domain_rules: false,
         domain_predicate_count: 0,
+        trace_enabled: false,
     }
 }
 

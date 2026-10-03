@@ -41,14 +41,12 @@ use tracing::debug;
 /// This is a hard bound: untrusted length fields never grow the buffer.
 const MAX_CLIENT_HELLO_SIZE: usize = 4096;
 
-/// Supported traffic types detected by sniffing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Supported traffic types detected by sniffing; the domain lives in
+/// [`SniffResult::domain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficType {
-    /// TLS traffic with optional SNI hostname
-    Tls { sni: Option<String> },
-    /// HTTP traffic with host header
-    Http { host: Option<String> },
-    /// Unknown traffic type
+    Tls,
+    Http,
     Unknown,
 }
 
@@ -76,9 +74,7 @@ impl SniffResult {
     /// Create a result with a domain extracted from TLS SNI.
     pub fn tls_sni(domain: String, buffered: Vec<u8>) -> Self {
         Self {
-            traffic_type: TrafficType::Tls {
-                sni: Some(domain.clone()),
-            },
+            traffic_type: TrafficType::Tls,
             domain: Some(domain),
             buffered,
         }
@@ -132,9 +128,7 @@ pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
     }
     if let Some(host) = parse_http_host(&data) {
         return SniffResult {
-            traffic_type: TrafficType::Http {
-                host: Some(host.clone()),
-            },
+            traffic_type: TrafficType::Http,
             domain: Some(host),
             buffered: data,
         };
@@ -609,12 +603,7 @@ mod tests {
         writer.await.unwrap();
 
         assert_eq!(result.domain.as_deref(), Some("fragmented.example.com"));
-        assert_eq!(
-            result.traffic_type,
-            TrafficType::Http {
-                host: Some("fragmented.example.com".to_string())
-            }
-        );
+        assert_eq!(result.traffic_type, TrafficType::Http);
         assert_eq!(result.buffered, request);
     }
 

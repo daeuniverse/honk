@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use honk_config::dns::DnsConfig;
-use honk_config::experimental::CacheFileConfig;
 
 use super::*;
 use crate::dns::cache::OperationKind;
@@ -10,17 +9,11 @@ use crate::dns::planner::{RequestScope, UpstreamTag};
 use crate::dns::query::{IngressProfile, QueryContext};
 
 mod actor;
+mod invalidation;
 mod restore;
 
-fn test_db(dir: &tempfile::TempDir, cache_id: &str) -> Arc<CacheDb> {
-    let config = CacheFileConfig {
-        enabled: true,
-        path: dir.path().join("cache.db").to_string_lossy().into_owned(),
-        cache_id: cache_id.to_string(),
-        store_fakeip: false,
-        store_dns: true,
-    };
-    Arc::new(CacheDb::open(&config).expect("cache.db"))
+fn test_db(dir: &tempfile::TempDir) -> Arc<CacheDb> {
+    Arc::new(CacheDb::in_dir(dir.path()))
 }
 
 fn policy(ttl: u64) -> PolicyId {

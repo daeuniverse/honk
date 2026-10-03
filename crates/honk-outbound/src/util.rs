@@ -101,6 +101,33 @@ pub async fn connect_marked_addr(
     mark: Option<u32>,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
+    use crate::runtime::flow_observation::{
+        ResolutionLocation, TransportAttempt, TransportError, TransportStatus,
+    };
+    let mut attempt = TransportAttempt::start(Some(addr), ResolutionLocation::Unknown);
+    let result = connect_marked_addr_inner(addr, mark, connect_timeout).await;
+    if let Some(attempt) = &mut attempt {
+        attempt.finish(
+            if result.is_ok() {
+                TransportStatus::Succeeded
+            } else {
+                TransportStatus::Failed
+            },
+            result.as_ref().err().map(|error| match error.kind() {
+                io::ErrorKind::TimedOut => TransportError::Timeout,
+                io::ErrorKind::ConnectionRefused => TransportError::ConnectionRefused,
+                _ => TransportError::ConnectFailed,
+            }),
+        );
+    }
+    result
+}
+
+async fn connect_marked_addr_inner(
+    addr: SocketAddr,
+    mark: Option<u32>,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
     let socket = new_tcp_socket(&addr, mark)?;
     match socket.connect(&addr.into()) {
         Ok(()) => {
@@ -140,15 +167,25 @@ pub async fn connect_marked(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    let addrs: Vec<_> = crate::bootstrap::resolve(host)
-        .await?
+    // Boxed: marked hosts/nameserver resolution and its lookup observation are
+    // several KiB, and every dial wrapper above this one would embed them.
+    let resolution = Box::pin(crate::bootstrap::resolve(host));
+    let (resolution, selection) =
+        crate::runtime::flow_observation::observe_resolution(resolution).await;
+    let addrs: Vec<_> = resolution?
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
         .collect();
     // Address fallback stays inside one authoritative node; policy selection
     // and its dial-admission accounting remain unchanged.
     crate::address_race::race_resolved_addrs(&addrs, |addr| {
-        connect_marked_addr(addr, mark, connect_timeout)
+        let selection = &selection;
+        async move {
+            if let Some(selection) = selection {
+                selection.selected_ip(addr.ip());
+            }
+            connect_marked_addr(addr, mark, connect_timeout).await
+        }
     })
     .await
     .unwrap_or_else(|| {

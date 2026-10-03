@@ -52,8 +52,7 @@ impl TrojanHandler {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
         let mut stream = super::transport::wrap_transport(node, tcp, connect_timeout).await?;
-        stream.write_all(&header).await?;
-        stream.flush().await?;
+        super::transport::write_request(&mut stream, &header).await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -110,8 +109,7 @@ impl PacketOutbound for TrojanHandler {
         header.push(CMD_UDP);
         header.extend_from_slice(&addr_header);
         header.extend_from_slice(CRLF);
-        control.write_all(&header).await?;
-        control.flush().await?;
+        super::transport::write_request(&mut control, &header).await?;
 
         let (rd, wr) = tokio::io::split(control);
         Ok(Arc::new(TrojanUdpTransport {

@@ -33,8 +33,10 @@ use std::time::{Duration, Instant};
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
-use state::UrlTestSelections;
+use state::{SelectorState, UrlTestSelections};
 
+#[cfg(feature = "flow-observation")]
+pub use resolver::GroupSelection;
 pub use score::{
     ScoreAttempt, ScoreAttribution, ScoreBudgetCounters, ScoreBusinessGuard, ScoreCacheSnapshot,
     ScoreChallenger, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceQuestion, ScoreFeedback,
@@ -43,7 +45,12 @@ pub use score::{
     ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
     ScoreVerificationState, ScoreWaitReason,
 };
-pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
+#[cfg(test)]
+pub use state::SelectorChoices;
+pub use state::{
+    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorError, SelectorMember,
+    SelectorNetworks, SelectorUpdate,
+};
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-
 /// time cycle breaking keeps the group graph acyclic; this bound (plus the
@@ -52,11 +59,7 @@ pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 pub const MAX_GROUP_DEPTH: usize = 8;
 const _: () = assert!(MAX_GROUP_DEPTH <= u8::BITS as usize);
 
-/// Network dimension for per-network group selections.
-///
-/// sing-box keeps `selectedOutboundTCP` and `selectedOutboundUDP` apart;
-/// honk does the same for URLTest groups so a node with fast TCP but
-/// broken UDP does not drag UDP flows down (and vice versa).
+/// Network dimension for independent group selections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectionNetwork {
     Tcp,
@@ -117,6 +120,7 @@ pub struct ScoreSelectionPlan<'a> {
     pub mode: SelectionPlanMode,
     pub health_family: IpVersion,
     pub entries: Vec<ScoreSelectionEntry<'a>>,
+    pub observation: Option<Arc<observation::SelectionObservation>>,
 }
 
 /// Whether resolving a selection may update group state or must only observe
@@ -168,7 +172,7 @@ pub type SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>;
 
 /// Display tags may be shared by distinct nodes; retain the concrete member.
 #[derive(Clone, Copy)]
-enum GroupMember<'a> {
+pub enum GroupMember<'a> {
     Node(&'a Node),
     Group(&'a Group),
 }
@@ -178,6 +182,13 @@ impl<'a> GroupMember<'a> {
         match self {
             Self::Node(node) => &node.name,
             Self::Group(group) => &group.name,
+        }
+    }
+
+    fn identity(self) -> SelectorMember {
+        match self {
+            Self::Node(node) => SelectorMember::Node(node.id),
+            Self::Group(group) => SelectorMember::Group(group.name.clone()),
         }
     }
 }
@@ -190,7 +201,7 @@ struct Candidate<'a> {
     /// Leaf node that would actually be dialed.
     node: &'a Node,
     attribution: Vec<&'a str>,
-    /// Pool obligations aligned with `attribution`, excluding each owner's explicit final.
+    /// Pool obligations aligned with `attribution`, excluding each owner's explicit final or pin.
     pool_bound: u8,
     selection_chain: Vec<&'a str>,
     final_owners: Vec<&'a str>,
@@ -289,9 +300,8 @@ pub struct GroupManager {
     lb_counters: HashMap<String, [AtomicUsize; 2]>,
     /// Per-group TCP/UDP Fallback pins.
     fallback_cache: RwLock<HashMap<String, [Option<String>; 2]>>,
-    /// Per-group selector choice (set via API, persisted by caller).
-    /// group_name → selected node name.
-    selector_choice: RwLock<HashMap<String, String>>,
+    /// One publication barrier for both Selector networks and their revision.
+    selector_choice: RwLock<SelectorState>,
     /// Per-group rate limiter for the sole TCP leaf's last-resort warning.
     last_resort_log: RwLock<HashMap<String, Instant>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
@@ -369,7 +379,7 @@ impl GroupManager {
                 })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
-            selector_choice: RwLock::new(HashMap::new()),
+            selector_choice: RwLock::new(SelectorState::default()),
             last_resort_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
@@ -637,6 +647,7 @@ impl GroupManager {
 }
 
 mod filter;
+pub mod observation;
 mod policy;
 mod resolver;
 mod score;

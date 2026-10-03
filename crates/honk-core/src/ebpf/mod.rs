@@ -217,6 +217,105 @@ pub struct DynamicHooks {
     pub egress: bool,
 }
 
+pub const MAX_DATAPATH_PROGRAMS: usize = 64;
+pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathKind {
+    Real,
+    Mock,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathCheck {
+    Verified,
+    Absent,
+    Unknown,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathObservationError {
+    Programs,
+    Hooks,
+    Routing,
+    Admission,
+    Maps,
+    Limit,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatapathProgram {
+    pub name: String,
+    pub id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatapathAttachment {
+    pub program: String,
+    pub interface: String,
+    pub egress: bool,
+    pub state: DatapathCheck,
+}
+
+/// Facts checked during one read of the backend cell, not configuration intent.
+/// Unknown occupancy is deliberate: observation never walks a traffic map.
+#[derive(Debug, Clone)]
+pub struct DatapathObservation {
+    pub kind: DatapathKind,
+    pub checked_at: std::time::SystemTime,
+    pub programs: DatapathCheck,
+    pub loaded_programs: Vec<DatapathProgram>,
+    pub hooks: DatapathCheck,
+    pub routing: DatapathCheck,
+    pub routing_generation: Option<u64>,
+    pub admission: Option<bool>,
+    pub listeners_published: Option<bool>,
+    pub attachments: Vec<DatapathAttachment>,
+    pub conn_state_capacity: Option<u32>,
+    pub errors: Vec<DatapathObservationError>,
+}
+
+impl DatapathObservation {
+    pub fn unknown(kind: DatapathKind) -> Self {
+        Self {
+            kind,
+            checked_at: std::time::SystemTime::now(),
+            programs: DatapathCheck::Unknown,
+            loaded_programs: Vec::new(),
+            hooks: DatapathCheck::Unknown,
+            routing: DatapathCheck::Unknown,
+            routing_generation: None,
+            admission: None,
+            listeners_published: None,
+            attachments: Vec::new(),
+            conn_state_capacity: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn record_error(&mut self, error: DatapathObservationError) {
+        if !self.errors.contains(&error) {
+            self.errors.push(error);
+        }
+    }
+
+    /// Claims hooks only when each of the `required` hooks was checked and found
+    /// attached. A required hook that cannot be checked keeps `hooks` unknown.
+    pub fn verify_required_hooks(&mut self, required: usize) {
+        if required > 0
+            && self.attachments.len() == required
+            && self
+                .attachments
+                .iter()
+                .all(|attachment| attachment.state == DatapathCheck::Verified)
+        {
+            self.hooks = DatapathCheck::Verified;
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DatapathFlagsWriteOrigin {
@@ -236,8 +335,52 @@ pub struct DatapathFlagsWriteTrace {
     pub failed: bool,
 }
 
+/// How far the datapath can match `pname()` rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PnameSupport {
+    #[default]
+    Full,
+    /// Kernel argv capture is unavailable; rules see the thread name.
+    ThreadName,
+    /// The cgroup hooks are not attached; `pname()` never matches and
+    /// `!pname()` always does.
+    Unavailable,
+}
+
+/// Lists `pname_routing` while `router` has a `pname()` rule that `backend` reduces.
+pub(crate) fn record_pname_routing(
+    router: &crate::routing::Router,
+    backend: &dyn EbpfBackend,
+    degradations: &crate::degradations::Degradations,
+) {
+    use crate::degradations::{Component, Issue};
+    let issue = match backend.pname_support() {
+        PnameSupport::Full => None,
+        _ if !router.uses_process_name() => None,
+        PnameSupport::ThreadName => Some(Issue {
+            code: "pname_routing_reduced",
+            message: "Kernel argv capture is unavailable; process-name rules match the thread name.",
+            reason: "comm_fallback",
+        }),
+        PnameSupport::Unavailable => Some(Issue {
+            code: "pname_routing_disabled",
+            message: "cgroup v2 is unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match.",
+            reason: "cgroup_unavailable",
+        }),
+    };
+    match issue {
+        Some(issue) => degradations.set(Component::PnameRouting, issue),
+        None => degradations.clear(Component::PnameRouting),
+    }
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
+    /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
+    fn observe_datapath(&self) -> DatapathObservation {
+        DatapathObservation::unknown(DatapathKind::Unknown)
+    }
+
     fn inject_routing_fault(
         &mut self,
         _phase: RoutingPushPhase,
@@ -355,6 +498,10 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Release all published listener references only after admission is closed
+    /// and the caller has joined ingress. Errors never authorize reopening.
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()>;
 
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 
@@ -499,6 +646,38 @@ pub trait EbpfBackend: Send + Sync {
     /// only job is to keep the backend (and its map fds) alive against
     /// `cleanup()`, which takes the write lock.
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>>;
+
+    fn routing_handoff_take_observed(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
+        Ok(self.routing_handoff_take(key)?.map(|entry| (entry, true)))
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        _key: &TuplesKey,
+        _reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
+        Err("kernel_trace_unsupported")
+    }
+
+    #[cfg(feature = "ebpf")]
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
+        None
+    }
+
+    fn pname_support(&self) -> PnameSupport {
+        PnameSupport::Full
+    }
 
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
     fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;

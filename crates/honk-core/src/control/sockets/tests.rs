@@ -589,6 +589,153 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
     assert_eq!(metadata.packet_mark, None);
 }
 
+#[test]
+fn optional_priority_cmsg_cannot_reject_or_relabel_packet_marks() {
+    for (priorities, expected) in [
+        (vec![42u32.to_ne_bytes().to_vec()], Some(42)),
+        (vec![vec![1, 2, 3]], None),
+        (
+            vec![42u32.to_ne_bytes().to_vec(), 43u32.to_ne_bytes().to_vec()],
+            None,
+        ),
+        (vec![vec![], 42u32.to_ne_bytes().to_vec()], None),
+    ] {
+        let mut storage = AlignedTestCmsgStorage::new();
+        let mut used = 0;
+        append_cmsg(
+            &mut storage,
+            &mut used,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &77u32.to_ne_bytes(),
+        );
+        for priority in priorities {
+            append_cmsg(
+                &mut storage,
+                &mut used,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                &priority,
+            );
+        }
+        let meta = parse_cmsg_control(&storage.bytes[..used], 0, addr("127.0.0.1:53")).unwrap();
+        assert_eq!(meta.packet_mark, Some(77));
+        assert_eq!(meta.packet_priority, expected);
+    }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[test]
+#[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Result<()> {
+    use socket2::Protocol;
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)?;
+        let mut netlink = crate::netlink::NlSock::new()?;
+        let (loopback, _) = netlink.get_link("lo")?;
+        netlink.set_link_up(loopback, true)?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let (bpf, trace) = crate::ebpf::real::receive_trace::ReceiveTrace::load_for_test()?;
+                for address in [addr("127.0.0.1:0"), addr("[::1]:0")] {
+                    for native in [false, true] {
+                        let receiver = build_tproxy_udp(address, false, true)?;
+                        if native && set_so_recvpriority(&receiver).is_err() {
+                            continue; // Linux 6.12 is required to exercise the fallback above.
+                        }
+                        let local = receiver.local_addr()?;
+                        let sender = Socket::new(
+                            Domain::for_address(address),
+                            Type::DGRAM,
+                            Some(Protocol::UDP),
+                        )?;
+                        sender.bind(&address.into())?;
+                        let mut batch = UdpRecvBatch::new_for_test(1)?;
+                        if !native {
+                            batch.register_trace(&receiver, &trace)?;
+                            assert!(trace.register(receiver.as_raw_fd()).is_err());
+                        }
+                        if address.is_ipv4() {
+                            let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))?;
+                            raw.set_priority(999)?;
+                            let mut corrupt = [0u8; 10];
+                            corrupt[..2].copy_from_slice(&12345u16.to_be_bytes());
+                            corrupt[2..4].copy_from_slice(&local.port().to_be_bytes());
+                            corrupt[4..6].copy_from_slice(&10u16.to_be_bytes());
+                            let mut sum =
+                                0x7f01u32 * 2 + 17 + 10 + 12345 + u32::from(local.port()) + 10;
+                            while sum > 0xffff {
+                                sum = (sum & 0xffff) + (sum >> 16);
+                            }
+                            let bad_checksum = if !(sum as u16) == 1 { 2u16 } else { 1 };
+                            corrupt[6..8].copy_from_slice(&bad_checksum.to_be_bytes());
+                            raw.send_to(&corrupt, &local.into())?;
+                        }
+                        for sequence in 0..8u8 {
+                            sender.set_priority(if sequence == 4 {
+                                0
+                            } else {
+                                100 + sequence as u32
+                            })?;
+                            set_so_mark(&sender, 200 + sequence as u32)?;
+                            let bytes = [sequence; 2];
+                            let size = match sequence {
+                                0 => 0,
+                                3 => 2,
+                                _ => 1,
+                            };
+                            sender.send_to(&bytes[..size], &local.into())?;
+                        }
+                        batch.recv_now(receiver.as_raw_fd(), local)?;
+                        assert_eq!(batch.len(), 8);
+                        for index in 0..8 {
+                            if index == 3 {
+                                assert_eq!(
+                                    batch.packet(index).unwrap_err().kind(),
+                                    io::ErrorKind::InvalidData
+                                );
+                                continue;
+                            }
+                            let (payload, _, meta) = batch.packet(index).unwrap();
+                            if index == 0 {
+                                assert!(payload.is_empty());
+                            } else {
+                                assert_eq!(payload, &[index as u8]);
+                            }
+                            assert_eq!(meta.packet_mark, Some(200 + index as u32));
+                            assert_eq!(
+                                meta.packet_priority,
+                                Some(if index == 4 { 0 } else { 100 + index as u32 })
+                            );
+                        }
+                        assert_eq!(
+                            batch
+                                .recv_now(receiver.as_raw_fd(), local)
+                                .unwrap_err()
+                                .kind(),
+                            io::ErrorKind::WouldBlock
+                        );
+                        sender.set_priority(555)?;
+                        sender.send_to(b"x", &local.into())?;
+                        batch.recv_now(receiver.as_raw_fd(), local)?;
+                        assert_eq!(batch.packet(0).unwrap().2.packet_priority, Some(555));
+                        drop(batch);
+                        if !native {
+                            drop(trace.register(receiver.as_raw_fd())?);
+                        }
+                    }
+                }
+                drop(bpf);
+                drop(trace);
+                Ok(())
+            })
+    })
+    .join()
+    .expect("receive trace namespace thread")
+}
+
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 #[test]
 #[ignore = "requires an isolated root network namespace; run via just test-netns"]
@@ -671,4 +818,23 @@ fn reply_send_errors_about_the_destination_keep_the_socket() {
     assert!(!send_error_is_destination_specific(&io::Error::other(
         "no os code"
     )));
+}
+
+/// A client that vanishes without FIN/RST must not pin its relay forever:
+/// accepted sockets are probed and a silent peer is cut within hours.
+#[cfg(target_os = "linux")]
+#[test]
+fn accepted_client_sockets_detect_a_vanished_peer() {
+    let listener = sockets::bind_tproxy_tcp(SocketAddr::from(([127, 0, 0, 1], 0)), 0).unwrap();
+    let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+
+    let socket = socket2::SockRef::from(&accepted);
+    assert!(socket.keepalive().unwrap(), "probes must be enabled");
+    let silence = socket.tcp_keepalive_time().unwrap()
+        + socket.tcp_keepalive_interval().unwrap() * socket.tcp_keepalive_retries().unwrap();
+    assert!(
+        silence <= std::time::Duration::from_secs(2 * 3600),
+        "a dead peer must be detected within 2 hours, got {silence:?}"
+    );
 }

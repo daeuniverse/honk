@@ -12,6 +12,14 @@ pub(in crate::control::udp_endpoint) enum SourceReplyTarget {
     Drop,
 }
 
+struct ForeignReplyGuard<'a>(&'a SourceOwner);
+
+impl Drop for ForeignReplyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().active_foreign_reply = None;
+    }
+}
+
 impl UdpEndpointPool {
     pub(in crate::control::udp_endpoint) fn classify_source_reply(
         &self,
@@ -24,7 +32,18 @@ impl UdpEndpointPool {
         };
         let Some(entry) = self.endpoints.get(&key) else {
             return match owner.scope.reply {
-                ReplyProjection::ActualPeer => SourceReplyTarget::Foreign(peer),
+                ReplyProjection::ActualPeer => {
+                    let state = owner.state.lock();
+                    if state.foreign_replies_disabled
+                        || state
+                            .retired_reply_peers
+                            .contains(&normalize_socket_addr(peer))
+                    {
+                        SourceReplyTarget::Drop
+                    } else {
+                        SourceReplyTarget::Foreign(peer)
+                    }
+                }
                 ReplyProjection::RewriteTo(_) => SourceReplyTarget::Drop,
             };
         };
@@ -59,9 +78,6 @@ impl UdpEndpointPool {
         token: u32,
         endpoint: &Arc<UdpEndpoint>,
     ) -> bool {
-        if !owner.is_ready() || !endpoint.begin_source_reply(owner.id) {
-            return false;
-        }
         self.endpoints.get(&key).is_some_and(|entry| {
             matches!(
                 entry.value(),
@@ -71,23 +87,40 @@ impl UdpEndpointPool {
                         && ready.alive.load(Ordering::Acquire)
                         && Arc::ptr_eq(&ready.endpoint, endpoint)
                         && ready.endpoint.source_owner_id() == Some(owner.id)
-            )
+            ) && endpoint.begin_source_reply(owner.id)
         })
     }
 
-    fn foreign_source_reply_admitted(&self, owner: &SourceOwner, peer: SocketAddr) -> bool {
-        if !owner.is_ready()
-            || self
-                .sources
-                .get(&owner.scope)
-                .is_none_or(|entry| entry.id != owner.id)
+    fn admit_foreign_source_reply<'a>(
+        &self,
+        owner: &'a SourceOwner,
+        peer: SocketAddr,
+    ) -> Option<ForeignReplyGuard<'a>> {
+        if self
+            .sources
+            .get(&owner.scope)
+            .is_none_or(|entry| entry.id != owner.id)
         {
-            return false;
+            return None;
         }
-        matches!(owner.scope.reply, ReplyProjection::ActualPeer)
-            && !self
-                .endpoints
-                .contains_key(&EndpointKey::new(owner.scope.client, peer))
+        let entry = self
+            .endpoints
+            .entry(EndpointKey::new(owner.scope.client, peer));
+        if !matches!(entry, dashmap::mapref::entry::Entry::Vacant(_)) {
+            return None;
+        }
+        let mut state = owner.state.lock();
+        let peer = normalize_socket_addr(peer);
+        if !matches!(owner.scope.reply, ReplyProjection::ActualPeer)
+            || state.retirement.is_some()
+            || state.foreign_replies_disabled
+            || state.retired_reply_peers.contains(&peer)
+            || state.active_foreign_reply.is_some()
+        {
+            return None;
+        }
+        state.active_foreign_reply = Some(peer);
+        Some(ForeignReplyGuard(owner))
     }
 }
 
@@ -112,17 +145,38 @@ pub(super) async fn deliver_source_reply(
             endpoint,
             source,
         } => {
-            if !pool.source_flow_reply_admitted(owner, key, generation, token, &endpoint)
-                || source.is_ipv4() != owner.scope.client.is_ipv4()
-            {
+            if !pool.source_flow_reply_admitted(owner, key, generation, token, &endpoint) {
                 return SourceReplyDisposition::Drop;
             }
-            if let Err(error) = endpoint
-                .source_reply_socket()
-                .send_to(data, owner.scope.client)
-                .await
+            endpoint.native.reply_received();
+            if source.is_ipv4() != owner.scope.client.is_ipv4() {
+                endpoint
+                    .native
+                    .dropped("reply_family_mismatch", Some("reply_family_mismatch"));
+                return SourceReplyDisposition::Drop;
+            }
+            #[cfg(test)]
             {
-                debug!("VLESS UDP source reply delivery failed: {}", error);
+                let hook = endpoint.source_reply_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook.entered.notify_one();
+                    hook.release.notified().await;
+                }
+            }
+            if !matches!(
+                tokio::time::timeout(
+                    TRANSPORT_SEND_TIMEOUT,
+                    endpoint
+                        .source_reply_socket()
+                        .send_to(data, owner.scope.client)
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                endpoint
+                    .native
+                    .dropped("client_delivery_failed", Some("client_send_failed"));
+                debug!("VLESS UDP source reply delivery failed");
                 return SourceReplyDisposition::Observed;
             }
             endpoint.mark_reply();
@@ -133,9 +187,7 @@ pub(super) async fn deliver_source_reply(
             SourceReplyDisposition::Delivered
         }
         SourceReplyTarget::Foreign(source) => {
-            if !pool.foreign_source_reply_admitted(owner, source)
-                || source.is_ipv4() != owner.scope.client.is_ipv4()
-            {
+            if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 return SourceReplyDisposition::Drop;
             }
             let index = match alternate_reply_sockets
@@ -156,15 +208,20 @@ pub(super) async fn deliver_source_reply(
                 }
                 None => return SourceReplyDisposition::Observed,
             };
-            if !pool.foreign_source_reply_admitted(owner, source) {
+            let Some(_reply) = pool.admit_foreign_source_reply(owner, source) else {
                 return SourceReplyDisposition::Drop;
-            }
-            if let Err(error) = alternate_reply_sockets[index]
-                .1
-                .send_to(data, owner.scope.client)
-                .await
-            {
-                debug!("VLESS UDP foreign reply delivery failed: {}", error);
+            };
+            if !matches!(
+                tokio::time::timeout(
+                    TRANSPORT_SEND_TIMEOUT,
+                    alternate_reply_sockets[index]
+                        .1
+                        .send_to(data, owner.scope.client)
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                debug!("VLESS UDP foreign reply delivery failed");
                 SourceReplyDisposition::Observed
             } else {
                 owner.node_tracker.add_bytes(0, data.len() as u64);

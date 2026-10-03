@@ -578,10 +578,8 @@ fn sample_config() -> Config {
         "https://example.com/ui.zip".to_string();
     config.experimental.clash_api.external_ui_download_detour = "proxy".to_string();
     config.experimental.clash_api.secret = "s3cret".to_string();
-    config.experimental.cache_file.enabled = true;
-    config.experimental.cache_file.path = "cache.db".to_string();
-    config.experimental.cache_file.cache_id = "router1".to_string();
-    config.experimental.cache_file.store_fakeip = true;
+    config.experimental.cache_file.enabled = Some(true);
+    config.experimental.cache_file.store_dns = true;
 
     config.nodes.push(
         Node::from_share_link(
@@ -1382,10 +1380,14 @@ fn test_vless_udp_query_coalesces_equal_claims_and_rejects_bad_values() {
 #[test]
 fn test_rejects_vless_mode_on_other_protocols() {
     for query in ["vless_mode=h2mux", "packetEncoding=xudp"] {
-        assert!(
-            Node::from_share_link(&format!("trojan://password@example.com:443?{query}#node"))
-                .is_err()
-        );
+        let link = format!("trojan://password@example.com:443?{query}#node");
+        assert!(Node::from_share_link(&link).is_err());
+        // The link parses; only the parameter is misplaced, so the message
+        // must not claim a syntax error.
+        let mut diagnostics = Vec::new();
+        let error =
+            Node::from_share_link_with_detailed_diagnostics(&link, &mut diagnostics).unwrap_err();
+        assert_eq!(error.diagnostic.message, "invalid configuration", "{query}");
     }
 }
 

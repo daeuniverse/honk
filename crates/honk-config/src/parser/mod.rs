@@ -1,3 +1,4 @@
+mod assets;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod cursor;
@@ -10,9 +11,15 @@ mod routing;
 
 mod read;
 mod scalars;
+pub mod source_edit;
+mod sources;
 use entries::{parse_node_section, parse_subscription_section};
 use groups::{parse_group_section, resolve_group_filters_inner};
 use scalars::{parse_experimental_section, parse_global_section};
+pub use sources::{
+    LoadedConfig, SourceLimits, SourceSnapshot, check_dae_source, load_dae_sources,
+    load_dae_sources_in_memory, parse_dae_sources,
+};
 
 #[cfg(test)]
 mod tests;
@@ -23,7 +30,7 @@ mod lexer_tests;
 #[cfg(test)]
 mod cursor_tests;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -82,47 +89,85 @@ pub fn parse_dae_config_file_with_detailed_diagnostics(
     path: impl AsRef<Path>,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<Config, DetailedConfigError> {
-    let result = parse_dae_config_file_attempt(path, diagnostics, &mut false);
+    let result = parse_dae_config_file_attempt(path, None, diagnostics, &mut false);
     finish_attempt(result, diagnostics)
 }
 
 pub(crate) fn parse_dae_config_file_attempt(
     path: impl AsRef<Path>,
+    entry_input: Option<Arc<str>>,
     diagnostics: &mut Vec<DetailedDiagnostic>,
     semantic: &mut bool,
 ) -> Result<Config, DetailedConfigError> {
-    let source = DiagnosticSources::new(Some(path.as_ref().to_path_buf())).root();
-    let mut sink = ParserDiagnostics::new(diagnostics, source);
-    let result = match parse_dae_file_inner(path, &mut sink, semantic) {
-        Ok(config) => Ok(config),
-        Err(ParseFailure::Detailed(error)) => Err(error),
-        Err(ParseFailure::Legacy(error)) => Err(sink.error(error)),
-    };
-    sink.finish();
-    result
+    sources::load_attempt(
+        path.as_ref(),
+        &HashMap::new(),
+        SourceLimits::UNLIMITED,
+        entry_input,
+        true,
+        diagnostics,
+        semantic,
+    )
+    .map(|loaded| loaded.config)
 }
 
 fn parse_dae_file_inner(
-    path: impl AsRef<Path>,
+    path: &Path,
+    overlay: &HashMap<PathBuf, Arc<str>>,
+    limits: SourceLimits,
+    entry_input: Option<Arc<str>>,
+    disk: bool,
     diagnostics: &mut ParserDiagnostics<'_>,
     semantic: &mut bool,
-) -> Result<Config, ParseFailure> {
-    let entry =
-        std::fs::canonicalize(path.as_ref()).map_err(|error| ParseFailure::Legacy(error.into()))?;
+) -> Result<LoadedConfig, ParseFailure> {
+    let entry = if !disk {
+        sources::lexical_source_path(path)
+    } else if overlay.contains_key(path) {
+        sources::canonical_overlay_path(path)
+    } else {
+        std::fs::canonicalize(path)
+    }
+    .map_err(|error| ParseFailure::Legacy(error.into()))?;
+    diagnostics.set_source(DiagnosticSources::new(Some(entry.clone())).root());
     let entry_dir = entry.parent().map(Path::to_path_buf).ok_or_else(|| {
-        ParseFailure::Legacy(crate::ConfigError::Include(format!(
-            "entry configuration '{}' has no parent directory",
-            entry.display()
-        )))
+        sources::source_error(
+            diagnostics.source(),
+            "invalid-config-path",
+            "configuration entry requires a parent directory",
+        )
     })?;
+    for path in overlay.keys() {
+        let canonical = if disk {
+            sources::canonical_overlay_path(path)
+        } else {
+            sources::lexical_source_path(path)
+        };
+        if !path.starts_with(&entry_dir)
+            || !canonical.is_ok_and(|canonical| canonical == *path)
+            || disk && std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
+        {
+            return Err(sources::source_error(
+                diagnostics.source(),
+                "invalid-config-overlay",
+                "configuration overlay paths must be canonical and confined to the entry directory",
+            )
+            .into());
+        }
+    }
     let mut loader = IncludeLoader {
         entry_dir,
         loaded: HashSet::new(),
         stack: Vec::new(),
         saw_include: false,
         entry_input: Arc::from(""),
+        supplied_entry: entry_input,
+        overlay,
+        disk,
+        limits,
+        bytes: 0,
+        sources: Vec::new(),
     };
-    let documents = match loader.expand_file(&entry, diagnostics) {
+    let documents = match loader.expand_file(&entry, None, diagnostics) {
         Ok(documents) => documents,
         Err(error) => {
             if loader.saw_include {
@@ -139,7 +184,10 @@ fn parse_dae_file_inner(
         }
     };
     match parse_documents(&documents, diagnostics) {
-        Ok(config) => Ok(config),
+        Ok(config) => Ok(LoadedConfig {
+            config,
+            sources: loader.sources,
+        }),
         Err(err) => {
             *semantic = loader.saw_include || !is_structured_document(&loader.entry_input);
             match err {
@@ -189,36 +237,37 @@ fn is_structured_document(input: &str) -> bool {
     })
 }
 
-struct IncludeLoader {
+struct IncludeLoader<'a> {
     entry_dir: PathBuf,
-    // dae treats a repeated include as a circular include too.  Keep that
-    // behavior, but canonical paths also prevent symlink aliases escaping it.
+    // Canonical paths prevent symlink aliases from bypassing duplicate detection.
     loaded: HashSet<PathBuf>,
     stack: Vec<PathBuf>,
     saw_include: bool,
     entry_input: Arc<str>,
+    supplied_entry: Option<Arc<str>>,
+    overlay: &'a HashMap<PathBuf, Arc<str>>,
+    /// When false the overlay is the whole source set and no path is resolved on disk.
+    disk: bool,
+    limits: SourceLimits,
+    bytes: usize,
+    sources: Vec<SourceSnapshot>,
 }
 
-impl IncludeLoader {
+impl IncludeLoader<'_> {
     fn expand_file(
         &mut self,
         path: &Path,
+        parent_index: Option<usize>,
         diagnostics: &mut ParserDiagnostics<'_>,
     ) -> Result<Vec<Document<'static>>, ParseFailure> {
         if !self.loaded.insert(path.to_path_buf()) {
-            let mut chain = self
-                .stack
-                .iter()
-                .map(|entry| entry.display().to_string())
-                .collect::<Vec<_>>();
-            chain.push(path.display().to_string());
-            return Err(crate::ConfigError::Include(format!(
-                "circular or duplicate include is not allowed: {}",
-                chain.join(" -> ")
-            ))
+            return Err(sources::source_error(
+                diagnostics.source(),
+                "duplicate-config-source",
+                "circular or duplicate include is not allowed",
+            )
             .into());
         }
-
         let parent = diagnostics.source();
         let source = if self.stack.is_empty() {
             parent
@@ -228,25 +277,60 @@ impl IncludeLoader {
                 .add(Some(path.to_path_buf()), Some(parent.index()))
         };
         diagnostics.set_source(source.clone());
+        sources::check_budget(self.limits, self.sources.len(), self.bytes, 0, &source)?;
         self.stack.push(path.to_path_buf());
         let result = (|| {
-            let input = std::fs::read_to_string(path).map_err(|err| {
-                crate::ConfigError::Include(format!(
-                    "failed to read configuration '{}': {err}",
-                    path.display()
-                ))
-            })?;
-            let input: Arc<str> = input.into();
+            let supplied_entry = if self.stack.len() == 1 {
+                self.supplied_entry.take()
+            } else {
+                None
+            };
+            let input = if let Some(input) = self.overlay.get(path) {
+                input.clone()
+            } else if let Some(input) = supplied_entry {
+                input
+            } else if !self.disk {
+                return Err(sources::source_error(
+                    source.clone(),
+                    "missing-config-source",
+                    "configuration source is not in the supplied set",
+                )
+                .into());
+            } else {
+                sources::read_source(
+                    path,
+                    self.limits.max_bytes.saturating_sub(self.bytes),
+                    &source,
+                )?
+            };
+            let loaded_at = std::time::SystemTime::now();
+            sources::check_budget(
+                self.limits,
+                self.sources.len(),
+                self.bytes,
+                input.len(),
+                &source,
+            )?;
+            self.bytes += input.len();
             if self.stack.len() == 1 {
                 self.entry_input = input.clone();
             }
-            let source_text = lexer::Source::shared(input, source.clone());
+            let source_text = lexer::Source::shared(input.clone(), source.clone());
             let document =
                 Document::parse_attempt(source_text, diagnostics.output, self.stack.len() == 1)
                     .map_err(|error| {
                         self.saw_include |= error.saw_include;
                         ParseFailure::Detailed(error.error)
                     })?;
+            let source_index = self.sources.len();
+            self.sources.push(SourceSnapshot {
+                path: path.to_path_buf(),
+                content: input,
+                parent: parent_index,
+                source: source.clone(),
+                contains_api_secret: sources::contains_api_secret(&document),
+                loaded_at,
+            });
             let mut patterns = Vec::new();
             for segment in document
                 .sections()
@@ -257,15 +341,12 @@ impl IncludeLoader {
                 patterns.extend(parse_include_body(segment, path)?);
             }
             let mut documents = vec![document];
-
-            // dae merges an entry's own sections before the sections of its
-            // included descendants, regardless of where `include` occurs in
-            // that entry.  Appending recursively gives that preorder.
+            // dae merges own sections before descendants, in declaration/glob order.
             for pattern in patterns {
                 diagnostics.set_source(source.clone());
-                for child in self.expand_pattern(&pattern, path)? {
+                for child in self.expand_pattern(&pattern, &source)? {
                     diagnostics.set_source(source.clone());
-                    documents.extend(self.expand_file(&child, diagnostics)?);
+                    documents.extend(self.expand_file(&child, Some(source_index), diagnostics)?);
                 }
             }
             Ok(documents)
@@ -277,64 +358,136 @@ impl IncludeLoader {
     fn expand_pattern(
         &self,
         pattern: &str,
-        source: &Path,
-    ) -> Result<Vec<PathBuf>, crate::ConfigError> {
+        source: &crate::diagnostic::SourceRef,
+    ) -> Result<Vec<PathBuf>, ParseFailure> {
         let pattern_path = Path::new(pattern);
         let pattern = if pattern_path.is_absolute() {
             pattern_path.to_path_buf()
         } else {
             self.entry_dir.join(pattern_path)
         };
-        // `glob` gives `**` recursive semantics while dae's filepath.Glob
-        // treats it as an ordinary same-component wildcard.  Normalize the
-        // one divergent form before matching.
-        let pattern = normalize_dae_glob_pattern(&pattern);
-        let pattern_display = pattern.display().to_string();
-        let mut matches = glob::glob(&pattern_display)
-            .map_err(|err| {
-                crate::ConfigError::Include(format!(
-                    "invalid include pattern '{}' in '{}': {err}",
-                    pattern_display,
-                    source.display()
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| {
-                crate::ConfigError::Include(format!(
-                    "failed to expand include pattern '{}' in '{}': {err}",
-                    pattern_display,
-                    source.display()
-                ))
-            })?;
-        matches.sort();
-
-        let mut files = Vec::new();
-        for path in matches {
+        // dae treats `**` as an ordinary same-component wildcard.
+        let mut pattern = normalize_dae_glob_pattern(&pattern);
+        if !self.disk {
+            pattern = sources::lexical_normalize(&pattern);
+        }
+        let pattern_display = pattern.to_string_lossy();
+        let expansion_error = || {
+            sources::source_error(
+                source.clone(),
+                "invalid-config-include",
+                "configuration include pattern cannot be expanded",
+            )
+        };
+        let mut matches = Vec::new();
+        let disk_matches = if self.disk {
+            Some(glob::glob(&pattern_display).map_err(|_| expansion_error())?)
+        } else {
+            None
+        };
+        for path in disk_matches.into_iter().flatten() {
+            let path = path.map_err(|_| expansion_error())?;
             if path.extension().and_then(|ext| ext.to_str()) != Some("dae") {
                 continue;
             }
-            let metadata = std::fs::metadata(&path).map_err(|err| {
-                crate::ConfigError::Include(format!(
-                    "failed to inspect included path '{}': {err}",
-                    path.display()
-                ))
-            })?;
+            let metadata = std::fs::metadata(&path).map_err(|_| expansion_error())?;
             if metadata.is_dir() {
                 continue;
             }
-
-            let path = std::fs::canonicalize(&path).map_err(|err| {
-                crate::ConfigError::Include(format!(
-                    "failed to resolve included path '{}': {err}",
-                    path.display()
-                ))
-            })?;
+            sources::check_budget(
+                self.limits,
+                self.sources.len().saturating_add(matches.len()),
+                self.bytes,
+                0,
+                source,
+            )?;
+            matches.push(path);
+        }
+        if !self.overlay.is_empty() {
+            let normalized: PathBuf = pattern.components().collect();
+            let matcher =
+                glob::Pattern::new(&normalized.to_string_lossy()).map_err(|_| expansion_error())?;
+            let options = glob::MatchOptions {
+                require_literal_separator: true,
+                ..glob::MatchOptions::new()
+            };
+            let mut add_virtual = |path: PathBuf| -> Result<(), DetailedConfigError> {
+                if !matches.contains(&path) {
+                    sources::check_budget(
+                        self.limits,
+                        self.sources.len().saturating_add(matches.len()),
+                        self.bytes,
+                        0,
+                        source,
+                    )?;
+                    matches.push(path);
+                }
+                Ok(())
+            };
+            for path in self.overlay.keys() {
+                if path.extension().and_then(|ext| ext.to_str()) == Some("dae")
+                    && matcher.matches_path_with(path, options)
+                {
+                    add_virtual(path.clone())?;
+                }
+            }
+            // Existing directory aliases and `..` must also find a virtual leaf.
+            if self.disk
+                && let (Some(parent), Some(name)) = (pattern.parent(), pattern.file_name())
+            {
+                let leaf =
+                    glob::Pattern::new(&name.to_string_lossy()).map_err(|_| expansion_error())?;
+                for directory in
+                    glob::glob(&parent.to_string_lossy()).map_err(|_| expansion_error())?
+                {
+                    let directory = directory.map_err(|_| expansion_error())?;
+                    if !directory.is_dir() {
+                        continue;
+                    }
+                    let canonical =
+                        std::fs::canonicalize(&directory).map_err(|_| expansion_error())?;
+                    if directory == canonical {
+                        continue;
+                    }
+                    for path in self.overlay.keys() {
+                        if path.parent() == Some(canonical.as_path())
+                            && path.extension().and_then(|ext| ext.to_str()) == Some("dae")
+                            && let Some(name) = path.file_name()
+                            && leaf.matches_with(&name.to_string_lossy(), options)
+                        {
+                            add_virtual(directory.join(name))?;
+                        }
+                    }
+                }
+            }
+        }
+        matches.sort();
+        let mut files = Vec::with_capacity(matches.len());
+        for path in matches {
+            let path = if !self.disk {
+                Ok(path)
+            } else if self.overlay.contains_key(&path) {
+                sources::canonical_overlay_path(&path)
+            } else {
+                std::fs::canonicalize(&path).or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+                        && let Ok(parent) = std::fs::canonicalize(parent)
+                        && self.overlay.contains_key(&parent.join(name))
+                    {
+                        return Ok(parent.join(name));
+                    }
+                    Err(error)
+                })
+            }
+            .map_err(|_| expansion_error())?;
             if !path.starts_with(&self.entry_dir) {
-                return Err(crate::ConfigError::Include(format!(
-                    "included path '{}' is outside entry configuration directory '{}'",
-                    path.display(),
-                    self.entry_dir.display()
-                )));
+                return Err(sources::source_error(
+                    source.clone(),
+                    "config-include-escape",
+                    "included configuration must remain inside the entry directory",
+                )
+                .into());
             }
             files.push(path);
         }
@@ -506,6 +659,15 @@ fn parse_documents(
         .filter(|(name, _)| *name == "global")
         .any(|(_, segments)| scalars::nfqueue_present(segments));
     let mut config = Config::default();
+    // Subscriptions start from these defaults, whichever block comes first.
+    let assets = sections
+        .iter()
+        .find(|(name, _)| Root::parse(name) == Some(Root::Assets))
+        .map(|(name, segments)| {
+            diagnostics.at_section(name, read::Text::segment(&segments[0]));
+            assets::parse_section(segments, diagnostics)
+        })
+        .unwrap_or_default();
     for (name, segments) in &sections {
         diagnostics.at_section(name, read::Text::segment(&segments[0]));
         match Root::parse(name) {
@@ -513,9 +675,10 @@ fn parse_documents(
             Some(Root::Dns) => config.dns = dns::parse_section(segments, diagnostics)?,
             Some(Root::Routing) => config.routing = routing::parse_section(segments, diagnostics)?,
             Some(Root::Node) => config.nodes = parse_node_section(segments, diagnostics)?,
-            Some(Root::Group) => config.groups = parse_group_section(segments, diagnostics)?,
+            Some(Root::Group) => {}
             Some(Root::Subscription) => {
-                config.subscriptions = parse_subscription_section(segments, diagnostics)?
+                config.subscriptions =
+                    parse_subscription_section(segments, &assets.config, diagnostics)?
             }
             Some(Root::Experimental) => {
                 config.experimental = parse_experimental_section(segments, diagnostics)?;
@@ -523,15 +686,15 @@ fn parse_documents(
             // Includes were spliced before dispatch; an unknown root never gets here
             // because the document only indexes known roots (K43 notices are emitted
             // there), so the last arm is a compile-time completeness check, not a guard.
-            Some(Root::Include) | None => {}
+            Some(Root::Include | Root::Assets) | None => {}
         }
     }
+    assets::apply(assets, &mut config)?;
     config.apply_legacy_nfqueue(canonical_nfqueue_present);
 
-    for group in &mut config.groups {
-        if group.policy == crate::node::GroupPolicy::URLTest {
-            group.tolerance = config.global.check_tolerance_ms;
-        }
+    if let Some((_, segments)) = sections.iter().find(|(name, _)| *name == "group") {
+        config.groups =
+            parse_group_section(segments, diagnostics, config.global.check_tolerance_ms)?;
     }
 
     resolve_group_filters_inner(

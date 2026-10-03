@@ -1,5 +1,5 @@
 use aya_ebpf::Global;
-use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, RingBuf, SockMap};
+use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SockMap};
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
     BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
@@ -146,6 +146,23 @@ pub static ROUTING_HANDOFF_MAP: HashMap<
     MAX_ROUTING_HANDOFF_NUM,
     1,
 > = HashMap::new();
+
+#[repr(C)]
+pub struct RouteTraceSequence {
+    pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
+    pub next: u32,
+}
+
+// Instance-local: unlike the UDP decision allocator, this map is never reused.
+#[btf_map]
+pub static ROUTE_TRACE_SEQUENCE: Array<RouteTraceSequence, 1> = Array::new();
+
+#[btf_map]
+pub static ROUTE_TRACE_MAP: LruHashMap<
+    u32,
+    honk_ebpf_common::KernelRouteWitness,
+    { honk_ebpf_common::ROUTE_TRACE_CAPACITY as usize },
+> = LruHashMap::new();
 
 /// Stable one-entry policy root. The backend atomically swaps the immutable
 /// descriptor map only after every inactive target slot and its generation-owned

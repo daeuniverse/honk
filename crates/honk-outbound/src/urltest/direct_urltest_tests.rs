@@ -89,7 +89,7 @@ async fn native_request_normalizes_query_only_target() {
         }
     });
     let node = honk_config::Config::builtin_direct_node();
-    let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
+    let mut guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
     let request = http::Request::builder()
         .method("HEAD")
         .uri(format!("http://u:PRIVATE@{addr}?check=1"))
@@ -106,7 +106,7 @@ async fn native_request_normalizes_query_only_target() {
         None,
     )
     .await;
-    guard.close().await;
+    guard.close().await.unwrap();
     peer.abort();
     let _ = peer.await;
     assert!(result.is_ok(), "native request target rejected: {result:?}");

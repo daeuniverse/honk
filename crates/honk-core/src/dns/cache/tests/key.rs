@@ -120,8 +120,8 @@ fn exact_key_separates_wire_profile_policy_scope_and_operation() {
     assert!(variants.iter().all(|variant| variant != &base));
 }
 
-#[test]
-fn exact_negative_identity_isolated_and_flush_fenced() {
+#[tokio::test]
+async fn exact_negative_identity_isolated_and_flush_fenced() {
     let wire = crate::dns::forwarder::build_dns_query("negative.example", 1);
     let query = QueryContext::parse(&wire).expect("query");
     let scope = RequestScope::Upstream(UpstreamTag::new("default").expect("scope"));
@@ -137,7 +137,7 @@ fn exact_negative_identity_isolated_and_flush_fenced() {
     let service = cache.service();
     let old_epoch = service.publication_epoch();
 
-    service.put_negative_if_current(old_epoch, key.clone(), 60, 3, None);
+    let _ = service.put_negative_if_current(old_epoch, key.clone(), 60, 3, None);
     assert_eq!(
         service.negative_hit_exact(&key).map(|hit| hit.rcode),
         Some(3)
@@ -145,13 +145,15 @@ fn exact_negative_identity_isolated_and_flush_fenced() {
     assert!(service.negative_hit_exact(&other_scope).is_none());
     assert!(service.negative_hit_exact(&refresh).is_none());
 
-    let flush = service.begin_flush();
+    service
+        .invalidate(crate::dns::cache::CacheInvalidation::All)
+        .await
+        .unwrap();
     assert!(service.negative_hit_exact(&key).is_none());
-    service.put_negative_if_current(old_epoch, key.clone(), 60, 2, None);
+    let _ = service.put_negative_if_current(old_epoch, key.clone(), 60, 2, None);
     assert!(service.negative_hit_exact(&key).is_none());
-    drop(flush);
 
-    service.put_negative_if_current(service.publication_epoch(), key.clone(), 60, 2, None);
+    let _ = service.put_negative_if_current(service.publication_epoch(), key.clone(), 60, 2, None);
     assert_eq!(
         service.negative_hit_exact(&key).map(|hit| hit.rcode),
         Some(2)
@@ -189,6 +191,7 @@ fn expired_exact_negative_preserves_the_stale_positive() {
         service
             .get_stale_exact(&key, true)
             .unwrap()
+            .0
             .response
             .as_ref(),
         response
@@ -239,7 +242,7 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
     let before = service.counters();
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative(hit) if hit.rcode == 2
+        ExactLookup::Negative { hit, .. } if hit.rcode == 2
     ));
     let after_negative = service.counters();
     assert_eq!(after_negative.hits, before.hits + 1);
@@ -299,7 +302,7 @@ fn exact_negative_hit_promotes_before_same_shard_eviction() {
     for _ in 0..3 {
         assert!(matches!(
             service.lookup_exact(&negative, true),
-            ExactLookup::Negative(hit) if hit.rcode == 3
+            ExactLookup::Negative { hit, .. } if hit.rcode == 3
         ));
     }
 
@@ -307,7 +310,7 @@ fn exact_negative_hit_promotes_before_same_shard_eviction() {
 
     assert!(matches!(
         service.lookup_exact(&negative, true),
-        ExactLookup::Negative(hit) if hit.rcode == 3
+        ExactLookup::Negative { hit, .. } if hit.rcode == 3
     ));
     assert!(matches!(
         service.lookup_exact(&positive, true),
@@ -342,7 +345,7 @@ fn conditional_publication_rejects_stale_revision_after_each_publication() {
     };
     let replacement = make_test_response([192, 0, 2, 2], 300);
     service.put_exact(key.clone(), replacement.clone(), 300, None);
-    service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
         ExactLookup::Positive { entry, .. } if entry.response.as_ref() == replacement.as_slice()
@@ -361,11 +364,11 @@ fn conditional_publication_rejects_stale_revision_after_each_publication() {
         ExactLookup::Positive { revision, .. } => revision,
         _ => panic!("positive fixture"),
     };
-    service.put_negative_if_current(epoch, key.clone(), 60, 2, None);
-    service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 2, None);
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative(hit) if hit.rcode == 2
+        ExactLookup::Negative { hit, .. } if hit.rcode == 2
     ));
 
     // Restored entries require compatibility-mode lookup.
@@ -383,8 +386,8 @@ fn conditional_publication_rejects_stale_revision_after_each_publication() {
         _ => panic!("positive fixture"),
     };
     let restored = make_test_response([192, 0, 2, 5], 300);
-    service.put_restored_exact(key.clone(), restored.clone(), 300);
-    service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
+    service.put_restored_exact_if_current(epoch, key.clone(), restored.clone(), 300);
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, false),
         ExactLookup::Positive { entry, .. } if entry.response.as_ref() == restored.as_slice()
@@ -424,7 +427,7 @@ fn conditional_publication_rejects_evicted_and_reinserted_slot() {
         _ => panic!("positive fixture"),
     };
     service.put_exact(other, make_test_response([192, 0, 2, 2], 300), 300, None);
-    service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
         ExactLookup::Miss
@@ -432,7 +435,7 @@ fn conditional_publication_rejects_evicted_and_reinserted_slot() {
 
     let reinserted = make_test_response([192, 0, 2, 3], 300);
     service.put_exact(key.clone(), reinserted.clone(), 300, None);
-    service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
         ExactLookup::Positive { entry, .. } if entry.response.as_ref() == reinserted.as_slice()
@@ -463,17 +466,17 @@ fn matching_revision_nxdomain_removes_positive_and_keeps_negative() {
         ExactLookup::Positive { revision, .. } => revision,
         _ => panic!("positive fixture"),
     };
-    service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative(hit) if hit.rcode == 3
+        ExactLookup::Negative { hit, .. } if hit.rcode == 3
     ));
 
     // The old token must not mutate the negative-only slot either.
-    service.put_negative_if_current(epoch, key.clone(), 60, 2, Some(revision));
+    let _ = service.put_negative_if_current(epoch, key.clone(), 60, 2, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative(hit) if hit.rcode == 3
+        ExactLookup::Negative { hit, .. } if hit.rcode == 3
     ));
 
     service.insert_expired_negative_exact_for_test(key.clone(), 3);
@@ -531,24 +534,18 @@ fn supersede_matching_revision_removes_combined_slot_and_releases_capacity() {
     );
 }
 
-#[test]
-fn supersede_rejects_stale_epoch_nonaccepting_and_newer_revision() {
+#[tokio::test]
+async fn supersede_rejects_stale_epoch_nonaccepting_and_newer_revision() {
     for case in ["stale epoch", "nonaccepting", "old revision"] {
         let service = DnsCache::new(4).service();
         let key = supersede_key(2);
-        let mut epoch = service.publication_epoch();
-        let fence = match case {
-            "stale epoch" => {
-                drop(service.begin_flush());
-                None
-            }
-            "nonaccepting" => {
-                let fence = service.begin_flush();
-                epoch = service.publication_epoch();
-                Some(fence)
-            }
-            _ => None,
-        };
+        let epoch = service.publication_epoch();
+        if case == "stale epoch" {
+            service
+                .invalidate(crate::dns::cache::CacheInvalidation::All)
+                .await
+                .unwrap();
+        }
         let response = make_test_response([192, 0, 2, 1], 300);
         service.put_exact(key.clone(), response.clone(), 300, None);
         let revision = match service.lookup_exact(&key, true) {
@@ -558,6 +555,9 @@ fn supersede_rejects_stale_epoch_nonaccepting_and_newer_revision() {
         if case == "old revision" {
             service.put_exact(key.clone(), response.clone(), 300, None);
         }
+        if case == "nonaccepting" {
+            super::super::lock(&service.publication).accepting = false;
+        }
         service.supersede_exact_if_current(epoch, key.clone(), Some(revision));
         assert!(
             matches!(
@@ -566,6 +566,5 @@ fn supersede_rejects_stale_epoch_nonaccepting_and_newer_revision() {
             ),
             "{case}"
         );
-        drop(fence);
     }
 }

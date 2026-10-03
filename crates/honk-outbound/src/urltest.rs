@@ -13,8 +13,11 @@
 //!
 //! Shared by clash delay measurements and periodic HTTP health checks; their
 //! wrappers remain responsible for alive-state updates.
+//!
+//! Native probes use a caller-owned absolute deadline and cancellation signal;
+//! cold probes include connection setup and do not publish legacy health/Score feedback.
 
-use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use crate::alive::{AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement};
 use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource,
     SelectionNetwork,
@@ -28,7 +31,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+mod exchange;
+use exchange::{exchange_http1, exchange_http2};
 
 fn start_feedback(feedback: Option<ScoreFeedback>) -> Option<ScoreReporter> {
     feedback.map(|feedback| feedback.start())
@@ -98,7 +103,8 @@ fn build_http_probe_request(
         .context("failed to build HTTP probe request")
 }
 
-fn probe_method(method: &str) -> anyhow::Result<http::Method> {
+/// The configured probe method; empty means HEAD.
+pub fn probe_method(method: &str) -> anyhow::Result<http::Method> {
     if method.is_empty() {
         return Ok(http::Method::HEAD);
     }
@@ -177,7 +183,14 @@ pub async fn urltest_node(
 ) -> anyhow::Result<Duration> {
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
-    urltest_request_impl(runtime, handler, &request, timeout).await
+    urltest_request_impl(
+        runtime,
+        handler,
+        &request,
+        timeout,
+        &ProbeCancellation::default(),
+    )
+    .await
 }
 
 async fn urltest_request_impl(
@@ -185,12 +198,15 @@ async fn urltest_request_impl(
     handler: &dyn TcpOutbound,
     request: &http::Request<()>,
     timeout: Duration,
+    cancel: &ProbeCancellation,
 ) -> anyhow::Result<Duration> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
     let host = target.host();
     let port = target.port();
-    let addr = resolve_urltest_address(host, port).await?;
+    let addr = cancel
+        .scope_resolution(resolve_urltest_address(host, port))
+        .await?;
     measure_http_probe(
         runtime,
         handler,
@@ -202,6 +218,7 @@ async fn urltest_request_impl(
         None,
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 async fn resolve_urltest_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
@@ -299,6 +316,7 @@ pub async fn warm_http_probe(
 
 /// Reuse an already-warm generation runtime. Cold reusable transports warm a
 /// throwaway runtime before measurement so a group scan retains no new state.
+#[allow(clippy::too_many_arguments)]
 pub async fn urltest_node_in_generation_with_feedback(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -307,6 +325,7 @@ pub async fn urltest_node_in_generation_with_feedback(
     url: &str,
     timeout: Duration,
     group_manager: &GroupManager,
+    cancel: ProbeCancellation,
 ) -> anyhow::Result<Duration> {
     urltest_node_in_generation_impl(
         generation,
@@ -316,10 +335,12 @@ pub async fn urltest_node_in_generation_with_feedback(
         url,
         timeout,
         Some(group_manager),
+        cancel,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn urltest_node_in_generation_impl(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -328,7 +349,11 @@ async fn urltest_node_in_generation_impl(
     url: &str,
     timeout: Duration,
     group_manager: Option<&GroupManager>,
+    cancel: ProbeCancellation,
 ) -> anyhow::Result<Duration> {
+    if cancel.is_cancelled() {
+        return Err(crate::proxy::PacketRejection::Cancelled.into());
+    }
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
     let (runtime, guard) =
@@ -350,14 +375,17 @@ async fn urltest_node_in_generation_impl(
                 .map(|feedback| feedback.with_source(ScoreSource::Warmup))
         })
     };
-    let result = generation
-        .scope_dials(async {
+    let result = cancel
+        .run(runtime.scope_tasks(generation.scope_dials(Box::pin(async {
             warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
-            urltest_request_impl(&runtime, handler, &request, timeout).await
-        })
-        .await;
-    if let Some(guard) = guard {
-        guard.close().await;
+            urltest_request_impl(&runtime, handler, &request, timeout, &cancel).await
+        }))))
+        .await
+        .unwrap_or_else(|| Err(crate::proxy::PacketRejection::Cancelled.into()));
+    if let Some(mut guard) = guard
+        && guard.close().await.is_err()
+    {
+        cancel.report_cleanup_failure();
     }
     result
 }
@@ -377,6 +405,7 @@ pub async fn urltest_node_addr(
         runtime, handler, &request, addr, None, timeout, timeout, None,
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 fn phase_timeout(message: &'static str) -> anyhow::Error {
@@ -395,7 +424,33 @@ pub async fn measure_http_probe(
     connect_timeout: Duration,
     timeout: Duration,
     feedback: Option<ScoreFeedback>,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
+    measure_http_probe_mode(
+        runtime,
+        handler,
+        request,
+        addr,
+        target_domain,
+        connect_timeout,
+        timeout,
+        feedback,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn measure_http_probe_mode(
+    runtime: &Arc<crate::runtime::NodeRuntime>,
+    handler: &dyn TcpOutbound,
+    request: &http::Request<()>,
+    addr: SocketAddr,
+    target_domain: Option<&str>,
+    connect_timeout: Duration,
+    timeout: Duration,
+    feedback: Option<ScoreFeedback>,
+    cold: bool,
+) -> anyhow::Result<ProbeMeasurement> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
     let normalized_request = build_http_probe_request(&target, request.method().clone())?;
@@ -406,9 +461,10 @@ pub async fn measure_http_probe(
     let reporter = start_feedback(feedback.map(|feedback| {
         feedback.with_probe_identity(&request.uri().to_string(), request.method().as_str())
     }));
+    let start = cold.then(Instant::now);
     let result = async {
-        // Dial, target TLS, HTTP/2 startup, and both exchanges each receive
-        // their own phase budget rather than sharing one outer clock.
+        // Legacy callers renew each phase budget; native callers also bound
+        // this entire future by their absolute deadline.
         let dial = crate::runtime::capture_dial_admission().scope(handler.dial_runtime(
             Arc::clone(runtime),
             addr,
@@ -433,20 +489,23 @@ pub async fn measure_http_probe(
                 "HTTP probe TLS established"
             );
             match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => exchange_http2(tls, request, &reporter, timeout).await,
+                Some(b"h2") => exchange_http2(tls, request, &reporter, timeout, cold).await,
                 _ => {
                     let mut tls = tls;
-                    exchange_http1(&mut tls, request, &reporter, timeout).await
+                    exchange_http1(&mut tls, request, &reporter, timeout, cold).await
                 }
             }
         } else {
             let mut stream = stream;
-            exchange_http1(&mut stream, request, &reporter, timeout).await
+            exchange_http1(&mut stream, request, &reporter, timeout, cold).await
         }
     }
     .await;
     match result {
-        Ok(elapsed) => {
+        Ok(mut elapsed) => {
+            if let Some(start) = start {
+                elapsed.latency = start.elapsed();
+            }
             reporter_success(&reporter);
             Ok(elapsed)
         }
@@ -455,6 +514,28 @@ pub async fn measure_http_probe(
             Err(error)
         }
     }
+}
+
+/// Probe one pinned address without resolving or forwarding the request hostname.
+///
+/// Cold probes time dial, TLS and one configured request; warm probes time the
+/// configured request after a validated HEAD. Host/SNI come from the request URI.
+/// `timeout` bounds each phase; the caller owns any absolute deadline,
+/// cancellation and runtime teardown. HTTP/2 is driven inline, so dropping this
+/// future releases its connection without a detached driver task.
+#[cfg(feature = "flow-observation")]
+pub async fn measure_pinned_http_probe(
+    runtime: &Arc<crate::runtime::NodeRuntime>,
+    handler: &dyn TcpOutbound,
+    request: &http::Request<()>,
+    addr: SocketAddr,
+    cold: bool,
+    timeout: Duration,
+) -> anyhow::Result<ProbeMeasurement> {
+    measure_http_probe_mode(
+        runtime, handler, request, addr, None, timeout, timeout, None, cold,
+    )
+    .await
 }
 
 /// BoringSSL connector with webpki root verification for HTTP probes.
@@ -470,345 +551,13 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
     }
 }
 
-enum RoundError {
-    Transport(anyhow::Error),
-    Invalid(anyhow::Error),
-}
-
-impl RoundError {
-    fn into_error(self) -> anyhow::Error {
-        match self {
-            Self::Transport(error) | Self::Invalid(error) => error,
-        }
-    }
-}
-
-struct H2Driver(Option<tokio::task::JoinHandle<()>>);
-
-impl H2Driver {
-    async fn stop(mut self) {
-        if let Some(driver) = self.0.take() {
-            driver.abort();
-            let _ = driver.await;
-        }
-    }
-}
-
-impl Drop for H2Driver {
-    fn drop(&mut self) {
-        if let Some(driver) = self.0.take() {
-            driver.abort();
-        }
-    }
-}
-
-fn h2_round_error(error: h2::Error, context: &'static str) -> RoundError {
-    // A remote REFUSED_STREAM means the request was not processed (RFC 9113 §8.7).
-    let refused =
-        error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::REFUSED_STREAM);
-    let transport = error.is_io()
-        || (error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
-        || refused;
-    let error = anyhow::Error::new(error).context(context);
-    if transport {
-        RoundError::Transport(error)
-    } else {
-        RoundError::Invalid(error)
-    }
-}
-
-fn request_with_method(
-    request: &http::Request<()>,
-    method: http::Method,
-) -> anyhow::Result<http::Request<()>> {
-    let target = request_target(request)?;
-    build_http_probe_request(&target, method)
-}
-
-async fn h2_round(
-    sender: &mut h2::client::SendRequest<bytes::Bytes>,
-    request: &http::Request<()>,
-    method: http::Method,
-    reporter: &Option<ScoreReporter>,
-    first_response: bool,
-) -> Result<(Duration, http::StatusCode), RoundError> {
-    std::future::poll_fn(|context| sender.poll_ready(context))
-        .await
-        .map_err(|error| h2_round_error(error, "HTTP/2 request readiness failed"))?;
-    let outgoing = request_with_method(request, method.clone()).map_err(RoundError::Invalid)?;
-    let start = Instant::now();
-    let (response, _) = sender
-        .send_request(outgoing, true)
-        .map_err(|error| h2_round_error(error, "HTTP/2 request send failed"))?;
-    let uri_bytes = request
-        .uri()
-        .authority()
-        .map_or(0, |authority| authority.as_str().len())
-        .saturating_add(
-            request
-                .uri()
-                .path_and_query()
-                .map_or(1, |target| target.as_str().len()),
-        );
-    reporter_tx(reporter, method.as_str().len().saturating_add(uri_bytes));
-    let response = response
-        .await
-        .map_err(|error| h2_round_error(error, "HTTP/2 response failed"))?;
-    if first_response {
-        reporter_first_response(reporter);
-    }
-    reporter_rx(reporter, 1);
-    // ponytail: locked h2 0.4.19 defaults missing :status; await a release containing hyperium/h2#959.
-    Ok((start.elapsed(), response.status()))
-}
-
-/// Two requests over a fresh HTTP/2 connection. The connection driver is
-/// owned by this future and aborted on both ordinary return and cancellation.
-async fn exchange_http2<S>(
-    stream: S,
-    request: &http::Request<()>,
-    reporter: &Option<ScoreReporter>,
-    timeout: Duration,
-) -> anyhow::Result<Duration>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, connection) = tokio::time::timeout(
-        timeout,
-        h2::client::Builder::new()
-            .enable_push(false)
-            // Fail this disposable connection on its first local protocol rejection,
-            // before a remote reset can overwrite the error.
-            .max_local_error_reset_streams(Some(0))
-            // Cover both request budgets so late warm-stream frames stay ignorable.
-            .reset_stream_duration(timeout.saturating_mul(2))
-            .max_header_list_size(MAX_HTTP_RESPONSE_HEAD as u32)
-            .handshake(stream),
-    )
-    .await
-    .map_err(|_| phase_timeout("HTTP/2 probe startup timed out"))?
-    .map_err(|error| anyhow::Error::new(error).context("HTTP/2 probe startup failed"))?;
-    let driver = H2Driver(Some(tokio::spawn(async move {
-        let _ = connection.await;
-    })));
-    let result = async {
-        let (warm, status) = match tokio::time::timeout(
-            timeout,
-            h2_round(&mut sender, request, http::Method::HEAD, reporter, true),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(RoundError::into_error)?,
-            Err(_) => return Err(phase_timeout("HTTP probe warm-up request timed out")),
-        };
-        validate_status_code(status)?;
-        match tokio::time::timeout(
-            timeout,
-            h2_round(
-                &mut sender,
-                request,
-                request.method().clone(),
-                reporter,
-                false,
-            ),
-        )
-        .await
-        {
-            Ok(Ok((measured, status))) => {
-                validate_status_code(status)?;
-                if let Some(reporter) = reporter {
-                    reporter.probe_latency(measured);
-                }
-                Ok(measured)
-            }
-            Ok(Err(RoundError::Transport(_))) | Err(_) => Ok(warm),
-            Ok(Err(RoundError::Invalid(error))) => Err(error),
-        }
-    }
-    .await;
-    driver.stop().await;
-    result
-}
-
-fn http1_wire_request(
-    request: &http::Request<()>,
-    method: &http::Method,
-    close: bool,
-) -> anyhow::Result<String> {
-    let target = request_target(request)?;
-    Ok(format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-http-probe/1.0\r\n{}\r\n",
-        method,
-        target.request_target(),
-        target.authority(),
-        if close { "Connection: close\r\n" } else { "" }
-    ))
-}
-
-const MAX_HTTP_RESPONSE_HEAD: usize = 16 * 1024;
-
-async fn read_response_head<S>(
-    stream: &mut S,
-    reporter: &Option<ScoreReporter>,
-    first_response: bool,
-    response_started: &mut bool,
-) -> Result<http::StatusCode, RoundError>
-where
-    S: AsyncBufRead + Unpin,
-{
-    let mut head = Vec::with_capacity(1024);
-    let mut total = 0;
-    loop {
-        if total == MAX_HTTP_RESPONSE_HEAD {
-            return Err(RoundError::Invalid(anyhow!(
-                "HTTP response heads exceed {MAX_HTTP_RESPONSE_HEAD} bytes"
-            )));
-        }
-        let first_bytes = !*response_started;
-        let (consumed, complete) = {
-            let available = match stream.fill_buf().await {
-                Ok(available) => available,
-                Err(error) if !*response_started => {
-                    return Err(RoundError::Transport(
-                        anyhow::Error::new(error).context("HTTP probe read failed"),
-                    ));
-                }
-                Err(error) => {
-                    return Err(RoundError::Invalid(
-                        anyhow::Error::new(error).context("truncated HTTP response head"),
-                    ));
-                }
-            };
-            if available.is_empty() {
-                return if !*response_started {
-                    Err(RoundError::Transport(anyhow!(
-                        "connection closed without an HTTP response"
-                    )))
-                } else {
-                    Err(RoundError::Invalid(anyhow!("truncated HTTP response head")))
-                };
-            }
-            *response_started = true;
-            let take = available.len().min(MAX_HTTP_RESPONSE_HEAD - total);
-            let old_len = head.len();
-            head.extend_from_slice(&available[..take]);
-            let scan_from = old_len.saturating_sub(3);
-            let complete = head[scan_from..]
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|offset| scan_from + offset + 4);
-            let consumed = complete.map_or(take, |end| end - old_len);
-            (consumed, complete)
-        };
-        stream.consume(consumed);
-        total += consumed;
-        if first_response && first_bytes {
-            reporter_first_response(reporter);
-        }
-        reporter_rx(reporter, consumed);
-        if let Some(end) = complete {
-            head.truncate(end);
-            let status = validate_response_head(&head).map_err(RoundError::Invalid)?;
-            if !status.is_informational() || status == http::StatusCode::SWITCHING_PROTOCOLS {
-                return Ok(status);
-            }
-            head.clear();
-        }
-    }
-}
-
-async fn http1_round<S>(
-    stream: &mut S,
-    request: &http::Request<()>,
-    method: &http::Method,
-    close: bool,
-    reporter: &Option<ScoreReporter>,
-    first_response: bool,
-    timeout: Duration,
-) -> Result<(Duration, http::StatusCode), RoundError>
-where
-    S: AsyncBufRead + AsyncWrite + Unpin,
-{
-    let wire = http1_wire_request(request, method, close).map_err(RoundError::Invalid)?;
-    let mut response_started = false;
-    let round = async {
-        let start = Instant::now();
-        stream.write_all(wire.as_bytes()).await.map_err(|error| {
-            RoundError::Transport(anyhow::Error::new(error).context("HTTP probe write failed"))
-        })?;
-        reporter_tx(reporter, wire.len());
-        let status =
-            read_response_head(stream, reporter, first_response, &mut response_started).await?;
-        Ok((start.elapsed(), status))
-    };
-    match tokio::time::timeout(timeout, round).await {
-        Ok(result) => result,
-        Err(_) => {
-            let error = phase_timeout("HTTP probe request timed out");
-            if response_started {
-                Err(RoundError::Invalid(
-                    error.context("incomplete HTTP response head"),
-                ))
-            } else {
-                Err(RoundError::Transport(error))
-            }
-        }
-    }
-}
-
-/// Two HTTP/1.x requests on one connection. Only measured-round transport
-/// failure may fall back to the validated warm response.
-async fn exchange_http1<S>(
-    stream: &mut S,
-    request: &http::Request<()>,
-    reporter: &Option<ScoreReporter>,
-    timeout: Duration,
-) -> anyhow::Result<Duration>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut stream = BufReader::new(stream);
-    let (warm, status) = http1_round(
-        &mut stream,
-        request,
-        &http::Method::HEAD,
-        false,
-        reporter,
-        true,
-        timeout,
-    )
-    .await
-    .map_err(RoundError::into_error)?;
-    validate_status_code(status)?;
-    match http1_round(
-        &mut stream,
-        request,
-        request.method(),
-        true,
-        reporter,
-        false,
-        timeout,
-    )
-    .await
-    {
-        Ok((measured, status)) => {
-            validate_status_code(status)?;
-            if let Some(reporter) = reporter {
-                reporter.probe_latency(measured);
-            }
-            Ok(measured)
-        }
-        Err(RoundError::Transport(_)) => Ok(warm),
-        Err(RoundError::Invalid(error)) => Err(error),
-    }
-}
-
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
 /// alive set: successes record measured TCP latency. An arbitrary measurement
 /// target failing does not establish a real dial failure or node-wide outage.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
+#[allow(clippy::too_many_arguments)]
 pub async fn urltest_group_with_feedback(
     members: &[Node],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -817,6 +566,7 @@ pub async fn urltest_group_with_feedback(
     url: &str,
     timeout: Duration,
     group_manager: Arc<GroupManager>,
+    cancel: ProbeCancellation,
 ) -> Vec<(String, anyhow::Result<Duration>)> {
     urltest_group_impl(
         members,
@@ -826,10 +576,12 @@ pub async fn urltest_group_with_feedback(
         url,
         timeout,
         Some(group_manager),
+        cancel,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn urltest_group_impl(
     members: &[Node],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -838,6 +590,7 @@ async fn urltest_group_impl(
     url: &str,
     timeout: Duration,
     group_manager: Option<Arc<GroupManager>>,
+    cancel: ProbeCancellation,
 ) -> Vec<(String, anyhow::Result<Duration>)> {
     let timeout = urltest_timeout(timeout);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
@@ -851,8 +604,14 @@ async fn urltest_group_impl(
         let url = url.clone();
         let permit = semaphore.clone();
         let group_manager = group_manager.clone();
+        let cancel = cancel.clone();
         join_set.spawn(async move {
-            let _permit = permit.acquire_owned().await;
+            let Some(_permit) = cancel.run(permit.acquire_owned()).await else {
+                return (
+                    node.name.clone(),
+                    Err(crate::proxy::PacketRejection::Cancelled.into()),
+                );
+            };
             let result = match registry.find(node.protocol()) {
                 Some(entry) => {
                     urltest_node_in_generation_impl(
@@ -863,6 +622,7 @@ async fn urltest_group_impl(
                         &url,
                         timeout,
                         group_manager.as_deref(),
+                        cancel,
                     )
                     .await
                 }
@@ -878,6 +638,8 @@ async fn urltest_group_impl(
     while let Some(res) = join_set.join_next().await {
         if let Ok(pair) = res {
             results.push(pair);
+        } else {
+            cancel.report_cleanup_failure();
         }
     }
     let order: std::collections::HashMap<&str, usize> = members
@@ -887,77 +649,6 @@ async fn urltest_group_impl(
         .collect();
     results.sort_by_key(|(name, _)| order.get(name.as_str()).copied().unwrap_or(usize::MAX));
     results
-}
-
-fn validate_status_code(status: http::StatusCode) -> anyhow::Result<()> {
-    if (200..500).contains(&status.as_u16()) {
-        Ok(())
-    } else {
-        Err(anyhow!("bad status code: {status}"))
-    }
-}
-
-fn validate_response_head(head: &[u8]) -> anyhow::Result<http::StatusCode> {
-    if head.len() > MAX_HTTP_RESPONSE_HEAD || !head.ends_with(b"\r\n\r\n") {
-        return Err(anyhow!("incomplete HTTP response head"));
-    }
-    let mut lines = head[..head.len() - 2].split(|byte| *byte == b'\n');
-    let status = lines
-        .next()
-        .and_then(|line| line.strip_suffix(b"\r"))
-        .ok_or_else(|| anyhow!("malformed HTTP status line"))?;
-    let separator = status
-        .iter()
-        .position(|byte| *byte == b' ')
-        .ok_or_else(|| anyhow!("malformed HTTP status line"))?;
-    let version = &status[..separator];
-    if version != b"HTTP/1.0" && version != b"HTTP/1.1" {
-        return Err(anyhow!("unsupported HTTP response version"));
-    }
-    let remainder = &status[separator + 1..];
-    let code_end = remainder
-        .iter()
-        .position(|byte| *byte == b' ')
-        .unwrap_or(remainder.len());
-    let code = &remainder[..code_end];
-    if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
-        return Err(anyhow!("malformed HTTP status code"));
-    }
-    if remainder[code_end..]
-        .iter()
-        .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
-    {
-        return Err(anyhow!("malformed HTTP reason phrase"));
-    }
-    let status = http::StatusCode::from_bytes(code).context("invalid HTTP status code")?;
-
-    for raw_line in lines {
-        if raw_line.is_empty() {
-            continue;
-        }
-        let line = raw_line
-            .strip_suffix(b"\r")
-            .ok_or_else(|| anyhow!("malformed HTTP header line ending"))?;
-        let colon = line
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or_else(|| anyhow!("malformed HTTP response header"))?;
-        let name = &line[..colon];
-        if name.is_empty() || !name.iter().copied().all(is_header_name_byte) {
-            return Err(anyhow!("malformed HTTP response header name"));
-        }
-        if line[colon + 1..]
-            .iter()
-            .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
-        {
-            return Err(anyhow!("malformed HTTP response header value"));
-        }
-    }
-    Ok(status)
-}
-
-fn is_header_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 #[cfg(test)]

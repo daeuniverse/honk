@@ -40,6 +40,10 @@ watcher_test=ebpf::real::iface_watch::tests::route_only_change_wakes_network_sub
 test "$("$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --list --format terse)" = "$watcher_test: test"
 "$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-iface-watch.log"
+native_lifecycle_test=control::lifecycle::tests::ordinary_shutdown_preserves_live_tcp_until_graceful_completion
+test "$("$HONK_CORE_TEST_BIN" "$native_lifecycle_test" --exact --ignored --list --format terse)" = "$native_lifecycle_test: test"
+"$HONK_CORE_TEST_BIN" control::lifecycle::tests --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-native-lifecycle.log"
 race_test=control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks
 test "$("$HONK_CORE_TEST_BIN" "$race_test" --exact --ignored --list --format terse)" = "$race_test: test"
 "$HONK_CORE_TEST_BIN" "$race_test" --exact --ignored --test-threads=1 \

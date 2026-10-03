@@ -124,11 +124,34 @@ impl Planner {
     }
 
     pub fn plan_request(&self, context: RequestContext<'_>) -> Result<RequestPlan, PlanError> {
-        match self.router.select_request_normalized(
+        self.plan_request_with_source(context, None, None)
+            .map(|(plan, _)| plan)
+    }
+
+    pub(crate) fn plan_request_with_source(
+        &self,
+        context: RequestContext<'_>,
+        forced: Option<&UpstreamTag>,
+        evidence: Option<&mut crate::dns::outcome::RouteSource>,
+    ) -> Result<(RequestPlan, crate::dns::outcome::RouteSource), PlanError> {
+        if let Some(upstream) = forced {
+            if let Some(evidence) = evidence {
+                *evidence = crate::dns::outcome::RouteSource::Forced;
+            }
+            return Ok((
+                RequestPlan::Exchange(RequestScope::Upstream(upstream.clone())),
+                crate::dns::outcome::RouteSource::Forced,
+            ));
+        }
+        let (decision, source) = self.router.select_request_with_source(
             context.domain,
             context.qtype,
             context.metadata.source_ip(),
-        ) {
+        );
+        if let Some(evidence) = evidence {
+            *evidence = source;
+        }
+        let plan = match decision {
             DnsRequestDecision::Reject => Ok(RequestPlan::Reject),
             DnsRequestDecision::AsIs => context
                 .metadata
@@ -140,7 +163,8 @@ impl Planner {
                 self.require_known(&upstream)?;
                 Ok(RequestPlan::Exchange(RequestScope::Upstream(upstream)))
             }
-        }
+        }?;
+        Ok((plan, source))
     }
 
     pub fn plan_response(

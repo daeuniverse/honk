@@ -11,7 +11,7 @@
 - 通过 eBPF 透明代理数据路径拦截 Linux 上的 LAN 转发流量和本机发起流量。
 - 将原生 `.dae` 配置语法保持为首要且唯一有文档说明的配置格式。
 - 提供多协议出站、Selector/URLTest/LoadBalance/Fallback/Score 组、健康检查和 Clash 兼容控制 API。
-- 只交付引擎 `honk-core`，不另设 GraphQL 服务或内置 dashboard 应用。
+- 交付单个 `honk-core` 引擎，不另设 GraphQL 服务；可选 `native-ui` 内嵌固定版本 doona 客户端。
 
 ### 非目标
 
@@ -75,6 +75,8 @@ flowchart LR
 - `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }。dae parser 显式允许当前两个嵌套节，旧 `udp_nfqueue` 仅作为迁移输入：发出告警，仅在未配置 `global.nfqueue_enable` 时将 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
 - `src/subscription.rs`、`src/types.rs`（`NodeProtocol` 有 11 个变体，Direct/Block 留给内建节点；`DialMode` 为 ip/domain/domain+/domain++；另有 `SubscriptionType`、`DnsProtocol` 与共享 `default_true`/`parse_duration_secs` helper）、`src/error.rs`（`ConfigError`）。
 
+`src/experimental.rs` 的 `ExperimentalConfig` 持有 `clash_api`、`native_api` 与 `cache_file`。原生设置严格校验、独立启用且均需重启。需显式编译的 `native-api`（以 `--features native-api` 或 `native-ui` 构建；发布产物包含）提供用户态观测、有界历史、来源所有的组 PATCH/主文件条目管理，以及已验证 geodata 激活，listener 仍默认关闭。`.dae` 仍是唯一配置权威；原文披露/写许可独立。凭据源只读，返回正文时遮蔽 listener secret 值，而不是省略正文。自动策略的分网络 pin/clear 已开放，pin 属于当前 GroupManager，激活后消失；原生 mode 与完整内核透明仍关闭。默认关闭的 `native-ui` 在打包时通过 `ci/fetch-doona.sh` 与 `.github/ci/pins.env` 获取有许可及版本记录的真实 doona，`build.rs` 读取绝对路径 `HONK_DOONA_DIR`，不在运行时获取资产或构建前端。弃用 `udp_nfqueue` 块仅将 `enabled` 迁移到 `GlobalConfig::nfqueue_enable` 并告警。
+
 ## 高层数据路径
 
 ```mermaid
@@ -135,10 +137,14 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入静态 `honk-ebpf` 对象，用户态在运行时编译 policy extension。运行时要求 Linux kernel 6.12+。 |
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
-| `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。 |
+| `native-api` | 否 | 独立的 HTTP/1.1 原生观测、可选历史、受控源管理/reload API 与本地目录 UI；完整拥有有界连接，严格校验 bearer/Host/Origin，不依赖 Clash。 |
+| `native-ui` | 否 | 隐含 `native-api`，为 `ui: embedded` 内嵌固定真实 doona 资产；运行时不解压、不下载、不构建前端。 |
+| `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页，并把 mimalloc 的 purge 延迟设为 100 ms（除非 `MIMALLOC_PURGE_DELAY` 另有设置）。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
 `mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。若请求 `global.nfqueue_enable = true`，启动会记录 warning，仅在本进程关闭 NFQUEUE 暂存，配置文件保持不变。
+
+嵌入 eBPF 时，`build.rs` 使用内核 crate 固定的编译器及独立 release 策略重建，不继承 host 的 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS` 或 `CARGO_PROFILE_*` 性能分析覆盖。编译器 sidecar 还必须不早于嵌入构建脚本，因此修改嵌入策略会使既有对象失效。显式 `--bpf-object` 资产及手动内核构建仍由调用方负责。
 
 ## 作者与分工说明
 

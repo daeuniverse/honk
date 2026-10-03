@@ -167,42 +167,47 @@ pub(in crate::control) fn group_check_url_registrations(config: &Config) -> Vec<
         .collect()
 }
 
-/// Wire the `interrupt_connections` callback into a group manager: when a
-/// group's selected node changes, close its tracked connections so they
-/// re-dial through the new node. The callback reads the *current* manager
-/// through the shared cell, so it keeps working after a reload swaps the
-/// manager out. Tracked connections record the dialed leaf node name, so
-/// the target set covers the group name, its member tags, and every leaf
-/// reachable through nested sub-groups.
+/// Automatic policy changes cancel captured group/network owners without rebuilding provenance.
 pub(in crate::control) fn install_interrupt_callback(
     group_manager: &GroupManager,
-    group_manager_cell: &SharedGroupManager,
+    groups: &[honk_config::group::Group],
     tracker: &Arc<ConnectionTracker>,
+    diagnostics: &crate::config_diagnostics::SharedDiagnostics,
+    generation: u64,
+    #[cfg(feature = "native-api")] native: Option<&Arc<crate::observe::Observation>>,
 ) {
     if group_manager.has_interrupt_connections() {
         tracker.enable_for_interrupts();
     }
-
-    let cell = group_manager_cell.clone();
-    let tracker = tracker.clone();
-    group_manager.set_interrupt_callback(Some(Arc::new(move |group_name: &str| {
-        let gm = cell.read().clone();
-        let mut targets: std::collections::HashSet<String> =
-            gm.node_names_in_group(group_name).into_iter().collect();
-        targets.extend(gm.leaf_node_names_in_group(group_name));
-        targets.insert(group_name.to_string());
-        let mut closed = 0usize;
-        for snap in tracker.snapshot() {
-            if targets.contains(&snap.proxy) {
-                tracker.remove(&snap.id);
-                closed += 1;
-            }
+    let identities: std::collections::HashMap<_, _> = groups
+        .iter()
+        .map(|group| (group.name.clone(), group.id.to_string()))
+        .collect();
+    let tracker = Arc::clone(tracker);
+    let diagnostics = Arc::clone(diagnostics);
+    #[cfg(feature = "native-api")]
+    let native = native.cloned();
+    group_manager.set_interrupt_callback(Some(Arc::new(move |name, network| {
+        if diagnostics.read().generation != generation {
+            return;
         }
-        if closed > 0 {
-            info!(
-                "interrupt_connections: closed {} connection(s) for group '{}'",
-                closed, group_name
-            );
+        let identity = identities.get(name).cloned();
+        #[cfg(feature = "native-api")]
+        let identity = if let Some(native) = &native {
+            native.catalog.snapshot().groups.get(name).cloned()
+        } else {
+            identity
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        let network = match network {
+            honk_outbound::group::SelectionNetwork::Tcp => "tcp",
+            honk_outbound::group::SelectionNetwork::Udp => "udp",
+        };
+        for selected in tracker.snapshot_group(&identity, Some(network)) {
+            // The transport/removal owner, not this synchronous callback, owns completion.
+            drop(tracker.start_close(selected));
         }
     })));
 }
@@ -216,7 +221,7 @@ pub(in crate::control) fn install_selector_warm_callback(
 ) {
     let notify = Arc::clone(notify);
     group_manager.set_selector_change_callback(Some(Arc::new(move || {
-        notify.notify_one();
+        notify.notify_waiters();
     })));
 }
 
@@ -328,8 +333,8 @@ impl ControlPlane {
     /// (control plane, per-connection handles, clash API) picks up new or
     /// changed groups at once. Runtime selector choices migrate by group
     /// name (choices whose group or selected node vanished are dropped);
-    /// cache.db-backed choices survive because every change is persisted
-    /// at set time, so no cache.db restore runs here. The alive set's
+    /// choices kept in the state db survive because every change is persisted
+    /// at set time, so no restore runs here. The alive set's
     /// health-check registrations and URLTest group table are refreshed to
     /// match the new group membership, and the node → eBPF outbound id map
     /// (`outbound_id_map`, already refreshed by the reload path) is built
@@ -350,11 +355,19 @@ impl ControlPlane {
         // Migrate runtime choices before wiring callbacks: migration must
         // not fire persistence or connection interruption.
         new_gm.migrate_selector_choices_from(&self.group_manager.read());
-        install_interrupt_callback(&new_gm, &self.group_manager, &self.connection_tracker);
+        install_interrupt_callback(
+            &new_gm,
+            &groups,
+            &self.connection_tracker,
+            &self.diagnostics,
+            self.diagnostics.read().generation,
+            #[cfg(feature = "native-api")]
+            self.native.as_ref(),
+        );
         if let Some(ref db) = self.cache_db {
             let db_cb = db.clone();
-            new_gm.set_persist_callback(Some(Arc::new(move |group, node| {
-                db_cb.save_selector_choice(group, node);
+            new_gm.set_persist_callback(Some(Arc::new(move |group, network, member| {
+                db_cb.save_network_selector(group, network, member);
             })));
         }
         {

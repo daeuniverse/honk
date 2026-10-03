@@ -3,6 +3,7 @@
 pub mod collection;
 mod health;
 pub mod latencies;
+mod observations;
 mod probe;
 mod urltest;
 
@@ -11,7 +12,13 @@ mod tests;
 
 use self::collection::DialerCollection;
 use crate::group::{ScoreFeedback, ScoreSelectionContext};
+pub use observations::{
+    GroupHealthObservation, GroupProbeContext, HealthAverages, HealthMeasurement,
+    HealthObservation, HealthPurpose, HealthState, HealthTransport, HealthWarmth, ProbeMeasurement,
+    ProbeTicket, UrlProbeMember,
+};
 use parking_lot::{Mutex, RwLock};
+pub use probe::{HealthCheckError, HealthProbePermit, ProbeCancellation};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -105,6 +112,22 @@ pub enum HttpProbeResult {
     SetupFailure(String),
     ExchangeFailure(String),
     LocalRefusal(crate::proxy::PacketRejection),
+    Cancelled,
+}
+
+#[derive(Debug)]
+pub struct HttpProbeOutcome {
+    pub result: HttpProbeResult,
+    pub observation: Option<HealthObservation>,
+}
+
+impl From<HttpProbeResult> for HttpProbeOutcome {
+    fn from(result: HttpProbeResult) -> Self {
+        Self {
+            result,
+            observation: None,
+        }
+    }
 }
 
 /// Trait for HTTP-based health check probing through proxy nodes.
@@ -116,14 +139,16 @@ pub enum HttpProbeResult {
 /// is healthy and carries a ranking RTT.
 /// Implementations own timeout handling; callers do not wrap the future in a
 /// competing deadline.
+/// Cancellation must stop network work and join owned children before returning.
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
-        node_name: &str,
+        node_id: Uuid,
         addr: SocketAddr,
         url: &str,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>>;
+        cancel: ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>>;
 }
 
 /// Type-erased HTTP prober stored in `AliveDialerSet`.
@@ -139,12 +164,14 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 /// from UDP selection permanently (no traffic left to revive them).
 #[derive(Debug)]
 pub struct UdpProbeOutcome {
-    /// Round-trip of the minimal DNS query through the node's UDP transport;
-    /// `None` when target policy skips it or local target initialization is still pending.
+    /// Legacy setup-inclusive DNS attempt timing; qualified exchange-only
+    /// timing is retained separately in `observations`. `None` means no attempt.
     pub dns: Option<anyhow::Result<Duration>>,
     /// Independent data-path handshake result; `None` when not run (no HTTPS
     /// check URL, no Score group, or target policy skips it).
     pub data_path: Option<anyhow::Result<Duration>>,
+    /// Qualified DNS and data measurements, captured before legacy family fanout.
+    pub observations: [Option<HealthObservation>; 2],
 }
 
 /// Trait for UDP-based health check probing through proxy nodes.
@@ -159,11 +186,13 @@ pub struct UdpProbeOutcome {
 /// never see that failure mode.
 /// Implementations own timeout handling; callers do not wrap the future in a
 /// competing deadline.
+/// Cancellation preserves completed measurements and joins owned children.
 pub trait UdpProber: Send + Sync {
     fn probe_udp(
         &self,
-        node_name: &str,
+        node_id: Uuid,
         timeout: Duration,
+        cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>>;
 }
 
@@ -265,9 +294,9 @@ type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
 /// must be idempotent.
 type DeathCallback = dyn Fn(Uuid, &str) + Send + Sync;
 
-/// Resolves a custom-check-URL group's member tags to `(tag, current
-/// leaf node)` pairs for probing (see `url_member_resolver`).
-pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<(String, String)> + Send + Sync>;
+/// Resolves custom-check members with concrete leaf IDs and optional captured
+/// native group/member identities; display tags are not node lookup keys.
+pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<UrlProbeMember> + Send + Sync>;
 
 /// Default URLTest group idle timeout when the group config has none
 /// (sing-box default: 30 minutes). Periodic probing of a URLTest group's
@@ -282,7 +311,7 @@ pub const DEFAULT_URLTEST_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
 
 /// A node registered for health checking: the content-derived NodeId is
-/// the map key; the name is kept for logs and the prober's node lookup.
+/// the map key; the name is kept only for display and logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     pub name: String,
@@ -318,6 +347,7 @@ pub struct AliveDialerSet {
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
     registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
+    health_observations: RwLock<Option<observations::HealthHistory>>,
     ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
     death_callback: RwLock<Option<Arc<DeathCallback>>>,
     base_cooldown: Duration,
@@ -327,6 +357,12 @@ pub struct AliveDialerSet {
     trigger_tx: tokio::sync::mpsc::Sender<Uuid>,
     trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Uuid>>>,
     trigger_pending: Mutex<HashSet<Uuid>>,
+    health_control: Mutex<probe::HealthControl>,
+    health_mode: tokio::sync::watch::Sender<probe::HealthMode>,
+    health_changed: tokio::sync::Notify,
+    external_probes: Mutex<tokio::task::JoinSet<()>>,
+    #[cfg(feature = "owned-tasks")]
+    health_resolver_tasks: Mutex<Option<Arc<crate::runtime::TaskOwner>>>,
     /// Optional `SO_MARK` value applied to probe sockets so the eBPF datapath
     /// treats them as control-plane traffic and does not re-route them.
     so_mark: Option<u32>,
@@ -399,10 +435,12 @@ impl AliveDialerSet {
     pub fn new() -> Self {
         const TRIGGER_QUEUE_CAPACITY: usize = 256;
         let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
+        let (health_mode, _) = tokio::sync::watch::channel(probe::HealthMode::Running);
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
             registered: RwLock::new(HashMap::new()),
+            health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
             resolver: RwLock::new(None),
@@ -411,6 +449,12 @@ impl AliveDialerSet {
             trigger_tx: tx,
             trigger_rx: Mutex::new(Some(rx)),
             trigger_pending: Mutex::new(HashSet::new()),
+            health_control: Mutex::new(probe::HealthControl::default()),
+            health_mode,
+            health_changed: tokio::sync::Notify::new(),
+            external_probes: Mutex::new(tokio::task::JoinSet::new()),
+            #[cfg(feature = "owned-tasks")]
+            health_resolver_tasks: Mutex::new(None),
             so_mark: None,
             last_emergency_tcp: Mutex::new(HashMap::new()),
             last_emergency_udp: Mutex::new(HashMap::new()),
@@ -513,6 +557,18 @@ impl AliveDialerSet {
     /// Resolve `host` via the installed hook. Typed local refusal is returned;
     /// ordinary empty or failed hook results retain marked bootstrap/system fallback.
     pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+        let permit = self.acquire_health_probe()?;
+        let cancel = permit.cancellation();
+        // Boxed: unboxed, this future is large enough in debug builds to overflow
+        // the worker stack when the check URL resolves through a proxied upstream.
+        let operation = Box::pin(self.resolve_host_inner(host, port));
+        cancel
+            .run(cancel.scope_resolution(operation))
+            .await
+            .ok_or(HealthCheckError::Stopped)?
+    }
+
+    async fn resolve_host_inner(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let hook = self.resolver.read().clone();
         if let Some(hook) = hook {
             match hook(host.to_string(), port).await {
@@ -635,7 +691,7 @@ impl AliveDialerSet {
             .collect()
     }
 
-    /// Registered display name for logs and prober lookups; falls back to
+    /// Registered display name for logs; falls back to
     /// the ID itself for nodes driven without registration (tests).
     pub fn node_name(&self, node_id: Uuid) -> String {
         self.registered
@@ -650,6 +706,12 @@ impl AliveDialerSet {
         registered.remove(&node_id);
         self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
+        if let Some(observations) = self.health_observations.write().as_mut() {
+            observations.nodes.remove(&node_id);
+            observations
+                .groups
+                .retain(|sample| sample.node_id != node_id);
+        }
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);
         self.probe_history
@@ -687,6 +749,10 @@ impl AliveDialerSet {
     }
 
     pub fn trigger_probe(&self, node_id: Uuid) {
+        let _control = self.health_control.lock();
+        if *self.health_mode.borrow() != probe::HealthMode::Running {
+            return;
+        }
         let mut pending = self.trigger_pending.lock();
         if !pending.insert(node_id) {
             return;

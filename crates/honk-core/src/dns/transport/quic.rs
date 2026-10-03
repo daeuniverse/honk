@@ -22,15 +22,21 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
 }
 
 /// Lazily-created per-family QUIC client endpoints reused across reconnects.
-pub(super) struct SharedQuicEndpoint(tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>);
+pub(super) struct SharedQuicEndpoint {
+    direct: tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>,
+    tasks: std::sync::Arc<honk_outbound::runtime::TaskOwner>,
+}
 
 impl SharedQuicEndpoint {
     pub(super) fn new() -> Self {
-        Self(tokio::sync::Mutex::new([None, None]))
+        Self {
+            direct: tokio::sync::Mutex::new([None, None]),
+            tasks: std::sync::Arc::new(honk_outbound::runtime::TaskOwner::production()),
+        }
     }
 
     async fn get(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
-        let mut endpoints = self.0.lock().await;
+        let mut endpoints = self.direct.lock().await;
         let endpoint = &mut endpoints[if ipv6 { 1 } else { 0 }];
         if let Some(endpoint) = endpoint.as_ref() {
             return Ok(endpoint.clone());
@@ -43,13 +49,18 @@ impl SharedQuicEndpoint {
 
     pub(super) async fn close(&self, timeout: Duration) {
         let endpoints = {
-            let mut endpoints = self.0.lock().await;
+            let mut endpoints = self.direct.lock().await;
             [endpoints[0].take(), endpoints[1].take()]
         };
         for endpoint in endpoints.into_iter().flatten() {
             endpoint.close(0_u32.into(), b"shutdown");
             let _ = tokio::time::timeout(timeout, endpoint.wait_idle()).await;
         }
+        self.tasks.close().await;
+    }
+
+    pub(super) fn tasks_failed(&self) -> bool {
+        self.tasks.has_failed()
     }
 }
 
@@ -125,33 +136,59 @@ async fn quic_connect(
     Option<honk_outbound::quic::PacketTransportEndpoint>,
 )> {
     let deadline = tokio::time::Instant::now() + budget;
-    let (connecting, owner) = if dial.proxy.is_some() {
+    let owner = if dial.proxy.is_some() {
         let transport = dial.dial_packet_transport_until(addr, deadline).await?;
-        let owner =
-            honk_outbound::quic::packet_transport_endpoint_with_metrics(transport, addr, true)
-                .map_err(|error| anyhow::anyhow!("{label} packet endpoint: {error}"))?;
-        let connecting = owner
-            .endpoint()
-            .connect_with(config.clone(), addr, sni)
-            .map_err(|error| {
-                with_packet_cause(Some(&owner), error.into())
-                    .context(format!("{label} connect_with"))
-            })?;
-        (connecting, Some(owner))
+        let owner = honk_outbound::quic::packet_transport_endpoint_with_metrics(
+            transport,
+            addr,
+            true,
+            Some(&direct_endpoint.tasks),
+        )
+        .map_err(|error| anyhow::anyhow!("{label} packet endpoint: {error}"))?;
+        Some(owner)
     } else {
-        let endpoint = direct_endpoint.get(addr.is_ipv6()).await?;
+        None
+    };
+    let direct;
+    let endpoint = if let Some(owner) = &owner {
+        owner.endpoint()
+    } else {
+        direct = direct_endpoint.get(addr.is_ipv6()).await?;
+        &direct
+    };
+    let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
+        Some(addr),
+        honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
+    );
+    let handshake = async {
         let connecting = endpoint
             .connect_with(config.clone(), addr, sni)
-            .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
-        (connecting, None)
-    };
-    let connection = tokio::time::timeout_at(deadline, connecting)
-        .await
-        .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
-        .map_err(|error| {
-            with_packet_cause(owner.as_ref(), anyhow::Error::new(error))
-                .context(format!("{label} handshake"))
-        })?;
+            .map_err(|error| {
+                with_packet_cause(owner.as_ref(), error.into())
+                    .context(format!("{label} connect_with"))
+            })?;
+        tokio::time::timeout_at(deadline, connecting)
+            .await
+            .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
+            .map_err(|error| {
+                with_packet_cause(owner.as_ref(), error.into())
+                    .context(format!("{label} handshake"))
+            })
+    }
+    .await;
+    if let Some(observation) = &mut observation {
+        observation.finish(
+            if handshake.is_ok() {
+                honk_outbound::runtime::flow_observation::TransportStatus::Succeeded
+            } else {
+                honk_outbound::runtime::flow_observation::TransportStatus::Failed
+            },
+            handshake.as_ref().err().map(|_| {
+                honk_outbound::runtime::flow_observation::TransportError::QuicConnectFailed
+            }),
+        );
+    }
+    let connection = handshake?;
     Ok((connection, owner))
 }
 
@@ -183,8 +220,10 @@ pub(super) async fn quic_connect_endpoint(
     .await
 }
 
+#[cfg(all(test, feature = "native-api"))]
+mod tests;
 #[cfg(test)]
-mod tests {
+mod packet_cause_tests {
     use super::*;
     use honk_outbound::group::ScoreOutcome;
     use honk_outbound::proxy::{NodeFailure, PacketTransport};

@@ -10,6 +10,47 @@ pub(crate) mod dns;
 pub(crate) use dns::dns_snapshot;
 pub(crate) use dns::{DnsStatEvent, record_dns_event};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundKind {
+    Builtin,
+    Node,
+    Group,
+}
+
+impl OutboundKind {
+    /// Validated configs reject unknown outbounds and group/node name clashes,
+    /// so a routed name that is neither builtin nor group is a node.
+    pub(crate) fn routed(groups: &crate::group::GroupManager, name: &str) -> Self {
+        match name {
+            "direct" | "block" => Self::Builtin,
+            // Internal handoff verdicts are neither node nor group; stats file them under groups.
+            "must_rules" | "control_plane_routing" => Self::Group,
+            _ if groups.get_group_policy(name).is_some() => Self::Group,
+            _ => Self::Node,
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Node => "node",
+            Self::Group => "group",
+        }
+    }
+}
+
+#[cfg(feature = "native-api")]
+pub(crate) struct NativeOutboundCounters {
+    pub(crate) name: String,
+    pub(crate) kind: OutboundKind,
+    pub(crate) active_connections: u64,
+    pub(crate) total_connections: u64,
+    pub(crate) upload_bytes: u64,
+    pub(crate) download_bytes: u64,
+    pub(crate) errors: u64,
+}
+
 /// Per-outbound statistics tracked in user-space.
 #[derive(Debug, Clone, Default)]
 pub struct OutboundTracker {
@@ -58,9 +99,15 @@ impl OutboundTracker {
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
             tx_packets: 0, // Not tracked at user-space level
             rx_packets: 0,
-            active_conns: self.active_connections.load(Ordering::Relaxed) as u32,
-            total_conns: self.total_connections.load(Ordering::Relaxed) as u32,
-            errors: self.errors.load(Ordering::Relaxed) as u32,
+            active_conns: self
+                .active_connections
+                .load(Ordering::Relaxed)
+                .min(u32::MAX as u64) as u32,
+            total_conns: self
+                .total_connections
+                .load(Ordering::Relaxed)
+                .min(u32::MAX as u64) as u32,
+            errors: self.errors.load(Ordering::Relaxed).min(u32::MAX as u64) as u32,
             _pad: 0,
         }
     }
@@ -382,9 +429,11 @@ impl Drop for TcpFlowGuard {
 /// Statistics manager that tracks per-outbound metrics.
 #[derive(Debug)]
 pub struct StatsManager {
-    trackers: DashMap<String, OutboundTracker>,
+    trackers: [DashMap<String, OutboundTracker>; 3],
     udp: UdpStats,
     tcp: TcpStats,
+    #[cfg(feature = "native-api")]
+    counter_since: std::time::SystemTime,
     /// Warm-reason attribution bits per node id, pruned at snapshot time to
     /// nodes that still hold warm resources.
     warm_marks: DashMap<uuid::Uuid, AtomicU8>,
@@ -455,9 +504,11 @@ impl WarmSnapshot {
 impl StatsManager {
     pub fn new() -> Self {
         Self {
-            trackers: DashMap::new(),
+            trackers: std::array::from_fn(|_| DashMap::new()),
             udp: UdpStats::default(),
             tcp: TcpStats::default(),
+            #[cfg(feature = "native-api")]
+            counter_since: std::time::SystemTime::now(),
             warm_marks: DashMap::new(),
         }
     }
@@ -549,40 +600,24 @@ impl StatsManager {
         snap
     }
 
-    /// Record a new connection on an outbound.
-    pub fn record_connection(&self, outbound: &str) {
-        if let Some(tracker) = self.trackers.get(outbound) {
-            tracker.increment_connections();
-            return;
-        }
-        self.trackers
-            .entry(outbound.to_owned())
-            .or_default()
-            .increment_connections();
-    }
-
     /// Track one connection with an exactly-once active counter balance.
-    pub fn track_connection(self: &Arc<Self>, outbound: &str) -> ActiveConnectionGuard {
-        let tracker = if let Some(tracker) = self.trackers.get(outbound) {
-            tracker.clone()
-        } else {
-            self.trackers
-                .entry(outbound.to_owned())
-                .or_default()
-                .clone()
-        };
-        tracker.increment_connections();
-        ActiveConnectionGuard { tracker }
+    pub fn track_connection(
+        self: &Arc<Self>,
+        outbound: &str,
+        kind: OutboundKind,
+    ) -> ActiveConnectionGuard {
+        self.track_outbound(self.outbound_tracker(outbound, kind))
     }
 
     /// Resolve an outbound tracker once for a long-lived data path. Callers
     /// that already retain the returned value avoid allocating an outbound
     /// name and taking a DashMap shard lock for every packet.
-    pub fn outbound_tracker(&self, outbound: &str) -> OutboundTracker {
-        self.trackers
-            .entry(outbound.to_owned())
-            .or_default()
-            .clone()
+    pub fn outbound_tracker(&self, outbound: &str, kind: OutboundKind) -> OutboundTracker {
+        let trackers = &self.trackers[kind as usize];
+        if let Some(tracker) = trackers.get(outbound) {
+            return tracker.clone();
+        }
+        trackers.entry(outbound.to_owned()).or_default().clone()
     }
 
     /// Track one connection using an already-resolved tracker.
@@ -897,32 +932,58 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a closed connection on an outbound.
-    pub fn record_close(&self, outbound: &str) {
-        if let Some(tracker) = self.trackers.get(outbound) {
-            tracker.decrement_connections();
-        }
-    }
-
     /// Record bytes transferred through an outbound.
-    pub fn record_bytes(&self, outbound: &str, tx: u64, rx: u64) {
-        if let Some(tracker) = self.trackers.get(outbound) {
+    pub fn record_bytes(&self, outbound: &str, kind: OutboundKind, tx: u64, rx: u64) {
+        let trackers = &self.trackers[kind as usize];
+        if let Some(tracker) = trackers.get(outbound) {
             tracker.add_bytes(tx, rx);
             return;
         }
-        self.trackers
+        trackers
             .entry(outbound.to_owned())
             .or_default()
             .add_bytes(tx, rx);
     }
 
+    pub(crate) fn byte_counters(
+        &self,
+        outbound: &str,
+        kind: OutboundKind,
+    ) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        let trackers = &self.trackers[kind as usize];
+        if let Some(tracker) = trackers.get(outbound) {
+            return (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes));
+        }
+        let tracker = trackers.entry(outbound.to_owned()).or_default();
+        (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes))
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn traffic_totals(&self) -> Option<(u64, u64)> {
+        self.trackers
+            .iter()
+            .flat_map(|trackers| trackers.iter())
+            .try_fold((0u64, 0u64), |(tx, rx), tracker| {
+                Some((
+                    tx.checked_add(tracker.tx_bytes.load(Ordering::Relaxed))?,
+                    rx.checked_add(tracker.rx_bytes.load(Ordering::Relaxed))?,
+                ))
+            })
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn counter_since(&self) -> std::time::SystemTime {
+        self.counter_since
+    }
+
     /// Record an error on an outbound.
-    pub fn record_error(&self, outbound: &str) {
-        if let Some(tracker) = self.trackers.get(outbound) {
+    pub fn record_error(&self, outbound: &str, kind: OutboundKind) {
+        let trackers = &self.trackers[kind as usize];
+        if let Some(tracker) = trackers.get(outbound) {
             tracker.increment_errors();
             return;
         }
-        self.trackers
+        trackers
             .entry(outbound.to_owned())
             .or_default()
             .increment_errors();
@@ -930,10 +991,45 @@ impl StatsManager {
 
     /// Get a snapshot of all per-outbound statistics.
     pub fn snapshot(&self) -> std::collections::HashMap<String, OutboundStats> {
-        self.trackers
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().snapshot()))
-            .collect()
+        let mut snapshot = std::collections::HashMap::<String, OutboundStats>::new();
+        for entry in self.trackers.iter().flat_map(|trackers| trackers.iter()) {
+            let value = entry.value().snapshot();
+            let merged = snapshot.entry(entry.key().clone()).or_default();
+            merged.tx_bytes = merged.tx_bytes.saturating_add(value.tx_bytes);
+            merged.rx_bytes = merged.rx_bytes.saturating_add(value.rx_bytes);
+            merged.active_conns = merged.active_conns.saturating_add(value.active_conns);
+            merged.total_conns = merged.total_conns.saturating_add(value.total_conns);
+            merged.errors = merged.errors.saturating_add(value.errors);
+        }
+        snapshot
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn native_snapshot(&self) -> Vec<NativeOutboundCounters> {
+        let mut snapshot = Vec::new();
+        for kind in [
+            OutboundKind::Builtin,
+            OutboundKind::Node,
+            OutboundKind::Group,
+        ] {
+            for entry in &self.trackers[kind as usize] {
+                snapshot.push(NativeOutboundCounters {
+                    name: entry.key().clone(),
+                    kind,
+                    active_connections: entry.active_connections.load(Ordering::Relaxed),
+                    total_connections: entry.total_connections.load(Ordering::Relaxed),
+                    upload_bytes: entry.tx_bytes.load(Ordering::Relaxed),
+                    download_bytes: entry.rx_bytes.load(Ordering::Relaxed),
+                    errors: entry.errors.load(Ordering::Relaxed),
+                });
+            }
+        }
+        snapshot.sort_unstable_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
+        });
+        snapshot
     }
 
     /// Get the complete fixed UDP metrics schema.
@@ -987,13 +1083,13 @@ mod tests {
 
     #[test]
     fn test_stats_manager() {
-        let mgr = StatsManager::new();
+        let mgr = Arc::new(StatsManager::new());
 
-        mgr.record_connection("proxy1");
-        mgr.record_connection("proxy1");
-        mgr.record_connection("proxy2");
-        mgr.record_bytes("proxy1", 1000, 2000);
-        mgr.record_error("proxy2");
+        let _first = mgr.track_connection("proxy1", crate::stats::OutboundKind::Node);
+        let _second = mgr.track_connection("proxy1", crate::stats::OutboundKind::Node);
+        let _third = mgr.track_connection("proxy2", crate::stats::OutboundKind::Node);
+        mgr.record_bytes("proxy1", crate::stats::OutboundKind::Node, 1000, 2000);
+        mgr.record_error("proxy2", crate::stats::OutboundKind::Node);
 
         let snap = mgr.snapshot();
         assert_eq!(snap.len(), 2);
@@ -1005,12 +1101,11 @@ mod tests {
     #[test]
     fn warmed_stats_methods_reuse_one_tracker() {
         let manager = Arc::new(StatsManager::new());
-        manager.record_connection("proxy");
-        let guard = manager.track_connection("proxy");
-        manager.record_bytes("proxy", 100, 200);
-        manager.record_error("proxy");
+        let first = manager.track_connection("proxy", crate::stats::OutboundKind::Node);
+        let guard = manager.track_connection("proxy", crate::stats::OutboundKind::Node);
+        manager.record_bytes("proxy", crate::stats::OutboundKind::Node, 100, 200);
+        manager.record_error("proxy", crate::stats::OutboundKind::Node);
 
-        assert_eq!(manager.trackers.len(), 1);
         let snapshot = manager.snapshot();
         let tracker = snapshot.get("proxy").unwrap();
         assert_eq!(tracker.total_conns, 2);
@@ -1020,14 +1115,14 @@ mod tests {
         assert_eq!(tracker.errors, 1);
 
         drop(guard);
-        manager.record_close("proxy");
+        drop(first);
         assert_eq!(manager.snapshot()["proxy"].active_conns, 0);
     }
 
     #[test]
     fn active_connection_guard_decrements_active_exactly_once() {
         let manager = Arc::new(StatsManager::new());
-        let guard = manager.track_connection("udp-test");
+        let guard = manager.track_connection("udp-test", crate::stats::OutboundKind::Node);
 
         let snapshot = manager.snapshot();
         let tracker = snapshot.get("udp-test").unwrap();
@@ -1297,5 +1392,92 @@ mod tests {
         assert_eq!(unavailable.held_packets, 1);
         assert_eq!(unavailable.held_peak, 6);
         assert_eq!(unavailable.socket_receive_buffer_bytes, 8192);
+    }
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn native_traffic_overflow_is_unknown_not_wrapped() {
+        let stats = StatsManager::new();
+        stats.record_bytes("first", crate::stats::OutboundKind::Node, u64::MAX, 1);
+        assert_eq!(stats.traffic_totals(), Some((u64::MAX, 1)));
+        stats.record_bytes("second", crate::stats::OutboundKind::Node, 1, 0);
+        assert_eq!(stats.traffic_totals(), None);
+    }
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn native_counters_retain_kind_and_full_width_across_config_changes() {
+        let stats = StatsManager::new();
+        let old_groups = crate::group::GroupManager::new(
+            &[honk_config::group::Group {
+                name: "shared".into(),
+                ..Default::default()
+            }],
+            &[],
+        );
+        let old_kind = OutboundKind::routed(&old_groups, "shared");
+        assert_eq!(old_kind, OutboundKind::Group);
+        let old = stats.outbound_tracker("shared", old_kind);
+        let wide = u32::MAX as u64 + 17;
+        old.total_connections.store(wide, Ordering::Relaxed);
+        old.active_connections.store(wide, Ordering::Relaxed);
+        old.errors.store(wide, Ordering::Relaxed);
+        old.add_bytes(wide, wide + 1);
+        let new_groups = crate::group::GroupManager::new(
+            &[],
+            &[honk_config::node::Node {
+                name: "shared".into(),
+                ..Default::default()
+            }],
+        );
+        let new_kind = OutboundKind::routed(&new_groups, "shared");
+        assert_eq!(new_kind, OutboundKind::Node);
+        let guard = stats.track_outbound(stats.outbound_tracker("shared", new_kind));
+        stats.record_bytes("shared", new_kind, 3, 5);
+        old.add_bytes(7, 11);
+        drop(guard);
+        let snapshot = stats.native_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        let group = snapshot
+            .iter()
+            .find(|row| row.kind == OutboundKind::Group)
+            .unwrap();
+        assert_eq!(
+            (
+                group.active_connections,
+                group.total_connections,
+                group.errors
+            ),
+            (wide, wide, wide)
+        );
+        assert_eq!(
+            (group.upload_bytes, group.download_bytes),
+            (wide + 7, wide + 12)
+        );
+        let node = snapshot
+            .iter()
+            .find(|row| row.kind == OutboundKind::Node)
+            .unwrap();
+        assert_eq!(
+            (
+                node.active_connections,
+                node.total_connections,
+                node.upload_bytes,
+                node.download_bytes
+            ),
+            (0, 1, 3, 5)
+        );
+        assert_eq!(stats.traffic_totals(), Some((wide + 10, wide + 17)));
+        let legacy = stats.snapshot();
+        assert_eq!(legacy["shared"].total_conns, u32::MAX);
+        assert_eq!(legacy["shared"].tx_bytes, wide + 10);
+        assert_eq!(
+            OutboundKind::routed(&new_groups, "direct"),
+            OutboundKind::Builtin
+        );
+        assert_eq!(
+            OutboundKind::routed(&new_groups, "must_rules"),
+            OutboundKind::Group
+        );
     }
 }

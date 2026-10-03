@@ -7,6 +7,7 @@ async fn successful_offer_releases_reusable_admission_permit() {
         1,
         1,
         1,
+        false,
         None,
     )
     .unwrap()

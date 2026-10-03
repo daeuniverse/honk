@@ -843,6 +843,74 @@ async fn test_first_read_sends_tcp_request_and_reports_response_error() {
     );
 }
 
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn observed_target_requires_deferred_request_and_positive_response() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    for status in [0, 1] {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observer = FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            {
+                let events = Arc::clone(&events);
+                Arc::new(move |_, event| events.lock().push(event))
+            },
+        );
+        let address = start_server_with_response(TEST_PASSWORD, Duration::ZERO, status).await;
+        let node = test_node(address.port(), TEST_PASSWORD);
+        let mut stream = observer
+            .scope(Hysteria2Handler::new().dial(
+                &node,
+                "93.184.216.34:80".parse().unwrap(),
+                None,
+                Duration::from_secs(2),
+            ))
+            .await
+            .unwrap();
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            FlowEvent::Milestone {
+                milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
+                    | crate::runtime::flow_observation::Milestone::TargetConfirmed
+            }
+        )));
+        // I/O is deliberately outside the dial scope: the exclusive stream owns its evidence.
+        stream.stream.write_all(b"x").await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), stream.stream.read_u8())
+            .await
+            .unwrap();
+        if status == 0 {
+            assert_eq!(reply.unwrap(), b'x');
+        } else {
+            assert_eq!(reply.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+        }
+        let milestones: Vec<_> = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::Milestone { milestone } if milestone.as_str().starts_with("target_") => {
+                    Some(milestone.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            milestones,
+            if status == 0 {
+                vec!["target_request_sent", "target_confirmed"]
+            } else {
+                vec!["target_request_sent"]
+            }
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_dial_tcp_domain_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;

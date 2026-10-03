@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::ebpf::{DynamicHooks, EbpfBackend, IfaceRole};
@@ -62,6 +62,7 @@ impl IfaceWatcher {
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
         attached: AttachedMap,
+        degradations: Arc<crate::degradations::Degradations>,
     ) -> Option<Self> {
         let fd = match subscribe_network_events() {
             Ok(fd) => fd,
@@ -70,11 +71,15 @@ impl IfaceWatcher {
                     "interface watcher disabled; subscribe network events failed: {}",
                     e
                 );
+                degradations.set(
+                    crate::degradations::Component::IfaceWatch,
+                    watcher_disabled("subscribe_failed"),
+                );
                 return None;
             }
         };
         let (stop, rx) = watch::channel(false);
-        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx));
+        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx, degradations));
         Some(Self { handle, stop })
     }
 
@@ -88,6 +93,14 @@ impl IfaceWatcher {
             handle.abort();
             let _ = (&mut handle).await;
         }
+    }
+}
+
+fn watcher_disabled(reason: &'static str) -> crate::degradations::Issue {
+    crate::degradations::Issue {
+        code: "interface_watcher_disabled",
+        message: "The interface watcher is not running; interface changes take effect after a restart.",
+        reason,
     }
 }
 
@@ -111,12 +124,17 @@ async fn run(
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
+    degradations: Arc<crate::degradations::Degradations>,
 ) {
     let async_fd = match tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
     {
         Ok(f) => f,
         Err(e) => {
             warn!("interface watcher disabled: AsyncFd setup failed: {}", e);
+            degradations.set(
+                crate::degradations::Component::IfaceWatch,
+                watcher_disabled("poll_setup_failed"),
+            );
             return;
         }
     };
@@ -124,54 +142,81 @@ async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
     let mut network_state = read_network_state(&config).await;
+    let mut pending_notification = true;
+    let mut netlink_retry_at = tokio::time::Instant::now();
 
     // Interface-dependent state may have changed before the watcher was ready;
     // the control-plane refresh is content-deduplicated.
-    reconcile_and_notify(&ebpf, &config, &commands, &mut attached, true).await;
+    reconcile_and_notify(
+        &ebpf,
+        &config,
+        &commands,
+        &mut attached,
+        true,
+        &mut pending_notification,
+    )
+    .await;
     loop {
         tokio::select! {
+            biased;
             _ = stop.changed() => break,
+            permit = commands.reserve(), if pending_notification => {
+                match permit {
+                    Ok(permit) => { permit.send(crate::control::ControlCommand::NetworkChanged); }
+                    Err(_) => debug!("control plane stopped before network-change refresh"),
+                }
+                pending_notification = false;
+            }
             _ = ticker.tick() => {
                 let changed = update_network_state(&config, &mut network_state).await;
-                reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await;
+                reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed, &mut pending_notification).await;
             }
-            guard = async_fd.readable() => {
+            guard = async {
+                tokio::time::sleep_until(netlink_retry_at).await;
+                async_fd.readable().await
+            } => {
                 // A transient read failure (ENOBUFS after a burst) must not
                 // kill the watcher: the ticker keeps reconciling regardless.
                 let mut guard = match guard {
                     Ok(g) => g,
                     Err(e) => {
                         warn!("interface watcher: netlink wait failed: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        netlink_retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
                         continue;
                     }
                 };
                 // Drain pending network events; their contents are irrelevant
                 // because reconcile re-derives state from /sys and /proc.
-                let drained = guard.try_io(|inner| loop {
-                    match recv(inner.as_raw_fd(), &mut buf, MsgFlags::empty()) {
-                        Ok(_) => {}
-                        Err(errno) => {
-                            let e = std::io::Error::from(errno);
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                return Ok(());
+                let drained = guard.try_io(|inner| {
+                    // Bound a burst so stop and the ticker cannot starve behind netlink traffic.
+                    for _ in 0..64 {
+                        match recv(inner.as_raw_fd(), &mut buf, MsgFlags::empty()) {
+                            Ok(_) => {}
+                            Err(errno) => {
+                                let e = std::io::Error::from(errno);
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    return Ok(true);
+                                }
+                                if e.kind() == std::io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                return Err(e);
                             }
-                            if e.kind() == std::io::ErrorKind::Interrupted {
-                                continue;
-                            }
-                            return Err(e);
                         }
                     }
+                    Ok(false)
                 });
                 match drained {
-                    Ok(Ok(())) => {
-                        guard.clear_ready();
+                    Ok(Ok(drained)) => {
+                        if drained {
+                            guard.clear_ready();
+                        }
                         let changed = update_network_state(&config, &mut network_state).await;
-                        reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed).await;
+                        reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed, &mut pending_notification).await;
                     }
                     Ok(Err(e)) => {
                         warn!("interface watcher: netlink recv failed: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        netlink_retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
                     }
                     // Spurious readiness; nothing was drained.
                     Err(_) => {}
@@ -205,17 +250,25 @@ async fn update_network_state(
 async fn reconcile_and_notify(
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: &Arc<RwLock<Arc<honk_config::Config>>>,
-    commands: &tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
+    commands: &mpsc::Sender<crate::control::ControlCommand>,
     attached: &mut AttachedMap,
     network_state_changed: bool,
+    pending_notification: &mut bool,
 ) {
-    if (reconcile(ebpf, config, attached).await || network_state_changed)
-        && commands
-            .send(crate::control::ControlCommand::NetworkChanged)
-            .await
-            .is_err()
-    {
-        debug!("control plane stopped before network-change refresh");
+    *pending_notification |= network_state_changed;
+    match reconcile(ebpf, config, attached).await {
+        Ok(changed) => *pending_notification |= changed,
+        Err(_) => *pending_notification = true,
+    }
+    if *pending_notification {
+        match commands.try_send(crate::control::ControlCommand::NetworkChanged) {
+            Ok(()) => *pending_notification = false,
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                *pending_notification = false;
+                debug!("control plane stopped before network-change refresh");
+            }
+        }
     }
 }
 
@@ -223,7 +276,7 @@ async fn reconcile(
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: &Arc<RwLock<Arc<honk_config::Config>>>,
     attached: &mut AttachedMap,
-) -> bool {
+) -> anyhow::Result<bool> {
     let (desired, single_homed) = {
         let cfg = config.read().await;
         desired_interfaces(&cfg)
@@ -247,6 +300,7 @@ async fn reconcile(
         },
     };
     let mut changed = false;
+    let mut attach_error = None;
     let mut backend = ebpf.write().await;
     // Forget tracked entries that vanished, were recreated (their hooks
     // died with the old ifindex), or are no longer wanted (un-enslaved,
@@ -273,7 +327,10 @@ async fn reconcile(
         if have == want {
             continue;
         }
-        if crate::netlink::ifindex_of(&name).is_err() || !iface_is_up(&name) {
+        let Ok(ifindex) = crate::netlink::ifindex_of(&name) else {
+            continue;
+        };
+        if !iface_is_up(&name) {
             continue;
         }
         match backend.attach_dynamic_interface(&name, role, single_homed) {
@@ -281,7 +338,7 @@ async fn reconcile(
                 attached.insert(
                     name.clone(),
                     AttachedInterface {
-                        ifindex: crate::netlink::ifindex_of(&name).unwrap_or(0),
+                        ifindex,
                         role,
                         hooks,
                     },
@@ -294,10 +351,12 @@ async fn reconcile(
             }
             Err(e) => {
                 warn!(interface = %name, role = ?role, "dynamic attach failed: {}", e);
+                attach_error
+                    .get_or_insert_with(|| e.context(format!("attach {role:?} interface {name}")));
             }
         }
     }
-    changed
+    attach_error.map_or(Ok(changed), Err)
 }
 
 /// The configured interface set with roles, mirroring the startup logic in
@@ -355,6 +414,56 @@ fn iface_is_up(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn watcher_fixture(
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        config: Arc<RwLock<Arc<honk_config::Config>>>,
+        commands: mpsc::Sender<crate::control::ControlCommand>,
+        attached: AttachedMap,
+    ) -> (IfaceWatcher, std::os::unix::net::UnixDatagram) {
+        let (events, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        events.set_nonblocking(true).unwrap();
+        let (stop, rx) = watch::channel(false);
+        let handle = tokio::spawn(run(
+            events.into(),
+            ebpf,
+            config,
+            commands,
+            attached,
+            rx,
+            Arc::default(),
+        ));
+        (IfaceWatcher { handle, stop }, writer)
+    }
+
+    #[tokio::test]
+    async fn a_watcher_that_cannot_poll_is_reported() {
+        let degradations = Arc::new(crate::degradations::Degradations::default());
+        // epoll refuses regular files.
+        let file = tempfile::tempfile().unwrap();
+        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        )));
+        let config = Arc::new(RwLock::new(Arc::new(honk_config::Config::default())));
+        let (commands, _receiver) = mpsc::channel(1);
+        let (_stop, rx) = watch::channel(false);
+        run(
+            file.into(),
+            ebpf,
+            config,
+            commands,
+            AttachedMap::default(),
+            rx,
+            Arc::clone(&degradations),
+        )
+        .await;
+        assert_eq!(
+            degradations
+                .get(crate::degradations::Component::IfaceWatch)
+                .map(|issue| issue.reason),
+            Some("poll_setup_failed")
+        );
+    }
 
     #[test]
     fn wan_only_configuration_does_not_synthesize_loopback_lan() {
@@ -429,13 +538,13 @@ mod tests {
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
 
-        assert!(reconcile(&ebpf, &config, &mut attached).await);
+        assert!(reconcile(&ebpf, &config, &mut attached).await.unwrap());
         let first = attach.load(Ordering::Relaxed);
         {
             let mut config = config.write().await;
             Arc::make_mut(&mut config).global.wan_interface = vec!["lo".to_string()];
         }
-        assert!(reconcile(&ebpf, &config, &mut attached).await);
+        assert!(reconcile(&ebpf, &config, &mut attached).await.unwrap());
 
         assert_eq!(forget.load(Ordering::Relaxed), 1);
         assert_eq!(attach.load(Ordering::Relaxed), first + 1);
@@ -443,7 +552,7 @@ mod tests {
             attached.get("lo").map(|state| state.role),
             Some(IfaceRole::LanWan)
         );
-        assert!(!reconcile(&ebpf, &config, &mut attached).await);
+        assert!(!reconcile(&ebpf, &config, &mut attached).await.unwrap());
     }
 
     #[tokio::test]
@@ -455,23 +564,81 @@ mod tests {
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, false).await;
+        let mut pending_notification = false;
+        reconcile_and_notify(
+            &ebpf,
+            &config,
+            &tx,
+            &mut attached,
+            false,
+            &mut pending_notification,
+        )
+        .await;
         assert!(matches!(
             rx.try_recv(),
             Ok(crate::control::ControlCommand::NetworkChanged)
         ));
 
-        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, false).await;
+        reconcile_and_notify(
+            &ebpf,
+            &config,
+            &tx,
+            &mut attached,
+            false,
+            &mut pending_notification,
+        )
+        .await;
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
-        reconcile_and_notify(&ebpf, &config, &tx, &mut attached, true).await;
+        reconcile_and_notify(
+            &ebpf,
+            &config,
+            &tx,
+            &mut attached,
+            true,
+            &mut pending_notification,
+        )
+        .await;
         assert!(matches!(
             rx.try_recv(),
             Ok(crate::control::ControlCommand::NetworkChanged)
         ));
+    }
+
+    #[tokio::test]
+    async fn full_control_queue_retains_hint_and_shutdown_joins_the_worker() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let backend = crate::ebpf::mock::MockEbpfBackend::new();
+            let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
+            let retained_backend = Arc::downgrade(&ebpf);
+            let mut config = honk_config::Config::default();
+            config.global.lan_interface = vec!["lo".to_string()];
+            let config = Arc::new(RwLock::new(Arc::new(config)));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.try_send(crate::control::ControlCommand::NetworkChanged)
+                .unwrap();
+            let (watcher, _events) = watcher_fixture(ebpf, config, tx, AttachedMap::new());
+
+            // Freeing capacity must deliver the startup hint the full queue held back.
+            assert!(matches!(
+                rx.recv().await,
+                Some(crate::control::ControlCommand::NetworkChanged)
+            ));
+            assert!(matches!(
+                rx.recv().await,
+                Some(crate::control::ControlCommand::NetworkChanged)
+            ));
+            watcher.shutdown(Duration::from_secs(1)).await;
+            assert!(
+                retained_backend.upgrade().is_none(),
+                "shutdown must join the retained worker"
+            );
+        })
+        .await
+        .expect("watcher did not deliver the retained hint or join on shutdown");
     }
 
     #[test]
@@ -535,12 +702,12 @@ mod tests {
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
 
-        reconcile(&ebpf, &config, &mut attached).await;
+        reconcile(&ebpf, &config, &mut attached).await.unwrap();
         let first = attach.load(Ordering::Relaxed);
         assert!(first >= 1, "first reconcile attaches the configured LAN");
         assert_eq!(detach.load(Ordering::Relaxed), 0);
 
-        reconcile(&ebpf, &config, &mut attached).await;
+        reconcile(&ebpf, &config, &mut attached).await.unwrap();
         assert_eq!(
             attach.load(Ordering::Relaxed),
             first,

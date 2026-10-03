@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(feature = "flow-observation")]
+mod observation;
+mod selector_networks;
 mod udp_selection;
 
 #[test]
@@ -18,7 +21,13 @@ fn direct_selector_plan_fast_path_preserves_choice_default_and_health() {
             .name,
         "plan-b"
     );
-    manager.set_selector_choice("plan-selector", "plan-a");
+    manager
+        .set_selector_choice(
+            "plan-selector",
+            "plan-a",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     assert_eq!(
         manager
             .selection_plan_for_domain("plan-selector", ProbeDomain::Tcp, IpVersion::V4)
@@ -126,7 +135,9 @@ fn selector_tcp_last_resort_cannot_escape_an_empty_selected_subgroup() {
             "{name}"
         );
     }
-    manager.set_selector_choice("child", "leaf");
+    manager
+        .set_selector_choice("child", "leaf", crate::group::SelectorNetworks::Both)
+        .unwrap();
     for name in ["child", "parent", "automatic"] {
         assert_eq!(
             manager.select_node(name).map(|node| node.id),
@@ -205,7 +216,8 @@ fn test_selector_runtime_choice_overrides_default() {
     let mut group = make_group("g", GroupPolicy::Selector, vec![n1, n2, n3]);
     group.default = Some("b".into());
     let m = GroupManager::new(&[group], &nodes);
-    m.set_selector_choice("g", "c");
+    m.set_selector_choice("g", "c", crate::group::SelectorNetworks::Both)
+        .unwrap();
     let selected = m.select_node("g").unwrap();
     assert_eq!(selected.name, "c");
 }
@@ -214,10 +226,12 @@ fn test_selector_runtime_choice_overrides_default() {
 fn selector_choice_filtered_by_health_refuses_without_rewriting_choice() {
     let (a, b) = (nid("sel-a"), nid("sel-b"));
     let nodes = vec![make_node(a, "sel-a"), make_node(b, "sel-b")];
-    let group = make_group("g", GroupPolicy::Selector, vec![a, b]);
+    let mut group = make_group("g", GroupPolicy::Selector, vec![a, b]);
+    group.default = Some("sel-b".into());
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
-    m.set_selector_choice("g", "sel-a");
+    m.set_selector_choice("g", "sel-a", crate::group::SelectorNetworks::Both)
+        .unwrap();
     alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
 
     assert!(
@@ -225,7 +239,7 @@ fn selector_choice_filtered_by_health_refuses_without_rewriting_choice() {
             .is_none()
     );
     assert_eq!(
-        m.get_selector_choice("g").as_deref(),
+        m.get_selector_choice("g", SelectionNetwork::Tcp).as_deref(),
         Some("sel-a"),
         "the stored choice is preserved so recovery restores it"
     );
@@ -268,23 +282,25 @@ fn selector_warm_node_keeps_dead_nested_choice_and_cold_fallback() {
 
     assert_eq!(
         manager
-            .selector_warm_node("warm-parent")
+            .selector_warm_node("warm-parent", SelectionNetwork::Tcp)
             .map(|node| node.id),
         Some(b),
         "nested selector defaults resolve within their own membership"
     );
-    manager.set_selector_choice("warm-child", "warm-a");
+    manager
+        .set_selector_choice("warm-child", "warm-a", crate::group::SelectorNetworks::Both)
+        .unwrap();
     alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(
         manager
-            .selector_warm_node("warm-parent")
+            .selector_warm_node("warm-parent", SelectionNetwork::Tcp)
             .map(|node| node.id),
         Some(a),
         "warm ownership retains the configured leaf despite failed health"
     );
     assert_eq!(
         manager
-            .selector_warm_node("warm-cold-parent")
+            .selector_warm_node("warm-cold-parent", SelectionNetwork::Tcp)
             .map(|node| node.id),
         Some(b),
         "a cold nested policy falls back to its next production leaf"
@@ -316,13 +332,13 @@ fn selector_warm_node_keeps_duplicate_name_member_identity() {
 
     assert_eq!(
         manager
-            .selector_warm_node("warm-left-parent")
+            .selector_warm_node("warm-left-parent", SelectionNetwork::Tcp)
             .map(|node| node.id),
         Some(left.id)
     );
     assert_eq!(
         manager
-            .selector_warm_node("warm-right-parent")
+            .selector_warm_node("warm-right-parent", SelectionNetwork::Tcp)
             .map(|node| node.id),
         Some(right.id)
     );
@@ -370,25 +386,50 @@ fn test_persist_callback_on_selector_change() {
     );
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    m.set_persist_callback(Some(Arc::new(move |g, n| {
-        calls2.lock().unwrap().push((g.to_string(), n.to_string()));
+    m.set_persist_callback(Some(Arc::new(move |g, network, member| {
+        calls2
+            .lock()
+            .unwrap()
+            .push((g.to_string(), network, member.clone()));
     })));
 
-    m.set_selector_choice("g", "a");
-    m.set_selector_choice("g", "a"); // unchanged → no extra call
-    m.set_selector_choice("g", "b");
+    m.set_selector_choice("g", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    m.set_selector_choice("g", "a", crate::group::SelectorNetworks::Both)
+        .unwrap(); // unchanged → no extra call
+    m.set_selector_choice("g", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &[
-            ("g".to_string(), "a".to_string()),
-            ("g".to_string(), "b".to_string())
+            (
+                "g".to_string(),
+                SelectionNetwork::Tcp,
+                SelectorMember::Node(n1)
+            ),
+            (
+                "g".to_string(),
+                SelectionNetwork::Udp,
+                SelectorMember::Node(n1)
+            ),
+            (
+                "g".to_string(),
+                SelectionNetwork::Tcp,
+                SelectorMember::Node(n2)
+            ),
+            (
+                "g".to_string(),
+                SelectionNetwork::Udp,
+                SelectorMember::Node(n2)
+            )
         ]
     );
 
     // Removing the callback stops persistence.
     m.set_persist_callback(None);
-    m.set_selector_choice("g", "a");
-    assert_eq!(calls.lock().unwrap().len(), 2);
+    m.set_selector_choice("g", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 4);
 }
 
 #[test]
@@ -408,9 +449,21 @@ fn selector_change_callback_fires_only_for_effective_choice_changes() {
         callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     })));
 
-    manager.set_selector_choice("warm-callback-group", "warm-callback");
-    manager.set_selector_choice("warm-callback-group", "warm-callback");
-    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    manager
+        .set_selector_choice(
+            "warm-callback-group",
+            "warm-callback",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
+    manager
+        .set_selector_choice(
+            "warm-callback-group",
+            "warm-callback",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -424,18 +477,22 @@ fn test_interrupt_callback_selector() {
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    m.set_interrupt_callback(Some(Arc::new(move |g| {
+    m.set_interrupt_callback(Some(Arc::new(move |g, _network| {
         calls2.lock().unwrap().push(g.to_string());
     })));
 
     // interrupt_connections = false → never fires.
-    m.set_selector_choice("off", "b");
+    m.set_selector_choice("off", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert!(calls.lock().unwrap().is_empty());
 
     // interrupt_connections = true → fires on actual changes only.
-    m.set_selector_choice("on", "a");
-    m.set_selector_choice("on", "a"); // unchanged → no interrupt
-    m.set_selector_choice("on", "b");
+    m.set_selector_choice("on", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    m.set_selector_choice("on", "a", crate::group::SelectorNetworks::Both)
+        .unwrap(); // unchanged → no interrupt
+    m.set_selector_choice("on", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &["on".to_string(), "on".to_string()]
@@ -453,7 +510,7 @@ fn test_interrupt_callback_urltest_switch() {
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    m.set_interrupt_callback(Some(Arc::new(move |g| {
+    m.set_interrupt_callback(Some(Arc::new(move |g, _network| {
         calls2.lock().unwrap().push(g.to_string());
     })));
 
@@ -539,7 +596,8 @@ fn test_selector_dial_list_is_the_chosen_node_only() {
         IpVersion::V4,
         Duration::from_millis(50),
     );
-    m.set_selector_choice("g", "b");
+    m.set_selector_choice("g", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
 
     let picked = m.select_nodes_in_order_for_domain("g", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(picked.len(), 1);
@@ -761,9 +819,12 @@ fn test_migrate_selector_choices_from() {
         ],
         &nodes,
     );
-    old.set_selector_choice("keep", "b");
-    old.set_selector_choice("shrunk", "b");
-    old.set_selector_choice("gone", "a");
+    old.set_selector_choice("keep", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    old.set_selector_choice("shrunk", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    old.set_selector_choice("gone", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
 
     // New config: "keep" unchanged, "shrunk" lost node "b", "gone" removed.
     let new = GroupManager::new(
@@ -776,12 +837,18 @@ fn test_migrate_selector_choices_from() {
     new.migrate_selector_choices_from(&old);
 
     // Surviving choice migrated and drives selection.
-    assert_eq!(new.get_selector_choice("keep"), Some("b".into()));
+    assert_eq!(
+        new.get_selector_choice("keep", SelectionNetwork::Tcp),
+        Some("b".into())
+    );
     assert_eq!(new.select_node("keep").unwrap().name, "b");
     // Choice whose node left the group is dropped.
-    assert_eq!(new.get_selector_choice("shrunk"), None);
+    assert_eq!(
+        new.get_selector_choice("shrunk", SelectionNetwork::Tcp),
+        None
+    );
     // Choice for a removed group is dropped.
-    assert_eq!(new.get_selector_choice("gone"), None);
+    assert_eq!(new.get_selector_choice("gone", SelectionNetwork::Tcp), None);
 }
 
 #[test]
@@ -916,7 +983,7 @@ fn test_loadbalance_no_interrupt_on_rotation() {
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    m.set_interrupt_callback(Some(Arc::new(move |g| {
+    m.set_interrupt_callback(Some(Arc::new(move |g, _network| {
         calls2.lock().unwrap().push(g.to_string());
     })));
 
@@ -1004,7 +1071,7 @@ fn test_fallback_interrupt_on_switch() {
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    m.set_interrupt_callback(Some(Arc::new(move |g| {
+    m.set_interrupt_callback(Some(Arc::new(move |g, _network| {
         calls2.lock().unwrap().push(g.to_string());
     })));
 
@@ -1349,9 +1416,12 @@ fn test_nested_selector_three_levels() {
     assert_eq!(m.node_names_in_group("mid"), vec!["l3", "leaf-g"]);
     assert_eq!(m.leaf_node_names_in_group("top"), vec!["l1", "l3", "l2"]);
 
-    m.set_selector_choice("leaf-g", "l2");
-    m.set_selector_choice("mid", "leaf-g");
-    m.set_selector_choice("top", "mid");
+    m.set_selector_choice("leaf-g", "l2", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    m.set_selector_choice("mid", "leaf-g", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    m.set_selector_choice("top", "mid", crate::group::SelectorNetworks::Both)
+        .unwrap();
 
     // The authoritative pick is the chain's leaf.
     let picked = m.select_nodes_in_order_for_domain("top", ProbeDomain::Tcp, IpVersion::V4);
@@ -1360,18 +1430,25 @@ fn test_nested_selector_three_levels() {
     assert_eq!(m.select_node("top").unwrap().name, "l2");
     assert_eq!(m.selection_chain("top"), vec!["top", "mid", "leaf-g", "l2"]);
 
-    // A sub-group choice pointing at a non-member is ignored
-    // (falls back to the first member) instead of breaking.
-    m.set_selector_choice("mid", "nope");
-    assert_eq!(m.select_node("mid").unwrap().name, "l3");
-    m.set_selector_choice("mid", "leaf-g");
+    // An invalid write cannot disturb the current member.
+    assert_eq!(
+        m.set_selector_choice("mid", "nope", SelectorNetworks::Both),
+        Err(SelectorError::NotMember)
+    );
+    assert_eq!(m.select_node("mid").unwrap().name, "l2");
 
     // Rebuild (config reload): every choice — node-targeted and
     // sub-group-targeted alike — migrates while the members exist.
     let m2 = GroupManager::new(&groups, &nodes);
     m2.migrate_selector_choices_from(&m);
-    assert_eq!(m2.get_selector_choice("top"), Some("mid".into()));
-    assert_eq!(m2.get_selector_choice("mid"), Some("leaf-g".into()));
+    assert_eq!(
+        m2.get_selector_choice("top", SelectionNetwork::Tcp),
+        Some("mid".into())
+    );
+    assert_eq!(
+        m2.get_selector_choice("mid", SelectionNetwork::Tcp),
+        Some("leaf-g".into())
+    );
     assert_eq!(m2.select_node("top").unwrap().name, "l2");
 
     // A rebuilt manager without the sub-group drops the stale choice.
@@ -1379,7 +1456,7 @@ fn test_nested_selector_three_levels() {
     top_only.nodes = vec![l1];
     let m3 = GroupManager::new(&[top_only], &nodes);
     m3.migrate_selector_choices_from(&m);
-    assert_eq!(m3.get_selector_choice("top"), None);
+    assert_eq!(m3.get_selector_choice("top", SelectionNetwork::Tcp), None);
 }
 
 /// URLTest parent over a URLTest sub-group: the sub-group contributes
@@ -1541,7 +1618,12 @@ fn test_user_style_nested_layout() {
     );
 
     // 🍥 final selecting direct-out dials the direct node itself.
-    m.set_selector_choice("🍥 final", "direct-out");
+    m.set_selector_choice(
+        "🍥 final",
+        "direct-out",
+        crate::group::SelectorNetworks::Both,
+    )
+    .unwrap();
     let picked = m.select_nodes_in_order_for_domain("🍥 final", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(picked.len(), 1);
     assert_eq!(picked[0].name, "direct-out");
@@ -1551,7 +1633,12 @@ fn test_user_style_nested_layout() {
     );
 
     // 👾 game → 🍪 country → first country sub-group → its first leaf.
-    m.set_selector_choice("👾 game", "🍪 country");
+    m.set_selector_choice(
+        "👾 game",
+        "🍪 country",
+        crate::group::SelectorNetworks::Both,
+    )
+    .unwrap();
     let picked = m.select_nodes_in_order_for_domain("👾 game", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(picked.len(), 1);
     assert_eq!(picked[0].name, "tw-1");
@@ -1568,7 +1655,8 @@ fn test_user_style_nested_layout() {
     assert_eq!(names, vec!["hk-1", "tw-1", "jp-1"]);
     // `now` caches the member (sub-group) tag once wind is reached as a
     // Selector's chosen sub-group with applied effects.
-    m.set_selector_choice("🥗 proxy", "🍃 wind");
+    m.set_selector_choice("🥗 proxy", "🍃 wind", crate::group::SelectorNetworks::Both)
+        .unwrap();
     let _ = m.select_nodes_in_order_for_domain("🥗 proxy", ProbeDomain::Tcp, IpVersion::V4);
     let wind_now = m.get_urltest_selection("🍃 wind").unwrap();
     assert!(["🇭🇰 hongkong", "🇨🇳 taiwan", "🇯🇵 japan"].contains(&wind_now.as_str()));
@@ -2008,7 +2096,7 @@ fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
     );
     let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let callback_interrupts = Arc::clone(&interrupts);
-    manager.set_interrupt_callback(Some(Arc::new(move |_| {
+    manager.set_interrupt_callback(Some(Arc::new(move |_, _| {
         callback_interrupts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     })));
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {

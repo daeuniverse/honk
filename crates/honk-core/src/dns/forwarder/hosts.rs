@@ -63,14 +63,23 @@ impl HostsSnapshot {
 
 impl HostsSourceSet {
     pub(crate) fn load(config: &honk_config::dns::DnsConfig) -> anyhow::Result<Self> {
+        Self::load_captured(config, |source| {
+            let path = honk_config::paths::resolve_dependency_path(source);
+            fs::read_to_string(&path)
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("failed to load DNS hosts file {}", path.display()))
+        })
+    }
+
+    pub(crate) fn load_captured<E>(
+        config: &honk_config::dns::DnsConfig,
+        mut read: impl FnMut(&str) -> Result<String, E>,
+    ) -> Result<Self, E> {
         let mut hash = Sha256::new();
         let mut sources = Vec::with_capacity(config.hosts.len());
         for source in &config.hosts {
             let rules = source != honk_config::dns::SYSTEM_HOSTS_PATH;
-            let path = honk_config::paths::resolve_dependency_path(source);
-            let contents = fs::read_to_string(&path)
-                .map_err(anyhow::Error::new)
-                .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
+            let contents = read(source)?;
             update_hash(&mut hash, &[u8::from(rules)]);
             update_hash(&mut hash, &Sha256::digest(contents.as_bytes()));
             sources.push((rules, contents));

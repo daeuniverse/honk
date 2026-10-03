@@ -19,6 +19,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
     Group {
         id: Uuid::new_v5(&NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.to_owned(),
+        icon: None,
         policy,
         nodes: nodes.iter().map(|node| node.id).collect(),
         filters: Vec::new(),
@@ -30,6 +31,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
         tolerance: 50,
         idle_timeout: None,
         interrupt_connections: false,
+        own: Default::default(),
         created_at: Utc::now(),
     }
 }

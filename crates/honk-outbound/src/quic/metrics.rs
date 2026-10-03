@@ -317,12 +317,14 @@ pub(crate) fn record_quic_session_rx_drop() {
 pub struct QuicConnectionMonitor {
     conn: Connection,
     tracker: Arc<SyncMutex<QuicMetricTracker>>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for QuicConnectionMonitor {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         self.tracker.lock().finish(self.conn.stats());
     }
 }
@@ -333,7 +335,7 @@ pub fn monitor_quic_connection(conn: &Connection) -> QuicConnectionMonitor {
     tracker.lock().sample(conn.stats());
     let task_conn = conn.clone();
     let task_tracker = Arc::clone(&tracker);
-    let task = tokio::spawn(async move {
+    let task = crate::runtime::spawn_owned(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + QUIC_SAMPLE_INTERVAL,
             QUIC_SAMPLE_INTERVAL,
@@ -410,8 +412,8 @@ pub(super) struct QuicClientConnectionMonitor {
     conn: Connection,
     metrics_enabled: Arc<AtomicBool>,
     tracker: Arc<SyncMutex<QuicMetricTracker>>,
+    task: Option<tokio::task::AbortHandle>,
     pressure: Arc<SyncMutex<Option<QuicCarrierPressure>>>,
-    task: tokio::task::JoinHandle<()>,
 }
 
 impl QuicClientConnectionMonitor {
@@ -439,7 +441,9 @@ impl QuicClientConnectionMonitor {
 
 impl Drop for QuicClientConnectionMonitor {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         self.tracker.lock().finish(self.conn.stats());
     }
 }
@@ -476,7 +480,7 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
     let task_tracker = Arc::clone(&tracker);
     let task_enabled = Arc::clone(&enabled);
     let task_pressure = Arc::clone(&pressure);
-    let task = tokio::spawn(async move {
+    let task = crate::runtime::spawn_owned(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + QUIC_SAMPLE_INTERVAL,
             QUIC_SAMPLE_INTERVAL,

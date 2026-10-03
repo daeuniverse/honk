@@ -7,7 +7,8 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 - `default = ["clash-api", "mimalloc", "rprx"]`
 - `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows `configuration.md`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
-- `mimalloc` — shipped binary allocates through mimalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
+- `native-api` — independent, opt-in native HTTP observations/control with a default-off listener; build with `--features native-api` (or `native-ui`); release builds include it. It can run with mock or real eBPF and without Clash; real-kernel CI enables it for lifecycle regression coverage.
+- `mimalloc` — shipped binary allocates through mimalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-api"` for the release capabilities with stock malloc.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
@@ -32,7 +33,7 @@ conn-state, handoff and redirect metadata together only after checking auxiliary
 tokens; preserve native/offloaded, missing and newer-token authority. Never infer
 WAN ownership from `must` alone or change the persistent 12-byte allocator ABI.
 
-`build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`.
+`build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The child also strips inherited `CARGO_PROFILE_*` overrides so host profiling cannot replace the standalone kernel crate's release policy. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it, and a sidecar older than core's `build.rs` triggers a rebuild after embedding-policy changes. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`; manually built or supplied objects remain the caller's responsibility.
 
 ```bash
 # Requires Linux kernel 6.12+, clang/llvm/libbpf headers, nightly + bpf-linker.

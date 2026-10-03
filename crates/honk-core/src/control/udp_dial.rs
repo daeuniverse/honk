@@ -5,12 +5,12 @@
 //! application send remain in the caller after a winner has been finalized.
 
 use crate::group::SelectionPlanMode;
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use honk_config::node::Node;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinSet;
 
 /// One candidate transport-preparation future. The candidate index preserves
 /// path-specific feedback when the same leaf appears through multiple groups.
@@ -62,7 +62,7 @@ where
     };
     let started_at = tokio::time::Instant::now();
     let mut next = 0;
-    let mut tasks = JoinSet::new();
+    let mut tasks = FuturesUnordered::new();
     let mut rejection = None;
 
     let winner = 'schedule: loop {
@@ -96,10 +96,13 @@ where
                 (callbacks.on_attempt)();
             }
             let prepare = Arc::clone(&prepare);
-            tasks.spawn(async move {
-                let result = prepare(next - 1, node.clone()).await;
-                (node, result)
-            });
+            tasks.push(
+                std::panic::AssertUnwindSafe(async move {
+                    let result = prepare(next - 1, node.clone()).await;
+                    (node, result)
+                })
+                .catch_unwind(),
+            );
         }
 
         if tasks.is_empty() && next == candidates.len() {
@@ -108,7 +111,7 @@ where
         let joined = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline) => break 'schedule None,
-            joined = tasks.join_next(), if !tasks.is_empty() => joined,
+            joined = tasks.next(), if !tasks.is_empty() => joined,
             _ = tokio::time::sleep_until(started_at + stagger_offset(next)),
                 if next < candidates.len() && tasks.len() < 3 => continue,
         };
@@ -139,8 +142,7 @@ where
         }
     };
 
-    tasks.abort_all();
-    while let Some(joined) = tasks.join_next().await {
+    while let Some(Some(joined)) = tasks.next().now_or_never() {
         match joined {
             Ok((node, Err(error))) => {
                 if honk_outbound::proxy::is_packet_rejection(&error) {
@@ -150,12 +152,15 @@ where
                 }
             }
             Ok((_, Ok(_))) => {}
-            Err(error) if error.is_cancelled() && records_stagger_metrics => {
-                (callbacks.on_cancellation)()
-            }
             Err(_) => {}
         }
     }
+    if records_stagger_metrics {
+        for _ in 0..tasks.len() {
+            (callbacks.on_cancellation)();
+        }
+    }
+    tasks.clear();
     if let Some(error) = rejection {
         return Err(error);
     }

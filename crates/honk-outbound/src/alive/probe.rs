@@ -3,6 +3,294 @@ use crate::group::{
     ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource, SelectionNetwork,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HealthMode {
+    Running,
+    Stopped,
+    Failed,
+}
+
+#[derive(Default)]
+pub(super) struct HealthControl {
+    active: usize,
+    loop_running: bool,
+    failed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HealthCheckError {
+    #[error("health checks are stopped")]
+    Stopped,
+    #[error("health probe capacity exhausted")]
+    Busy,
+    #[error("health-check drain timed out")]
+    DrainTimeout,
+    #[error("health-check worker failed")]
+    WorkerFailed,
+}
+
+/// A captured health generation. Cancellation drops only the supplied I/O future;
+/// callers must finish child/transport cleanup outside `run`.
+#[derive(Clone, Default)]
+pub struct ProbeCancellation {
+    mode: Option<tokio::sync::watch::Sender<HealthMode>>,
+    #[cfg(feature = "owned-tasks")]
+    resolver_tasks: Option<Arc<crate::runtime::TaskOwner>>,
+}
+
+impl ProbeCancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.mode
+            .as_ref()
+            .is_some_and(|mode| *mode.borrow() != HealthMode::Running)
+    }
+    pub async fn cancelled(&self) {
+        let Some(sender) = self.mode.as_ref() else {
+            return std::future::pending().await;
+        };
+        let mut mode = sender.subscribe();
+        while *mode.borrow_and_update() == HealthMode::Running {
+            if mode.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn report_cleanup_failure(&self) {
+        if let Some(mode) = &self.mode {
+            mode.send_replace(HealthMode::Failed);
+        }
+    }
+
+    pub async fn run<F: Future>(&self, future: F) -> Option<F::Output> {
+        if self.is_cancelled() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            result = future => Some(result),
+            _ = self.cancelled() => None,
+        }
+    }
+
+    /// Keep blocking fallback lookups in the health generation, including when
+    /// the measured node itself reuses a warm production runtime.
+    pub async fn scope_resolution<T>(
+        &self,
+        future: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        #[cfg(feature = "owned-tasks")]
+        if let Some(owner) = &self.resolver_tasks {
+            return owner.scope(future).await;
+        }
+        future.await
+    }
+}
+
+/// Retain through network cleanup and synchronous result publication.
+pub struct HealthProbePermit<'a> {
+    alive: &'a AliveDialerSet,
+    cancel: ProbeCancellation,
+}
+
+impl HealthProbePermit<'_> {
+    pub fn cancellation(&self) -> ProbeCancellation {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for HealthProbePermit<'_> {
+    fn drop(&mut self) {
+        self.alive.finish_health_probe();
+    }
+}
+
+struct ExternalProbePermit(Arc<AliveDialerSet>);
+
+impl Drop for ExternalProbePermit {
+    fn drop(&mut self) {
+        self.0.finish_health_probe();
+    }
+}
+
+struct HealthLoopGuard {
+    alive: Arc<AliveDialerSet>,
+    terminal: bool,
+}
+
+impl Drop for HealthLoopGuard {
+    fn drop(&mut self) {
+        let mut control = self.alive.health_control.lock();
+        control.loop_running = false;
+        if !self.terminal {
+            control.failed = true;
+            self.alive.health_mode.send_replace(HealthMode::Stopped);
+        }
+        self.alive.health_changed.notify_waiters();
+    }
+}
+
+impl AliveDialerSet {
+    pub fn acquire_health_probe(&self) -> Result<HealthProbePermit<'_>, HealthCheckError> {
+        let cancel = self.admit_health_probe()?;
+        Ok(HealthProbePermit {
+            alive: self,
+            cancel,
+        })
+    }
+
+    fn admit_health_probe(&self) -> Result<ProbeCancellation, HealthCheckError> {
+        let mut control = self.health_control.lock();
+        if control.failed {
+            return Err(HealthCheckError::WorkerFailed);
+        }
+        match *self.health_mode.borrow() {
+            HealthMode::Running => {}
+            HealthMode::Stopped => return Err(HealthCheckError::Stopped),
+            HealthMode::Failed => return Err(HealthCheckError::WorkerFailed),
+        }
+        control.active += 1;
+        Ok(ProbeCancellation {
+            mode: Some(self.health_mode.clone()),
+            #[cfg(feature = "owned-tasks")]
+            resolver_tasks: self.health_observations.read().is_some().then(|| {
+                Arc::clone(
+                    self.health_resolver_tasks
+                        .lock()
+                        .get_or_insert_with(|| Arc::new(crate::runtime::TaskOwner::production())),
+                )
+            }),
+        })
+    }
+
+    fn finish_health_probe(&self) {
+        let mut control = self.health_control.lock();
+        control.active -= 1;
+        control.failed |= std::thread::panicking();
+        self.health_changed.notify_waiters();
+    }
+
+    /// The closure owns measurement, cleanup and publication. Dropping the
+    /// response future does not abandon the registered job.
+    pub async fn run_external_probe<T, F>(
+        self: &Arc<Self>,
+        make: impl FnOnce(ProbeCancellation) -> F + Send + 'static,
+    ) -> Result<T, HealthCheckError>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let cancel = self.admit_health_probe()?;
+        let permit = ExternalProbePermit(Arc::clone(self));
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut tasks = self.external_probes.lock();
+            while let Some(result) = tasks.try_join_next() {
+                if result.is_err() {
+                    cancel.report_cleanup_failure();
+                }
+            }
+            if tasks.len() >= 10 {
+                return Err(HealthCheckError::Busy);
+            }
+            tasks.spawn(async move {
+                let result = if cancel.is_cancelled() {
+                    Err(HealthCheckError::Stopped)
+                } else {
+                    Ok(make(cancel).await)
+                };
+                drop(permit);
+                let _ = reply.send(result);
+            });
+        }
+        receive.await.map_err(|_| HealthCheckError::WorkerFailed)?
+    }
+
+    /// Terminal stop; the caller still joins the retained health-loop handle.
+    pub async fn shutdown_health_checks(&self) -> Result<(), HealthCheckError> {
+        self.close_health_admission();
+        self.wait_health_drained().await
+    }
+
+    fn close_health_admission(&self) {
+        let _control = self.health_control.lock();
+        let closed = self.health_mode.send_if_modified(|mode| {
+            if *mode != HealthMode::Running {
+                return false;
+            }
+            *mode = HealthMode::Stopped;
+            true
+        });
+        if closed {
+            self.advance_probe_epoch();
+        }
+    }
+
+    async fn wait_health_drained(&self) -> Result<(), HealthCheckError> {
+        let drain = async {
+            loop {
+                let changed = self.health_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let drained = {
+                    let control = self.health_control.lock();
+                    control.active == 0
+                        && !control.loop_running
+                        && self.external_probes.lock().is_empty()
+                };
+                if drained {
+                    #[cfg(feature = "owned-tasks")]
+                    {
+                        let owner = self.health_resolver_tasks.lock().clone();
+                        if let Some(owner) = owner {
+                            owner.close().await;
+                            if owner.has_failed() {
+                                self.health_worker_failed();
+                            }
+                        }
+                    }
+                    let control = self.health_control.lock();
+                    return if control.failed || *self.health_mode.borrow() == HealthMode::Failed {
+                        Err(HealthCheckError::WorkerFailed)
+                    } else {
+                        Ok(())
+                    };
+                }
+                tokio::select! {
+                    _ = &mut changed => {}
+                    result = std::future::poll_fn(|cx| {
+                        let mut tasks = self.external_probes.lock();
+                        if tasks.is_empty() {
+                            std::task::Poll::Pending
+                        } else {
+                            tasks.poll_join_next(cx)
+                        }
+                    }) => {
+                        if matches!(result, Some(Err(_))) {
+                            self.health_worker_failed();
+                        }
+                    }
+                }
+            }
+        };
+        tokio::pin!(drain);
+        match tokio::time::timeout(Duration::from_secs(5), &mut drain).await {
+            Ok(result) => result,
+            Err(_) => {
+                // A missed deadline is failure, not permission to detach blocking cleanup.
+                drain.await?;
+                Err(HealthCheckError::DrainTimeout)
+            }
+        }
+    }
+
+    fn health_worker_failed(&self) {
+        self.health_control.lock().failed = true;
+        self.health_mode.send_replace(HealthMode::Stopped);
+        self.health_changed.notify_waiters();
+    }
+}
+
 impl AliveDialerSet {
     fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
         let factory = self.score_feedback.read().clone();
@@ -22,7 +310,7 @@ impl AliveDialerSet {
 }
 
 impl AliveDialerSet {
-    fn same_registration(
+    pub(super) fn same_registration(
         current: Option<&Arc<RegisteredNode>>,
         captured: Option<&Arc<RegisteredNode>>,
     ) -> bool {
@@ -72,6 +360,10 @@ impl AliveDialerSet {
     /// proxy node, validating the status code.
     /// Falls back to raw TCP connect when no prober is set.
     pub async fn probe_node(&self, node_id: Uuid, timeout: Duration) -> bool {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return false;
+        };
+        let cancel = permit.cancellation();
         // block has no liveness to measure.
         if node_id == honk_config::config::BLOCK_NODE_ID {
             return true;
@@ -86,7 +378,14 @@ impl AliveDialerSet {
             let registration = self.registered.read().get(&node_id).cloned();
             let target = self.direct_check_addr.read().clone();
             return self
-                .probe_node_tcp(node_id, "direct", &target, timeout, registration.as_ref())
+                .probe_node_tcp(
+                    node_id,
+                    "direct",
+                    &target,
+                    timeout,
+                    registration.as_ref(),
+                    &cancel,
+                )
                 .await;
         }
         let registered = self.registered.read().get(&node_id).cloned();
@@ -97,7 +396,7 @@ impl AliveDialerSet {
         // Clone the Arc out of the lock before awaiting (parking_lot guard is !Send).
         let prober = self.http_prober.read().clone();
         if let Some(prober) = &prober {
-            self.probe_node_http(node_id, &registered, timeout, prober)
+            self.probe_node_http(node_id, &registered, timeout, prober, &cancel)
                 .await
         } else {
             self.probe_node_tcp(
@@ -106,6 +405,7 @@ impl AliveDialerSet {
                 &registered.address,
                 timeout,
                 Some(&registered),
+                &cancel,
             )
             .await
         }
@@ -119,6 +419,7 @@ impl AliveDialerSet {
         registered: &Arc<RegisteredNode>,
         timeout: Duration,
         prober: &HttpProberRef,
+        cancel: &ProbeCancellation,
     ) -> bool {
         let node_name = registered.name.as_str();
         let check_url = self.check_url.read().clone();
@@ -130,6 +431,7 @@ impl AliveDialerSet {
                     &registered.address,
                     timeout,
                     Some(registered),
+                    cancel,
                 )
                 .await;
         }
@@ -142,6 +444,7 @@ impl AliveDialerSet {
                     &registered.address,
                     timeout,
                     Some(registered),
+                    cancel,
                 )
                 .await;
         };
@@ -200,8 +503,27 @@ impl AliveDialerSet {
             }
 
             let mut family_ok = false;
+            let mut family_failed = false;
             for a in family_addrs {
-                match prober.probe_http(node_name, *a, &check_url, timeout).await {
+                let outcome = prober
+                    .probe_http(node_id, *a, &check_url, timeout, cancel.clone())
+                    .await;
+                if let Some(observation) = outcome.observation {
+                    self.record_health_observation(node_id, Some(registered), observation);
+                }
+                match outcome.result {
+                    HttpProbeResult::Cancelled => {
+                        if family_failed {
+                            self.apply_probe_result(
+                                node_id,
+                                Some(registered),
+                                ProbeDomain::Tcp,
+                                ipver,
+                                None,
+                            );
+                        }
+                        return any_ok;
+                    }
                     HttpProbeResult::WarmSuccess(elapsed) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
@@ -225,6 +547,7 @@ impl AliveDialerSet {
                         return any_ok;
                     }
                     HttpProbeResult::SetupFailure(error) => {
+                        family_failed = true;
                         tracing::debug!(
                             "HTTP health check establishment failed for node '{}' via {}: {}",
                             node_name,
@@ -233,6 +556,7 @@ impl AliveDialerSet {
                         );
                     }
                     HttpProbeResult::ExchangeFailure(error) => {
+                        family_failed = true;
                         tracing::debug!(
                             "HTTP health check warm exchange failed for node '{}' via {}: {}",
                             node_name,
@@ -269,21 +593,30 @@ impl AliveDialerSet {
     /// path: try up to 3 resolved addresses (any family),
     /// first success wins. State is tracked per (tag, url) and never
     /// touches the global six domains.
-    pub async fn probe_node_with_url(
+    pub(super) async fn probe_node_with_url(
         &self,
         tag: &str,
-        leaf: &str,
+        leaf: Uuid,
         url: &str,
         timeout: Duration,
+        native: Option<(GroupProbeContext, Uuid)>,
     ) -> bool {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return false;
+        };
+        let cancel = permit.cancellation();
         // direct/block exemption, same rationale as probe_node. The
         // vacuous success still advances the (tag, url) liveness machine:
         // the tag may carry failures earned by a previous non-builtin leaf,
         // and leaving them would filter this member forever.
-        if matches!(leaf, "direct" | "block") {
+        if matches!(
+            leaf,
+            honk_config::config::DIRECT_NODE_ID | honk_config::config::BLOCK_NODE_ID
+        ) {
             self.mark_url_probe_succeeded(tag, url);
             return true;
         }
+        let registration = self.registered.read().get(&leaf).cloned();
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -295,6 +628,9 @@ impl AliveDialerSet {
                 return false;
             }
         };
+        if cancel.is_cancelled() {
+            return false;
+        }
         if addrs.is_empty() {
             tracing::debug!(
                 "Health check found no addresses for '{}' (member '{}')",
@@ -306,8 +642,27 @@ impl AliveDialerSet {
         }
 
         let mut any_ok = false;
+        let mut failed = false;
         for a in addrs.into_iter().take(3) {
-            match prober.probe_http(leaf, a, url, timeout).await {
+            let outcome = prober
+                .probe_http(leaf, a, url, timeout, cancel.clone())
+                .await;
+            if let (Some(observation), Some((context, epoch))) = (outcome.observation, native) {
+                self.record_group_health_observation(
+                    leaf,
+                    registration.as_ref(),
+                    context,
+                    epoch,
+                    observation,
+                );
+            }
+            match outcome.result {
+                HttpProbeResult::Cancelled => {
+                    if failed {
+                        self.record_url_probe_failure(tag, url);
+                    }
+                    return any_ok;
+                }
                 HttpProbeResult::WarmSuccess(elapsed) => {
                     tracing::debug!(
                         "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
@@ -326,6 +681,7 @@ impl AliveDialerSet {
                     return false;
                 }
                 HttpProbeResult::SetupFailure(error) => {
+                    failed = true;
                     tracing::debug!(
                         "HTTP health check establishment failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
@@ -336,6 +692,7 @@ impl AliveDialerSet {
                     );
                 }
                 HttpProbeResult::ExchangeFailure(error) => {
+                    failed = true;
                     tracing::debug!(
                         "HTTP health check warm exchange failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
@@ -367,6 +724,7 @@ impl AliveDialerSet {
         node_addr: &str,
         timeout: Duration,
         registration: Option<&Arc<RegisteredNode>>,
+        cancel: &ProbeCancellation,
     ) -> bool {
         let addr = node_addr.to_string();
         let (host, port) = match addr.rsplit_once(':') {
@@ -439,16 +797,31 @@ impl AliveDialerSet {
             let reporter = self.raw_probe_reporter(node_id, ipver);
 
             let start = Instant::now();
-            let result = tokio::time::timeout(
-                timeout,
-                crate::util::connect_marked_addr(
-                    *a,
-                    Some(self.so_mark.unwrap_or_else(crate::util::bypass_mark)),
+            let Some(result) = cancel
+                .run(tokio::time::timeout(
                     timeout,
-                ),
-            )
-            .await;
+                    crate::util::connect_marked_addr(
+                        *a,
+                        Some(self.so_mark.unwrap_or_else(crate::util::bypass_mark)),
+                        timeout,
+                    ),
+                ))
+                .await
+            else {
+                return any_ok;
+            };
             let elapsed = start.elapsed();
+            self.record_health_observation(
+                node_id,
+                registration,
+                HealthObservation::probe(
+                    ProbeDomain::Tcp,
+                    HealthMeasurement::TcpConnect,
+                    ipver,
+                    matches!(&result, Ok(Ok(_))).then_some(elapsed),
+                    std::time::SystemTime::now(),
+                ),
+            );
 
             match result {
                 Ok(Ok(_stream)) => {
@@ -549,6 +922,9 @@ impl AliveDialerSet {
         timeout: Duration,
         registration: Option<Arc<RegisteredNode>>,
     ) -> bool {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return false;
+        };
         if !Self::same_registration(self.registered.read().get(&node_id), registration.as_ref()) {
             return false;
         }
@@ -573,7 +949,12 @@ impl AliveDialerSet {
             .map(|node| node.name.clone())
             .unwrap_or_else(|| node_id.to_string());
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        let outcome = prober.probe_udp(&node_name, timeout).await;
+        let outcome = prober
+            .probe_udp(node_id, timeout, permit.cancellation())
+            .await;
+        for observation in outcome.observations.into_iter().flatten() {
+            self.record_health_observation(node_id, registration.as_ref(), observation);
+        }
         let measured = |result: Option<anyhow::Result<Duration>>| {
             result.filter(|result| {
                 !result
@@ -693,6 +1074,9 @@ impl AliveDialerSet {
         timeout: Duration,
         concurrency: usize,
     ) {
+        let Ok(_permit) = self.acquire_health_probe() else {
+            return;
+        };
         let nodes: Vec<_> = self
             .registered
             .read()
@@ -735,7 +1119,11 @@ impl AliveDialerSet {
             });
         }
 
-        while join_set.join_next().await.is_some() {}
+        while let Some(result) = join_set.join_next().await {
+            if result.is_err() {
+                self.health_worker_failed();
+            }
+        }
     }
 
     /// Run health check cycle with concurrent probing.
@@ -749,6 +1137,10 @@ impl AliveDialerSet {
         timeout: Duration,
         concurrency: usize,
     ) {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return;
+        };
+        let cancel = permit.cancellation();
         // Refresh cached check URL IPs at start of each full cycle.
         // Matches Go's TcpCheckOptionRaw.Reset().
         self.refresh_check_ips().await;
@@ -798,7 +1190,14 @@ impl AliveDialerSet {
             });
         }
 
-        while join_set.join_next().await.is_some() {}
+        while let Some(result) = join_set.join_next().await {
+            if result.is_err() {
+                self.health_worker_failed();
+            }
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
 
         // Per-group custom check URLs (sing-box urltest `url` option):
         // probe each group's members against its own target. Members are
@@ -806,6 +1205,7 @@ impl AliveDialerSet {
         // member the probe dials its CURRENT pick, and the result is
         // recorded under the sub-group's tag (sing-box RealTag semantics),
         // so nested groups rank correctly even as sub-picks change.
+        let native_epoch = self.health_epoch();
         for (group, url) in self.group_check_urls() {
             if self.is_urltest_group_idle(&group) {
                 tracing::trace!(
@@ -814,8 +1214,8 @@ impl AliveDialerSet {
                 );
                 continue;
             }
-            for (tag, leaf) in self.url_members_for(&group) {
-                if !self.should_probe_url(&tag, &url) {
+            for member in self.url_members_for(&group) {
+                if !self.should_probe_url(&member.tag, &url) {
                     continue;
                 }
                 let this = self.clone();
@@ -823,12 +1223,23 @@ impl AliveDialerSet {
                 let permit = semaphore.clone();
                 join_set.spawn(async move {
                     let _p = permit.acquire().await;
-                    this.probe_node_with_url(&tag, &leaf, &url, timeout).await;
+                    this.probe_node_with_url(
+                        &member.tag,
+                        member.leaf,
+                        &url,
+                        timeout,
+                        member.native.zip(native_epoch),
+                    )
+                    .await;
                 });
             }
         }
 
-        while join_set.join_next().await.is_some() {}
+        while let Some(result) = join_set.join_next().await {
+            if result.is_err() {
+                self.health_worker_failed();
+            }
+        }
     }
 
     /// Get recent probe history for a node for API/UI consumption.
@@ -868,51 +1279,61 @@ impl AliveDialerSet {
         timeout: Duration,
         concurrency: usize,
     ) -> tokio::task::JoinHandle<()> {
-        let this = self.clone();
-        let mut trigger_rx = self.take_trigger_rx();
-        let concurrency = concurrency.max(1);
-        let mut emergency_workers = tokio::task::JoinSet::new();
+        let mut control = self.health_control.lock();
+        assert!(!control.loop_running, "health loop already running");
+        let mut trigger_rx = self
+            .take_trigger_rx()
+            .expect("health trigger receiver owned");
+        control.loop_running = true;
+        let mut mode = self.health_mode.subscribe();
+        let mut owner = HealthLoopGuard {
+            alive: Arc::clone(self),
+            terminal: false,
+        };
+        drop(control);
+        let this = Arc::clone(self);
         tokio::spawn(async move {
-            // ── Anti-thundering-herd: stagger the first health check by a
-            // random delay within [0, min(5s, interval/4)] to avoid all
-            // nodes probing the proxy server simultaneously at startup.
-            // Matches Go dae's initialConnectivityCheckJitterWindow logic.
-            let stagger_max = std::cmp::min(interval / 4, std::time::Duration::from_secs(5));
-            if stagger_max > std::time::Duration::ZERO {
-                let jitter_ms =
-                    (rand::random::<u64>() % stagger_max.as_millis().max(1) as u64) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-            }
-
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let recovery_interval = std::cmp::max(
-                std::cmp::min(interval, this.base_cooldown),
-                Duration::from_secs(1),
+            let concurrency = concurrency.max(1);
+            let mut emergency_workers = tokio::task::JoinSet::new();
+            let stagger_max = std::cmp::min(interval / 4, Duration::from_secs(5));
+            let jitter = Duration::from_millis(
+                rand::random::<u64>() % stagger_max.as_millis().max(1) as u64,
             );
-            let mut recovery_ticker = tokio::time::interval(recovery_interval);
+            let mut ticker =
+                tokio::time::interval_at(tokio::time::Instant::now() + jitter, interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let recovery_interval = interval.min(this.base_cooldown).max(Duration::from_secs(1));
+            let mut recovery_ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + recovery_interval,
+                recovery_interval,
+            );
             recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            recovery_ticker.tick().await;
             loop {
-                tokio::select! {
-                    biased;
-                    Some(result) = emergency_workers.join_next(), if !emergency_workers.is_empty() => {
-                        if let Err(error) = result {
-                            tracing::warn!(?error, "emergency health-check worker panicked");
+                if *mode.borrow_and_update() != HealthMode::Running {
+                    while let Some(result) = emergency_workers.join_next().await {
+                        if result.is_err() {
+                            this.health_worker_failed();
                         }
                     }
-                    node = async {
-                        match trigger_rx.as_mut() {
-                            Some(rx) => rx.recv().await,
-                            None => std::future::pending().await,
+                    owner.terminal = true;
+                    drop(owner);
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = mode.changed() => {}
+                    Some(result) = emergency_workers.join_next(), if !emergency_workers.is_empty() => {
+                        if result.is_err() {
+                            this.health_worker_failed();
                         }
-                    }, if emergency_workers.len() < concurrency => {
+                    }
+                    node = trigger_rx.recv(), if emergency_workers.len() < concurrency => {
                         if let Some(id) = node {
                             {
                                 let mut states = this.states.write();
                                 if let Some(entry) = states.get_mut(&id) {
-                                    for e in entry.iter_mut() {
-                                        e.cooldown_until = Instant::now();
+                                    for state in entry {
+                                        state.cooldown_until = Instant::now();
                                     }
                                 }
                             }

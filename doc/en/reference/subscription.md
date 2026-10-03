@@ -4,22 +4,24 @@ This reference defines `subscription {}` entries, durable recovery, and the subs
 
 ## `subscription {}` syntax
 
-Each entry has one of these forms:
+Declare the URL on the entry line. To override download settings for one subscription, add a block after the quoted URL, one key per line:
 
 ```dae
 subscription {
     primary: 'https://example.com/sub'
-    compatible: 'https://example.net/sub'(honk/1.0 like)
     'https://example.com/no_tag_link'
-    detailed: {
-        url: 'https://example.org/sub'
+    detailed: 'https://example.org/sub' {
         ua: 'honk/1.0'
-        interval: '10000s'
+        interval: 10000s
+        cache: false
+        route: direct
     }
 }
 ```
 
-The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append `(UA)` after a quoted URL to override it. The block form accepts `url`, optional `ua`, and optional `interval`; `interval` is a duration and defaults to `86400s`. Set it to `0` to disable periodic refresh.
+The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` says how the fetch leaves (see below). A missing option takes the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
+
+Two earlier forms still read, without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block holding the URL (`detailed: { url: '…' ua: '…' }`), which also accepts `download_detour` as another name for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
 
 Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
@@ -36,7 +38,7 @@ After a quoted URL, a glued `#` immediately after the closing quote or one balan
 
 This glued-tail compatibility runs after block recognition; it is not a lexical comment. In `sub: 'http://q'(ua)# }`, the separated `}` still closes the subscription block, so subsequent entries can fall outside it. Write `(ua) # }` to make the brace comment data instead.
 
-Quote-error and block rules are listed in the [dialect reference](./dialect.md). The block form's `url`, `ua`, and `interval` parsing is unchanged.
+Quote-error and block rules are listed in the [dialect reference](./dialect.md). An empty `route` follows routing, in every build.
 
 ## Internal model
 
@@ -46,10 +48,12 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `name` | string | `""` | Yes, as the tag; otherwise the URL host | Display tag and the value used by group `subtag(...)` filters. |
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
-| `update_interval` | u64 | `86400` | Yes, as block `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
-| `user_agent` | string or null | `honk/<version>` | Yes, as `(UA)` or block `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
+| `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
+| `user_agent` | string or null | `honk/<version>` | Yes, as `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
+| `download_detour` | string | `""` | Yes, as `route` | How the fetch leaves: empty or `routing` follows the routing rules, `direct` connects straight to the host, and a group name always goes through that group. An unknown group is refused at validation. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
+| `cache` | bool | `true` | Yes, as `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
 | `node_count` | u32 | `0` | No | Model metadata; the current core runtime does not update it. |
 | `created_at` | datetime | construction time | No | Model construction time. |
@@ -71,17 +75,25 @@ The internal body-selector behavior is:
 
 | Property | Current behavior |
 | --- | --- |
-| Preferred location | `<data_dir>/.sub`; the default `data_dir` is `/var/lib/honk`. |
-| Legacy locations | Prefer an existing `/var/share/honk/.sub` (`LEGACY_DATA_DIR`), then an existing `./.sub` when the configured store is absent. Unusable legacy locations are skipped; a new preferred store is created only when no legacy candidate can be opened. A custom `data_dir` follows the same order. No store is moved or deleted automatically; migrate it explicitly when ready. |
-| Permissions and trust | The store directory is opened once without following a final symlink and retained as a file descriptor. An existing directory must be owned by the process's effective UID and must not be group- or other-writable; an unsafe directory is refused without changing its permissions. A safe owned directory is tightened to `0700`. Cache files are opened relative to that descriptor with no-follow and nonblocking flags, then accepted only when they are regular, effective-UID-owned, and not group- or other-writable. New files use `0600`; reads preserve existing file permissions so already-private read-only caches can be restored. Renaming or replacing the original path after opening cannot redirect store reads or writes. |
-| Filename | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their cache across upgrades. The request identity is not exposed in plaintext. |
-| Write boundary | After HTTP success and body acceptance, persist the complete raw response, including rejected entries. A descriptor-relative temporary file is synced, renamed atomically within the retained directory, and followed by a directory sync. |
+| Location | The `subscription_body` table of the state db, `<data_dir>/state/honk.db` (0600 file in a 0700 directory; see the [API reference](./api.md#configuration-db---store-db)); the default `data_dir` is `/var/lib/honk`. |
+| Key | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their body across upgrades. The request identity is not exposed in plaintext. |
+| Write boundary | After HTTP success and body acceptance, the complete raw response, including rejected entries, is written in one transaction. |
+| Limits | Each body is at most 8 MiB, and all bodies together at most 32 MiB. A write that would pass 32 MiB first deletes bodies of subscriptions that are no longer enabled; if that is not enough it is refused, the previous body stays, and the fetch reports `subscription-store-write-failed`. A body whose subscription is not enabled at two consecutive maintenance ticks (every 60 seconds) is deleted, and a start with `store_subscribe: false` that still opens the state db, for `cache_file`, `password_auth` or `--store db`, empties the table. |
+| Upgrade from `.sub` | Once the instance lock is held, a start copies the bodies of enabled subscriptions from the first private legacy store it finds in `<data_dir>/.sub`, `/var/share/honk/.sub` and `./.sub`, keeping bodies already in the state db. honk then unlinks the copied `*.sub` and every `.*.tmp` in that directory and removes it if empty; other legacy locations are left alone. A body that is unreadable, over 8 MiB, or would pass 32 MiB in total stays with a warning, and the body of a disabled subscription stays too, so a later start that enables the subscription imports it without a fetch. The previous process has exited by then, so a body it wrote last is copied like the others. An older binary started afterwards finds only the bodies left behind and fetches the others again. |
 | Redirects | At most 5 hops. A redirect from `https` to another scheme fails the fetch, as does one to a loopback, private, link-local, or unspecified literal address that the configured URL did not itself use. A hostname resolving to such an address is not detected. |
 | Body size | At most 8 MiB, enforced while reading rather than after the body is buffered. |
 
 Subscription bodies and the nodes created from them remain runtime state; neither is written back into the dae configuration.
 
-Startup parses stored bodies before launching network refreshes. A valid restored body supplies active nodes immediately, so that subscription does not participate in the five-second first-fetch wait. Its network refresh still runs in the background. A missing or invalid stored body is ignored and keeps that subscription in the bounded first-fetch wait until the fetch finishes or the deadline expires; a later valid refresh replaces the corrupt file.
+Subscription fetches follow routing unless the entry's `route` (or `assets.route`) says otherwise, like every other download honk makes itself. With `routing` the fetch target goes through the routing rules as user traffic does, so a rule can send it to a node, a group, `direct`, or `block`; each redirect is routed again. A group name forces that group. Routed requests share the route decision and tunnel of geodata and external UI downloads, send the same `User-Agent` and headers, and keep the 30-second timeout, 8 MiB limit, and redirect rules (only 301, 302, 303, 307 and 308, at most 5, never from HTTPS to HTTP, never to a private literal address from a public one). URL userinfo is sent as basic authentication, and a redirect to another scheme, host or port drops `Authorization`, `Cookie` and `Proxy-Authorization`, as the direct client does. `direct` keeps the previous transport: the bootstrap resolver and the bypass mark, with no routing involved. Builds without the `native-api` feature route these fetches the same way.
+
+A subscription can route through nodes it supplies itself, for example when the rules send its URL to a group made only of its own nodes. On a fresh install those nodes do not exist yet. honk never falls back to direct: when the chosen route has no usable node, the fetch fails with an error that names the subscription and the outbound, says the route cannot carry the download yet, and suggests `route: direct` for that subscription. The provider status in the native API reports `last_error.code` `route_unavailable`. Nodes restored from the stored body stay in service throughout.
+
+Routing starts after the startup subscription pass. Only `direct` subscriptions take part in the five-second first-fetch wait; routed subscriptions restore their stored body there and are fetched as soon as routing is ready.
+
+Startup parses stored bodies before launching network refreshes. A valid restored body supplies active nodes immediately and excludes that subscription from the five-second first-fetch wait; its refresh still runs in the background. Missing, invalid or empty stored bodies are ignored. Only direct subscriptions without a valid restore enter the shared bounded wait, until their fetch finishes or the deadline expires; routed subscriptions fetch once routing is ready. A later accepted refresh replaces the SQLite body row, not a legacy file.
+
+A restored or first-fetched body whose node ID is already used by an inline node or another subscription's node leaves that subscription out of the startup configuration instead of failing startup; a runtime publication rejects the same collision. A body may still replace the subscription's own nodes. The native API provider reports `last_error.code` `publication_rejected` with `last_error.details.diagnostic_code` `duplicate-node-id`. A restored body rejected this way still counts as restored: the subscription does not join the first-fetch wait, and its background refresh still runs and repeats the check.
 
 On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + headers) retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, commits the rebuilt configuration, and then starts an immediate background refresh. It does not read stored bodies, even when no nodes survive for a subscription; stored-body recovery runs only at startup.
 

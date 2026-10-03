@@ -560,6 +560,8 @@ async fn budget_wait_to_body_handoff_is_atomic_for_synack_liveness() {
 
     tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
+    tokio::time::advance(SILENT_SESSION_GRACE).await;
+    tokio::task::yield_now().await;
     assert!(
         session.is_closed(),
         "a peer-stalled frame body must not count as completed activity"

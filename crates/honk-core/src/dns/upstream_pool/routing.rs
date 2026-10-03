@@ -17,6 +17,23 @@ pub(super) struct DnsDialRoute {
     pub(super) target: SocketAddr,
     pub(super) node: Option<Node>,
     pub(super) feedback: Option<ScoreAttempt>,
+    pub(super) observation: Option<crate::observe::flows::record::OutboundAttempt>,
+}
+
+#[derive(Default)]
+struct SelectedLeaf {
+    node: Option<Node>,
+    feedback: Option<ScoreAttempt>,
+    path: crate::observe::flows::dns::SelectionPath,
+}
+
+impl SelectedLeaf {
+    fn explicit(node: &Node) -> Self {
+        Self {
+            node: Some(node.clone()),
+            ..Self::default()
+        }
+    }
 }
 
 pub(super) fn target_context(entry: &UpstreamEntry, target: SocketAddr) -> ScoreSelectionContext {
@@ -64,18 +81,34 @@ fn select_group_leaf_for_target(
     entry: &UpstreamEntry,
     target: SocketAddr,
     original: Option<&ScoreContinuation>,
-) -> Option<(Node, Option<ScoreAttempt>)> {
+) -> Option<SelectedLeaf> {
     group_manager.get_group_policy(outbound)?;
-    group_manager
-        .selection_plan_for_target_with_health_fallback(
+    let select = || {
+        group_manager.selection_plan_for_target_with_health_fallback(
             outbound,
             &target_context(entry, target),
             original,
         )
-        .entries
+    };
+    let plan = match honk_outbound::runtime::flow_observation::current() {
+        Some(observer) => observer.sync_scope(select),
+        None => select(),
+    };
+    let selections = crate::observe::flows::dns::selection_evaluated(plan.observation.as_deref());
+    let family = plan.health_family;
+    plan.entries
         .into_iter()
         .next()
-        .map(|selected| (selected.node.clone(), selected.feedback))
+        .map(|selected| SelectedLeaf {
+            node: Some(selected.node.clone()),
+            feedback: selected.feedback,
+            path: crate::observe::flows::dns::selection_path(
+                &selections,
+                &selected.selection_chain,
+                selected.node,
+                family,
+            ),
+        })
 }
 
 impl UpstreamPool {
@@ -85,38 +118,38 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         target: SocketAddr,
         original: Option<&ScoreContinuation>,
-    ) -> (Option<Node>, Option<ScoreAttempt>) {
+    ) -> SelectedLeaf {
         if outbound.eq_ignore_ascii_case("direct") {
-            return (None, None);
+            return SelectedLeaf::default();
         }
 
         if let Some(group_manager) = self.group_manager_snapshot.read().as_ref() {
-            if let Some((node, feedback)) =
+            if let Some(selected) =
                 select_group_leaf_for_target(group_manager, outbound, entry, target, original)
             {
-                return (Some(node), feedback);
+                return selected;
             }
             if group_manager.get_group_policy(outbound).is_some() {
-                return (None, None);
+                return SelectedLeaf::default();
             }
         } else if let Some(cell) = self.group_manager.read().as_ref() {
             let group_manager = cell.read();
             if group_manager.get_group_policy(outbound).is_some() {
-                if let Some((node, feedback)) =
+                if let Some(selected) =
                     select_group_leaf_for_target(&group_manager, outbound, entry, target, original)
                 {
-                    return (Some(node), feedback);
+                    return selected;
                 }
                 warn!(
                     "DNS outbound group '{}' has no available node (GroupManager)",
                     outbound
                 );
-                return (None, None);
+                return SelectedLeaf::default();
             }
         }
 
         if let Some(node) = self.nodes.iter().find(|node| node.name == outbound) {
-            return (Some(node.clone()), None);
+            return SelectedLeaf::explicit(node);
         }
         if self.group_manager.read().is_none()
             && let Some(group) = self.groups.iter().find(|group| group.name == outbound)
@@ -125,10 +158,10 @@ impl UpstreamPool {
                 .iter()
                 .find_map(|id| self.nodes.iter().find(|node| node.id == *id))
         {
-            return (Some(node.clone()), None);
+            return SelectedLeaf::explicit(node);
         }
         warn!("DNS outbound '{}' resolved to no node", outbound);
-        (None, None)
+        SelectedLeaf::default()
     }
     pub(super) fn tcp_feedback_for_route(
         &self,
@@ -160,21 +193,31 @@ impl UpstreamPool {
     ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
             if tag.eq_ignore_ascii_case("block") {
+                crate::observe::flows::dns::decision("rejected", Some("policy_block"));
                 anyhow::bail!("DNS upstream outbound 'block' rejected the dial");
             }
-            let (node, feedback) = self.resolve_outbound_for_target(tag, entry, target, original);
-            if node.is_none() && !tag.eq_ignore_ascii_case("direct") {
+            let selected = self.resolve_outbound_for_target(tag, entry, target, original);
+            if selected.node.is_none() && !tag.eq_ignore_ascii_case("direct") {
+                crate::observe::flows::dns::decision("rejected", Some("no_available_outbound"));
                 anyhow::bail!("DNS upstream outbound '{tag}' has no available node");
             }
             debug!(
                 "DNS dial leaf (forced -> {}): {:?}",
                 tag,
-                node.as_ref().map(|node| node.name.as_str())
+                selected.node.as_ref().map(|node| node.name.as_str())
             );
             return Ok(DnsDialRoute {
+                observation: crate::observe::flows::dns::outbound_evidence(
+                    tag,
+                    crate::observe::vocab::RoutingSource::Forced,
+                    None,
+                    selected.node.as_ref(),
+                    target,
+                    selected.path,
+                ),
                 target,
-                node,
-                feedback,
+                node: selected.node,
+                feedback: selected.feedback,
             });
         }
 
@@ -194,20 +237,30 @@ impl UpstreamPool {
             mac: None,
             dscp: None,
         };
-        let outbound_name = if let Some(router) = self.traffic_router_snapshot.read().as_ref() {
-            router.route(&connection).to_string()
-        } else {
-            let router_cell = self.traffic_router.read().clone();
-            let Some(router) = router_cell else {
-                debug!("DNS dial leaf (no traffic router): direct");
-                return Ok(DnsDialRoute {
-                    target,
-                    node: None,
-                    feedback: None,
-                });
+        let (outbound_name, evaluation_id) =
+            if let Some(router) = self.traffic_router_snapshot.read().as_ref() {
+                crate::observe::flows::dns::route_upstream(router, &connection)
+            } else {
+                let router_cell = self.traffic_router.read().clone();
+                let Some(router) = router_cell else {
+                    debug!("DNS dial leaf (no traffic router): direct");
+                    return Ok(DnsDialRoute {
+                        observation: crate::observe::flows::dns::outbound_evidence(
+                            "direct",
+                            crate::observe::vocab::RoutingSource::Builtin,
+                            None,
+                            None,
+                            target,
+                            Default::default(),
+                        ),
+                        target,
+                        node: None,
+                        feedback: None,
+                    });
+                };
+                let router = router.read().await;
+                crate::observe::flows::dns::route_upstream(&router, &connection)
             };
-            router.read().await.route(&connection).to_string()
-        };
         debug!(
             "DNS dial route: {} {}:{} (host={}) l4={} → outbound '{}'",
             entry.endpoint.host,
@@ -218,18 +271,27 @@ impl UpstreamPool {
             outbound_name
         );
         if outbound_name.eq_ignore_ascii_case("block") {
+            crate::observe::flows::dns::decision("rejected", Some("policy_block"));
             anyhow::bail!("DNS dial route selected block");
         }
         if outbound_name.eq_ignore_ascii_case("direct") {
             return Ok(DnsDialRoute {
+                observation: crate::observe::flows::dns::outbound_evidence(
+                    &outbound_name,
+                    crate::observe::vocab::RoutingSource::Evaluation,
+                    evaluation_id,
+                    None,
+                    target,
+                    Default::default(),
+                ),
                 target,
                 node: None,
                 feedback: None,
             });
         }
-        let (node, feedback) =
-            self.resolve_outbound_for_target(&outbound_name, entry, target, original);
-        if node.is_none() {
+        let selected = self.resolve_outbound_for_target(&outbound_name, entry, target, original);
+        if selected.node.is_none() {
+            crate::observe::flows::dns::decision("rejected", Some("no_available_outbound"));
             anyhow::bail!(
                 "DNS dial route selected outbound '{outbound_name}' but no leaf node is available"
             );
@@ -237,12 +299,20 @@ impl UpstreamPool {
         debug!(
             "DNS dial leaf (routed via {}): {:?}",
             outbound_name,
-            node.as_ref().map(|node| node.name.as_str())
+            selected.node.as_ref().map(|node| node.name.as_str())
         );
         Ok(DnsDialRoute {
+            observation: crate::observe::flows::dns::outbound_evidence(
+                &outbound_name,
+                crate::observe::vocab::RoutingSource::Evaluation,
+                evaluation_id,
+                selected.node.as_ref(),
+                target,
+                selected.path,
+            ),
             target,
-            node,
-            feedback,
+            node: selected.node,
+            feedback: selected.feedback,
         })
     }
 

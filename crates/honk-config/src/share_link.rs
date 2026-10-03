@@ -177,8 +177,8 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 ErrorCategory::UnknownProtocol,
                 "unknown-protocol",
                 source.clone(),
-                SettingPath::new("config"),
-                "unknown node protocol",
+                SettingPath::new("config").field("protocol"),
+                "unknown node protocol; expected socks5, socks4, socks4a, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
             ));
         }
     };

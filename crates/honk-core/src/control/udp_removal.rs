@@ -28,11 +28,17 @@ pub(crate) fn spawn_udp_removal_worker(
                 }
             }
 
-            let mut backend = ebpf.write().await;
             for removal in removals.drain(..) {
-                if let Some(id) = removal.conn_id.as_deref() {
-                    tracker.remove(id);
+                if !udp_pool.wait_removal_io(&removal).await {
+                    udp_pool.finish_removal(&removal, false);
+                    let _ = fatal_tx.send(anyhow::anyhow!(
+                        "UDP retirement did not complete owned I/O: token={}, generation={}",
+                        removal.decision_token,
+                        removal.generation
+                    ));
+                    continue;
                 }
+                let mut backend = ebpf.write().await;
                 let backend_clean = if removal.reason == RemovalReason::UserspaceEndpointRetired {
                     let key = crate::control::connection::build_tuples_key(
                         removal.dst.ip(),
@@ -77,22 +83,12 @@ pub(crate) fn spawn_udp_removal_worker(
                 } else {
                     true
                 };
-                if backend_clean
-                    && !udp_pool.complete_removal(
-                        removal.client,
-                        removal.dst,
-                        removal.decision_token,
-                        removal.generation,
-                    )
-                {
-                    debug!(
-                        token = removal.decision_token,
-                        generation = removal.generation,
-                        "ignored stale UDP retirement acknowledgement"
-                    );
+                drop(backend);
+                if backend_clean && let Some(id) = removal.conn_id.as_deref() {
+                    tracker.remove(id);
                 }
+                udp_pool.finish_removal(&removal, backend_clean);
             }
-            drop(backend);
             udp_pool.flush_removal_dirty();
         }
     })

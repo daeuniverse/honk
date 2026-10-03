@@ -4,7 +4,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use thiserror::Error;
 
-use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name};
+use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name_into};
+
+#[cfg(feature = "native-api")]
+pub(crate) mod native;
 
 const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;
@@ -62,7 +65,7 @@ pub struct ResponseTemplate {
 
 impl ResponseTemplate {
     pub(crate) fn check(request: &QueryContext, response: &[u8]) -> Result<(), ResponseError> {
-        validate_layout(request, response).map(|_| ())
+        visit_layout(request, response, |_| {}).map(|_| ())
     }
 
     pub fn validate(request: &QueryContext, response: &[u8]) -> Result<Self, ResponseError> {
@@ -150,6 +153,24 @@ fn validate_layout(
     request: &QueryContext,
     response: &[u8],
 ) -> Result<(usize, Vec<RecordBoundary>), ResponseError> {
+    let mut records = Vec::new();
+    let question_end = visit_layout(request, response, |record| records.push(record))?;
+    Ok((question_end, records))
+}
+
+fn visit_layout(
+    request: &QueryContext,
+    response: &[u8],
+    visit: impl FnMut(RecordBoundary),
+) -> Result<usize, ResponseError> {
+    visit_message(Some(request), response, visit)
+}
+
+fn visit_message(
+    request: Option<&QueryContext>,
+    response: &[u8],
+    mut visit: impl FnMut(RecordBoundary),
+) -> Result<usize, ResponseError> {
     if response.len() < HEADER_LEN {
         return Err(ResponseError::HeaderTruncated);
     }
@@ -157,24 +178,32 @@ fn validate_layout(
     if flags & QR == 0 {
         return Err(ResponseError::QueryMessage);
     }
-    if flags & OPCODE_MASK != request.flags() & OPCODE_MASK {
+    if request.is_some_and(|request| flags & OPCODE_MASK != request.flags() & OPCODE_MASK) {
         return Err(ResponseError::OpcodeMismatch);
     }
-    if flags & TC != 0 && !matches!(request.ingress(), IngressProfile::Udp { .. }) {
+    if flags & TC != 0
+        && request.is_some_and(|request| !matches!(request.ingress(), IngressProfile::Udp { .. }))
+    {
         return Err(ResponseError::IncompatibleProfile);
     }
     let qdcount = read_u16(response, 4)?;
-    if usize::from(qdcount) != request.questions().len() {
+    if request.is_some_and(|request| usize::from(qdcount) != request.questions().len()) {
         return Err(ResponseError::QuestionMismatch);
     }
     let mut name_state = NameParseState::new(response.len());
     let mut cursor = HEADER_LEN;
-    for (expected_name, expected_type, expected_class) in request.questions() {
-        let (name, name_end) = parse_name(response, cursor, &mut name_state)
+    let mut expected = request.map(QueryContext::questions);
+    for _ in 0..qdcount {
+        let mut name = [0; 255];
+        let (length, name_end) = parse_name_into(response, cursor, &mut name_state, &mut name)
             .map_err(|_| ResponseError::QuestionMismatch)?;
         let qtype = read_u16(response, name_end)?;
         let qclass = read_u16(response, name_end + 2)?;
-        if &name != expected_name || qtype != expected_type.get() || qclass != expected_class.get()
+        if let Some((expected_name, expected_type, expected_class)) =
+            expected.as_mut().and_then(Iterator::next)
+            && (&name[..length] != expected_name.as_wire()
+                || qtype != expected_type.get()
+                || qclass != expected_class.get())
         {
             return Err(ResponseError::QuestionMismatch);
         }
@@ -186,12 +215,11 @@ fn validate_layout(
         (Section::Authority, read_u16(response, 8)?),
         (Section::Additional, read_u16(response, 10)?),
     ];
-    let mut records = Vec::new();
     for (section, count) in sections {
         for _ in 0..count {
             let start = cursor;
             cursor = record_end(response, cursor, &mut name_state)?;
-            records.push(RecordBoundary {
+            visit(RecordBoundary {
                 section,
                 wire: start..cursor,
             });
@@ -200,7 +228,7 @@ fn validate_layout(
     if cursor != response.len() {
         return Err(ResponseError::TrailingBytes);
     }
-    Ok((question_end, records))
+    Ok(question_end)
 }
 
 fn record_end(
@@ -208,8 +236,9 @@ fn record_end(
     start: usize,
     name_state: &mut NameParseState,
 ) -> Result<usize, ResponseError> {
-    let (_, name_end) =
-        parse_name(response, start, name_state).map_err(|_| ResponseError::MalformedRecord)?;
+    let mut name = [0; 255];
+    let (_, name_end) = parse_name_into(response, start, name_state, &mut name)
+        .map_err(|_| ResponseError::MalformedRecord)?;
     let rdlength = usize::from(read_u16(response, name_end + 8)?);
     (name_end + 10)
         .checked_add(rdlength)

@@ -201,6 +201,7 @@ fn cold_http_and_udp_probes_share_exhausted_generation_and_dns_carrier_gate() {
         1,
         1,
         1,
+        false,
         None,
     )
     .unwrap();
@@ -242,6 +243,7 @@ fn reload_and_dns_share_the_startup_vless_carrier_ceiling() {
         1,
         4,
         1,
+        false,
         None,
     )
     .unwrap();
@@ -255,6 +257,7 @@ fn reload_and_dns_share_the_startup_vless_carrier_ceiling() {
         1,
         99,
         99,
+        false,
         Some(&first),
     )
     .unwrap();
@@ -279,6 +282,7 @@ fn zero_vless_carrier_ceiling_remains_zero_for_cold_probes() {
         1,
         1,
         0,
+        false,
         None,
     )
     .unwrap();
@@ -374,4 +378,53 @@ fn parsed_equivalent_vless_udp_fallbacks_reuse_runtime() {
             &replacement.get(&right.id).unwrap()
         ));
     }
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_production_cool_factory_joins_carrier_io_before_shutdown_returns() {
+    use crate::session::ManagedSession as _;
+    use futures_util::FutureExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let node = cold_probe_vless_node("joined-cool");
+    let (generation, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap();
+    let runtime = generation.get(&node.id).unwrap();
+    let ProtocolRuntime::Vless(vless) = &runtime.runtime else {
+        panic!("VLESS expected")
+    };
+    let pool = vless.shared_cool_pool().unwrap();
+    let permit = runtime.acquire_vless_carrier().unwrap();
+    let (io, mut peer) = tokio::io::duplex(1024);
+    let session = pool
+        .offer(move || async move {
+            let io = crate::proxy::ProxyStream {
+                stream: Box::new(io),
+                target_addr: "127.0.0.1:443".parse().unwrap(),
+                target_domain: None,
+            }
+            .with_owner(permit);
+            Ok(crate::proxy::vless::cool::connect(io.stream, 8))
+        })
+        .await
+        .unwrap();
+    let child = session.try_reserve().unwrap();
+    assert!(runtime.acquire_vless_carrier().is_err());
+    generation.shutdown().await;
+    assert!(session.is_closed());
+    assert!(matches!(peer.read(&mut [0; 1]).now_or_never(), Some(Ok(0))));
+    drop(
+        runtime
+            .acquire_vless_carrier()
+            .expect("both joined drivers released carrier I/O"),
+    );
+    drop(child);
 }

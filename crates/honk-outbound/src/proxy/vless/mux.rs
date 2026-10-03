@@ -84,8 +84,8 @@ impl VlessMuxSession {
         })
     }
 
-    fn install_driver(&self, driver: tokio::task::AbortHandle) {
-        *self.driver.lock() = Some(driver);
+    fn install_driver(&self, driver: Option<tokio::task::AbortHandle>) {
+        *self.driver.lock() = driver;
     }
 
     fn sender(&self) -> anyhow::Result<SendRequest<Bytes>> {
@@ -219,7 +219,7 @@ pub(crate) async fn connect(
     let (sender, connection) = builder.handshake(carrier).await?;
     let session = VlessMuxSession::new(sender);
     let weak = Arc::downgrade(&session);
-    let driver = tokio::spawn(async move {
+    let driver = crate::runtime::spawn_owned(async move {
         let result = connection.await;
         if let Some(session) = weak.upgrade() {
             if let Err(error) = result {
@@ -228,7 +228,7 @@ pub(crate) async fn connect(
             session.driver_finished();
         }
     });
-    session.install_driver(driver.abort_handle());
+    session.install_driver(driver);
     Ok(session)
 }
 
@@ -394,6 +394,7 @@ struct MuxResponse {
     error_message: Vec<u8>,
     failed: Option<crate::SharedError>,
     carrier: CarrierFailure,
+    observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 fn h2_clean_eof(error: &h2::Error) -> bool {
@@ -410,6 +411,7 @@ impl MuxResponse {
             error_remaining: None,
             error_message: Vec::new(),
             failed: None,
+            observer: crate::runtime::flow_observation::current(),
             carrier,
         }
     }
@@ -562,6 +564,11 @@ impl MuxResponse {
             match byte {
                 0 => {
                     self.status_ready = true;
+                    if let Some(observer) = self.observer.take() {
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                        );
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 1 => self.error_len = Some((0, 0)),
@@ -660,6 +667,7 @@ struct MuxUdpWriter {
     carrier: CarrierFailure,
     setup: Option<Bytes>,
     pending: bool,
+    request_observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 struct MuxUdpReader {
@@ -703,6 +711,9 @@ impl VlessMuxUdpTransport {
         writer.pending = true;
         let writer = &mut *writer;
         send_owned(&mut writer.send, &writer.carrier, frame).await?;
+        if let Some(observer) = writer.request_observer.take() {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+        }
         writer.setup = None;
         writer.pending = false;
         Ok(())
@@ -780,6 +791,9 @@ impl MuxSession for VlessMuxSession {
             send_owned(&mut opened.send, &opened.failure, request)
                 .await
                 .map_err(|error| OpenError::Draining(anyhow::Error::new(error)))?;
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+            );
             Ok(VlessMuxStream {
                 send: MuxSendStream::new(opened.send, Arc::clone(&opened.failure)),
                 response: MuxResponse::new(opened.response, opened.failure),
@@ -804,6 +818,7 @@ impl MuxSession for VlessMuxSession {
                     carrier: Arc::clone(&opened.failure),
                     setup: Some(setup),
                     pending: false,
+                    request_observer: crate::runtime::flow_observation::current(),
                 }),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
                     response: MuxResponse::new(opened.response, opened.failure),

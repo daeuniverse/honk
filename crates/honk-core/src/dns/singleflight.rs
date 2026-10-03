@@ -20,6 +20,7 @@ pub(crate) enum FlightKey {
         cache_key: CacheKey,
         mode: ResolveMode,
         prefer_meta: Option<DnsRequestMeta>,
+        prefer_forced: Option<super::planner::UpstreamTag>,
     },
     Refresh(CacheKey),
 }
@@ -31,6 +32,7 @@ impl FlightKey {
         strategy: &DnsStrategy,
         qtype: u16,
         metadata: DnsRequestMeta,
+        forced: Option<&super::planner::UpstreamTag>,
     ) -> Self {
         let prefer_meta = matches!(
             (strategy, qtype),
@@ -41,6 +43,7 @@ impl FlightKey {
             cache_key,
             mode,
             prefer_meta,
+            prefer_forced: prefer_meta.and(forced.cloned()),
         }
     }
 

@@ -35,8 +35,8 @@ native-direct 与已有流缓存路径保持原生执行。
 
 切换保留当前用户态匹配语义：
 
-- 普通 domain pattern/suffix/keyword 是同一条件内的 OR；与 geosite 字段同时存在
-  时，geosite 仍是独立条件。suffix、regex、keyword、大小写和 geosite 属性行为不变。
+- 普通 domain pattern/suffix/keyword/regex 与 geosite 在同一条件内按 OR 匹配；
+  否定作用于整个并集。suffix、regex、keyword、大小写和 geosite 属性行为不变。
 - 目的/源 IP 保留 IPv4/IPv6 身份，覆盖 `/0`、裸主机地址及重叠前缀。
 - 端口区间包含两端；TCP/UDP 和 IPv4/IPv6 mask 可以同时包含两种值。
 - pname 保留配置端 15 字节规范化及子串匹配语义。内核进程字节按照 handoff 相同的

@@ -356,11 +356,15 @@ async fn stream_capacity_race_is_a_health_neutral_refusal() {
     pool.insert(&session);
     session.compete_on_reserve.store(true, Ordering::Relaxed);
 
-    let error = pool
-        .open_with(
-            || async { unreachable!("the offered session has capacity") },
-            |_session, _permit| async { Ok::<_, OpenError>(()) },
-        )
+    let open = pool.open_with(
+        || async { unreachable!("the offered session has capacity") },
+        |_session, _permit| async { Ok::<_, OpenError>(()) },
+    );
+    #[cfg(feature = "flow-observation")]
+    let (observer, events) = observation::capture();
+    #[cfg(feature = "flow-observation")]
+    let open = observer.scope(open);
+    let error = open
         .await
         .expect_err("both reservations must lose the last stream slot");
     assert_eq!(
@@ -372,6 +376,14 @@ async fn stream_capacity_race_is_a_health_neutral_refusal() {
         crate::group::ScoreOutcome::Rejected
     );
     assert_eq!(session.state(), SessionState::Active);
+    #[cfg(feature = "flow-observation")]
+    assert_eq!(
+        observation::outcomes(&events.lock()),
+        [
+            ("session_open_capacity", Some("capacity")),
+            ("session_open_capacity", Some("capacity")),
+        ]
+    );
 
     session.compete_on_reserve.store(false, Ordering::Relaxed);
     let reused = pool
@@ -410,4 +422,197 @@ async fn offer_registers_before_checking_capacity() {
     };
     assert!(Arc::ptr_eq(&reused, &session));
     assert_eq!(session.active_streams(), 0);
+}
+
+#[cfg(feature = "flow-observation")]
+mod observation {
+    use super::*;
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+
+    pub(super) fn capture() -> (FlowObserver, Arc<Mutex<Vec<FlowEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&events);
+        let observer = FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 7,
+                attempt_id: Some(uuid::Uuid::new_v4()),
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |_, event| output.lock().push(event)),
+        );
+        (observer, events)
+    }
+
+    pub(super) fn outcomes(events: &[FlowEvent]) -> Vec<(&'static str, Option<&'static str>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::Session(event) => Some((event.reason(), event.error())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_open_records_replacement_and_refusal_never_retries() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            max_sessions: 1,
+            max_streams_per_session: 1,
+            ..Default::default()
+        });
+        let failed = ReservedTestSession::new(1);
+        let replacement = ReservedTestSession::new(1);
+        pool.insert(&failed);
+        let dials = Arc::new(AtomicUsize::new(0));
+        let (observer, events) = capture();
+        let held = observer
+            .scope(pool.open_with(
+                {
+                    let replacement = Arc::clone(&replacement);
+                    let dials = Arc::clone(&dials);
+                    move || async move {
+                        dials.fetch_add(1, Ordering::Relaxed);
+                        Ok(replacement)
+                    }
+                },
+                |session, permit| {
+                    let fail = Arc::ptr_eq(&session, &failed);
+                    async move {
+                        if fail {
+                            Err(OpenError::Session(anyhow!("session died before open")))
+                        } else {
+                            Ok(permit)
+                        }
+                    }
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(failed.is_closed());
+        assert_eq!(failed.active_streams(), 0);
+        assert_eq!(replacement.active_streams(), 1);
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            outcomes(&events.lock()),
+            [
+                ("session_open_started", None),
+                ("session_open_failed", Some("session")),
+                ("session_open_started", None),
+                ("session_open_succeeded", None),
+            ]
+        );
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            FlowEvent::Transport { .. } | FlowEvent::Milestone { .. } | FlowEvent::Gap(_)
+        )));
+        drop(held);
+        assert_eq!(replacement.active_streams(), 0);
+        events.lock().clear();
+        let opens = AtomicUsize::new(0);
+        let error = observer
+            .scope(pool.open_with(
+                || async { unreachable!("a protocol refusal must not dial") },
+                |_session, _permit| {
+                    opens.fetch_add(1, Ordering::Relaxed);
+                    async {
+                        Err::<(), _>(OpenError::Refused(
+                            crate::proxy::PacketRejection::Policy.into(),
+                        ))
+                    }
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::proxy::packet_rejection(&error),
+            Some(crate::proxy::PacketRejection::Policy)
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        assert_eq!(replacement.state(), SessionState::Active);
+        assert_eq!(replacement.active_streams(), 0);
+        assert_eq!(
+            outcomes(&events.lock()),
+            [
+                ("session_open_started", None),
+                ("session_open_refused", Some("refused")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_open_records_retry_without_closing_existing_streams() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            max_sessions: 1,
+            max_streams_per_session: 2,
+            ..Default::default()
+        });
+        let draining = ReservedTestSession::new(2);
+        let existing = draining.try_reserve().unwrap();
+        pool.insert(&draining);
+        let (observer, events) = capture();
+        let replacement = observer
+            .scope(pool.open_with(
+                || async { Ok(ReservedTestSession::new(2)) },
+                |session, permit| {
+                    let drain = Arc::ptr_eq(&session, &draining);
+                    async move {
+                        if drain {
+                            Err(OpenError::Draining(anyhow!("GOAWAY before open")))
+                        } else {
+                            Ok(permit)
+                        }
+                    }
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(draining.state(), SessionState::Draining);
+        assert!(!draining.is_closed());
+        assert_eq!(draining.active_streams(), 1);
+        assert_eq!(pool.metrics().sessions, 2);
+        assert_eq!(
+            outcomes(&events.lock()),
+            [
+                ("session_open_started", None),
+                ("session_open_draining", Some("draining")),
+                ("session_open_started", None),
+                ("session_open_succeeded", None),
+            ]
+        );
+        drop(existing);
+        drop(replacement);
+        assert_eq!(draining.active_streams(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_open_releases_capacity_without_success_or_invalidation() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            max_streams_per_session: 1,
+            ..Default::default()
+        });
+        let session = ReservedTestSession::new(1);
+        pool.insert(&session);
+        let (observer, events) = capture();
+        let mut open = Box::pin(observer.scope(pool.open_with(
+            || async { unreachable!("seeded session must be reused") },
+            |_session, permit| async move {
+                std::future::pending::<()>().await;
+                Ok::<_, OpenError>(permit)
+            },
+        )));
+        assert!(futures_util::poll!(open.as_mut()).is_pending());
+        assert_eq!(session.active_streams(), 1);
+        drop(open);
+        assert_eq!(session.active_streams(), 0);
+        assert_eq!(session.state(), SessionState::Active);
+        assert_eq!(
+            outcomes(&events.lock()),
+            [
+                ("session_open_started", None),
+                ("session_open_cancelled", Some("cancelled")),
+            ]
+        );
+    }
 }

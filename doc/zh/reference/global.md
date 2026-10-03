@@ -12,7 +12,7 @@
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关；当前运行时不读取该字段。 |
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
-| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为 `--debug`、`RUST_LOG`、该值。通过 SIGHUP 修改需重启。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
+| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为 `--debug`、`RUST_LOG`、该值。通过 SIGHUP 修改需重启；native API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
@@ -20,7 +20,7 @@
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此向每个已解析的 WAN 接口（含运行期晚挂载的）写入 `net.ipv6.conf.<wan>.accept_ra=2`，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
 | `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。修改后需重启。 |
-| `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
+| `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到状态数据库 `data_dir/state/honk.db`，仅供启动恢复；重载沿用活动节点而不读取已存正文。修改后需重启。 |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。健康检查循环使用第一个值；空列表退回普通 TCP 检查。URI 解析分别处理用户信息、带方括号的 IPv6、端口、路径、查询和片段。用户信息不会生成授权头；请求保留路径和查询，不发送片段，无斜杠的查询以 `/?query` 发送。HTTP/HTTPS 默认端口为 80/443；无协议的健康检查目标使用 HTTP/80。URLTest 的无协议目标使用 HTTPS/443，并向解码后的路径和查询串发送 HEAD。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔。裸 IPv4/IPv6、`[IPv6]` 和域名默认使用端口 `53`；显式端口必须为 `1..65535` 内的整数。无效括号或端口会使校验失败，并产生带位置的诊断。优先选择第一个 IP 字面量，否则解析第一个域名。解析与 Score 共用解码后的主机和端口，解析完成后仍保留域名身份。 |
@@ -131,10 +131,10 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 | 路径 | 解析与旧路径回退 |
 | ---- | ---------------- |
 | 节点 `ech_config_path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对路径。都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
-| `global.log_file` | 相对路径始终通过仅用于创建的路径 helper 解析为 `<data_dir>/<path>`，启动时创建父目录；不会读取或迁移 `/var/share/honk` 中已有的日志。绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。控制台与文件里的时间戳都是本机本地时间并带 UTC 偏移（`2026-09-12T02:30:15.123456+10:00`）。 |
-| `experimental.cache_file.path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及相对于原始配置目录且已存在的路径。新数据库在 `data_dir` 下创建。 |
+| `global.log_file` | 相对路径始终通过仅用于创建的路径 helper 解析为 `<data_dir>/<path>`，启动时创建父目录；不会读取或迁移 `/var/share/honk` 中已有的日志。绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 追加写入，文件达到 10 MiB 时轮转：当前文件改名为 `<name>.1` 并覆盖旧副本，再按相同检查打开新文件，因此日志最多占用 20 MiB。重启交接期间两个实例共用该文件时，只有文件仍在原路径上的实例执行改名，另一个实例直接切换到新文件，因此不会互相覆盖轮转副本。轮转失败（例如新文件无法打开）时，honk 不再尝试轮转，继续写入当前文件直到 20 MiB，之后丢弃日志行，并在 stderr 输出一次警告，直到重启。控制台与文件里的时间戳都是本机本地时间并带 UTC 偏移（`2026-09-12T02:30:15.123456+10:00`）。 |
+| `experimental.cache_file.path` | 不再决定存储位置，状态保存在 `<data_dir>/state/honk.db`。首次启动时按旧的解析顺序读取一次，用于导入旧 `cache.db`（见[升级说明](./experimental.md#从-cachedb-升级)）。 |
 | `experimental.clash_api.external_ui` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对目录。都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
-| 订阅存储 | 依次优先使用已存在的 `<data_dir>/.sub`、已存在的 `/var/share/honk/.sub`，以及已存在的 `./.sub`。都不存在时创建 `<data_dir>/.sub`；不会自动移动或删除存储。 |
+| 订阅存储 | 正文保存在 `<data_dir>/state/honk.db` 中。每次启动时，honk 依次在 `<data_dir>/.sub`、`/var/share/honk/.sub`、`./.sub` 中查找第一个私有的旧存储，导入已启用订阅的正文，然后删除已复制的文件（见[订阅参考](./subscription.md#拉取持久化与恢复)）。 |
 
 ## 预热与拨号预算
 

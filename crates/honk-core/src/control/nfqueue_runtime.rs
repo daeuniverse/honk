@@ -291,42 +291,81 @@ impl NfqueueRuntime {
         self.pending.wait_empty().await;
     }
 
+    // Handles stay in place while awaited: a timed-out stage leaves them for
+    // `abort_tasks` instead of detaching them.
     async fn stop_observers(&mut self) -> anyhow::Result<()> {
         let _ = self.stop.send(true);
-        if let Some(stats_sampler) = self.stats_sampler.take() {
-            stats_sampler
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE stats sampler: {error}"))?;
+        if let Some(stats_sampler) = self.stats_sampler.as_mut() {
+            let result = stats_sampler.await;
+            self.stats_sampler = None;
+            result.map_err(|error| anyhow::anyhow!("join NFQUEUE stats sampler: {error}"))?;
         }
-        if let Some(watchdog) = self.watchdog.take() {
-            watchdog
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE watchdog: {error}"))?;
+        if let Some(watchdog) = self.watchdog.as_mut() {
+            let result = watchdog.await;
+            self.watchdog = None;
+            result.map_err(|error| anyhow::anyhow!("join NFQUEUE watchdog: {error}"))?;
         }
         Ok(())
     }
 
     pub(super) async fn finish_pending_drain(&mut self) -> anyhow::Result<()> {
         let observer_result = self.stop_observers().await;
-        if let Some(worker) = self.ingest_worker.take() {
-            worker
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
+        if let Some(worker) = self.ingest_worker.as_mut() {
+            let result = worker.await;
+            self.ingest_worker = None;
+            result.map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
         }
         self.pending.cancel_all().await;
         self.pending.wait_empty().await;
         observer_result
     }
 
+    /// Abort and join whatever a timed-out stage left running, so no NFQUEUE
+    /// child outlives the queue into flag/table cleanup.
+    pub(super) async fn abort_tasks(&mut self) {
+        for task in [
+            &mut self.stats_sampler,
+            &mut self.watchdog,
+            &mut self.ingest_worker,
+        ] {
+            if let Some(handle) = task.as_mut() {
+                handle.abort();
+                let _ = handle.await;
+                *task = None;
+            }
+        }
+    }
+
+    /// The observer joins are bounded, but the queue close is not: a blocking
+    /// shutdown cannot be cancelled, and abandoning it would let owned-table
+    /// deletion run before the queue closes. Wait it out; report an overrun.
     pub(super) async fn shutdown_service(&mut self) -> anyhow::Result<()> {
-        let observer_result = self.stop_observers().await;
+        let observer_result = match tokio::time::timeout(
+            super::lifecycle::STAGE_TIMEOUT,
+            self.stop_observers(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "NFQUEUE observers exceeded their stop deadline"
+            )),
+        };
         let service_result = async {
             let service = self
                 .service
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("NFQUEUE service already stopped"))?;
-            tokio::task::spawn_blocking(move || service.shutdown())
-                .await
+            let mut shutdown = tokio::task::spawn_blocking(move || service.shutdown());
+            let joined =
+                match tokio::time::timeout(super::lifecycle::STAGE_TIMEOUT, &mut shutdown).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        let _ = shutdown.await;
+                        anyhow::bail!("NFQUEUE shutdown exceeded its stop deadline");
+                    }
+                };
+            joined
                 .map_err(|error| anyhow::anyhow!("join NFQUEUE shutdown: {error}"))?
                 .map_err(|error| anyhow::anyhow!("shutdown NFQUEUE: {error}"))
         }
@@ -521,6 +560,7 @@ impl ControlPlane {
         let drain = Arc::clone(&self.drain_tracker);
         let ingest_queue = Arc::clone(&actor_queue);
         let dns_ingress = super::udp_ingress::UdpLoopState::new(self, true);
+        let initializer_tasks = Arc::clone(&self.udp_pool);
         let ingest_worker = tokio::spawn(async move {
             while let Some((packet, guard, epoch)) = ingest_rx.recv().await {
                 let dns = packet.tuple.destination.port() == 53;
@@ -539,7 +579,7 @@ impl ControlPlane {
                 let initializer = initializer.clone();
                 let pending = Arc::clone(&actor_pending);
                 let drain = Arc::clone(&drain);
-                tokio::spawn(async move {
+                initializer_tasks.spawn_slow_path(async move {
                     let _guard = ConnectionGuard::new(drain);
                     match std::panic::AssertUnwindSafe(initializer.serve_udp_connection(lease))
                         .catch_unwind()

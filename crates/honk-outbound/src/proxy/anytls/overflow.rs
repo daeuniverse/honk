@@ -413,9 +413,9 @@ impl AnyTlsSession {
         let mut handle = self.watchdog.lock().unwrap();
         if handle.is_none() {
             let session = Arc::clone(self);
-            *handle = Some(
-                tokio::spawn(async move { session.run_overflow_watchdog().await }).abort_handle(),
-            );
+            *handle = self
+                .task_scope
+                .spawn(async move { session.run_overflow_watchdog().await });
         }
     }
 

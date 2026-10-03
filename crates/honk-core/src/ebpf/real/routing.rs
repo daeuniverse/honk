@@ -36,6 +36,8 @@ pub(super) struct RoutingGeneration {
     _source_v6: RoutingLpm,
     _mac: RoutingLpm,
     descriptor: RoutingDescriptor,
+    pub(super) trace_policy: u32,
+    pub(super) fingerprint: [u8; 32],
     _btf: OwnedFd,
     _program: OwnedFd,
     _links: Vec<OwnedFd>,
@@ -110,7 +112,8 @@ fn btf_bytes(fd: &OwnedFd) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Validate the actual freplace output parameter before writing generated fields.
+/// Validate the actual freplace output parameter, a `KernelRouteOutput` whose
+/// first member is the `RoutingDecision`, before writing generated fields.
 fn validate_routing_decision_abi(data: &[u8], slot: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         btf::Btf::parse(data)
@@ -131,7 +134,33 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
     if btf.kind(pointer)? != 2 {
         return None;
     }
-    let structure = btf.resolve_composite(read(pointer + 8)?)?;
+    // Generated code writes the decision prefix and the trace fields by offset.
+    let output = btf.resolve_composite(read(pointer + 8)?)?;
+    let output_fields = [
+        ("decision", offset_of!(KernelRouteOutput, decision)),
+        ("flags", offset_of!(KernelRouteOutput, flags)),
+        ("generation", offset_of!(KernelRouteOutput, generation)),
+        ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
+        ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
+        ("input", offset_of!(KernelRouteOutput, input)),
+        (
+            "domain_bitmap",
+            offset_of!(KernelRouteOutput, domain_bitmap),
+        ),
+        ("outcomes", offset_of!(KernelRouteOutput, outcomes)),
+    ];
+    if read(output + 4)? != (4 << 24) | output_fields.len() as u32
+        || read(output + 8)? != size_of::<KernelRouteOutput>() as u32
+    {
+        return None;
+    }
+    for (index, (name, offset)) in output_fields.into_iter().enumerate() {
+        let member = output + 12 + index * 12;
+        if btf.string(read(member)?) != Some(name) || read(member + 8)? != offset as u32 * 8 {
+            return None;
+        }
+    }
+    let structure = btf.resolve_composite(read(output + 16)?)?;
     let fields = [
         ("outbound", offset_of!(RoutingDecision, outbound)),
         ("mark", offset_of!(RoutingDecision, mark)),
@@ -356,6 +385,35 @@ pub(super) fn open_routing_generation_sequence(
 }
 
 impl RealEbpfBackend {
+    pub(super) fn observed_routing_generation(&self) -> anyhow::Result<Option<u64>> {
+        let root = self
+            .bpf()?
+            .map(ROUTING_POLICY_ROOT_NAME)
+            .ok_or_else(|| anyhow::anyhow!("routing root unavailable"))?;
+        let root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
+        let descriptor = match root.get(&0, 0) {
+            Ok(descriptor) => descriptor,
+            Err(MapError::KeyNotFound) if self.routing_generation.is_none() => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let owner = self
+            .routing_generation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("routing root has no owner"))?;
+        let value = descriptor.get(&0, 0)?;
+        anyhow::ensure!(
+            descriptor.map().info()?.id() == owner.descriptor.map().info()?.id()
+                && value.generation == self.routing_generation_counter
+                && value.generation != 0
+                && value.slot == self.routing_slot
+                && value.slot < ROUTING_SLOT_NAMES.len() as u32
+                && value.trace_policy == owner.trace_policy
+                && value.domain_map_id == owner.domain.map().info()?.id(),
+            "routing root differs from its owner"
+        );
+        Ok(Some(value.generation))
+    }
+
     fn reserve_routing_generation(&mut self) -> anyhow::Result<u64> {
         let generation = self
             .routing_generation_sequence
@@ -436,6 +494,12 @@ impl RealEbpfBackend {
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
         let generation = self.reserve_routing_generation()?;
+        let trace_policy = if plan.trace_enabled() {
+            self.next_trace_policy = self.next_trace_policy.saturating_add(1);
+            self.next_trace_policy
+        } else {
+            0
+        };
         let active = self.routing_slot;
         anyhow::ensure!(
             active < ROUTING_SLOT_NAMES.len() as u32,
@@ -459,7 +523,7 @@ impl RealEbpfBackend {
             features: plan.features,
             generation,
             domain_map_id,
-            reserved: 0,
+            trace_policy,
         };
         let descriptor = self.publish_routing_descriptor(descriptor_value)?;
 
@@ -471,6 +535,8 @@ impl RealEbpfBackend {
             _source_v6: maps.source_v6,
             _mac: maps.mac,
             descriptor,
+            trace_policy,
+            fingerprint: plan.fingerprint,
             _btf: btf,
             _program: program,
             _links: links,
@@ -518,6 +584,7 @@ impl RealEbpfBackend {
             interface_links: Vec::new(),
             cgroup_sock_links: Vec::new(),
             cgroup_sock_addr_links: Vec::new(),
+            pname_mode: process_name::PnameCaptureMode::Argv0,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
@@ -530,6 +597,12 @@ impl RealEbpfBackend {
             routing_slot: 0,
             routing_generation_counter: 0,
             routing_generation_sequence: AyaArray::create(1, 0)?,
+            next_trace_policy: 0,
+            #[cfg(feature = "native-api")]
+            trace_dictionaries: Default::default(),
+            receive_trace: None,
+            receive_trace_available: false,
+            receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
         })
     }

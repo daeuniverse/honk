@@ -59,7 +59,8 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             context.prepared,
             traversal,
             response,
-            matches!(context.mode, ResolveMode::Strict) || context.bypass_cache_read,
+            matches!(context.mode, ResolveMode::Strict)
+                || context.options.cache != crate::dns::forwarder::CacheAccess::Normal,
         )? {
             ResponseDirective::Accept {
                 response: analyzed,
@@ -115,7 +116,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
     };
 
     let exact_cache_key = context.cache_key.clone();
-    let expiry = if strict_reusable {
+    let (expiry, _revision) = if strict_reusable {
         cache::store(
             context,
             &exact_cache_key,
@@ -125,8 +126,20 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         )
         .await
     } else {
-        EffectiveExpiry::do_not_cache()
+        (EffectiveExpiry::do_not_cache(), None)
     };
+    #[cfg(feature = "native-api")]
+    let entry_id = if let Some(revision) = _revision {
+        context
+            .forwarder
+            .cache_service()
+            .await
+            .entry_id_for_revision(&exact_cache_key, revision)
+    } else {
+        None
+    };
+    #[cfg(feature = "native-api")]
+    crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     debug!(
         ttl = expiry.ttl().as_secs(),
         bytes = response.len(),
@@ -141,9 +154,10 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             response.into(),
             context.metadata,
             context.mode,
+            context.options,
         )
         .await?;
-    context.forwarder.outcome_from_wire(
+    let outcome = context.forwarder.outcome_from_wire(
         context.engine,
         context.prepared,
         response,
@@ -155,7 +169,10 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         Some(upstream_name.as_str().to_owned()),
         traversal_strings(&traversal),
         context.mode,
-    )
+    )?;
+    #[cfg(feature = "native-api")]
+    let outcome = outcome.with_cache_entry_id(entry_id);
+    Ok(outcome)
 }
 
 async fn stale_outcome(
@@ -163,13 +180,21 @@ async fn stale_outcome(
     final_upstream: &UpstreamTag,
     history: Vec<String>,
 ) -> Result<Option<DnsOutcome>, DnsForwardError> {
-    let Some(stale) = context
+    let Some((stale, _revision)) = context
         .forwarder
         .try_serve_stale(&context.cache_key, context.raw_query, context.mode)
         .await
     else {
         return Ok(None);
     };
+    #[cfg(feature = "native-api")]
+    let entry_id = context
+        .forwarder
+        .cache_service()
+        .await
+        .entry_id_for_revision(&context.cache_key, _revision);
+    #[cfg(feature = "native-api")]
+    crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let stale = context
         .forwarder
         .apply_prefer_strategy(
@@ -179,6 +204,7 @@ async fn stale_outcome(
             stale.into(),
             context.metadata,
             context.mode,
+            context.options,
         )
         .await?;
     let ttl = if context.forwarder.stale_reply_ttl == 0 {
@@ -201,5 +227,9 @@ async fn stale_outcome(
             history,
             context.mode,
         )
-        .map(Some)
+        .map(|outcome| {
+            #[cfg(feature = "native-api")]
+            let outcome = outcome.with_cache_entry_id(entry_id);
+            Some(outcome)
+        })
 }

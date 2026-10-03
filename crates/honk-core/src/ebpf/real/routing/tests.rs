@@ -1,5 +1,6 @@
 use super::*;
 mod dns_ownership;
+mod native_trace;
 mod predicate_semantics;
 mod publication;
 mod readiness;
@@ -807,16 +808,41 @@ fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() 
         "direct_mark_index",
     ]
     .map(&mut name);
+    let output = name("KernelRouteOutput");
+    let output_fields = [
+        ("decision", offset_of!(KernelRouteOutput, decision)),
+        ("flags", offset_of!(KernelRouteOutput, flags)),
+        ("generation", offset_of!(KernelRouteOutput, generation)),
+        ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
+        ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
+        ("input", offset_of!(KernelRouteOutput, input)),
+        (
+            "domain_bitmap",
+            offset_of!(KernelRouteOutput, domain_bitmap),
+        ),
+        ("outcomes", offset_of!(KernelRouteOutput, outcomes)),
+    ]
+    .map(|(field, offset)| (name(field), offset as u32 * 8));
     let mut types = vec![integer, 1 << 24, 4, 32];
     let structure_offset = types.len();
     types.extend([structure, (4 << 24) | 6, 24]);
     for (index, field) in fields.into_iter().enumerate() {
         types.extend([field, 1, index as u32 * 32]);
     }
-    types.extend([0, 2 << 24, 2]); // pointer to the output struct
+    let output_offset = types.len();
+    types.extend([
+        output,
+        (4 << 24) | output_fields.len() as u32,
+        size_of::<KernelRouteOutput>() as u32,
+    ]);
+    for (index, (field, offset)) in output_fields.into_iter().enumerate() {
+        // The decision is type 2; other member types are not inspected.
+        types.extend([field, if index == 0 { 2 } else { 1 }, offset]);
+    }
+    types.extend([0, 2 << 24, 3]); // pointer to the output struct
     let prototype_offset = types.len();
-    types.extend([0, (13 << 24) | 2, 1, 0, 3, 0, 3]);
-    types.extend([slot, (12 << 24) | 1, 4]);
+    types.extend([0, (13 << 24) | 2, 1, 0, 4, 0, 4]);
+    types.extend([slot, (12 << 24) | 1, 5]);
     let encode = |types: &[u32]| {
         let mut bytes = vec![0x9f, 0xeb, 1, 0];
         for word in [
@@ -838,7 +864,10 @@ fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() 
     for (word, replacement) in [
         (structure_offset + 2, 20),
         (structure_offset + 3 + 5 * 3 + 2, 128),
-        (prototype_offset + 6, 2),
+        (output_offset + 2, 264),
+        (output_offset + 3 + 2, 32),
+        (output_offset + 3 + 1, 1),
+        (prototype_offset + 6, 3),
     ] {
         let mut incompatible = types.clone();
         incompatible[word] = replacement;

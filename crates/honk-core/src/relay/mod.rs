@@ -146,6 +146,8 @@ pub struct RelayStats {
 pub struct RelayProgress {
     pub upload: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub download: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub outbound_upload: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub outbound_download: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// First nonempty upstream read, independent of client write backpressure.
     pub first_response: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Accepted destination writes as `(upload_bytes, download_bytes)`.
@@ -158,6 +160,7 @@ pub type OptionalRelayProgress = Option<RelayProgress>;
 pub(crate) struct RelayIo<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     write_is_upload: bool,
@@ -167,6 +170,7 @@ impl<S> RelayIo<S> {
     pub(crate) fn wrap(
         inner: S,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
         on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
         write_is_upload: bool,
@@ -174,6 +178,7 @@ impl<S> RelayIo<S> {
         Self {
             inner,
             counter,
+            aggregate,
             on_progress,
             on_transfer,
             write_is_upload,
@@ -204,6 +209,7 @@ fn relay_io_pair<S1, S2>(
         RelayIo::wrap(
             client,
             progress.upload.clone(),
+            progress.outbound_upload.clone(),
             None,
             progress.on_transfer.clone(),
             false,
@@ -211,6 +217,7 @@ fn relay_io_pair<S1, S2>(
         RelayIo::wrap(
             proxy,
             progress.download.clone(),
+            progress.outbound_download.clone(),
             progress.first_response.clone(),
             progress.on_transfer.clone(),
             true,
@@ -231,6 +238,9 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RelayIo<S> {
             if n > 0 {
                 self.counter
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                if let Some(aggregate) = &self.aggregate {
+                    aggregate.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Some(callback) = self.on_progress.take() {
                     callback();
                 }
@@ -284,6 +294,9 @@ const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 
 // A saturated read fits one AnyTLS frame without a one-byte tail.
 const RELAY_BUF_SIZE: usize = u16::MAX as usize;
+// Idle and chatty flows keep this small buffer; one saturated read marks a
+// bulk flow, which uses the full frame size for the rest of its life.
+const RELAY_BUF_MIN: usize = 8 * 1024;
 
 /// Stops both copy directions where neither holds unwritten bytes, so the
 /// relay can hand the connection to another engine without cancelling a
@@ -344,8 +357,8 @@ where
     // Sniffing or protocol setup may already have buffered bytes before the
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await.map_err(write_error)?;
-    let mut rd = RelayIo::wrap(rd, progress, None, None, false);
-    let mut buffer = vec![0; RELAY_BUF_SIZE];
+    let mut rd = RelayIo::wrap(rd, progress, None, None, None, false);
+    let mut buffer = vec![0; RELAY_BUF_MIN];
     let mut n = 0;
     loop {
         if park.is_some_and(|park| park.take(upload)) {
@@ -380,6 +393,9 @@ where
         }
         wr.write_all(&buffer[..read]).await.map_err(write_error)?;
         n += read as u64;
+        if read == buffer.len() && read < RELAY_BUF_SIZE {
+            buffer = vec![0; RELAY_BUF_SIZE];
+        }
     }
     wr.flush().await.map_err(write_error)?;
     wr.shutdown().await.map_err(write_error)?;
@@ -535,7 +551,7 @@ mod tests {
     async fn saturated_relay_keeps_large_frames_and_partial_write_integrity() {
         struct FramedWriter {
             bytes: Vec<u8>,
-            frames: usize,
+            sizes: Vec<usize>,
             limit: usize,
             pending: bool,
         }
@@ -553,7 +569,7 @@ mod tests {
                 }
                 let n = buf.len().min(self.limit);
                 self.bytes.extend_from_slice(&buf[..n]);
-                self.frames += 1;
+                self.sizes.push(n);
                 std::task::Poll::Ready(Ok(n))
             }
 
@@ -577,7 +593,7 @@ mod tests {
             let mut source = payload.as_slice();
             let mut writer = FramedWriter {
                 bytes: Vec::new(),
-                frames: 0,
+                sizes: Vec::new(),
                 limit,
                 pending: false,
             };
@@ -589,12 +605,74 @@ mod tests {
             assert_eq!(copied, payload.len() as u64);
             assert_eq!(progress.load(Ordering::Relaxed), copied);
             if limit == u16::MAX as usize {
-                assert_eq!(
-                    writer.frames, 3,
-                    "saturated data must not fragment into small frames"
+                // One small frame while the flow proves itself bulk, then full ones.
+                let sizes = &writer.sizes;
+                assert_eq!(sizes[0], RELAY_BUF_MIN);
+                assert!(
+                    sizes[1..sizes.len() - 1]
+                        .iter()
+                        .all(|&size| size == RELAY_BUF_SIZE),
+                    "saturated data must not fragment into small frames: {sizes:?}"
                 );
             }
         }
+    }
+
+    /// Reports the buffer room each `poll_read` is offered and serves scripted
+    /// reads: a size, or `FILL` to saturate whatever room it gets.
+    struct Scripted {
+        reads: std::collections::VecDeque<usize>,
+        offered: Vec<usize>,
+    }
+
+    const FILL: usize = usize::MAX;
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.offered.push(buf.remaining());
+            if let Some(read) = self.reads.pop_front() {
+                let read = read.min(buf.remaining());
+                buf.put_slice(&vec![7; read]);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn offered_room(reads: &[usize]) -> Vec<usize> {
+        let mut source = Scripted {
+            reads: reads.iter().copied().collect(),
+            offered: Vec::new(),
+        };
+        copy_way(
+            &mut source,
+            &mut tokio::io::sink(),
+            Arc::new(AtomicU64::new(0)),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        source.offered
+    }
+
+    #[tokio::test]
+    async fn chatty_flows_keep_the_small_buffer_and_bulk_flows_grow_once() {
+        let chatty = offered_room(&[1000; 50]).await;
+        assert!(
+            chatty.iter().all(|&room| room == RELAY_BUF_MIN),
+            "{chatty:?}"
+        );
+
+        let bulk = offered_room(&[FILL, 100, 100]).await;
+        assert_eq!(bulk[0], RELAY_BUF_MIN);
+        assert!(
+            bulk[1..].iter().all(|&room| room == RELAY_BUF_SIZE),
+            "{bulk:?}"
+        );
     }
 
     #[tokio::test]
@@ -717,6 +795,8 @@ mod tests {
                         Some(RelayProgress {
                             upload: upload.clone(),
                             download: download.clone(),
+                            outbound_upload: None,
+                            outbound_download: None,
                             first_response: Some(Arc::new(move || {
                                 first_response.fetch_add(1, Ordering::Relaxed);
                             })),
@@ -860,5 +940,52 @@ mod tests {
             .expect("relay pinned by stalled survivor")
             .unwrap();
         assert_eq!(stats.proxy_to_client, 4096);
+    }
+
+    #[tokio::test]
+    async fn native_copy_accounting_survives_error_and_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        for cancel in [false, true] {
+            let (mut client, relayed_client) = tokio::io::duplex(64);
+            let (upstream, mut peer) = tokio::io::duplex(64);
+            let upload = Arc::new(AtomicU64::new(0));
+            let aggregate = Arc::new(AtomicU64::new(17));
+            let progress = RelayProgress {
+                upload: upload.clone(),
+                download: Arc::new(AtomicU64::new(0)),
+                outbound_upload: Some(aggregate.clone()),
+                outbound_download: None,
+                first_response: None,
+                on_transfer: None,
+            };
+            client.write_all(b"abcdef").await.unwrap();
+            let mut peer = if cancel {
+                Some(&mut peer)
+            } else {
+                drop(peer);
+                None
+            };
+            let task = tokio::spawn(splice::relay_auto(
+                relayed_client,
+                upstream,
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+                Some(progress),
+            ));
+            if let Some(peer) = peer.as_mut() {
+                let mut received = [0; 6];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"abcdef");
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(task.await.unwrap().is_err());
+            }
+            assert_eq!(upload.load(Ordering::Relaxed), 6);
+            assert_eq!(aggregate.load(Ordering::Relaxed), 23);
+        }
     }
 }

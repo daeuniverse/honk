@@ -1,4 +1,8 @@
 use super::*;
+pub(super) mod closure;
+
+#[cfg(feature = "native-api")]
+mod native_flow_tests;
 
 mod score;
 
@@ -209,7 +213,7 @@ async fn run_endpoint_driver(
     first: QueuedDatagram,
     first_ack: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<()> {
-    let outbound_tracker = stats.outbound_tracker(&outbound_name);
+    let outbound_tracker = stats.outbound_tracker(&outbound_name, crate::stats::OutboundKind::Node);
     super::run_endpoint_driver(
         UdpDriverContext {
             endpoint,
@@ -1351,40 +1355,6 @@ async fn udp_init_lease_commit_before_cancellation_keeps_ready_endpoint() {
     pool.remove(client, dst);
 }
 
-#[test]
-fn udp_init_lease_drop_notifies_registered_tracker_once() {
-    let pool = Arc::new(UdpEndpointPool::new());
-    let stats = StatsManager::new();
-    let client = make_addr("10.0.0.1", 12345);
-    let dst = make_addr("8.8.8.8", 53);
-    let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
-    pool.set_remove_sink(removed_tx);
-    let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
-        EndpointReservation::Initializing(lease) => lease,
-        _ => panic!("first reservation must initialize"),
-    };
-    assert!(lease.set_tracker_id("tracker-before-commit".to_owned()));
-
-    drop(lease);
-
-    assert_eq!(
-        try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
-        EndpointRemoval {
-            client,
-            dst,
-            decision_token: 0,
-            generation: 1,
-            conn_id: Some("tracker-before-commit".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
-        }
-    );
-    assert!(matches!(
-        removed_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-}
-
 #[tokio::test]
 async fn udp_init_lease_abort_and_panic_release_generation_for_reuse() {
     let pool = Arc::new(UdpEndpointPool::new());
@@ -1466,7 +1436,7 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -1536,7 +1506,8 @@ async fn local_reply_failures_do_not_become_upstream_failures() {
                     client_dst: relay,
                     alive_set: Arc::clone(&alive),
                     stats: Arc::clone(&stats),
-                    outbound_tracker: stats.outbound_tracker("test-node"),
+                    outbound_tracker: stats
+                        .outbound_tracker("test-node", crate::stats::OutboundKind::Node),
                     health_family: honk_outbound::alive::IpVersion::V4,
                 },
                 UdpDriverStart {
@@ -1654,8 +1625,8 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
             queue_rx,
             reply_socket,
             Arc::new(honk_outbound::alive::AliveDialerSet::new()),
-            stats,
-            "test-node".to_owned(),
+            Arc::clone(&stats),
+            stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(endpoint));
@@ -1679,7 +1650,7 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
             assert_eq!(factory.created(), vec![source_a, source_b]);
         }
         driver.abort();
-        assert!(pool.shutdown().await);
+        assert!(pool.shutdown().await.joined);
     }
 }
 
@@ -2122,7 +2093,6 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("idle-tracker".to_owned());
-    assert!(lease.set_tracker_id("idle-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2134,7 +2104,7 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
         test_reply_socket().await,
         Arc::clone(&alive),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -2187,7 +2157,9 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("shutdown fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("shutdown-node"));
+    lease.set_connection_guard(
+        stats.track_connection("shutdown-node", crate::stats::OutboundKind::Node),
+    );
     let transport = Arc::new(ScriptedPacketTransport::with_receive_actions(
         relay,
         [DriverSendAction::Ok],
@@ -2195,7 +2167,6 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
     ));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("shutdown-tracker".to_owned());
-    assert!(lease.set_tracker_id("shutdown-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2207,7 +2178,7 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         test_reply_socket().await,
         Arc::clone(&alive),
         Arc::clone(&stats),
-        "shutdown-node".to_owned(),
+        stats.outbound_tracker("shutdown-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2223,7 +2194,9 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         let closed = removed_rx.recv().await;
         (removal, closed)
     });
-    assert!(pool.shutdown().await);
+    let shutdown = pool.shutdown().await;
+    assert!(shutdown.joined);
+    assert!(shutdown.graceful);
     let (removal, removal_channel_closed) = removal_ack.await.unwrap();
 
     assert!(pool.is_terminal());
@@ -2284,8 +2257,9 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("stuck initializer fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("stuck-initializer"));
-    assert!(lease.set_tracker_id("stuck-tracker".to_owned()));
+    lease.set_connection_guard(
+        stats.track_connection("stuck-initializer", crate::stats::OutboundKind::Node),
+    );
     assert!(pool.spawn_slow_path(async move {
         std::future::pending::<()>().await;
         drop(lease);
@@ -2300,7 +2274,9 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         let closed = removed_rx.recv().await;
         (removal, closed)
     });
-    assert!(pool.shutdown().await);
+    let shutdown = pool.shutdown().await;
+    assert!(shutdown.joined);
+    assert!(!shutdown.graceful);
     let (removal, removal_channel_closed) = removal_ack.await.unwrap();
 
     assert_eq!(pool.slow_task_count(), 0);
@@ -2314,7 +2290,7 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
             dst,
             decision_token: 0,
             generation: 1,
-            conn_id: Some("stuck-tracker".to_owned()),
+            conn_id: None,
             reason: RemovalReason::UserspaceEndpointRetired,
         })
     );
@@ -2366,7 +2342,6 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
         let endpoint = driver_test_endpoint(transport, relay);
         endpoint.record_pending_reply_peer(relay);
         endpoint.set_tracker("receive-tracker".to_owned());
-        assert!(lease.set_tracker_id("receive-tracker".to_owned()));
         let queue_rx = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
             client,
@@ -2378,7 +2353,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "test-node".to_owned(),
+            stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(endpoint));
@@ -2446,7 +2421,6 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
     ));
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
     endpoint.set_tracker("blocked-receive-tracker".to_owned());
-    assert!(lease.set_tracker_id("blocked-receive-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2458,7 +2432,7 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -2596,7 +2570,7 @@ async fn udp_driver_scores_transport_failure_before_synchronous_node_retirement(
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "failed".to_owned(),
+            stats.outbound_tracker("failed", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2650,7 +2624,6 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
     ));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("worker-tracker".to_owned());
-    assert!(lease.set_tracker_id("worker-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2662,7 +2635,7 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -2704,8 +2677,9 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("panic fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("driver-node"));
-    assert!(lease.set_tracker_id("panic-tracker".to_owned()));
+    lease.set_connection_guard(
+        stats.track_connection("driver-node", crate::stats::OutboundKind::Node),
+    );
     let transport = Arc::new(ScriptedPacketTransport::new(
         relay,
         [DriverSendAction::Panic],
@@ -2723,7 +2697,7 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "driver-node".to_owned(),
+        stats.outbound_tracker("driver-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2776,8 +2750,9 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("abort fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("driver-node"));
-    assert!(lease.set_tracker_id("abort-tracker".to_owned()));
+    lease.set_connection_guard(
+        stats.track_connection("driver-node", crate::stats::OutboundKind::Node),
+    );
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("abort-tracker".to_owned());
@@ -2792,7 +2767,7 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "driver-node".to_owned(),
+        stats.outbound_tracker("driver-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2859,7 +2834,6 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
     ));
     let old_endpoint = driver_test_endpoint(old_transport.clone(), relay);
     old_endpoint.set_tracker("old-tracker".to_owned());
-    assert!(old_lease.set_tracker_id("old-tracker".to_owned()));
     let old_queue_rx = old_lease.take_queue_receiver().unwrap();
     let mut old_driver = pool.spawn_driver(
         client,
@@ -2871,7 +2845,7 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     old_driver.wait_ready().await.unwrap();
     assert!(old_lease.commit_ready(old_endpoint));
@@ -2985,7 +2959,6 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
         _ => panic!("death-during-dial fixture must initialize"),
     };
     assert!(lease.bind_selected_node(DEAD_NODE_ID));
-    assert!(lease.set_tracker_id("during-dial".to_owned()));
     // Death arrives while dial would be in flight.
     pool.remove_by_node(DEAD_NODE_ID);
     assert!(!lease.still_initializing());
@@ -2996,7 +2969,7 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
             dst,
             decision_token: 0,
             generation: 1,
-            conn_id: Some("during-dial".to_owned()),
+            conn_id: None,
             reason: RemovalReason::UserspaceEndpointRetired,
         }
     );
@@ -3041,8 +3014,6 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         relay,
         DEAD_NODE_ID,
     ));
-    endpoint.set_tracker("before-commit".to_owned());
-    assert!(lease.set_tracker_id("before-commit".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -3054,7 +3025,7 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "dead-node".to_owned(),
+        stats.outbound_tracker("dead-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
 
@@ -3068,7 +3039,7 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
             dst,
             decision_token: 0,
             generation: 1,
-            conn_id: Some("before-commit".to_owned()),
+            conn_id: None,
             reason: RemovalReason::UserspaceEndpointRetired,
         }
     );
@@ -3107,7 +3078,6 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
     let proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport> = transport.clone();
     let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, DEAD_NODE_ID));
     endpoint.set_tracker("dead-before-start".to_owned());
-    assert!(lease.set_tracker_id("dead-before-start".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -3119,7 +3089,7 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "dead-node".to_owned(),
+        stats.outbound_tracker("dead-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));

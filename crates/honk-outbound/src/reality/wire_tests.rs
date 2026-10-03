@@ -230,6 +230,7 @@ async fn exercise(replies: &[Reply], supplied: bool) -> Vec<Captured> {
                 1,
                 1,
                 1,
+                false,
                 None,
             )
             .unwrap();
@@ -315,6 +316,7 @@ async fn supplied_fallback_waits_for_capacity_without_spending_sibling_credit() 
                 2,
                 2,
                 2,
+                false,
                 None,
             )
             .unwrap();
@@ -444,6 +446,7 @@ async fn setup_deadline_includes_initial_dial_admission() {
         1,
         1,
         1,
+        false,
         None,
     )
     .unwrap();

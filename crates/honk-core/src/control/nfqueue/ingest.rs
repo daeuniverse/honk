@@ -49,6 +49,8 @@ impl PendingUdpVerdicts {
                 destination,
                 route,
                 enqueued_at,
+                #[cfg(feature = "native-api")]
+                packet.priority,
             ),
         )
         .await;

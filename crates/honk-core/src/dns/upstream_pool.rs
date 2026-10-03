@@ -272,6 +272,7 @@ pub struct UpstreamPool {
     dns_query_timeout: Duration,
     dns_dial_timeout: Duration,
     active_transport_tasks: Arc<AtomicUsize>,
+    transport_tasks_failed: Arc<std::sync::atomic::AtomicBool>,
     admission: AdmissionGate,
     #[cfg(test)]
     admission_pause: parking_lot::Mutex<Option<AdmissionPause>>,
@@ -330,6 +331,7 @@ impl UpstreamPool {
             dns_query_timeout: Duration::from_secs(3),
             dns_dial_timeout: Duration::from_secs(10),
             active_transport_tasks: Arc::new(AtomicUsize::new(0)),
+            transport_tasks_failed: Arc::default(),
             admission: AdmissionGate::new(),
             #[cfg(test)]
             admission_pause: parking_lot::Mutex::new(None),
@@ -361,10 +363,19 @@ impl UpstreamPool {
             .map_err(|_| anyhow::anyhow!("DNS upstream runtime generation is already set"))
     }
 
-    pub(crate) fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
+    pub(crate) fn reap_idle_resources(&self) -> usize {
         self.runtime_generation
             .get()
-            .map_or(0, |generation| generation.reap_idle_resources(now))
+            .map_or(0, |generation| generation.reap_idle_resources())
+    }
+
+    pub(crate) fn tasks_failed(&self) -> bool {
+        self.transport_tasks_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .runtime_generation
+                .get()
+                .is_some_and(|generation| generation.tasks_failed())
     }
 
     pub fn set_group_manager(&self, group_manager: Option<SharedGroupManager>) {

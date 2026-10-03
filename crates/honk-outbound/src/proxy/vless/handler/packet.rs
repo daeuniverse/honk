@@ -14,6 +14,7 @@ struct VlessPacketWriter {
     stream: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
     setup: Option<bytes::Bytes>,
     pending: bool,
+    observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 pub(super) struct VlessConnectedTransport {
@@ -40,6 +41,11 @@ impl VlessConnectedTransport {
                 stream: writer,
                 setup,
                 pending: false,
+                observer: if native {
+                    None
+                } else {
+                    crate::runtime::flow_observation::current()
+                },
             }),
             target,
             native,
@@ -67,8 +73,21 @@ impl VlessConnectedTransport {
             packet
         };
         writer.pending = true;
-        writer.stream.write_all(&frame).await?;
-        writer.stream.flush().await?;
+        let observer = writer.observer.take();
+        let write = async {
+            writer.stream.write_all(&frame).await?;
+            writer.stream.flush().await
+        };
+        match observer {
+            Some(observer) => {
+                observer
+                    .scope(crate::runtime::flow_observation::request_write(
+                        std::pin::pin!(write),
+                    ))
+                    .await?
+            }
+            None => write.await?,
+        }
         writer.setup = None;
         writer.pending = false;
         Ok(())

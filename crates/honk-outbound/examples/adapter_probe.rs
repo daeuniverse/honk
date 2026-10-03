@@ -45,11 +45,12 @@ async fn main() -> anyhow::Result<()> {
             "inner.test",
             &config,
             timeout,
+            honk_outbound::alive::ProbeCancellation::default(),
         )
         .await?;
         let total = started.elapsed();
         if round >= 5 {
-            println!("{}\t{}", elapsed.as_nanos(), total.as_nanos());
+            println!("{}\t{}", elapsed.latency.as_nanos(), total.as_nanos());
         }
     }
     Ok(())

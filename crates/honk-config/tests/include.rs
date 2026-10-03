@@ -520,3 +520,464 @@ fn fragment_format_recognition_stays_at_the_entry_boundary() {
         honk_config::error::ErrorCategory::Include,
     );
 }
+
+#[test]
+fn source_capture_preserves_preorder_bytes_and_physical_diagnostics() {
+    use honk_config::parser::{SourceLimits, load_dae_sources};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("parts")).unwrap();
+    let entry = root.join("config.dae");
+    let main = "# unchanged UTF-8: 雪\r\ninclude { parts/*.dae }\r\nglobal { log_level: warn }\r\n";
+    let first = "include { sibling.dae }\nglobal { log_level: info }\n";
+    let sibling = "global {\n check_tolerance: invalid\n}\n";
+    let last = "global { log_level: debug }\n";
+    write(&entry, main);
+    write(&root.join("parts/10.dae"), first);
+    write(&root.join("sibling.dae"), sibling);
+    write(&root.join("parts/20.dae"), last);
+    let before = std::time::SystemTime::now();
+    let mut diagnostics = Vec::new();
+    let loaded = load_dae_sources(
+        &entry,
+        &Default::default(),
+        SourceLimits::default(),
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(loaded.config.global.log_level, "debug");
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.content.as_ref())
+            .collect::<Vec<_>>(),
+        [main, first, sibling, last]
+    );
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.parent)
+            .collect::<Vec<_>>(),
+        [None, Some(0), Some(1), Some(0)]
+    );
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect::<Vec<_>>(),
+        [
+            entry.clone(),
+            root.join("parts/10.dae"),
+            root.join("sibling.dae"),
+            root.join("parts/20.dae")
+        ]
+    );
+    let warning = diagnostics
+        .iter()
+        .find(|d| {
+            d.setting
+                == honk_config::diagnostic::SettingPath::new("global").field("check_tolerance")
+        })
+        .unwrap();
+    assert!(warning.source.same_source(&loaded.sources[2].source));
+    assert_eq!(warning.line, Some(2));
+    assert_eq!(
+        warning.source.sources().metadata()[warning.source.index()].path,
+        Some(root.join("sibling.dae"))
+    );
+    assert!(loaded.sources.iter().all(
+        |source| source.loaded_at >= before && source.loaded_at <= std::time::SystemTime::now()
+    ));
+    write(&entry, "global { log_level: error }");
+    assert_eq!(loaded.sources[0].content.as_bytes(), main.as_bytes());
+    assert_eq!(loaded.config.global.log_level, "debug");
+}
+
+#[test]
+fn source_overlay_resolves_siblings_and_virtual_globs_without_writing() {
+    use honk_config::parser::{SourceLimits, load_dae_sources};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("parts")).unwrap();
+    let entry = root.join("config.dae");
+    let first = root.join("parts/10.dae");
+    let sibling = root.join("sibling.dae");
+    let virtual_source = root.join("parts/20.dae");
+    write(
+        &entry,
+        "include { parts/*.dae }\nglobal { log_level: warn }",
+    );
+    write(&first, "include { sibling.dae }");
+    write(&sibling, "global { log_level: info }");
+    let overlay: HashMap<_, Arc<str>> = HashMap::from([
+        (sibling.clone(), Arc::from("global { tproxy_port: 30000 }")),
+        (
+            virtual_source.clone(),
+            Arc::from("global { log_level: debug }"),
+        ),
+    ]);
+    let loaded =
+        load_dae_sources(&entry, &overlay, SourceLimits::default(), &mut Vec::new()).unwrap();
+    assert_eq!(loaded.config.global.tproxy_port, 30000);
+    assert_eq!(loaded.config.global.log_level, "debug");
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| &source.path)
+            .collect::<Vec<_>>(),
+        [&entry, &first, &sibling, &virtual_source]
+    );
+    assert!(Arc::ptr_eq(&loaded.sources[2].content, &overlay[&sibling]));
+    assert!(!virtual_source.exists());
+    assert_eq!(
+        fs::read_to_string(&sibling).unwrap(),
+        "global { log_level: info }"
+    );
+    write(&root.join("parts/30.dae"), "global { log_level: error }");
+    let changed =
+        load_dae_sources(&entry, &overlay, SourceLimits::default(), &mut Vec::new()).unwrap();
+    assert_eq!(
+        changed.sources.last().unwrap().path,
+        root.join("parts/30.dae")
+    );
+    assert_eq!(changed.config.global.log_level, "error");
+}
+
+#[test]
+fn memory_sources_expand_includes_without_reading_the_disk() {
+    use honk_config::parser::SourceLimits;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("conf.d")).unwrap();
+    let entry = root.join("config.dae");
+    let included = root.join("conf.d/a.dae");
+    write(&entry, "global { log_level: error }");
+    write(&root.join("conf.d/x.dae"), "global { tproxy_port: 30001 }");
+    let sources: HashMap<_, Arc<str>> = HashMap::from([
+        (
+            entry.clone(),
+            Arc::from("include { conf.d/*.dae }\nglobal { log_level: warn }"),
+        ),
+        (included.clone(), Arc::from("global { tproxy_port: 30000 }")),
+    ]);
+    let loaded = Config::from_dae_sources_in_memory(
+        &entry,
+        &sources,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| &source.path)
+            .collect::<Vec<_>>(),
+        [&entry, &included]
+    );
+    assert_eq!(loaded.config.global.log_level, "warn");
+    assert_eq!(loaded.config.global.tproxy_port, 30000);
+
+    let gone = root.join("missing");
+    let moved: HashMap<_, Arc<str>> = sources
+        .iter()
+        .map(|(path, content)| {
+            (
+                gone.join(path.strip_prefix(&root).unwrap()),
+                content.clone(),
+            )
+        })
+        .collect();
+    let relocated = Config::from_dae_sources_in_memory(
+        &gone.join("config.dae"),
+        &moved,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(relocated.config, loaded.config);
+
+    let orphan = HashMap::from([(included, Arc::from("global {}"))]);
+    let error = Config::from_dae_sources_in_memory(
+        &entry,
+        &orphan,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.diagnostic.code, "missing-config-source");
+}
+
+#[test]
+fn source_limits_cover_entry_and_dependency_bytes_and_counts() {
+    use honk_config::parser::{SourceLimits, load_dae_sources, parse_dae_sources};
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("config.dae");
+    let main = "include { child.dae }";
+    let child = "global { log_level: debug }";
+    write(&entry, main);
+    write(&dir.path().join("child.dae"), child);
+    let exact = SourceLimits {
+        max_bytes: main.len() + child.len(),
+        max_sources: 2,
+    };
+    let accepted = load_dae_sources(&entry, &Default::default(), exact, &mut Vec::new()).unwrap();
+    assert_eq!(accepted.config.global.log_level, "debug");
+    for (limits, code) in [
+        (
+            SourceLimits {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            "config-byte-limit",
+        ),
+        (
+            SourceLimits {
+                max_sources: 1,
+                ..exact
+            },
+            "config-source-limit",
+        ),
+        (
+            SourceLimits {
+                max_bytes: main.len() - 1,
+                ..exact
+            },
+            "config-byte-limit",
+        ),
+    ] {
+        let mut diagnostics = Vec::new();
+        let error =
+            load_dae_sources(&entry, &Default::default(), limits, &mut diagnostics).unwrap_err();
+        assert_eq!(error.diagnostic.code, code);
+        assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
+    }
+    let inputs = vec![
+        (entry.clone(), std::sync::Arc::from(main)),
+        (dir.path().join("child.dae"), std::sync::Arc::from(child)),
+    ];
+    assert_eq!(
+        parse_dae_sources(
+            &inputs,
+            SourceLimits {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            &mut Vec::new()
+        )
+        .unwrap_err()
+        .diagnostic
+        .code,
+        "config-byte-limit"
+    );
+    assert_eq!(
+        parse_dae_sources(
+            &inputs,
+            SourceLimits {
+                max_sources: 1,
+                ..exact
+            },
+            &mut Vec::new()
+        )
+        .unwrap_err()
+        .diagnostic
+        .code,
+        "config-source-limit"
+    );
+}
+
+#[test]
+fn submitted_sources_are_ordered_syntax_only_and_reject_nested_includes() {
+    use honk_config::parser::{SourceLimits, parse_dae_sources};
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    let inputs = vec![
+        (missing.join("main.dae"), std::sync::Arc::from("")),
+        (
+            missing.join("second.dae"),
+            std::sync::Arc::from(
+                "include { /unreadable/private/*.dae }\nglobal { log_level: debug }",
+            ),
+        ),
+    ];
+    let loaded = parse_dae_sources(&inputs, SourceLimits::default(), &mut Vec::new()).unwrap();
+    assert_eq!(loaded.config.global.log_level, "debug");
+    assert_eq!(loaded.sources[0].path, inputs[0].0);
+    assert_eq!(loaded.sources[1].path, inputs[1].0);
+    assert!(!missing.exists());
+    for body in [
+        "include { file.dae {} }",
+        "experimental { native_api { secret { value } } }",
+    ] {
+        let invalid = vec![(missing.join("main.dae"), std::sync::Arc::from(body))];
+        assert!(parse_dae_sources(&invalid, SourceLimits::default(), &mut Vec::new()).is_err());
+    }
+    let duplicated = vec![inputs[0].clone(), inputs[0].clone()];
+    assert_eq!(
+        parse_dae_sources(&duplicated, SourceLimits::default(), &mut Vec::new())
+            .unwrap_err()
+            .diagnostic
+            .code,
+        "duplicate-config-source"
+    );
+    write(&dir.path().join("empty.dae"), "");
+    assert!(
+        honk_config::parser::load_dae_sources(
+            &dir.path().join("empty.dae"),
+            &Default::default(),
+            SourceLimits::default(),
+            &mut Vec::new()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn source_secret_marker_keeps_overridden_native_and_clash_credentials_private() {
+    use honk_config::parser::{SourceLimits, parse_dae_sources};
+    let inputs = vec![
+        (
+            "native.dae".into(),
+            std::sync::Arc::from(
+                "experimental { native_api {\n secret: 'old-native-token'\n secret: ''\n} }",
+            ),
+        ),
+        (
+            "clash.dae".into(),
+            std::sync::Arc::from(
+                "experimental { clash_api {\n secret: 'old-clash-token'\n secret: ''\n} }",
+            ),
+        ),
+        (
+            "ordinary.dae".into(),
+            std::sync::Arc::from("# secret: comment-only\nglobal { log_level: debug }"),
+        ),
+    ];
+    let loaded = parse_dae_sources(&inputs, SourceLimits::default(), &mut Vec::new()).unwrap();
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.contains_api_secret)
+            .collect::<Vec<_>>(),
+        [true, true, false]
+    );
+    assert!(loaded.config.experimental.native_api.secret.is_empty());
+    assert!(loaded.config.experimental.clash_api.secret.is_empty());
+    let rendered = format!("{loaded:?}");
+    assert!(!rendered.contains("old-native-token"));
+    assert!(!rendered.contains("old-clash-token"));
+    assert!(!rendered.contains("native.dae"));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_overlay_rejects_escaping_and_duplicate_physical_sources() {
+    use honk_config::parser::{SourceLimits, load_dae_sources};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap().join("root");
+    fs::create_dir(&root).unwrap();
+    let entry = root.join("config.dae");
+    write(&entry, "global {}");
+    let outside = root.parent().unwrap().join("outside.dae");
+    let overlay: HashMap<_, Arc<str>> = HashMap::from([(outside.clone(), Arc::from("global {}"))]);
+    let error =
+        load_dae_sources(&entry, &overlay, SourceLimits::default(), &mut Vec::new()).unwrap_err();
+    assert_eq!(error.diagnostic.code, "invalid-config-overlay");
+    assert!(!error.to_string().contains(outside.to_str().unwrap()));
+    write(&outside, "global {}");
+    std::os::unix::fs::symlink(&outside, root.join("escape.dae")).unwrap();
+    write(&entry, "include { escape.dae }");
+    assert_eq!(
+        load_dae_sources(
+            &entry,
+            &Default::default(),
+            SourceLimits::default(),
+            &mut Vec::new()
+        )
+        .unwrap_err()
+        .diagnostic
+        .code,
+        "config-include-escape"
+    );
+    write(&root.join("child.dae"), "global {}");
+    std::os::unix::fs::symlink(root.join("child.dae"), root.join("alias.dae")).unwrap();
+    write(&entry, "include { child.dae alias.dae }");
+    assert_eq!(
+        load_dae_sources(
+            &entry,
+            &Default::default(),
+            SourceLimits::default(),
+            &mut Vec::new()
+        )
+        .unwrap_err()
+        .diagnostic
+        .code,
+        "duplicate-config-source"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn virtual_includes_follow_existing_directory_aliases_and_parent_components() {
+    use honk_config::parser::{SourceLimits, load_dae_sources};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("parts")).unwrap();
+    std::os::unix::fs::symlink(root.join("parts"), root.join("alias")).unwrap();
+    let entry = root.join("config.dae");
+    let virtual_source = root.join("parts/child.dae");
+    let overlay: HashMap<_, Arc<str>> = HashMap::from([(
+        virtual_source.clone(),
+        Arc::from("global { tproxy_port: 31000 }"),
+    )]);
+    for pattern in ["./parts/*.dae", "alias/*.dae", "parts/../parts/*.dae"] {
+        write(&entry, &format!("include {{ {pattern} }}"));
+        let loaded =
+            load_dae_sources(&entry, &overlay, SourceLimits::default(), &mut Vec::new()).unwrap();
+        assert_eq!(loaded.config.global.tproxy_port, 31000, "{pattern}");
+        assert_eq!(loaded.sources[1].path, virtual_source);
+    }
+    assert!(!virtual_source.exists());
+    write(&entry, "include { parts/C*.dae }");
+    let unmatched =
+        load_dae_sources(&entry, &overlay, SourceLimits::default(), &mut Vec::new()).unwrap();
+    assert_eq!(
+        unmatched
+            .sources
+            .iter()
+            .map(|source| &source.path)
+            .collect::<Vec<_>>(),
+        [&entry]
+    );
+    write(&entry, "include { parts/*.dae alias/*.dae }");
+    assert_eq!(
+        load_dae_sources(&entry, &overlay, SourceLimits::default(), &mut Vec::new())
+            .unwrap_err()
+            .diagnostic
+            .code,
+        "duplicate-config-source"
+    );
+}
+
+#[test]
+fn structural_source_check_rejects_recovered_lexical_errors() {
+    let path = std::path::Path::new("unused.dae");
+    let error = honk_config::parser::check_dae_source(path, "dns {\n use_host: 'unterminated\n}\n")
+        .unwrap_err();
+    assert_eq!(error.diagnostic.code, "unterminated-quote");
+    assert_eq!(error.diagnostic.line, Some(2));
+    assert!(error.diagnostic.terminal);
+}

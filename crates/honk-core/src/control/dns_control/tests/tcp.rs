@@ -1,5 +1,103 @@
 use super::*;
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_log_records_one_client_completion_not_internal_resolution() {
+    let (controller, _) =
+        test_controller(response_with_txid("example.com", 0x1234), Duration::ZERO);
+    let api = Arc::new(crate::native_api::dns::DnsApi::new(
+        "tcp-log".into(),
+        true,
+        std::sync::Weak::new(),
+    ));
+    controller
+        .dns_service()
+        .attach_observer(Arc::downgrade(&api.recorder));
+    let query = query_with_txid("example.com", 0x1234);
+    controller
+        .dns_service()
+        .resolve(&query, IngressProfile::Api)
+        .await
+        .unwrap();
+    let (mut client, mut server) = tcp_pair().await;
+    let source = server.peer_addr().unwrap();
+    let task = tokio::spawn(async move {
+        controller
+            .handle_tcp_dns(&mut server, source, "127.0.0.1:53".parse().unwrap())
+            .await
+            .unwrap();
+    });
+    write_tcp_query(&mut client, &query).await;
+    let response = read_tcp_response(&mut client).await;
+    assert_eq!(response[3] & 15, 0);
+    drop(client);
+    task.await.unwrap();
+    let response = api.log_for_test().page_for_test();
+    let body = axum::body::to_bytes(response.into_body(), 262144)
+        .await
+        .unwrap();
+    let log: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(log["total"], 1);
+    assert_eq!(log["records"][0]["src"], source.to_string());
+    assert_eq!(log["records"][0]["status"], "NOERROR");
+    assert_eq!(log["records"][0]["question"]["name"], "example.com.");
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_log_keeps_admission_refusal_and_forward_failure() {
+    let upstream = Arc::new(SlowUpstream {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+        response: Vec::new(),
+    });
+    let mut config = honk_config::dns::DnsConfig::default();
+    config.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+        conditions: vec![honk_config::dns::DnsCond::Sip {
+            not: false,
+            cidrs: vec!["127.0.0.0/8".into()],
+        }],
+        action: honk_config::dns::DnsRequestAction::Upstream("default".into()),
+    }];
+    let controller = controller_with_dns_config(upstream, &config);
+    let api = Arc::new(crate::native_api::dns::DnsApi::new(
+        "tcp-errors".into(),
+        true,
+        std::sync::Weak::new(),
+    ));
+    controller
+        .dns_service()
+        .attach_observer(Arc::downgrade(&api.recorder));
+    let held: Vec<_> = (0..2048)
+        .map(|_| controller.try_admit_query(false).unwrap())
+        .collect();
+    let (mut client, mut server) = tcp_pair().await;
+    let source = server.peer_addr().unwrap();
+    let task = tokio::spawn(async move {
+        controller
+            .serve_bound_tcp_dns(&mut server, source)
+            .await
+            .unwrap();
+    });
+    write_tcp_query(&mut client, &query_with_txid("refused.example", 1)).await;
+    assert_eq!(read_tcp_response(&mut client).await[3] & 15, 5);
+    drop(held);
+    write_tcp_query(&mut client, &query_with_txid("failed.example", 2)).await;
+    assert_eq!(read_tcp_response(&mut client).await[3] & 15, 2);
+    drop(client);
+    task.await.unwrap();
+    let response = api.log_for_test().page_for_test();
+    let body = axum::body::to_bytes(response.into_body(), 262144)
+        .await
+        .unwrap();
+    let log: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(log["total"], 2);
+    assert_eq!(log["records"][0]["status"], "SERVFAIL");
+    assert_eq!(log["records"][1]["status"], "REFUSED");
+    assert_eq!(log["records"][0]["route"]["source"], "dns.routing");
+    assert_eq!(log["records"][1]["route"]["source"], "default");
+}
+
 #[tokio::test]
 async fn first_tcp_frame_holds_permit_until_response_is_written() {
     let upstream = Arc::new(BlockingFirstUpstream {
@@ -269,4 +367,112 @@ async fn bound_tcp_connection_closes_after_idle_timeout() {
     task.await
         .expect("bound task")
         .expect("idle timeout closes cleanly");
+}
+
+#[cfg(feature = "native-api")]
+fn dns_flow_observer() -> (
+    honk_outbound::runtime::flow_observation::FlowObserver,
+    Arc<parking_lot::Mutex<Vec<honk_outbound::runtime::flow_observation::DnsLookup>>>,
+) {
+    use honk_outbound::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let rows = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = rows.clone();
+    let observer = FlowObserver::new(
+        FlowContext {
+            flow_id: uuid::Uuid::new_v4(),
+            generation: 0,
+            attempt_id: None,
+            lookup_id: None,
+            dns_purpose: "intercepted_query",
+        },
+        Arc::new(move |_, event| {
+            if let FlowEvent::Dns(row) = event {
+                captured.lock().push(row);
+            }
+        }),
+    );
+    (observer, rows)
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn dns_flow_tracks_each_persistent_frame_and_actual_delivery() {
+    let (controller, _) = test_controller(response_with_txid("example.com", 0), Duration::ZERO);
+    let (observer, rows) = dns_flow_observer();
+    let (mut client, mut server) = tcp_pair().await;
+    let source = server.peer_addr().unwrap();
+    let task = tokio::spawn(async move {
+        observer
+            .scope(controller.serve_bound_tcp_dns(&mut server, source))
+            .await
+    });
+    for txid in [1, 2] {
+        let query = query_with_txid("example.com", txid);
+        write_tcp_query(&mut client, &query).await;
+        assert_eq!(&read_tcp_response(&mut client).await[..2], &query[..2]);
+    }
+    drop(client);
+    task.await.unwrap().unwrap();
+    let rows = rows.lock();
+    let roots: Vec<_> = rows
+        .iter()
+        .filter(|row| row.parent_lookup_id.is_none() && row.status == "started")
+        .collect();
+    assert_eq!(roots.len(), 2);
+    assert_ne!(roots[0].lookup_id, roots[1].lookup_id);
+    for root in roots {
+        assert!(
+            rows.iter()
+                .any(|row| row.lookup_id == root.lookup_id && row.status == "delivered")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.parent_lookup_id == Some(root.lookup_id))
+        );
+    }
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn dns_flow_does_not_promote_answer_to_failed_client_delivery() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let upstream = Arc::new(BlockingFirstUpstream {
+            first_entered: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let controller = controller_with_limit(upstream.clone(), 1);
+        let (observer, rows) = dns_flow_observer();
+        let (mut client, mut server) = tcp_pair().await;
+        let source = server.peer_addr().unwrap();
+        let task = tokio::spawn(async move {
+            observer
+                .scope(controller.serve_bound_tcp_dns(&mut server, source))
+                .await
+        });
+        write_tcp_query(&mut client, &query_with_txid("first.example", 1)).await;
+        upstream.first_entered.notified().await;
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+        upstream.release_first.notify_one();
+        assert!(task.await.unwrap().is_err());
+        let rows = rows.lock();
+        let root = rows
+            .iter()
+            .find(|row| row.parent_lookup_id.is_none() && row.status == "started")
+            .unwrap()
+            .lookup_id;
+        assert!(
+            rows.iter()
+                .any(|row| row.lookup_id == root && row.status == "delivery_failed")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.lookup_id == root && row.status == "delivered")
+        );
+    })
+    .await
+    .expect("upstream admission and failed client delivery must settle");
 }

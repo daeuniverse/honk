@@ -104,6 +104,32 @@ fn accepts_questions_at_the_minimum_wire_size_boundary() {
 }
 
 #[test]
+fn canonical_domain_keeps_root_and_rejects_malformed_wire() {
+    for (wire, expected) in [(vec![0], "."), (example_name(true), "example.com")] {
+        let raw = query(0x0100, &[(&wire, 2, 1)], None);
+        let context = QueryContext::parse(&raw).unwrap();
+        assert_eq!(
+            context.qname().unwrap().to_domain_name().as_deref(),
+            Some(expected)
+        );
+        assert!(super::validate_exact_dns_query(&raw).is_some());
+        assert_eq!(
+            crate::dns::forwarder::parse_dns_question(&raw),
+            Some((expected.to_owned(), 2)),
+        );
+    }
+    for wire in [
+        vec![],
+        vec![0, 0],
+        vec![1, b'a', 0, 0],
+        vec![2, b'a'],
+        vec![1, 0xff, 0],
+    ] {
+        assert!(super::DnsName(wire.into()).to_domain_name().is_none());
+    }
+}
+
+#[test]
 fn preserves_exact_question_identity_when_parsed() {
     // Given
     let name = example_name(true);
@@ -246,4 +272,88 @@ fn rejects_malformed_name_compression_without_panicking() {
         // Then
         assert!(parsed.is_err());
     }
+}
+
+fn full_parse_verdict(raw: &[u8]) -> Option<u16> {
+    let query = QueryContext::parse(raw).ok()?;
+    query.qname()?.to_domain_name()?;
+    Some(query.edns().map_or(512, |edns| edns.advertised_size()))
+}
+
+#[test]
+fn allocation_free_scan_matches_full_parse() {
+    let name = example_name(false);
+    let plain = query(0x0100, &[(&name, 1, 1)], None);
+    let with_opt = |opt: &[u8]| query(0x0100, &[(&name, 1, 1)], Some(opt));
+    let mut two_opts = with_opt(&[opt(1232, 0, 0x8000, &[]), opt(4096, 0, 0, &[])].concat());
+    two_opts[11] = 2;
+    let mut foreign_owner = vec![1, b'a'];
+    foreign_owner.extend_from_slice(&opt(512, 0, 0, &[]));
+    assert_eq!(full_parse_verdict(&with_opt(&foreign_owner)), None);
+    let mut with_answer = plain.clone();
+    with_answer[7] = 1;
+    with_answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+    let seeds = [
+        plain.clone(),
+        with_opt(&opt(1232, 0, 0x8000, &[])),
+        with_opt(&opt(1, 0, 0, &[0, 10, 0, 2, 1, 2])),
+        with_opt(&opt(1232, 0, 0, &[0, 10, 0, 5, 1])),
+        with_opt(&foreign_owner),
+        two_opts,
+        with_answer,
+        query(0x0100, &[(&[2, 0xff, 0xfe, 0], 1, 1)], None),
+    ];
+
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as usize
+    };
+    let (mut accepted, mut rejected) = (0, 0);
+    for seed in &seeds {
+        for _ in 0..5000 {
+            let mut raw = seed.clone();
+            for _ in 0..=next() % 3 {
+                let at = next() % raw.len();
+                raw[at] = next() as u8;
+            }
+            if next() % 4 == 0 {
+                raw.truncate(next() % (raw.len() + 1));
+            }
+            if raw.len() < 12 || u16::from_be_bytes([raw[4], raw[5]]) != 1 {
+                continue;
+            }
+            let scanned = super::parser::scan_single_question_query(&raw)
+                .ok()
+                .map(|size| size.unwrap_or(512));
+            assert_eq!(scanned, full_parse_verdict(&raw), "{raw:?}");
+            if scanned.is_some() {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+    }
+    assert!(accepted > 1000 && rejected > 1000, "{accepted}/{rejected}");
+}
+
+#[test]
+fn validation_follows_compression_through_labels_past_the_pointer_range() {
+    let rr = |owner: &[u8], rdata: &[u8]| {
+        let mut wire = owner.to_vec();
+        wire.extend_from_slice(&[0, 10, 0, 1, 0, 0, 0, 0]);
+        wire.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        wire.extend_from_slice(rdata);
+        wire
+    };
+    let mut wire = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 3, 0, 0, 10, 0, 1];
+    wire.extend(rr(&[0], &vec![0; 16352]));
+    assert_eq!(wire.len(), 16380);
+    // The `abc` owner starts inside the 14-bit range but its terminator does not.
+    wire.extend(rr(&[3, b'a', b'b', b'c', 0], &[]));
+    wire.extend(rr(&[0xff, 0xfc], &[]));
+
+    assert!(super::validate_exact_dns_query(&wire).is_some());
 }

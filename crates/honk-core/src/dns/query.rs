@@ -5,7 +5,7 @@ use thiserror::Error;
 
 mod parser;
 
-pub(crate) use parser::{NameParseState, parse_name};
+pub(crate) use parser::{NameParseState, parse_name, parse_name_into};
 use parser::{parse_edns, parse_rr, read_u16};
 
 const HEADER_LEN: usize = 12;
@@ -42,7 +42,7 @@ pub(crate) fn validate_exact_dns_query(data: &[u8]) -> Option<ValidatedDnsQuery>
     // Label starts observed while walking question/owner names. Compression
     // pointers may only land on these boundaries (not header/RDATA/interior
     // label bytes). Unparsed RDATA is intentionally not scanned.
-    let mut label_boundaries = vec![false; data.len()];
+    let mut label_boundaries = LabelBoundaries::new(data.len());
 
     if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
         || pos.checked_add(4).is_none_or(|end| end > data.len())
@@ -72,11 +72,8 @@ pub(crate) fn validate_exact_dns_query(data: &[u8]) -> Option<ValidatedDnsQuery>
         return None;
     }
 
-    let query = QueryContext::parse(data).ok()?;
-    query.qname()?.to_domain_name()?;
-    let advertised_size = query
-        .edns()
-        .map(|edns| edns.advertised_size())
+    let advertised_size = parser::scan_single_question_query(data)
+        .ok()?
         .unwrap_or(512);
     Some(ValidatedDnsQuery(IngressProfile::Udp { advertised_size }))
 }
@@ -95,25 +92,74 @@ pub(crate) fn udp_ingress_profile(data: &[u8]) -> IngressProfile {
     IngressProfile::Udp { advertised_size }
 }
 
+/// Offsets that start a label, one bit each. Queries that fit 512 bytes
+/// (nearly all) never touch the heap.
+struct LabelBoundaries {
+    inline: [u64; 8],
+    spill: Vec<u64>,
+}
+
+impl LabelBoundaries {
+    fn new(message_len: usize) -> Self {
+        Self {
+            inline: [0; 8],
+            spill: if message_len > 512 {
+                vec![0; message_len.div_ceil(64)]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn words(&self) -> &[u64] {
+        if self.spill.is_empty() {
+            &self.inline
+        } else {
+            &self.spill
+        }
+    }
+
+    fn mark(&mut self, offset: usize) {
+        let words = if self.spill.is_empty() {
+            &mut self.inline[..]
+        } else {
+            &mut self.spill[..]
+        };
+        if let Some(word) = words.get_mut(offset / 64) {
+            *word |= 1 << (offset % 64);
+        }
+    }
+
+    fn contains(&self, offset: usize) -> bool {
+        self.words()
+            .get(offset / 64)
+            .is_some_and(|word| word >> (offset % 64) & 1 == 1)
+    }
+}
+
 /// Bounds-safe name walk that enforces the RFC expanded-name limit and
 /// restricts compression pointers to previously observed label boundaries.
-fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bool]) -> bool {
+fn skip_strict_dns_name(
+    data: &[u8],
+    pos: &mut usize,
+    label_boundaries: &mut LabelBoundaries,
+) -> bool {
     let mut cursor = *pos;
     let mut expanded = 0usize;
     let mut jumped = false;
     let mut depth = 0usize;
 
     loop {
-        if depth > 128 || cursor >= data.len() || cursor >= label_boundaries.len() {
+        if depth > 128 || cursor >= data.len() {
             return false;
         }
 
         if jumped {
-            if !label_boundaries[cursor] {
+            if !label_boundaries.contains(cursor) {
                 return false;
             }
         } else {
-            label_boundaries[cursor] = true;
+            label_boundaries.mark(cursor);
         }
 
         let label_len = data[cursor];
@@ -133,7 +179,7 @@ fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bo
             };
             let target = (usize::from(label_len & 0x3f) << 8) | usize::from(next);
             // Pointers name an earlier observed label start only.
-            if target >= cursor || target >= label_boundaries.len() || !label_boundaries[target] {
+            if target >= cursor || !label_boundaries.contains(target) {
                 return false;
             }
             if !jumped {
@@ -199,6 +245,7 @@ impl DnsName {
     }
 
     /// Decode the canonical wire name as a lowercase dotted UTF-8 domain.
+    /// The root is `"."`; other names have no trailing dot.
     pub fn to_domain_name(&self) -> Option<String> {
         let mut domain = String::with_capacity(self.0.len());
         let mut cursor = 0usize;
@@ -206,8 +253,11 @@ impl DnsName {
             let length = usize::from(*self.0.get(cursor)?);
             cursor += 1;
             if length == 0 {
-                if domain.is_empty() || cursor != self.0.len() {
+                if cursor != self.0.len() {
                     return None;
+                }
+                if domain.is_empty() {
+                    domain.push('.');
                 }
                 domain.make_ascii_lowercase();
                 return Some(domain);
@@ -409,9 +459,9 @@ impl QueryContext {
         if cursor != raw.len() {
             return Err(QueryError::TrailingBytes);
         }
-        let mut canonical_wire = raw.to_vec();
-        if let Some(id) = canonical_wire.get_mut(0..2) {
-            id.copy_from_slice(&[0, 0]);
+        let mut canonical_wire: Arc<[u8]> = Arc::from(raw);
+        if let Some(id) = Arc::get_mut(&mut canonical_wire).and_then(|wire| wire.get_mut(0..2)) {
+            id.fill(0);
         }
         let cacheable = flags & !ALLOWED_QUERY_FLAGS == 0
             && qdcount == 1
@@ -431,7 +481,7 @@ impl QueryContext {
             questions,
             edns,
             ingress,
-            canonical_wire: canonical_wire.into(),
+            canonical_wire,
             cacheable,
         })
     }

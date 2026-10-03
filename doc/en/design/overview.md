@@ -11,7 +11,7 @@ Its configuration syntax and TC datapath have dae lineage and remain dae-compati
 - Intercept Linux LAN-forwarded and host-originated traffic with an eBPF transparent-proxy datapath.
 - Keep the native `.dae` configuration syntax as the primary and only documented configuration format.
 - Provide multi-protocol outbounds, Selector/URLTest/LoadBalance/Fallback/Score groups, health checks, and a Clash-compatible control API.
-- Ship an engine-only `honk-core` binary rather than a separate GraphQL service or bundled dashboard application.
+- Ship one `honk-core` engine rather than a separate GraphQL service; optionally embed the pinned doona client with `native-ui`.
 
 ### Non-goals
 
@@ -64,7 +64,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 - `src/share_link.rs` is the sole `Node::from_share_link` parser. `src/share_link/options.rs` maps URI packet encoding and independent mux controls into the canonical protocol model, then normalization/validation precedes identity derivation. It does not retain a second VLESS mode model.
 - `src/node/wire.rs` is the sole flat serde adapter. It rejects the removed VLESS legacy field by raw presence, including `null`; the same field on non-VLESS input remains only a compatibility artifact. `VlessConfig.network`, `udp_encoding`, and `multiplex` determine identity, so a canonical cutover can change a VLESS `Node.id` without changing VMess behavior or identity.
 - Canonical VLESS behavior is summarized in [Outbound design](./outbound.md#vless-wire-contracts); field-level syntax and URI values belong in the [node reference](../reference/nodes.md).
-- `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }. The dae parser explicitly whitelists both current nested sections and accepts the deprecated `udp_nfqueue` section only as a migration input; it warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
+- `src/experimental.rs` — `ExperimentalConfig` owns `clash_api`, `native_api`, and `cache_file`. Native settings are strict, independent and restart-required. Opt-in `native-api` (build with `--features native-api` or `native-ui`; release builds include it) provides userspace observations, bounded histories, source-owned Group PATCH and main-entry administration, plus verified-geodata activation; its listener remains default-off. `.dae` remains authoritative. Per-network automatic-policy pin/clear is enabled; pins belong to the current GroupManager and disappear on activation. Credential-bearing sources are read-only, with listener-secret values masked in returned content, not omitted bodies. Native mode and full kernel transparency stay gated. Default-off `native-ui` embeds licensed pinned doona assets obtained at packaging time through `ci/fetch-doona.sh` and `.github/ci/pins.env`; `build.rs` reads the absolute `HONK_DOONA_DIR`, with no runtime fetching or frontend build. The deprecated `udp_nfqueue` block remains migration-only and warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 11 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ## High-level data path
@@ -127,10 +127,14 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the static `honk-ebpf` object, and userspace compiles policy extensions at runtime. Requires Linux kernel 6.12+ at runtime. |
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
-| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
+| `native-api` | no | Independent HTTP/1.1 native observations, opt-in accepted-source administration and local-directory UI, with owned bounded connections, strict bearer/Host/Origin checks, and no dependency on Clash. |
+| `native-ui` | no | Includes `native-api` and embeds pinned real doona assets for `ui: embedded`; no runtime extraction, download or frontend build. |
+| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio, and sets mimalloc's purge delay to 100 ms unless `MIMALLOC_PURGE_DELAY` says otherwise. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
 `mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested, startup logs a warning and disables NFQUEUE staging for that process; the config file is unchanged.
+
+When embedding eBPF, `build.rs` rebuilds with the kernel crate's pinned compiler and standalone release policy, not inherited host `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_*` profiling overrides. The compiler sidecar must be no older than the embedding build script, so an embedding-policy change invalidates previously built objects. Explicit `--bpf-object` artifacts and manual kernel builds remain the caller's responsibility.
 
 ## Authorship disclosure
 

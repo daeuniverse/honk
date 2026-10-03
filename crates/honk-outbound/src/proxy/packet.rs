@@ -256,7 +256,7 @@ impl<T: ?Sized + Send + Sync + 'static> PreparedUdpTransport<T> {
         Fut: Future<Output = anyhow::Result<Arc<T>>> + Send + 'static,
     {
         Self {
-            commit: Box::pin(commit),
+            commit: Box::pin(crate::runtime::TaskScope::capture().scope_owned(commit)),
         }
     }
     /// Wrap an already-authoritative ordinary transport. This deliberately
@@ -286,14 +286,17 @@ where
     if !matches!(runtime.runtime, crate::runtime::ProtocolRuntime::Quic(_)) {
         anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
     }
-    let transport = prepare(Arc::clone(&client)).await?;
-    Ok(PreparedUdpTransport::new(async move {
-        let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
-            anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
-        };
-        quic.publish_client(client).await?;
-        Ok(transport)
-    }))
+    let task_scope = runtime.task_scope();
+    let transport = runtime.scope_tasks(prepare(Arc::clone(&client))).await?;
+    Ok(PreparedUdpTransport::new(task_scope.scope_owned(
+        async move {
+            let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+                anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
+            };
+            quic.publish_client(client).await?;
+            Ok(transport)
+        },
+    )))
 }
 
 /// Adapter presenting a raw `UdpSocket` (e.g. the direct handler's

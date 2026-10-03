@@ -71,70 +71,64 @@ impl ControlPlane {
             let stats = self.stats.clone();
             let generation = self.runtime_registry.read().clone();
             let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-            let handle = tokio::spawn(async move {
-                let mut set = tokio::task::JoinSet::new();
-                for node in nodes {
-                    let feedback = manager.feedback_for_node(
-                        node.id,
-                        crate::group::ScoreSelectionContext::aggregate(
-                            crate::group::SelectionNetwork::Tcp,
-                            ProbeDomain::Tcp,
-                            IpVersion::V4,
-                        ),
-                    );
-                    let addr = format!("{}:{}", node.host(), node.port);
-                    let pool = pool.clone();
-                    let stats = stats.clone();
-                    let generation = Arc::clone(&generation);
-                    let sem = semaphore.clone();
-                    set.spawn(async move {
-                        let _permit = sem.acquire_owned().await;
-                        let reporter = feedback.map(|feedback| {
-                            feedback
-                                .with_source(crate::group::ScoreSource::Warmup)
-                                .start()
-                        });
-                        match generation
-                            .scope_dials(honk_outbound::util::connect_outbound(
-                                &addr,
-                                connect_timeout,
-                            ))
-                            .await
-                        {
-                            Ok(stream) => {
-                                if pool.deposit_tcp(&addr, stream).await {
-                                    if let Some(reporter) = &reporter {
-                                        reporter.setup_succeeded();
-                                    }
-                                    stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
-                                    if let Some(reporter) = &reporter {
-                                        reporter.finish_setup_only();
-                                    }
-                                    debug!("Preconnect warmup: deposited connection to {}", addr);
-                                } else if let Some(reporter) = &reporter {
-                                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
-                                        io::ErrorKind::ConnectionAborted,
-                                    ));
-                                }
-                            }
-                            Err(error) => {
+            for node in nodes {
+                let feedback = manager.feedback_for_node(
+                    node.id,
+                    crate::group::ScoreSelectionContext::aggregate(
+                        crate::group::SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        IpVersion::V4,
+                    ),
+                );
+                let addr = format!("{}:{}", node.host(), node.port);
+                let pool = pool.clone();
+                let stats = stats.clone();
+                let generation = Arc::clone(&generation);
+                let task_owner = Arc::clone(&generation);
+                let sem = semaphore.clone();
+                let _ = task_owner.spawn_background(async move {
+                    let _permit = sem.acquire_owned().await;
+                    let reporter = feedback.map(|feedback| {
+                        feedback
+                            .with_source(crate::group::ScoreSource::Warmup)
+                            .start()
+                    });
+                    match generation
+                        .scope_dials(honk_outbound::util::connect_outbound(
+                            &addr,
+                            connect_timeout,
+                        ))
+                        .await
+                    {
+                        Ok(stream) => {
+                            if pool.deposit_tcp(&addr, stream).await {
                                 if let Some(reporter) = &reporter {
-                                    reporter.setup_failed(
-                                        if error.kind() == io::ErrorKind::TimedOut {
-                                            crate::group::ScoreOutcome::Timeout
-                                        } else {
-                                            crate::group::ScoreOutcome::from_io_error(&error)
-                                        },
-                                    );
+                                    reporter.setup_succeeded();
                                 }
-                                debug!("Preconnect warmup to {} failed: {}", addr, error);
+                                stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
+                                if let Some(reporter) = &reporter {
+                                    reporter.finish_setup_only();
+                                }
+                                debug!("Preconnect warmup: deposited connection to {}", addr);
+                            } else if let Some(reporter) = &reporter {
+                                reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                                    io::ErrorKind::ConnectionAborted,
+                                ));
                             }
                         }
-                    });
-                }
-                while set.join_next().await.is_some() {}
-            });
-            self.background_tasks.lock().await.push(handle);
+                        Err(error) => {
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
+                                    crate::group::ScoreOutcome::Timeout
+                                } else {
+                                    crate::group::ScoreOutcome::from_io_error(&error)
+                                });
+                            }
+                            debug!("Preconnect warmup to {} failed: {}", addr, error);
+                        }
+                    }
+                });
+            }
             info!(
                 "Preconnect warmup started for {} nodes (max {} concurrent)",
                 node_count, max_concurrent

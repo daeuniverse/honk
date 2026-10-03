@@ -48,6 +48,7 @@ anyhow = "1"
 
 # HTTP (clash-api in honk-core, h2 probes in honk-outbound)
 axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 reqwest = { version = "0.13", features = [
     "json",
@@ -55,8 +56,12 @@ reqwest = { version = "0.13", features = [
 ], default-features = false }
 h2 = "0.4"
 http = "1"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client-proxy"] }
+hyper = { version = "1.11", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "service",
+    "client-proxy",
+] }
 
 # eBPF / Aya
 aya = "0.14"
@@ -93,6 +98,7 @@ hmac = "0.13"
 hkdf = "0.13"
 md-5 = "0.11"
 blake3 = "1"
+subtle = "2.6.1"
 
 # Networking
 socket2 = { version = "0.6", features = ["all"] }
@@ -108,8 +114,8 @@ url = "2"
 percent-encoding = "2"
 aho-corasick = "1"
 
-# Persistence (cache_file / cachedb)
-rusqlite = { version = "0.40", features = ["bundled"] }
+# Persistence (state database)
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
@@ -135,6 +141,7 @@ nix = { version = "0.31", features = [
 ] }
 pin-project-lite = "0.2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+flate2 = "1.1"
 
 # Dev/test utilities
 tempfile = "3"
@@ -173,7 +180,7 @@ strip = true
 [patch.crates-io]
 # honk rprx fork: preset X25519 keyshare + ClientHello fixup hooks (REALITY)
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b65ecaa69b7eefe3c2fecd074b97facd2" }
-# honk fork: bound receive fragmentation, expose delivery and flow-control state,
+# honk fork (branch `honk-0.11` = upstream 0.11.x + patches, auto-merged): bound receive fragmentation, expose delivery and flow-control state,
 # and allow runtime flow-control window tuning.
-quinn = { git = "https://github.com/Glassyiris/quinn", rev = "7f13718a" }
-quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "7f13718a" }
+quinn = { git = "https://github.com/Glassyiris/quinn", rev = "47852e8b" }
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "47852e8b" }

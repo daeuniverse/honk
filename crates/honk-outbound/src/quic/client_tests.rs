@@ -624,3 +624,231 @@ async fn ephemeral_guard_releases_quic_client_when_probe_is_aborted() {
     .await
     .expect("the guard Drop must drive the QUIC close after abort");
 }
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
+    use futures_util::FutureExt as _;
+
+    let (server_endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let peer = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        connection.closed().await;
+    });
+    let mut guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
+    let runtime = guard.runtime();
+    let (client, connection) = runtime
+        .scope_tasks(async { Ok(probe_client(&runtime, addr.port()).await) })
+        .await
+        .unwrap();
+    let endpoint = client
+        .0
+        .state
+        .lock()
+        .await
+        .endpoint
+        .as_ref()
+        .unwrap()
+        .1
+        .clone();
+    assert!(endpoint.wait_idle().now_or_never().is_none());
+    guard.close().await.unwrap();
+    assert!(connection.close_reason().is_some());
+    assert!(endpoint.wait_idle().now_or_never().is_some());
+    peer.await.unwrap();
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_close_drains_endpoint_from_cancelled_unpublished_handshake() {
+    use futures_util::FutureExt as _;
+
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
+    let runtime = guard.runtime();
+    let observed = Arc::new(parking_lot::Mutex::new(None));
+    let endpoint_observed = Arc::clone(&observed);
+    let client = test_client(blackhole.local_addr().unwrap().port())
+        .await
+        .with_endpoint_factory(move |ipv6| {
+            let endpoint = client_endpoint(ipv6)?;
+            *endpoint_observed.lock() = Some(endpoint.clone());
+            Ok(endpoint)
+        });
+    let mut probe = Box::pin(runtime.scope_tasks(
+        client.connection_with(Duration::from_secs(5), |_conn| async {
+            Ok::<(), anyhow::Error>(())
+        }),
+    ));
+    assert!(probe.as_mut().now_or_never().is_none());
+    let endpoint = observed
+        .lock()
+        .clone()
+        .expect("dial must create its endpoint before handshake");
+    drop(probe);
+    guard.close().await.unwrap();
+    assert!(endpoint.wait_idle().now_or_never().is_some());
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_production_close_drains_cancelled_quic_handshake() {
+    use futures_util::FutureExt as _;
+
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let node = tuic_test_node();
+    let generation = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap()
+    .0;
+    let runtime = generation.get(&node.id).unwrap();
+    let observed = Arc::new(parking_lot::Mutex::new(None));
+    let endpoint_observed = Arc::clone(&observed);
+    let client = runtime
+        .quic_client(|| async {
+            let client = test_client(blackhole.local_addr().unwrap().port())
+                .await
+                .with_endpoint_factory(move |ipv6| {
+                    let endpoint = client_endpoint(ipv6)?;
+                    *endpoint_observed.lock() = Some(endpoint.clone());
+                    Ok(endpoint)
+                });
+            Ok(Arc::new(ProbeClient(client)))
+        })
+        .await
+        .unwrap();
+    let mut dial = Box::pin(
+        client
+            .0
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            }),
+    );
+    assert!(dial.as_mut().now_or_never().is_none());
+    let endpoint = observed
+        .lock()
+        .clone()
+        .expect("unpublished endpoint created");
+    drop(dial);
+    generation.shutdown().await;
+    assert!(endpoint.wait_idle().now_or_never().is_some());
+    assert!(
+        client
+            .0
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let observe = |flow_id| {
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id,
+                generation: 1,
+                attempt_id: Some(uuid::Uuid::new_v4()),
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |context, event| events.lock().push((context, event))),
+        )
+    };
+    let first = observe(uuid::Uuid::new_v4());
+    let second = observe(uuid::Uuid::new_v4());
+    let (endpoint, address) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let accepted = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move { endpoint.accept().await.unwrap().await.unwrap() }
+    });
+    let client = test_client(address.port()).await;
+    let (connection, _) = first
+        .scope(client.connection_with(Duration::from_secs(2), |_| async { Ok(()) }))
+        .await
+        .unwrap();
+    let server = accepted.await.unwrap();
+    let (reused, _) = second
+        .scope(client.connection_with(Duration::from_secs(2), |_| async {
+            panic!("cached connection must not run setup")
+        }))
+        .await
+        .unwrap();
+    assert_eq!(connection.stable_id(), reused.stable_id());
+    {
+        let events = events.lock();
+        let physical: Vec<_> = events
+            .iter()
+            .filter_map(|(context, event)| match event {
+                FlowEvent::Transport {
+                    attempt_id, status, ..
+                } => Some((context, attempt_id, status.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(physical.len(), 2);
+        assert_eq!(physical[0].2, "started");
+        assert_eq!(physical[1].2, "succeeded");
+        assert_eq!(physical[0].1, physical[1].1);
+        assert_ne!(Some(*physical[0].1), physical[0].0.attempt_id);
+        assert!(
+            physical
+                .iter()
+                .all(|(context, _, _)| context.flow_id == first.context().flow_id)
+        );
+        assert!(events.iter().any(|(context, event)| {
+            context.flow_id == second.context().flow_id
+                && matches!(event, FlowEvent::TransportAttached { server_addr: Some(addr), .. } if *addr == address)
+        }));
+        assert!(!events.iter().any(|(_, event)| matches!(
+            event,
+            FlowEvent::Milestone {
+                milestone: crate::runtime::flow_observation::Milestone::TargetConfirmed
+                    | crate::runtime::flow_observation::Milestone::TargetRequestSent
+            }
+        )));
+    }
+    connection.close(VarInt::from_u32(0), b"finished");
+    drop(server);
+    client.force_close().await;
+    endpoint.close(VarInt::from_u32(0), b"finished");
+
+    events.lock().clear();
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(blackhole.local_addr().unwrap().port()).await;
+    let mut pending = Box::pin(
+        first.scope(client.connection_with(Duration::from_secs(10), |_| async { Ok(()) })),
+    );
+    let mut packet = [0; 2048];
+    tokio::select! {
+        _ = &mut pending => panic!("blackhole handshake unexpectedly completed"),
+        result = blackhole.recv(&mut packet) => { result.unwrap(); }
+    }
+    drop(pending);
+    let physical: Vec<_> = events
+        .lock()
+        .iter()
+        .filter_map(|(_, event)| match event {
+            FlowEvent::Transport {
+                attempt_id, status, ..
+            } => Some((*attempt_id, status.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(physical.len(), 2);
+    assert_eq!(physical[0].0, physical[1].0);
+    assert_eq!((physical[0].1, physical[1].1), ("started", "cancelled"));
+    client.force_close().await;
+}

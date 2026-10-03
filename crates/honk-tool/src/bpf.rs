@@ -495,7 +495,7 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                 }
                 shown += 1;
                 println!(
-                    "{:?} {}:{} -> {}:{} out={} mark=0x{:x} must={} state={} seen={}",
+                    "{:?} {}:{} -> {}:{} out={} mark=0x{:x} must={} state={} seen={} trace={}",
                     k.l4proto,
                     ip_of(&k.src_ip),
                     k.src_port,
@@ -505,7 +505,8 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                     unsafe { v.meta.data.mark },
                     unsafe { v.meta.data.must },
                     v.state,
-                    v.last_seen_ns
+                    v.last_seen_ns,
+                    v.trace_id
                 );
             }
             println!("-- {shown}/{} entries", entries.len());
@@ -592,7 +593,7 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                 }
                 shown += 1;
                 println!(
-                    "{:?} {}:{} -> {}:{} out={} mark=0x{:x} must={} seen={}",
+                    "{:?} {}:{} -> {}:{} out={} mark=0x{:x} must={} seen={} generation={} trace={}",
                     k.l4proto,
                     ip_of(&k.src_ip),
                     k.src_port,
@@ -601,7 +602,9 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                     v.result.outbound,
                     v.result.mark,
                     v.result.must,
-                    v.last_seen_ns
+                    v.last_seen_ns,
+                    v.routing_generation,
+                    v.trace_id
                 );
             }
             println!("-- {shown}/{} entries", entries.len());

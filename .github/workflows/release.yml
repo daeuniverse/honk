@@ -172,23 +172,28 @@ jobs:
         with:
           version: 0.14.1
 
-      # The default feature set carries mimalloc; the "-stock" matrix entries
-      # build the same target against the system malloc instead.
+      - name: Fetch doona for the embedded UI
+        run: |
+          set -euo pipefail
+          dir=$(ci/fetch-doona.sh)
+          echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
+
+      # Allocator variants must expose the same protocol and API capabilities.
       - name: Resolve feature set
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.suffix }}" == "-stock" ]]; then
-            echo "FEATURES=--no-default-features --features clash-api,ebpf,rprx" >> "$GITHUB_ENV"
-          else
-            echo "FEATURES=--features ebpf" >> "$GITHUB_ENV"
+          features=clash-api,ebpf,rprx,native-ui
+          if [[ "${{ matrix.suffix }}" != "-stock" ]]; then
+            features+=,mimalloc
           fi
+          echo "FEATURES=$features" >> "$GITHUB_ENV"
 
       # The root rust-toolchain.toml selects the host compiler whose cross
       # targets were installed above; the eBPF crate has its own nightly pin.
       - name: Build honk-core (native gnu)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release -p honk-core $FEATURES --target ${{ matrix.target }}
+        run: cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target ${{ matrix.target }}
 
       - name: Build honk-core (cross via zig wrappers)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
@@ -211,8 +216,9 @@ jobs:
           fi
           # boring-sys generates its bindings with bindgen at build time —
           # point it at zig's target headers, not the host's.
-          export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo build --release -p honk-core $FEATURES --target "$T"
+          BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
+          export BINDGEN_EXTRA_CLANG_ARGS
+          cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target "$T"
 
       - name: Package artifact
         run: |
@@ -221,6 +227,9 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
+          # The embedded doona UI keeps its own license and notices.
+          mkdir "dist/$name/doona"
+          cp -r "$HONK_DOONA_DIR"/{LICENSE,LICENSES,NOTICE,THIRD-PARTY-NOTICES.txt} "dist/$name/doona/"
           tar -czf "$name.tar.gz" -C dist "$name"
 
       - name: Start the packaged x86_64 artifact
@@ -254,15 +263,28 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: release-source
+
+      # GPL-3.0 section 6: the binaries embed doona, so its corresponding
+      # source is published next to them.
+      - name: Add doona corresponding source
+        run: bash release-source/ci/fetch-doona.sh --source dist
+
       - name: Create signature
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           cd dist
           for FILE in *.tar.gz; do
-            echo "$(md5sum $FILE)""  md5" >> $FILE.dgst
-            echo "$(shasum -a 1 $FILE)""  sha1" >> $FILE.dgst
-            echo "$(shasum -a 256 $FILE)""  sha256" >> $FILE.dgst
-            echo "$(shasum -a 512 $FILE)""  sha512" >> $FILE.dgst
+            {
+              echo "$(md5sum "$FILE")  md5"
+              echo "$(shasum -a 1 "$FILE")  sha1"
+              echo "$(shasum -a 256 "$FILE")  sha256"
+              echo "$(shasum -a 512 "$FILE")  sha512"
+            } >> "$FILE.dgst"
           done
 
       - name: Create release
@@ -275,28 +297,16 @@ jobs:
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           generate_release_notes: true
 
-      - name: Checkout Debug source
-        if: startsWith(github.ref, 'refs/tags/debug.')
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          path: debug-source
-
       - name: Check complete Debug artifacts
         if: startsWith(github.ref, 'refs/tags/debug.')
-        run: bash debug-source/.github/ci/check-debug-artifacts.sh
+        run: bash release-source/.github/ci/check-debug-artifacts.sh
 
-      - name: Move rolling Debug tag
-        if: startsWith(github.ref, 'refs/tags/debug.')
-        working-directory: debug-source
-        run: git push --force origin "$GITHUB_SHA:refs/tags/debug"
-
-      - name: Update Debug release
+      - name: Publish Debug release
         if: startsWith(github.ref, 'refs/tags/debug.')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: debug
-          name: Debug
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: "false"
@@ -304,7 +314,7 @@ jobs:
           overwrite_files: true
           fail_on_unmatched_files: true
           body: |
-            Rolling debug build; replaced by subsequent successful debug-tag runs.
+            Debug build of `${{ github.ref_name }}`.
 
             Source tag: `${{ github.ref_name }}`
             Commit: `${{ github.sha }}`

@@ -336,10 +336,41 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
         .unwrap();
     assert!(old_state.sessions.lock().contains_key(&u16::MAX));
 
-    let fresh = handler
-        .udp_transport_via_client(Arc::clone(&client), target, None, timeout)
-        .await
-        .unwrap();
+    #[cfg(feature = "flow-observation")]
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    #[cfg(feature = "flow-observation")]
+    let observer = {
+        use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: Some(uuid::Uuid::new_v4()),
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |_, event| {
+                if let FlowEvent::Session(event) = event {
+                    events.lock().push((event.reason(), event.error()));
+                }
+            }),
+        )
+    };
+    let fresh = handler.udp_transport_via_client(Arc::clone(&client), target, None, timeout);
+    #[cfg(feature = "flow-observation")]
+    let fresh = observer.scope(fresh);
+    let fresh = fresh.await.unwrap();
+    #[cfg(feature = "flow-observation")]
+    assert_eq!(
+        events.lock().as_slice(),
+        [
+            ("session_open_started", None),
+            ("session_open_capacity", Some("capacity")),
+            ("session_open_started", None),
+            ("session_open_succeeded", None),
+        ]
+    );
     let (fresh_conn, fresh_state) = client.connection(timeout).await.unwrap();
     assert_ne!(old_conn.stable_id(), fresh_conn.stable_id());
     assert!(fresh_state.sessions.lock().contains_key(&0));

@@ -12,7 +12,7 @@ use quinn::{ClientConfig, Connection};
 use super::framing::{
     force_dns_id_zero, read_length_prefixed, restore_dns_id, write_length_prefixed,
 };
-use super::lifecycle::{LifecycleSlot, SessionFailure};
+use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::quic::with_packet_cause;
 use super::{
     DialContext, SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect_endpoint,
@@ -127,12 +127,33 @@ impl DoqClient {
     }
 
     async fn get_conn(&self) -> anyhow::Result<Arc<DoqConnection>> {
-        let connection = self.connection.acquire(|| self.dial()).await?;
-        if connection.connection.close_reason().is_some() {
-            self.retire_connection(&connection).await;
-            return self.connection.acquire(|| self.dial()).await;
+        let observation = SessionObservation::start();
+        let result = async {
+            let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
+            if connection.connection.close_reason().is_some() {
+                observation.record(
+                    honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed,
+                );
+                observation.record(
+                    honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted,
+                );
+                self.retire_connection(&connection).await;
+                let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
+                if reused {
+                    super::lifecycle::attached();
+                }
+                return Ok(connection);
+            }
+            if reused {
+                super::lifecycle::attached();
+            }
+            Ok(connection)
         }
-        Ok(connection)
+        .await;
+        observation.finish(
+            result,
+            honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionAcquired,
+        )
     }
     async fn dial(&self) -> anyhow::Result<DoqConnection> {
         let (connection, endpoint) = quic_connect_endpoint(
@@ -157,6 +178,10 @@ impl DoqClient {
         self.connection
             .retire(connection, move |connection| connection.close(timeout))
             .await;
+    }
+
+    pub(crate) fn tasks_failed(&self) -> bool {
+        self.quic_ep.tasks_failed()
     }
 
     pub(crate) async fn close(&self) {
@@ -200,11 +225,78 @@ mod tests {
             quic_ep: SharedQuicEndpoint::new(),
             connection: LifecycleSlot::new(),
         });
-        let query = build_dns_query("example.com", 1);
-
-        for _ in 0..2 {
-            let response = client.exchange(&query, None).await.unwrap();
+        #[cfg(feature = "native-api")]
+        let store = {
+            use crate::native_api::events::EventHub;
+            use crate::observe::flows::FlowStore;
+            let instance = uuid::Uuid::new_v4().to_string();
+            Arc::new(FlowStore::new(
+                instance.clone(),
+                Arc::new(EventHub::new(instance)),
+            ))
+        };
+        for (index, name) in ["cold.example", "warm.example"].into_iter().enumerate() {
+            let query = build_dns_query(name, 1);
+            #[cfg(feature = "native-api")]
+            let flow = Arc::new(
+                store
+                    .begin(
+                        crate::observe::vocab::Network::Udp,
+                        "127.0.0.1:31000".parse().unwrap(),
+                        address,
+                    )
+                    .unwrap(),
+            );
+            #[cfg(feature = "native-api")]
+            let observer = flow.observer(13, None, "intercepted_query").unwrap();
+            let exchange = client.exchange(&query, None);
+            #[cfg(feature = "native-api")]
+            let exchange = observer.scope(exchange);
+            let response = exchange.await.unwrap();
+            assert!(super::super::is_valid_response(&query, &response));
             assert_eq!(&response[..2], &query[..2]);
+            #[cfg(feature = "native-api")]
+            {
+                let view = store.test_detail(flow.id());
+                assert_eq!(view["trace"]["status"], "complete", "{view:#}");
+                let steps = view["trace"]["steps"].as_array().unwrap();
+                let lookup = steps
+                    .iter()
+                    .find(|step| step["stage"] == "dns" && step["data"]["status"] == "succeeded")
+                    .unwrap();
+                let physical: Vec<_> = steps
+                    .iter()
+                    .filter(|step| {
+                        step["stage"] == "outbound" && step["data"]["kind"] == "transport"
+                    })
+                    .collect();
+                assert_eq!(physical.len(), if index == 0 { 2 } else { 0 }, "{view:#}");
+                let attached: Vec<_> = steps
+                    .iter()
+                    .filter(|step| step["data"]["reason"] == "dns_transport_attached")
+                    .collect();
+                assert_eq!(attached.len(), index, "{view:#}");
+                if index == 1 {
+                    assert_eq!(
+                        attached[0]["data"]["lookup_id"],
+                        lookup["data"]["lookup_id"]
+                    );
+                    assert_eq!(
+                        attached[0]["data"]["attempt_id"],
+                        lookup["data"]["attempt_id"]
+                    );
+                    assert_eq!(attached[0]["generation_id"], lookup["generation_id"]);
+                }
+                assert!(
+                    !steps
+                        .iter()
+                        .any(|step| step["data"]["reason"] == "target_confirmed"
+                            || step["data"]["reason"] == "dns_session_retry_started"
+                            || step["data"]["milestone"] == "first_reply")
+                );
+            }
+            #[cfg(not(feature = "native-api"))]
+            let _ = index;
         }
         assert_eq!(runtime_dials.load(Ordering::SeqCst), 1);
         assert_eq!(active.load(Ordering::SeqCst), 1);

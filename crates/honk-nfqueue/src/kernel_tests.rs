@@ -43,6 +43,7 @@ struct CallbackEvent {
     tuple: UdpTuple,
     payload: Bytes,
     mark: u32,
+    priority: Option<u32>,
     decision: CallbackDecision,
     verdict_error: Option<String>,
     retry_rejected: bool,
@@ -133,6 +134,7 @@ fn exercise_kernel_contract(runtime: &tokio::runtime::Runtime) {
                 tuple: packet.tuple,
                 payload: packet.payload,
                 mark: packet.mark,
+                priority: packet.priority,
                 decision,
                 verdict_error,
                 retry_rejected,
@@ -284,9 +286,22 @@ fn exercise_datagram(
     payload: &[u8],
     expected_decision: CallbackDecision,
 ) {
+    let priority = match expected_decision {
+        CallbackDecision::Accept => 0x1234,
+        CallbackDecision::ExplicitDrop => 0,
+        CallbackDecision::DefaultDrop => 0x5678,
+    };
+    set_socket_u32(
+        client.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_PRIORITY,
+        priority,
+        "SO_PRIORITY",
+    );
     client.send(payload).expect("send marked UDP datagram");
     let event = receive_event_or_fatal(events, fatal);
     assert_eq!(event.mark, INPUT_MARK, "NFQA_MARK is an exact carrier");
+    assert_eq!(event.priority, (priority != 0).then_some(priority));
     assert_eq!(event.payload.as_ref(), payload);
     assert_eq!(event.tuple.destination, receiver.local_addr().unwrap());
     assert_eq!(event.decision, expected_decision);

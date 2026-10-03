@@ -388,6 +388,7 @@ replaces PKI.
 - `src/tls.rs` — **BoringSSL TLS client** with webpki/no-verify stores. Process-wide `set_tls_mode` (`tls_implementation = "utls"`) selects a Chrome-oriented ClientHello profile: GREASE, permuted extensions, hybrid then classic X25519 shares, Chrome-derived sigalgs/curves/ciphers, brotli certificate compression, ALPS-h2, and ECH GREASE. This is protocol emulation, not a claim of complete Chrome identity. Per-node **ECH** uses `ech_config` / `ech_config_path`; discovery uses DNS HTTPS records and remains best-effort/fail-open, while an explicit server ECH rejection fails closed.
   `build_reality_connector(chrome)` replaces PKI with post-handshake ed25519 authentication in `reality.rs`, permits TLS 1.3 only, and never offers REALITY resumption. REALITY necessarily adds ed25519 to the signature list, another reason not to describe it as a full browser fingerprint.
   Explicit structured TCP ALPN reaches `build_connector` in both tls/utls modes; empty lists retain existing profile defaults. Chrome ALPS follows exact `h2` membership. Registry publication and direct connector construction validate nonempty overrides; shared stream dispatch validates before choosing plaintext or REALITY, and direct QUIC configuration rejects TCP ALPN rather than ignoring it.
+  `build_connector` and `build_reality_connector` return shared BoringSSL contexts, one per (REALITY, verification, pin, ALPN override, Chrome mode) shape, kept in a process-wide cache that restarts empty at 128 shapes. Each context holds the process-wide webpki store instead of the OS CA bundle that `SslConnector::builder` parses by default, so a dial parses no certificates and a live connection pins no private CA copy.
 
 ### Process-wide TLS profile
 
@@ -814,7 +815,7 @@ throughput-neutral on a 75ms/15%-loss link. Overrides:
 ## AnyTLS session engine
 
 `src/proxy/anytls/mod.rs` implements sing-anytls multiplexing with stateless handlers. Each generation's `NodeRuntime::AnyTls` owns one
-`SessionPool<AnyTlsSession>` and lazily materialized BoringSSL connector.
+`SessionPool<AnyTlsSession>` and a BoringSSL connector built on the first dial; the connector is never idle-reaped because TLS contexts are shared per shape.
 Generation-free calls use a guarded ephemeral equivalent.
 
 ### Pool and session lifecycle
@@ -842,8 +843,11 @@ settles only its own SID — an unrelated acknowledgement never clears another
 stream's deadline, and local stream teardown cancels it. An open still pending
 three seconds after its SYN was written is reset at stream level when the
 session kept receiving frames during the window (the server was alive but
-never acknowledged that open); a fully silent window retires the physical
-session so the pool redials instead of reusing a dead carrier.
+never acknowledged that open). A fully silent window is not proof of a dead
+carrier, because a loss burst silences every stream at once and TCP delivers
+afterwards: it resets only that open and takes the session out of rotation, and
+the session is retired with its streams only if it stays silent for another ten
+seconds, so the pool still redials instead of reusing a dead carrier.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor (`anytls_min_idle_session`) and `anytls_idle_session_timeout` feed one node-local janitor.

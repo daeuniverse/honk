@@ -55,7 +55,7 @@ fn facts_ahead_of_long_process_chains_stay_within_the_verifier_budget() {
     )
     .unwrap();
     let router = Router::new(&config.routing.rules, "direct").unwrap();
-    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Domain).unwrap();
+    let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Domain).unwrap();
 
     let mut benchmark = golden::connection();
     benchmark.src_ip = "198.18.81.2".parse().unwrap();
@@ -76,24 +76,27 @@ fn facts_ahead_of_long_process_chains_stay_within_the_verifier_budget() {
     let learned = [domain_entry(&router, &proxied, "www.example.com")];
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
-    backend.publish_routing_plan(&plan, &learned).unwrap();
+    for enabled in [false, true] {
+        plan.enable_trace(enabled);
+        backend.publish_routing_plan(&plan, &learned).unwrap();
 
-    for (label, connection, expected) in [
-        ("first rule", &benchmark, decision(2, 0, true, 0, 0)),
-        ("process name", &torrent, decision(1, 0, true, 0, 11)),
-        ("MAC after the chains", &lan, decision(1, 0, true, 0, 20)),
-        (
-            "destination after the chains",
-            &private,
-            decision(1, 0, true, 0, 22),
-        ),
-        (
-            "region with a learned domain",
-            &proxied,
-            decision(2, 0, false, 1, 25),
-        ),
-        ("fallback", &fallback, decision(0, 0, false, 0, u32::MAX)),
-    ] {
-        assert_route(&mut backend, label, &input(connection), expected);
+        for (label, connection, expected) in [
+            ("first rule", &benchmark, decision(2, 0, true, 0, 0)),
+            ("process name", &torrent, decision(1, 0, true, 0, 11)),
+            ("MAC after the chains", &lan, decision(1, 0, true, 0, 20)),
+            (
+                "destination after the chains",
+                &private,
+                decision(1, 0, true, 0, 22),
+            ),
+            (
+                "region with a learned domain",
+                &proxied,
+                decision(2, 0, false, 1, 25),
+            ),
+            ("fallback", &fallback, decision(0, 0, false, 0, u32::MAX)),
+        ] {
+            assert_route(&mut backend, label, &input(connection), expected);
+        }
     }
 }

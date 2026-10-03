@@ -3,7 +3,9 @@ use super::support::{
 };
 use crate::control::{ControlPlane, drain::DrainTracker, probers::UdpDnsProbeTarget};
 use honk_config::{Config, node::Node, parser::parse_dae_config, types::NodeProtocol};
-use honk_outbound::alive::{HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber};
+use honk_outbound::alive::{
+    HttpProbeOutcome, HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber,
+};
 use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
 use parking_lot::Mutex;
 use std::{
@@ -41,13 +43,14 @@ struct PeriodProbe(tokio::sync::mpsc::UnboundedSender<tokio::time::Instant>);
 impl HttpProber for PeriodProbe {
     fn probe_http(
         &self,
-        _: &str,
+        _: uuid::Uuid,
         _: SocketAddr,
         _: &str,
         _: Duration,
-    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>> {
+        _cancel: honk_outbound::alive::ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let _ = self.0.send(tokio::time::Instant::now());
-        Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(1)) })
+        Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(1)).into() })
     }
 }
 
@@ -88,8 +91,8 @@ async fn c28_health_reload_retains_old_period_after_rejection() {
         Duration::from_secs(30)
     );
     assert_eq!(cp.config_handle().read().await.as_ref(), &old);
-    task.abort();
-    let _ = task.await;
+    alive.shutdown_health_checks().await.unwrap();
+    task.await.unwrap();
 }
 
 async fn http_fixture() -> (
@@ -296,8 +299,11 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         candidate.global.udp_check_dns = new_raw.into_iter().map(str::to_owned).collect();
         let accepted = cp
             .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
-            .await;
-        let outcome = UdpProber::probe_udp(&prober, &node.name, Duration::from_secs(1)).await;
+            .await
+            .accepted();
+        let outcome =
+            UdpProber::probe_udp(&prober, node.id, Duration::from_secs(1), Default::default())
+                .await;
         assert!(matches!(outcome.dns, Some(Ok(_))), "{outcome:?}");
         assert_eq!(
             *capture.lock(),
@@ -492,7 +498,11 @@ async fn udp_dns_resolution_and_transport_share_one_deadline() {
     );
     let start = tokio::time::Instant::now();
     let outcome = prober
-        .probe_udp(&node.name, Duration::from_millis(50))
+        .probe_udp(
+            node.id,
+            Duration::from_millis(50),
+            honk_outbound::alive::ProbeCancellation::default(),
+        )
         .await;
     assert!(matches!(outcome.dns, Some(Err(_))), "{outcome:?}");
     assert!(outcome.data_path.is_none());
@@ -566,7 +576,8 @@ async fn c28_dae_tolerance_reload_changes_real_urltest_selection() {
     let candidate = dae_urltest_config(10);
     let accepted = cp
         .apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
-        .await;
+        .await
+        .accepted();
     assert!(accepted, "dae tolerance-only reload must remain admissible");
     assert_eq!(
         cp.group_manager()

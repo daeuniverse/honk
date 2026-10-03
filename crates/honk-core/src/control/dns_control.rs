@@ -43,6 +43,30 @@ pub struct DnsController {
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
 }
 
+pub(crate) struct DnsClientAnswer(Result<crate::dns::outcome::DnsOutcome, Vec<u8>>);
+
+impl DnsClientAnswer {
+    pub(crate) fn wire(&self) -> &[u8] {
+        match &self.0 {
+            Ok(outcome) => outcome.rendered(),
+            Err(response) => response,
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn outcome(&self) -> Option<&crate::dns::outcome::DnsOutcome> {
+        self.0.as_ref().ok()
+    }
+
+    #[cfg(test)]
+    fn into_wire(self) -> Vec<u8> {
+        match self.0 {
+            Ok(outcome) => outcome.into_rendered(),
+            Err(response) => response,
+        }
+    }
+}
+
 /// Admission for one DNS request. The runtime lease and both runtime-owned
 /// permits are held by the transport owner through response I/O.
 pub(crate) struct AdmittedDnsQuery {
@@ -132,8 +156,8 @@ impl DnsController {
             let runtime = dns_service
                 .provider()
                 .unwrap_or_else(|| unreachable!("controller requires runtime DNS service"))
-                .acquire();
-            Arc::clone(runtime.runtime().routing_projection())
+                .current();
+            Arc::clone(runtime.routing_projection())
         };
         let routing_projection =
             crate::dns::projection::RoutingProjection::spawn(Arc::clone(&ebpf), snapshot);
@@ -163,9 +187,8 @@ impl DnsController {
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
         self.routing_projection.shutdown(timeout).await;
-        // The provider retires runtimes through a JoinSet of supervisors,
-        // and a dropped JoinSet aborts its tasks — a timeout here cannot
-        // leave a detached worker behind.
+        // The provider's pause JoinSet, not this wait, owns every close task,
+        // so abandoning the wait on timeout detaches nothing.
         let provider = self.runtime_provider();
         if tokio::time::timeout(timeout, provider.shutdown())
             .await
@@ -203,7 +226,13 @@ impl DnsController {
     /// Acquire a generation-pinned query admission. The runtime lease and
     /// permits remain owned by the caller through response I/O.
     pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
-        let runtime = self.runtime_provider().acquire();
+        let runtime = self
+            .runtime_provider()
+            .try_acquire()
+            .map_err(|_| DnsAdmissionError {
+                error: TryAcquireError::Closed,
+                udp_reply: None,
+            })?;
         let udp_permit =
             if udp {
                 Some(runtime.runtime().try_acquire_udp_query().map_err(|error| {
@@ -238,15 +267,30 @@ impl DnsController {
         data: &[u8],
         metadata: DnsRequestMeta,
         ingress: IngressProfile,
-    ) -> Vec<u8> {
-        match self
+    ) -> DnsClientAnswer {
+        #[cfg(feature = "native-api")]
+        let mut observed_route = self
             .dns_service
-            .resolve_outcome_with_runtime(&admission.runtime, data, metadata, ingress)
+            .observation_enabled()
+            .then(crate::dns::outcome::RouteSource::default);
+        #[cfg(feature = "native-api")]
+        let evidence = observed_route.as_mut();
+        #[cfg(not(feature = "native-api"))]
+        let evidence = None;
+        let answer = match self
+            .dns_service
+            .resolve_client_outcome_with_runtime(
+                &admission.runtime,
+                data,
+                metadata,
+                ingress,
+                evidence,
+            )
             .await
         {
             Ok(outcome) => {
                 self.submit_projection(admission.runtime.runtime(), &outcome);
-                outcome.into_rendered()
+                DnsClientAnswer(Ok(outcome))
             }
             Err(error)
                 if error
@@ -259,7 +303,7 @@ impl DnsController {
                     }) =>
             {
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
-                build_dns_refused(data)
+                DnsClientAnswer(Err(build_dns_refused(data)))
             }
             Err(error) => {
                 // A wedged upstream layer must be visible at the default
@@ -271,9 +315,17 @@ impl DnsController {
                     *last = Some(Instant::now());
                     warn!(error = %error, "DNS controller forward failed; sending SERVFAIL");
                 }
-                build_dns_servfail(data)
+                DnsClientAnswer(Err(build_dns_servfail(data)))
             }
-        }
+        };
+        #[cfg(feature = "native-api")]
+        let answer = match (answer.0, observed_route) {
+            (Err(response), Some(source)) => DnsClientAnswer(
+                crate::dns::outcome::DnsOutcome::client_error(data, ingress, response, source),
+            ),
+            (result, _) => DnsClientAnswer(result),
+        };
+        answer
     }
 
     #[cfg(test)]
@@ -286,7 +338,9 @@ impl DnsController {
         let admission = self
             .try_admit_query(false)
             .expect("test DNS query admission");
-        self.answer_query(&admission, data, metadata, ingress).await
+        self.answer_query(&admission, data, metadata, ingress)
+            .await
+            .into_wire()
     }
 
     fn submit_projection(

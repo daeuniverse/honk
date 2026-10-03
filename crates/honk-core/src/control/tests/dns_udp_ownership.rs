@@ -184,6 +184,7 @@ fn recv_meta(route: Option<UdpDnsRoute>) -> sockets::UdpRecvMeta {
         packet_dst_ip: Some(original_dst.ip()),
         packet_ifindex: Some(1),
         packet_mark: route.map(UdpDnsRoute::to_mark),
+        packet_priority: None,
         local_addr: super::addr("0.0.0.0:15000"),
     }
 }
@@ -245,7 +246,7 @@ async fn marked_udp_dns_dispatches_raw_bytes_to_the_packet_owner() {
         ("beta-node".into(), b"not dns: beta".to_vec())
     );
 
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(
         dns_queries.load(Ordering::SeqCst),
         1,
@@ -287,7 +288,7 @@ async fn marked_udp_dns_rejects_stale_missing_and_unknown_owners_before_send() {
         ("alpha-node".into(), b"malformed nonmust".to_vec())
     );
 
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
@@ -328,7 +329,7 @@ async fn marked_udp_dns_rechecks_initializer_epoch_after_config_validation() {
         "the crossed packet must not reach transport ahead of the accepted sentinel"
     );
 
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
@@ -401,7 +402,7 @@ async fn malformed_controller_fallback_discards_incompatible_raw_handoff_metadat
         "compatible controller metadata must remain available to normal routing"
     );
 
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
@@ -414,6 +415,7 @@ fn queued_dns_packet(client: SocketAddr, payload: &[u8], mark: u32) -> honk_nfqu
         },
         payload: bytes::Bytes::copy_from_slice(payload),
         mark,
+        priority: None,
         received_at: std::time::Instant::now(),
     }
 }
@@ -524,7 +526,7 @@ async fn queued_dns_uses_canonical_controller_and_raw_owner() {
             b"malformed controller fallback".to_vec()
         )
     );
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 1);
     assert!(matches!(
         fatal.try_recv(),
@@ -587,7 +589,7 @@ async fn queued_dns_rejects_stale_carriers_and_closed_or_reopened_admission() {
         ("alpha-node".into(), b"current admission".to_vec()),
         "no rejected packet may precede the accepted same-flow sentinel"
     );
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
@@ -621,7 +623,7 @@ async fn queued_dns_verdict_failure_cannot_send_ready_raw_or_start_controller() 
         b"sentinel after failure",
         "a failed verdict must not publish into an already-running endpoint"
     );
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
@@ -672,7 +674,7 @@ async fn queued_dns_config_wait_obeys_receipt_deadline_and_admission_drain() {
     )
     .await;
     assert_eq!(sent(&mut received).await.1, b"after drain");
-    assert!(state.udp_pool.shutdown().await);
+    assert!(state.udp_pool.shutdown().await.joined);
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
@@ -737,6 +739,8 @@ async fn direct_dns_carrier_pins_packet_mark_not_latest_tuple_handoff() {
             target,
             first,
             udp_endpoint::queue_now(),
+            #[cfg(feature = "native-api")]
+            None,
         )
         .await
     else {
@@ -751,6 +755,8 @@ async fn direct_dns_carrier_pins_packet_mark_not_latest_tuple_handoff() {
                 target,
                 second,
                 udp_endpoint::queue_now(),
+                #[cfg(feature = "native-api")]
+                None,
             )
             .await,
         UdpSlowPathWork::Done
@@ -764,6 +770,8 @@ async fn direct_dns_carrier_pins_packet_mark_not_latest_tuple_handoff() {
             target,
             second,
             udp_endpoint::queue_now(),
+            #[cfg(feature = "native-api")]
+            None,
         )
         .await
     else {
@@ -783,6 +791,8 @@ async fn direct_dns_carrier_pins_packet_mark_not_latest_tuple_handoff() {
                     target,
                     invalid,
                     udp_endpoint::queue_now(),
+                    #[cfg(feature = "native-api")]
+                    None,
                 )
                 .await,
             UdpSlowPathWork::Done

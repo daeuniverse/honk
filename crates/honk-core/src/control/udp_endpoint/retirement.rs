@@ -2,6 +2,72 @@ use super::*;
 
 const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 
+const ENDPOINT_RELEASED: u8 = 1;
+const DRIVER_RELEASED: u8 = 2;
+
+pub(super) struct RetirementIo {
+    released: watch::Sender<u8>,
+    failed: AtomicBool,
+    pub(super) close: Arc<crate::connection_tracker::CloseSignal>,
+}
+
+impl RetirementIo {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            released: watch::channel(DRIVER_RELEASED).0,
+            failed: AtomicBool::new(false),
+            close: crate::connection_tracker::CloseSignal::new(),
+        })
+    }
+
+    fn release(&self, bit: u8) {
+        self.released.send_modify(|released| *released |= bit);
+    }
+
+    pub(super) fn start_driver(self: &Arc<Self>) -> DriverIoGuard {
+        self.released
+            .send_modify(|released| *released &= !DRIVER_RELEASED);
+        DriverIoGuard {
+            io: Arc::clone(self),
+            completed: false,
+        }
+    }
+
+    async fn wait(&self) -> bool {
+        let mut receiver = self.released.subscribe();
+        tokio::time::timeout(
+            DRIVER_SHUTDOWN_TIMEOUT,
+            receiver.wait_for(|released| *released == (ENDPOINT_RELEASED | DRIVER_RELEASED)),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+            && !self.failed.load(Ordering::Acquire)
+    }
+}
+
+// Last endpoint field: its transport and source reply view have already dropped.
+pub(super) struct EndpointIoGuard(pub(super) Arc<RetirementIo>);
+
+impl Drop for EndpointIoGuard {
+    fn drop(&mut self) {
+        self.0.release(ENDPOINT_RELEASED);
+    }
+}
+
+pub(super) struct DriverIoGuard {
+    io: Arc<RetirementIo>,
+    pub(super) completed: bool,
+}
+
+impl Drop for DriverIoGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.io.failed.store(true, Ordering::Release);
+        }
+        self.io.release(DRIVER_RELEASED);
+    }
+}
+
 /// Why a UDP pool entry went away.  The removal worker retires the flow's
 /// conntrack entries only when userspace owned the datapath.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +92,128 @@ pub(crate) struct EndpointRemoval {
 }
 
 impl UdpEndpointPool {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::control) fn register_ready_tracker(
+        self: &Arc<Self>,
+        client: SocketAddr,
+        dst: SocketAddr,
+        token: u32,
+        generation: u64,
+        endpoint: &Arc<UdpEndpoint>,
+        tracker: &crate::connection_tracker::ConnectionTracker,
+        groups: Vec<String>,
+        make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
+    ) -> Result<Option<String>, ()> {
+        let entry = self
+            .endpoints
+            .get(&EndpointKey::new(client, dst))
+            .ok_or(())?;
+        if !matches!(entry.value(), EndpointEntry::Ready(ready)
+            if ready.generation == generation && ready.decision_token == token
+                && Arc::ptr_eq(&ready.endpoint, endpoint) && ready.alive.load(Ordering::Acquire))
+        {
+            return Err(());
+        }
+        if !tracker.is_enabled() {
+            return Ok(None);
+        }
+        let tracked = make_entry();
+        let id = tracked.id.clone();
+        endpoint.set_tracker(id.clone());
+        tracker.register_owned(
+            tracked,
+            crate::connection_tracker::ConnectionOwner {
+                signal: Arc::clone(&endpoint.retirement.0.close),
+                action: crate::connection_tracker::CloseAction::Udp {
+                    pool: Arc::downgrade(self),
+                    client,
+                    destination: dst,
+                    token,
+                    generation,
+                },
+                groups,
+            },
+        );
+        Ok(Some(id))
+    }
+    pub(crate) fn close_exact(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        token: u32,
+        generation: u64,
+    ) -> bool {
+        let key = EndpointKey::new(client, dst);
+        self.retire_if_same(key, token, generation)
+            || self.endpoints.get(&key).is_some_and(|entry| {
+                matches!(entry.value(), EndpointEntry::Retiring { generation: found, token: observed, .. }
+                    if *found == generation && *observed == token)
+            })
+    }
+
+    pub(in crate::control) async fn wait_removal_io(&self, removal: &EndpointRemoval) -> bool {
+        let io = self
+            .endpoints
+            .get(&EndpointKey::new(removal.client, removal.dst))
+            .and_then(|entry| match entry.value() {
+                EndpointEntry::Retiring {
+                    generation,
+                    token,
+                    io,
+                    ..
+                } if *generation == removal.generation && *token == removal.decision_token => {
+                    io.clone()
+                }
+                _ => None,
+            });
+        match io {
+            Some(io) => io.wait().await,
+            None => true,
+        }
+    }
+
+    pub(in crate::control) fn finish_removal(&self, removal: &EndpointRemoval, success: bool) {
+        let io = self
+            .endpoints
+            .get(&EndpointKey::new(removal.client, removal.dst))
+            .and_then(|entry| match entry.value() {
+                EndpointEntry::Retiring {
+                    generation,
+                    token,
+                    io,
+                    ..
+                } if *generation == removal.generation && *token == removal.decision_token => {
+                    io.clone()
+                }
+                _ => None,
+            });
+        #[cfg(feature = "native-api")]
+        if !success
+            && let Some(entry) = self
+                .endpoints
+                .get(&EndpointKey::new(removal.client, removal.dst))
+            && let EndpointEntry::Retiring {
+                generation,
+                token,
+                native_terminal: Some(terminal),
+                ..
+            } = entry.value()
+            && *generation == removal.generation
+            && *token == removal.decision_token
+        {
+            terminal.cleaned(false);
+        }
+        let acknowledged = success
+            && self.complete_removal(
+                removal.client,
+                removal.dst,
+                removal.decision_token,
+                removal.generation,
+            );
+        if let Some(io) = io {
+            io.close.finish(acknowledged);
+        }
+    }
     pub(crate) fn set_remove_sink(&self, tx: tokio::sync::mpsc::Sender<EndpointRemoval>) {
         *self.remove_sink.lock() = Some(tx);
         self.flush_removal_dirty();
@@ -124,7 +312,25 @@ impl UdpEndpointPool {
                     initializing.cancel();
                 }
                 self.active_retirements.fetch_add(1, Ordering::AcqRel);
-                occupied.insert(EndpointEntry::Retiring { generation, token })
+                let io = match occupied.get() {
+                    EndpointEntry::Ready(ready) => Some(Arc::clone(&ready.endpoint.retirement.0)),
+                    _ => None,
+                };
+                #[cfg(feature = "native-api")]
+                let native_terminal = match occupied.get() {
+                    EndpointEntry::Initializing(initializing) => {
+                        initializing.native_terminal.get().cloned()
+                    }
+                    EndpointEntry::Ready(ready) => ready.endpoint.native.terminal().cloned(),
+                    EndpointEntry::Retiring { .. } => None,
+                };
+                occupied.insert(EndpointEntry::Retiring {
+                    generation,
+                    token,
+                    io,
+                    #[cfg(feature = "native-api")]
+                    native_terminal,
+                })
             }
             _ => return false,
         };
@@ -154,10 +360,22 @@ impl UdpEndpointPool {
             dashmap::mapref::entry::Entry::Occupied(occupied)
                 if matches!(
                     occupied.get(),
-                    EndpointEntry::Retiring { generation: found, token }
+                    EndpointEntry::Retiring { generation: found, token, .. }
                         if *found == generation && *token == decision_token
                 ) =>
             {
+                #[cfg(feature = "native-api")]
+                if let EndpointEntry::Retiring {
+                    native_terminal: Some(terminal),
+                    ..
+                } = occupied.get()
+                {
+                    terminal.cleaned(true);
+                }
+                // A late close must observe completion before the tombstone disappears.
+                if let EndpointEntry::Retiring { io: Some(io), .. } = occupied.get() {
+                    io.close.finish(true);
+                }
                 occupied.remove();
                 true
             }
@@ -264,7 +482,7 @@ impl UdpEndpointPool {
     /// generation-owned slow-path tasks and endpoint drivers. The removal sink
     /// is closed only after task cleanup has completed so its consumer can
     /// drain before the control plane tears down generic background tasks.
-    pub(in crate::control) async fn shutdown(&self) -> bool {
+    pub(in crate::control) async fn shutdown(&self) -> UdpShutdown {
         self.advance_initialization_epoch(true);
         let slow_tasks = {
             let mut tasks = self.slow_tasks.lock();
@@ -281,7 +499,7 @@ impl UdpEndpointPool {
         }
 
         let initializers_graceful = self.wait_for_initializers().await;
-        let slow_tasks_clean = join_registered_tasks(
+        let slow_tasks = join_registered_tasks(
             slow_tasks,
             "slow-path",
             DRIVER_ABORT_TIMEOUT,
@@ -289,7 +507,7 @@ impl UdpEndpointPool {
         )
         .await;
         let initializers_clean =
-            slow_tasks_clean && self.active_initializers.load(Ordering::Acquire) == 0;
+            slow_tasks.joined && self.active_initializers.load(Ordering::Acquire) == 0;
 
         let stale: Vec<(EndpointKey, u32, u64)> = self
             .endpoints
@@ -314,7 +532,7 @@ impl UdpEndpointPool {
             let mut drivers = self.drivers.lock();
             std::mem::take(&mut drivers.tasks)
         };
-        let drivers_clean = join_registered_tasks(
+        let drivers = join_registered_tasks(
             driver_tasks,
             "endpoint driver",
             DRIVER_SHUTDOWN_TIMEOUT,
@@ -328,7 +546,7 @@ impl UdpEndpointPool {
             std::mem::take(&mut tasks.tasks)
         };
         #[cfg(feature = "rprx")]
-        let sources_clean = join_registered_tasks(
+        let sources = join_registered_tasks(
             source_tasks,
             "VLESS source receiver",
             DRIVER_SHUTDOWN_TIMEOUT,
@@ -336,11 +554,22 @@ impl UdpEndpointPool {
         )
         .await;
         #[cfg(not(feature = "rprx"))]
-        let sources_clean = true;
+        let sources = UdpShutdown {
+            joined: true,
+            graceful: true,
+        };
 
         self.drain_removal_dirty().await;
         let retirements_clean = self.wait_for_retirements().await;
         self.remove_sink.lock().take();
-        initializers_clean && drivers_clean && sources_clean && retirements_clean
+        let joined = initializers_clean && drivers.joined && sources.joined && retirements_clean;
+        UdpShutdown {
+            joined,
+            graceful: joined
+                && initializers_graceful
+                && slow_tasks.graceful
+                && drivers.graceful
+                && sources.graceful,
+        }
     }
 }

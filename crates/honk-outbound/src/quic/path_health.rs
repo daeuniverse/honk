@@ -482,7 +482,7 @@ fn quic_path_stall_timeout_from_rtt(rtt: Duration) -> Duration {
 /// Close a shared QUIC path only after repeated send deadlines or a full
 /// no-ACK grace period. Any new packet acknowledgement clears both clocks.
 pub(crate) fn spawn_quic_path_watchdog(conn: Connection, health: Arc<QuicPathHealth>) {
-    tokio::spawn(async move {
+    let _ = crate::runtime::spawn_owned(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + PATH_WATCH_INTERVAL,
             PATH_WATCH_INTERVAL,

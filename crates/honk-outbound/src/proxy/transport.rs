@@ -23,6 +23,18 @@ use crate::proxy::transport::grpc::wrap_grpc;
 use super::AsyncReadWrite;
 use crate::transport_quality::tcp::ObservedTcp;
 
+pub(crate) async fn write_request<W: tokio::io::AsyncWrite + Unpin + ?Sized>(
+    stream: &mut W,
+    request: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let write = async {
+        stream.write_all(request).await?;
+        stream.flush().await
+    };
+    crate::runtime::flow_observation::request_write(std::pin::pin!(write)).await
+}
+
 /// Connect if needed, then apply TLS and `node.transport` wrapping.
 pub(crate) async fn wrap_transport(
     node: &Node,
@@ -85,7 +97,18 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     let cold = tcp.is_none();
     let initial_tcp = async {
         match tcp {
-            Some(tcp) => Ok(tcp),
+            Some(tcp) => {
+                if let Some(observer) = crate::runtime::flow_observation::current() {
+                    observer.publish(
+                        crate::runtime::flow_observation::FlowEvent::TransportAttached {
+                            server_addr: tcp.peer_addr().ok(),
+                            resolution_location:
+                                crate::runtime::flow_observation::ResolutionLocation::Unknown,
+                        },
+                    );
+                }
+                Ok(tcp)
+            }
             None => {
                 let addr = format!("{}:{}", node.host(), node.port);
                 crate::util::connect_outbound(&addr, connect_timeout).await
@@ -134,6 +157,9 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                     Err(error) => return Err(error),
                 };
             tls_stream.get_mut().activate();
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TransportReady,
+            );
             Ok(MaybeTls::Tls(tls_stream))
         };
         return tokio::time::timeout_at(deadline, setup)
@@ -148,9 +174,15 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
         let mut tls_stream = connector.connect(&server_name, tcp).await?;
         tls_stream.get_mut().activate();
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         return Ok(MaybeTls::Tls(tls_stream));
     }
     tcp.activate();
+    crate::runtime::flow_observation::milestone(
+        crate::runtime::flow_observation::Milestone::TransportReady,
+    );
     Ok(MaybeTls::Plain(Box::new(tcp)))
 }
 
@@ -191,10 +223,77 @@ async fn wrap_ws(
         .map_err(|e| anyhow::anyhow!("WebSocket upgrade failed: {}", e))?;
 
     let (client_half, server_half) = tokio::io::duplex(65536);
+    let progress = crate::runtime::flow_observation::current()
+        .map(|_| std::sync::Arc::new(parking_lot::Mutex::new(WsWriteProgress::default())));
 
-    tokio::spawn(ws_bridge_relay(ws_stream, server_half));
+    let _ = crate::runtime::spawn_owned(ws_bridge_relay(ws_stream, server_half, progress.clone()));
 
+    if let Some(progress) = progress {
+        return Ok(Box::new(ObservedWs {
+            inner: client_half,
+            progress,
+        }));
+    }
     Ok(Box::new(client_half))
+}
+
+#[derive(Debug, Default)]
+struct WsWriteProgress {
+    accepted: u64,
+    flushed: u64,
+    request: Option<(crate::runtime::flow_observation::RequestWrite, u64)>,
+}
+
+#[derive(Debug)]
+struct ObservedWs {
+    inner: tokio::io::DuplexStream,
+    progress: std::sync::Arc<parking_lot::Mutex<WsWriteProgress>>,
+}
+
+impl tokio::io::AsyncRead for ObservedWs {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedWs {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let mut progress = this.progress.lock();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(size)) = result {
+            progress.accepted += size as u64;
+            if size != 0
+                && let Some(request) = crate::runtime::flow_observation::RequestWrite::current()
+            {
+                request.defer(progress.accepted);
+                progress.request = Some((request, progress.accepted));
+            }
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Background task that bridges a WebSocket stream to a duplex half.
@@ -204,6 +303,7 @@ async fn wrap_ws(
 async fn ws_bridge_relay(
     ws: tokio_tungstenite::WebSocketStream<Box<dyn AsyncReadWrite>>,
     server: tokio::io::DuplexStream,
+    progress: Option<std::sync::Arc<parking_lot::Mutex<WsWriteProgress>>>,
 ) {
     let (mut ws_sink, mut ws_stream) = ws.split();
     let (mut server_read, mut server_write) = tokio::io::split(server);
@@ -226,6 +326,20 @@ async fn ws_bridge_relay(
                 ))
                 .await
                 .map_err(|e| anyhow::anyhow!("ws bridge send: {}", e))?;
+            if let Some(progress) = &progress {
+                let delivered = {
+                    let mut progress = progress.lock();
+                    progress.flushed += n as u64;
+                    progress
+                        .request
+                        .as_ref()
+                        .filter(|(_, end)| *end <= progress.flushed)
+                        .map(|(request, _)| (request.clone(), progress.flushed))
+                };
+                if let Some((request, position)) = delivered {
+                    request.delivered(position);
+                }
+            }
         }
         let _ = ws_sink.close().await;
         Ok::<_, anyhow::Error>(())

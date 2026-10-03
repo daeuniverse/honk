@@ -8,18 +8,18 @@
 
 use honk_config::Config;
 use honk_config::dns::{DnsConfig, DnsRouting};
-use honk_config::experimental::CacheFileConfig;
+use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
-use honk_core::cachedb::CacheDb;
+use honk_config::types::NodeProtocol;
 use honk_core::clash_api::{self, ClashState};
-use honk_core::connection_tracker::{ConnectionEntry, ConnectionTracker};
+use honk_core::connection_tracker::ConnectionEntry;
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
 use honk_core::dns::routing::DnsRouter;
-use honk_core::mode::{DatapathFlagsHandle, ModeState};
-use honk_core::stats::StatsManager;
-use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use honk_outbound::group::GroupManager;
+use honk_core::mode::ModeState;
+use honk_core::state::StateDb;
+use honk_core::state::cache::CacheDb;
+use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::proxy::ProxyRegistry;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,10 +65,17 @@ struct TestApp {
     addr: SocketAddr,
     state: Arc<ClashState>,
     log_dispatch: tracing::Dispatch,
-    db_path: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
     /// Every `set_datapath_flags` value the mock backend received.
     ebpf_datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
+    control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
     _tmp: tempfile::TempDir,
+}
+
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        self.control_task.abort();
+    }
 }
 
 impl TestApp {
@@ -127,40 +134,19 @@ async fn spawn_app(secret: &str, external_ui: &str) -> TestApp {
     spawn_app_with_config(test_config(), secret, external_ui).await
 }
 
-async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) -> TestApp {
+async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &str) -> TestApp {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("cache.db");
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: db_path.to_str().unwrap().to_string(),
-        ..Default::default()
-    };
-    let db = Arc::new(CacheDb::open(&cache_cfg).expect("cache.db opens"));
-
-    let alive_set = Arc::new(AliveDialerSet::new());
-    let group_manager =
-        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
-    // Wire the same persistence the control plane installs in production.
-    {
-        let db_cb = db.clone();
-        group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
-            db_cb.save_selector_choice(group, node);
-        })));
-    }
-    let group_manager = group_manager.into_shared();
-
+    let data_dir = tmp.path().to_path_buf();
+    config.experimental.cache_file.enabled = Some(true);
+    config.global.nfqueue_enable = false;
     let (log_layer, log_handle) = clash_api::logs::layer();
     let log_dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log_layer));
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let dns_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+    let forwarder = Arc::new(test_dns_forwarder(
         dns_cache,
         a_record_response([93, 184, 216, 34], 300),
-    )));
-    let stats = Arc::new(StatsManager::new());
-    let connection_tracker = Arc::new(ConnectionTracker::new());
-    let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
-        .unwrap()
-        .into_shared();
+    ));
+    let resolver = honk_core::dns::DnsResolver::new(&config.dns).unwrap();
     let traffic_router =
         honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
             .unwrap();
@@ -168,33 +154,47 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
     mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
     let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy")));
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn honk_core::ebpf::EbpfBackend>>> =
-        Arc::new(tokio::sync::RwLock::new(Box::new(mock_ebpf)));
-    let datapath_flags =
-        DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
+    let mut control = honk_core::control::ControlPlane::new(
+        config,
+        Box::new(mock_ebpf),
+        traffic_router,
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
+    control
+        .init_cache_db(Some(Arc::new(StateDb::open(&data_dir).unwrap())), None)
+        .await;
+    control.set_mode_state(Arc::clone(&mode_state));
+    control.start_datapath_flags_coordinator().unwrap();
+    let datapath_flags = control.datapath_flags_handle().unwrap();
     datapath_flags.initialize(false, false).await.unwrap();
+    let stats = control.stats_handle();
+    let connection_tracker = control.connection_tracker();
     let state = Arc::new(ClashState {
-        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
-        stats: stats.clone(),
-        alive_set,
-        group_manager,
-        cache_db: Some(db),
-        connection_tracker: connection_tracker.clone(),
-        proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
-        runtime_registry,
+        config: control.config_handle(),
+        stats: Arc::clone(&stats),
+        alive_set: control.alive_set(),
+        group_manager: control.group_manager(),
+        cache_db: control.cache_db(),
+        connection_tracker: Arc::clone(&connection_tracker),
+        proxy_registry: control.proxy_registry(),
+        runtime_registry: control.runtime_registry(),
         mode_state,
         datapath_flags,
-        diagnostics: Arc::new(parking_lot::RwLock::new(
-            honk_core::config_diagnostics::ActiveDiagnostics::default(),
-        )),
+        control: Some(control.control_client()),
+        ui_download: control.ui_download_handle(),
+        diagnostics: control.diagnostics_handle(),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
-        router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
+        router: control.traffic_router(),
         log_handle,
-        dns_service,
-        connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
+        dns_service: control.dns_service(),
+        connection_pool: control.connection_pool(),
         stream_samplers: Arc::new(clash_api::StreamSamplers::new()),
     });
+    let control_task = tokio::spawn(async move { control.serve_control_commands().await });
 
     let app = clash_api::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -211,8 +211,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         addr,
         state,
         log_dispatch,
-        db_path,
+        data_dir,
         ebpf_datapath_flags_writes,
+        control_task,
         _tmp: tmp,
     }
 }
@@ -275,6 +276,7 @@ async fn test_auth_secret_enforced() {
 async fn test_rules_aggregate_simple_and_preserve_complex() {
     let config = honk_config::parser::parse_dae_config(
         r#"
+group { proxy {} }
 routing {
     sip(10.10.10.24/32,
         10.10.10.25/32
@@ -372,7 +374,7 @@ async fn test_selector_switch_releases_the_group_manager_lock() {
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();
-    app.state.mode_state.write().global_selection = "Proxy".to_string();
+    *app.state.mode_state.write() = ModeState::new("Rule", "Proxy");
 
     let body: serde_json::Value = client
         .get(app.url("/proxies"))
@@ -429,10 +431,6 @@ async fn test_proxies_structure_and_selector_switch() {
         .await
         .unwrap();
     assert_eq!(body["proxies"]["proxy"]["now"], "node-b");
-
-    // The persist callback must have written cache.db.
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
 
     // Unknown member → 400.
     let resp = client
@@ -522,13 +520,13 @@ async fn test_score_proxy_contract_and_put_rejection() {
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
-    assert_eq!(
+    assert!(
         app.state
             .cache_db
             .as_ref()
             .unwrap()
-            .load_selector_choice("auto"),
-        None
+            .load_network_selector("auto", honk_outbound::group::SelectionNetwork::Tcp)
+            .is_none()
     );
     let body: serde_json::Value = client
         .get(app.url("/proxies/auto"))
@@ -542,12 +540,153 @@ async fn test_score_proxy_contract_and_put_rejection() {
 }
 
 #[tokio::test]
+async fn test_automatic_group_pin_is_reported_as_now() {
+    use honk_outbound::group::{SelectorMember, SelectorNetworks};
+
+    let (a, b) = (make_node("node-a"), make_node("node-b"));
+    for policy in [
+        GroupPolicy::URLTest,
+        GroupPolicy::Fallback,
+        GroupPolicy::LoadBalance,
+        GroupPolicy::Score,
+    ] {
+        let app = spawn_app_with_config(
+            Config {
+                nodes: vec![a.clone(), b.clone()],
+                groups: vec![Group {
+                    name: "auto".into(),
+                    policy,
+                    nodes: vec![a.id, b.id],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "",
+            "",
+        )
+        .await;
+        let client = http_client();
+        let now = || async {
+            let body: serde_json::Value = client
+                .get(app.url("/proxies"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let single: serde_json::Value = client
+                .get(app.url("/proxies/auto"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(body["proxies"]["auto"]["now"], single["now"], "{policy:?}");
+            single["now"].clone()
+        };
+        let before = now().await;
+        let manager = app.state.group_manager.read().clone();
+        manager
+            .publish_override("auto", &SelectorMember::Node(b.id), SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(now().await, "node-b", "{policy:?}");
+        manager
+            .clear_override("auto", SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(now().await, before, "{policy:?}");
+    }
+}
+
+#[tokio::test]
 async fn score_stats_are_authenticated_deterministic_and_private() {
     use honk_outbound::group::{ScoreSelectionContext, ScoreTarget, SelectionNetwork};
 
     let fixture = include_str!("fixtures/score_stats_manual.dae");
 
-    let config = honk_config::parser::parse_dae_config(fixture).unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = honk_config::parser::parse_dae_config(&fixture.replace(
+        "__HONK_SCORE_QA_DATA_DIR__",
+        data_dir.path().to_str().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        config.experimental.clash_api.external_controller,
+        "127.0.0.1:19090"
+    );
+    assert_eq!(config.experimental.clash_api.secret, "score-review-secret");
+    assert_eq!(config.global.lan_interface, ["lo"]);
+    assert_eq!(config.global.wan_interface, ["lo"]);
+    assert_eq!(config.global.log_level, "info");
+    assert!(!config.global.auto_config_kernel_parameter);
+    assert!(!config.global.nfqueue_enable);
+    assert_eq!(config.routing.default_outbound, "direct");
+    assert_eq!(
+        config
+            .groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect::<Vec<_>>(),
+        ["z-score", "a-score"]
+    );
+    assert!(
+        config
+            .groups
+            .iter()
+            .all(|group| group.policy == GroupPolicy::Score)
+    );
+    assert_eq!(
+        config
+            .nodes
+            .iter()
+            .map(|node| {
+                let socks = node.socks5().unwrap();
+                (
+                    node.name.as_str(),
+                    node.protocol(),
+                    node.address.as_str(),
+                    node.port,
+                    socks.username.as_deref(),
+                    socks.password.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            (
+                "private-node-alpha",
+                NodeProtocol::Socks5,
+                "private-node-alpha.invalid:16543",
+                16543,
+                Some("private-user"),
+                Some("private-pass"),
+            ),
+            (
+                "private-node-beta",
+                NodeProtocol::Socks5,
+                "203.0.113.88:26543",
+                26543,
+                Some("private-user-2"),
+                Some("private-pass-2"),
+            ),
+        ]
+    );
+    let expected_members: std::collections::HashSet<_> =
+        config.nodes.iter().map(|node| node.id).collect();
+    for group in &config.groups {
+        assert_eq!(
+            group
+                .nodes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected_members,
+            "{} must resolve exactly the two fixture nodes",
+            group.name
+        );
+    }
 
     let selector = spawn_app("", "").await;
     let selector_stats: serde_json::Value = http_client()
@@ -824,8 +963,6 @@ async fn test_put_and_patch_without_content_type() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
 
     let resp = client
         .patch(app.url("/configs"))
@@ -915,9 +1052,7 @@ async fn test_configs_additive_safe_diagnostics_snapshot() {
     );
 }
 
-/// Parent selector containing a sub-group: the sub-group tag appears in
-/// `all`, is a valid PUT target (persisted + restored on "restart"), and
-/// the selection chain resolves through it to the leaf.
+/// Nested Selector membership is layer-local; reachable leaves are not direct members.
 #[tokio::test]
 async fn test_nested_group_selector_via_api() {
     let (a, b, c) = (
@@ -991,35 +1126,6 @@ async fn test_nested_group_selector_via_api() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-
-    // The persist callback wrote the sub-group tag to cache.db.
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("parent").as_deref(), Some("sub"));
-
-    // "Restart": rebuild the manager from the same config and restore the
-    // persisted choices exactly like ControlPlane::init_cache_db does.
-    let restored = GroupManager::with_alive_set(
-        &config.groups,
-        &config.nodes,
-        Some(app.state.alive_set.clone()),
-    );
-    for group in &config.groups {
-        if group.policy == honk_config::group::GroupPolicy::Selector
-            && let Some(choice) = db.load_selector_choice(&group.name)
-        {
-            restored.set_selector_choice(&group.name, &choice);
-        }
-    }
-    assert_eq!(
-        restored.get_selector_choice("parent").as_deref(),
-        Some("sub")
-    );
-    // The restored choice drives selection: parent → sub → sub's leaf.
-    assert_eq!(restored.select_node("parent").unwrap().name, "node-b");
-    assert_eq!(
-        restored.selection_chain("parent"),
-        vec!["parent", "sub", "node-b"]
-    );
 }
 
 #[tokio::test]
@@ -1035,7 +1141,7 @@ async fn test_global_selection_and_mode_persisted() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert_eq!(app.state.mode_state.read().global_selection, "proxy");
+    assert_eq!(app.state.mode_state.read().global_selection(), "proxy");
 
     // Virtual and unknown GLOBAL targets do not resolve.
     for invalid in ["Proxy", "nope"] {
@@ -1089,22 +1195,17 @@ async fn test_global_selection_and_mode_persisted() {
 
     // Point writes are acknowledged from the in-memory pending map and become
     // crash-durable on the bounded background flush.
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: app.db_path.to_str().unwrap().to_string(),
-        ..Default::default()
-    };
-    let reopened = CacheDb::open(&cache_cfg).unwrap();
+    let reopened = CacheDb::open(Arc::new(StateDb::open(&app.data_dir).unwrap())).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         if reopened.load_clash_mode().as_deref() == Some("Global")
-            && reopened.load_selector_choice("GLOBAL").as_deref() == Some("proxy")
+            && reopened.load_clash_global().as_deref() == Some("proxy")
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "cache.db point-write durability bound exceeded"
+            "state db point-write durability bound exceeded"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1165,6 +1266,10 @@ async fn test_connections_snapshot_and_delete() {
         source: "10.0.0.2:12345".into(),
         destination: "142.250.72.14:443".into(),
         proxy: "proxy".into(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "suffix".into(),
         rule_payload: "example.com".into(),
         chains: vec!["node-a".into(), "hk".into(), "proxy".into()],
@@ -1182,6 +1287,10 @@ async fn test_connections_snapshot_and_delete() {
         source: "[2001:db8::10]:4321".into(),
         destination: "[2001:db8::20]:443".into(),
         proxy: "proxy".into(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Match".into(),
         rule_payload: String::new(),
         chains: vec!["node-a".into(), "proxy".into()],
@@ -1235,13 +1344,13 @@ async fn test_connections_snapshot_and_delete() {
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
-    // DELETE the single connection.
+    // Metadata without an owning transport cannot claim successful closure.
     let resp = client
         .delete(app.url(&format!("/connections/{}", id)))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 409);
     let body: serde_json::Value = client
         .get(app.url("/connections"))
         .send()
@@ -1251,8 +1360,8 @@ async fn test_connections_snapshot_and_delete() {
         .await
         .unwrap();
     let remaining = body["connections"].as_array().unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0]["id"], "conn-2");
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|row| row["id"] == id));
 }
 
 /// Plaintext HTTP server answering 204 to everything.
@@ -1320,6 +1429,61 @@ async fn test_group_delay_omits_failed_members() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn delay_owner_errors_distinguish_saturation_stop_and_failure() {
+    use honk_outbound::alive::HealthCheckError;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let app = spawn_app("", "").await;
+        let owner = &app.state.alive_set;
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut jobs = Vec::new();
+        for _ in 0..10 {
+            let owner = Arc::clone(owner);
+            let started = started.clone();
+            jobs.push(tokio::spawn(async move {
+                owner
+                    .run_external_probe(move |cancel| async move {
+                        started.send(()).unwrap();
+                        cancel.cancelled().await;
+                    })
+                    .await
+            }));
+            starts.recv().await.unwrap();
+        }
+        let client = http_client();
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::Busy.to_string());
+        }
+        owner.shutdown_health_checks().await.unwrap();
+        for job in jobs {
+            job.await.unwrap().unwrap();
+        }
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::Stopped.to_string());
+        }
+
+        let failed = spawn_app("", "").await;
+        let permit = failed.state.alive_set.acquire_health_probe().unwrap();
+        permit.cancellation().report_cleanup_failure();
+        drop(permit);
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(failed.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::WorkerFailed.to_string());
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1480,6 +1644,26 @@ async fn node_delay_failures_return_503_without_advancing_real_dial_streaks() {
 
 #[tokio::test]
 async fn node_delay_resolver_refusal_does_not_demote_node() {
+    const ISOLATED: &str = "HONK_CLASH_REFUSAL_ISOLATED";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node_delay_resolver_refusal_does_not_demote_node",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let app = spawn_app("", "").await;
     honk_outbound::urltest::set_urltest_resolver(Arc::new(|host, port| {
         Box::pin(async move {
             if host == "packet-refusal.invalid" {
@@ -1490,7 +1674,6 @@ async fn node_delay_resolver_refusal_does_not_demote_node() {
                 .collect())
         })
     }));
-    let app = spawn_app("", "").await;
     app.state.alive_set.record_probe_latency(
         make_node("node-a").id,
         ProbeDomain::Tcp,
@@ -1597,23 +1780,31 @@ async fn test_cache_flush_endpoints() {
     let client = http_client();
 
     let db = app.state.cache_db.as_ref().unwrap();
-    db.set("fakeip:198.18.0.1", "example.com");
-    assert!(db.get("fakeip:198.18.0.1").is_some());
+    db.save_clash_global("node-a");
 
+    // Nothing persists FakeIP mappings; the flush is accepted and touches nothing.
     let resp = client
         .post(app.url("/cache/fakeip/flush"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert!(db.get("fakeip:198.18.0.1").is_none());
-    // Unrelated keys survive the prefix flush.
-    db.save_selector_choice("proxy", "node-a");
-    assert!(db.load_selector_choice("proxy").is_some());
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
 
     // DNS cache flush clears both the in-memory cache and persisted answers.
     let now = honk_core::dns::persist::unix_now();
-    db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
+    let sqlite = rusqlite::Connection::open(app.data_dir.join("state/honk.db")).unwrap();
+    sqlite
+        .execute(
+            "INSERT INTO dns_answer (key, expire_at, entry) VALUES ('k', ?1, x'00')",
+            [now as i64 + 300],
+        )
+        .unwrap();
+    let persisted = || -> i64 {
+        sqlite
+            .query_row("SELECT count(*) FROM dns_answer", [], |row| row.get(0))
+            .unwrap()
+    };
     app.state
         .dns_service
         .cache()
@@ -1629,7 +1820,7 @@ async fn test_cache_flush_endpoints() {
             .get("example.com:1")
             .is_some()
     );
-    assert_eq!(db.load_dns_answers(now).len(), 1);
+    assert_eq!(persisted(), 1);
 
     let resp = client
         .post(app.url("/cache/dns/flush"))
@@ -1646,9 +1837,9 @@ async fn test_cache_flush_endpoints() {
             .get("example.com:1")
             .is_none()
     );
-    assert!(db.load_dns_answers(now).is_empty());
-    // The selector choice is untouched by the DNS flush.
-    assert!(db.load_selector_choice("proxy").is_some());
+    assert_eq!(persisted(), 0);
+    // Clash state is untouched by the DNS flush.
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
 }
 
 #[tokio::test]
@@ -1701,7 +1892,7 @@ async fn test_traffic_ws_with_token_auth() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
         let stats = &app.state.stats;
-        stats.record_bytes("proxy", 500, 1500);
+        stats.record_bytes("proxy", honk_core::stats::OutboundKind::Node, 500, 1500);
     }
 
     use futures::StreamExt;
@@ -1792,6 +1983,10 @@ async fn test_connections_ws_stream() {
         source: "10.0.0.3:5555".into(),
         destination: "1.1.1.1:443".into(),
         proxy: "proxy".into(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Match".into(),
         rule_payload: String::new(),
         chains: vec!["node-a".into(), "proxy".into()],
@@ -1930,6 +2125,8 @@ async fn test_dns_query_upstream_and_nxdomain() {
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
         datapath_flags: app.state.datapath_flags.clone(),
+        control: app.state.control.clone(),
+        ui_download: app.state.ui_download.clone(),
         diagnostics: app.state.diagnostics.clone(),
         secret: String::new(),
         external_ui: String::new(),
@@ -2039,14 +2236,7 @@ async fn test_proxy_providers_structure() {
 #[tokio::test]
 async fn test_store_dns_persister_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("cache.db");
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: db_path.to_str().unwrap().to_string(),
-        store_dns: true,
-        ..Default::default()
-    };
-    let db = Arc::new(CacheDb::open(&cache_cfg).unwrap());
+    let db = Arc::new(CacheDb::open(Arc::new(StateDb::open(tmp.path()).unwrap())).unwrap());
 
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_config = DnsConfig::default();
@@ -2074,8 +2264,6 @@ async fn test_store_dns_persister_end_to_end() {
     persister.shutdown().await.expect("persistence shutdown");
     assert_eq!(persister.counters().written, 1);
 
-    let now = honk_core::dns::persist::unix_now();
-    db.save_dns_answer("legacy.example", 1, r#"{"r":"TEVHQUNZ"}"#, now + 300);
     let fresh_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let restart = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
@@ -2095,11 +2283,6 @@ async fn test_store_dns_persister_end_to_end() {
         .unwrap();
     assert_eq!(resp, a_record_response([1, 2, 3, 4], 300));
     restart.shutdown().await.expect("restart shutdown");
-    assert_eq!(
-        db.load_dns_answers(now).len(),
-        1,
-        "v2 restart must leave rollback-compatible legacy rows untouched"
-    );
 }
 
 #[tokio::test]

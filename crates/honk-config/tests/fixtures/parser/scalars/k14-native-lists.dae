@@ -1,0 +1,11 @@
+global {
+    lan_interface: 'eth0', 'eth1', 'eth2'
+}
+experimental {
+    native_api {
+        enabled: true
+        secret: 'token'
+        allow_origins: 'http://one.example', 'http://two.example', 'http://three.example'
+        allowed_hosts: 'one.example', 'two.example', 'three.example'
+    }
+}

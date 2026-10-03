@@ -4,8 +4,9 @@ use aya::programs::{CgroupSock, CgroupSockAddr};
 use honk_ebpf_common::DaeParam;
 use std::convert::TryInto;
 
-const VMLINUX_BTF_PATHS: [&str; 2] = ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
-const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
+pub(super) const VMLINUX_BTF_PATHS: [&str; 2] =
+    ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
+pub(super) const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PnameCaptureMode {

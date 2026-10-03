@@ -146,6 +146,7 @@ impl ScorePolicyState {
             return None;
         }
         let mut inner = self.inner.lock();
+        observation::metric("score_utility", None);
         let authorized = authority.is_some_and(|authority| {
             inner
                 .active_authority
@@ -154,8 +155,12 @@ impl ScorePolicyState {
         }) && inner.valid_groups.contains(group);
         if !authorized || origins.preview {
             let view = comparison::View::new(&inner, group, context, nodes, now);
-            return ordinary_decision(&view, origins, authorized && origins.preview)
-                .map(|(decision, _)| (decision.ordinary.index, None));
+            return ordinary_decision(&view, origins, authorized && origins.preview).map(
+                |(decision, _)| {
+                    observe_reason(decision.ordinary.reason);
+                    (decision.ordinary.index, None)
+                },
+            );
         }
         let mut decision = decision(&inner, group, context, nodes, origins, now, true)?;
         let mut set = decision
@@ -240,6 +245,21 @@ impl ScorePolicyState {
                 selection.reason,
             );
         }
+        observe_reason(selection.reason);
         Some((selection.index, reservation))
     }
+}
+
+fn observe_reason(reason: SelectionReason) {
+    observation::reason(match reason {
+        SelectionReason::ColdExplore => "cold_explore",
+        SelectionReason::PeriodicExplore => "periodic_explore",
+        SelectionReason::ReliabilityWinner => "reliability_winner",
+        SelectionReason::PerformanceWinner => "performance_winner",
+        SelectionReason::IncumbentHeld => "incumbent_held",
+        SelectionReason::InsufficientEvidenceHeld => "insufficient_evidence_held",
+        SelectionReason::DirectionalTradeoffHeld => "directional_tradeoff_held",
+        SelectionReason::IncumbentIneligible => "incumbent_ineligible",
+        SelectionReason::FreshFailureBypass => "fresh_failure_bypass",
+    });
 }

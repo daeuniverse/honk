@@ -10,6 +10,7 @@ const MAX_PREFETCH_TASKS: usize = 32;
 
 struct Registry {
     closed: bool,
+    failed: bool,
     tasks: JoinSet<()>,
 }
 
@@ -45,6 +46,7 @@ impl PrefetchTasks {
         Self {
             registry: Mutex::new(Registry {
                 closed,
+                failed: false,
                 tasks: JoinSet::new(),
             }),
             active: Arc::new(AtomicUsize::new(0)),
@@ -54,7 +56,9 @@ impl PrefetchTasks {
 
     pub(super) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
         let mut registry = self.registry.lock();
-        while registry.tasks.try_join_next().is_some() {}
+        while let Some(result) = registry.tasks.try_join_next() {
+            registry.failed |= result.is_err_and(|error| !error.is_cancelled());
+        }
         if registry.closed || self.active.load(Ordering::Acquire) >= MAX_PREFETCH_TASKS {
             return false;
         }
@@ -64,6 +68,8 @@ impl PrefetchTasks {
             active: Arc::clone(&self.active),
             idle: Arc::clone(&self.idle),
         };
+        #[cfg(feature = "native-api")]
+        let task = honk_outbound::runtime::TaskScope::capture().scope_owned(task);
         registry.tasks.spawn(async move {
             let _active = active;
             task.await;
@@ -71,14 +77,23 @@ impl PrefetchTasks {
         true
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(super) fn request_shutdown(&self) {
+        let mut registry = self.registry.lock();
+        registry.closed = true;
+        registry.tasks.abort_all();
+    }
+
+    pub(super) async fn shutdown(&self) -> bool {
         let mut tasks = {
             let mut registry = self.registry.lock();
             registry.closed = true;
             std::mem::take(&mut registry.tasks)
         };
         tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        while let Some(result) = tasks.join_next().await {
+            self.registry.lock().failed |= result.is_err_and(|error| !error.is_cancelled());
+        }
+        !self.registry.lock().failed
     }
 
     #[cfg(test)]
@@ -116,6 +131,17 @@ mod tests {
         tasks.shutdown().await;
 
         assert!(!tasks.spawn(async {}), "closed registry must reject");
+        assert_eq!(tasks.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_background_failure_survives_reaping_until_shutdown() {
+        let tasks = PrefetchTasks::new();
+        assert!(tasks.spawn(async { panic!("injected prefetch failure") }));
+        tasks.wait_empty().await;
+        assert!(tasks.spawn(pending()));
+        tasks.request_shutdown();
+        assert!(!tasks.shutdown().await);
         assert_eq!(tasks.active(), 0);
     }
 }

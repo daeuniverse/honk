@@ -92,17 +92,6 @@ impl DnsEndpoint {
         self
     }
 
-    /// Resolve host to the first address allowed by the configured strategy.
-    pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
-        self.resolve_addrs()
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
-            })
-    }
-
     /// Resolve host to every allowed candidate, preferred family first.
     ///
     /// Dialers iterate this list so failure in the preferred family can fall
@@ -123,7 +112,9 @@ impl DnsEndpoint {
         } else {
             let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
                 .await
-                .map_err(|e| anyhow::anyhow!("bootstrap resolve '{}': {}", self.host, e))?;
+                .map_err(|error| {
+                    anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
+                })?;
             if ips.is_empty() {
                 anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
             }

@@ -13,6 +13,7 @@ tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 rand.workspace = true
 uuid.workspace = true
 sha1.workspace = true
@@ -64,6 +65,8 @@ tokio-rustls.workspace = true
 # descriptor facts stay unconditional; normal feature-off builds have neither
 # handlers nor VLESS runtime pools/carrier semaphores. Unit backend tests remain.
 rprx = []
+flow-observation = []
+owned-tasks = []
 
 [[bench]]
 name = "ss_aead"

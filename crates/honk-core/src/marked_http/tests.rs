@@ -100,8 +100,10 @@ fn marked_downloads_netns() {
             let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
             let target = std::net::SocketAddr::new(address.parse().unwrap(), listener.local_addr().unwrap().port());
             assert!(tokio::net::TcpStream::connect(target).await.is_err(), "unmarked dial must have no route");
+            // The direct fetch, the routed fetch when built, and the archive download.
+            let requests = if cfg!(feature = "native-api") { 3 } else { 2 };
             let server = tokio::spawn(async move {
-                for _ in 0..2 {
+                for _ in 0..requests {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut headers = Vec::new();
                     let mut byte = [0];
@@ -114,15 +116,44 @@ fn marked_downloads_netns() {
                     stream.write_all(response.as_bytes()).await.unwrap();
                 }
             });
-            let sub = honk_config::subscription::Subscription { url: format!("http://{target}/subscription"), ..Default::default() };
+            let sub = honk_config::subscription::Subscription { url: format!("http://{target}/subscription"), download_detour: "direct".into(), ..Default::default() };
             let nodes = crate::subscription::SubscriptionManager::new().unwrap().fetch(&sub).await.unwrap();
             assert_eq!(nodes[0].name, "marked");
+            // An empty detour leaves the fetch to routing, whose fallback here is `direct`.
+            #[cfg(feature = "native-api")]
+            {
+                let manager = crate::subscription::SubscriptionManager::new().unwrap();
+                manager.route_through(direct_routing());
+                let sub = honk_config::subscription::Subscription { download_detour: String::new(), ..sub };
+                assert_eq!(manager.fetch(&sub).await.unwrap()[0].name, "marked");
+            }
             let url = reqwest::Url::parse(&format!("http://{target}/archive")).unwrap();
             let response = super::Client::new().unwrap().get(&url, &http::HeaderMap::new(), Duration::from_secs(1)).await.unwrap();
-            assert_eq!(response.bytes().await.unwrap().as_ref(), b"socks5://127.0.0.1:1080#marked");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let reply = super::read(response, |_, _| true, deadline.into(), 64).await.unwrap();
+            assert_eq!(&*reply.body, b"socks5://127.0.0.1:1080#marked");
             server.await.unwrap();
         }
     });
+}
+
+#[cfg(all(target_os = "linux", feature = "native-api"))]
+fn direct_routing() -> crate::download_route::SharedOutbounds {
+    use std::sync::Arc;
+    let config = honk_config::Config::default();
+    crate::download_route::SharedOutbounds {
+        router: Arc::new(tokio::sync::RwLock::new(
+            crate::routing::Router::new(&[], "direct").unwrap(),
+        )),
+        group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::group::GroupManager::new(&config.groups, &config.nodes),
+        ))),
+        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
+        proxy_registry: Arc::new(honk_outbound::proxy::ProxyRegistry::new()),
+        runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
+        ))),
+    }
 }
 
 async fn credential_request(headers: &http::HeaderMap) -> String {
@@ -185,4 +216,55 @@ async fn explicit_authorization_overrides_url_credentials() {
         .filter_map(|line| line.strip_prefix("authorization: "))
         .collect();
     assert_eq!(authorization, ["Bearer explicit"]);
+}
+
+/// Answers one GET over an in-memory stream with `response`, read with a
+/// four-byte cap.
+async fn capped(response: &'static [u8]) -> Result<std::sync::Arc<[u8]>, &'static str> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let Ok(byte) = server.read_u8().await else {
+                return;
+            };
+            head.push(byte);
+        }
+        let _ = server.write_all(response).await;
+    });
+    let url = reqwest::Url::parse("http://capped.example/file").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let prepared = super::Client::new()
+        .unwrap()
+        .prepare_over(Box::new(client), &url, &http::HeaderMap::new(), deadline)
+        .await
+        .map_err(|error| error.stage)?;
+    let response = super::send(prepared).await.map_err(|error| error.stage)?;
+    Ok(super::read(response, |_, _| true, deadline.into(), 4)
+        .await
+        .map_err(|error| error.stage)?
+        .body)
+}
+
+/// Declared and chunked bodies alike may fill the cap but not pass it.
+#[tokio::test]
+async fn a_body_may_fill_the_cap_but_not_pass_it() {
+    for (response, expected) in [
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n1234".as_slice(), Ok(b"1234".as_slice())),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345".as_slice(), Err("asset_too_large")),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n1234\r\n0\r\n\r\n".as_slice(),
+            Ok(b"1234".as_slice()),
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n1234\r\n1\r\n5\r\n0\r\n\r\n"
+                .as_slice(),
+            Err("asset_too_large"),
+        ),
+    ] {
+        let body = capped(response).await;
+        let body = body.as_deref().map_err(|stage| *stage);
+        assert_eq!(body, expected, "{}", String::from_utf8_lossy(response));
+    }
 }

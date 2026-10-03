@@ -244,6 +244,7 @@ fn netns_tcp_dns_queued_must_handoff_cannot_alias_reordered_group() {
                     &DrainTracker::new(),
                 )
                 .await
+                .accepted()
         );
         let result = tokio::time::timeout(
             Duration::from_secs(3),
@@ -319,6 +320,7 @@ fn netns_tcp_dns_must_keeps_pinned_node_and_runtime_across_reload() {
                     &DrainTracker::new(),
                 )
                 .await
+                .accepted()
         );
 
         client.write_all(&wire[2..]).await?;

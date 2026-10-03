@@ -82,6 +82,7 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
         1,
         1,
         1,
+        false,
         None,
     )
     .unwrap()
@@ -228,6 +229,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
             8,
             8,
             1,
+            cfg!(feature = "flow-observation"),
             None,
         )
         .unwrap()
@@ -272,6 +274,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
             8,
             8,
             1,
+            cfg!(feature = "flow-observation"),
             Some(&generation),
         )
         .unwrap();
@@ -329,6 +332,12 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
     assert!(!pool.is_warm_retained());
     assert_eq!(pool.live_session_count(), 0);
     replacement.shutdown().await;
+    #[cfg(feature = "flow-observation")]
+    drop(
+        runtime
+            .acquire_vless_carrier()
+            .expect("joined H2 driver must already release its carrier"),
+    );
     let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             if let Ok(permit) = runtime.acquire_vless_carrier() {
@@ -353,6 +362,7 @@ async fn cool_c8_opens_seventeen_tcp_children_on_three_global_carriers() {
             8,
             8,
             3,
+            false,
             None,
         )
         .unwrap()
@@ -429,7 +439,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
         node.id = node.derive_id();
     }
     let registry = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
-        &nodes, 8, 8, 3, None,
+        &nodes, 8, 8, 3, false, None,
     )
     .unwrap()
     .0;
@@ -460,7 +470,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
     pools[1].set_warm_retained(true);
     let active_child = sessions[2].try_reserve().unwrap();
 
-    assert_eq!(registry.reap_idle_resources(std::time::Instant::now()), 1);
+    assert_eq!(registry.reap_idle_resources(), 1);
     assert!(sessions[0].is_closed());
     assert!(!sessions[1].is_closed());
     assert!(!sessions[2].is_closed());

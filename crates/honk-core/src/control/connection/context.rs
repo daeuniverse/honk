@@ -23,6 +23,8 @@ impl Drop for ConnectionGuard {
 #[derive(Clone)]
 pub(in crate::control) struct ControlPlaneHandle {
     pub(in crate::control) config: Arc<RwLock<Arc<Config>>>,
+    pub(in crate::control) diagnostics: crate::config_diagnostics::SharedDiagnostics,
+    pub(in crate::control) native: Option<Arc<crate::observe::Observation>>,
     pub(in crate::control) router: Arc<RwLock<Router>>,
     pub(in crate::control) proxy_registry: Arc<ProxyRegistry>,
     pub(in crate::control) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,

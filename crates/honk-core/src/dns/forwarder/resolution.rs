@@ -1,7 +1,7 @@
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus, ResponseClass};
 use crate::dns::query::{DnsRequestMeta, IngressProfile};
 
-use super::{DnsForwardError, DnsForwarder, ResolveMode};
+use super::{DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
 
 impl DnsForwarder {
     /// Resolve a raw DNS query (no original destination for `asis`).
@@ -21,8 +21,9 @@ impl DnsForwarder {
                 raw_query,
                 DnsRequestMeta::EMPTY,
                 ingress,
-                false,
+                &ResolveOptions::default(),
                 ResolveMode::Compatibility,
+                None,
             )
             .await?
             .into_rendered())
@@ -50,8 +51,9 @@ impl DnsForwarder {
                 raw_query,
                 metadata,
                 ingress,
-                false,
+                &ResolveOptions::default(),
                 ResolveMode::Compatibility,
+                None,
             )
             .await?
             .into_rendered())
@@ -64,7 +66,14 @@ impl DnsForwarder {
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         Ok(self
-            .resolve_inner(raw_query, metadata, ingress, false, ResolveMode::Strict)
+            .resolve_inner(
+                raw_query,
+                metadata,
+                ingress,
+                &ResolveOptions::default(),
+                ResolveMode::Strict,
+                None,
+            )
             .await?
             .into_rendered())
     }
@@ -89,32 +98,46 @@ impl DnsForwarder {
         metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        self.resolve_inner(raw_query, metadata, ingress, false, ResolveMode::Strict)
-            .await
+        self.resolve_inner(
+            raw_query,
+            metadata,
+            ingress,
+            &ResolveOptions::default(),
+            ResolveMode::Strict,
+            None,
+        )
+        .await
     }
 
-    /// `bypass_cache_read` skips the cache/negative lookup — used by the
-    /// stale-while-revalidate refresh so it always reaches the upstream
-    /// (its result is still written back through the normal pipeline).
-    pub(super) async fn resolve_inner(
+    pub(crate) async fn resolve_inner(
         &self,
         raw_query: &[u8],
         metadata: DnsRequestMeta,
         ingress: IngressProfile,
-        bypass_cache_read: bool,
+        options: &ResolveOptions,
         mode: ResolveMode,
+        evidence: Option<&mut crate::dns::outcome::RouteSource>,
     ) -> Result<DnsOutcome, DnsForwardError> {
+        let mut observation =
+            crate::observe::flows::dns::LookupGuard::start(raw_query, ingress, metadata);
         let publication_epoch = self.cache_service().await.publication_epoch();
-        let result = crate::dns::engine::pipeline::resolve(
+        let resolve = crate::dns::engine::pipeline::resolve(
             self,
             raw_query,
             metadata,
             ingress,
-            bypass_cache_read,
+            options,
             mode,
             publication_epoch,
-        )
-        .await;
+            evidence,
+        );
+        let result = match &observation {
+            Some(observation) => observation.scope(resolve).await,
+            None => resolve.await,
+        };
+        if let Some(observation) = &mut observation {
+            observation.outcome(&result);
+        }
         match &result {
             Ok(outcome) => {
                 let event = match (outcome.status(), outcome.response_class()) {

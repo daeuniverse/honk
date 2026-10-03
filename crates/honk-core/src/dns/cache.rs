@@ -147,10 +147,12 @@ mod counters {
         }
     }
 }
+mod control;
 mod key;
 mod maintenance {
     use std::time::Instant;
 
+    use super::service::remove_positive;
     use super::{CacheSlot, CachedEntry, DnsCacheService, lock};
 
     impl DnsCacheService {
@@ -207,7 +209,7 @@ mod maintenance {
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in expired {
-                    shard.remove_positive(&key);
+                    remove_positive(&mut shard, &key);
                 }
             }
             self.purge_expired_negatives();
@@ -324,6 +326,7 @@ mod storage {
             }
         }
 
+        #[cfg(any(feature = "native-api", test))]
         pub(super) fn response_bytes(&self) -> usize {
             self.positive
                 .as_ref()
@@ -356,6 +359,15 @@ mod storage {
 }
 mod store;
 
+#[cfg(feature = "native-api")]
+pub(crate) use control::CacheInspection;
+#[cfg(feature = "native-api")]
+pub(crate) use control::ExactCacheEntry;
+#[cfg(any(feature = "native-api", test))]
+pub(crate) use control::question_matches;
+#[cfg(any(feature = "native-api", test))]
+pub(crate) use control::{CacheInspectionError, CacheUsage};
+pub(crate) use control::{CacheInvalidation, CacheMutation};
 pub use counters::CacheCounters;
 pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;
@@ -378,7 +390,7 @@ use storage::{CacheValue, NegativeEntry};
 ///
 /// When a [`DnsCachePersister`](super::persist::DnsCachePersister) is
 /// installed (`cache_file.store_dns`), every positive `put` is mirrored to
-/// cache.db by a background writer; with no persister the insert path pays
+/// the state db by a background writer; with no persister the insert path pays
 /// a single branch.
 pub struct DnsCache {
     service: Arc<DnsCacheService>,
@@ -388,7 +400,7 @@ impl DnsCache {
     pub(crate) fn service(&self) -> Arc<DnsCacheService> {
         Arc::clone(&self.service)
     }
-    /// Install (or remove) the cache.db persistence sink. Wired by the
+    /// Install (or remove) the state-db persistence sink. Wired by the
     /// control plane when `experimental.cache_file.store_dns` is enabled.
     pub fn set_persister(&mut self, persister: Option<super::persist::DnsCachePersister>) {
         *lock(&self.service.persister) = persister;

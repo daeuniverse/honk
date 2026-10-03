@@ -412,7 +412,7 @@ mod path_health_tests;
 struct TrackedConnection<C> {
     id: u64,
     connection: Connection,
-    _endpoint: Endpoint,
+    _endpoint: crate::runtime::RuntimeEndpoint,
     state: Weak<C>,
     monitor: Arc<QuicClientConnectionMonitor>,
 }
@@ -420,7 +420,7 @@ struct TrackedConnection<C> {
 struct State<C> {
     /// Lazily created endpoint, tagged with its address family. Recreated when
     /// the family of the resolved server address changes.
-    endpoint: Option<(bool, Endpoint)>,
+    endpoint: Option<(bool, crate::runtime::RuntimeEndpoint)>,
     conn: Option<(Connection, Arc<C>)>,
     connections: Vec<TrackedConnection<C>>,
     next_connection_id: u64,
@@ -458,6 +458,7 @@ pub struct QuicClient<C> {
     mtu: u16,
     flow_control_profiles: Arc<AdaptiveFlowProfiles>,
     state: Arc<Mutex<State<C>>>,
+    task_scope: crate::runtime::TaskScope,
 }
 #[cfg(test)]
 pub(crate) mod testutil;

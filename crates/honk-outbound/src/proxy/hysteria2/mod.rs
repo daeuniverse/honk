@@ -168,7 +168,7 @@ impl Hy2ConnState {
             let recv_conn = conn.clone();
             let recv_sessions = Arc::clone(&sessions);
             let recv_health = Arc::clone(&path_health);
-            tokio::spawn(async move {
+            let _ = crate::runtime::spawn_owned(async move {
                 loop {
                     let Ok(data) = recv_conn.read_datagram().await else {
                         break;
@@ -222,6 +222,7 @@ struct Hy2TcpStream {
     request: Option<Bytes>,
     response: Vec<u8>,
     body_offset: Option<usize>,
+    observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 impl Hy2TcpStream {
@@ -231,6 +232,7 @@ impl Hy2TcpStream {
             request: Some(encode_tcp_request(addr).into()),
             response: Vec::new(),
             body_offset: None,
+            observer: crate::runtime::flow_observation::current(),
         }
     }
 
@@ -323,6 +325,11 @@ impl AsyncRead for Hy2TcpStream {
             }
             if let Some(header_end) = self.parse_response()? {
                 self.body_offset = Some(header_end);
+                if let Some(observer) = self.observer.take() {
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                    );
+                }
                 continue;
             }
             if self.response.len() == MAX_TCP_RESPONSE_BUFFER {
@@ -370,11 +377,24 @@ impl AsyncWrite for Hy2TcpStream {
                 Poll::Ready(Ok(written)) if written <= request_len => {
                     if !chunks[0].is_empty() {
                         self.request = Some(chunks[0].clone());
+                    } else {
+                        if let Some(observer) = &self.observer {
+                            observer.milestone_once(
+                                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                            );
+                        }
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
-                Poll::Ready(Ok(written)) => Poll::Ready(Ok(written - request_len)),
+                Poll::Ready(Ok(written)) => {
+                    if let Some(observer) = &self.observer {
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
+                    }
+                    Poll::Ready(Ok(written - request_len))
+                }
             }
         } else {
             AsyncWrite::poll_write(Pin::new(&mut self.inner), cx, input)
@@ -394,7 +414,13 @@ impl AsyncWrite for Hy2TcpStream {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Ok(_)) => {
+                    if let Some(observer) = &self.observer {
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
+                    }
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             }
         }
@@ -643,12 +669,16 @@ impl WarmableOutbound for Hysteria2Handler {
         connect_timeout: Duration,
         requirement: super::WarmRequirement,
     ) -> anyhow::Result<()> {
-        let client = self.client_for_runtime(&runtime).await?;
-        let (_, state) = client.connection(connect_timeout).await?;
-        if requirement == super::WarmRequirement::Udp && state.udp_disabled {
-            anyhow::bail!("Hysteria2: UDP disabled by server");
-        }
-        Ok(())
+        let warm = async {
+            let client = self.client_for_runtime(&runtime).await?;
+            let (_, state) = client.connection(connect_timeout).await?;
+            if requirement == super::WarmRequirement::Udp && state.udp_disabled {
+                anyhow::bail!("Hysteria2: UDP disabled by server");
+            }
+            Ok(())
+        };
+        let warm = crate::runtime::flow_observation::without(warm);
+        warm.await
     }
 }
 
@@ -716,6 +746,7 @@ impl Hysteria2Handler {
             addr,
             max_datagram,
             target,
+            request_observer: parking_lot::Mutex::new(crate::runtime::flow_observation::current()),
         }))
     }
 }
@@ -831,6 +862,7 @@ struct Hy2UdpTransport {
     addr: String,
     max_datagram: usize,
     target: SocketAddr,
+    request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
 }
 
 impl std::fmt::Debug for Hy2UdpTransport {
@@ -909,6 +941,9 @@ impl PacketTransport for Hy2UdpTransport {
                 .await
                 .map_err(io::Error::other)
                 .map_err(super::quic_carrier_io_error)?;
+        }
+        if let Some(observer) = self.request_observer.lock().take() {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         Ok(())
     }

@@ -11,6 +11,14 @@ use honk_outbound::proxy::PreparedUdpTransport;
 use honk_outbound::proxy::vless::{VLessHandler, VlessXudpTransport};
 use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 
+const MAX_RETIRED_REPLY_PEERS: usize = 64;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct ReplyAdmissionHook {
+    pub(super) entered: Notify,
+    pub(super) release: Notify,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ReplyProjection {
     ActualPeer,
@@ -67,6 +75,9 @@ struct SourceState {
     bindings: usize,
     active_sender: u64,
     intentional_sender: u64,
+    retired_reply_peers: HashSet<SocketAddr>,
+    foreign_replies_disabled: bool,
+    active_foreign_reply: Option<SocketAddr>,
 }
 
 impl SourceState {
@@ -129,6 +140,9 @@ impl SourceOwner {
                 bindings: 0,
                 active_sender: 0,
                 intentional_sender: 0,
+                retired_reply_peers: HashSet::new(),
+                foreign_replies_disabled: false,
+                active_foreign_reply: None,
             }),
             ready: AtomicBool::new(true),
             retire_notify: Notify::new(),
@@ -166,9 +180,10 @@ impl SourceOwner {
         })
     }
 
-    fn commit_attachment(&self) -> bool {
+    fn commit_attachment(&self, target: SocketAddr) -> bool {
+        let target = normalize_socket_addr(target);
         let mut state = self.state.lock();
-        if state.retirement.is_some() {
+        if state.retirement.is_some() || state.active_foreign_reply == Some(target) {
             return false;
         }
         debug_assert_ne!(state.attachments, 0);
@@ -177,6 +192,7 @@ impl SourceOwner {
             .bindings
             .checked_add(1)
             .expect("VLESS source binding count overflow");
+        state.retired_reply_peers.remove(&target);
         true
     }
 
@@ -353,8 +369,8 @@ pub(in crate::control) struct SourceAttachment {
 }
 
 impl SourceAttachment {
-    fn commit(&mut self) -> bool {
-        if self.committed || !self.owner.commit_attachment() {
+    fn commit(&mut self, target: SocketAddr) -> bool {
+        if self.committed || !self.owner.commit_attachment(target) {
             return false;
         }
         self.committed = true;
@@ -474,7 +490,10 @@ impl VlessSourcePreparation {
                                     alive_set,
                                     node_id,
                                     health_family,
-                                    stats.outbound_tracker(&node_name),
+                                    stats.outbound_tracker(
+                                        &node_name,
+                                        crate::stats::OutboundKind::Node,
+                                    ),
                                     stats,
                                     source_permit,
                                 );
@@ -571,7 +590,7 @@ impl SourceEndpoint {
         let Some(attachment) = binding.attachment.as_mut() else {
             return false;
         };
-        if !attachment.commit() {
+        if !attachment.commit(self.target) {
             return false;
         }
         binding.attachment.take();
@@ -585,6 +604,15 @@ impl SourceEndpoint {
         binding.attachment.take();
         {
             let mut state = self.owner.state.lock();
+            if matches!(self.owner.scope.reply, ReplyProjection::ActualPeer) {
+                let peer = normalize_socket_addr(self.target);
+                if state.retired_reply_peers.len() < MAX_RETIRED_REPLY_PEERS {
+                    state.retired_reply_peers.insert(peer);
+                } else if !state.retired_reply_peers.contains(&peer) {
+                    // ponytail: after 64 retired peers, disable only unbound foreign replies for this source lifetime.
+                    state.foreign_replies_disabled = true;
+                }
+            }
             if binding.bound {
                 state.mark_intentional_sender(self.view);
                 binding.retirement = state.retirement;
@@ -597,6 +625,13 @@ impl SourceEndpoint {
             binding.bound = false;
             self.owner.release_binding();
         }
+    }
+
+    pub(super) fn reply_admitted(&self, owner_id: u64) -> bool {
+        let state = self.owner.state.lock();
+        self.owner.id == owner_id
+            && state.retirement.is_none()
+            && !self.retired.load(Ordering::Acquire)
     }
 
     pub(super) fn reply_socket(&self) -> &Arc<ReplySocket> {
@@ -907,6 +942,8 @@ impl UdpEndpointPool {
         }
         let stale = self.source_settlement_endpoints(owner);
         for (key, token, generation, endpoint) in stale {
+            #[cfg(feature = "native-api")]
+            endpoint.finish_native_source(SourceRetirement::Neutral(no_reply));
             endpoint.finish_score(no_reply);
             self.retire_if_same(key, token, generation);
         }
@@ -932,6 +969,8 @@ impl UdpEndpointPool {
         };
         let stale = self.source_settlement_endpoints(owner);
         for (_, _, _, endpoint) in &stale {
+            #[cfg(feature = "native-api")]
+            endpoint.finish_native_source(SourceRetirement::Failure(outcome));
             endpoint.finish_score(outcome);
         }
         for (key, token, generation, _) in stale {

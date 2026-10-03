@@ -55,6 +55,14 @@ impl DirectHandler {
             connect_timeout,
         ))
         .await?;
+        {
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TransportReady,
+            );
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetConfirmed,
+            );
+        }
         Ok(ProxyStream {
             stream: Box::new(stream),
             target_addr: target,
@@ -80,6 +88,9 @@ impl DirectHandler {
         let socket = tokio::net::UdpSocket::from_std(crate::util::marked_udp_socket_with_mark(
             bind_addr, mark,
         )?)?;
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
     }
 }

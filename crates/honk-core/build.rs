@@ -12,6 +12,9 @@ fn main() {
 
     #[cfg(feature = "ebpf")]
     embed_ebpf_object();
+
+    #[cfg(feature = "native-ui")]
+    embed_native_ui().expect("failed to embed native UI assets");
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
@@ -50,6 +53,176 @@ fn emit_version() {
         .or_else(|| git_output(&["describe", "--tags", "--always", "--match", "v*"]))
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=HONK_VERSION={version}");
+    // The commit and target triple identify a build precisely when the version is a tag.
+    let revision = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
+    println!("cargo:rustc-env=HONK_REVISION={revision}");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    println!("cargo:rustc-env=HONK_TARGET={target}");
+}
+
+#[cfg(feature = "native-ui")]
+#[path = "src/native_api/hashed_asset.rs"]
+mod hashed_asset;
+
+#[cfg(feature = "native-ui")]
+fn embed_native_ui() -> anyhow::Result<()> {
+    use std::{fmt::Write, fs, path::Path};
+
+    use anyhow::{Context, ensure};
+
+    fn collect(root: &Path, path: &Path, files: &mut Vec<String>) -> anyhow::Result<()> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "native UI assets must not contain symlinks: {}",
+            path.display()
+        );
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                collect(root, &entry?.path(), files)?;
+            }
+        } else {
+            ensure!(
+                metadata.is_file(),
+                "native UI asset must be a regular file: {}",
+                path.display()
+            );
+            files.push(
+                path.strip_prefix(root)?
+                    .to_str()
+                    .context("native UI asset paths must be UTF-8")?
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
+        }
+        Ok(())
+    }
+
+    println!("cargo:rerun-if-env-changed=HONK_DOONA_DIR");
+    let root = std::path::PathBuf::from(std::env::var_os("HONK_DOONA_DIR").context(
+        "the native-ui feature embeds a doona build from HONK_DOONA_DIR; \
+         fetch the pinned release with `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`",
+    )?);
+    ensure!(
+        root.is_absolute(),
+        "HONK_DOONA_DIR must be an absolute path: {}",
+        root.display()
+    );
+    println!("cargo:rerun-if-changed={}", root.display());
+    ensure!(
+        fs::symlink_metadata(&root)
+            .with_context(|| format!("failed to inspect HONK_DOONA_DIR {}", root.display()))?
+            .is_dir(),
+        "HONK_DOONA_DIR must be a directory: {}",
+        root.display()
+    );
+    let mut files = Vec::new();
+    collect(&root, &root, &mut files)?;
+    files.sort_unstable();
+    ensure!(
+        files
+            .binary_search_by(|path| path.as_str().cmp("index.html"))
+            .is_ok(),
+        "native UI assets must include index.html"
+    );
+    let unhashed: Vec<_> = files
+        .iter()
+        .filter(|path| path.starts_with("assets/") && !hashed_asset::is_hashed_asset(path))
+        .collect();
+    // The server caches assets/ as immutable, which is only safe for content-hashed names.
+    ensure!(
+        unhashed.is_empty(),
+        "native UI assets/ files must carry a content hash: {unhashed:?}"
+    );
+
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    let compressed = out.join("native_ui");
+    if compressed.exists() {
+        fs::remove_dir_all(&compressed)?;
+    }
+    fs::create_dir(&compressed)?;
+    // Brotli at quality 11 is slow; one worker per core keeps its memory bounded, and
+    // Cargo's job count caps it so `-j` still limits the build.
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = std::env::var("NUM_JOBS")
+        .ok()
+        .and_then(|jobs| jobs.parse::<usize>().ok())
+        .map_or(workers, |jobs| workers.min(jobs.max(1)));
+    let encoded = std::thread::scope(|scope| {
+        let tasks: Vec<_> = files
+            .chunks(files.len().div_ceil(workers))
+            .map(|chunk| {
+                scope.spawn(|| {
+                    chunk
+                        .iter()
+                        .map(|path| encode(&root.join(path)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .flat_map(|task| task.join().expect("native UI compression panicked"))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })?;
+    let mut generated = String::from("&[\n");
+    for (index, (path, encoded)) in files.iter().zip(encoded).enumerate() {
+        if let Some(Compressed { br, gzip, len }) = encoded {
+            let br_file = compressed.join(format!("{index}.br"));
+            let gzip_file = compressed.join(format!("{index}.gz"));
+            fs::write(&br_file, br)?;
+            fs::write(&gzip_file, gzip)?;
+            writeln!(
+                generated,
+                "    ({path:?}, EmbeddedAsset::Encoded {{ br: include_bytes!({:?}), gzip: include_bytes!({:?}), len: {len} }}),",
+                br_file.to_str().context("OUT_DIR must be UTF-8")?,
+                gzip_file.to_str().context("OUT_DIR must be UTF-8")?,
+            )?;
+        } else {
+            let file = root.join(path);
+            let file = file
+                .to_str()
+                .context("HONK_DOONA_DIR paths must be UTF-8")?;
+            writeln!(
+                generated,
+                "    ({path:?}, EmbeddedAsset::Identity(include_bytes!({file:?}))),"
+            )?;
+        }
+    }
+    generated.push_str("]\n");
+    fs::write(out.join("native_ui_assets.rs"), generated)?;
+    Ok(())
+}
+
+#[cfg(feature = "native-ui")]
+struct Compressed {
+    br: Vec<u8>,
+    gzip: Vec<u8>,
+    len: usize,
+}
+
+/// Brotli and gzip variants of a text asset, or `None` to embed the file as is.
+#[cfg(feature = "native-ui")]
+fn encode(file: &std::path::Path) -> anyhow::Result<Option<Compressed>> {
+    use std::io::Write;
+
+    const TEXT: &[&str] = &["css", "html", "js", "json", "svg", "txt", "webmanifest"];
+    if !file
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| TEXT.contains(&extension))
+    {
+        return Ok(None);
+    }
+    let raw = std::fs::read(file)?;
+    let mut br = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
+    br.write_all(&raw)?;
+    let br = br.into_inner();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gzip.write_all(&raw)?;
+    let gzip = gzip.finish()?;
+    let len = raw.len();
+    Ok((br.len().max(gzip.len()) < len).then_some(Compressed { br, gzip, len }))
 }
 
 #[cfg(feature = "ebpf")]
@@ -144,6 +317,10 @@ fn embed_ebpf_object() {
                 && std::fs::read_to_string(p.with_extension("toolchain"))
                     .is_ok_and(|built_channel| built_channel == channel)
                 && !object_stale(
+                    &p.with_extension("toolchain"),
+                    &[manifest_dir.join("build.rs").as_path()],
+                )
+                && !object_stale(
                     &p,
                     &src_dirs.iter().map(|d| d.as_path()).collect::<Vec<_>>(),
                 ) =>
@@ -164,30 +341,38 @@ fn embed_ebpf_object() {
             // Missing, or stale without .BTF (e.g. built while an environment
             // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
             println!("cargo:warning=Building eBPF object with {channel}...");
-            let status = Command::new("cargo")
-                .arg(format!("+{channel}"))
-                .args([
-                    "build",
-                    "--release",
-                    "-Zbuild-std=core",
-                    "--target",
-                    "bpfel-unknown-none",
-                ])
-                // Cargo exports its absolute host rustc path to build scripts.
-                // Let the selected nightly resolve its own compiler and sysroot.
-                .env_remove("RUSTC")
-                // An inherited RUSTFLAGS would override the crate's
-                // .cargo/config.toml rustflags (--btf, debuginfo) and silently
-                // produce a BTF-less object again.
-                .env_remove("RUSTFLAGS")
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                // Parent workspace analysis must not turn this separate build into clippy.
-                .env_remove("RUSTC_WORKSPACE_WRAPPER")
-                .env_remove("CLIPPY_ARGS")
-                .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
-                .current_dir(&ebpf_crate)
-                .status()
-                .expect("failed to build eBPF object");
+            let status = {
+                let mut command = Command::new("cargo");
+                for (key, _) in std::env::vars_os() {
+                    if key.as_encoded_bytes().starts_with(b"CARGO_PROFILE_") {
+                        command.env_remove(key);
+                    }
+                }
+                command
+            }
+            .arg(format!("+{channel}"))
+            .args([
+                "build",
+                "--release",
+                "-Zbuild-std=core",
+                "--target",
+                "bpfel-unknown-none",
+            ])
+            // Cargo exports its absolute host rustc path to build scripts.
+            // Let the selected nightly resolve its own compiler and sysroot.
+            .env_remove("RUSTC")
+            // An inherited RUSTFLAGS would override the crate's
+            // .cargo/config.toml rustflags (--btf, debuginfo) and silently
+            // produce a BTF-less object again.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            // Parent workspace analysis must not turn this separate build into clippy.
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CLIPPY_ARGS")
+            .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
+            .current_dir(&ebpf_crate)
+            .status()
+            .expect("failed to build eBPF object");
 
             if !status.success() {
                 panic!(

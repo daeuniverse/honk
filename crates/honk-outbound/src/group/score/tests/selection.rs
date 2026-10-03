@@ -144,7 +144,9 @@ fn recovery_keeps_nested_selector_permissions_health_and_attribution() {
             .entries
             .is_empty()
     );
-    manager.set_selector_choice("outer", "outside");
+    manager
+        .set_selector_choice("outer", "outside", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert!(
         manager
             .score_retry_plan_for_target("outer", &context, failed_node, final_owners, &original)
@@ -291,7 +293,13 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     );
 
     // Switching the choice moves the committed rank to sub-b.
-    manager.set_selector_choice("sel-parent", "sel-sub-b");
+    manager
+        .set_selector_choice(
+            "sel-parent",
+            "sel-sub-b",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(
         state
@@ -307,7 +315,13 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     );
 
     // The target-aware dial path applies the same rule.
-    manager.set_selector_choice("sel-parent", "sel-sub-a");
+    manager
+        .set_selector_choice(
+            "sel-parent",
+            "sel-sub-a",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
     let before_b = state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp);
     let plan = manager
@@ -337,9 +351,14 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
         before_b
     );
 
-    // A stale stored choice names no member: the fallback serving
-    // sub-group still commits its rank instead of everything peeking.
-    manager.set_selector_choice("sel-parent", "sel-sub-renamed-away");
+    assert_eq!(
+        manager.set_selector_choice(
+            "sel-parent",
+            "sel-sub-renamed-away",
+            crate::group::SelectorNetworks::Both
+        ),
+        Err(crate::group::SelectorError::NotMember),
+    );
     let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
     let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
     assert_ne!(
@@ -397,7 +416,13 @@ fn selector_refusal_does_not_commit_a_sibling_score_group() {
         super::super::super::GroupManager::with_alive_set(&[sub, parent], &nodes, Some(alive));
     let state = manager.score_state();
 
-    manager.set_selector_choice("fallback-parent", "fallback-dead");
+    manager
+        .set_selector_choice(
+            "fallback-parent",
+            "fallback-dead",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     assert!(
         manager
             .selection_plan_for_domain("fallback-parent", ProbeDomain::Tcp, IpVersion::V4)
@@ -450,8 +475,12 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
                 alive.report_unavailable_forced(nodes[1].id, domain, IpVersion::V4);
             }
             let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive));
-            manager.set_selector_choice("parent", "child");
-            manager.set_selector_choice("child", "a");
+            manager
+                .set_selector_choice("parent", "child", crate::group::SelectorNetworks::Both)
+                .unwrap();
+            manager
+                .set_selector_choice("child", "a", crate::group::SelectorNetworks::Both)
+                .unwrap();
             let context = ScoreSelectionContext {
                 target: Some(ScoreTarget::domain("commit.example", 443)),
                 ..ScoreSelectionContext::aggregate(
@@ -467,7 +496,9 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
                     .id,
                 nodes[0].id
             );
-            manager.set_selector_choice("child", "b");
+            manager
+                .set_selector_choice("child", "b", crate::group::SelectorNetworks::Both)
+                .unwrap();
             let committed = if target_aware {
                 manager
                     .selection_plan_for_target("parent", &context)

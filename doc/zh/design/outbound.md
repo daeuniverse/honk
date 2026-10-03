@@ -353,6 +353,8 @@ A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机�
 
 `src/tls.rs` 提供 BoringSSL TLS client；进程级 `set_tls_mode` 选择 TLS profile。`build_reality_connector(chrome)` 使用 `reality.rs` 的握手后 ed25519 认证替代 PKI，只允许 TLS 1.3 且不提供 REALITY resumption。显式结构化 TCP ALPN 在 tls/utls 模式下都传入 `build_connector`；空列表保留 profile 默认值，Chrome ALPS 取决于列表是否精确包含 `h2`。Registry 发布与直接 connector 构造都会校验非空 override；共享 stream dispatch 在选择 plaintext 或 REALITY 前校验，直接 QUIC 配置会拒绝 TCP ALPN，而不会忽略它。
 
+`build_connector` 与 `build_reality_connector` 返回共享的 BoringSSL context：每种（REALITY、是否验证、pin、ALPN 覆盖、Chrome 模式）组合一个，保存在进程级缓存中，达到 128 种组合时清空重建。每个 context 持有进程级 webpki 信任库，而不是 `SslConnector::builder` 默认解析的系统 CA 证书包，因此拨号不再解析证书，存活连接也不会各自占用一份 CA 副本。
+
 ### 进程级 TLS profile
 
 `tls_implementation = "utls"` 在进程范围启用唯一实现的 Chrome-oriented
@@ -705,7 +707,7 @@ quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。c
 ## AnyTLS session 引擎
 
 `src/proxy/anytls/mod.rs` 实现 sing-anytls 多路复用，handler 无状态。每个 generation 的 `NodeRuntime::AnyTls` 拥有一个
-`SessionPool<AnyTlsSession>` 与 lazy materialize 的 BoringSSL connector。
+`SessionPool<AnyTlsSession>` 与首次拨号时构建的 BoringSSL connector；TLS context 按 shape 共享，因此 connector 不做空闲回收。
 无 generation 调用使用带 guard 的 ephemeral 等价物。
 
 ### Pool 与 session 生命周期
@@ -728,8 +730,9 @@ least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每�
 即加入按 SID 跟踪的 pending 集合，SYNACK 只结清自己的 SID——无关 stream 的应答
 不会清除其他 stream 的 deadline，本地拆流同样取消对应定时器。SYN 写出三秒后
 仍 pending 的 open，若窗口内 session 仍有入站帧（服务端活着只是未应答该开流）
-则只重置该 stream；窗口内完全静默才退役物理 session，让 pool 重新拨号而不是
-继续复用已死 carrier。
+则只重置该 stream。窗口内完全静默并不证明 carrier 已死——丢包突发会让所有 stream
+同时静默，之后 TCP 仍会送达：此时只重置该 open 并让 session 退出轮转，仅当再静默
+十秒才连同其 stream 一起退役，pool 依旧会重新拨号，而不是继续复用已死 carrier。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor（`anytls_min_idle_session`）与 `anytls_idle_session_timeout` 输入同一个节点局部 janitor。Selector 或

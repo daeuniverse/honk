@@ -174,7 +174,10 @@ pub fn decode_http_check_target(
         ))
     }
     .map_err(|_| InvalidCheckTarget)?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.port() == Some(0)
+    {
         return Err(InvalidCheckTarget);
     }
     let request_target = configured_request_target(&authority_and_target[target_start..]);

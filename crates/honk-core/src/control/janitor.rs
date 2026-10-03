@@ -29,7 +29,7 @@ use honk_ebpf_common::conn::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tracing::{debug, error, info, warn};
 
 /// Janitor tick interval: 2 seconds.
@@ -188,6 +188,8 @@ struct PressureState {
 pub struct BpfJanitor {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tcp_flow_pins: Arc<TcpFlowPins>,
+    #[cfg(test)]
+    blocking_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl BpfJanitor {
@@ -199,16 +201,19 @@ impl BpfJanitor {
         Self {
             ebpf,
             tcp_flow_pins,
+            #[cfg(test)]
+            blocking_read_hook: None,
         }
     }
 
-    /// Spawn with a guard that reports task death to the control plane.
+    /// Spawn with a guard that reports unexpected task death to the control plane.
     pub(super) fn spawn_supervised(
         self,
         exit_guard: super::runtime::CriticalTaskExit,
+        mut stop: watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let _exit_guard = exit_guard;
+            let mut exit_guard = exit_guard;
             let tick_duration = Duration::from_secs(JANITOR_TICK_INTERVAL_SECS);
             let mut interval = tokio::time::interval(tick_duration);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -240,7 +245,21 @@ impl BpfJanitor {
             );
 
             loop {
-                interval.tick().await;
+                // Never race a stop against an in-flight blocking scan or deletion.
+                if *stop.borrow_and_update() {
+                    exit_guard.expected_stop();
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    changed = stop.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ = interval.tick() => {}
+                }
 
                 let now = tokio::time::Instant::now();
 
@@ -366,8 +385,14 @@ impl BpfJanitor {
         F: FnOnce(&dyn EbpfBackend) -> T + Send + 'static,
     {
         let ebpf = Arc::clone(&self.ebpf);
+        #[cfg(test)]
+        let blocking_read_hook = self.blocking_read_hook.clone();
         match tokio::task::spawn_blocking(move || {
             let ebpf = ebpf.blocking_read();
+            #[cfg(test)]
+            if let Some(hook) = blocking_read_hook {
+                hook();
+            }
             work(ebpf.as_ref())
         })
         .await
@@ -375,6 +400,9 @@ impl BpfJanitor {
             Ok(result) => Some(result),
             Err(error) => {
                 error!(%error, map = label, "BPF janitor blocking read task failed");
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
                 None
             }
         }
@@ -406,6 +434,9 @@ impl BpfJanitor {
             Ok(result) => Some(result),
             Err(error) => {
                 error!(%error, map = label, "BPF janitor blocking delete task failed");
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
                 None
             }
         }
@@ -948,6 +979,76 @@ mod tests {
             read_available,
             "bounded janitor scans must not block per-flow eBPF reads"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervised_stop_retains_blocking_scan_across_cancelled_join() {
+        for panic_in_scan in [false, true] {
+            let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+                Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+            let retained_backend = Arc::downgrade(&backend);
+            let mut janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = parking_lot::Mutex::new(release_rx);
+            janitor.blocking_read_hook = Some(Arc::new(move || {
+                if let Some(entered_tx) = entered_tx.lock().take() {
+                    entered_tx.send(()).expect("test receiver stays alive");
+                    release_rx
+                        .lock()
+                        .recv()
+                        .expect("test releases blocking scan");
+                    assert!(!panic_in_scan, "injected blocking scan panic");
+                }
+            }));
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut task = janitor.spawn_supervised(
+                super::super::runtime::CriticalTaskExit {
+                    name: "bpf_janitor",
+                    fatal_tx,
+                    expected: false,
+                },
+                stop_rx,
+            );
+
+            entered_rx.await.expect("supervised blocking scan started");
+            stop_tx.send(true).expect("janitor owns stop receiver");
+            let mut wait = Box::pin(tokio::time::timeout(Duration::from_secs(1), &mut task));
+            assert!(futures::poll!(&mut wait).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(
+                wait.await.is_err(),
+                "stop must retain the blocked scan join"
+            );
+            assert!(!task.is_finished());
+            assert!(retained_backend.upgrade().is_some());
+
+            release_tx.send(()).expect("release blocking scan");
+            let result = task.await;
+            if panic_in_scan {
+                assert!(
+                    result
+                        .expect_err("scan panic must fail janitor join")
+                        .is_panic()
+                );
+                assert!(
+                    fatal_rx.try_recv().is_ok(),
+                    "stop must not hide a prior panic"
+                );
+            } else {
+                result.expect("janitor joins after its blocking scan");
+                assert!(
+                    fatal_rx.try_recv().is_err(),
+                    "cooperative stop is not fatal"
+                );
+            }
+            assert!(
+                retained_backend.upgrade().is_none(),
+                "acknowledged stop must leave no owner able to access the backend"
+            );
+        }
     }
 
     #[test]

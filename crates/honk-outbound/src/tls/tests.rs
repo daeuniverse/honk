@@ -8,6 +8,95 @@ fn root_store_clones_share_one_store() {
     let b = root_store().unwrap();
     assert_eq!(a.as_ptr(), b.as_ptr());
 }
+
+/// No context keeps a private copy of the OS CA bundle (~0.8 MiB each):
+/// verifying, non-verifying and REALITY connectors all hold the shared store.
+#[test]
+fn connectors_share_the_process_root_store() {
+    use foreign_types::{ForeignType, ForeignTypeRef};
+    let shared = root_store().unwrap();
+    let skipping = build_connector(&test_node()).unwrap();
+    let mut verifying_node = test_node();
+    verifying_node.tls_mut().unwrap().skip_cert_verify = false;
+    let verifying = build_connector(&verifying_node).unwrap();
+    let reality = build_reality_connector(false).unwrap();
+    for context in [
+        skipping.connector.context(),
+        verifying.connector.context(),
+        reality.context(),
+    ] {
+        assert_eq!(context.cert_store().as_ptr(), shared.as_ptr());
+    }
+}
+
+/// Dials of one node shape share a context instead of re-parsing the CA
+/// bundle per connection; a differing pin builds its own.
+#[test]
+fn dials_share_one_context_per_shape() {
+    use foreign_types::ForeignTypeRef;
+    let mut node = test_node();
+    node.tls_mut().unwrap().pin_sha256 = Some("ee".repeat(32));
+    let context = |node: &Node| build_connector(node).unwrap().connector.context().as_ptr();
+    // Other tests flip the process-wide TLS mode; retry until it held still.
+    let (first, second) = loop {
+        let mode = chrome_mode();
+        let pair = (context(&node), context(&node));
+        if chrome_mode() == mode {
+            break pair;
+        }
+    };
+    assert_eq!(first, second);
+    node.tls_mut().unwrap().pin_sha256 = Some("ef".repeat(32));
+    assert_ne!(context(&node), first);
+}
+
+/// The pin decides the handshake even when an unpinned context of the same
+/// shape is already cached.
+#[tokio::test]
+async fn pin_is_not_bypassed_by_a_cached_unpinned_context() {
+    use boring::hash::MessageDigest;
+    use tokio::io::AsyncWriteExt;
+    let (cert, key) = server_cert();
+    let pin: String = X509::from_pem(cert.as_bytes())
+        .unwrap()
+        .digest(MessageDigest::sha256())
+        .unwrap()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let (port, server) = spawn_server(&cert, &key);
+    let mut stream = loopback_connect(&test_node(), false, port).await.unwrap();
+    stream.shutdown().await.unwrap();
+    server.join().unwrap();
+
+    let mut pinned = test_node();
+    pinned.tls_mut().unwrap().pin_sha256 = Some("00".repeat(32));
+    let (port, server) = spawn_server(&cert, &key);
+    assert!(
+        loopback_connect(&pinned, false, port).await.is_err(),
+        "a wrong pin must be rejected"
+    );
+    server.join().unwrap();
+
+    pinned.tls_mut().unwrap().pin_sha256 = Some(pin);
+    let (port, server) = spawn_server(&cert, &key);
+    let mut stream = loopback_connect(&pinned, false, port).await.unwrap();
+    stream.shutdown().await.unwrap();
+    server.join().unwrap();
+}
+
+/// Swapping the context's cert store must leave verification on and
+/// fail-closed: an untrusted self-signed certificate is rejected.
+#[tokio::test]
+async fn verifying_connector_rejects_an_untrusted_certificate() {
+    let (cert, key) = server_cert();
+    let mut node = test_node();
+    node.tls_mut().unwrap().skip_cert_verify = false;
+    let (port, server) = spawn_server(&cert, &key);
+    assert!(loopback_connect(&node, false, port).await.is_err());
+    server.join().unwrap();
+}
 use boring::ssl::{SslAcceptor, SslStream};
 use std::io::Read;
 use std::net::TcpListener;
@@ -35,9 +124,12 @@ fn spawn_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u
     let port = listener.local_addr().unwrap().port();
     let handle = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        let mut tls: SslStream<_> = acceptor.accept(stream).unwrap();
         let mut buf = Vec::new();
-        tls.read_to_end(&mut buf).ok();
+        // A client that rejects the certificate aborts the handshake; that is
+        // the client's verdict, not a server failure.
+        if let Ok(mut tls) = acceptor.accept(stream) {
+            tls.read_to_end(&mut buf).ok();
+        }
         buf
     });
     (port, handle)

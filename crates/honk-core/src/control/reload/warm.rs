@@ -1,5 +1,22 @@
 use super::*;
 
+pub(in crate::control) struct WarmTask {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WarmTask {
+    async fn stop_and_join(&mut self) -> bool {
+        self.stop.send_replace(true);
+        let Some(task) = self.task.as_mut() else {
+            return true;
+        };
+        let joined = task.await;
+        self.task.take();
+        joined.is_ok()
+    }
+}
+
 const SELECTOR_WARM_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub(in crate::control) struct SelectorWarmResources {
@@ -19,6 +36,7 @@ pub(super) struct SelectorWarmCoordinator {
     pub(super) group_manager: crate::group::SharedGroupManager,
     pub(super) notify: Arc<tokio::sync::Notify>,
     pub(super) resources: SelectorWarmResources,
+    pub(super) stop: tokio::sync::watch::Receiver<bool>,
 }
 
 /// One configured leaf per Selector, preserving config order and deduplicating
@@ -39,7 +57,10 @@ pub(in crate::control) fn selector_warm_candidates(
         .groups
         .iter()
         .filter(|group| group.policy == GroupPolicy::Selector)
-        .filter_map(|group| group_manager.selector_warm_node(&group.name))
+        .filter_map(|group| {
+            group_manager
+                .selector_warm_node(&group.name, honk_outbound::group::SelectionNetwork::Tcp)
+        })
         .filter(|node| {
             !matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block)
                 && configured.contains(&node.id)
@@ -56,9 +77,13 @@ pub(super) async fn run_selector_warm_coordinator(context: SelectorWarmCoordinat
         group_manager,
         notify,
         resources,
+        mut stop,
     } = context;
     loop {
-        if resources.generation.is_shutdown() {
+        let changed = notify.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if *stop.borrow() || resources.generation.is_shutdown() {
             return;
         }
         let (connect_timeout, candidates) = {
@@ -69,12 +94,13 @@ pub(super) async fn run_selector_warm_coordinator(context: SelectorWarmCoordinat
                 selector_warm_candidates(&config, &manager, &resources.generation),
             )
         };
-        reconcile_selector_warm(candidates, &resources, connect_timeout).await;
-        if resources.generation.is_shutdown() {
+        reconcile_selector_warm(candidates, &resources, connect_timeout, &mut stop).await;
+        if *stop.borrow() || resources.generation.is_shutdown() {
             return;
         }
         tokio::select! {
-            _ = notify.notified() => {}
+            _ = stop.changed() => return,
+            _ = changed => {}
             _ = tokio::time::sleep(SELECTOR_WARM_RECONCILE_INTERVAL) => {}
         }
     }
@@ -84,6 +110,7 @@ async fn reconcile_selector_warm(
     candidates: Vec<Node>,
     resources: &SelectorWarmResources,
     connect_timeout: Duration,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let SelectorWarmResources {
         generation,
@@ -125,15 +152,24 @@ async fn reconcile_selector_warm(
     let mut pending = candidates.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
     loop {
+        if *stop.borrow() {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return;
+        }
         while tasks.len() < 4 {
             let Some(node) = pending.next() else {
                 break;
             };
-            tasks.spawn(warm_selector_candidate(
-                node,
-                resources.clone(),
-                connect_timeout,
-            ));
+            let resources = resources.clone();
+            let mut cancelled = stop.clone();
+            tasks.spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => {},
+                    _ = warm_selector_candidate(node, resources, connect_timeout) => {},
+                }
+            });
         }
         if tasks.is_empty() {
             break;
@@ -147,151 +183,162 @@ pub(in crate::control) async fn warm_selector_candidate(
     resources: SelectorWarmResources,
     connect_timeout: Duration,
 ) {
-    let SelectorWarmResources {
-        generation,
-        proxy_registry,
-        connection_pool,
-        group_manager,
-        stats,
-        bare_warm,
-        ..
-    } = resources;
-    // Purge a moved endpoint before redial: failure must not keep the old
-    // socket pinned under a stable node ID.
-    let descriptor = honk_outbound::descriptor::descriptor(node.protocol());
-    let bare_addr =
-        (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
-    let stale = {
-        let mut retained = bare_warm.lock();
-        match (retained.get(&node.id), bare_addr.as_ref()) {
-            (Some(old), Some(current)) if old == current => None,
-            (Some(_), _) => retained.remove(&node.id),
-            (None, _) => None,
+    let runtime = resources.generation.get(&node.id);
+    let work = async move {
+        let SelectorWarmResources {
+            generation,
+            proxy_registry,
+            connection_pool,
+            group_manager,
+            stats,
+            bare_warm,
+            ..
+        } = resources;
+        // Purge a moved endpoint before redial: failure must not keep the old
+        // socket pinned under a stable node ID.
+        let descriptor = honk_outbound::descriptor::descriptor(node.protocol());
+        let bare_addr =
+            (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
+        let stale = {
+            let mut retained = bare_warm.lock();
+            match (retained.get(&node.id), bare_addr.as_ref()) {
+                (Some(old), Some(current)) if old == current => None,
+                (Some(_), _) => retained.remove(&node.id),
+                (None, _) => None,
+            }
+        };
+        if let Some(stale) = stale {
+            connection_pool.purge_bare(&stale);
+            stats.clear_warm(node.id, crate::stats::WarmReason::Selector);
         }
-    };
-    if let Some(stale) = stale {
-        connection_pool.purge_bare(&stale);
-        stats.clear_warm(node.id, crate::stats::WarmReason::Selector);
-    }
 
-    if descriptor.supports_warm(&node, honk_outbound::proxy::WarmRequirement::Session) {
-        let reporter = group_manager
-            .read()
-            .feedback_for_node(
-                node.id,
-                crate::group::ScoreSelectionContext::aggregate(
-                    crate::group::SelectionNetwork::Tcp,
-                    ProbeDomain::Tcp,
-                    IpVersion::V4,
-                ),
-            )
-            .map(|feedback| {
-                feedback
-                    .with_source(crate::group::ScoreSource::Warmup)
-                    .start()
-            });
-        match proxy_registry
-            .warm_session(Arc::clone(&generation), node.id, connect_timeout)
-            .await
-        {
-            Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+        if descriptor.supports_warm(&node, honk_outbound::proxy::WarmRequirement::Session) {
+            let reporter = group_manager
+                .read()
+                .feedback_for_node(
+                    node.id,
+                    crate::group::ScoreSelectionContext::aggregate(
+                        crate::group::SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        IpVersion::V4,
+                    ),
+                )
+                .map(|feedback| {
+                    feedback
+                        .with_source(crate::group::ScoreSource::Warmup)
+                        .start()
+                });
+            match proxy_registry
+                .warm_session(Arc::clone(&generation), node.id, connect_timeout)
+                .await
+            {
+                Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.setup_succeeded();
+                        reporter.finish_setup_only();
+                    }
+                    if let Some(addr) = bare_warm.lock().remove(&node.id) {
+                        connection_pool.purge_bare(&addr);
+                    }
+                    stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+                    return;
+                }
+                Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
+                Err(error) if generation.is_shutdown() => {
+                    if let Some(reporter) = &reporter {
+                        reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                    }
+                    debug!(node = %node.name, %error, "Selector warm generation ended");
+                    return;
+                }
+                Err(error) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.setup_failed(if error.is::<tokio::time::error::Elapsed>() {
+                            crate::group::ScoreOutcome::Timeout
+                        } else {
+                            crate::group::ScoreOutcome::from_error(&error)
+                        });
+                    }
+                    debug!(node = %node.name, %error, "Selector warm session failed");
+                    return;
+                }
+            }
+        }
+
+        let Some(addr) = bare_addr else {
+            return;
+        };
+        if !connection_pool.has_live_bare_entry(&addr) {
+            let reporter = group_manager
+                .read()
+                .feedback_for_node(
+                    node.id,
+                    crate::group::ScoreSelectionContext::aggregate(
+                        crate::group::SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        IpVersion::V4,
+                    ),
+                )
+                .map(|feedback| {
+                    feedback
+                        .with_source(crate::group::ScoreSource::Warmup)
+                        .start()
+                });
+            let stream = match generation
+                .scope_dials(honk_outbound::util::connect_outbound(
+                    &addr,
+                    connect_timeout,
+                ))
+                .await
+            {
+                Ok(_) if generation.is_shutdown() => {
+                    if let Some(reporter) = &reporter {
+                        reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                    }
+                    return;
+                }
+                Ok(stream) => stream,
+                Err(error) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
+                            crate::group::ScoreOutcome::Timeout
+                        } else {
+                            crate::group::ScoreOutcome::from_io_error(&error)
+                        });
+                    }
+                    debug!(node = %node.name, %error, "Selector warm bare TCP failed");
+                    return;
+                }
+            };
+            if connection_pool.deposit_tcp(&addr, stream).await {
                 if let Some(reporter) = &reporter {
                     reporter.setup_succeeded();
                     reporter.finish_setup_only();
                 }
-                if let Some(addr) = bare_warm.lock().remove(&node.id) {
-                    connection_pool.purge_bare(&addr);
-                }
-                stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
-                return;
-            }
-            Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
-            Err(error) if generation.is_shutdown() => {
+            } else {
                 if let Some(reporter) = &reporter {
-                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                        io::ErrorKind::ConnectionAborted,
+                    ));
                 }
-                debug!(node = %node.name, %error, "Selector warm generation ended");
-                return;
-            }
-            Err(error) => {
-                if let Some(reporter) = &reporter {
-                    reporter.setup_failed(if error.is::<tokio::time::error::Elapsed>() {
-                        crate::group::ScoreOutcome::Timeout
-                    } else {
-                        crate::group::ScoreOutcome::from_error(&error)
-                    });
-                }
-                debug!(node = %node.name, %error, "Selector warm session failed");
                 return;
             }
         }
-    }
-
-    let Some(addr) = bare_addr else {
-        return;
+        if connection_pool.has_live_bare_entry(&addr) {
+            let old = bare_warm.lock().insert(node.id, addr.clone());
+            if let Some(old) = old.filter(|old| old != &addr) {
+                connection_pool.purge_bare(&old);
+            }
+            stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+        }
     };
-    if !connection_pool.has_live_bare_entry(&addr) {
-        let reporter = group_manager
-            .read()
-            .feedback_for_node(
-                node.id,
-                crate::group::ScoreSelectionContext::aggregate(
-                    crate::group::SelectionNetwork::Tcp,
-                    ProbeDomain::Tcp,
-                    IpVersion::V4,
-                ),
-            )
-            .map(|feedback| {
-                feedback
-                    .with_source(crate::group::ScoreSource::Warmup)
-                    .start()
-            });
-        let stream = match generation
-            .scope_dials(honk_outbound::util::connect_outbound(
-                &addr,
-                connect_timeout,
-            ))
-            .await
-        {
-            Ok(_) if generation.is_shutdown() => {
-                if let Some(reporter) = &reporter {
-                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
-                }
-                return;
-            }
-            Ok(stream) => stream,
-            Err(error) => {
-                if let Some(reporter) = &reporter {
-                    reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
-                        crate::group::ScoreOutcome::Timeout
-                    } else {
-                        crate::group::ScoreOutcome::from_io_error(&error)
-                    });
-                }
-                debug!(node = %node.name, %error, "Selector warm bare TCP failed");
-                return;
-            }
-        };
-        if connection_pool.deposit_tcp(&addr, stream).await {
-            if let Some(reporter) = &reporter {
-                reporter.setup_succeeded();
-                reporter.finish_setup_only();
-            }
-        } else {
-            if let Some(reporter) = &reporter {
-                reporter.setup_failed(crate::group::ScoreOutcome::Io(
-                    io::ErrorKind::ConnectionAborted,
-                ));
-            }
-            return;
-        }
-    }
-    if connection_pool.has_live_bare_entry(&addr) {
-        let old = bare_warm.lock().insert(node.id, addr.clone());
-        if let Some(old) = old.filter(|old| old != &addr) {
-            connection_pool.purge_bare(&old);
-        }
-        stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+    if let Some(runtime) = runtime {
+        let _ = runtime
+            .scope_tasks(async {
+                work.await;
+                Ok(())
+            })
+            .await;
     }
 }
 
@@ -382,6 +429,7 @@ pub(super) async fn reconcile_udp_warm_retention(
 /// re-ranks the per-group top-N from current probe data; handlers reuse live
 /// sessions/clients, so repeat dispatch is cheap. Exits when the count is
 /// disabled or the generation turns terminal (reload/shutdown replaces it).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_udp_warm_coordinator<F, Fut>(
     config: Arc<tokio::sync::RwLock<Arc<Config>>>,
     group_manager: crate::group::SharedGroupManager,
@@ -389,6 +437,8 @@ pub(super) async fn run_udp_warm_coordinator<F, Fut>(
     stats: Arc<StatsManager>,
     dispatch: Arc<F>,
     retained_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    notify: Arc<tokio::sync::Notify>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) where
     F: Fn(Arc<honk_outbound::runtime::OutboundRuntimeRegistry>, uuid::Uuid) -> Fut
         + Send
@@ -397,18 +447,21 @@ pub(super) async fn run_udp_warm_coordinator<F, Fut>(
     Fut: Future<Output = anyhow::Result<honk_outbound::proxy::WarmOutcome>> + Send + 'static,
 {
     loop {
-        if generation.is_shutdown() {
+        let changed = notify.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if *stop.borrow() || generation.is_shutdown() {
             return;
         }
-        let (interval, count, candidates) = {
+        let (interval, has_work, candidates) = {
             let cfg = config.read().await.clone();
             let count = cfg.global.udp_warm_node_count;
             let interval = Duration::from_secs(cfg.global.check_interval_secs.max(10));
             let manager = group_manager.read().clone();
             let candidates = udp_warm_candidates(&cfg, &manager, &generation, count);
-            (interval, count, candidates)
+            (interval, count != 0, candidates)
         };
-        if count == 0 {
+        if !has_work {
             reconcile_udp_warm_retention(&[], &generation, &stats, &retained_ids).await;
             return;
         }
@@ -418,12 +471,17 @@ pub(super) async fn run_udp_warm_coordinator<F, Fut>(
             generation.clone(),
             stats.clone(),
             dispatch.clone(),
+            stop.clone(),
         )
         .await;
-        if generation.is_shutdown() {
+        if *stop.borrow() || generation.is_shutdown() {
             return;
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = stop.changed() => return,
+            _ = changed => {},
+            _ = tokio::time::sleep(interval) => {},
+        }
     }
 }
 
@@ -435,6 +493,7 @@ pub(in crate::control) async fn run_udp_warm_dispatches<F, Fut>(
     generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     stats: Arc<StatsManager>,
     dispatch: Arc<F>,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) where
     F: Fn(Arc<honk_outbound::runtime::OutboundRuntimeRegistry>, uuid::Uuid) -> Fut
         + Send
@@ -448,6 +507,11 @@ pub(in crate::control) async fn run_udp_warm_dispatches<F, Fut>(
     let mut pending = candidates.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
     loop {
+        if *stop.borrow() {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return;
+        }
         while tasks.len() < 4 {
             let Some(node_id) = pending.next() else {
                 break;
@@ -455,9 +519,15 @@ pub(in crate::control) async fn run_udp_warm_dispatches<F, Fut>(
             let generation = Arc::clone(&generation);
             let stats = Arc::clone(&stats);
             let dispatch = Arc::clone(&dispatch);
+            let mut cancelled = stop.clone();
             tasks.spawn(async move {
                 stats.record_udp_warm_attempt();
-                match dispatch(generation.clone(), node_id).await {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => return,
+                    result = dispatch(generation.clone(), node_id) => result,
+                };
+                match result {
                     Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
                         stats.record_udp_warm_success();
                         stats.mark_warm(node_id, crate::stats::WarmReason::Udp);
@@ -487,21 +557,16 @@ pub(in crate::control) async fn run_udp_warm_dispatches<F, Fut>(
 }
 
 impl ControlPlane {
-    /// Stop and join the prior generation's warm coordinator. Aborting the
-    /// parent drops its JoinSet, so in-flight child dispatches are cancelled
-    /// without becoming health or per-outbound error events.
-    pub(in crate::control) async fn stop_udp_warm_coordinator(&self) {
-        let handle = self.udp_warm_task.lock().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
+    pub(in crate::control) async fn stop_udp_warm_coordinator(&self) -> bool {
+        let mut owner = self.udp_warm_task.lock().await;
+        let clean = match owner.as_mut() {
+            Some(task) => task.stop_and_join().await,
+            None => true,
+        };
+        owner.take();
+        clean
     }
 
-    /// Start a warm coordinator bound to one immutable runtime generation.
-    /// A zero count releases the prior UDP retention set without creating a
-    /// task or touching attempt metrics. Positive counts re-rank after every
-    /// probe cycle.
     pub(in crate::control) async fn start_udp_warm_coordinator(
         &self,
         generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
@@ -509,8 +574,8 @@ impl ControlPlane {
         if generation.is_shutdown() {
             return;
         }
-        let count = self.config.read().await.global.udp_warm_node_count;
-        if count == 0 {
+        let has_work = self.config.read().await.global.udp_warm_node_count != 0;
+        if !has_work {
             reconcile_udp_warm_retention(&[], &generation, &self.stats, &self.udp_warm_ids).await;
             return;
         }
@@ -582,6 +647,7 @@ impl ControlPlane {
                 }
             },
         );
+        let (stop, stopping) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(run_udp_warm_coordinator(
             self.config.clone(),
             self.group_manager.clone(),
@@ -589,16 +655,23 @@ impl ControlPlane {
             self.stats.clone(),
             dispatch,
             self.udp_warm_ids.clone(),
+            self.selector_warm_notify.clone(),
+            stopping,
         ));
-        *self.udp_warm_task.lock().await = Some(handle);
+        *self.udp_warm_task.lock().await = Some(WarmTask {
+            stop,
+            task: Some(handle),
+        });
     }
 
-    pub(in crate::control) async fn stop_selector_warm_coordinator(&self) {
-        let handle = self.selector_warm_task.lock().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
+    pub(in crate::control) async fn stop_selector_warm_coordinator(&self) -> bool {
+        let mut owner = self.selector_warm_task.lock().await;
+        let clean = match owner.as_mut() {
+            Some(task) => task.stop_and_join().await,
+            None => true,
+        };
+        owner.take();
+        clean
     }
 
     /// Pin every configured Selector leaf in this immutable runtime
@@ -611,10 +684,12 @@ impl ControlPlane {
         if generation.is_shutdown() {
             return;
         }
+        let (stop, stopping) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(run_selector_warm_coordinator(SelectorWarmCoordinator {
             config: self.config.clone(),
             group_manager: self.group_manager.clone(),
             notify: self.selector_warm_notify.clone(),
+            stop: stopping,
             resources: SelectorWarmResources {
                 generation,
                 proxy_registry: self.proxy_registry.clone(),
@@ -625,6 +700,9 @@ impl ControlPlane {
                 bare_warm: self.selector_bare_warm.clone(),
             },
         }));
-        *self.selector_warm_task.lock().await = Some(handle);
+        *self.selector_warm_task.lock().await = Some(WarmTask {
+            stop,
+            task: Some(handle),
+        });
     }
 }

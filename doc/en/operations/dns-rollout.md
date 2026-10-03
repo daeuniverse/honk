@@ -16,7 +16,8 @@ explicitly authorized Linux host with root access.
   Linux kernel with BTF, and the target interfaces, routes, and DNS clients.
 - Rust stable plus the project nightly toolchain, `rust-src`, `bpf-linker`,
   CMake, C/C++ compiler, libclang/bindgen dependencies, and `readelf`.
-- Exact paths for the active binary, config, BPF object, and `cache.db`;
+- Exact paths for the active binary, config, BPF object, and persisted state
+  (`<data_dir>/state/`, or `cache.db` before the state db);
   enough space for immutable rollback copies; the previous known-good binary
   and config checksum.
 - A way to observe service logs and host health. DNS counters and structured
@@ -38,8 +39,8 @@ explicitly authorized Linux host with root access.
    removes all temporary resources before returning.
 3. Quiesce the installed service using its normal service manager. Copy the
    current binary and config to timestamped, read-only rollback paths.
-4. Back up `cache.db` while the service is quiesced, preserving ownership and
-   mode. Record checksums for all three rollback artifacts. Do not delete,
+4. Back up the persisted state (`<data_dir>/state/`, or `cache.db`) while the
+   service is quiesced, preserving ownership and mode. Record checksums for all three rollback artifacts. Do not delete,
    rewrite, compact, or migrate the database.
 5. Restart the previous version and verify its UDP/TCP DNS smoke before
    proceeding. This proves the rollback bundle rather than merely creating it.
@@ -80,11 +81,12 @@ explicitly authorized Linux host with root access.
 ## Rollback
 
 1. Stop the candidate normally and retain its logs. Do not clean BPF state or
-   mutate `cache.db`.
+   mutate the persisted state.
 2. Restore the prior binary and config from the verified rollback copies.
    Restore the database backup only if the canary corrupted or replaced the
-   database; normally keep the live database. `dns:v2:` rows may remain because
-   a pre-v2 binary ignores them, and legacy rows were not deleted by upgrade.
+   database; normally keep the live database. A candidate with the state db
+   imports and deletes `cache.db` on its first start, so rolling back to a
+   binary without it means restoring the `cache.db` backup.
 3. Start the prior binary with the prior config and BPF object. Trigger its
    normal config reload once so it re-pushes the prior routing generation;
    verify the generation commit in logs before reopening traffic.

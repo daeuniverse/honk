@@ -15,7 +15,7 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
 | `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL, excluding NODATA; `0` preserves the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL, while `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. |
-| `max_cache_size` | `10000` | Maximum cache entries and the input to the retained wire-byte budget. |
+| `max_cache_size` | `10000` | Maximum cache entries, at most 100,000. |
 | `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
 
 Scalar values own the remainder of their physical line and split only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` remain intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line; malformed quotes fail the configuration.
@@ -207,7 +207,7 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | `optimistic_cache` | `true` | Enables cache reads and publications. |
 | `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs, but never applies to NODATA. `0` keeps the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. |
-| `max_cache_size` | `10000` | Entry limit. It also scales the retained query/response wire-byte budget at 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. `0` is warned and clamped to one entry. |
+| `max_cache_size` | `10000` | Entry limit, and the only cache limit: an answer of any size occupies one entry. Values above 100,000 are clamped to 100,000 and `0` to one entry, each with a warning. |
 | `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. |
 
 Request routing runs before cache lookup. Cache and background-refresh identity uses the selected upstream or exact `asis` destination, not the raw client source: clients selecting the same exchange scope share entries, while different selected upstreams or `asis` destinations remain isolated. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.

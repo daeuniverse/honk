@@ -122,3 +122,80 @@ async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
     let _stream = stream.unwrap();
     assert_eq!(host, "example.invalid");
 }
+
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn websocket_request_event_waits_for_real_frame_flush() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    for fails in [false, true] {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let delivered = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&delivered);
+        let observer = FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: Some(uuid::Uuid::new_v4()),
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |_, event| {
+                captured.lock().push(event);
+                notify.notify_one();
+            }),
+        );
+        let (physical, peer) = tokio::io::duplex(64);
+        let websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            Box::new(physical) as Box<dyn AsyncReadWrite>,
+            Role::Client,
+            None,
+        )
+        .await;
+        let (client, server) = tokio::io::duplex(65536);
+        let progress = Arc::new(parking_lot::Mutex::new(WsWriteProgress::default()));
+        let bridge = tokio::spawn(ws_bridge_relay(
+            websocket,
+            server,
+            Some(Arc::clone(&progress)),
+        ));
+        let mut stream = ObservedWs {
+            inner: client,
+            progress,
+        };
+        let request = vec![0x5a; 4096];
+        observer
+            .scope(write_request(&mut stream, &request))
+            .await
+            .unwrap();
+        assert!(
+            events.lock().is_empty(),
+            "duplex acceptance is not a WebSocket frame flush"
+        );
+        if fails {
+            drop(peer);
+            bridge.await.unwrap();
+            assert!(
+                events.lock().is_empty(),
+                "failed frame write cannot confirm a request"
+            );
+        } else {
+            let mut peer =
+                tokio_tungstenite::WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+            let message = peer.next().await.unwrap().unwrap();
+            assert_eq!(message.into_data().as_ref(), request.as_slice());
+            delivered.notified().await;
+            assert!(matches!(
+                events.lock().as_slice(),
+                [FlowEvent::Milestone {
+                    milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
+                }]
+            ));
+            bridge.abort();
+            assert!(bridge.await.unwrap_err().is_cancelled());
+        }
+    }
+}

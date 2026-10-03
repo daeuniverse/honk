@@ -6,17 +6,43 @@ use super::*;
 async fn caller_cancel_does_not_stop_shared_dial() {
     let pool = Arc::new(pool(SessionPoolConfig::default()));
     let (tx, rx) = tokio::sync::oneshot::channel::<Arc<TestSession>>();
+    #[cfg(feature = "flow-observation")]
+    let events = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "flow-observation")]
+    let observer = {
+        use crate::runtime::flow_observation::{FlowContext, FlowObserver};
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |_, event| events.lock().push(event)),
+        )
+    };
     let p1 = Arc::clone(&pool);
     let leader = tokio::spawn(async move {
-        p1.offer(move || async move {
+        let dial = p1.offer(move || async move {
             let s: anyhow::Result<Arc<TestSession>> = Ok(rx.await.expect("trigger"));
             s
-        })
-        .await
+        });
+        #[cfg(feature = "flow-observation")]
+        let dial = observer.scope(dial);
+        dial.await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     leader.abort();
     let _ = leader.await;
+    #[cfg(feature = "flow-observation")]
+    assert!(matches!(
+        events.lock().as_slice(),
+        [crate::runtime::flow_observation::FlowEvent::Gap(
+            crate::runtime::flow_observation::GapReason::SharedDialContinuesAfterWaiter
+        )]
+    ));
     let dials = Arc::new(AtomicUsize::new(0));
     let d = Arc::clone(&dials);
     let p2 = Arc::clone(&pool);
@@ -42,6 +68,92 @@ async fn caller_cancel_does_not_stop_shared_dial() {
     assert!(!session.is_closed());
     assert!(pool.pool.lock().dial_done.is_none());
     assert_eq!(pool.pool.lock().dial_failures, 0);
+}
+
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn shared_physical_setup_survives_creator_cancellation_without_reparenting() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observe = |flow_id| {
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id,
+                generation: 1,
+                attempt_id: Some(uuid::Uuid::new_v4()),
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |context, event| events.lock().push((context, event))),
+        )
+    };
+    let creator_id = uuid::Uuid::new_v4();
+    let joiner_id = uuid::Uuid::new_v4();
+    let creator = observe(creator_id);
+    let joiner = observe(joiner_id);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let (connected, established) = tokio::sync::oneshot::channel();
+    let leader_pool = Arc::clone(&pool);
+    let leader = tokio::spawn(async move {
+        creator
+            .scope(leader_pool.offer(move || async move {
+                let _transport =
+                    crate::util::connect_outbound(&address, Duration::from_secs(2)).await?;
+                connected.send(()).unwrap();
+                blocked.await.unwrap();
+                Ok(TestSession::new())
+            }))
+            .await
+    });
+    let (_peer, _) = listener.accept().await.unwrap();
+    established.await.unwrap();
+    leader.abort();
+    let _ = leader.await;
+    let mut waiter =
+        Box::pin(joiner.scope(pool.offer(|| async {
+            unreachable!("joiner must not create another physical transport")
+        })));
+    assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+    release.send(()).unwrap();
+    waiter.await.unwrap();
+    let events = events.lock();
+    let physical: Vec<_> = events
+        .iter()
+        .filter_map(|(context, event)| match event {
+            FlowEvent::Transport {
+                attempt_id, status, ..
+            } => Some((context, *attempt_id, status.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(physical.len(), 2);
+    assert_eq!((physical[0].2, physical[1].2), ("started", "succeeded"));
+    assert_eq!(physical[0].1, physical[1].1);
+    assert!(
+        physical
+            .iter()
+            .all(|(context, _, _)| context.flow_id == creator_id)
+    );
+    assert!(events.iter().any(|(context, event)| {
+        context.flow_id == creator_id
+            && matches!(
+                event,
+                FlowEvent::Gap(
+                    crate::runtime::flow_observation::GapReason::SharedDialContinuesAfterWaiter
+                )
+            )
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|(context, _)| context.flow_id == joiner_id)
+    );
+    drop(events);
+    pool.shutdown();
 }
 
 #[tokio::test(start_paused = true)]

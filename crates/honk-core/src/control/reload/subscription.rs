@@ -54,11 +54,17 @@ impl ControlPlane {
         &self,
         subscription_id: uuid::Uuid,
         mut nodes: Vec<Node>,
-        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
+        mut diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
-    ) -> Result<bool, honk_config::error::DetailedConfigError> {
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         if nodes.is_empty() {
-            return Ok(true);
+            return Ok(ReloadOutcome::Noop {
+                generation: self
+                    .dns_controller
+                    .runtime_provider()
+                    .current_generation()
+                    .get(),
+            });
         }
         honk_config::node::validate_node_collection(&nodes)?;
         if let Some(index) = nodes.iter().position(|node| {
@@ -77,6 +83,13 @@ impl ControlPlane {
         let incoming_len = nodes.len();
         let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
         new_config.validate_assembled()?;
+        if let Some(subscription) = current
+            .subscriptions
+            .iter()
+            .find(|subscription| subscription.id == subscription_id)
+        {
+            crate::config_diagnostics::declare_provider_diagnostics(subscription, &mut diagnostics);
+        }
         let diagnostic_update = DiagnosticUpdate::ReplaceProvider {
             id: subscription_id,
             diagnostics,
@@ -94,12 +107,21 @@ impl ControlPlane {
                 subscription_id = %subscription_id,
                 "subscription unchanged; skipping runtime rebuild"
             );
-            return Ok(true);
+            return Ok(ReloadOutcome::Noop {
+                generation: self.diagnostics.read().generation,
+            });
         }
         drop(config_guard);
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
-        self.apply_resolved_runtime_config_locked(new_config, drain, diagnostic_update, None)
-            .await
+        self.apply_resolved_runtime_config_locked(
+            new_config,
+            drain,
+            diagnostic_update,
+            None,
+            #[cfg(feature = "native-api")]
+            None,
+        )
+        .await
     }
 
     pub(in crate::control) async fn merge_authorized_subscription_nodes_with_drain(
@@ -110,7 +132,7 @@ impl ControlPlane {
         nodes: Vec<Node>,
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
-    ) -> Result<bool, honk_config::error::DetailedConfigError> {
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
         if !authorizations.authorizes(subscription_id, revision) {
             warn!(
@@ -118,7 +140,7 @@ impl ControlPlane {
                 revision,
                 "discarding stale subscription refresh"
             );
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
         self.merge_subscription_nodes_locked(subscription_id, nodes, diagnostics, drain)
             .await

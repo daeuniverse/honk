@@ -85,6 +85,7 @@ pub struct RealEbpfBackend {
     cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
     /// cgroup connect4/6 + sendmsg4/6 links; same lifetime rule as above.
     cgroup_sock_addr_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
+    pname_mode: process_name::PnameCaptureMode,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
@@ -102,6 +103,12 @@ pub struct RealEbpfBackend {
     routing_slot: u32,
     routing_generation_counter: u64,
     routing_generation_sequence: AyaArray<AyaMapData, u64>,
+    next_trace_policy: u32,
+    #[cfg(feature = "native-api")]
+    trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
+    receive_trace: Option<std::sync::Arc<receive_trace::ReceiveTrace>>,
+    receive_trace_available: bool,
+    receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
 }
 
@@ -138,7 +145,9 @@ mod attach;
 mod btf;
 mod events;
 mod iface_watch;
+mod observation;
 mod process_name;
+pub(crate) mod receive_trace;
 mod routing;
 mod syscall;
 #[cfg(test)]
@@ -255,6 +264,14 @@ impl RealEbpfBackend {
                 MapError::SyscallError(error)
                     if error.io_error.raw_os_error() == Some(libc::ENOENT)
             )
+    }
+
+    fn sockmap_slot_is_empty(error: &MapError) -> bool {
+        // Linux __sock_map_delete returns EINVAL for vacant slots; Aya checks
+        // index bounds before issuing this SOCKMAP-specific syscall.
+        Self::map_error_is_missing(error)
+            || matches!(error,
+            MapError::SyscallError(error) if error.io_error.raw_os_error() == Some(libc::EINVAL))
     }
 
     fn array_set<V: Pod>(&mut self, name: &str, index: u32, value: &V) -> anyhow::Result<()> {
@@ -456,6 +473,10 @@ impl RealEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for RealEbpfBackend {
+    fn observe_datapath(&self) -> super::DatapathObservation {
+        self.observe_backend()
+    }
+
     fn attach_dynamic_interface(
         &mut self,
         ifname: &str,
@@ -826,6 +847,15 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+        Ok(self
+            .routing_handoff_take_observed(key)?
+            .map(|(entry, _)| entry))
+    }
+
+    fn routing_handoff_take_observed(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
         let bpf = self.bpf()?;
         match bpf_lookup_and_delete::<_, RoutingHandoffEntry>(
             bpf,
@@ -833,17 +863,72 @@ impl EbpfBackend for RealEbpfBackend {
             "ROUTING_HANDOFF_MAP",
             key,
         )? {
-            LookupAndDelete::Value(entry) => return Ok(Some(entry)),
+            LookupAndDelete::Value(entry) => return Ok(Some((entry, true))),
             LookupAndDelete::Missing => return Ok(None),
             LookupAndDelete::Unsupported => {}
         }
-        // This legacy non-atomic fallback may lose a replacement. Ordinary
-        // flows can re-route; transparent TCP DNS rejects missing authority.
         let entry = self.hash_lookup("ROUTING_HANDOFF_MAP", key)?;
         if entry.is_some() {
             bpf_delete_shared(bpf, "ROUTING_HANDOFF_MAP", key)?;
         }
-        Ok(entry)
+        Ok(entry.map(|entry| (entry, false)))
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries
+                .bind(owner.trace_policy, owner.fingerprint, dictionary);
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        key: &TuplesKey,
+        reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
+        if reference.trace_id == 0 {
+            return Err("kernel_trace_not_captured");
+        }
+        if reference.trace_id == ROUTE_TRACE_LOST {
+            return Err("kernel_trace_lost");
+        }
+        let witness = self
+            .hash_lookup::<_, KernelRouteWitness>("ROUTE_TRACE_MAP", &reference.trace_id)
+            .map_err(|_| "kernel_trace_lookup_failed")?
+            .ok_or("kernel_trace_sidecar_missing")?;
+        self.trace_dictionaries.capture(&witness, key, reference)
+    }
+
+    /// Without the cgroup hooks `pname()` never matches and `!pname()`
+    /// always does; without argv capture they see the thread name.
+    fn pname_support(&self) -> super::PnameSupport {
+        if self.cgroup_sock_links.is_empty() {
+            super::PnameSupport::Unavailable
+        } else if self.pname_mode == process_name::PnameCaptureMode::Comm {
+            super::PnameSupport::ThreadName
+        } else {
+            super::PnameSupport::Full
+        }
+    }
+
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<receive_trace::ReceiveTrace>> {
+        if !self.receive_trace_attempted {
+            self.receive_trace_attempted = true;
+            if !self.receive_trace_available {
+                warn!("kernel UDP trace unavailable: checked BTF offsets missing");
+            } else {
+                match receive_trace::ReceiveTrace::attach(self.bpf_mut().ok()?) {
+                    Ok(trace) => self.receive_trace = Some(trace),
+                    Err(error) => warn!(%error, "kernel UDP trace attach unavailable"),
+                }
+            }
+        }
+        self.receive_trace.clone()
     }
 
     fn cookie_pid_lookup(&self, c: u64) -> anyhow::Result<Option<PIDName>> {
@@ -1181,6 +1266,28 @@ impl EbpfBackend for RealEbpfBackend {
         Ok(())
     }
 
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.array_get::<u32>("DATAPATH_STATE_MAP", 0)? == Some(0),
+            "datapath admission must be closed before clearing listeners"
+        );
+        // Invalidation precedes removal: a partial failure must not permit READY.
+        self.listeners_published = false;
+        let map = self
+            .bpf_mut()?
+            .map_mut("LISTEN_SOCKET_MAP")
+            .ok_or_else(|| anyhow::anyhow!("listener socket map unavailable"))?;
+        let mut sockets = AyaSockMap::try_from(map)?;
+        for key in 0..10 {
+            match sockets.clear_index(&key) {
+                Ok(()) => {}
+                Err(error) if Self::sockmap_slot_is_empty(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         // Detach eBPF programs immediately to restore network connectivity.
         self.detach_hooks()?;
@@ -1199,6 +1306,7 @@ impl EbpfBackend for RealEbpfBackend {
             h.abort();
             let _ = h.await;
         }
+        drop(self.receive_trace.take());
 
         // Drop object map fds before unlinking generation-owned pins; both
         // persistent sequence pins survive ordinary shutdown.

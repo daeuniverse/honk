@@ -14,13 +14,15 @@ honk-core [OPTIONS] [COMMAND]
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `-c`, `--config PATH` | `/etc/honk/config.dae` | 配置入口文件。`mode`、`proxy` 和 `delay` 也读取此路径。`reload` 忽略此项，仅向运行中实例发送信号；运行实例重载其启动时使用的路径。 |
+| `-c`, `--config PATH` | `/etc/honk/config.dae` | 配置入口文件。使用 `--store db` 时，仅在数据库为空或 API 导入时读取。文件模式下 `mode`、`proxy` 和 `delay` 也读取此路径。`reload` 忽略此项，仅向运行中实例发送信号；运行实例重载其启动时使用的路径。 |
 | `--log-file PATH` | 未设置 | 仅为本次引擎进程覆盖 `global.log_file`，不重写配置文件。相对路径在 `global.data_dir` 下解析，控制台日志保持启用。设置后，SIGHUP 会忽略被遮蔽配置值的变化，除非实际生效的目标发生改变。 |
 | `-b`, `--bpf-object PATH` | 内嵌目标文件 | 覆盖 `ebpf` 构建内嵌的目标文件。仅真实后端使用。 |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | eBPF map 的 pin 根目录。 |
 | `--disable-timestamp` | 关 | 控制台日志行不再带时间戳。在 systemd 或其他自带时间戳的日志系统下使用；`--log-file` 或 `global.log_file` 指定的文件仍带时间戳。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |
 | `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录 warning 并仅在本进程关闭 NFQUEUE 暂存。 |
+| `--store file\|db` | `file` | `db` 从 `<data-dir>/state/honk.db` 中的 revision 加载配置，数据库为空时导入 `-c`。见[配置数据库](./api.md#配置数据库--store-db)。 |
+| `--data-dir PATH` | `/var/lib/honk` | 数据目录，状态数据库位于其下的 `state/honk.db`，必须与 `global.data_dir` 相同。供 `--store db`、`config export` 与 `admin reset` 使用。 |
 
 两个二进制都提供 `-h`/`--help` 和 `-v`/`--version`。
 
@@ -48,9 +50,13 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `reload` | 从已加锁的 `/run/honk-core.lock` 读取 PID 并发送 `SIGHUP`。 | 只报告信号成功送达；运行中进程随后记录 `applied` 或 `rejected`。mock 实例不持有该锁。 |
 | `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
+| `config export --out PATH [--without-secrets]` | 把配置数据库的当前 revision 写成一份 `.dae` 文件；未给 `--without-secrets` 时补回监听凭据。无论 daemon 是否运行，都通过以读写方式打开的 query-only 连接读取数据库。关闭该连接不会执行检查点，也不会删除 `honk.db-wal`；除 SQLite 可能创建的 `-shm` 索引外，唯一可能的写入是回滚崩溃遗留的日志。文件写完后才发布。 | 以 0600 权限新建 `PATH`，拒绝已存在的文件。 |
+| `admin reset` | 从 `--data-dir` 下的状态数据库删除密码模式管理员，下次启动时重新开放 setup。 | 任何 honk-core（包括 mock 模式）打开该状态数据库时拒绝执行。 |
 | `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
 
 [编译路由发布计数器](../design/routing.md#同步槽与原子发布)耗尽后需重启；它与普通 SIGHUP 及 DNS runtime 重载分开计数。
+
+使用 `--store db` 时，`proxy` 与 `delay` 读取当前 revision，`mode` 拒绝执行。
 
 真实数据面进程在其生命周期内持有该锁。`reload` 会先确认文件仍被锁定，再信任其中的 PID；`kill(2)` 成功送达并不表示候选配置通过校验或需重启字段检查。
 
@@ -59,10 +65,12 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | 变量 | 作用范围 | 当前行为 |
 | --- | --- | --- |
 | `RUST_LOG` | 两个二进制 | Tracing filter。对 `honk-core` 采用上述当前有效优先级；`honk-tool` 在未设置时默认 `warn`。 |
-| `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | dashboard ZIP URL 的最高优先级覆盖；已配置的外部 UI 目录需要下载时，它会覆盖 `external_ui_download_url`。 |
+| `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | dashboard ZIP URL 的最高优先级覆盖；已配置的外部 UI 目录需要下载时，它会覆盖 `assets.ui.url`。 |
 | `HONK_POOL_DISABLE=1` | `honk-core` | 绕过 Ready stream 与裸 TCP 两类池，每次全新拨号。代码也接受不区分大小写的 `true`；首次使用后缓存该值。 |
 | `HONK_QUIC_GSO=0|1` | QUIC 出站 | 强制关闭/开启 UDP GSO。未覆盖时，保守的 1252-byte MTU 保持关闭；显式设置更大的 `mtu` 时自动开启，并把批量限制为最多 16 个 segment。 |
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
+| `MIMALLOC_PURGE_DELAY` | 启用 `mimalloc` 的 `honk-core` | mimalloc 自带的 purge 延迟（毫秒）：已释放页面在归还 OS 前保持 committed 的时间。honk 启动时设为 `100`（mimalloc v3 默认 `1000`），在连接、探测与 DNS 的分配抖动下降低 RSS，批量 relay 的吞吐与 CPU 无可测量变化；环境变量中设置的任何值都优先，包括无法解析的值（此时保持 mimalloc 的 `1000`）。`0` 立即归还（RSS 最低、CPU 略增），`-1` 从不归还。 |
+| `TOKIO_WORKER_THREADS` | `honk-core` | Tokio 自带的 worker 数量。`honk-core` 使用默认的多线程 runtime，因此默认等于核数。必须是正整数：`0` 或非数字会使 Tokio 在启动时 panic。每个 worker 持有独立的 allocator 堆，在多核网关上调低该值可降低 RSS（实验室，4 核主机，120 条连接加 DNS：16 个 worker 约 85 MiB，8 个约 66 MiB，4 个约 60 MiB，CPU 差异在噪声内）。relay 路径运行在这些 worker 上，请按流量取值。 |
 | `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖解析进程名字段偏移所用的原始内核 BTF 文件。未设置时，honk 依次检查 `/sys/kernel/btf/vmlinux` 与 `/usr/lib/debug/boot/vmlinux`；若运行时 BTF 偏移或内核 argv 访问无法通过 verifier，pname 同步回退到调用线程的 `comm`。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
 
@@ -158,6 +166,8 @@ vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp
 `n/a` 表示探测不适用，例如 packet 拨号被关闭，或 UDP/443 策略拒绝该目标。本地 carrier 容量拒绝是已尝试后的 terminal failure，显示为 `FAIL(...)` 而不是 `n/a`，且对远程端点健康保持中立。之所以需要区分，是因为共享的全局文件描述符预算所能接纳的物理 VLESS carrier 可能少于各节点 mux 上限之和。
 
 UDP DNS 目标解析、packet transport 建立、发送与接收共用一个 `--timeout` 预算。解析失败或超时只体现在 DNS 列，TCP、URLTest 和 QUIC 探测继续进行。不支持 UDP 的节点跳过该解析；主机名解析失败时不会替换为另一个目标。
+
+外层逐节点预算另留两秒用于 join QUIC 清理，再加一秒调度余量。清理耗时不是延迟样本，也不应抹掉已完成的其他探测结果。
 
 UDP DNS 主机名目标使用共享异步解析器，读取 `/etc/resolv.conf` 中首个数字形式的 nameserver（UDP 端口 `53`），并在 `/etc/hosts` 存在时加载它，不执行阻塞的 NSS 查询。此路径不应用 NSS 插件或解析器搜索后缀。解析器不可用时，DNS 列报告 `resolve`，不会回退到公共解析器；字面量目标不需要解析器。
 

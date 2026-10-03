@@ -5,6 +5,7 @@ use crate::dae_ip::In6Addr;
 pub mod conn;
 pub mod dae_ip;
 pub mod event;
+pub mod receive_trace;
 pub mod redirect_need;
 pub mod routing_policy;
 
@@ -15,10 +16,15 @@ pub use crate::redirect_need::{
     TuplesKey,
 };
 pub use routing_policy::{
-    ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
-    ROUTING_FEATURE_PROCESS, ROUTING_POLICY_ROOT_NAME, ROUTING_PROCESS_MAX_LEN, ROUTING_SLOT_NAMES,
-    RoutingDecision, RoutingInput, RoutingPolicyDescriptor, RoutingTestResult,
-    normalize_process_name,
+    KernelRouteOutput, KernelRouteWitness, ROUTE_FACT_DESTINATION, ROUTE_FACT_DOMAIN,
+    ROUTE_FACT_MAC, ROUTE_FACT_PRESENT_SHIFT, ROUTE_FACT_SOURCE, ROUTE_TRACE_AMBIGUOUS,
+    ROUTE_TRACE_CAPACITY, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_DNS_OVERRIDE, ROUTE_TRACE_ENABLED,
+    ROUTE_TRACE_LOST, ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW,
+    ROUTE_TRACE_SKIPPED, ROUTE_TRACE_UNAVAILABLE, ROUTE_TRACE_VALUES, ROUTE_TRACE_VERSION,
+    ROUTE_TRACE_VERSION_MASK, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
+    ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_POLICY_ROOT_NAME,
+    ROUTING_PROCESS_MAX_LEN, ROUTING_SLOT_NAMES, RoutingDecision, RoutingInput,
+    RoutingPolicyDescriptor, RoutingTestResult, normalize_process_name,
 };
 
 pub const TASK_COMM_LEN: usize = 16;
@@ -493,11 +499,10 @@ const _REDIRECT_ENTRY_TOKEN_OFFSET: () =
     assert!(core::mem::offset_of!(RedirectEntry, decision_token) == 28);
 
 /// Bits of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
-/// at runtime (unlike `DaeParam`, which is fixed at load time).  They encode
-/// the mode-based direct-offload policy and are read **once per new flow**
-/// in `lan_ingress` and `wan_egress`, at route-decision time; the resulting decision
-/// is cached per flow in `ROUTING_META_FLAG_OFFLOAD`, so established packets
-/// never touch this map.
+/// at runtime (unlike `DaeParam`, which is fixed at load time). Mode/offload
+/// policy and optional witness admission share one new-flow snapshot in
+/// `lan_ingress` and `wan_egress`. Established flows retain their decision and
+/// captured witness; UDP staging re-reads only the NFQUEUE readiness fence.
 ///
 /// `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`: the effective clash mode is `Rule`
 /// (including "clash API disabled", where no mode override ever applies).
@@ -512,6 +517,10 @@ pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
 /// `block` or `must` rule reachable only through a sniffed domain does not
 /// apply, unlike the userspace override.
 pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
+
+/// Admit optional witnesses for new routing invocations. Clearing this bit never
+/// revokes an already captured witness or changes the routing decision.
+pub const DATAPATH_FLAG_TRACE_ENABLED: u32 = 1 << 2;
 
 /// NFQUEUE staging is configured; without readiness, eligible new flows fail closed.
 pub const DATAPATH_FLAG_NFQ_ENABLED: u32 = 1 << 3;
