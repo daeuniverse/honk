@@ -351,7 +351,7 @@ jobs:
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
@@ -767,7 +767,7 @@ jobs:
           set -euo pipefail
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: nextest
       - name: Run eBPF-feature unit tests
@@ -1083,7 +1083,7 @@ jobs:
           set -euo pipefail
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: nextest
       - name: Run eBPF-feature unit tests
@@ -1180,7 +1180,7 @@ jobs:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
