@@ -301,17 +301,31 @@ impl VLessHandler {
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<super::mux::VlessMuxSession>> {
+        let (session, preparation) = Self::prepare_h2_session(runtime, connect_timeout).await?;
+        preparation.commit()?;
+        Ok(session)
+    }
+
+    async fn prepare_h2_session(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Arc<super::mux::VlessMuxSession>,
+        crate::proxy::transport::TransportPreparation,
+    )> {
         let (target, domain) = super::mux::physical_target();
         let honk_config::node::VlessMultiplex::H2 { padding } =
             &runtime.node.vless().unwrap().multiplex
         else {
             anyhow::bail!("VLESS H2 path has no H2 multiplex settings");
         };
-        let stream = Self::new()
-            .dial_retained_base(&runtime, target, Some(domain), connect_timeout)
-            .await?
-            .stream;
-        super::mux::connect(stream, *padding).await
+        let (stream, preparation) = Self::new()
+            .prepare_retained_base(&runtime, target, Some(domain), connect_timeout)
+            .await?;
+        Ok((
+            super::mux::connect(stream.stream, *padding).await?,
+            preparation,
+        ))
     }
 
     async fn open_h2_tcp(
@@ -653,9 +667,11 @@ impl TcpOutbound for VLessHandler {
         match runtime.node.vless().unwrap().tcp_path() {
             VlessTcpPath::Direct => {
                 if runtime.xhttp.is_some() {
-                    return self
-                        .dial_retained_base(&runtime, target, target_domain, connect_timeout)
-                        .await;
+                    let (stream, preparation) = self
+                        .prepare_retained_base(&runtime, target, target_domain, connect_timeout)
+                        .await?;
+                    preparation.commit()?;
+                    return Ok(stream);
                 }
                 self.dial_base(&runtime.node, target, target_domain, None, connect_timeout)
                     .await
@@ -719,12 +735,7 @@ impl PacketOutbound for VLessHandler {
                 let dial_runtime = Arc::clone(&runtime);
                 Self::prepare_mux_udp(
                     pool,
-                    move || async move {
-                        Ok((
-                            Self::dial_h2_session(dial_runtime, connect_timeout).await?,
-                            crate::proxy::transport::TransportPreparation::none(),
-                        ))
-                    },
+                    move || Self::prepare_h2_session(dial_runtime, connect_timeout),
                     move |session, permit| async move {
                         let transport: Arc<dyn PacketTransport> =
                             session.open_packet(permit, target, target_domain).await?;

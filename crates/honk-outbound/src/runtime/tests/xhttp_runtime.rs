@@ -154,7 +154,9 @@ async fn xhttp_physical_warm_retention_maintenance_and_shutdown() {
     let _ = peer.await;
 }
 
-async fn h2_preparation_peer() -> (
+async fn h2_preparation_peer(
+    h2_mux: bool,
+) -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::Receiver<()>,
@@ -177,10 +179,16 @@ async fn h2_preparation_peer() -> (
                             let _ = opened.send(()).await;
                             let mut responses = Vec::new();
                             let mut requests = Vec::new();
+                            let mut muxes = tokio::task::JoinSet::new();
                             while let Some(Ok((request, mut response))) = connection.accept().await {
-                                requests.push(request.into_body());
+                                let body = request.into_body();
                                 if let Ok(stream) = response.send_response(http::Response::new(()), false) {
-                                    responses.push(stream);
+                                    if h2_mux {
+                                        muxes.spawn(serve_vless_h2_mux(body, stream));
+                                    } else {
+                                        requests.push(body);
+                                        responses.push(stream);
+                                    }
                                 }
                             }
                         }
@@ -194,6 +202,53 @@ async fn h2_preparation_peer() -> (
         }
     });
     (address, task, open_events, close_events)
+}
+
+async fn serve_vless_h2_mux(mut recv: h2::RecvStream, mut send: h2::SendStream<bytes::Bytes>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut mux, bridge) = tokio::io::duplex(32768);
+    let (mut read, mut write) = tokio::io::split(bridge);
+    tokio::select! {
+        _ = async {
+            while let Some(Ok(data)) = recv.data().await {
+                let length = data.len();
+                if write.write_all(&data).await.is_err() { break; }
+                if recv.flow_control().release_capacity(length).is_err() { break; }
+            }
+        } => {}
+        _ = async {
+            let mut data = [0; 4096];
+            while let Ok(length) = read.read(&mut data).await {
+                if length == 0 || send.send_data(bytes::Bytes::copy_from_slice(&data[..length]), false).is_err() {
+                    break;
+                }
+            }
+        } => {}
+        _ = async {
+            let mut head = [0; 23];
+            mux.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[18], 1);
+            assert_eq!(&head[19..21], &444u16.to_be_bytes());
+            assert_eq!(head[21], 2);
+            let mut domain = vec![0; head[22] as usize];
+            mux.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"sp.mux.sing-box.arpa");
+            mux.write_all(&[0, 0]).await.unwrap();
+            let mut preface = [0; 2];
+            mux.read_exact(&mut preface).await.unwrap();
+            assert_eq!(preface, [0, 2]);
+            let mut connection = h2::server::handshake(mux).await.unwrap();
+            let mut requests = Vec::new();
+            let mut responses = Vec::new();
+            while let Some(Ok((request, mut response))) = connection.accept().await {
+                assert_eq!(request.method(), http::Method::CONNECT);
+                requests.push(request.into_body());
+                let mut stream = response.send_response(http::Response::new(()), false).unwrap();
+                stream.send_data(bytes::Bytes::from_static(b"\0"), false).unwrap();
+                responses.push(stream);
+            }
+        } => {}
+    }
 }
 
 fn xhttp_node_at(protocol: NodeProtocol, address: std::net::SocketAddr) -> Node {
@@ -213,14 +268,15 @@ fn xhttp_node_at(protocol: NodeProtocol, address: std::net::SocketAddr) -> Node 
 async fn speculative_udp_publishes_only_winner_and_loser_closes_physical_carrier() {
     use crate::proxy::PacketOutbound;
     use honk_config::node::VlessUdpEncoding;
-    for (encoding, source) in [
-        (None, false),
-        (Some(VlessUdpEncoding::Native), false),
-        (Some(VlessUdpEncoding::UotV2), false),
-        (Some(VlessUdpEncoding::Xudp), false),
-        (Some(VlessUdpEncoding::Xudp), true),
+    for (encoding, source, h2_mux) in [
+        (None, false, false),
+        (Some(VlessUdpEncoding::Native), false, false),
+        (Some(VlessUdpEncoding::UotV2), false, false),
+        (Some(VlessUdpEncoding::Xudp), false, false),
+        (Some(VlessUdpEncoding::Xudp), true, false),
+        (Some(VlessUdpEncoding::Native), false, true),
     ] {
-        let (address, peer, mut opened, mut closed) = h2_preparation_peer().await;
+        let (address, peer, mut opened, mut closed) = h2_preparation_peer(h2_mux).await;
         let protocol = if encoding.is_some() {
             NodeProtocol::VLess
         } else {
@@ -229,6 +285,11 @@ async fn speculative_udp_publishes_only_winner_and_loser_closes_physical_carrier
         let mut node = xhttp_node_at(protocol, address);
         if let Some(encoding) = encoding {
             node.vless_mut().unwrap().udp_encoding = encoding;
+            node.id = node.derive_id();
+        }
+        if h2_mux {
+            node.vless_mut().unwrap().multiplex =
+                honk_config::node::VlessMultiplex::H2 { padding: false };
             node.id = node.derive_id();
         }
         let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
@@ -282,7 +343,7 @@ async fn speculative_udp_publishes_only_winner_and_loser_closes_physical_carrier
             );
             if winner {
                 let transport = preparation.commit().await.unwrap();
-                assert_eq!(runtime.warm_counts().sessions, 1);
+                assert_eq!(runtime.warm_counts().sessions, 1 + usize::from(h2_mux));
                 drop(transport);
                 registry.shutdown().await;
             } else {
@@ -491,7 +552,7 @@ async fn exhausted_xhttp_physical_admission_stays_capacity_scoped_without_start_
 #[tokio::test]
 async fn losing_xhttp_udp_preparation_preserves_shared_warm_carrier() {
     use crate::proxy::PacketOutbound;
-    let (address, peer, mut opened, mut closed) = h2_preparation_peer().await;
+    let (address, peer, mut opened, mut closed) = h2_preparation_peer(false).await;
     let node = xhttp_node_at(NodeProtocol::Trojan, address);
     let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
     let runtime = registry.get(&node.id).unwrap();
@@ -533,7 +594,7 @@ async fn losing_xhttp_udp_preparation_preserves_shared_warm_carrier() {
 #[tokio::test]
 async fn retired_xhttp_runtime_rejects_provisional_winner_without_publishing() {
     use crate::proxy::PacketOutbound;
-    let (address, peer, mut opened, mut closed) = h2_preparation_peer().await;
+    let (address, peer, mut opened, mut closed) = h2_preparation_peer(false).await;
     let node = xhttp_node_at(NodeProtocol::VLess, address);
     let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
     let runtime = registry.get(&node.id).unwrap();

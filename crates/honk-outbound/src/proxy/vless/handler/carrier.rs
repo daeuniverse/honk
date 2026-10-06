@@ -102,20 +102,6 @@ impl VLessHandler {
         })
     }
 
-    pub(super) async fn dial_retained_carrier(
-        &self,
-        runtime: &Arc<crate::runtime::NodeRuntime>,
-        uuid: [u8; 16],
-        header: Vec<u8>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let (stream, preparation) = self
-            .prepare_retained_carrier(runtime, uuid, header, connect_timeout)
-            .await?;
-        preparation.commit()?;
-        Ok(stream)
-    }
-
     pub(super) async fn prepare_retained_carrier(
         &self,
         runtime: &Arc<crate::runtime::NodeRuntime>,
@@ -154,13 +140,13 @@ impl VLessHandler {
             .await
     }
 
-    pub(super) async fn dial_retained_base(
+    pub(super) async fn prepare_retained_base(
         &self,
         runtime: &Arc<crate::runtime::NodeRuntime>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<ProxyStream> {
+    ) -> anyhow::Result<(ProxyStream, crate::proxy::transport::TransportPreparation)> {
         let vless = runtime.node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
@@ -170,14 +156,17 @@ impl VLessHandler {
             target_domain,
             vless.wire_flow(),
         )?;
-        let stream = self
-            .dial_retained_carrier(runtime, uuid, header, connect_timeout)
+        let (stream, preparation) = self
+            .prepare_retained_carrier(runtime, uuid, header, connect_timeout)
             .await?;
-        Ok(ProxyStream {
-            stream,
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-        })
+        Ok((
+            ProxyStream {
+                stream,
+                target_addr: target,
+                target_domain: target_domain.map(str::to_string),
+            },
+            preparation,
+        ))
     }
 
     pub(super) async fn prepare_retained_mux_carrier(

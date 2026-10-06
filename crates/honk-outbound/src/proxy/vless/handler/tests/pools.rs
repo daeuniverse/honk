@@ -89,14 +89,14 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
     let runtime = generation.get(&node.id).unwrap();
     let handler = VLessHandler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-    let mut dial = Box::pin(handler.dial_retained_base(
+    let mut dial = Box::pin(handler.prepare_retained_base(
         &runtime,
         target,
         None,
         std::time::Duration::from_secs(3),
     ));
     tokio::select! {
-        result = &mut dial => panic!("encrypted handshake completed before cancellation: {result:?}"),
+        result = &mut dial => panic!("encrypted handshake completed before cancellation: {:?}", result.map(|(stream, _)| stream)),
         result = hello_rx => result.unwrap(),
     }
     drop(dial);
