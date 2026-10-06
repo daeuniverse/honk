@@ -392,6 +392,47 @@ fn direct_alias_must_normalize_before_config_admission() {
 }
 
 #[test]
+fn direct_alpn_must_normalize_before_config_admission() {
+    let canonical = link("type=xhttp");
+    for alpn in [vec![], vec!["h2".into(), "h2".into()]] {
+        let mut node = canonical.clone();
+        node.tls_mut().unwrap().alpn = alpn;
+        node.id = node.derive_id();
+        assert!(node.validate_protocol().is_err());
+        assert!(
+            honk_config::Config {
+                nodes: vec![node.clone()],
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        node.normalize_stream_transport().unwrap();
+        assert_eq!(node.tls().unwrap().alpn, ["h2"]);
+        node.id = node.derive_id();
+        assert_eq!(node.id, canonical.id);
+        honk_config::Config {
+            nodes: vec![node],
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
+    for alpn in [
+        vec!["http/1.1".into()],
+        vec!["h2".into(), "http/1.1".into()],
+    ] {
+        let mut node = canonical.clone();
+        node.tls_mut().unwrap().alpn = alpn;
+        assert!(node.validate_protocol().is_err());
+        assert_eq!(
+            node.normalize_stream_transport(),
+            Err("XHTTP requires H2-only ALPN")
+        );
+    }
+}
+
+#[test]
 fn direct_options_must_normalize_before_config_admission() {
     for options in [
         XhttpOptions {

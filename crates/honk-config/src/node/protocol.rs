@@ -35,7 +35,7 @@ impl TlsOptions {
     }
 
     pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {
-        if self.alpn.iter().all(|protocol| protocol == "h2") {
+        if self.alpn == ["h2"] {
             Ok(())
         } else {
             Err("XHTTP requires H2-only ALPN")

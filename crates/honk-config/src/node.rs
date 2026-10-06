@@ -116,8 +116,11 @@ impl Node {
         }
         if self.is_xhttp() {
             let tls = self.tls_mut().expect("stream transports have TLS options");
+            tls.alpn.dedup();
+            if tls.alpn.is_empty() {
+                tls.alpn.push("h2".into());
+            }
             tls.check_xhttp_alpn()?;
-            tls.alpn = vec!["h2".into()];
         }
         Ok(())
     }
