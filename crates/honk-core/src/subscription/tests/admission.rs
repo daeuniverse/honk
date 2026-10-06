@@ -432,12 +432,26 @@ fn official_sing_box_and_records_explicitly_reject_xhttp_with_salvage() {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "survivor");
         assert_eq!(diagnostics.len(), 1);
-        let body = format!(
-            "invalid=trojan,example.com,443,password=secret,transport={transport}\nsurvivor=socks5,127.0.0.1,1080\n"
-        );
-        let nodes = parse_subscription_content(&Subscription::default(), &body).unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name, "survivor");
+        for claim in [
+            format!("transport={transport}"),
+            format!("{transport}=false"),
+            format!("{transport}-opts="),
+            transport.to_string(),
+        ] {
+            let body = format!(
+                "invalid=trojan,example.com,443,password=secret,{claim}\nsurvivor=socks5,127.0.0.1,1080\n"
+            );
+            let mut diagnostics = Vec::new();
+            let nodes = parse_subscription_content_with_diagnostics(
+                &Subscription::default(),
+                &body,
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(nodes.len(), 1, "{claim}");
+            assert_eq!(nodes[0].name, "survivor", "{claim}");
+            assert_eq!(diagnostics.len(), 1, "{claim}");
+        }
     }
 }
 
