@@ -273,7 +273,8 @@ pub(super) async fn connect(inner: Box<dyn AsyncReadWrite>) -> anyhow::Result<Ar
     let progress = Arc::new(IoProgress::default());
     let (sender, mut connection) = h2::client::Builder::new()
         .enable_push(false)
-        .max_local_error_reset_streams(Some(0))
+        // Shared-carrier churn spans many admission windows before reset state expires.
+        .max_concurrent_reset_streams(MAX_REQUESTS * 16)
         .max_header_list_size(64 * 1024)
         .max_send_buffer_size(STREAM_WRITE)
         // Before SETTINGS, admit only one request so a GET cannot strand its upload.

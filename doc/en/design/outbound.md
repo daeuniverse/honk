@@ -333,6 +333,8 @@ response-header and body-decoding failures reach the stream owner instead of EOF
 
 `proxy/transport/xhttp.rs` adapts raw H2 bodies to the existing stream contract. It owns a node-local `SessionPool`, not a second proxy protocol or loopback relay. The pool keeps at most two reusable physical carriers; draining carriers may overlap replacements under the existing process descriptor and VLESS-carrier gates. Physical drivers retain their socket, observation and carrier permit; HTTP requests and logical proxy flows hold separate reservations. The peer's advertised concurrent-stream limit remains authoritative, including zero, one and later reductions.
 
+Each carrier retains up to 2048 locally reset requests (16 admission windows) for h2's default one-second in-flight-frame grace period and keeps its bounded default lifetime budget of 1024 protocol-error resets; steady short-flow churn can cancel several admission windows before old reset state expires, so retention must exceed the active-request bound.
+
 Stream-one uses one POST; stream-up uses a GET and streaming POST; packet-up uses a GET and ordered finite POSTs. Establishment returns a writable stream without waiting for response headers. Upload-response padding is drained and discarded, never reported as application RX. Packet-up aggregates owned bytes with bounded unanswered responses rather than sending one POST per application write; subsequent POSTs may progress after the previous body was physically written, without waiting for that response.
 
 Legacy upload padding uses a Referer built from the configured base path with its query replaced by the generated `x_padding` value; the request itself retains the configured query.

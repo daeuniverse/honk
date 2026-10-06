@@ -307,6 +307,8 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 
 `proxy/transport/xhttp.rs` 将原始 H2 body 适配为已有 stream 契约，持有节点级 `SessionPool`，不是新代理协议或 loopback relay。Pool 最多保留两条可复用物理 carrier；draining carrier 可在既有进程 FD/VLESS-carrier gate 下与 replacement 短暂重叠。物理 driver 拥有 socket、观测和 carrier permit；HTTP 请求与逻辑代理流使用独立 reservation。对端公布的并发 stream 上限保持权威，包括零、一与后续缩小。
 
+每条 carrier 最多保留 2048 个本地 reset 请求（16 个准入窗口），使用 h2 默认的一秒在途 frame 宽限期，并保留其默认、有限的终身 1024 次协议错误 reset 预算；持续的短 flow churn 会在旧 reset 状态过期前取消多个准入窗口，因此保留数量必须高于活跃请求上限。
+
 Stream-one 使用一个 POST，stream-up 使用 GET 与流式 POST，packet-up 使用 GET 与有序有限 POST。建链无需等待响应头即可返回可写流。上传响应中的 padding 持续排空并丢弃，不记作应用 RX。Packet-up 聚合已取得所有权的字节并限制未完成响应数，不会每次应用 write 都发一个 POST；前一个 body 物理写完后即可继续后续 POST，不必等待它的响应。
 
 Legacy 上传 padding 的 Referer 使用配置的基础 path，并将其 query 替换为生成的 `x_padding` 值；请求本身保留配置的 query。
