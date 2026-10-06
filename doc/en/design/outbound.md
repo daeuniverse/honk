@@ -337,6 +337,8 @@ Legacy upload padding uses a Referer built from the configured base path with it
 
 Flush waits for byte ownership release and physical I/O flush under current H2 flow control; buffered download bytes precede terminal errors. Upload shutdown retains the response direction; stream-up completes once its request END_STREAM is physically flushed and continues draining its POST response, retaining late upload refusals. Packet-up waits for its terminal POST responses and has no fabricated EOF marker. Graceful GOAWAY stops new requests on that carrier while retaining admitted streams; only future new POSTs move to a replacement, with no ambiguous application replay. New logical-flow admission closes on retirement, while already-admitted packet flows retain the request capacity needed to finish.
 
+A ready stream-up upload-response failure takes precedence over simultaneous request END_STREAM completion, so shutdown reports that refusal rather than successful half-close.
+
 Ephemeral establishment is guarded through cancellation, pool-owned handshakes have a deadline, and speculative UDP carriers stay unpublished until the winner's fallible commit. Closing or losing a preparation rolls back its reservations. Existing runtime shutdown, retirement and idle maintenance own cleanup; no protocol-specific janitor or production per-packet telemetry is added.
 
 ### Marked sockets and name resolution

@@ -311,6 +311,8 @@ Legacy 上传 padding 的 Referer 使用配置的基础 path，并将其 query �
 
 Flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新；缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 等待各 POST 的终端响应，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
 
+Stream-up 上传响应错误已经就绪时，优先于同时完成的请求 END_STREAM 处理，因此 shutdown 返回该拒绝错误，而不是报告半关闭成功。
+
 Ephemeral 建立过程在取消期间也受 guard 管理，pool 自主管理的握手有 deadline，speculative UDP carrier 只有胜者 fallible commit 后才发布；关闭或丢弃 preparation 回滚 reservation。清理由既有 runtime shutdown、retirement 与 idle maintenance 拥有，不新增协议 janitor 或生产逐包 telemetry。
 
 ### 带 mark socket 与名称解析

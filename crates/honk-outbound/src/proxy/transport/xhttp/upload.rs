@@ -259,14 +259,15 @@ pub(super) async fn streaming_upload(mut upload: UploadRequest, flow: Arc<Flow>)
         let drain = drain_response(response, session);
         tokio::pin!(send, drain);
         let drained = tokio::select! {
-            result = &mut send => {
-                result?;
-                false
-            }
+            biased;
             result = &mut drain => {
                 result?;
                 send.await?;
                 true
+            }
+            result = &mut send => {
+                result?;
+                false
             }
         };
         flow.sent(0, true);
