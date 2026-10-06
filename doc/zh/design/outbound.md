@@ -36,6 +36,8 @@ UDP 对象。
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score 与健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
 | Session pool | `session/{maintenance,speculative}.rs` |
+| Stream transport | `proxy/transport/{grpc,h2_io}.rs`；`proxy/transport/xhttp/{preparation,request,response,runtime,session,stream,upload}.rs` |
+| Pooled runtime 生命周期 | `runtime/pooled.rs` |
 
 共享状态仍留在共同父模块中，子模块不公开这些字段。REALITY、TLS、stream transport
 与 UoT 仍由多个协议共用，不归 VLESS 独占。既有测试主题名称在对应协议族内保留。物

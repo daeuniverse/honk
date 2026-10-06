@@ -39,6 +39,8 @@ Implementations are split into ordinary Rust modules:
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score and health | `group/score/{evidence,ranking,feedback}.rs`; `alive/{health,urltest}.rs` |
 | Session pool | `session/{maintenance,speculative}.rs` |
+| Stream transports | `proxy/transport/{grpc,h2_io}.rs`; `proxy/transport/xhttp/{preparation,request,response,runtime,session,stream,upload}.rs` |
+| Pooled runtime lifecycle | `runtime/pooled.rs` |
 
 Common state remains at the shared ancestor; child implementations do not make
 its fields public. REALITY, TLS, stream transport and UoT remain shared rather
