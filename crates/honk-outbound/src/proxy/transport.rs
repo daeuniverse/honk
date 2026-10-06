@@ -3,16 +3,17 @@
 //! Trojan, VMess and VLESS all wrap their connections in the same order:
 //!
 //! ```text
-//! TCP -> (TLS) -> (WebSocket | gRPC) -> protocol header
+//! TCP -> (TLS/REALITY) -> (WebSocket | gRPC | XHTTP) -> protocol header
 //! ```
 //!
 //! This module provides the reusable pieces so each handler only implements
 //! its own protocol handshake:
 //!
-//! - [`wrap_transport`]: optional TCP connect + TLS + WS/gRPC wrapping,
-//!   shared by cold dials and supplied pooled sockets.
+//! - [`wrap_transport`]: cold or supplied TCP/TLS wrapping, including one-shot XHTTP,
+//! - [`wrap_transport_runtime`]: XHTTP physical reuse owned by the node generation,
 //! - [`maybe_tls_wrap`]: just the TCP/TLS step, preserving the same setup budget.
 //! - [`grpc`]: gRPC gun framing over a connection-owned HTTP/2 client.
+//! - [`xhttp`]: raw XHTTP bodies over bounded node-owned HTTP/2 carriers.
 
 use futures_util::{SinkExt, StreamExt};
 use honk_config::node::Node;
@@ -23,14 +24,64 @@ use crate::proxy::transport::grpc::wrap_grpc;
 use super::AsyncReadWrite;
 use crate::transport_quality::tcp::ObservedTcp;
 
+pub(crate) struct TransportPreparation(Option<xhttp::XhttpPreparation>);
+
+impl TransportPreparation {
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn commit(self) -> anyhow::Result<()> {
+        self.0.map_or(Ok(()), xhttp::XhttpPreparation::commit)
+    }
+}
+
 /// Connect if needed, then apply TLS and `node.transport` wrapping.
 pub(crate) async fn wrap_transport(
     node: &Node,
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+    if node.is_xhttp() {
+        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
+        let runtime = owner.runtime();
+        let stream = wrap_transport_runtime(&runtime, tcp, connect_timeout).await?;
+        return Ok(Box::new(crate::proxy::RuntimeOwnedIo {
+            inner: stream,
+            _owner: owner,
+        }));
+    }
     let stream = maybe_tls_wrap(node, tcp, connect_timeout).await?;
     wrap_after_tls(node, stream).await
+}
+
+/// Reuse the node-owned physical H2 pool, not a pool of logical protocol streams.
+pub(crate) async fn wrap_transport_runtime(
+    runtime: &std::sync::Arc<crate::runtime::NodeRuntime>,
+    tcp: Option<TcpStream>,
+    connect_timeout: std::time::Duration,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+    let (stream, preparation) = prepare_transport_runtime(runtime, tcp, connect_timeout).await?;
+    preparation.commit()?;
+    Ok(stream)
+}
+
+/// Caller-owned preparation: unpublished XHTTP carriers roll back unless the
+/// selected UDP candidate commits them through its existing preparation fence.
+pub(crate) async fn prepare_transport_runtime(
+    runtime: &std::sync::Arc<crate::runtime::NodeRuntime>,
+    tcp: Option<TcpStream>,
+    connect_timeout: std::time::Duration,
+) -> anyhow::Result<(Box<dyn AsyncReadWrite>, TransportPreparation)> {
+    if let Some(xhttp) = &runtime.xhttp {
+        let (stream, preparation) = xhttp.prepare(runtime, tcp, connect_timeout).await?;
+        return Ok((stream, TransportPreparation(Some(preparation))));
+    }
+    let stream = maybe_tls_wrap(&runtime.node, tcp, connect_timeout).await?;
+    Ok((
+        wrap_after_tls(&runtime.node, stream).await?,
+        TransportPreparation::none(),
+    ))
 }
 
 pub(crate) async fn wrap_after_tls(
@@ -44,7 +95,7 @@ pub(crate) async fn wrap_after_tls(
         // Unknown transport must not silently degrade to raw TCP — a
         // mistyped transport means a different protocol than intended.
         other => anyhow::bail!(
-            "node '{}': unsupported transport '{}' (expected tcp/ws/grpc)",
+            "node '{}': unsupported transport '{}' (expected tcp/ws/grpc; xhttp requires its runtime)",
             node.name,
             other
         ),
@@ -94,45 +145,48 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     };
     if let Some(reality) = crate::reality::parse_reality_config(node)? {
         let deadline = tokio::time::Instant::now() + connect_timeout * 3;
+        let alpn = node.is_xhttp().then_some(b"\x02h2".as_slice());
         let setup = async {
             let tcp = initial_tcp.await?;
             let peer = tcp.peer_addr()?;
             let tcp = ObservedTcp::new(tcp);
             let chrome = crate::tls::chrome_mode();
-            let mut tls_stream =
-                match crate::reality::reality_connect_with_key_shares(tcp, &reality, chrome, true)
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(error) if error.is::<crate::reality::RealityMaskCertificate>() => {
-                        // The failed handshake has dropped its SSL/TCP before admission
-                        // transfers. Supplied sockets cannot spend another dial's credit.
-                        let replacement = async {
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            if remaining.is_zero() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "REALITY setup timeout",
-                                )
-                                .into());
-                            }
-                            let tcp = crate::util::connect_marked_addr(
-                                peer,
-                                Some(crate::util::bypass_mark()),
-                                connect_timeout.min(remaining),
+            let mut tls_stream = match crate::reality::reality_connect_with_key_shares(
+                tcp, &reality, chrome, true, alpn,
+            )
+            .await
+            {
+                Ok(stream) => stream,
+                Err(error) if error.is::<crate::reality::RealityMaskCertificate>() => {
+                    // The failed handshake has dropped its SSL/TCP before admission
+                    // transfers. Supplied sockets cannot spend another dial's credit.
+                    let replacement = async {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "REALITY setup timeout",
                             )
-                            .await?;
-                            let tcp = ObservedTcp::new(tcp);
-                            crate::reality::reality_connect_with_key_shares(
-                                tcp, &reality, chrome, false,
-                            )
-                            .await
-                        };
-                        crate::runtime::admit_replacement_dial(replacement, cold).await?
-                    }
-                    Err(error) => return Err(error),
-                };
+                            .into());
+                        }
+                        let tcp = crate::util::connect_marked_addr(
+                            peer,
+                            Some(crate::util::bypass_mark()),
+                            connect_timeout.min(remaining),
+                        )
+                        .await?;
+                        let tcp = ObservedTcp::new(tcp);
+                        crate::reality::reality_connect_with_key_shares(
+                            tcp, &reality, chrome, false, alpn,
+                        )
+                        .await
+                    };
+                    crate::runtime::admit_replacement_dial(replacement, cold).await?
+                }
+                Err(error) => return Err(error),
+            };
+            // Xray REALITY omits server ALPN; XHTTP selects H2 after authentication.
             tls_stream.get_mut().activate();
             Ok(MaybeTls::Tls(tls_stream))
         };
@@ -147,6 +201,12 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let connector = crate::tls::build_connector(node)?;
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
         let mut tls_stream = connector.connect(&server_name, tcp).await?;
+        if node.is_xhttp() {
+            anyhow::ensure!(
+                tls_stream.ssl().selected_alpn_protocol() == Some(b"h2"),
+                "XHTTP requires negotiated h2 ALPN"
+            );
+        }
         tls_stream.get_mut().activate();
         return Ok(MaybeTls::Tls(tls_stream));
     }
@@ -267,5 +327,7 @@ async fn ws_bridge_relay(
 }
 
 mod grpc;
+mod h2_io;
 #[cfg(test)]
 mod tests;
+pub(crate) mod xhttp;

@@ -12,6 +12,7 @@
 //! QUIC protocols own their per-node client (and shared connection) here.
 
 mod admission;
+mod pooled;
 #[cfg(any(feature = "rprx", test))]
 mod vless;
 
@@ -331,7 +332,7 @@ impl AnyTlsRuntime {
     }
 }
 
-/// Live warm-state gauge of one runtime: retained AnyTLS/VLESS mux sessions
+/// Live warm-state gauge of one runtime: retained AnyTLS/VLESS/XHTTP sessions
 /// and one occupied QUIC client slot (`None` = count unknown under lock
 /// contention, to be treated as warm rather than cold).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +374,8 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub udp_capable: bool,
     pub runtime: ProtocolRuntime,
+    /// Transport-owned physical H2 sessions, independent of protocol UDP/mux state.
+    pub(crate) xhttp: Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>>,
     transport_quality: Arc<crate::transport_quality::TransportQuality>,
     /// One-shot runtime outside any generation (see [`Self::ephemeral`]).
     /// Session protocols skip their standby janitor for these: there is no
@@ -386,71 +389,15 @@ pub struct NodeRuntime {
     vless_carriers: Arc<tokio::sync::Semaphore>,
 }
 
-/// Warm establishment transaction. Cancellation rolls back only a bit this
-/// attempt inserted; QUIC cleanup rechecks the bitmap after reacquiring the
-/// lock so it cannot dismantle a successor attempt's client.
-pub(crate) struct WarmAttempt {
-    runtime: Arc<NodeRuntime>,
-    retention: Option<tokio::sync::OwnedMutexGuard<u8>>,
-    reason: WarmRetention,
-    inserted: bool,
-}
-
-impl WarmAttempt {
-    pub(crate) fn commit(mut self) {
-        self.retention.take();
-    }
-
-    pub(crate) async fn rollback(mut self) {
-        let retention = self
-            .retention
-            .take()
-            .expect("live warm attempt owns the retention lock");
-        if self.inserted {
-            self.runtime
-                .release_warm_locked(retention, self.reason)
-                .await;
-        }
-    }
-}
-
-impl Drop for WarmAttempt {
-    fn drop(&mut self) {
-        if !self.inserted {
-            return;
-        }
-        let Some(mut retention) = self.retention.take() else {
-            return;
-        };
-        *retention &= !self.reason.bit();
-        #[cfg(any(feature = "rprx", test))]
-        if let ProtocolRuntime::Vless(runtime) = &self.runtime.runtime {
-            runtime.sync_warm_retention(*retention);
-            return;
-        }
-        if *retention != 0 {
-            return;
-        }
-        match &self.runtime.runtime {
-            ProtocolRuntime::AnyTls(runtime) => {
-                runtime.pool.set_warm_retained(false);
-                runtime.tls.evict();
-            }
-            ProtocolRuntime::Quic(_) => {
-                drop(retention);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let runtime = Arc::clone(&self.runtime);
-                    handle.spawn(async move { runtime.release_if_unretained().await });
-                }
-            }
-            ProtocolRuntime::None => {}
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(_) => {}
-        }
-    }
-}
-
 impl NodeRuntime {
+    fn build_xhttp(node: &Node) -> Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>> {
+        #[cfg(not(any(feature = "rprx", test)))]
+        if node.protocol() == honk_config::types::NodeProtocol::VLess {
+            return None;
+        }
+        crate::proxy::transport::xhttp::XhttpRuntime::new(node)
+    }
+
     fn build_ephemeral_with_vless_carriers(
         node: &Node,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
@@ -462,6 +409,7 @@ impl NodeRuntime {
             runtime: crate::descriptor::descriptor(node.protocol())
                 .generation_runtime
                 .build(node, false, Arc::clone(&transport_quality)),
+            xhttp: Self::build_xhttp(node),
             ephemeral: true,
             warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
             #[cfg(any(feature = "rprx", test))]
@@ -515,106 +463,6 @@ impl NodeRuntime {
     /// Advisory evidence belongs to this runtime, not merely its reusable node ID.
     pub fn transport_quality(&self) -> Arc<crate::transport_quality::TransportQuality> {
         Arc::clone(&self.transport_quality)
-    }
-
-    pub(crate) async fn retain_warm(self: &Arc<Self>, reason: WarmRetention) -> WarmAttempt {
-        let mut retention = Arc::clone(&self.warm_retention).lock_owned().await;
-        let bit = reason.bit();
-        let inserted = *retention & bit == 0;
-        let was_unretained = *retention == 0;
-        *retention |= bit;
-        if inserted {
-            match &self.runtime {
-                #[cfg(any(feature = "rprx", test))]
-                ProtocolRuntime::Vless(runtime) => runtime.sync_warm_retention(*retention),
-                ProtocolRuntime::AnyTls(runtime) if was_unretained => {
-                    runtime.pool.set_warm_retained(true)
-                }
-                ProtocolRuntime::None | ProtocolRuntime::AnyTls(_) | ProtocolRuntime::Quic(_) => {}
-            }
-        }
-        WarmAttempt {
-            runtime: Arc::clone(self),
-            retention: Some(retention),
-            reason,
-            inserted,
-        }
-    }
-
-    async fn release_warm_state(&self) {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => {
-                runtime.pool.set_warm_retained(false);
-                runtime.tls.evict();
-            }
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(runtime) => runtime.sync_warm_retention(0),
-            ProtocolRuntime::Quic(runtime) => runtime.release_warm().await,
-            ProtocolRuntime::None => {}
-        }
-    }
-
-    async fn release_warm_locked(
-        self: &Arc<Self>,
-        mut retention: tokio::sync::OwnedMutexGuard<u8>,
-        reason: WarmRetention,
-    ) {
-        let bit = reason.bit();
-        if *retention & bit == 0 {
-            return;
-        }
-        *retention &= !bit;
-        #[cfg(any(feature = "rprx", test))]
-        if let ProtocolRuntime::Vless(runtime) = &self.runtime {
-            runtime.sync_warm_retention(*retention);
-            return;
-        }
-        if *retention != 0 {
-            return;
-        }
-        if matches!(&self.runtime, ProtocolRuntime::Quic(_)) {
-            drop(retention);
-            let runtime = Arc::clone(self);
-            // Spawn before awaiting so cancellation of the releasing caller
-            // cannot strand a client after the ownership bit reached zero.
-            let cleanup = tokio::spawn(async move { runtime.release_if_unretained().await });
-            let _ = cleanup.await;
-        } else {
-            self.release_warm_state().await;
-        }
-    }
-
-    /// Finish cancellation-driven QUIC cleanup after the owned guard drops.
-    /// A successor may have retained the runtime meanwhile, so zero is
-    /// revalidated under the same lock before releasing the client slot.
-    async fn release_if_unretained(self: Arc<Self>) {
-        let retention = Arc::clone(&self.warm_retention).lock_owned().await;
-        if *retention == 0 {
-            self.release_warm_state().await;
-        }
-    }
-
-    /// Release one policy's warm ownership. A later selection may warm this
-    /// runtime again; active logical flows are never cut.
-    pub async fn release_warm(self: &Arc<Self>, reason: WarmRetention) {
-        let retention = Arc::clone(&self.warm_retention).lock_owned().await;
-        self.release_warm_locked(retention, reason).await;
-    }
-
-    /// Close every session-layer resource this runtime owns: AnyTLS or VLESS
-    /// mux pool sessions (connections + drivers), or one cached QUIC client
-    /// (connection + endpoint driver). Terminal for the runtime; idempotent.
-    pub async fn close(&self) {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => {
-                runtime.pool.shutdown();
-                runtime.tls.close();
-            }
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(runtime) => runtime.shutdown(),
-            ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
-            ProtocolRuntime::None => {}
-        }
     }
 
     pub(crate) fn anytls_pool(&self) -> anyhow::Result<Arc<crate::proxy::anytls::AnyTlsPool>> {
@@ -676,6 +524,18 @@ impl NodeRuntime {
             .map_err(|_| anyhow::Error::new(crate::proxy::PacketRejection::Capacity))
     }
 
+    /// Physical-carrier slot the node's protocol bounds process-wide, if any.
+    /// Transports hold it for the carrier's lifetime without naming protocols.
+    pub(crate) fn acquire_carrier_permit(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        #[cfg(any(feature = "rprx", test))]
+        if self.node.protocol() == honk_config::types::NodeProtocol::VLess {
+            return self.acquire_vless_carrier().map(Some);
+        }
+        Ok(None)
+    }
+
     pub(crate) async fn quic_client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
     where
         T: QuicRuntimeClient,
@@ -708,35 +568,24 @@ impl NodeRuntime {
     /// Stateless paths are always safe; pooled paths qualify only when their
     /// selected pool already has a reusable session/client.
     pub fn is_warm_or_stateless_for(&self, requirement: crate::proxy::WarmRequirement) -> bool {
-        #[cfg(not(any(feature = "rprx", test)))]
-        let _ = requirement;
-        match &self.runtime {
-            ProtocolRuntime::None => true,
-            ProtocolRuntime::AnyTls(runtime) => runtime.pool.has_usable_session(),
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(runtime) => runtime.is_warm_or_stateless_for(requirement),
-            ProtocolRuntime::Quic(runtime) => runtime.client_count().is_none_or(|count| count != 0),
-        }
+        self.pools_are_warm_for(requirement)
+            && match &self.runtime {
+                ProtocolRuntime::Quic(runtime) => {
+                    runtime.client_count().is_none_or(|count| count != 0)
+                }
+                _ => true,
+            }
     }
 
     /// Live reusable state: AnyTLS/VLESS sessions or one occupied QUIC client slot.
     /// `clients` is `None` while the slot lock is held; callers treat that
     /// in-flight state as warm rather than pruning its attribution.
     pub fn warm_counts(&self) -> WarmCounts {
-        match &self.runtime {
-            ProtocolRuntime::None => WarmCounts::default(),
-            ProtocolRuntime::AnyTls(runtime) => WarmCounts {
-                sessions: runtime.pool.live_session_count(),
-                clients: Some(0),
-            },
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(runtime) => WarmCounts {
-                sessions: runtime.live_session_count(),
-                clients: Some(0),
-            },
-            ProtocolRuntime::Quic(runtime) => WarmCounts {
-                sessions: 0,
-                clients: runtime.client_count(),
+        WarmCounts {
+            sessions: self.pooled_session_count(),
+            clients: match &self.runtime {
+                ProtocolRuntime::Quic(runtime) => runtime.client_count(),
+                _ => Some(0),
             },
         }
     }
@@ -795,16 +644,11 @@ impl EphemeralRuntimeGuard {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        match &runtime.runtime {
-            ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(vless) => vless.shutdown(),
-            ProtocolRuntime::Quic(_) => {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move { runtime.close().await });
-                }
-            }
-            ProtocolRuntime::None => {}
+        runtime.shutdown_pools();
+        if matches!(&runtime.runtime, ProtocolRuntime::Quic(_))
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move { runtime.close().await });
         }
     }
 
@@ -1026,6 +870,7 @@ impl OutboundRuntimeRegistry {
                         runtime: crate::descriptor::descriptor(node.protocol())
                             .generation_runtime
                             .build(node, true, Arc::clone(&transport_quality)),
+                        xhttp: NodeRuntime::build_xhttp(node),
                         transport_quality,
                         ephemeral: false,
                         warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
@@ -1085,17 +930,7 @@ impl OutboundRuntimeRegistry {
     /// AnyTLS keeps its recent connector working set; VLESS closes only idle
     /// carriers above explicit or runtime warm retention.
     pub fn reap_idle_resources(&self, now: Instant) -> usize {
-        #[cfg(any(feature = "rprx", test))]
-        let mut reaped = self
-            .nodes
-            .values()
-            .filter_map(|runtime| match &runtime.runtime {
-                ProtocolRuntime::Vless(vless) => Some(vless.reap_unretained_idle()),
-                _ => None,
-            })
-            .sum();
-        #[cfg(not(any(feature = "rprx", test)))]
-        let mut reaped = 0;
+        let mut reaped = self.reap_session_pools();
         let anytls_count = self
             .nodes
             .values()
@@ -1158,15 +993,9 @@ impl OutboundRuntimeRegistry {
             if moved_out.contains(id) {
                 continue;
             }
-            match &runtime.runtime {
-                ProtocolRuntime::AnyTls(anytls) => {
-                    anytls.pool.retire();
-                    anytls.tls.close();
-                }
-                #[cfg(any(feature = "rprx", test))]
-                ProtocolRuntime::Vless(vless) => vless.retire(),
-                ProtocolRuntime::Quic(quic) => quic.release_warm().await,
-                ProtocolRuntime::None => {}
+            runtime.retire_pools();
+            if let ProtocolRuntime::Quic(quic) = &runtime.runtime {
+                quic.release_warm().await;
             }
         }
     }

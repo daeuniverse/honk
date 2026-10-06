@@ -55,9 +55,13 @@ static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| Dia
 });
 
 #[derive(Default)]
-struct DialScopeState {
+struct DialPermits {
     first: Option<DialPermit>,
     extra: Vec<DialPermit>,
+}
+
+#[derive(Default)]
+struct Progress {
     started: bool,
     pending: usize,
     on_start: Option<Box<dyn FnOnce() + Send>>,
@@ -66,24 +70,26 @@ struct DialScopeState {
 /// One logical dial's physical admission, retained permits, and start boundary.
 pub struct DialScope {
     admission: DialAdmission,
-    state: parking_lot::Mutex<DialScopeState>,
+    permits: parking_lot::Mutex<DialPermits>,
+    progress: Arc<parking_lot::Mutex<Progress>>,
 }
 
 impl DialScope {
     fn new(admission: DialAdmission, on_start: Option<Box<dyn FnOnce() + Send>>) -> Arc<Self> {
         Arc::new(Self {
             admission,
-            state: parking_lot::Mutex::new(DialScopeState {
+            permits: parking_lot::Mutex::new(DialPermits::default()),
+            progress: Arc::new(parking_lot::Mutex::new(Progress {
                 on_start,
                 ..Default::default()
-            }),
+            })),
         })
     }
 
     /// Start once before a physical attempt or a logical open on reused state.
     pub fn start(&self) {
         let callback = {
-            let mut state = self.state.lock();
+            let mut state = self.progress.lock();
             state.started = true;
             state.on_start.take()
         };
@@ -95,7 +101,7 @@ impl DialScope {
     /// Whether an unstarted dial is currently blocked on physical admission.
     /// Snapshot before cancelling the scoped future, which removes its waiters.
     pub fn is_waiting_for_admission(&self) -> bool {
-        let state = self.state.lock();
+        let state = self.progress.lock();
         !state.started && state.pending > 0
     }
 
@@ -119,7 +125,7 @@ impl DialScope {
         std::future::poll_fn(|cx| {
             // Poll and publish under the same lock so a timeout cannot see
             // a gap between leaving admission and starting the attempt.
-            let mut state = self.state.lock();
+            let mut state = self.progress.lock();
             match acquire.as_mut().poll(cx) {
                 Poll::Pending => {
                     if !waiter.pending {
@@ -155,7 +161,7 @@ struct DialWaiter<'a> {
 impl Drop for DialWaiter<'_> {
     fn drop(&mut self) {
         if self.pending {
-            self.scope.state.lock().pending -= 1;
+            self.scope.progress.lock().pending -= 1;
         }
     }
 }
@@ -179,6 +185,20 @@ pub(crate) struct CapturedDialScope(Arc<DialScope>);
 impl CapturedDialScope {
     fn standalone() -> Self {
         Self(DialScope::new(DialAdmission::standalone(), None))
+    }
+
+    /// One physical TCP/TLS/H2 setup, with independent retained credits and the
+    /// initiating operation's existing cancellation/start feedback.
+    pub(crate) fn physical_setup(&self) -> Self {
+        Self(Arc::new(DialScope {
+            admission: self.0.admission.clone(),
+            permits: parking_lot::Mutex::new(DialPermits::default()),
+            progress: Arc::clone(&self.0.progress),
+        }))
+    }
+
+    pub(crate) fn is_waiting_for_admission(&self) -> bool {
+        self.0.is_waiting_for_admission()
     }
 
     pub(crate) async fn scope<F>(self, future: F) -> F::Output
@@ -238,7 +258,7 @@ where
 {
     let scope = DIAL_SCOPE.try_with(Arc::clone).ok();
     let retained = scope.as_ref().filter(|_| reuse_existing).and_then(|scope| {
-        let mut held = scope.state.lock();
+        let mut held = scope.permits.lock();
         held.extra.pop().or_else(|| held.first.take())
     });
     let permit = match retained {
@@ -252,7 +272,7 @@ where
     if result.is_ok()
         && let Some(scope) = scope
     {
-        let mut held = scope.state.lock();
+        let mut held = scope.permits.lock();
         if held.first.is_none() {
             held.first = Some(permit);
         } else {

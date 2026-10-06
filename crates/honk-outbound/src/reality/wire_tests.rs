@@ -76,7 +76,7 @@ async fn read_hello(tcp: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
     record
 }
 
-fn key_shares(hello: &[u8]) -> Vec<(u16, &[u8])> {
+fn hello_extension(hello: &[u8], extension: u16) -> Option<&[u8]> {
     let mut cursor = 71;
     cursor += 2 + u16::from_be_bytes([hello[cursor], hello[cursor + 1]]) as usize;
     cursor += 1 + hello[cursor] as usize;
@@ -86,22 +86,27 @@ fn key_shares(hello: &[u8]) -> Vec<(u16, &[u8])> {
         let kind = u16::from_be_bytes([hello[cursor], hello[cursor + 1]]);
         let len = u16::from_be_bytes([hello[cursor + 2], hello[cursor + 3]]) as usize;
         cursor += 4;
-        if kind == 51 {
-            let mut shares = Vec::new();
-            let mut share = cursor + 2;
-            while share < cursor + len {
-                let group = u16::from_be_bytes([hello[share], hello[share + 1]]);
-                let size = u16::from_be_bytes([hello[share + 2], hello[share + 3]]) as usize;
-                share += 4;
-                shares.push((group, &hello[share..share + size]));
-                share += size;
-            }
-            shares.retain(|(group, _)| group >> 8 != group & 0xff || group & 0x0f != 0x0a);
-            return shares;
+        if kind == extension {
+            return Some(&hello[cursor..cursor + len]);
         }
         cursor += len;
     }
-    panic!("ClientHello omitted key_share");
+    None
+}
+
+fn key_shares(hello: &[u8]) -> Vec<(u16, &[u8])> {
+    let extension = hello_extension(hello, 51).expect("ClientHello omitted key_share");
+    let mut shares = Vec::new();
+    let mut cursor = 2;
+    while cursor < extension.len() {
+        let group = u16::from_be_bytes([extension[cursor], extension[cursor + 1]]);
+        let size = u16::from_be_bytes([extension[cursor + 2], extension[cursor + 3]]) as usize;
+        cursor += 4;
+        shares.push((group, &extension[cursor..cursor + size]));
+        cursor += size;
+    }
+    shares.retain(|(group, _)| group >> 8 != group & 0xff || group & 0x0f != 0x0a);
+    shares
 }
 
 fn authenticate_hello(hello: &[u8], server_key: &PKey<Private>) -> [u8; 32] {
@@ -132,7 +137,7 @@ fn authenticate_hello(hello: &[u8], server_key: &PKey<Private>) -> [u8; 32] {
     auth_key
 }
 
-fn acceptor(reply: Reply, auth_key: &[u8; 32]) -> SslAcceptor {
+fn acceptor(reply: Reply, auth_key: &[u8; 32], alpn: Option<&'static [u8]>) -> SslAcceptor {
     let key = if matches!(reply, Reply::Mask) {
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap()
     } else {
@@ -169,6 +174,11 @@ fn acceptor(reply: Reply, auth_key: &[u8; 32]) -> SslAcceptor {
         .set_certificate(&X509::from_der(&der).unwrap())
         .unwrap();
     acceptor.set_private_key(&key).unwrap();
+    if let Some(alpn) = alpn {
+        acceptor.set_alpn_select_callback(move |_, client| {
+            boring::ssl::select_next_proto(alpn, client).ok_or(boring::ssl::AlpnError::NOACK)
+        });
+    }
     acceptor.build()
 }
 
@@ -188,7 +198,7 @@ async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Cap
     } else {
         let (read, write) = tcp.into_split();
         let replay = tokio::io::join(Cursor::new(record).chain(read), write);
-        let mut tls = tokio_boring::accept(&acceptor(reply, &auth_key), replay)
+        let mut tls = tokio_boring::accept(&acceptor(reply, &auth_key, None), replay)
             .await
             .unwrap();
         // Send before the client's post-handshake authentication; a failure must
@@ -495,10 +505,80 @@ async fn both_tls_and_key_share_profiles_authenticate_the_full_transcript() {
                     peer.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
                 };
                 let (result, ()) = tokio::join!(
-                    reality_connect_with_key_shares(client, &config, chrome, hybrid),
+                    reality_connect_with_key_shares(client, &config, chrome, hybrid, None),
                     server,
                 );
                 assert!(result.is_err());
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn targeted_h2_and_raw_reality_profiles_negotiate_and_authenticate() {
+    timeout(Duration::from_secs(10), async {
+        let key = PKey::generate(Id::X25519).unwrap();
+        let mut public_key = [0; 32];
+        key.raw_public_key(&mut public_key).unwrap();
+        let config = RealityConfig {
+            public_key,
+            short_id: [0x19; 8],
+            server_name: "localhost".into(),
+        };
+        for chrome in [false, true] {
+            for hybrid in [false, true] {
+                for targeted in [false, true] {
+                    let (client, mut peer) = tokio::io::duplex(16 * 1024);
+                    let selected = (chrome || targeted).then_some(b"h2".as_slice());
+                    let server = async {
+                        let record = read_hello(&mut peer).await;
+                        let hello = &record[5..];
+                        let expected_alpn = if targeted {
+                            Some(b"\0\x03\x02h2".as_slice())
+                        } else {
+                            chrome.then_some(b"\0\x0c\x02h2\x08http/1.1".as_slice())
+                        };
+                        assert_eq!(hello_extension(hello, 16), expected_alpn);
+                        assert_eq!(
+                            hello_extension(hello, 0x4469),
+                            chrome.then_some(b"\0\x03\x02h2".as_slice())
+                        );
+                        let auth_key = authenticate_hello(hello, &key);
+                        let (read, write) = tokio::io::split(peer);
+                        let replay = tokio::io::join(Cursor::new(record).chain(read), write);
+                        let acceptor = acceptor(Reply::Authenticated, &auth_key, Some(b"\x02h2"));
+                        let mut tls = tokio_boring::accept(&acceptor, replay).await.unwrap();
+                        assert_eq!(tls.ssl().selected_alpn_protocol(), selected);
+                        let mut received = vec![0; CLIENT_DATA.len()];
+                        tls.read_exact(&mut received).await.unwrap();
+                        assert_eq!(received, CLIENT_DATA);
+                        tls.write_all(SERVER_DATA).await.unwrap();
+                        tls.flush().await.unwrap();
+                    };
+                    let client = async {
+                        let result = if !targeted && hybrid {
+                            super::reality_connect(client, &config, chrome).await
+                        } else {
+                            reality_connect_with_key_shares(
+                                client,
+                                &config,
+                                chrome,
+                                hybrid,
+                                targeted.then_some(b"\x02h2".as_slice()),
+                            )
+                            .await
+                        };
+                        let mut tls = result.unwrap();
+                        assert_eq!(tls.ssl().selected_alpn_protocol(), selected);
+                        tls.write_all(CLIENT_DATA).await.unwrap();
+                        let mut received = vec![0; SERVER_DATA.len()];
+                        tls.read_exact(&mut received).await.unwrap();
+                        assert_eq!(received, SERVER_DATA);
+                    };
+                    tokio::join!(client, server);
+                }
             }
         }
     })

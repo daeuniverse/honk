@@ -10,7 +10,6 @@ use super::{ManagedSession, PoolState, SessionPool, SessionState};
 impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Drain idle sessions above the configured or runtime-retained reusable floor.
     /// Sessions with live streams are never disturbed; terminal sessions are pruned.
-    #[cfg(any(feature = "rprx", test))]
     pub fn reap_unretained_idle(&self) -> usize {
         if self.state() != PoolState::Running {
             return 0;

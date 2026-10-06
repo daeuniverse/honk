@@ -108,9 +108,9 @@ Trojan transport, affect capability or pooling. Trojan and AnyTLS share
 | Protocol | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | Share-link schemes |
 | --- | --- | --- | --- | --- | --- |
 | Shadowsocks, including 2022 | yes | no | yes | `None` | `ss` |
-| Trojan | when `network` is absent or contains `udp` | only `tcp`/empty transport | yes | `None` | `trojan` |
-| VMess | no | no | yes | `None` | `vmess` |
-| VLESS | when `network` allows UDP | no | when the TCP path is direct | `Vless` | `vless` |
+| Trojan | when `network` is absent or contains `udp` | only `tcp`/empty transport | except XHTTP | `None` | `trojan` |
+| VMess | no | no | except XHTTP | `None` | `vmess` |
+| VLESS | when `network` allows UDP | no | direct TCP path except XHTTP | `Vless` | `vless` |
 | SOCKS5 | yes | yes | yes | `None` | `socks5`, `socks4`, `socks4a` |
 | Hysteria2 | yes | no | no | `Quic` | `hysteria2`, `hysteria` |
 | TUIC | yes | no | no | `Quic` | `tuic` |
@@ -125,6 +125,7 @@ perform the per-target protocol handshake. TCP-multiplexed and QUIC protocols
 exclude both because their generation runtime owns reuse. Direct excludes both
 because each flow's socket carries its own rule or global mark. VLESS with direct
 TCP remains bare-poolable even when an independent UDP-only Xray pool exists.
+XHTTP excludes both preconnect pools because its transport runtime owns physical H2 reuse.
 
 Ready streams are keyed by runtime generation, node identity, and target; only
 flows using the generation that dialed them may acquire them. After a reload
@@ -184,8 +185,9 @@ outbound state for one immutable configuration generation. It maps `Node.id` to
 `NodeRuntime`:
 
 - immutable `Arc<Node>` configuration;
-- the node-aware `udp_capable` result; and
-- one `ProtocolRuntime` selected by the descriptor.
+- the node-aware `udp_capable` result;
+- one `ProtocolRuntime` selected by the descriptor; and
+- optional transport-owned XHTTP state beside, not instead of, the protocol runtime.
 
 `ProtocolRuntime` is `None`, AnyTLS state, `VlessRuntime`, or one type-erased
 QUIC client slot. Every VLESS node owns a `VlessRuntime`; it contains only the
@@ -194,6 +196,8 @@ private source-ID key. Handlers remain stateless with respect to these
 generation-owned resources.
 
 - Structured/imported raw TCP TLS ALPN lives in `TlsOptions.alpn` (flat serde `tls_alpn`, omitted when empty). `Node::validate_protocol` requires enabled ordinary TLS on AnyTLS or TCP Trojan/VMess/VLESS, rejects REALITY/WS/gRPC/QUIC overrides, and bounds names to 1–255 bytes plus the encoded list to 65,533 bytes. Nonempty ALPN derives a child UUID v5 using the base ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name, separating it from arbitrary credential text; empty lists retain that base ID, including VLESS's re-derived identity. URI/v2rayN ALPN compatibility and TUIC's separate `tuic_alpn` remain unchanged.
+
+XHTTP is a separate H2-only profile. Canonical nodes carry `["h2"]`; ordinary TLS and REALITY configure that offer without changing raw-TCP, WS or gRPC profiles. Ordinary TLS rejects a peer that does not negotiate H2 before sending proxy bytes. Authenticated REALITY selects H2 by transport contract: official Xray deliberately omits server ALPN. Explicit cleartext XHTTP requires H2 support at the peer. Its canonical request and TLS/plaintext shape participates in node identity and reload reuse.
 
 Admission-scoped TCP feedback starts once at the first admitted physical attempt or before logical open on a reused session/QUIC connection; cold admission waiting remains unstarted, while completed paths without either boundary retain the completion fallback.
 
@@ -276,20 +280,21 @@ teardown. This gate, not a sum of node-local pool caps, is the authoritative des
 
 ### Stream transport
 
-`src/proxy/transport.rs` is shared by Trojan, VMess, and VLESS, driven by `StreamTransportOptions` fields `transport`/`ws_path`/`ws_host`/`grpc_service` through `node.transport()`. The order is fixed:
+`src/proxy/transport.rs` is shared by Trojan, VMess, and VLESS, driven by `StreamTransportOptions` fields `transport`/`ws_path`/`ws_host`/`grpc_service`/`xhttp` through `node.transport()`. The order is fixed:
 
 ```text
-TCP -> optional TLS or REALITY -> optional WebSocket or gRPC -> protocol header
+TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol header
 ```
 
 `maybe_tls_wrap_concrete` preserves the concrete TCP/TLS type needed by VLESS Vision direct-copy.
 When REALITY parameters are present, its [bounded authenticated setup](#server-authentication-and-fingerprint-constraints)
 replaces ordinary TLS. The same shared path therefore gives Trojan, VMess, and VLESS
-consistent TLS, REALITY, WS, and gRPC setup.
+consistent TLS, REALITY, WS, gRPC and XHTTP setup.
 
 Cold and pooled-bare Trojan streams use that same complete transport stack.
 TLS batching returns bytes already read before surfacing a later I/O error on
 the next non-empty read; it never converts that error into EOF.
+
 
 `transport_quality` owns advisory per-runtime carrier pressure. Common TCP/TLS/REALITY and AnyTLS use a physical-I/O adapter; Shadowsocks borrows its existing socket half. Linux `TCP_INFO` is read at most once per active second, checking each field against the returned ABI length; missing fields/errors remain unknown and never alter I/O. Vision Direct and ready-pool descriptor probing retain the socket path. Hy2/TUIC/Juicity reuse their existing one-second physical QUIC monitor, excluding pre-confirmation/pre-publication history and reseeding on peer changes. Logical mux children do not each report the same carrier event. No extra descriptor or per-TCP sampling task is retained; quiescent TCP has no new event-driven observation. See [Score pressure semantics](./groups.md#score-scoring-and-lifecycle).
 
@@ -321,6 +326,16 @@ requires upgrading to a published release containing the fix.
 
 VMess records errors returned by its relay before closing the duplex half, so
 response-header and body-decoding failures reach the stream owner instead of EOF.
+
+#### XHTTP carrier and logical-flow ownership
+
+`proxy/transport/xhttp.rs` adapts raw H2 bodies to the existing stream contract. It owns a node-local `SessionPool`, not a second proxy protocol or loopback relay. The pool keeps at most two reusable physical carriers; draining carriers may overlap replacements under the existing process descriptor and VLESS-carrier gates. Physical drivers retain their socket, observation and carrier permit; HTTP requests and logical proxy flows hold separate reservations. The peer's advertised concurrent-stream limit remains authoritative, including zero, one and later reductions.
+
+Stream-one uses one POST; stream-up uses a GET and streaming POST; packet-up uses a GET and ordered finite POSTs. Establishment returns a writable stream without waiting for response headers. Upload-response padding is drained and discarded, never reported as application RX. Packet-up aggregates owned bytes with bounded unanswered responses rather than sending one POST per application write; subsequent POSTs may progress after the previous body was physically written, without waiting for that response.
+
+Flush waits for byte ownership release and physical I/O flush under current H2 flow control; buffered download bytes precede terminal errors. Upload shutdown retains the response direction; stream-up and packet-up wait for their terminal POST responses, preserving late upload refusals. Packet-up has no fabricated EOF marker. Graceful GOAWAY stops new requests on that carrier while retaining admitted streams; only future new POSTs move to a replacement, with no ambiguous application replay. New logical-flow admission closes on retirement, while already-admitted packet flows retain the request capacity needed to finish.
+
+Ephemeral establishment is guarded through cancellation, pool-owned handshakes have a deadline, and speculative UDP carriers stay unpublished until the winner's fallible commit. Closing or losing a preparation rolls back its reservations. Existing runtime shutdown, retirement and idle maintenance own cleanup; no protocol-specific janitor or production per-packet telemetry is added.
 
 ### Marked sockets and name resolution
 
@@ -820,7 +835,7 @@ Generation-free calls use a guarded ephemeral equivalent.
 ### Pool and session lifecycle
 
 `src/session.rs` defines the generic node-owned `SessionPool` for AnyTLS, VLESS
-H2MUX, and VLESS Mux.Cool (QUIC keeps `quic::QuicClient`). It enforces `Active`,
+H2MUX, VLESS Mux.Cool and XHTTP (QUIC keeps `quic::QuicClient`). It enforces `Active`,
 `Draining`, and `Closed` states, atomic stream permits, event-driven capacity
 waits, least-loaded selection, and pool-owned single-flight physical dials.
 Draining sessions are excluded from the reusable cap and can overlap

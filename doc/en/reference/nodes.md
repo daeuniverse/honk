@@ -37,6 +37,8 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and the effective VLESS TLS posture, UDP permission, fallback encoding, and multiplex paths. Plaintext VLESS is distinct from TLS; a REALITY key selects the authenticated transport regardless of a redundant TLS flag. Nonempty structured `tls_alpn` derives a child UUID v5 using the base ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains the base ID. Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
 
+For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
+
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
 **Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. Other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
@@ -62,10 +64,10 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `packet_encoding` | `VlessUdpEncoding` | `auto` for VLESS | Structured VLESS fallback encoding: `auto`, `native`, `xudp`, or `uot-v2`; canonical URI `packetEncoding=none` maps to `native` |
 | `multiplex` | `VlessMultiplex` | `{"protocol":"off"}` for VLESS | Structured VLESS carrier selection: `off`, `h2`, or `xray`; exact shapes are documented below |
 | `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
-| `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
+| `transport` | string | `"tcp"` | Stream transport: empty/`tcp`, `ws`, `grpc`, or canonical `xhttp`; input `splithttp` normalizes to `xhttp` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
 | `sni` | string? | null | TLS server name; nonempty `sni` and `peer` claims must agree, then an unconsumed `host` supplies the fallback |
-| `tls_alpn` | string[] | `[]` | Structured/imported ordinary raw-TCP TLS ALPN; empty preserves the TLS profile default. Nonempty values are supported for AnyTLS and TCP Trojan/VMess/VLESS, not disabled TLS, REALITY, WS/gRPC, or QUIC. TUIC retains `tuic_alpn`; this is not a share-link query. |
+| `tls_alpn` | string[] | `[]` | Structured/imported raw-TCP TLS ALPN for AnyTLS and TCP Trojan/VMess/VLESS. XHTTP instead canonicalizes omission or `h2` to `["h2"]`, including REALITY and explicit cleartext H2. Other disabled-TLS/REALITY/WS/gRPC/QUIC overrides remain unsupported; TUIC retains `tuic_alpn`. |
 | `skip_cert_verify` | bool | `false` | Certificate-verification bypass from agreeing `allowInsecure`, `allow_insecure`, and `insecure` claims; see the security note below |
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
 | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |
@@ -77,6 +79,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
+| `xhttp` | object? | omitted | Canonical XHTTP options in flat structured input/output; options on another transport reject |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 authentication and salamander password |
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal sender/receiver bandwidth hints |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 `mport` list and `mhop` seconds; effective interval is 30 s |
@@ -172,7 +175,7 @@ all receive-session state changes, so an invalid packet cannot reset replay hist
 
 ### Stream transports
 
-Stream-capable share links select transport with `type=` or its `network=` alias. Empty text and `tcp` mean raw TCP; `ws` and `grpc` select WebSocket and gRPC. All supplied aliases, including compatible `obfs` declarations and repeated query keys, must agree before assignment. Unsupported names such as `h2` and `kcp` reject the link during parsing. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. `alpn` is accepted for compatibility but not stored.
+Stream-capable share links select transport with `type=` or its `network=` alias. Empty text and `tcp` mean raw TCP; `ws`, `grpc`, and `xhttp` select WebSocket, gRPC, and XHTTP. `splithttp` is an XHTTP input alias. All supplied aliases, including compatible `obfs` declarations and repeated query keys, must agree before assignment. Unsupported names such as `h2` and `kcp` reject the link during parsing. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. Outside XHTTP, share-link `alpn` remains compatibility-only and is not stored.
 
 ```dae
 node {
@@ -185,13 +188,44 @@ VMess accepts v2rayN Base64 JSON (`net`, `host`, `path`, `sni`) and Shadowrocket
 
 VMess JSON `net` and Shadowrocket transport parameters select only the stream transport. They no longer populate packet-network capability; an omitted packet restriction retains the existing default UDP allowance. Valid empty transport spelling is preserved where already used.
 
-VLESS supports TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Unencrypted Vision's direct-copy path is raw TCP with TLS 1.3 or REALITY, not WS/gRPC; encrypted Vision follows the composition rules below.
+VLESS supports TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC, and the H2 XHTTP profile below. Unencrypted Vision's direct-copy path requires raw TCP with TLS 1.3 or REALITY, not WS/gRPC/XHTTP; encrypted Vision follows the composition rules below.
 
 Vision adds uplink padding and removes downstream padding. Uplink Direct needs
 an eligible TLS 1.3 ServerHello before the first complete application-data record;
 early data or an undecided inspection-budget expiry ends padding with End on the outer transport.
 Each direction switches independently. See the
 [Vision support boundary](../design/outbound.md#vision-and-vless-encryption).
+
+#### XHTTP over H2
+
+Trojan, VMess and VLESS share this outbound transport. VMess remains TCP-only. This is an H2 XHTTP compatibility profile, not full Xray or mihomo configuration parity: ordinary TLS must negotiate `h2`; authenticated REALITY selects H2 by the transport contract even when its server omits ALPN; explicitly configured cleartext requires an H2-capable peer. There is no H1/H3 fallback.
+
+```dae
+node {
+    xhttp: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&type=xhttp&mode=stream-up&path=%2Fxhttp%2F&sni=edge.example&alpn=h2#xhttp'
+}
+```
+
+`mode=auto|packet-up|stream-up|stream-one` defaults to `auto`. Auto selects packet-up for ordinary TLS or cleartext and stream-one for REALITY. Packet-up sends finite ordered POST bodies with a shared-session GET; stream-up uses separate streaming POST and GET; stream-one uses one bidirectional POST. Bodies are raw proxy bytes despite gRPC/SSE camouflage headers.
+
+`path` defaults to `/`; normalization adds leading/trailing slashes before the query without cleaning dot segments or percent escapes. HTTP `host` is independent of the dial address and SNI, falling back to SNI and then the server host. A directly constructed node must call `normalize_stream_transport()` before deriving its ID; immutable admission rejects noncanonical XHTTP spelling/options/ALPN.
+
+URI `extra` accepts a percent-encoded JSON object with only these fields:
+
+| Xray extra key | Flat `xhttp` field | Default | Supported bounds |
+| --- | --- | --- | --- |
+| `headers` | `headers` | `{}` | At most 64 headers and 16 KiB of names plus values |
+| `xPaddingBytes` | `x_padding_bytes` | `100-1000` | 1–8192 bytes |
+| `noGRPCHeader` | `no_grpc_header` | `false` | Boolean |
+| `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 bytes |
+| `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms; zero disables the minimum interval |
+
+Ranges accept an unsigned scalar, a `min-max` string or `{"min":N,"max":N}` in structured input. Headers normalize to lowercase and equal aliases coalesce; conflicting aliases, control characters and protocol-managed headers (`host`, `content-type`, `content-length`, `referer`, hop-by-hop headers and trailers) reject. URI/VMess extra JSON rejects duplicate members before map construction. Padding remains enabled. The bounds are local safety limits, not a guarantee that a peer or CDN accepts every value.
+
+Top-level `host`, `path` and `mode` remain authoritative when extra is present. Unknown or unsupported options, including `downloadSettings`, `xmux`, alternate session/sequence/payload placement, custom upload methods and padding-obfuscation profiles, reject the entire node even when supplied as null or empty. Mihomo subscriptions use the corresponding `xhttp-opts` fields; official sing-box and client-record XHTTP transports remain unsupported.
+
+XHTTP does not permit TCP Mux.Cool; UDP-only XUDP carriers remain supported. Existing VLESS UDP permission, packet encoding and UDP/443 policy are unchanged. Packet-up has no wire upload-EOF marker: shutdown flushes accepted upload bytes and retains the GET for the application's final reply; closing the logical flow retires its requests.
+
 
 ### Shadowrocket VLESS
 

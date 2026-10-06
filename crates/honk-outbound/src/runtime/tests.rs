@@ -2,6 +2,7 @@ use super::*;
 use honk_config::types::NodeProtocol;
 mod dial_admission;
 mod vless_runtime;
+mod xhttp_runtime;
 
 fn node(name: &str, protocol: NodeProtocol) -> Node {
     let host = format!("{name}.example");

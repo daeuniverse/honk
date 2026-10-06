@@ -15,28 +15,14 @@ pub struct ProtocolDescriptor {
     pub supports_udp: fn(&Node) -> bool,
     pub pool_ready_streams: fn(&Node) -> bool,
     pub pool_bare_tcp: fn(&Node) -> bool,
+    supports_warm: fn(&Node, WarmRequirement) -> bool,
     pub generation_runtime: GenerationRuntime,
     pub share_link_schemes: &'static [&'static str],
 }
 
 impl ProtocolDescriptor {
     pub fn supports_warm(&self, node: &Node, requirement: WarmRequirement) -> bool {
-        if self.protocol == NodeProtocol::VLess {
-            let vless = node
-                .vless()
-                .expect("VLESS descriptor requires VLESS config");
-            return match requirement {
-                WarmRequirement::Session => {
-                    matches!(vless.tcp_path(), VlessTcpPath::H2 | VlessTcpPath::Cool)
-                }
-                WarmRequirement::Udp => matches!(
-                    vless.udp_path(0),
-                    Some(VlessUdpPath::H2 | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate)
-                ),
-            };
-        }
-        self.generation_runtime != GenerationRuntime::None
-            && (requirement == WarmRequirement::Session || (self.supports_udp)(node))
+        (self.supports_warm)(node, requirement)
     }
 }
 
@@ -59,12 +45,46 @@ fn always(_: &Node) -> bool {
     true
 }
 
+fn stream_pool_bare_tcp(node: &Node) -> bool {
+    !node.is_xhttp()
+}
+
+fn stream_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
+    node.is_xhttp()
+        && (requirement == WarmRequirement::Session
+            || (descriptor(node.protocol()).supports_udp)(node))
+}
+
+fn pooled_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
+    requirement == WarmRequirement::Session || (descriptor(node.protocol()).supports_udp)(node)
+}
+
+fn no_warm(_: &Node, _: WarmRequirement) -> bool {
+    false
+}
+
+fn vless_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
+    let vless = node
+        .vless()
+        .expect("VLESS descriptor requires VLESS config");
+    stream_supports_warm(node, requirement)
+        || match requirement {
+            WarmRequirement::Session => {
+                matches!(vless.tcp_path(), VlessTcpPath::H2 | VlessTcpPath::Cool)
+            }
+            WarmRequirement::Udp => matches!(
+                vless.udp_path(0),
+                Some(VlessUdpPath::H2 | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate)
+            ),
+        }
+}
+
 fn vless_supports_udp(node: &Node) -> bool {
     node.vless().unwrap().udp_enabled()
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
-    node.vless().unwrap().tcp_path() == VlessTcpPath::Direct
+    stream_pool_bare_tcp(node) && node.vless().unwrap().tcp_path() == VlessTcpPath::Direct
 }
 
 /// Poolable only on the plain TCP transport: `dial()` completes the TLS
@@ -72,7 +92,7 @@ fn vless_pool_bare_tcp(node: &Node) -> bool {
 /// defines no server handshake reply, so the stream is then a target-bound
 /// data channel. WebSocket/gRPC transports add a bridge task / HTTP/2
 /// framing state whose idle liveness cannot be probed at the fd level, so
-/// they stay on bare-TCP pooling.
+/// they stay on bare-TCP pooling. XHTTP instead owns its physical session pool.
 fn trojan_pool_ready_streams(node: &Node) -> bool {
     matches!(node.transport().unwrap().transport.as_str(), "" | "tcp")
 }
@@ -83,6 +103,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
+        supports_warm: no_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["ss"],
     },
@@ -90,7 +111,8 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         protocol: NodeProtocol::Trojan,
         supports_udp: network_allows_udp,
         pool_ready_streams: trojan_pool_ready_streams,
-        pool_bare_tcp: always,
+        pool_bare_tcp: stream_pool_bare_tcp,
+        supports_warm: stream_supports_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["trojan"],
     },
@@ -98,7 +120,8 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         protocol: NodeProtocol::VMess,
         supports_udp: never,
         pool_ready_streams: never,
-        pool_bare_tcp: always,
+        pool_bare_tcp: stream_pool_bare_tcp,
+        supports_warm: stream_supports_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["vmess"],
     },
@@ -107,6 +130,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: vless_supports_udp,
         pool_ready_streams: never,
         pool_bare_tcp: vless_pool_bare_tcp,
+        supports_warm: vless_supports_warm,
         generation_runtime: GenerationRuntime::Vless,
         share_link_schemes: &["vless"],
     },
@@ -119,6 +143,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: always,
         pool_bare_tcp: always,
+        supports_warm: no_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["socks5", "socks4", "socks4a"],
     },
@@ -130,6 +155,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
+        supports_warm: pooled_supports_warm,
         generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["hysteria2", "hysteria", "hy2"],
     },
@@ -138,6 +164,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
+        supports_warm: pooled_supports_warm,
         generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["tuic"],
     },
@@ -146,6 +173,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
+        supports_warm: pooled_supports_warm,
         generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["juicity"],
     },
@@ -157,6 +185,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: network_allows_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
+        supports_warm: pooled_supports_warm,
         generation_runtime: GenerationRuntime::AnyTls,
         share_link_schemes: &["anytls"],
     },
@@ -167,6 +196,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
+        supports_warm: no_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
@@ -175,6 +205,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
+        supports_warm: no_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
@@ -266,6 +297,35 @@ mod tests {
                 descriptor.supports_warm(&node, WarmRequirement::Udp),
                 warm_udp
             );
+        }
+    }
+
+    #[test]
+    fn xhttp_owns_warming_without_bare_or_ready_tcp_competition() {
+        for protocol in [
+            NodeProtocol::Trojan,
+            NodeProtocol::VMess,
+            NodeProtocol::VLess,
+        ] {
+            let mut node = Node {
+                outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
+                ..Default::default()
+            };
+            node.transport_mut().unwrap().transport = "xhttp".into();
+            let descriptor = descriptor(protocol);
+            assert!(!(descriptor.pool_bare_tcp)(&node));
+            assert!(!(descriptor.pool_ready_streams)(&node));
+            assert!(descriptor.supports_warm(&node, WarmRequirement::Session));
+            assert_eq!(
+                descriptor.supports_warm(&node, WarmRequirement::Udp),
+                (descriptor.supports_udp)(&node),
+            );
+            match protocol {
+                NodeProtocol::Trojan => node.trojan_mut().unwrap().network = Some("tcp".into()),
+                NodeProtocol::VLess => node.vless_mut().unwrap().network = Some("tcp".into()),
+                _ => {}
+            }
+            assert!(!descriptor.supports_warm(&node, WarmRequirement::Udp));
         }
     }
 

@@ -185,6 +185,11 @@ impl<S: ManagedSession> Drop for SessionPermit<S> {
 pub trait ManagedSession: Send + Sync {
     /// Currently open streams on this session.
     fn active_streams(&self) -> usize;
+    /// Protocol-negotiated admission limit in addition to the configured soft cap.
+    /// Existing streams may remain alive after the peer reduces this limit.
+    fn has_capacity(&self) -> bool {
+        true
+    }
     /// Closed/broken sessions are pruned and never offered again.
     fn is_closed(&self) -> bool;
     /// Close the session (idle reap, pool shutdown).
@@ -378,6 +383,7 @@ impl<S> Drop for DialGuard<S> {
 #[derive(Debug, Clone, Default)]
 pub struct PoolMetrics {
     pub sessions: usize,
+    pub streams: usize,
 }
 
 /// Generic node-owned session pool. One instance replaces each node's
@@ -447,7 +453,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             + pool.provisional.len()
     }
 
-    fn try_reserve(&self, session: &Arc<S>) -> Option<SessionPermit<S>> {
+    pub(crate) fn try_reserve(&self, session: &Arc<S>) -> Option<SessionPermit<S>> {
         session
             .try_reserve()
             .map(|permit| permit.with_capacity_notify(Arc::clone(&self.capacity_notify)))
@@ -476,6 +482,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         pool.sessions.iter().any(|session| {
             session.state() == SessionState::Active
                 && session.active_streams() < self.config.max_streams_per_session
+                && session.has_capacity()
         })
     }
 
@@ -528,6 +535,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .filter(|s| {
                             s.state() == SessionState::Active
                                 && s.active_streams() < self.config.max_streams_per_session
+                                && s.has_capacity()
                         })
                         .min_by_key(|s| s.active_streams());
                     // Normal offers are bounded by real sessions only:
@@ -815,8 +823,14 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Current metrics snapshot.
     #[cfg(test)]
     pub fn metrics(&self) -> PoolMetrics {
+        let pool = self.pool.lock();
         PoolMetrics {
-            sessions: self.pool.lock().sessions.len(),
+            sessions: pool.sessions.len(),
+            streams: pool
+                .sessions
+                .iter()
+                .map(|session| session.active_streams())
+                .sum(),
         }
     }
 }

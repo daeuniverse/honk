@@ -551,7 +551,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         };
     let default_alpn = if node
         .transport()
-        .is_some_and(|transport| transport.transport == "grpc")
+        .is_some_and(|transport| matches!(transport.transport.as_str(), "grpc" | "xhttp"))
     {
         Some(b"\x02h2".as_slice())
     } else {

@@ -78,6 +78,7 @@ fn node(transport: &str, alpn: &[&str]) -> Node {
         outbound: OutboundConfig::Trojan(TrojanConfig {
             transport: StreamTransportOptions {
                 transport: transport.into(),
+                xhttp: (transport == "xhttp").then(Default::default),
                 ..Default::default()
             },
             tls: TlsOptions {
@@ -185,6 +186,25 @@ async fn connector_applies_explicit_alpn_and_preserves_profile_defaults() {
         chrome_websocket.selected.as_deref(),
         Some(b"http/1.1".as_slice())
     );
+}
+
+#[tokio::test]
+async fn xhttp_tls_offers_only_h2_with_default_or_explicit_alpn() {
+    let _mode_lock = TLS_MODE_LOCK.lock().await;
+    for mode in ["tls", "utls"] {
+        for alpn in [&[][..], &["h2"][..]] {
+            let observed = observe(mode, "xhttp", alpn).await;
+            assert_eq!(
+                observed.hello.alpn.as_deref(),
+                Some(b"\0\x03\x02h2".as_slice())
+            );
+            assert_eq!(observed.selected.as_deref(), Some(b"h2".as_slice()));
+            assert_eq!(
+                observed.hello.alps.as_deref(),
+                (mode == "utls").then_some(b"\0\x03\x02h2".as_slice())
+            );
+        }
+    }
 }
 
 #[tokio::test]

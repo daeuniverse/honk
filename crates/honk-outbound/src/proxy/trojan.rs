@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use super::addr;
 use super::{
     AsyncReadWrite, PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound,
+    WarmRequirement, WarmableOutbound,
 };
 
 const CRLF: &[u8] = b"\r\n";
@@ -44,6 +45,7 @@ impl TrojanHandler {
 
     async fn dial_stream(
         node: &Node,
+        runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
         target: SocketAddr,
         target_domain: Option<&str>,
         tcp: Option<TcpStream>,
@@ -51,7 +53,9 @@ impl TrojanHandler {
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
-        let mut stream = super::transport::wrap_transport(node, tcp, connect_timeout).await?;
+        let (mut stream, preparation) =
+            Self::prepare_transport(node, runtime, tcp, connect_timeout).await?;
+        preparation.commit()?;
         stream.write_all(&header).await?;
         stream.flush().await?;
         Ok(ProxyStream {
@@ -60,49 +64,68 @@ impl TrojanHandler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
-}
 
-#[async_trait]
-impl TcpOutbound for TrojanHandler {
-    async fn dial(
-        &self,
+    async fn dial_udp_stream(
         node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        Self::dial_stream(node, target, target_domain, None, connect_timeout).await
-    }
-
-    async fn dial_with_tcp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        tcp: TcpStream,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        Self::dial_stream(node, target, target_domain, Some(tcp), connect_timeout).await
-    }
-}
-
-#[async_trait]
-impl PacketOutbound for TrojanHandler {
-    async fn dial_udp_transport(
-        &self,
-        node: &Node,
+        runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Self::prepare_udp_stream(node, runtime, target, target_domain, connect_timeout)
+            .await?
+            .commit()
+            .await
+    }
+
+    async fn prepare_transport(
+        node: &Node,
+        runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
+        tcp: Option<TcpStream>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Box<dyn AsyncReadWrite>,
+        super::transport::TransportPreparation,
+    )> {
+        match runtime {
+            Some(runtime) => {
+                super::transport::prepare_transport_runtime(runtime, tcp, timeout).await
+            }
+            None => Ok((
+                super::transport::wrap_transport(node, tcp, timeout).await?,
+                super::transport::TransportPreparation::none(),
+            )),
+        }
+    }
+
+    async fn prepare_udp_stream(
+        node: &Node,
+        runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport> {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!(
                 "Trojan UDP: node network {:?} does not include \"udp\"",
                 node.network()
             );
         }
+        let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
+        let transport = Self::finish_udp_stream(node, target, domain, control).await?;
+        Ok(super::PreparedUdpTransport::new(async move {
+            preparation.commit()?;
+            Ok(transport)
+        }))
+    }
+
+    async fn finish_udp_stream(
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        mut control: Box<dyn AsyncReadWrite>,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
-        let mut control = super::transport::wrap_transport(node, None, connect_timeout).await?;
         let addr_header = addr::encode_address(target, target_domain)?;
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
         header.extend_from_slice(hex_sha224(password).as_bytes());
@@ -120,6 +143,115 @@ impl PacketOutbound for TrojanHandler {
             addr_header,
             relay_addr: target,
         }))
+    }
+}
+
+#[async_trait]
+impl TcpOutbound for TrojanHandler {
+    async fn dial(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        Self::dial_stream(node, None, target, target_domain, None, connect_timeout).await
+    }
+
+    async fn dial_with_tcp(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        tcp: TcpStream,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        Self::dial_stream(
+            node,
+            None,
+            target,
+            target_domain,
+            Some(tcp),
+            connect_timeout,
+        )
+        .await
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        Self::dial_stream(
+            &runtime.node,
+            Some(&runtime),
+            target,
+            target_domain,
+            None,
+            connect_timeout,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for TrojanHandler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Self::dial_udp_stream(node, None, target, target_domain, connect_timeout).await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Self::dial_udp_stream(
+            &runtime.node,
+            Some(&runtime),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport> {
+        Self::prepare_udp_stream(
+            &runtime.node,
+            Some(&runtime),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl WarmableOutbound for TrojanHandler {
+    async fn warm(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: std::time::Duration,
+        _requirement: WarmRequirement,
+    ) -> anyhow::Result<()> {
+        super::transport::xhttp::XhttpRuntime::warm(&runtime, connect_timeout).await
     }
 }
 

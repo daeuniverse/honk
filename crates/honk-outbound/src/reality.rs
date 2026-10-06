@@ -100,7 +100,7 @@ pub async fn reality_connect<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    reality_connect_with_key_shares(stream, config, chrome, true).await
+    reality_connect_with_key_shares(stream, config, chrome, true, None).await
 }
 
 pub(crate) async fn reality_connect_with_key_shares<S>(
@@ -108,12 +108,16 @@ pub(crate) async fn reality_connect_with_key_shares<S>(
     config: &RealityConfig,
     chrome: bool,
     hybrid: bool,
+    alpn: Option<&[u8]>,
 ) -> anyhow::Result<TlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let connector = crate::tls::build_reality_connector(chrome)?;
     let mut cfg = connector.configure()?;
+    if let Some(alpn) = alpn {
+        cfg.set_alpn_protos(alpn)?;
+    }
     if chrome {
         cfg.set_permute_extensions(true);
         // Real Chrome GREASEs ECH whenever it holds no ECH keys.

@@ -365,3 +365,54 @@ async fn overlapping_generations_bound_physical_address_attempts() {
     assert_eq!(peak.load(Ordering::SeqCst), 2);
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn nested_physical_setups_share_progress_but_release_independent_permits() {
+    let (registry, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+    let occupied = registry.acquire_dial_permit().await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let operation = registry.dial_scope({
+        let starts = Arc::clone(&starts);
+        move || {
+            starts.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    operation
+        .scope(async {
+            let captured = capture_dial_scope();
+            let first = captured.physical_setup();
+            let second = first.physical_setup();
+            let mut waiting_first = Box::pin(
+                first
+                    .clone()
+                    .scope(admit_physical_dial(ready(Ok::<_, ()>(())))),
+            );
+            let mut waiting_second = Box::pin(
+                second
+                    .clone()
+                    .scope(admit_physical_dial(ready(Ok::<_, ()>(())))),
+            );
+            assert!(waiting_first.as_mut().now_or_never().is_none());
+            assert!(waiting_second.as_mut().now_or_never().is_none());
+            assert!(operation.is_waiting_for_admission());
+            assert!(second.is_waiting_for_admission());
+            drop(waiting_first);
+            assert!(operation.is_waiting_for_admission());
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            drop(occupied);
+            waiting_second.await.unwrap();
+            assert!(!operation.is_waiting_for_admission());
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            operation.start();
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert!(registry.acquire_dial_permit().now_or_never().is_none());
+            drop(second);
+            registry
+                .acquire_dial_permit()
+                .now_or_never()
+                .expect("setup exit must release its credit while the operation remains alive");
+        })
+        .await;
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+}

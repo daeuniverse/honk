@@ -180,9 +180,8 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             if self.pool.state() == PoolState::Running {
                 if let Some(session) = session {
                     pool.sessions.retain(|existing| !existing.is_closed());
-                    // Normal offers don't count provisional slots. Preserve their
-                    // in-flight publication slot as well as established sessions;
-                    // detached winners keep their already-reserved streams drain-only.
+                    // Preserve normal offers' publication slots; detached winners
+                    // retain already-reserved streams as drain-only above the cap.
                     let active = pool
                         .sessions
                         .iter()
@@ -213,6 +212,58 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
                 Err(SessionPool::<S>::pool_closed_err())
             }
         }
+    }
+
+    /// Publish one preparation's physical sessions under a single pool lock.
+    /// Every reservation is validated before any session becomes reusable.
+    pub(crate) fn commit_all(mut reservations: Vec<Self>) -> anyhow::Result<()> {
+        let Some(first) = reservations.first() else {
+            return Ok(());
+        };
+        let owner = Arc::clone(&first.pool);
+        anyhow::ensure!(
+            reservations
+                .iter()
+                .all(|reservation| Arc::ptr_eq(&owner, &reservation.pool)),
+            "detached sessions belong to different pools"
+        );
+        {
+            let mut pool = owner.pool.lock();
+            if owner.state() != PoolState::Running
+                || !reservations.iter().all(|reservation| {
+                    reservation.active
+                        && pool
+                            .provisional
+                            .get(&reservation.slot_id)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|session| session.state() == SessionState::Active)
+                })
+            {
+                return Err(SessionPool::<S>::pool_closed_err());
+            }
+            pool.sessions.retain(|session| !session.is_closed());
+            let active = pool
+                .sessions
+                .iter()
+                .filter(|session| session.state() == SessionState::Active)
+                .count();
+            if active + usize::from(pool.dial_done.is_some()) + reservations.len()
+                > owner.config.max_sessions
+            {
+                return Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity));
+            }
+            for reservation in &mut reservations {
+                let session = pool
+                    .provisional
+                    .remove(&reservation.slot_id)
+                    .flatten()
+                    .expect("validated detached session");
+                pool.sessions.push(session);
+                reservation.active = false;
+            }
+        };
+        owner.capacity_notify.notify_waiters();
+        Ok(())
     }
 }
 

@@ -24,6 +24,15 @@ impl VLessHandler {
         let vless = node.vless().unwrap();
         let vision = vless.is_vision().then_some(uuid);
         let encryption = self.encryption_config(node)?;
+        if node.is_xhttp() {
+            let stream =
+                crate::proxy::transport::wrap_transport(node, tcp, connect_timeout).await?;
+            return if let Some(config) = encryption {
+                Ok(start(config.connect(stream).await?, &header, vision).await?)
+            } else {
+                Ok(start(stream, &header, vision).await?)
+            };
+        }
         if encryption.is_none()
             && vision.is_some()
             && matches!(vless.transport.transport.as_str(), "" | "tcp")
@@ -100,17 +109,48 @@ impl VLessHandler {
         header: Vec<u8>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let permit = runtime.acquire_vless_carrier()?;
+        let (stream, preparation) = self
+            .prepare_retained_carrier(runtime, uuid, header, connect_timeout)
+            .await?;
+        preparation.commit()?;
+        Ok(stream)
+    }
+
+    pub(super) async fn prepare_retained_carrier(
+        &self,
+        runtime: &Arc<crate::runtime::NodeRuntime>,
+        uuid: [u8; 16],
+        header: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Box<dyn AsyncReadWrite>,
+        crate::proxy::transport::TransportPreparation,
+    )> {
+        if runtime.xhttp.is_none() {
+            let permit = runtime.acquire_vless_carrier()?;
+            let stream = runtime
+                .transport_quality()
+                .scope(self.dial_carrier(&runtime.node, uuid, header, None, timeout, Some(permit)))
+                .await?;
+            return Ok((
+                stream,
+                crate::proxy::transport::TransportPreparation::none(),
+            ));
+        }
         runtime
             .transport_quality()
-            .scope(self.dial_carrier(
-                &runtime.node,
-                uuid,
-                header,
-                None,
-                connect_timeout,
-                Some(permit),
-            ))
+            .scope(async {
+                let (stream, preparation) =
+                    crate::proxy::transport::prepare_transport_runtime(runtime, None, timeout)
+                        .await?;
+                let vision = runtime.node.vless().unwrap().is_vision().then_some(uuid);
+                let stream = if let Some(config) = self.encryption_config(&runtime.node)? {
+                    start(config.connect(stream).await?, &header, vision).await?
+                } else {
+                    start(stream, &header, vision).await?
+                };
+                Ok((stream, preparation))
+            })
             .await
     }
 
@@ -140,11 +180,14 @@ impl VLessHandler {
         })
     }
 
-    pub(super) async fn dial_retained_mux_carrier(
+    pub(super) async fn prepare_retained_mux_carrier(
         &self,
         runtime: &Arc<crate::runtime::NodeRuntime>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Box<dyn AsyncReadWrite>,
+        crate::proxy::transport::TransportPreparation,
+    )> {
         let vless = runtime.node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
@@ -154,7 +197,7 @@ impl VLessHandler {
             None,
             vless.wire_flow(),
         )?;
-        self.dial_retained_carrier(runtime, uuid, header, connect_timeout)
+        self.prepare_retained_carrier(runtime, uuid, header, timeout)
             .await
     }
 }

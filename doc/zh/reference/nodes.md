@@ -37,6 +37,8 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow`，以及有效的 VLESS TLS 安全配置、UDP 权限、回退 encoding 和 multiplex 路径。明文 VLESS 与 TLS 使用不同身份；REALITY key 选择认证 transport，不受冗余 TLS 标志影响。非空的结构化 `tls_alpn` 以基础 ID 为命名空间、JSON 元组 `["tls-alpn", <ordered list>]` 为名称派生子 UUID v5，从而将 ALPN 与任意凭据文本分离。空 `tls_alpn` 保留基础 ID。调优参数与显示元数据不参与，但改变物理路径的 VLESS multiplex 上限除外。
 
+XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括 headers、padding 和 POST 间隔。输入别名、header 名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
+
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
 **破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及 session 状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
@@ -62,10 +64,10 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `packet_encoding` | `VlessUdpEncoding` | VLESS 使用 `auto` | 结构化 VLESS 回退 encoding：`auto`、`native`、`xudp` 或 `uot-v2`；规范 URI 的 `packetEncoding=none` 映射为 `native` |
 | `multiplex` | `VlessMultiplex` | VLESS 使用 `{"protocol":"off"}` | 结构化 VLESS carrier 选择：`off`、`h2` 或 `xray`；精确形态见下文 |
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
-| `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
+| `transport` | string | `"tcp"` | 流 transport：空值/`tcp`、`ws`、`grpc` 或规范 `xhttp`；输入 `splithttp` 规范化为 `xhttp` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
 | `sni` | string? | null | TLS 服务端名称；非空的 `sni` 与 `peer` 必须一致，未被传输层使用的 `host` 作为回退值 |
-| `tls_alpn` | string[] | `[]` | 结构化配置/订阅导入的普通裸 TCP TLS ALPN；空列表保留 TLS profile 默认值。非空值支持 AnyTLS 与 TCP Trojan/VMess/VLESS，不支持关闭 TLS、REALITY、WS/gRPC 或 QUIC。TUIC 继续使用 `tuic_alpn`；这不是分享链接 query。 |
+| `tls_alpn` | string[] | `[]` | AnyTLS 与 TCP Trojan/VMess/VLESS 的结构化普通裸 TCP TLS ALPN。XHTTP 将省略或 `h2` 规范化为 `["h2"]`，包括 REALITY 和显式明文 H2；其他关闭 TLS、REALITY、WS/gRPC、QUIC override 仍不支持。TUIC 保留 `tuic_alpn`。 |
 | `skip_cert_verify` | bool | `false` | 跳过证书校验；`allowInsecure`、`allow_insecure` 与 `insecure` 的有效声明必须一致，安全影响见下文 |
 | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
 | `ech_config` | string? | null | 来自 `ech_config` 或 `echconfig` 的 Base64 ECHConfigList |
@@ -77,6 +79,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
+| `xhttp` | object? | 省略 | flat 结构化输入/输出中的规范 XHTTP 参数；其他 transport 携带该对象会被拒绝 |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证与 salamander 密码 |
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal 发送端/接收端带宽提示 |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 `mport` 列表与 `mhop` 秒数；有效间隔为 30 秒 |
@@ -171,7 +174,7 @@ UDP 重放保护分别保留当前和前一个服务端 session 的窗口。前�
 
 ### 流传输
 
-支持流传输的分享链接用 `type=` 或其 `network=` 别名选择传输方式。空文本和 `tcp` 表示裸 TCP；`ws`、`grpc` 分别选择 WebSocket、gRPC。赋值前会比较所有已提供的别名，包括兼容的 `obfs` 声明和重复查询键；不一致则拒绝链接。`h2`、`kcp` 等不支持的名称会在解析时被拒绝。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。`alpn` 为兼容而接受，但不会存储。
+支持流传输的分享链接用 `type=` 或其 `network=` 别名选择传输。空文本和 `tcp` 表示裸 TCP；`ws`、`grpc`、`xhttp` 分别选择 WebSocket、gRPC、XHTTP；`splithttp` 是 XHTTP 输入别名。赋值前比较所有已提供的别名，包括兼容的 `obfs` 声明和重复查询键；不一致则拒绝链接。`h2`、`kcp` 等名称在解析时拒绝。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。除 XHTTP 外，分享链接 `alpn` 仍只为兼容而接受，不会存储。
 
 ```dae
 node {
@@ -184,13 +187,44 @@ VMess 接受 v2rayN Base64 JSON（`net`、`host`、`path`、`sni`），也接受
 
 VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，保留原有默认 UDP 能力；已有的有效空传输字段也保留原始写法。
 
-VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。未加密 Vision 的 direct-copy 路径是使用 TLS 1.3 或 REALITY 的裸 TCP，而不是 WS/gRPC；加密 Vision 遵循下文的组合规则。
+VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC 与下述 H2 XHTTP profile。未加密 Vision 的 direct-copy 要求使用 TLS 1.3 或 REALITY 的裸 TCP，不能使用 WS/gRPC/XHTTP；加密 Vision 遵循下文的组合规则。
 
 Vision 添加上行 padding 并移除下行 padding。上行 Direct 要求在第一个完整的
 application-data record 前已观察到符合条件的 TLS 1.3 ServerHello；early data
 或检查预算耗尽但仍未决定时，会改用 End 结束 padding 并保留 outer transport。
 两个方向各自独立切换。参见
 [Vision 支持边界](../design/outbound.md)。
+
+#### H2 上的 XHTTP
+
+Trojan、VMess 与 VLESS 共用该出站传输；VMess 仍仅支持 TCP。这是 H2 XHTTP 兼容 profile，不是完整 Xray/mihomo 配置兼容：普通 TLS 必须协商 `h2`；认证后的 REALITY 按 transport 契约选择 H2，即使服务端不返回 ALPN；显式明文配置要求对端支持 H2。不会回退到 H1/H3。
+
+```dae
+node {
+    xhttp: 'vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&type=xhttp&mode=stream-up&path=%2Fxhttp%2F&sni=edge.example&alpn=h2#xhttp'
+}
+```
+
+`mode=auto|packet-up|stream-up|stream-one` 默认为 `auto`。Auto 对普通 TLS 或明文选择 packet-up，对 REALITY 选择 stream-one。Packet-up 用有序有限 POST body 与同 session 的 GET；stream-up 用独立流式 POST 和 GET；stream-one 用一个双向 POST。即使 header 伪装为 gRPC/SSE，body 仍是原始代理字节。
+
+`path` 默认为 `/`；在 query 之前补首尾斜杠，不清理 dot segment 或百分号转义。HTTP `host` 与拨号地址、SNI 独立，依次回退到 SNI、服务端 host。直接构造节点必须先调用 `normalize_stream_transport()`，再派生 ID；不可变准入会拒绝非规范 XHTTP 名称、参数及 ALPN。
+
+URI `extra` 接受百分号编码的 JSON 对象，仅支持：
+
+| Xray extra key | flat `xhttp` 字段 | 默认值 | 支持边界 |
+| --- | --- | --- | --- |
+| `headers` | `headers` | `{}` | 最多 64 项，名称和值总共不超过 16 KiB |
+| `xPaddingBytes` | `x_padding_bytes` | `100-1000` | 1–8192 字节 |
+| `noGRPCHeader` | `no_grpc_header` | `false` | 布尔值 |
+| `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 字节 |
+| `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms；零关闭最小间隔 |
+
+结构化范围接受无符号标量、`min-max` 字符串或 `{"min":N,"max":N}`。Header 名称规范化为小写，等价别名合并；冲突别名、控制字符与传输层管理的 header（`host`、`content-type`、`content-length`、`referer`、hop-by-hop header、trailers）会被拒绝。URI/VMess extra JSON 在转为 map 前拒绝重复成员。Padding 始终启用。这些范围是本地安全上限，不保证每个对端或 CDN 都接受。
+
+存在 extra 时，顶层 `host`、`path`、`mode` 保持权威。未知或未实现的参数，包括 `downloadSettings`、`xmux`、其他 session/sequence/payload placement、自定义上传方法、padding 混淆 profile，即使为 null 或空值也会拒绝整个节点。Mihomo 订阅使用对应 `xhttp-opts`；官方 sing-box 与 client-record 的 XHTTP transport 仍不支持。
+
+XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP 权限、packet encoding 与 UDP/443 策略不变。Packet-up 没有上传 EOF 的 wire 标记：shutdown 刷新已经接受的上传字节并保留 GET 等待应用最终回复；关闭逻辑流才结束其请求。
+
 
 ### Shadowrocket VLESS
 

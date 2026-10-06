@@ -83,6 +83,52 @@ async fn handshake_standard_and_chrome() {
     }
 }
 
+#[tokio::test]
+async fn xhttp_tls_rejects_missing_h2_but_raw_tls_preserves_no_alpn() {
+    use crate::proxy::transport::{MaybeTls, maybe_tls_wrap_concrete};
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for xhttp in [false, true] {
+            let (cert, key) = server_cert();
+            let (port, server) = spawn_server(&cert, &key);
+            let mut node = test_node();
+            let tls = node.tls_mut().unwrap();
+            tls.enabled = true;
+            tls.sni = Some("localhost".into());
+            if xhttp {
+                tls.alpn = vec!["h2".into()];
+                let transport = node.transport_mut().unwrap();
+                transport.transport = "xhttp".into();
+                transport.xhttp = Some(Default::default());
+            }
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let result = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(1)).await;
+            if xhttp {
+                let Err(error) = result else {
+                    panic!("XHTTP accepted TLS without negotiated h2");
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("XHTTP requires negotiated h2 ALPN")
+                );
+            } else {
+                let MaybeTls::Tls(tls) = result.unwrap() else {
+                    panic!("enabled TLS returned plaintext");
+                };
+                assert_eq!(tls.ssl().selected_alpn_protocol(), None);
+                drop(tls);
+            }
+            assert!(server.join().unwrap().is_empty());
+        }
+    })
+    .await
+    .unwrap();
+}
+
 /// Spawn a server holding real ECH keys (boring test fixtures:
 /// public_name ech.com, DHKEM-P256-SHA256).
 fn spawn_ech_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {

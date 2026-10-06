@@ -3,6 +3,9 @@
 #[path = "vless_udp/reality.rs"]
 mod reality;
 
+#[path = "vless_udp/xhttp.rs"]
+mod xhttp;
+
 use honk_config::node::{
     Node, Udp443Policy, VlessMultiplex, VlessTcpPath, VlessUdpEncoding, VlessUdpPath,
 };

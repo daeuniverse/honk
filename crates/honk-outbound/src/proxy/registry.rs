@@ -121,6 +121,7 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::Trojan, trojan.clone())
                 .with_packet(trojan.clone())
+                .with_warmable(trojan.clone())
                 .with_probeable(trojan),
         );
         let hysteria2 = Arc::new(Hysteria2Handler::new());
@@ -147,7 +148,9 @@ impl ProxyRegistry {
             );
             let vmess = Arc::new(VmessHandler::new());
             registry.register(
-                ProtocolEntry::new(NodeProtocol::VMess, vmess.clone()).with_probeable(vmess),
+                ProtocolEntry::new(NodeProtocol::VMess, vmess.clone())
+                    .with_warmable(vmess.clone())
+                    .with_probeable(vmess),
             );
         }
         let anytls = Arc::new(AnyTlsHandler::new());

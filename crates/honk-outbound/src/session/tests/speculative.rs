@@ -401,3 +401,212 @@ async fn normal_dial_publication_wakes_a_speculative_capacity_waiter() {
     };
     assert!(Arc::ptr_eq(&reused, &session));
 }
+
+#[tokio::test]
+async fn detached_batch_commit_publishes_all_sessions_once() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 2,
+        ..Default::default()
+    }));
+    let mut reservations = Vec::new();
+    let mut sessions = Vec::new();
+    let mut permits = Vec::new();
+    for _ in 0..2 {
+        let SpeculativeCheckout::Detached(mut reservation) =
+            pool.checkout_speculative().await.unwrap()
+        else {
+            panic!("unpublished sessions must remain private");
+        };
+        let session = ReservedTestSession::new(1);
+        permits.push(reservation.attach(&session).unwrap());
+        sessions.push(session);
+        reservations.push(reservation);
+    }
+    assert_eq!(pool.live_session_count(), 0);
+    DetachedSessionReservation::commit_all(reservations).unwrap();
+    {
+        let published = pool.pool.lock();
+        assert_eq!(published.sessions.len(), 2);
+        for (expected, actual) in sessions.iter().zip(&published.sessions) {
+            assert!(Arc::ptr_eq(expected, actual));
+            assert_eq!(actual.state(), SessionState::Active);
+        }
+    }
+    assert_eq!(pool.live_session_count(), 2);
+    assert!(pool.pool.lock().provisional.is_empty());
+    drop(permits);
+    pool.shutdown();
+}
+
+#[tokio::test]
+async fn detached_batch_commit_rejects_terminal_or_invalid_member_without_partial_publication() {
+    for shutdown in [false, true] {
+        let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+            max_sessions: 2,
+            ..Default::default()
+        }));
+        let mut reservations = Vec::new();
+        let mut sessions = Vec::new();
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            let SpeculativeCheckout::Detached(mut reservation) =
+                pool.checkout_speculative().await.unwrap()
+            else {
+                panic!("unpublished sessions must remain private");
+            };
+            let session = ReservedTestSession::new(1);
+            permits.push(reservation.attach(&session).unwrap());
+            sessions.push(session);
+            reservations.push(reservation);
+        }
+        if shutdown {
+            pool.shutdown();
+        } else {
+            sessions[1].close();
+        }
+        assert!(DetachedSessionReservation::commit_all(reservations).is_err());
+        assert_eq!(pool.live_session_count(), 0);
+        assert!(pool.pool.lock().provisional.is_empty());
+        assert!(sessions.iter().all(|session| session.is_closed()));
+        drop(permits);
+    }
+}
+
+#[tokio::test]
+async fn detached_batch_capacity_refusal_closes_private_sessions_but_preserves_shared_owners() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 2,
+        ..Default::default()
+    }));
+    let SpeculativeCheckout::Detached(mut reservation) = pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("empty pool must reserve a private slot");
+    };
+    let private = ReservedTestSession::new(1);
+    let _permit = reservation.attach(&private).unwrap();
+    let incumbents = [ReservedTestSession::new(1), ReservedTestSession::new(1)];
+    for incumbent in &incumbents {
+        pool.insert(incumbent);
+    }
+    let error = DetachedSessionReservation::commit_all(vec![reservation]).unwrap_err();
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Capacity)
+    );
+    assert_eq!(
+        crate::group::ScoreOutcome::from_error(&error),
+        crate::group::ScoreOutcome::Rejected
+    );
+    assert!(private.is_closed());
+    assert!(
+        incumbents
+            .iter()
+            .all(|session| session.state() == SessionState::Active)
+    );
+    assert_eq!(pool.live_session_count(), 2);
+    assert!(pool.pool.lock().provisional.is_empty());
+    pool.shutdown();
+}
+
+#[tokio::test]
+async fn carrier_first_capacity_refusal_never_publishes_mux_or_disturbs_shared_carriers() {
+    for outer_terminal in [false, true] {
+        let outer = Arc::new(SessionPool::new(SessionPoolConfig {
+            max_sessions: 1,
+            ..Default::default()
+        }));
+        let inner = Arc::new(SessionPool::new(SessionPoolConfig {
+            max_sessions: 2,
+            ..Default::default()
+        }));
+        let SpeculativeCheckout::Detached(mut outer_guard) =
+            outer.checkout_speculative().await.unwrap()
+        else {
+            panic!("empty outer pool must reserve a private slot");
+        };
+        let SpeculativeCheckout::Detached(mut inner_guard) =
+            inner.checkout_speculative().await.unwrap()
+        else {
+            panic!("empty inner pool must reserve a private slot");
+        };
+        let outer_session = ReservedTestSession::new(1);
+        let inner_session = ReservedTestSession::new(1);
+        let _outer_permit = outer_guard.attach(&outer_session).unwrap();
+        let _inner_permit = inner_guard.attach(&inner_session).unwrap();
+        let incumbents = [ReservedTestSession::new(1), ReservedTestSession::new(1)];
+        for incumbent in &incumbents {
+            inner.insert(incumbent);
+        }
+        if outer_terminal {
+            outer.shutdown();
+        }
+        let result = (|| {
+            DetachedSessionReservation::commit_all(vec![inner_guard])?;
+            outer_guard.commit()?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        let error = result.unwrap_err();
+        assert_eq!(
+            crate::proxy::packet_rejection(&error),
+            Some(crate::proxy::PacketRejection::Capacity)
+        );
+        assert_eq!(outer.live_session_count(), 0);
+        assert_eq!(inner.live_session_count(), 2);
+        assert!(outer_session.is_closed());
+        assert!(inner_session.is_closed());
+        assert!(outer.pool.lock().provisional.is_empty());
+        assert!(inner.pool.lock().provisional.is_empty());
+        assert!(
+            incumbents
+                .iter()
+                .all(|session| session.state() == SessionState::Active)
+        );
+        outer.shutdown();
+        inner.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn carrier_first_publication_preserves_mux_winner_retirement_and_loser_rollback() {
+    for outcome in ["winner", "retired", "loser"] {
+        let outer = Arc::new(SessionPool::new(SessionPoolConfig::default()));
+        let inner = Arc::new(SessionPool::new(SessionPoolConfig::default()));
+        let SpeculativeCheckout::Detached(mut outer_guard) =
+            outer.checkout_speculative().await.unwrap()
+        else {
+            panic!("empty mux pool must reserve a private slot");
+        };
+        let SpeculativeCheckout::Detached(mut inner_guard) =
+            inner.checkout_speculative().await.unwrap()
+        else {
+            panic!("empty carrier pool must reserve a private slot");
+        };
+        let mux = ReservedTestSession::new(1);
+        let carrier = ReservedTestSession::new(1);
+        let _mux_permit = outer_guard.attach(&mux).unwrap();
+        let _carrier_permit = inner_guard.attach(&carrier).unwrap();
+        if outcome == "loser" {
+            drop(inner_guard);
+            drop(outer_guard);
+            assert_eq!(inner.live_session_count(), 0);
+            assert_eq!(outer.live_session_count(), 0);
+            assert!(mux.is_closed());
+            assert!(carrier.is_closed());
+        } else {
+            if outcome == "retired" {
+                outer.retire();
+            }
+            DetachedSessionReservation::commit_all(vec![inner_guard]).unwrap();
+            let result = outer_guard.commit();
+            assert_eq!(result.is_ok(), outcome == "winner");
+            assert_eq!(outer.live_session_count(), usize::from(outcome == "winner"));
+            assert_eq!(inner.live_session_count(), 1);
+            assert_eq!(mux.is_closed(), outcome == "retired");
+            assert!(!carrier.is_closed());
+        }
+        assert!(outer.pool.lock().provisional.is_empty());
+        assert!(inner.pool.lock().provisional.is_empty());
+        outer.shutdown();
+        inner.shutdown();
+    }
+}

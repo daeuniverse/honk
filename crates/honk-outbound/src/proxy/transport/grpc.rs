@@ -1,6 +1,9 @@
 //! gRPC gun framing over a connection-owned HTTP/2 client.
 
 use super::AsyncReadWrite;
+use super::h2_io::{DataProgress, FlushProgress};
+type TrackedIo = super::h2_io::TrackedIo<IoProgress>;
+type QueuedData = super::h2_io::QueuedData<Arc<IoProgress>>;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::task::{ArcWake, AtomicWaker, waker_ref};
 use honk_config::node::Node;
@@ -110,82 +113,21 @@ impl ArcWake for IoProgress {
     }
 }
 
-#[derive(Debug)]
-struct TrackedIo {
-    inner: Box<dyn AsyncReadWrite>,
-    progress: Arc<IoProgress>,
-}
-
-impl AsyncRead for TrackedIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+impl FlushProgress for IoProgress {
+    fn writing(&self) {
+        self.flushed.store(false, Ordering::Release);
     }
-}
-
-impl AsyncWrite for TrackedIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.progress.flushed.store(false, Ordering::Release);
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.progress.flushed.store(false, Ordering::Release);
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
-        if !self.progress.flushed.swap(true, Ordering::AcqRel) {
-            self.progress.write.wake();
+    fn flushed(&self) {
+        if !self.flushed.swap(true, Ordering::AcqRel) {
+            self.write.wake();
         }
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
-// h2 retains this buffer across DATA fragmentation, including a later window reduction.
-// A physical control-frame flush alone therefore cannot acknowledge queued application data.
-#[derive(Debug)]
-struct QueuedData {
-    bytes: Bytes,
-    progress: Arc<IoProgress>,
-}
-
-impl Buf for QueuedData {
-    fn remaining(&self) -> usize {
-        self.bytes.remaining()
-    }
-    fn chunk(&self) -> &[u8] {
-        self.bytes.chunk()
-    }
-    fn advance(&mut self, count: usize) {
-        self.bytes.advance(count);
-    }
-}
-
-impl Drop for QueuedData {
-    fn drop(&mut self) {
-        self.progress.pending.fetch_sub(1, Ordering::AcqRel);
-        self.progress.write.wake();
+impl DataProgress for IoProgress {
+    fn released(&self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.write.wake();
     }
 }
 

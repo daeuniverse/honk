@@ -11,7 +11,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 ## 功能概览
 
 - 透明 TCP/UDP：通过 TC eBPF、`dae0`/`daens` 和 Linux 6.12+ 上的编译路由处理 LAN 转发及本机发起的流量。
-- 出站：SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS，以及内建的 `direct` 和 `block`。VMess 仅支持 TCP；各协议限制见[节点参考](doc/zh/reference/nodes.md)。
+- 出站：SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS，以及内建的 `direct` 和 `block`。Trojan/VMess/VLESS 支持 H2 XHTTP profile（`packet-up`、`stream-up`、`stream-one`）；VMess 仍仅支持 TCP。各协议限制见[节点参考](doc/zh/reference/nodes.md)。
 - 组策略：Selector、URLTest、LoadBalance、Fallback 和 Score。Score 使用业务观测与有界验证，通过 `policy: score` 选择；省略策略仍为 Selector。详见[组参考](doc/zh/reference/groups.md#score-策略)。
 - DNS：支持 UDP、TCP、DoT、DoH、DoQ、DoH3 上游，可经节点或组出站，并提供路由和缓存。
 - 配置与控制：dae 语法、订阅、重载、Clash 兼容 REST/WebSocket API，以及 `honk-tool` CLI 工具箱。

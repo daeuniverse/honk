@@ -11,7 +11,7 @@ honk is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapa
 ## Capabilities
 
 - Transparent TCP/UDP: LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing on Linux 6.12+.
-- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS, plus built-in `direct` and `block`. VMess is TCP-only; protocol-specific limits are in the [node reference](doc/en/reference/nodes.md).
+- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS, plus built-in `direct` and `block`. Trojan/VMess/VLESS support the H2 XHTTP profile (`packet-up`, `stream-up`, `stream-one`); VMess remains TCP-only. Protocol-specific limits are in the [node reference](doc/en/reference/nodes.md).
 - Groups: Selector, URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; select it with `policy: score`. Omitted policy remains Selector. See the [group reference](doc/en/reference/groups.md#score-policy).
 - DNS: UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
 - Configuration and control: dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.
