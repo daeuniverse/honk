@@ -48,49 +48,83 @@ async fn non_200_download_failure_is_typed_and_retained_for_every_mode() {
 }
 
 #[tokio::test]
-async fn shutdown_waits_for_split_upload_status_and_retains_late_failure() {
-    for mode in [XhttpMode::PacketUp, XhttpMode::StreamUp] {
-        tokio::time::timeout(DEADLINE, async {
-            let mut peer = Peer::new(32).await;
-            let owner = peer.runtime(mode, 32);
-            let runtime = owner.runtime();
-            let mut stream = open(&runtime).await;
-            let _download = peer.next().await;
-            stream.write_all(b"accepted").await.unwrap();
-            let upload = async {
-                let mut upload = peer.next().await;
-                assert_eq!(receive(upload.request.body_mut(), 8).await, b"accepted");
-                upload
-            };
-            let (flushed, mut upload) = tokio::join!(stream.flush(), upload);
-            flushed.unwrap();
-            let mut shutdown = Box::pin(stream.shutdown());
-            tokio::select! {
-                result = &mut shutdown => panic!("shutdown discarded the upload status: {result:?}"),
-                () = eof(upload.request.body_mut()) => {}
+async fn packet_shutdown_waits_for_upload_status_and_retains_late_failure() {
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(32).await;
+        let owner = peer.runtime(XhttpMode::PacketUp, 32);
+        let runtime = owner.runtime();
+        let mut stream = open(&runtime).await;
+        let _download = peer.next().await;
+        stream.write_all(b"accepted").await.unwrap();
+        let upload = async {
+            let mut upload = peer.next().await;
+            assert_eq!(receive(upload.request.body_mut(), 8).await, b"accepted");
+            upload
+        };
+        let (flushed, mut upload) = tokio::join!(stream.flush(), upload);
+        flushed.unwrap();
+        let mut shutdown = Box::pin(stream.shutdown());
+        tokio::select! {
+            result = &mut shutdown => panic!("shutdown discarded the upload status: {result:?}"),
+            () = eof(upload.request.body_mut()) => {}
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown completed before the terminal POST response"
+        );
+        response(&mut upload.respond, 503, true);
+        let error = shutdown.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(!crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+        assert!(
+            anyhow::Error::new(error)
+                .chain()
+                .any(|cause| cause.downcast_ref::<StatusFailure>().is_some())
+        );
+        assert!(stream.shutdown().await.unwrap_err().to_string().contains("HTTP 503"));
+        drop(stream);
+        wait_released(&runtime).await;
+    })
+    .await
+    .expect("late packet upload status stalled");
+}
+
+#[tokio::test]
+async fn stream_shutdown_completes_at_upload_eof_and_retains_late_failure() {
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(32).await;
+        let owner = peer.runtime(XhttpMode::StreamUp, 32);
+        let runtime = owner.runtime();
+        let mut stream = open(&runtime).await;
+        let _download = peer.next().await;
+        let mut upload = peer.next().await;
+        let (shutdown, ()) = tokio::join!(stream.shutdown(), eof(upload.request.body_mut()));
+        shutdown.unwrap();
+        response(&mut upload.respond, 503, true);
+        for _ in 0..2 {
+            let errors = [
+                stream.read(&mut [0; 1]).await.unwrap_err(),
+                stream.write(b"rejected").await.unwrap_err(),
+                stream.shutdown().await.unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+                assert!(error.to_string().contains("HTTP 503"));
+                assert!(!crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+                assert!(
+                    anyhow::Error::new(error)
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<StatusFailure>().is_some())
+                );
             }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
-                    .await
-                    .is_err(),
-                "shutdown completed before the terminal POST response for {mode:?}"
-            );
-            response(&mut upload.respond, 503, true);
-            let error = shutdown.await.unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
-            assert!(!crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
-            assert!(
-                anyhow::Error::new(error)
-                    .chain()
-                    .any(|cause| cause.downcast_ref::<StatusFailure>().is_some())
-            );
-            assert!(stream.shutdown().await.unwrap_err().to_string().contains("HTTP 503"));
-            drop(stream);
-            wait_released(&runtime).await;
-        })
-        .await
-        .unwrap_or_else(|_| panic!("late upload status stalled for {mode:?}"));
-    }
+        }
+        drop(stream);
+        wait_released(&runtime).await;
+    })
+    .await
+    .expect("stream shutdown waited for the still-open upload response");
 }
 
 #[tokio::test]

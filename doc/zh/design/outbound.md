@@ -307,7 +307,7 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 
 Stream-one 使用一个 POST，stream-up 使用 GET 与流式 POST，packet-up 使用 GET 与有序有限 POST。建链无需等待响应头即可返回可写流。上传响应中的 padding 持续排空并丢弃，不记作应用 RX。Packet-up 聚合已取得所有权的字节并限制未完成响应数，不会每次应用 write 都发一个 POST；前一个 body 物理写完后即可继续后续 POST，不必等待它的响应。
 
-Flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新；缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 与 packet-up 等待各自 POST 的终端响应，不丢失延迟到达的上传拒绝。Packet-up 不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
+Flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新；缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 等待各 POST 的终端响应，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
 
 Ephemeral 建立过程在取消期间也受 guard 管理，pool 自主管理的握手有 deadline，speculative UDP carrier 只有胜者 fallible commit 后才发布；关闭或丢弃 preparation 回滚 reservation。清理由既有 runtime shutdown、retirement 与 idle maintenance 拥有，不新增协议 janitor 或生产逐包 telemetry。
 

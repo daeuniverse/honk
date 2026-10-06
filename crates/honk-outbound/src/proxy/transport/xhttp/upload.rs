@@ -256,11 +256,27 @@ pub(super) async fn streaming_upload(mut upload: UploadRequest, flow: Arc<Flow>)
         Ok::<_, io::Error>(())
     };
     if let Some(response) = response {
-        tokio::try_join!(send, drain_response(response, session))?;
+        let drain = drain_response(response, session);
+        tokio::pin!(send, drain);
+        let drained = tokio::select! {
+            result = &mut send => {
+                result?;
+                false
+            }
+            result = &mut drain => {
+                result?;
+                send.await?;
+                true
+            }
+        };
+        flow.sent(0, true);
+        if !drained {
+            drain.await?;
+        }
     } else {
         send.await?;
+        flow.sent(0, true);
     }
-    flow.sent(0, true);
     // Keep the stream-one upload permit until the logical flow drops.
     std::future::pending().await
 }
