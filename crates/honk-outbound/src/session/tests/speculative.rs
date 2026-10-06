@@ -439,6 +439,50 @@ async fn detached_batch_commit_publishes_all_sessions_once() {
 }
 
 #[tokio::test]
+async fn detached_batch_commit_publishes_draining_members_without_charging_capacity() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 2,
+        ..Default::default()
+    }));
+    let mut reservations = Vec::new();
+    let mut sessions = Vec::new();
+    let mut permits = Vec::new();
+    for draining in [true, false] {
+        let SpeculativeCheckout::Detached(mut reservation) =
+            pool.checkout_speculative().await.unwrap()
+        else {
+            panic!("unpublished sessions must remain private");
+        };
+        let session = ReservedTestSession::new(2);
+        permits.push(reservation.attach(&session).unwrap());
+        if draining {
+            session.begin_drain();
+        }
+        sessions.push(session);
+        reservations.push(reservation);
+    }
+    let incumbent = ReservedTestSession::new(1);
+    let incumbent_permit = incumbent.try_reserve().unwrap();
+    pool.insert(&incumbent);
+    DetachedSessionReservation::commit_all(reservations).unwrap();
+    assert_eq!(pool.live_session_count(), 3);
+    assert!(pool.pool.lock().provisional.is_empty());
+    assert_eq!(sessions[0].state(), SessionState::Draining);
+    assert!(!sessions[0].is_closed());
+    let SpeculativeCheckout::Shared { session, permit } =
+        pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("the active member must remain reusable");
+    };
+    assert!(Arc::ptr_eq(&session, &sessions[1]));
+    drop(permit);
+    drop(incumbent_permit);
+    drop(permits);
+    pool.shutdown();
+    assert!(sessions.iter().all(|session| session.is_closed()));
+}
+
+#[tokio::test]
 async fn detached_batch_commit_rejects_terminal_or_invalid_member_without_partial_publication() {
     for shutdown in [false, true] {
         let pool = Arc::new(SessionPool::new(SessionPoolConfig {

@@ -229,17 +229,20 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
         );
         {
             let mut pool = owner.pool.lock();
-            if owner.state() != PoolState::Running
-                || !reservations.iter().all(|reservation| {
-                    reservation.active
-                        && pool
-                            .provisional
-                            .get(&reservation.slot_id)
-                            .and_then(Option::as_ref)
-                            .is_some_and(|session| session.state() == SessionState::Active)
-                })
-            {
+            if owner.state() != PoolState::Running {
                 return Err(SessionPool::<S>::pool_closed_err());
+            }
+            let mut incoming_active = 0;
+            for reservation in &reservations {
+                let session = pool
+                    .provisional
+                    .get(&reservation.slot_id)
+                    .and_then(Option::as_ref);
+                match session.map(|session| session.state()) {
+                    Some(SessionState::Active) if reservation.active => incoming_active += 1,
+                    Some(SessionState::Draining) if reservation.active => {}
+                    _ => return Err(SessionPool::<S>::pool_closed_err()),
+                }
             }
             pool.sessions.retain(|session| !session.is_closed());
             let active = pool
@@ -247,7 +250,7 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
                 .iter()
                 .filter(|session| session.state() == SessionState::Active)
                 .count();
-            if active + usize::from(pool.dial_done.is_some()) + reservations.len()
+            if active + usize::from(pool.dial_done.is_some()) + incoming_active
                 > owner.config.max_sessions
             {
                 return Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity));
