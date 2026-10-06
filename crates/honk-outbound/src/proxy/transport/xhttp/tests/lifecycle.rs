@@ -132,6 +132,99 @@ async fn concurrent_one_stream_opens_keep_the_first_upload_live_until_drop() {
 }
 
 #[tokio::test]
+async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() {
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::with_stream_limit(32, 1).await;
+        let owner = peer.runtime(XhttpMode::PacketUp, 32);
+        let runtime = owner.runtime();
+        let transport = runtime.xhttp.as_ref().unwrap();
+        let state = super::super::preparation::PreparationState::new(transport.clone());
+        let preparation = super::super::XhttpPreparation::new(state.clone());
+        let tcp = Arc::new(parking_lot::Mutex::new(None));
+        let path = uuid::Uuid::new_v4().to_string();
+        let mut sessions = Vec::new();
+        let mut requests = Vec::new();
+        for post in [false, true] {
+            let (session, permit) = state
+                .reserve(&runtime, tcp.clone(), DEADLINE)
+                .await
+                .unwrap();
+            let mut request = Some(
+                transport
+                    .template()
+                    .unwrap()
+                    .request(&path, post.then_some(0), post, Some(0))
+                    .unwrap(),
+            );
+            requests.push(
+                session
+                    .clone()
+                    .request(RequestOwner::Pool { _permit: permit }, &mut request, true)
+                    .await
+                    .unwrap_or_else(|_| panic!("private request was not admitted")),
+            );
+            sessions.push(session);
+        }
+        let mut download = peer.next().await;
+        let mut upload = peer.next().await;
+        assert_eq!(download.request.method(), http::Method::GET);
+        assert_eq!(upload.request.method(), http::Method::POST);
+        assert_ne!(download.carrier, upload.carrier);
+        response(&mut upload.respond, 200, true);
+        assert_eq!(transport.pool.live_session_count(), 0);
+        sessions[0].begin_drain();
+        sessions[1].close();
+        let (replacement, permit) = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.reserve(&runtime, tcp, DEADLINE),
+        )
+        .await
+        .expect("closed private carrier retained its provisional slot")
+        .unwrap();
+        assert!(!Arc::ptr_eq(&replacement, &sessions[1]));
+        let mut request = Some(
+            transport
+                .template()
+                .unwrap()
+                .request(&path, Some(1), true, Some(0))
+                .unwrap(),
+        );
+        let request = replacement
+            .clone()
+            .request(RequestOwner::Pool { _permit: permit }, &mut request, true)
+            .await
+            .unwrap_or_else(|_| panic!("replacement POST was not admitted"));
+        let mut replaced_upload = peer.next().await;
+        assert_eq!(replaced_upload.request.method(), http::Method::POST);
+        assert_ne!(replaced_upload.carrier, upload.carrier);
+        assert_ne!(replaced_upload.carrier, download.carrier);
+        response(&mut replaced_upload.respond, 200, true);
+        preparation
+            .commit()
+            .expect("closed private carrier poisoned winner commit");
+        assert_eq!(transport.pool.live_session_count(), 2);
+        assert_eq!(sessions[0].state(), SessionState::Draining);
+        assert!(!sessions[0].is_closed());
+        assert_eq!(replacement.state(), SessionState::Active);
+        let mut reply = response(&mut download.respond, 200, false);
+        send(
+            &mut reply,
+            Bytes::from_static(b"accepted GET survives"),
+            true,
+        )
+        .await;
+        let download_response = (&mut requests[0].response).await.unwrap();
+        assert_eq!(download_response.status(), 200);
+        let mut body = download_response.into_body();
+        assert_eq!(receive(&mut body, 21).await, b"accepted GET survives");
+        drop(request);
+        drop(requests);
+    })
+    .await
+    .expect("private carrier replacement or winner commit stalled");
+}
+
+#[tokio::test]
 async fn generation_retirement_between_posts_keeps_admitted_packet_flow_usable() {
     tokio::time::timeout(DEADLINE, async {
         let mut peer = Peer::new(32).await;

@@ -26,8 +26,7 @@ impl PhaseState {
 
 struct State {
     phase: PhaseState,
-    sessions: Vec<Arc<XhttpSession>>,
-    reservations: Vec<DetachedSessionReservation<XhttpSession>>,
+    sessions: Vec<(Arc<XhttpSession>, DetachedSessionReservation<XhttpSession>)>,
 }
 
 /// One candidate's unpublished physical sessions. Shared sessions remain pool-owned.
@@ -44,7 +43,6 @@ impl PreparationState {
             state: Mutex::new(State {
                 phase: PhaseState::Open,
                 sessions: Vec::new(),
-                reservations: Vec::new(),
             }),
             changed: Notify::new(),
         })
@@ -86,18 +84,28 @@ impl PreparationState {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let (committed, sessions) = {
+            let (committed, sessions, closed) = {
                 let lifecycle = self.transport.lifecycle.lock();
-                let state = self.state.lock();
+                let mut state = self.state.lock();
                 state.phase.ensure_open()?;
                 let committed = state.phase == PhaseState::Committed;
                 if !committed {
                     anyhow::ensure!(!lifecycle.is_retired(), "XHTTP runtime retired");
                 }
+                let closed: Vec<_> = state
+                    .sessions
+                    .extract_if(.., |(session, _)| session.state() == SessionState::Closed)
+                    .collect();
                 let sessions: [Option<Arc<XhttpSession>>; MAX_CARRIERS] =
-                    std::array::from_fn(|index| state.sessions.get(index).cloned());
-                (committed, sessions)
+                    std::array::from_fn(|index| {
+                        state
+                            .sessions
+                            .get(index)
+                            .map(|(session, _)| session.clone())
+                    });
+                (committed, sessions, closed)
             };
+            drop(closed);
             if committed {
                 return self.transport.reserve_pooled(runtime, tcp, timeout).await;
             }
@@ -143,8 +151,7 @@ impl PreparationState {
                         DetachedSessionReservation::commit_all(vec![reservation])?;
                     } else {
                         anyhow::ensure!(!lifecycle.is_retired(), "XHTTP runtime retired");
-                        state.sessions.push(session.clone());
-                        state.reservations.push(reservation);
+                        state.sessions.push((session.clone(), reservation));
                     }
                     self.changed.notify_waiters();
                     return Ok((session, permit));
@@ -154,17 +161,16 @@ impl PreparationState {
     }
 
     fn cancel(&self) {
-        let reservations = {
+        let sessions = {
             let mut state = self.state.lock();
             if state.phase != PhaseState::Open {
                 return;
             }
             state.phase = PhaseState::Cancelled;
-            state.sessions.clear();
-            std::mem::take(&mut state.reservations)
+            std::mem::take(&mut state.sessions)
         };
         self.changed.notify_waiters();
-        drop(reservations);
+        drop(sessions);
     }
 
     fn commit(&self) -> anyhow::Result<()> {
@@ -176,9 +182,13 @@ impl PreparationState {
         if state.phase == PhaseState::Committed {
             return Ok(());
         }
-        DetachedSessionReservation::commit_all(std::mem::take(&mut state.reservations))?;
+        DetachedSessionReservation::commit_all(
+            std::mem::take(&mut state.sessions)
+                .into_iter()
+                .map(|(_, reservation)| reservation)
+                .collect(),
+        )?;
         state.phase = PhaseState::Committed;
-        state.sessions.clear();
         self.changed.notify_waiters();
         Ok(())
     }
