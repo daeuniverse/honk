@@ -131,11 +131,11 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `password` | `password` | Optional string; VLESS applies the precedence below. |
 | `cipher` | `encryption` | Optional string; VLESS applies the precedence below. |
 | `plugin`, `plugin-opts` | — | Unsupported. An entry with either non-empty value is skipped before node publication; mapping-valued options are rejected too. |
-| `network` | `transport` or packet capability | Trojan/VMess/VLESS use a stream transport (`tcp`, `ws`, or `grpc`); AnyTLS uses packet capability. |
+| `network` | `transport` or packet capability | Trojan/VMess/VLESS use a stream transport (`tcp`, `ws`, `grpc`, or `xhttp`); AnyTLS uses packet capability. |
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `server-name`, `sni` | `sni` | Empty or whitespace-only names are absent; nonempty aliases must agree byte for byte. |
 | `skip-cert-verify`, `skip_cert_verify`, `insecure` | `skip_cert_verify` | Native booleans; supplied aliases must agree. |
-| `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for AnyTLS and ordinary raw-TCP Trojan/VMess/VLESS TLS; explicit values reach the TLS handshake in both `tls` and `utls` modes. QUIC retains the protocol-specific rules below. |
+| `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for raw-TCP TLS; XHTTP accepts only H2 and normalizes omission to `["h2"]`. QUIC retains the protocol-specific rules below. |
 
 #### Protocol-specific options
 
@@ -146,6 +146,8 @@ Explicit disabled feature blocks are treated as disabled, not as unsupported act
 AnyTLS packet claims are resolved once in this order: `anytls-network`, applicable `network`, then `udp`. Empty or null network text supplies no claim. Network strings use comma-separated `tcp`/`udp` tokens; aliases are compared by UDP allowance, so `udp` and `tcp,udp` agree, while `tcp` with `udp: true` conflicts. Unknown tokens such as `quic` reject the entry even beside a valid alias. Equivalent claims retain the first explicit network spelling; only a boolean-only input synthesizes `tcp` or `tcp,udp`.
 
 TCP TLS ALPN list members are preserved verbatim, including order; each name must occupy 1–255 UTF-8 bytes and the length-prefixed list may not exceed 65,533 bytes. This is a syntactic ceiling; the complete ClientHello also has TLS-library size limits. Absent, null, or empty imported `alpn` lists preserve existing TLS-profile defaults and node IDs; the flat `tls_alpn` field accepts omission or a string array, not null. Nonempty overrides participate in identity and are rejected with disabled TLS, REALITY, WebSocket, or gRPC rather than silently discarded. Chrome ALPS is offered only when the actual ALPN list contains `h2`. Share-link ALPN compatibility is unchanged; this applies to structured subscription imports and the flat `tls_alpn` model field.
+
+XHTTP is the exception to the raw-TCP ALPN rule: it always uses H2, including REALITY or explicit cleartext H2. Mihomo `network: xhttp` (or input alias `splithttp`) accepts `xhttp-opts` keys `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, and `sc-min-posts-interval-ms`. The canonical defaults, bounds and header restrictions are in the [XHTTP node reference](./nodes.md#xhttp-over-h2). Unsupported options such as `download-settings`, `reuse-settings`, alternate placements and padding-obfuscation settings reject that entry by raw presence, including null/empty/false; valid sibling nodes survive. URI/VMess extra JSON rejects duplicate members before decoding them into maps.
 
 #### VLESS transport and REALITY
 
@@ -197,6 +199,8 @@ SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import 
 sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet choices, and supported protocol tuning are normalized through the common node builder. A sing-box VLESS entry defaults specifically to Single XUDP with UDP permitted when no enabled H2MUX/UoT wrapper or explicit `packet_encoding` selects another path. This is a sing-box import default, not the global meaning of Auto. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, or authentication requirements are not silently discarded, and per-node uTLS fingerprint hints do not override honk's process-wide TLS selection.
 
 In sing-box input, `network` is packet capability, not a stream type; `transport.type` selects the stream. Unsupported stream names such as `h2` reject the entry rather than becoming raw TCP.
+
+Official sing-box has no native XHTTP transport. This importer explicitly rejects `transport.type: xhttp` and `splithttp`; it does not reinterpret old `http`, H2, QUIC or a third-party fork as XHTTP. Client-record XHTTP transports are likewise unsupported.
 
 Where the sing-box mapping supports packet restrictions, `network: udp` and `network: tcp,udp` permit UDP, while `network: tcp` disables it. These values do not introduce UDP-only TCP rejection. `network` remains independent of VLESS fallback encoding and H2MUX/UoT carrier selection.
 

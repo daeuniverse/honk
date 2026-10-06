@@ -323,3 +323,148 @@ fn truncated_all_invalid_body_keeps_terminal_failure() {
     );
     assert!(diagnostics.last().unwrap().terminal);
 }
+
+#[test]
+fn xhttp_mihomo_options_reach_canonical_nodes_and_identity() {
+    let body = r#"proxies:
+  - {name: first, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: splithttp, alpn: [h2], xhttp-opts: {path: api, host: front.example, mode: stream-up, headers: {X-B: b, x-a: a}, x-padding-bytes: 123-456, no-grpc-header: true, sc-max-each-post-bytes: 4096, sc-min-posts-interval-ms: 0-50}}
+  - {name: alias, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {path: /api/, host: front.example, mode: stream-up, headers: {X-A: a, x-b: b}, x-padding-bytes: {min: 123, max: 456}, no-grpc-header: true, sc-max-each-post-bytes: '4096', sc-min-posts-interval-ms: {min: 0, max: 50}}}
+  - {name: changed, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {path: /changed}}
+"#;
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        body,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes.len(),
+        2,
+        "equal aliases deduplicate; changed path survives"
+    );
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "duplicate-subscription-entry");
+    let options = nodes[0].transport().unwrap().xhttp.as_ref().unwrap();
+    assert_eq!(options.path, "/api/");
+    assert_eq!(options.host.as_deref(), Some("front.example"));
+    assert_eq!(options.mode, honk_config::node::XhttpMode::StreamUp);
+    assert_eq!(options.headers.get("x-a").map(String::as_str), Some("a"));
+    assert_eq!(
+        options.x_padding_bytes,
+        honk_config::node::XhttpRange { min: 123, max: 456 }
+    );
+    assert!(options.no_grpc_header);
+    assert_eq!(options.sc_max_each_post_bytes.max, 4096);
+    assert_eq!(
+        options.sc_min_posts_interval_ms,
+        honk_config::node::XhttpRange { min: 0, max: 50 }
+    );
+    assert_eq!(nodes[0].tls().unwrap().alpn, ["h2"]);
+    assert_ne!(nodes[0].id, nodes[1].id);
+}
+
+#[test]
+fn xhttp_unsupported_raw_presence_salvages_siblings_and_redacts_errors() {
+    for field in [
+        "download-settings",
+        "reuse-settings",
+        "session-placement",
+        "seq-placement",
+        "uplink-data-placement",
+        "uplink-http-method",
+        "x-padding-obfs-mode",
+        "PRIVATE_UNKNOWN",
+    ] {
+        for value in ["null", "''", "{}", "false"] {
+            let body = format!(
+                "proxies:\n  - {{name: PRIVATE_NAME, type: vless, server: private.example, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, network: xhttp, xhttp-opts: {{{field}: {value}}}}}\n  - {{name: survivor, type: socks5, server: 127.0.0.1, port: 1080}}\n"
+            );
+            let mut diagnostics = Vec::new();
+            let nodes = parse_subscription_content_with_diagnostics(
+                &Subscription::default(),
+                &body,
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].name, "survivor");
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].entry_index, Some(1));
+            let rendered = format!("{diagnostics:?}");
+            assert!(!rendered.contains("PRIVATE_"));
+            assert!(!rendered.contains("private.example"));
+            assert!(!rendered.contains("b831381d-6324-4d53-ad4f-8cda48b30811"));
+        }
+    }
+    for options in [
+        "null",
+        "{headers: {Connection: close}}",
+        "{x-padding-bytes: '0'}",
+        "{mode: unsupported}",
+    ] {
+        let body = format!(
+            "proxies: [{{name: invalid, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, network: xhttp, xhttp-opts: {options}}}]"
+        );
+        assert!(parse_subscription_content(&Subscription::default(), &body).is_err());
+    }
+    for alpn in ["[http/1.1]", "[h3]", "[h2, http/1.1]"] {
+        let body = format!(
+            "proxies: [{{name: invalid, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, network: xhttp, alpn: {alpn}}}]"
+        );
+        assert!(parse_subscription_content(&Subscription::default(), &body).is_err());
+    }
+}
+
+#[test]
+fn official_sing_box_and_records_explicitly_reject_xhttp_with_salvage() {
+    for transport in ["xhttp", "splithttp"] {
+        let body = format!(
+            r#"{{"outbounds":[{{"type":"vless","tag":"invalid","server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","transport":{{"type":"{transport}"}}}},{{"type":"socks","tag":"survivor","server":"127.0.0.1","server_port":1080}}]}}"#
+        );
+        let mut diagnostics = Vec::new();
+        let nodes = parse_subscription_content_with_diagnostics(
+            &Subscription::default(),
+            &body,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "survivor");
+        assert_eq!(diagnostics.len(), 1);
+        let body = format!(
+            "invalid=trojan,example.com,443,password=secret,transport={transport}\nsurvivor=socks5,127.0.0.1,1080\n"
+        );
+        let nodes = parse_subscription_content(&Subscription::default(), &body).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "survivor");
+    }
+}
+
+#[test]
+fn vmess_xhttp_tls_and_plain_entries_survive_subscription_dedup() {
+    let mut fixture = serde_json::json!({"ps":"posture","add":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"xhttp"});
+    let plain = format!(
+        "vmess://{}",
+        base64::engine::general_purpose::STANDARD.encode(fixture.to_string())
+    );
+    fixture["tls"] = serde_json::json!("tls");
+    let tls = format!(
+        "vmess://{}",
+        base64::engine::general_purpose::STANDARD.encode(fixture.to_string())
+    );
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        &format!("{plain}\n{tls}\n"),
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert!(diagnostics.is_empty());
+    assert_ne!(nodes[0].id, nodes[1].id);
+    assert_ne!(
+        nodes[0].tls().unwrap().enabled,
+        nodes[1].tls().unwrap().enabled
+    );
+}

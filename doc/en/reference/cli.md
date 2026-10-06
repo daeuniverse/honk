@@ -148,10 +148,12 @@ Remote subscriptions and local files share the engine's automatic format detecti
 For each node, the command reports server address families, full proxied IPv4 and IPv6 exchanges, proxied URLTest latency, a DNS query through the packet handler, and a real QUIC handshake through that handler. VLESS rows carry this redacted shape, with no endpoint, UUID, REALITY key, SNI, or URL query:
 
 ```text
-vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
+vless/{plain|tls|reality}/{tcp|ws|grpc|xhttp}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
 ```
 
 `tcp=` reports the effective TCP path. `udp-fallback=` reports the normalized fallback field even when H2MUX or Xray mux currently owns the target UDP path; `udp=disabled` means packet dialing is forbidden. `padding=` is present only for H2MUX. For Xray mux, `TCP` is the effective per-carrier TCP logical-child concurrency (`0` means disabled), `UDP` is `protocol`, `shared`, or the per-carrier logical-child concurrency of a separate UDP pool, and `POLICY` is `reject`, `skip`, or `allow` for UDP/443. Example shapes include `vless/tls/tcp/tcp=plain/udp-fallback=native`, `vless/reality/grpc/tcp=h2mux/udp-fallback=auto/padding=true`, and `vless/tls/tcp/vision/tcp=plain/udp-fallback=auto/mux=0:8:allow`.
+
+`xhttp` identifies the H2 XHTTP transport; the row does not expose its path, HTTP host, extra headers or padding contents. The transport's mode and supported parameter profile are documented in the [node reference](./nodes.md#xhttp-over-h2).
 
 Probe eligibility is `supported`, `invalid-uuid`, `invalid-reality`, `invalid-config`, `unsupported-transport`, `unsupported-flow`, or `vision-without-tls`/`vision-non-tcp`; invalid and intentionally unsupported entries remain visible but perform no network work. Vision may use TCP only with an eligible direct carrier, while UDP-only Xray mux remains valid. VLESS Encryption can combine with Vision; only unencrypted Vision additionally requires TLS 1.3 or REALITY on raw TCP.
 

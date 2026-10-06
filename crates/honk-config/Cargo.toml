@@ -39,6 +39,7 @@ ipnet.workspace = true
 libc.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

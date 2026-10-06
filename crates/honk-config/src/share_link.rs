@@ -24,9 +24,10 @@ use base64::Engine as _;
 use crate::diagnostic::{SettingPath, SourceRef};
 use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
 use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
-use crate::options::vocab::{optional_text, stream_transport, vmess_cipher};
+use crate::options::vocab::{optional_text, vmess_cipher, xhttp_stream_transport};
 
 mod options;
+mod xhttp;
 
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
@@ -81,6 +82,15 @@ impl Node {
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, crate::error::DetailedConfigError> {
         let mut node = Self::decode_share_link(link, source, emit)?;
+        node.normalize_stream_transport().map_err(|message| {
+            DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-config-value",
+                source.clone(),
+                SettingPath::new("nodes").field("xhttp"),
+                message,
+            )
+        })?;
         if let Some(config) = node.vless_mut() {
             config.normalize();
         }
@@ -286,25 +296,31 @@ struct VmessLinkJson {
     tls: Option<String>,
     /// Explicit TLS SNI (takes precedence over `host`).
     sni: Option<String>,
-    /// ALPN; accepted for compatibility, not stored.
-    #[allow(dead_code)]
+    /// XHTTP ALPN is validated and retained; other legacy VMess links ignore it.
     alpn: Option<String>,
+    #[serde(default, deserialize_with = "crate::node::present_option")]
+    mode: Option<crate::node::XhttpMode>,
+    #[serde(default, deserialize_with = "crate::node::deserialize_xray_extra")]
+    extra: Option<crate::node::XrayExtra>,
+    #[serde(flatten)]
+    additional: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl VmessLinkJson {
-    fn into_node(self) -> Result<Node, ConfigError> {
-        let host = self.add.filter(|h| !h.is_empty()).ok_or_else(|| {
+    fn into_node(mut self) -> Result<Node, ConfigError> {
+        let host = self.add.take().filter(|h| !h.is_empty()).ok_or_else(|| {
             ConfigError::Parse("invalid vmess link: missing server address".into())
         })?;
-        let port = json_port(self.port)
+        let port = json_port(self.port.take())
             .ok_or_else(|| ConfigError::Parse("invalid vmess link: missing or bad port".into()))?;
         let id = self
             .id
+            .take()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ConfigError::Parse("invalid vmess link: missing user id".into()))?;
 
-        let transport = self.net.unwrap_or_default();
-        let transport_kind = stream_transport(&transport)
+        let transport = self.net.take().unwrap_or_default();
+        let transport_kind = xhttp_stream_transport(&transport)
             .map_err(|_| ConfigError::Parse("unsupported stream transport".into()))?;
 
         let mut stream = crate::node::StreamTransportOptions {
@@ -315,6 +331,15 @@ impl VmessLinkJson {
             enabled: self.tls.as_deref() == Some("tls"),
             ..Default::default()
         };
+        if transport_kind == "xhttp" {
+            let mode = self.mode.take();
+            let extra = self.extra.take();
+            xhttp::apply_vmess_xhttp(&self, mode, extra, &mut stream, &mut tls)?;
+        } else if self.extra.is_some() || self.mode.is_some() {
+            return Err(ConfigError::Parse(
+                "XHTTP options require XHTTP transport".into(),
+            ));
+        }
         let host_claim = self.host.filter(|host| !host.is_empty());
         let host_sni_claim = optional_text([host_claim.as_deref()])
             .map_err(|_| ConfigError::Parse("invalid VMess TLS server name".into()))?;
@@ -323,7 +348,9 @@ impl VmessLinkJson {
         if let Some(value) = host_claim.as_deref() {
             if transport_kind == "ws" {
                 stream.ws_host = Some(value.to_string());
-            } else if let Some(value) = host_sni_claim {
+            } else if !stream.is_xhttp()
+                && let Some(value) = host_sni_claim
+            {
                 tls.sni = Some(value.to_string());
             }
         }

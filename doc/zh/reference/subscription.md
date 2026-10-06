@@ -131,11 +131,11 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `password` | `password` | 可选 string；VLESS 使用下文优先级。 |
 | `cipher` | `encryption` | 可选加密算法；VLESS 的字段优先级见下文。 |
 | `plugin`, `plugin-opts` | — | 不支持；任一字段具有非空值时，条目会在发布节点前被跳过，mapping 类型的 options 也会被拒绝。 |
-| `network` | `transport` 或数据包网络能力 | Trojan/VMess/VLESS 使用流传输方式（`tcp`、`ws`、`grpc`）；AnyTLS 使用数据包网络能力。 |
+| `network` | `transport` 或数据包网络能力 | Trojan/VMess/VLESS 使用流传输（`tcp`、`ws`、`grpc`、`xhttp`）；AnyTLS 使用数据包网络能力。 |
 | `tls` | `tls` | 可选 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 默认启用 TLS，并拒绝显式关闭。 |
 | `servername`、`server-name`、`sni` | `sni` | 空值或纯空白名称视为未指定；非空别名必须逐字节一致。 |
 | `skip-cert-verify`、`skip_cert_verify`、`insecure` | `skip_cert_verify` | 须使用原生布尔值；已提供的别名必须一致。 |
-| `alpn` | `tls_alpn` | AnyTLS 与普通裸 TCP Trojan/VMess/VLESS TLS 的有序字符串列表（或逗号分隔字符串）；显式值在 `tls` 与 `utls` 模式下都会用于实际 TLS 握手。QUIC 继续使用下文的协议专属规则。 |
+| `alpn` | `tls_alpn` | raw TCP TLS 的有序字符串列表或逗号分隔字符串；XHTTP 只接受 H2，省略时规范化为 `["h2"]`。QUIC 保留下文的协议专属规则。 |
 
 #### 协议专属选项
 
@@ -146,6 +146,8 @@ Hysteria2 导入 `password`/`auth`、`obfs: salamander` 与 `obfs-password`、�
 AnyTLS 按 `anytls-network`、适用的 `network`、`udp` 的顺序一次性解析数据包能力声明。空文本或 null 不提供网络声明。网络字符串使用逗号分隔的 `tcp`/`udp`；别名按是否允许 UDP 比较，因此 `udp` 与 `tcp,udp` 一致，而 `tcp` 与 `udp: true` 冲突。即使存在有效别名，`quic` 等未知值仍会使条目被拒绝。等价声明保留第一个显式网络字段的写法；仅提供布尔值时，才生成 `tcp` 或 `tcp,udp`。
 
 TCP TLS ALPN 列表成员及顺序原样保留；每个名称必须占 1–255 个 UTF-8 字节，带长度前缀的完整列表不得超过 65,533 字节。这是语法上限；完整 ClientHello 还受 TLS 库的大小限制。导入的 `alpn` 省略、为 null 或空列表时保留原有 TLS profile 默认值及节点 ID；扁平字段 `tls_alpn` 只接受省略或字符串数组，不接受 null。非空覆盖值参与节点身份派生；与关闭 TLS、REALITY、WebSocket 或 gRPC 组合时会拒绝，不会静默丢弃。只有实际 ALPN 列表包含 `h2` 时才发送 Chrome ALPS。分享链接原有的 ALPN 兼容行为不变；这里适用于结构化订阅导入及扁平模型字段 `tls_alpn`。
+
+XHTTP 是 raw TCP ALPN 规则的例外：始终使用 H2，包括 REALITY 或显式明文 H2。Mihomo 的 `network: xhttp`（或输入别名 `splithttp`）接受 `xhttp-opts` 中的 `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms`。规范默认值、范围和 header 限制见 [XHTTP 节点参考](./nodes.md#h2-上的-xhttp)。`download-settings`、`reuse-settings`、其他 placement、padding 混淆等未实现参数按原始存在性拒绝该条目，包括 null/空值/false；合法 sibling 节点保留。URI/VMess extra JSON 在转为 map 前拒绝重复成员。
 
 #### VLESS transport 与 REALITY
 
@@ -197,6 +199,8 @@ SIP008 version 1/2 wrapper（`{"servers":[...]}`）及裸服务器数组会导�
 sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet 选择和受支持的协议调优会通过共同的节点构建逻辑规范化。未启用 H2MUX/UoT wrapper 且没有显式 `packet_encoding` 选择其他路径时，sing-box VLESS 条目特定地默认使用 Single XUDP 并允许 UDP；这是 sing-box 导入默认值，不是 Auto 的全局含义。gRPC service name 为空或省略时保留 sing-box 的空 service，不套用 honk 的 `GunService` 默认值。Hysteria2 可以只提供 `server_ports`，以第一个跳跃端口作为名义端点。不支持的链式代理、wire 功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
 
 在 sing-box 输入中，`network` 表示数据包网络能力，不是流传输类型；`transport.type` 选择流传输方式。`h2` 等不支持的名称会使条目被拒绝，不会被当作裸 TCP。
+
+官方 sing-box 没有原生 XHTTP transport。导入器明确拒绝 `transport.type: xhttp` 与 `splithttp`，不会把旧 `http`、H2、QUIC 或第三方 fork 解释为 XHTTP。Client-record 中的 XHTTP transport 同样不支持。
 
 在支持数据包限制的 sing-box 映射中，`network: udp` 与 `network: tcp,udp` 允许 UDP，`network: tcp` 则关闭 UDP。这些值不会额外禁止 TCP。`network` 与 VLESS 回退 encoding 和 H2MUX/UoT carrier 选择保持独立。
 

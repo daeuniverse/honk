@@ -320,6 +320,12 @@ impl VlessConfig {
     }
 
     pub(super) fn validate_fields(&self) -> Result<(), ValidationFailure> {
+        if self.transport.is_xhttp() && self.tcp_path() == VlessTcpPath::Cool {
+            return Err(ValidationFailure::new(
+                Some("multiplex"),
+                "XHTTP does not support TCP Mux.Cool",
+            ));
+        }
         if let VlessMultiplex::Xray { tcp, udp, .. } = self.multiplex {
             if tcp.is_some_and(|limit| limit.get() > MAX_XRAY_CONCURRENCY)
                 || matches!(udp, VlessUdpMux::Separate(limit) if limit.get() > MAX_XRAY_CONCURRENCY)

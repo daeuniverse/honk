@@ -191,6 +191,12 @@ fn record_header(field: &Field) -> Option<(&str, &str)> {
 }
 
 fn consume_record_controls(protocol: &str, options: &mut RecordOptions) -> RecordResult<()> {
+    for key in options.keys() {
+        let claim = key.strip_suffix("-opts").unwrap_or(key);
+        if honk_config::options::vocab::xhttp_stream_transport(claim) == Ok("xhttp") {
+            stream_transport(claim)?;
+        }
+    }
     if take_any_active(
         options,
         &[
@@ -518,7 +524,10 @@ fn apply_transport(
     let transport = transport.or_else(|| {
         positions
             .iter()
-            .find(|value| matches!(value.as_str(), "tcp" | "ws" | "grpc" | "h2" | "httpupgrade"))
+            .find(|value| {
+                honk_config::options::vocab::xhttp_stream_transport(value).is_ok()
+                    || matches!(value.as_str(), "h2" | "httpupgrade")
+            })
             .map(String::as_str)
     });
     let Some(transport) = transport else {

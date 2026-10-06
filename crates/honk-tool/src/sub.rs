@@ -331,10 +331,7 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
         false
     };
 
-    if !matches!(
-        vless.transport.transport.as_str(),
-        "" | "tcp" | "ws" | "grpc"
-    ) {
+    if honk_config::options::vocab::xhttp_stream_transport(&vless.transport.transport).is_err() {
         return ProbeEligibility::ExpectedUnsupported("unsupported-transport");
     }
 
@@ -348,7 +345,7 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
     }
     if vision
         && !vless.is_encrypted()
-        && matches!(vless.transport.transport.as_str(), "ws" | "grpc")
+        && (matches!(vless.transport.transport.as_str(), "ws" | "grpc") || node.is_xhttp())
     {
         return ProbeEligibility::ExpectedUnsupported("vision-non-tcp");
     }
@@ -381,6 +378,7 @@ fn vless_shape(node: &Node) -> String {
         "" | "tcp" => "tcp",
         "ws" => "ws",
         "grpc" => "grpc",
+        "xhttp" => "xhttp",
         _ => "unsupported",
     };
     let vision = if vless.is_vision() { "/vision" } else { "" };

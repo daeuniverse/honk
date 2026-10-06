@@ -393,3 +393,26 @@ fn rendered_failures_exclude_connection_identifiers() {
         assert_eq!(render_probe_result(&Some(Err(kind)), "n/a"), expected);
     }
 }
+
+#[test]
+fn xhttp_probe_shape_is_supported_without_exposing_options() {
+    let node = Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=xhttp&path=/PRIVATE_PATH&host=PRIVATE_HOST&mode=stream-up&udp=false#xhttp").unwrap();
+    assert_eq!(classify_vless_node(&node), ProbeEligibility::Supported);
+    assert_eq!(vless_shape(&node), "vless/tls/xhttp/tcp=plain/udp=disabled");
+    assert!(!vless_shape(&node).contains("PRIVATE_"));
+    let mut invalid = node.clone();
+    invalid.vless_mut().unwrap().multiplex =
+        VlessMultiplex::xray(8, 8, honk_config::node::Udp443Policy::Allow);
+    assert_eq!(
+        classify_vless_node(&invalid),
+        ProbeEligibility::InvalidConfig("invalid-config")
+    );
+    let udp = Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=xhttp&mux=xray&concurrency=-1&xudpConcurrency=4").unwrap();
+    assert_eq!(classify_vless_node(&udp), ProbeEligibility::Supported);
+    let mut vision = node;
+    vision.vless_mut().unwrap().flow = Some("xtls-rprx-vision".into());
+    assert_eq!(
+        classify_vless_node(&vision),
+        ProbeEligibility::ExpectedUnsupported("vision-non-tcp")
+    );
+}

@@ -1,7 +1,8 @@
 use serde::de::{DeserializeSeed, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::validation::ValidationFailure;
+use super::validation::{ValidationFailure, semantic_error};
+use super::xhttp::deserialize_xhttp;
 use crate::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, SourceRef,
     report_detailed_diagnostics,
@@ -14,19 +15,6 @@ use super::{
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
     VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig,
 };
-fn semantic_error(
-    source: &SourceRef,
-    setting: SettingPath,
-    message: &'static str,
-) -> crate::error::DetailedConfigError {
-    crate::error::DetailedConfigError::new(
-        crate::error::ErrorCategory::Validation,
-        "invalid-config-value",
-        source.clone(),
-        setting,
-        message,
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum RawVlessMode {
@@ -110,6 +98,8 @@ struct FlatNode {
     plugin_opts: Option<String>,
     #[serde(default = "super::default_transport")]
     transport: String,
+    #[serde(default, deserialize_with = "deserialize_xhttp")]
+    xhttp: Option<super::XhttpOptions>,
     #[serde(default)]
     tls: bool,
     #[serde(default)]
@@ -506,6 +496,7 @@ impl FlatNode {
             ws_path: self.ws_path.take(),
             ws_host: self.ws_host.take(),
             grpc_service: self.grpc_service.take(),
+            xhttp: self.xhttp.take(),
         }
     }
 }
@@ -526,6 +517,19 @@ impl FlatNode {
                 source.clone(),
                 setting.clone().field("vless_mode"),
                 "VLESS vless_mode was removed; use packet_encoding and multiplex",
+            ));
+        }
+        if (self.xhttp.is_some()
+            || crate::options::vocab::xhttp_stream_transport(&self.transport) == Ok("xhttp"))
+            && !matches!(
+                self.protocol,
+                NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+            )
+        {
+            return Err(semantic_error(
+                source,
+                setting.clone().field("xhttp"),
+                "XHTTP options require a stream protocol",
             ));
         }
         self.strip_protocol_incompatible_fields(diagnostics, source, setting);
@@ -693,6 +697,8 @@ impl FlatNode {
             created_at: flat.created_at,
             updated_at: flat.updated_at,
         };
+        node.normalize_stream_transport()
+            .map_err(|message| semantic_error(source, setting.clone().field("xhttp"), message))?;
         node.validate_detailed_at(source, setting)?;
         if let Some(config) = node.vless_mut() {
             config.normalize();
@@ -722,6 +728,8 @@ struct WireOptions<'a> {
     plugin: Option<&'a str>,
     plugin_opts: Option<&'a str>,
     transport: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xhttp: Option<&'a super::XhttpOptions>,
     tls: bool,
     sni: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -789,6 +797,7 @@ impl<'a> WireOptions<'a> {
         self.ws_path = transport.ws_path.as_deref();
         self.ws_host = transport.ws_host.as_deref();
         self.grpc_service = transport.grpc_service.as_deref();
+        self.xhttp = transport.xhttp.as_ref();
     }
 
     fn from_node(node: &'a Node) -> Self {

@@ -4,7 +4,7 @@ mod fields;
 pub(super) mod options;
 
 use honk_config::node::{Node, OutboundConfig};
-use honk_config::options::vocab::{optional_flow, packet_network, stream_transport};
+use honk_config::options::vocab::{optional_flow, packet_network, xhttp_stream_transport};
 use honk_config::types::NodeProtocol;
 use serde_yaml::Mapping;
 
@@ -126,6 +126,9 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     let protocol = protocol_from_name(&proxy_type)?;
     if protocol == NodeProtocol::VLess && yaml_value(mapping, "vless_mode").is_some() {
         return Err("VLESS vless_mode was removed");
+    }
+    if yaml_value(mapping, "xhttp-opts").is_some() && !supports_stream(protocol) {
+        return Err("XHTTP options require a stream protocol");
     }
 
     reject_active_unless(
@@ -429,8 +432,7 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
             yaml_text_alias(mapping, &["network"])?.filter(|network| !network.trim().is_empty())
             && let Some(transport) = node.transport_mut()
         {
-            stream_transport(&network)?;
-            transport.transport = network;
+            transport.transport = xhttp_stream_transport(&network)?.to_string();
         }
         if let Some(udp) = udp {
             let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
@@ -454,6 +456,17 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
         {
             return Err("gRPC options require gRPC transport");
         }
+    }
+    if let Some(value) = yaml_value(mapping, "xhttp-opts") {
+        let transport = node
+            .transport_mut()
+            .ok_or("XHTTP options require XHTTP transport")?;
+        if !transport.is_xhttp() {
+            return Err("XHTTP options require XHTTP transport");
+        }
+        value.as_mapping().ok_or("xhttp-opts must be a mapping")?;
+        transport.xhttp =
+            Some(serde_yaml::from_value(value.clone()).map_err(|_| "invalid XHTTP options")?);
     }
     if let Some(transport) = node.transport_mut() {
         if let Some(options) = yaml_value(mapping, "ws-opts").filter(|value| yaml_active(value)) {
@@ -706,6 +719,7 @@ pub(super) fn parse_clash_proxy(
     apply_stream(mapping, &mut node, udp)?;
     apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
     apply_quic(mapping, &mut node)?;
+    node.normalize_stream_transport()?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
     }

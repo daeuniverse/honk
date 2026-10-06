@@ -148,10 +148,12 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 对每个节点，命令报告服务端地址族、完整的代理 IPv4/IPv6 交换、代理 URLTest 延迟、经 packet handler 的 DNS 查询，以及经该 handler 的真实 QUIC 握手。VLESS 行使用以下脱敏 shape，不包含端点、UUID、REALITY key、SNI 或 URL query：
 
 ```text
-vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
+vless/{plain|tls|reality}/{tcp|ws|grpc|xhttp}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
 ```
 
 `tcp=` 表示有效 TCP 路径。即使 H2MUX 或 Xray mux 当前接管目标 UDP 路径，`udp-fallback=` 仍表示规范化后的回退字段；`udp=disabled` 表示不允许 packet 拨号。`padding=` 只对 H2MUX 出现。对 Xray mux，`TCP` 为每条 TCP carrier 的有效逻辑 child 并发（`0` 表示关闭），`UDP` 为 `protocol`、`shared` 或独立 UDP pool 的逐 carrier 逻辑 child 并发，`POLICY` 为 UDP/443 的 `reject`、`skip` 或 `allow`。示例 shape 包括 `vless/tls/tcp/tcp=plain/udp-fallback=native`、`vless/reality/grpc/tcp=h2mux/udp-fallback=auto/padding=true` 与 `vless/tls/tcp/vision/tcp=plain/udp-fallback=auto/mux=0:8:allow`。
+
+`xhttp` 表示 H2 XHTTP transport；该行不暴露 path、HTTP host、自定义 headers 或 padding 内容。模式及支持参数见[节点参考](./nodes.md#h2-上的-xhttp)。
 
 探测资格状态码为 `supported`、`invalid-uuid`、`invalid-reality`、`invalid-config`、`unsupported-transport`、`unsupported-flow`、`vision-without-tls`/`vision-non-tcp`；无效或有意不支持的条目仍会显示，但不会执行网络操作。Vision 的 TCP 只能使用符合条件的 direct carrier，UDP-only Xray mux 仍然有效。VLESS Encryption 可以与 Vision 组合；只有未加密 Vision 还要求 raw TCP 上使用 TLS 1.3 或 REALITY。
 

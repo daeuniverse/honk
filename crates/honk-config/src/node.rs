@@ -6,12 +6,15 @@ mod protocol;
 mod validation;
 mod vless;
 mod wire;
+mod xhttp;
 
 pub use protocol::*;
 pub use validation::validate_node_collection;
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
+pub use xhttp::{XhttpMode, XhttpOptions, XhttpRange};
+pub(crate) use xhttp::{XrayExtra, deserialize_xray_extra, present_option};
 
 /// Deserialize a group-tag list from either an array (`["hk", "jp"]`) or a
 /// single delimited string (`"hk|jp"` / `"hk, jp"`). Entries themselves may
@@ -96,6 +99,27 @@ impl Default for Node {
 impl Node {
     pub fn protocol(&self) -> NodeProtocol {
         self.outbound.protocol()
+    }
+
+    pub fn is_xhttp(&self) -> bool {
+        self.transport()
+            .is_some_and(StreamTransportOptions::is_xhttp)
+    }
+
+    /// Canonicalize XHTTP at every adapter boundary before deriving identity.
+    pub fn normalize_stream_transport(&mut self) -> Result<(), &'static str> {
+        if let Some(transport) = self.transport_mut()
+            && (crate::options::vocab::xhttp_stream_transport(&transport.transport) == Ok("xhttp")
+                || transport.xhttp.is_some())
+        {
+            transport.normalize()?;
+        }
+        if self.is_xhttp() {
+            let tls = self.tls_mut().expect("stream transports have TLS options");
+            tls.check_xhttp_alpn()?;
+            tls.alpn = vec!["h2".into()];
+        }
+        Ok(())
     }
 
     /// Get the effective host (use host field or parse from address).

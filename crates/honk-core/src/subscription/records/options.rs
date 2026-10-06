@@ -18,6 +18,10 @@ impl RecordOptions {
     pub(super) fn contains(&self, key: &str) -> bool {
         self.occurrences.iter().any(|(name, _)| name == key)
     }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &str> {
+        self.occurrences.iter().map(|(name, _)| name.as_str())
+    }
     pub(super) fn remove(&mut self, key: &str) -> Option<String> {
         let index = self.occurrences.iter().rposition(|(name, _)| name == key)?;
         let value = self.occurrences.remove(index).1;

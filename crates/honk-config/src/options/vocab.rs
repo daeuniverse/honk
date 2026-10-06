@@ -62,6 +62,14 @@ pub fn stream_transport(value: &str) -> Result<&'static str, &'static str> {
     }
 }
 
+/// XHTTP-aware adapters share the sole alias-to-canonical transport mapping.
+pub fn xhttp_stream_transport(value: &str) -> Result<&'static str, &'static str> {
+    match value {
+        "xhttp" | "splithttp" => Ok("xhttp"),
+        _ => stream_transport(value),
+    }
+}
+
 /// Resolve optional VMess cipher claims before any alias is discarded.
 pub fn vmess_cipher<'a>(
     values: impl IntoIterator<Item = &'a str>,

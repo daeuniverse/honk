@@ -29,6 +29,19 @@ impl TlsOptions {
         }
     }
 
+    /// True when the dial speaks TLS or authenticated REALITY.
+    pub fn is_secure(&self) -> bool {
+        self.enabled || matches!(self.effective_reality_public_key(), Ok(Some(_)))
+    }
+
+    pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {
+        if self.alpn.iter().all(|protocol| protocol == "h2") {
+            Ok(())
+        } else {
+            Err("XHTTP requires H2-only ALPN")
+        }
+    }
+
     pub(super) fn validate_alpn(&self) -> Result<(), ValidationFailure> {
         let mut encoded_len = 0usize;
         for protocol in &self.alpn {
@@ -57,6 +70,7 @@ pub struct StreamTransportOptions {
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
     pub grpc_service: Option<String>,
+    pub xhttp: Option<super::XhttpOptions>,
 }
 
 impl Default for StreamTransportOptions {
@@ -66,7 +80,49 @@ impl Default for StreamTransportOptions {
             ws_path: None,
             ws_host: None,
             grpc_service: None,
+            xhttp: None,
         }
+    }
+}
+
+impl StreamTransportOptions {
+    pub fn is_xhttp(&self) -> bool {
+        self.transport == "xhttp"
+    }
+
+    pub fn normalize(&mut self) -> Result<(), &'static str> {
+        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)?;
+        if kind == "xhttp" {
+            self.transport = "xhttp".into();
+            self.xhttp
+                .get_or_insert_with(Default::default)
+                .normalize()?;
+        }
+        self.check().map_err(|(_, message)| message)
+    }
+
+    pub(super) fn check(&self) -> Result<(), (&'static str, &'static str)> {
+        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)
+            .map_err(|message| ("transport", message))?;
+        if kind == "xhttp" {
+            if !self.is_xhttp() {
+                return Err((
+                    "transport",
+                    "XHTTP transport must be normalized before admission",
+                ));
+            }
+            self.xhttp
+                .as_ref()
+                .ok_or(("xhttp", "XHTTP requires canonical options"))?
+                .validate()
+                .map_err(|message| ("xhttp", message))?;
+            if self.ws_path.is_some() || self.ws_host.is_some() || self.grpc_service.is_some() {
+                return Err(("xhttp", "XHTTP cannot use WebSocket or gRPC options"));
+            }
+        } else if self.xhttp.is_some() {
+            return Err(("xhttp", "XHTTP options require XHTTP transport"));
+        }
+        Ok(())
     }
 }
 
@@ -341,6 +397,18 @@ impl OutboundConfig {
             if !config.tls.enabled && config.tls.reality_public_key.is_none() {
                 fingerprint.push_str("|tls:0");
             }
+        }
+        if let Some(options) = transport
+            .filter(|transport| transport.is_xhttp())
+            .and_then(|transport| transport.xhttp.as_ref())
+        {
+            fingerprint.push_str("|xhttp:");
+            fingerprint.push_str(&serde_json::to_string(options).expect("XHTTP options serialize"));
+            fingerprint.push_str(if tls.is_some_and(TlsOptions::is_secure) {
+                "|xhttp-tls:1"
+            } else {
+                "|xhttp-tls:0"
+            });
         }
         fingerprint
     }

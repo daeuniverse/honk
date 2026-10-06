@@ -1459,6 +1459,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "glob",
+ "http",
  "ipnet",
  "libc",
  "parking_lot",

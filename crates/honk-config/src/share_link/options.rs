@@ -7,12 +7,13 @@ use crate::node::{
     VlessUdpEncoding,
 };
 use crate::options::vocab::{
-    coalesce_equal, optional_flow, optional_text, stream_transport, verification_text, vmess_cipher,
+    coalesce_equal, optional_flow, optional_text, verification_text, vmess_cipher,
+    xhttp_stream_transport,
 };
 use crate::types::{NodeProtocol, parse_duration_secs};
 
 #[derive(Default)]
-pub(super) struct Query(Vec<(String, String)>);
+pub(super) struct Query(pub(super) Vec<(String, String)>, pub(super) bool);
 
 impl Query {
     fn push(&mut self, key: String, value: String) {
@@ -27,7 +28,7 @@ impl Query {
             .map(|(_, value)| value)
     }
 
-    fn values<'a>(&'a self, key: &str) -> impl Iterator<Item = &'a str> {
+    pub(super) fn values<'a>(&'a self, key: &str) -> impl Iterator<Item = &'a str> {
         self.0
             .iter()
             .filter(move |(candidate, _)| candidate == key)
@@ -47,12 +48,12 @@ impl Query {
             .map(|(index, (_, value))| (index, value.as_str()))
     }
 
-    fn contains_key(&self, key: &str) -> bool {
+    pub(super) fn contains_key(&self, key: &str) -> bool {
         self.0.iter().any(|(candidate, _)| candidate == key)
     }
 }
 
-fn query_error(
+pub(super) fn query_error(
     source: &SourceRef,
     fields: &[&'static str],
     code: &'static str,
@@ -77,10 +78,11 @@ pub(super) fn parse_query(
 ) -> Result<Query, DetailedConfigError> {
     let legacy = |error| DetailedConfigError::from_legacy(error, source.clone());
     let shadowrocket_vmess = shadowrocket && protocol == NodeProtocol::VMess;
-    let mut query = Query::default();
+    let mut query = Query(Vec::new(), super::xhttp::is_xhttp_link(url));
     for (key, value) in url.query_pairs() {
         let key = key.into_owned();
         if shadowrocket_vmess
+            && !(query.1 && super::xhttp::is_xhttp_parameter(&key))
             && !matches!(
                 key.as_str(),
                 "sni"
@@ -319,7 +321,7 @@ fn resolve_stream_transport<'a>(
     let mut resolved = None;
     for (key, value) in &query.0 {
         let canonical = match key.as_str() {
-            "type" | "network" => stream_transport(value).map_err(|_| invalid())?,
+            "type" | "network" => xhttp_stream_transport(value).map_err(|_| invalid())?,
             "obfs" if matches!(protocol, NodeProtocol::VLess | NodeProtocol::VMess) => {
                 match value.as_str() {
                     "" | "none" => "tcp",
@@ -357,11 +359,14 @@ pub(super) fn apply_transport(
         None
     };
     let mut host_consumed = false;
+    if let Some(transport) = node.transport_mut()
+        && let Some(value) = resolve_stream_transport(query, protocol, source)?
+    {
+        transport.transport = value.to_string();
+    }
+    host_consumed |= super::xhttp::apply_xhttp_query(node, query, source)?;
     if let Some(transport) = node.transport_mut() {
-        if let Some(value) = resolve_stream_transport(query, protocol, source)? {
-            transport.transport = value.to_string();
-        }
-        let transport_kind = stream_transport(&transport.transport).map_err(|_| {
+        let transport_kind = xhttp_stream_transport(&transport.transport).map_err(|_| {
             query_error(
                 source,
                 &["transport"],

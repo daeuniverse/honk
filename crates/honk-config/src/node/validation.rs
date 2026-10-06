@@ -4,8 +4,21 @@ use crate::diagnostic::{DiagnosticSources, SafeValue, SettingPath, SourceRef};
 use crate::error::{DetailedConfigError, ErrorCategory};
 use crate::node::{Node, OutboundConfig};
 use crate::options::vocab::{
-    optional_flow, packet_network, parse_port_hopping, stream_transport, vmess_cipher,
+    optional_flow, packet_network, parse_port_hopping, vmess_cipher, xhttp_stream_transport,
 };
+pub(super) fn semantic_error(
+    source: &SourceRef,
+    setting: SettingPath,
+    message: &'static str,
+) -> crate::error::DetailedConfigError {
+    crate::error::DetailedConfigError::new(
+        crate::error::ErrorCategory::Validation,
+        "invalid-config-value",
+        source.clone(),
+        setting,
+        message,
+    )
+}
 
 #[derive(Debug)]
 pub(super) struct ValidationFailure {
@@ -104,7 +117,7 @@ impl Node {
             ));
         }
         if let Some(transport) = self.transport() {
-            stream_transport(&transport.transport)
+            xhttp_stream_transport(&transport.transport)
                 .map_err(|message| invalid(Some("transport"), message))?;
         }
         if let Some(network) = self.network() {
@@ -180,6 +193,11 @@ impl Node {
     }
 
     fn validate_protocol_inner(&self) -> Result<(), ValidationFailure> {
+        if let Some(transport) = self.transport() {
+            transport
+                .check()
+                .map_err(|(field, message)| ValidationFailure::new(Some(field), message))?;
+        }
         if let Some(config) = self.vless() {
             config.validate_fields()?;
         }
@@ -189,6 +207,11 @@ impl Node {
             .effective_reality_public_key()
             .map_err(|message| ValidationFailure::new(Some("reality_public_key"), message))?
             .is_some();
+        if self.is_xhttp() {
+            return tls
+                .check_xhttp_alpn()
+                .map_err(|message| ValidationFailure::new(Some("tls_alpn"), message));
+        }
         if tls.alpn.is_empty() {
             return Ok(());
         }
