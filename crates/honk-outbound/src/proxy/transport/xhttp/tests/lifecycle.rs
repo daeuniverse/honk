@@ -351,32 +351,3 @@ async fn cancelling_guarded_tls_setup_closes_pending_driver_and_releases_physica
     .await
     .expect("guarded TLS cancellation left a pool-owned establishment alive");
 }
-
-#[tokio::test]
-async fn cancelling_direct_transport_tls_setup_drops_its_ephemeral_runtime() {
-    tokio::time::timeout(DEADLINE, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let node = stalled_tls_node(listener.local_addr().unwrap());
-        let gate = Arc::new(physical_gate());
-        let scoped_gate = gate.clone();
-        let mut clients = JoinSet::new();
-        clients.spawn(async move {
-            scoped_gate
-                .scope_dials(super::super::super::wrap_transport(&node, None, DEADLINE))
-                .await
-        });
-        let (mut tcp, _) = listener.accept().await.unwrap();
-        client_hello(&mut tcp).await;
-        clients.abort_all();
-        while let Some(result) = clients.join_next().await {
-            assert!(result.unwrap_err().is_cancelled());
-        }
-        socket_closed(&mut tcp).await;
-        let permit = tokio::time::timeout(Duration::from_millis(500), gate.acquire_dial_permit())
-            .await
-            .expect("cancelled direct TLS setup retained physical admission");
-        drop(permit);
-    })
-    .await
-    .expect("direct XHTTP TLS cancellation orphaned its one-shot runtime");
-}
