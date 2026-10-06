@@ -17,12 +17,12 @@ async fn all_modes_are_writable_before_headers_and_half_close_preserves_raw_down
             let path = if mode == XhttpMode::StreamOne {
                 assert_headers(&download.request);
                 assert_eq!(download.request.method(), http::Method::POST);
-                assert_eq!(download.request.uri().path(), PREFIX);
+                assert_eq!(download.request.uri().path(), WIRE_PREFIX);
                 assert_eq!(
                     download.request.headers()["content-type"],
                     "application/grpc"
                 );
-                PREFIX.to_owned()
+                WIRE_PREFIX.to_owned()
             } else {
                 assert_eq!(download.request.method(), http::Method::GET);
                 session_path(&download.request)
@@ -150,5 +150,26 @@ async fn referer_replaces_configured_padding_query_with_sampled_padding() {
             .expect("Referer must replace the configured query");
         assert!((5..=9).contains(&padding.len()));
         assert!(padding.bytes().all(|byte| byte == b'X'));
+    }
+}
+
+#[tokio::test]
+async fn request_escapes_literal_path_without_reencoding_the_query() {
+    let peer = Peer::new(32).await;
+    let owner = peer.runtime(XhttpMode::StreamUp, 32);
+    let mut node = (*owner.runtime().node).clone();
+    for (path, expected) in [("/a%2Fb/", "/a%252Fb/"), ("/雪/", "/%E9%9B%AA/")] {
+        node.transport_mut().unwrap().xhttp.as_mut().unwrap().path =
+            format!("{path}?token=a%2Fb&empty=");
+        let template = super::super::request::RequestTemplate::new(&node).unwrap();
+        let request = template.request("session", None, false, None).unwrap();
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            format!("{expected}session?token=a%2Fb&empty=")
+        );
+        assert_eq!(
+            request.headers()["referer"],
+            format!("http://peer.example{expected}?x_padding=XXXXXXX")
+        );
     }
 }

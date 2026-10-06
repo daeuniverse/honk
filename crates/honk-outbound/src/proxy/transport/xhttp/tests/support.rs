@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) const DEADLINE: Duration = Duration::from_secs(5);
 pub(super) const PREFIX: &str = "/raw/../%2f/";
+pub(super) const WIRE_PREFIX: &str = "/raw/../%252f/";
 pub(super) const QUERY: &str = "token=a%2Fb&empty=";
 
 pub(super) enum PeerCommand {
@@ -206,13 +207,13 @@ pub(super) fn assert_headers(request: &http::Request<h2::RecvStream>) {
     assert_eq!(request.headers()["x-peer-test"], "raw");
     assert_eq!(
         request.headers()["referer"],
-        format!("http://peer.example{PREFIX}?x_padding=XXXXXXX")
+        format!("http://peer.example{WIRE_PREFIX}?x_padding=XXXXXXX")
     );
 }
 
 pub(super) fn session_path(request: &http::Request<h2::RecvStream>) -> String {
     assert_headers(request);
-    let session = request.uri().path().strip_prefix(PREFIX).unwrap();
+    let session = request.uri().path().strip_prefix(WIRE_PREFIX).unwrap();
     uuid::Uuid::parse_str(session).expect("session must be one UUID path component");
     request.uri().path().to_owned()
 }

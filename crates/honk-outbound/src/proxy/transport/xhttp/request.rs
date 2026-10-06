@@ -70,7 +70,10 @@ impl RequestTemplate {
                 value.parse()?,
             );
         }
-        let referer = format!("{scheme}://{authority}{prefix}?x_padding=");
+        let referer = format!(
+            "{scheme}://{authority}{}?x_padding=",
+            escape_path(prefix.to_owned())
+        );
         Ok(Self {
             mode,
             scheme,
@@ -101,6 +104,7 @@ impl RequestTemplate {
                 path.push_str(&seq.to_string());
             }
         }
+        let mut path = escape_path(path);
         if let Some(query) = &self.query {
             path.push('?');
             path.push_str(query);
@@ -136,7 +140,51 @@ impl RequestTemplate {
     }
 }
 
+fn escape_path(path: String) -> String {
+    let needs_escape = |byte: u8| {
+        !matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' | b'/' | b'$' | b'&' | b'+'
+            | b',' | b':' | b';' | b'=' | b'@')
+    };
+    let count = path.bytes().filter(|&byte| needs_escape(byte)).count();
+    if count == 0 {
+        return path;
+    }
+    let mut escaped = String::with_capacity(path.len() + 2 * count);
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in path.bytes() {
+        if needs_escape(byte) {
+            escaped.push('%');
+            escaped.push(HEX[(byte >> 4) as usize] as char);
+            escaped.push(HEX[(byte & 15) as usize] as char);
+        } else {
+            escaped.push(byte as char);
+        }
+    }
+    escaped
+}
+
 pub(super) fn sample(range: XhttpRange) -> u32 {
     use rand::RngExt;
     rand::rng().random_range(range.min..=range.max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_path;
+
+    #[test]
+    fn path_escaping_matches_go_url_path_mode() {
+        for (path, expected) in [
+            ("/xhttp/Az09-_.~/", "/xhttp/Az09-_.~/"),
+            ("/a%2Fb/", "/a%252Fb/"),
+            ("/a b/", "/a%20b/"),
+            ("/雪/é/", "/%E9%9B%AA/%C3%A9/"),
+            ("/!'()*/", "/%21%27%28%29%2A/"),
+            ("/$&+,:;=@/", "/$&+,:;=@/"),
+            ("/a#b/", "/a%23b/"),
+        ] {
+            assert_eq!(escape_path(path.to_owned()), expected, "{path}");
+        }
+    }
 }

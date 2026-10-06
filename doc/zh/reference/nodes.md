@@ -207,7 +207,7 @@ node {
 
 `mode=auto|packet-up|stream-up|stream-one` 默认为 `auto`。Auto 对普通 TLS 或明文选择 packet-up，对 REALITY 选择 stream-one。Packet-up 用有序有限 POST body 与同 session 的 GET；stream-up 用独立流式 POST 和 GET；stream-one 用一个双向 POST。即使 header 伪装为 gRPC/SSE，body 仍是原始代理字节。
 
-`path` 默认为 `/`；在 query 之前补首尾斜杠，不清理 dot segment 或百分号转义。HTTP `host` 与拨号地址、SNI 独立，依次回退到 SNI、服务端 host。直接构造节点必须先调用 `normalize_stream_transport()`，再派生 ID；不可变准入会拒绝非规范 XHTTP 名称、参数及 ALPN。
+`path` 默认为 `/`；在 query 之前补首尾斜杠，不清理 dot segment 或百分号转义。HTTP `host` 与拨号地址、SNI 独立，依次回退到 SNI、服务端 host。直接构造节点必须先调用 `normalize_stream_transport()`，再派生 ID；不可变准入会拒绝非规范 XHTTP 名称、参数及 ALPN。Path 部分是解码后的字面值，发送时按 Xray 规则转义：字面 `%` 变为 `%25`，空格及 UTF-8 字节使用百分号编码，配置的 query 保持不变；URI 分享链接参数在此之前只解码一次，因此 `path=%2Fxhttp%2F` 仍发送 `/xhttp/`，而 Mihomo path 使用 YAML 字符串字面值。
 
 URI `extra` 接受百分号编码的 JSON 对象，仅支持：
 

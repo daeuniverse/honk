@@ -83,7 +83,14 @@ async fn packet_shutdown_waits_for_upload_status_and_retains_late_failure() {
                 .chain()
                 .any(|cause| cause.downcast_ref::<StatusFailure>().is_some())
         );
-        assert!(stream.shutdown().await.unwrap_err().to_string().contains("HTTP 503"));
+        assert!(
+            stream
+                .shutdown()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 503")
+        );
         drop(stream);
         wait_released(&runtime).await;
     })

@@ -208,7 +208,7 @@ node {
 
 `mode=auto|packet-up|stream-up|stream-one` defaults to `auto`. Auto selects packet-up for ordinary TLS or cleartext and stream-one for REALITY. Packet-up sends finite ordered POST bodies with a shared-session GET; stream-up uses separate streaming POST and GET; stream-one uses one bidirectional POST. Bodies are raw proxy bytes despite gRPC/SSE camouflage headers.
 
-`path` defaults to `/`; normalization adds leading/trailing slashes before the query without cleaning dot segments or percent escapes. HTTP `host` is independent of the dial address and SNI, falling back to SNI and then the server host. A directly constructed node must call `normalize_stream_transport()` before deriving its ID; immutable admission rejects noncanonical XHTTP spelling/options/ALPN.
+`path` defaults to `/`; normalization adds leading/trailing slashes before the query without cleaning dot segments or percent escapes. HTTP `host` is independent of the dial address and SNI, falling back to SNI and then the server host. A directly constructed node must call `normalize_stream_transport()` before deriving its ID; immutable admission rejects noncanonical XHTTP spelling/options/ALPN. The path component is a decoded literal, escaped on the wire like Xray: a literal `%` becomes `%25`, spaces and UTF-8 bytes are percent-encoded, and the configured query is unchanged; URI share-link values are percent-decoded once beforehand, so `path=%2Fxhttp%2F` still sends `/xhttp/`, while Mihomo paths are literal YAML strings.
 
 URI `extra` accepts a percent-encoded JSON object with only these fields:
 
