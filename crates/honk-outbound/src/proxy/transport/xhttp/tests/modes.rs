@@ -131,3 +131,24 @@ async fn stream_up_drains_large_upload_response_padding_without_exposing_it() {
     .await
     .expect("upload response padding was not concurrently drained");
 }
+
+#[tokio::test]
+async fn referer_replaces_configured_padding_query_with_sampled_padding() {
+    let peer = Peer::new(32).await;
+    let owner = peer.runtime(XhttpMode::StreamUp, 32);
+    let mut node = (*owner.runtime().node).clone();
+    let options = node.transport_mut().unwrap().xhttp.as_mut().unwrap();
+    options.path = "/p/?x_padding=old&token=retained".into();
+    options.x_padding_bytes = XhttpRange { min: 5, max: 9 };
+    let template = super::super::request::RequestTemplate::new(&node).unwrap();
+    for _ in 0..16 {
+        let request = template.request("session", None, false, None).unwrap();
+        assert_eq!(request.uri().query(), Some("x_padding=old&token=retained"));
+        let referer = request.headers()["referer"].to_str().unwrap();
+        let padding = referer
+            .strip_prefix("http://peer.example/p/?x_padding=")
+            .expect("Referer must replace the configured query");
+        assert!((5..=9).contains(&padding.len()));
+        assert!(padding.bytes().all(|byte| byte == b'X'));
+    }
+}

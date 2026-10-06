@@ -206,7 +206,7 @@ pub(super) fn assert_headers(request: &http::Request<h2::RecvStream>) {
     assert_eq!(request.headers()["x-peer-test"], "raw");
     assert_eq!(
         request.headers()["referer"],
-        format!("http://peer.example{PREFIX}?{QUERY}&x_padding=XXXXXXX")
+        format!("http://peer.example{PREFIX}?x_padding=XXXXXXX")
     );
 }
 

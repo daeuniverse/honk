@@ -70,15 +70,7 @@ impl RequestTemplate {
                 value.parse()?,
             );
         }
-        let separator = match query {
-            Some("") => "",
-            Some(_) => "&",
-            None => "?",
-        };
-        let referer = format!(
-            "{scheme}://{authority}{}{separator}x_padding=",
-            options.path
-        );
+        let referer = format!("{scheme}://{authority}{prefix}?x_padding=");
         Ok(Self {
             mode,
             scheme,
