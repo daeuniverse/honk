@@ -204,6 +204,52 @@ async fn h2_preparation_peer(
     (address, task, open_events, close_events)
 }
 
+#[cfg(feature = "rprx")]
+#[tokio::test]
+async fn xhttp_session_warming_establishes_the_selected_vless_mux_pool() {
+    for h2_mux in [false, true] {
+        let (address, peer, mut opened, mut closed) = h2_preparation_peer(h2_mux).await;
+        let mut node = xhttp_node_at(NodeProtocol::VLess, address);
+        if h2_mux {
+            node.vless_mut().unwrap().multiplex =
+                honk_config::node::VlessMultiplex::H2 { padding: false };
+            node.id = node.derive_id();
+        }
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap());
+        let runtime = generation.get(&node.id).unwrap();
+        let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+        assert!(!runtime.is_warm_or_stateless_for(WarmRequirement::Session));
+        for _ in 0..2 {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                registry.warm_session(Arc::clone(&generation), node.id, Duration::from_secs(2)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(outcome, crate::proxy::WarmOutcome::Ready);
+            assert!(runtime.is_warm_or_stateless_for(WarmRequirement::Session));
+            assert_eq!(runtime.warm_counts().sessions, 1 + usize::from(h2_mux));
+            if h2_mux {
+                assert!(runtime.vless_h2_pool().unwrap().has_usable_session());
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), opened.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        generation.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(3), closed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.warm_counts().sessions, 0);
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
+    }
+}
+
 async fn serve_vless_h2_mux(mut recv: h2::RecvStream, mut send: h2::SendStream<bytes::Bytes>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut mux, bridge) = tokio::io::duplex(32768);

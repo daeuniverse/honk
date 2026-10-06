@@ -786,38 +786,39 @@ impl WarmableOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
         requirement: WarmRequirement,
     ) -> anyhow::Result<()> {
-        if runtime.xhttp.is_some() {
-            crate::proxy::transport::xhttp::XhttpRuntime::warm(&runtime, connect_timeout).await?;
-            if requirement == WarmRequirement::Session
-                || matches!(
-                    runtime.node.vless().unwrap().udp_path(0),
-                    Some(VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2)
-                )
-            {
-                return Ok(());
-            }
-        }
         enum WarmPath {
             H2,
             Cool(bool),
         }
         let path = match requirement {
             WarmRequirement::Session => match runtime.node.vless().unwrap().tcp_path() {
-                VlessTcpPath::H2 => WarmPath::H2,
-                VlessTcpPath::Cool => WarmPath::Cool(false),
-                VlessTcpPath::Direct => anyhow::bail!("VLESS TCP path is not warmable"),
+                VlessTcpPath::H2 => Some(WarmPath::H2),
+                VlessTcpPath::Cool => Some(WarmPath::Cool(false)),
+                VlessTcpPath::Direct => None,
             },
             WarmRequirement::Udp => match runtime.node.vless().unwrap().udp_path(0) {
-                Some(VlessUdpPath::H2) => WarmPath::H2,
-                Some(VlessUdpPath::CoolShared) => WarmPath::Cool(false),
-                Some(VlessUdpPath::CoolSeparate) => WarmPath::Cool(true),
+                Some(VlessUdpPath::H2) => Some(WarmPath::H2),
+                Some(VlessUdpPath::CoolShared) => Some(WarmPath::Cool(false)),
+                Some(VlessUdpPath::CoolSeparate) => Some(WarmPath::Cool(true)),
                 Some(VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2) | None => {
-                    anyhow::bail!("VLESS UDP path is not warmable")
+                    None
                 }
             },
         };
+        if runtime.xhttp.is_some() {
+            crate::proxy::transport::xhttp::XhttpRuntime::warm(&runtime, connect_timeout).await?;
+        } else {
+            anyhow::ensure!(
+                path.is_some(),
+                "VLESS {} path is not warmable",
+                match requirement {
+                    WarmRequirement::Session => "TCP",
+                    WarmRequirement::Udp => "UDP",
+                }
+            );
+        }
         match path {
-            WarmPath::H2 => {
+            Some(WarmPath::H2) => {
                 let pool = runtime.vless_h2_pool()?;
                 let dial_runtime = Arc::clone(&runtime);
                 Self::warm_mux_pool(
@@ -827,7 +828,7 @@ impl WarmableOutbound for VLessHandler {
                 )
                 .await
             }
-            WarmPath::Cool(separate) => {
+            Some(WarmPath::Cool(separate)) => {
                 let pool = if separate {
                     runtime.vless_separate_cool_pool()?
                 } else {
@@ -846,6 +847,7 @@ impl WarmableOutbound for VLessHandler {
                 )
                 .await
             }
+            None => Ok(()),
         }
     }
 }
