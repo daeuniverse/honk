@@ -157,25 +157,6 @@ pub(super) fn apply_vmess_xhttp(
         "XHTTP mode claims conflict",
     )
     .map_err(|_| invalid())?;
-    if let Some(insecure) = coalesce_equal(
-        ["insecure", "allowInsecure"]
-            .into_iter()
-            .filter_map(|key| json.additional.get(key))
-            .map(|value| match value {
-                serde_json::Value::Bool(value) => Ok(Some(*value)),
-                serde_json::Value::Number(value) if value.as_u64() == Some(0) => Ok(Some(false)),
-                serde_json::Value::Number(value) if value.as_u64() == Some(1) => Ok(Some(true)),
-                serde_json::Value::String(value) => {
-                    crate::options::vocab::verification_text(value).map(Some)
-                }
-                _ => Err("invalid certificate verification boolean"),
-            }),
-        "conflicting certificate verification aliases",
-    )
-    .map_err(|_| invalid())?
-    {
-        tls.skip_cert_verify = insecure;
-    }
     let options =
         XhttpOptions::from_xray_extra(extra, json.path.as_deref(), json.host.as_deref(), mode)
             .map_err(|_| invalid())?;

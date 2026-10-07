@@ -126,13 +126,13 @@ fn vmess_exported_xhttp_mode_and_empty_alpn_are_canonical() {
             assert_eq!(node.id, canonical.id);
         }
         exported["insecure"] = json!(true);
-        assert!(
-            parse(exported.clone())
-                .unwrap()
-                .tls()
-                .unwrap()
-                .skip_cert_verify
-        );
+        for allow_insecure in [true, false] {
+            exported["allowInsecure"] = json!(allow_insecure);
+            let node = parse(exported.clone()).unwrap();
+            assert!(!node.tls().unwrap().skip_cert_verify);
+            assert_eq!(node.outbound, canonical.outbound);
+            assert_eq!(node.id, canonical.id);
+        }
         exported["mode"] = json!(if mode == "auto" { "stream-one" } else { "auto" });
         assert!(parse(exported).is_err());
     }
