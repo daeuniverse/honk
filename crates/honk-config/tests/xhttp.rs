@@ -27,10 +27,18 @@ fn literal_path_admission_keeps_raw_query_validation() {
         let node = flat(json!({"path":path})).unwrap();
         assert_eq!(node.transport().unwrap().xhttp.as_ref().unwrap().path, path);
         let query = url::form_urlencoded::Serializer::new(String::from("type=xhttp&"))
-            .append_pair("path", path).finish();
+            .append_pair("path", path)
+            .finish();
         assert_eq!(node.derive_id(), link(&query).id);
     }
-    for path in ["/a\t/", "/a\u{7f}/", "/a\0/", "/a#fragment/", "/a/?q=a b", "/a/?q=<>"] {
+    for path in [
+        "/a\t/",
+        "/a\u{7f}/",
+        "/a\0/",
+        "/a#fragment/",
+        "/a/?q=a b",
+        "/a/?q=<>",
+    ] {
         assert!(flat(json!({"path":path})).is_err(), "{path:?}");
     }
 }
@@ -42,9 +50,16 @@ fn extra_request_fields_fill_only_absent_top_level_claims() {
     let from_extra = link(&format!("type=xhttp&{}", extra_uri(extra.clone())));
     assert_eq!(from_extra.outbound, canonical.outbound);
     assert_eq!(from_extra.id, canonical.id);
-    let defaults = link(&format!("type=xhttp&host=&path=&mode=&{}", extra_uri(extra.clone())));
+    let defaults = link(&format!(
+        "type=xhttp&host=&path=&mode=&{}",
+        extra_uri(extra.clone())
+    ));
     assert_eq!(defaults.id, link("type=xhttp").id);
-    let overriding = link(&format!("type=xhttp&host=front.example&path=api&mode=stream-up&{}&{}", extra_uri(extra.clone()), extra_uri(json!({"host":"other.example", "path":"other", "mode":"auto"}))));
+    let overriding = link(&format!(
+        "type=xhttp&host=front.example&path=api&mode=stream-up&{}&{}",
+        extra_uri(extra.clone()),
+        extra_uri(json!({"host":"other.example", "path":"other", "mode":"auto"}))
+    ));
     assert_eq!(overriding.id, canonical.id);
     for top_level in [false, true] {
         let mut fixture = json!({"add":"example.com", "port":443, "id":UUID, "net":"xhttp", "tls":"tls", "extra":extra});
@@ -53,26 +68,49 @@ fn extra_request_fields_fill_only_absent_top_level_claims() {
             fixture["path"] = json!("");
             fixture["mode"] = json!("");
         }
-        let node = Node::from_share_link(&format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(fixture.to_string()))).unwrap();
+        let node = Node::from_share_link(&format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(fixture.to_string())
+        ))
+        .unwrap();
         fixture.as_object_mut().unwrap().remove("extra");
         if !top_level {
             fixture["host"] = json!("front.example");
             fixture["path"] = json!("api");
             fixture["mode"] = json!("stream-up");
         }
-        let canonical = Node::from_share_link(&format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(fixture.to_string()))).unwrap();
+        let canonical = Node::from_share_link(&format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(fixture.to_string())
+        ))
+        .unwrap();
         assert_eq!(node.outbound, canonical.outbound);
         assert_eq!(node.id, canonical.id);
     }
-    for extra in [json!({"mode":"gun"}), json!({"path":"/bad#fragment"}), json!({"host":"bad host"}), json!({"host":null})] {
-        assert!(Node::from_share_link(&format!("vless://{UUID}@example.com:443?type=xhttp&{}", extra_uri(extra))).is_err());
+    for extra in [
+        json!({"mode":"gun"}),
+        json!({"path":"/bad#fragment"}),
+        json!({"host":"bad host"}),
+        json!({"host":null}),
+    ] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://{UUID}@example.com:443?type=xhttp&{}",
+                extra_uri(extra)
+            ))
+            .is_err()
+        );
     }
 }
 
 #[test]
 fn vmess_exported_xhttp_mode_and_empty_alpn_are_canonical() {
-    let parse = |fixture: Value| Node::from_share_link(&format!("vmess://{}",
-        base64::engine::general_purpose::STANDARD.encode(fixture.to_string())));
+    let parse = |fixture: Value| {
+        Node::from_share_link(&format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(fixture.to_string())
+        ))
+    };
     for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
         let base = json!({"add":"example.com", "port":443, "id":UUID, "net":"xhttp", "tls":"tls", "mode":mode});
         let canonical = parse(base.clone()).unwrap();
@@ -88,13 +126,20 @@ fn vmess_exported_xhttp_mode_and_empty_alpn_are_canonical() {
             assert_eq!(node.id, canonical.id);
         }
         exported["insecure"] = json!(true);
-        assert!(parse(exported.clone()).unwrap().tls().unwrap().skip_cert_verify);
+        assert!(
+            parse(exported.clone())
+                .unwrap()
+                .tls()
+                .unwrap()
+                .skip_cert_verify
+        );
         exported["mode"] = json!(if mode == "auto" { "stream-one" } else { "auto" });
         assert!(parse(exported).is_err());
     }
     for alpn in ["", " , ", " h2, ,h2 "] {
         let query = url::form_urlencoded::Serializer::new(String::from("type=xhttp&"))
-            .append_pair("alpn", alpn).finish();
+            .append_pair("alpn", alpn)
+            .finish();
         assert_eq!(link(&query).id, link("type=xhttp").id);
     }
 }
@@ -102,21 +147,33 @@ fn vmess_exported_xhttp_mode_and_empty_alpn_are_canonical() {
 #[test]
 fn xhttp_uri_exporter_metadata_preserves_tls_and_request_options() {
     for scheme in ["trojan", "vless"] {
-        let base = format!("{scheme}://{UUID}@example.com:443?type=xhttp&security=reality&pbk=key&sid=&spx=/&sni=tls.example&alpn=h2&host=front.example&path=/api&mode=auto&allowInsecure=1&insecure=1");
+        let base = format!(
+            "{scheme}://{UUID}@example.com:443?type=xhttp&security=reality&pbk=key&sid=&spx=/&sni=tls.example&alpn=h2&host=front.example&path=/api&mode=auto&allowInsecure=1&insecure=1"
+        );
         let canonical = Node::from_share_link(&base).unwrap();
-        let exported = Node::from_share_link(&format!("{base}&fp=chrome&headerType=none&flow=&encryption=none&extra=%7B%7D")).unwrap();
+        let exported = Node::from_share_link(&format!(
+            "{base}&fp=chrome&headerType=none&flow=&encryption=none&extra=%7B%7D"
+        ))
+        .unwrap();
         assert_eq!(exported.transport(), canonical.transport());
         assert_eq!(exported.tls(), canonical.tls());
         assert!(exported.tls().unwrap().skip_cert_verify);
     }
-    assert!(Node::from_share_link(&format!("vless://{UUID}@example.com:443?type=xhttp&headerType=http")).is_err());
+    assert!(
+        Node::from_share_link(&format!(
+            "vless://{UUID}@example.com:443?type=xhttp&headerType=http"
+        ))
+        .is_err()
+    );
 }
 
 #[test]
 fn legacy_transports_ignore_unrelated_mode_and_extra() {
     for transport in ["tcp", "ws", "grpc"] {
         for scheme in ["vless", "trojan"] {
-            let base = format!("{scheme}://{UUID}@example.com:443?type={transport}&path=/svc&serviceName=svc");
+            let base = format!(
+                "{scheme}://{UUID}@example.com:443?type={transport}&path=/svc&serviceName=svc"
+            );
             let canonical = Node::from_share_link(&base).unwrap();
             for suffix in ["&mode=gun", "&mode=multi&extra=", "&extra=not-json"] {
                 let node = Node::from_share_link(&format!("{base}{suffix}")).unwrap();
@@ -126,8 +183,11 @@ fn legacy_transports_ignore_unrelated_mode_and_extra() {
         }
         let fixture = json!({"add":"example.com", "port":443, "id":UUID, "net":transport,
             "mode":"gun", "extra":{"unrelated":null}});
-        let node = Node::from_share_link(&format!("vmess://{}",
-            base64::engine::general_purpose::STANDARD.encode(fixture.to_string()))).unwrap();
+        let node = Node::from_share_link(&format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(fixture.to_string())
+        ))
+        .unwrap();
         assert_eq!(node.transport().unwrap().transport, transport);
     }
 }
@@ -524,14 +584,20 @@ fn direct_alpn_must_normalize_before_config_admission() {
 fn direct_options_must_normalize_before_config_admission() {
     for (transport, options) in [
         ("splithttp", XhttpOptions::default()),
-        ("xhttp", XhttpOptions {
-            path: "/api?token=a%2Fb".into(),
-            ..Default::default()
-        }),
-        ("xhttp", XhttpOptions {
-            headers: [("X-A".into(), "one".into())].into(),
-            ..Default::default()
-        }),
+        (
+            "xhttp",
+            XhttpOptions {
+                path: "/api?token=a%2Fb".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "xhttp",
+            XhttpOptions {
+                headers: [("X-A".into(), "one".into())].into(),
+                ..Default::default()
+            },
+        ),
     ] {
         let mut node = link("type=xhttp");
         node.transport_mut().unwrap().transport = transport.into();
@@ -601,11 +667,7 @@ fn nonstream_uri_protocols_reject_xhttp_claims_instead_of_discarding_them() {
         "juicity://b831381d-6324-4d53-ad4f-8cda48b30811:password@example.com:443",
     ] {
         Node::from_share_link(base).unwrap();
-        for query in [
-            "type=xhttp",
-            "network=splithttp",
-            "type=xhttp&extra=%7B%7D",
-        ] {
+        for query in ["type=xhttp", "network=splithttp", "type=xhttp&extra=%7B%7D"] {
             let mut diagnostics = Vec::new();
             let error = Node::from_share_link_with_detailed_diagnostics(
                 &format!("{base}?{query}"),

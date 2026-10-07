@@ -32,44 +32,46 @@ pub(super) fn apply_xhttp_query(
         return Ok(false);
     }
     for (key, value) in &query.0 {
-        if !(key == "headerType" && matches!(value.as_str(), "" | "none")) && !matches!(
-            key.as_str(),
-            "type"
-                | "network"
-                | "host"
-                | "path"
-                | "mode"
-                | "extra"
-                | "alpn"
-                | "security"
-                | "tls"
-                | "sni"
-                | "peer"
-                | "fp"
-                | "allowInsecure"
-                | "allow_insecure"
-                | "insecure"
-                | "pbk"
-                | "sid"
-                | "spx"
-                | "pinSHA256"
-                | "pin_sha256"
-                | "ech"
-                | "ech_config"
-                | "echconfig"
-                | "flow"
-                | "encryption"
-                | "scy"
-                | "udp"
-                | "packetEncoding"
-                | "mux"
-                | "padding"
-                | "concurrency"
-                | "xudpConcurrency"
-                | "xudpProxyUDP443"
-                | "xtls"
-                | "remark"
-        ) {
+        if !(key == "headerType" && matches!(value.as_str(), "" | "none"))
+            && !matches!(
+                key.as_str(),
+                "type"
+                    | "network"
+                    | "host"
+                    | "path"
+                    | "mode"
+                    | "extra"
+                    | "alpn"
+                    | "security"
+                    | "tls"
+                    | "sni"
+                    | "peer"
+                    | "fp"
+                    | "allowInsecure"
+                    | "allow_insecure"
+                    | "insecure"
+                    | "pbk"
+                    | "sid"
+                    | "spx"
+                    | "pinSHA256"
+                    | "pin_sha256"
+                    | "ech"
+                    | "ech_config"
+                    | "echconfig"
+                    | "flow"
+                    | "encryption"
+                    | "scy"
+                    | "udp"
+                    | "packetEncoding"
+                    | "mux"
+                    | "padding"
+                    | "concurrency"
+                    | "xudpConcurrency"
+                    | "xudpProxyUDP443"
+                    | "xtls"
+                    | "remark"
+            )
+        {
             return Err(invalid("unsupported XHTTP URI option"));
         }
     }
@@ -92,19 +94,32 @@ pub(super) fn apply_xhttp_query(
     .map_err(invalid)?;
     let extra = coalesce_equal(
         query.values("extra").map(|extra| {
-            XhttpOptions::from_xray_extra(Some(XrayExtra::parse(extra)?), path.as_deref(), host, mode).map(Some)
+            XhttpOptions::from_xray_extra(
+                Some(XrayExtra::parse(extra)?),
+                path.as_deref(),
+                host,
+                mode,
+            )
+            .map(Some)
         }),
         "XHTTP extra claims conflict",
     )
     .map_err(invalid)?;
     transport.xhttp = Some(match extra {
         Some(options) => options,
-        None => XhttpOptions::from_xray_extra(None, path.as_deref(), host, mode).map_err(invalid)?,
+        None => {
+            XhttpOptions::from_xray_extra(None, path.as_deref(), host, mode).map_err(invalid)?
+        }
     });
     transport.transport = "xhttp".into();
     let alpn = coalesce_equal(
         query.values("alpn").map(|value| {
-            let mut protocols = value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
+            let mut protocols = value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
             protocols.dedup();
             Ok((!protocols.is_empty()).then_some(protocols))
         }),
@@ -125,28 +140,45 @@ pub(super) fn apply_vmess_xhttp(
     tls: &mut TlsOptions,
 ) -> Result<(), ConfigError> {
     let invalid = || ConfigError::Parse("unsupported or invalid VMess XHTTP option".into());
-    if json.additional.keys().any(|key| !matches!(key.as_str(), "v" | "fp" | "insecure" | "allowInsecure"))
+    if json
+        .additional
+        .keys()
+        .any(|key| !matches!(key.as_str(), "v" | "fp" | "insecure" | "allowInsecure"))
     {
         return Err(invalid());
     }
     let mode = coalesce_equal(
-        mode.map(Some).into_iter().map(Ok).chain(json.r#type.as_deref().filter(|value| !matches!(*value, "" | "none")).map(|value| value.parse().map(Some))),
+        mode.map(Some).into_iter().map(Ok).chain(
+            json.r#type
+                .as_deref()
+                .filter(|value| !matches!(*value, "" | "none"))
+                .map(|value| value.parse().map(Some)),
+        ),
         "XHTTP mode claims conflict",
-    ).map_err(|_| invalid())?;
+    )
+    .map_err(|_| invalid())?;
     if let Some(insecure) = coalesce_equal(
-        ["insecure", "allowInsecure"].into_iter().filter_map(|key| json.additional.get(key)).map(|value| {
-            match value {
+        ["insecure", "allowInsecure"]
+            .into_iter()
+            .filter_map(|key| json.additional.get(key))
+            .map(|value| match value {
                 serde_json::Value::Bool(value) => Ok(Some(*value)),
                 serde_json::Value::Number(value) if value.as_u64() == Some(0) => Ok(Some(false)),
                 serde_json::Value::Number(value) if value.as_u64() == Some(1) => Ok(Some(true)),
-                serde_json::Value::String(value) => crate::options::vocab::verification_text(value).map(Some),
+                serde_json::Value::String(value) => {
+                    crate::options::vocab::verification_text(value).map(Some)
+                }
                 _ => Err("invalid certificate verification boolean"),
-            }
-        }), "conflicting certificate verification aliases",
-    ).map_err(|_| invalid())? {
+            }),
+        "conflicting certificate verification aliases",
+    )
+    .map_err(|_| invalid())?
+    {
         tls.skip_cert_verify = insecure;
     }
-    let options = XhttpOptions::from_xray_extra(extra, json.path.as_deref(), json.host.as_deref(), mode).map_err(|_| invalid())?;
+    let options =
+        XhttpOptions::from_xray_extra(extra, json.path.as_deref(), json.host.as_deref(), mode)
+            .map_err(|_| invalid())?;
     stream.transport = "xhttp".into();
     stream.xhttp = Some(options);
     if let Some(alpn) = &json.alpn {

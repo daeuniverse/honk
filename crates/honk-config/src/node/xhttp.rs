@@ -426,8 +426,11 @@ impl XhttpOptions {
             options.headers = extra.headers.unwrap_or_default();
             options.x_padding_bytes = extra.x_padding_bytes.unwrap_or(Self::DEFAULT_PADDING);
             options.no_grpc_header = extra.no_grpc_header.unwrap_or_default();
-            options.sc_max_each_post_bytes = extra.sc_max_each_post_bytes.unwrap_or(Self::DEFAULT_POST);
-            options.sc_min_posts_interval_ms = extra.sc_min_posts_interval_ms.unwrap_or(Self::DEFAULT_INTERVAL);
+            options.sc_max_each_post_bytes =
+                extra.sc_max_each_post_bytes.unwrap_or(Self::DEFAULT_POST);
+            options.sc_min_posts_interval_ms = extra
+                .sc_min_posts_interval_ms
+                .unwrap_or(Self::DEFAULT_INTERVAL);
         }
         if let Some(path) = path {
             options.path = path.to_owned();

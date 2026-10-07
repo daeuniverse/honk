@@ -296,14 +296,13 @@ struct VmessLinkJson {
     /// Cipher (`scy` in newer links, `security` in older ones).
     scy: Option<String>,
     security: Option<String>,
-    /// Transport: tcp / ws / grpc / h2 / kcp.
+    /// Transport: tcp / ws / grpc / xhttp / splithttp.
     net: Option<String>,
-    /// Transport header type; accepted for compatibility, not stored.
-    #[allow(dead_code)]
+    /// Legacy header type; XHTTP exporters use this field for the mode.
     r#type: Option<String>,
-    /// WS host header on `net = "ws"` links, TLS SNI elsewhere.
+    /// HTTP host for WS/XHTTP; lower-priority TLS SNI on other transports.
     host: Option<String>,
-    /// WS path, or gRPC service name on `net = "grpc"` links.
+    /// WS/XHTTP path, or gRPC service name on `net = "grpc"` links.
     path: Option<String>,
     /// TLS flag: the exact string "tls" enables it.
     tls: Option<String>,
