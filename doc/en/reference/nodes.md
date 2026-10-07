@@ -137,8 +137,8 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | Protocol | Alias | TCP | UDP | Notes |
 | --- | --- | --- | --- | --- |
 | `ss` | `shadowsocks` | Yes | Yes | AEAD and Shadowsocks 2022 |
-| `trojan` | — | Yes | Yes* | TLS; TCP/WS/gRPC transport |
-| `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC and REALITY; handler requires `rprx` |
+| `trojan` | — | Yes | Yes* | TLS; TCP/WS/gRPC/XHTTP transport |
+| `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC/XHTTP and REALITY; handler requires `rprx` |
 | `vless` | — | Yes | Configurable* | Native UDP, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
 | `socks5` | — | Yes | Yes | CONNECT and UDP ASSOCIATE |
 | `hysteria2` | — | Yes | Yes | QUIC/H3, salamander, brutal/BBR, and port hopping |

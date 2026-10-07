@@ -137,8 +137,8 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | 协议 | 别名 | TCP | UDP | 说明 |
 | --- | --- | --- | --- | --- |
 | `ss` | `shadowsocks` | 是 | 是 | AEAD 与 Shadowsocks 2022 |
-| `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC transport |
-| `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC 与 REALITY；handler 需要 `rprx` |
+| `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC/XHTTP transport |
+| `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC/XHTTP 与 REALITY；handler 需要 `rprx` |
 | `vless` | — | 是 | 可配置* | 原生 UDP、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
