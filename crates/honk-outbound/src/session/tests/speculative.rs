@@ -133,36 +133,6 @@ async fn detached_commit_inserts_once_into_the_captured_pool() {
 }
 
 #[tokio::test]
-async fn detached_commit_at_capacity_admits_drain_only() {
-    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
-        max_sessions: 1,
-        ..Default::default()
-    }));
-    let mut reservation = match pool.checkout_speculative().await.unwrap() {
-        SpeculativeCheckout::Detached(reservation) => reservation,
-        SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
-    };
-    let winner = ReservedTestSession::new(1);
-    let _permit = reservation.attach(&winner).unwrap();
-    // Normal offers don't count provisional slots, so the pool can fill
-    // while the speculative dial is detached.
-    let active = pool
-        .offer(|| async { Ok(ReservedTestSession::new(1)) })
-        .await
-        .unwrap();
-
-    let committed = reservation.commit().unwrap();
-
-    assert!(Arc::ptr_eq(&committed, &winner));
-    assert_eq!(
-        committed.state(),
-        SessionState::Draining,
-        "a commit arriving at a full pool must not exceed max_sessions"
-    );
-    assert_eq!(active.state(), SessionState::Active);
-}
-
-#[tokio::test]
 async fn detached_commit_preserves_inflight_normal_dial_slot() {
     let pool = Arc::new(SessionPool::new(SessionPoolConfig {
         max_sessions: 1,

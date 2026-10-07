@@ -475,48 +475,6 @@ async fn setup_deadline_includes_initial_dial_admission() {
 }
 
 #[tokio::test]
-async fn both_tls_and_key_share_profiles_authenticate_the_full_transcript() {
-    timeout(Duration::from_secs(3), async {
-        let key = PKey::generate(Id::X25519).unwrap();
-        let mut public_key = [0; 32];
-        key.raw_public_key(&mut public_key).unwrap();
-        let config = RealityConfig {
-            public_key,
-            short_id: [0x19; 8],
-            server_name: "localhost".into(),
-        };
-        for chrome in [false, true] {
-            for hybrid in [false, true] {
-                let (client, mut peer) = tokio::io::duplex(16 * 1024);
-                let server = async {
-                    let record = read_hello(&mut peer).await;
-                    let hello = &record[5..];
-                    let shares: Vec<_> = key_shares(hello)
-                        .into_iter()
-                        .map(|(group, bytes)| (group, bytes.len()))
-                        .collect();
-                    let expected = if hybrid {
-                        vec![(0x11ec, 1184 + 32), (29, 32)]
-                    } else {
-                        vec![(29, 32)]
-                    };
-                    assert_eq!(shares, expected, "chrome={chrome}, hybrid={hybrid}");
-                    authenticate_hello(hello, &key);
-                    peer.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
-                };
-                let (result, ()) = tokio::join!(
-                    reality_connect_with_key_shares(client, &config, chrome, hybrid, None),
-                    server,
-                );
-                assert!(result.is_err());
-            }
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
 async fn targeted_h2_and_raw_reality_profiles_negotiate_and_authenticate() {
     timeout(Duration::from_secs(10), async {
         let key = PKey::generate(Id::X25519).unwrap();
@@ -535,6 +493,19 @@ async fn targeted_h2_and_raw_reality_profiles_negotiate_and_authenticate() {
                     let server = async {
                         let record = read_hello(&mut peer).await;
                         let hello = &record[5..];
+                        let shares: Vec<_> = key_shares(hello)
+                            .into_iter()
+                            .map(|(group, bytes)| (group, bytes.len()))
+                            .collect();
+                        let expected_shares = if hybrid {
+                            vec![(0x11ec, 1184 + 32), (29, 32)]
+                        } else {
+                            vec![(29, 32)]
+                        };
+                        assert_eq!(
+                            shares, expected_shares,
+                            "chrome={chrome}, hybrid={hybrid}, targeted={targeted}"
+                        );
                         let expected_alpn = if targeted {
                             Some(b"\0\x03\x02h2".as_slice())
                         } else {

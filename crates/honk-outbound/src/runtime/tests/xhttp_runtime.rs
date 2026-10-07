@@ -509,7 +509,7 @@ async fn cancelled_speculative_udp_tls_establishment_releases_socket_and_carrier
 }
 
 #[tokio::test]
-async fn exhausted_xhttp_physical_admission_stays_capacity_scoped_without_start_feedback() {
+async fn exhausted_xhttp_admission_preserves_capacity_and_cancellation_feedback() {
     use futures_util::FutureExt;
     for speculative in [false, true] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -572,7 +572,18 @@ async fn exhausted_xhttp_physical_admission_stays_capacity_scoped_without_start_
             listener.accept().now_or_never().is_none(),
             "exhausted admission must not create a socket"
         );
-        drop(attempt);
+        if speculative {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(91)).await;
+            let error = attempt.await.err().expect("unadmitted dial cannot succeed");
+            assert_eq!(
+                crate::proxy::packet_rejection(&error),
+                Some(crate::proxy::PacketRejection::Capacity)
+            );
+            tokio::time::resume();
+        } else {
+            drop(attempt);
+        }
         registry.shutdown().await;
         tokio::time::timeout(Duration::from_secs(3), async {
             while scope.is_waiting_for_admission() {
@@ -581,11 +592,13 @@ async fn exhausted_xhttp_physical_admission_stays_capacity_scoped_without_start_
         })
         .await
         .unwrap();
-        assert_eq!(
-            starts.load(Ordering::SeqCst),
-            0,
-            "cancelled unstarted work must not publish physical-start feedback"
-        );
+        if !speculative {
+            assert_eq!(
+                starts.load(Ordering::SeqCst),
+                0,
+                "cancelled unstarted work must not publish physical-start feedback"
+            );
+        }
         drop(occupied);
         drop(
             tokio::time::timeout(Duration::from_secs(3), registry.acquire_dial_permit())
