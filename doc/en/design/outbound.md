@@ -260,8 +260,11 @@ The initiating caller subscribes before its dial task starts and consumes that
 attempt's result directly. A completed local refusal remains terminal even when
 a warm session could serve an ordinary failed spread attempt.
 Pool-owned tasks recheck terminal state before polling the dial. An in-flight
-normal dial reserves a reusable slot; an overlapping detached commit goes
-drain-only when that reservation fills the cap, preserving its existing child.
+normal dial reserves a reusable slot. Detached winner commits, including
+multi-carrier batches, publish excess private carriers drain-only when ordinary
+offers or in-flight dials fill the cap, preserving their already-admitted streams.
+A batch validates every member before publishing any; dropping a loser or
+committing into a retired pool still closes only its private carriers.
 Releasing warm retention also wakes capacity waiters as excess live carriers
 enter Draining, without waiting for their existing children to finish.
 Maintenance likewise publishes capacity released by max-age drains or closed

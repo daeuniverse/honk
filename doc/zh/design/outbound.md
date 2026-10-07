@@ -241,7 +241,10 @@ Pool waiter 在检查容量前注册容量变化通知。每个由 pool 持有�
 拨号发起者在启动 task 前订阅结果，并直接消费该次尝试的结果。即使已有 warm
 session 可以承接普通 spread 拨号失败，已完成的本地拒绝仍保持终态。
 Pool-owned task 在 poll 拨号前重新检查终态。进行中的普通拨号预留一个可复用
-slot；并发的 detached commit 在该预留占满上限时进入 drain-only，保留已有 child。
+slot。如果普通 offer 或进行中的拨号填满上限，detached winner commit（包括多
+carrier 批次）将超出的 private carrier 以 drain-only 发布，保留已经准入的 stream。
+批次先校验全部成员再发布任何成员；丢弃 loser 或向已退役 pool 提交时，仍只关闭
+其 private carrier。
 解除 warm retention 时，多余的 live carrier 进入 Draining 后也会唤醒容量
 waiter，无需等待这些 carrier 上已有的 child 结束。
 maintenance 因 max-age 退役或清理已关闭 session 释放容量时，也会发布通知，
