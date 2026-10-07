@@ -136,7 +136,12 @@ pub(super) async fn take_batch(
             if next > Instant::now() {
                 tokio::time::sleep_until(next).await;
             }
-            let bytes = flow.state.lock().bytes.split().freeze();
+            let mut state = flow.state.lock();
+            if let Some(error) = &state.error {
+                return Err(clone_error(error));
+            }
+            let bytes = state.bytes.split().freeze();
+            drop(state);
             flow.write.wake();
             return Ok(Some(bytes));
         }

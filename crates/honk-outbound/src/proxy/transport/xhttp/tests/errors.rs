@@ -371,3 +371,22 @@ async fn buffered_download_precedes_upload_status_failure() {
         .expect("upload failure discarded already-owned download payload");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn paced_batch_is_not_sent_after_the_flow_failed() {
+    use super::super::{stream::Flow, upload::take_batch};
+
+    let flow = Flow::new(1024);
+    flow.state.lock().bytes.extend_from_slice(b"queued");
+    let last = tokio::time::Instant::now();
+    let batch = tokio::spawn({
+        let flow = flow.clone();
+        async move { take_batch(&flow, Duration::from_secs(60), last).await }
+    });
+    tokio::task::yield_now().await;
+    flow.fail(io::Error::other("peer reset"));
+    assert!(
+        batch.await.unwrap().is_err(),
+        "a batch accepted before the failure was sent after it"
+    );
+}
