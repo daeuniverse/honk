@@ -333,6 +333,17 @@ impl XhttpOptions {
         normalized
     }
 
+    /// Blank members are absent and adjacent repeats carry no information.
+    pub(crate) fn normalize_alpn(protocols: &mut Vec<String>) {
+        protocols.retain_mut(|protocol| {
+            protocol.truncate(protocol.trim_end().len());
+            let leading = protocol.len() - protocol.trim_start().len();
+            protocol.drain(..leading);
+            !protocol.is_empty()
+        });
+        protocols.dedup();
+    }
+
     pub fn normalize(&mut self) -> Result<(), &'static str> {
         self.path = Self::normalize_path(&self.path);
         self.host = self.host.take().filter(|host| !host.is_empty());

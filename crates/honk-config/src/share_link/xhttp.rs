@@ -114,13 +114,8 @@ pub(super) fn apply_xhttp_query(
     transport.transport = "xhttp".into();
     let alpn = coalesce_equal(
         query.values("alpn").map(|value| {
-            let mut protocols = value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            protocols.dedup();
+            let mut protocols = value.split(',').map(str::to_string).collect::<Vec<_>>();
+            XhttpOptions::normalize_alpn(&mut protocols);
             Ok((!protocols.is_empty()).then_some(protocols))
         }),
         "XHTTP ALPN claims conflict",
