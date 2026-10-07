@@ -110,6 +110,77 @@ async fn graceful_goaway_rotates_carrier_without_replay_and_keeps_active_get() {
 }
 
 #[tokio::test]
+async fn packet_up_replacement_obeys_the_published_successor_admission() {
+    use crate::runtime::OutboundRuntimeRegistry;
+
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(32).await;
+        let mut node = node(XhttpMode::PacketUp, 32);
+        node.address = peer.address.ip().to_string();
+        node.port = peer.address.port();
+        node.normalize_stream_transport().unwrap();
+        node.id = node.derive_id();
+        let (first, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+            std::slice::from_ref(&node), 1, 4, 4, None,
+        )
+        .unwrap();
+        first.activate_background_dial_admission();
+        let runtime = first.get(&node.id).unwrap();
+        first
+            .scope_dials(XhttpRuntime::warm(&runtime, DEADLINE))
+            .await
+            .unwrap();
+        peer.wait_settings(&runtime).await;
+        let mut stream = first.scope_dials(open(&runtime)).await;
+        let mut download = peer.next().await;
+        let old_session = carrier(&runtime).await;
+        let _reply = response(&mut download.respond, 200, false);
+
+        let (successor, moved) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+            std::slice::from_ref(&node), 1, 4, 4, Some(&first),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&runtime, &successor.get(&node.id).unwrap()));
+        successor.activate_background_dial_admission();
+        first.mark_moved_out(moved);
+        first.retire_reusable_state().await;
+        let successor_held = successor.acquire_dial_permit().await;
+
+        let (ack, received) = oneshot::channel();
+        download.control.send(PeerCommand::Goaway(ack)).await.unwrap();
+        received.await.unwrap();
+        while old_session.state() == SessionState::Active {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(old_session.state(), SessionState::Draining);
+        stream.write_all(b"unique").await.unwrap();
+        if let Ok(request) =
+            tokio::time::timeout(Duration::from_millis(100), peer.requests.recv()).await
+        {
+            let request = request.expect("H2 peer stopped during replacement admission");
+            panic!(
+                "packet-up replacement bypassed the successor's physical-dial limit: carrier {}, GET carrier {}, URI {}",
+                request.carrier, download.carrier, request.request.uri()
+            );
+        }
+
+        let predecessor_held = first.acquire_dial_permit().await;
+        drop(successor_held);
+        let mut upload = peer.next().await;
+        assert_ne!(upload.carrier, download.carrier);
+        assert_eq!(receive(upload.request.body_mut(), 6).await, b"unique");
+        eof(upload.request.body_mut()).await;
+        response(&mut upload.respond, 200, true);
+        stream.flush().await.unwrap();
+        drop(predecessor_held);
+        drop(stream);
+        successor.shutdown().await;
+    })
+    .await
+    .expect("packet-up replacement retained the predecessor's admission");
+}
+
+#[tokio::test]
 async fn cancelled_requests_keep_late_frames_from_closing_a_live_carrier() {
     async fn frame(tcp: &mut TcpStream) -> io::Result<(u8, u8, u32, Vec<u8>)> {
         let mut header = [0; 9];

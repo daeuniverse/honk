@@ -80,11 +80,19 @@ impl XhttpRuntime {
         }))
     }
 
+    pub(crate) fn set_dial_admission(&self, admission: crate::runtime::CapturedDialAdmission) {
+        let lifecycle = self.lifecycle.lock();
+        if !lifecycle.is_retired() {
+            self.pool.set_dial_admission(admission);
+        }
+    }
+
     pub(crate) fn retire(&self) {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.phase == Phase::Running {
             lifecycle.phase = Phase::Retired;
         }
+        self.pool.clear_dial_admission();
         self.lifecycle_changed.notify_waiters();
         self.finish_retirement_locked(&lifecycle);
     }
@@ -190,11 +198,15 @@ impl XhttpRuntime {
         timeout: Duration,
     ) -> anyhow::Result<(Arc<XhttpSession>, SessionPermit<XhttpSession>)> {
         let runtime = runtime.clone();
-        self.pool
-            .open_with(
+        let admission = self
+            .pool
+            .dial_admission()
+            .unwrap_or_else(crate::runtime::capture_dial_admission);
+        admission
+            .scope(self.pool.open_with(
                 move || Self::dial(runtime, tcp, timeout),
                 |session, permit| std::future::ready(Ok::<_, OpenError>((session, permit))),
-            )
+            ))
             .await
     }
 
@@ -292,7 +304,7 @@ impl XhttpRuntime {
         let flow = Flow::new(limit);
         let driver_flow = flow.clone();
         let runtime_owner = runtime.clone();
-        // Admission must be captured while the public dial is still generation-scoped.
+        // Unpublished runtimes have no pool-bound owner to supply replacement admission.
         let admission = crate::runtime::capture_dial_admission();
         let download_session = download.session.clone();
         let driver = tokio::spawn(admission.scope(async move {

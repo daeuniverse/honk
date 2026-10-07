@@ -329,13 +329,16 @@ impl OutboundRuntimeRegistry {
     {
         DialScope::new(DialAdmission::for_registry(self), Some(Box::new(on_start)))
     }
-    /// Rebind autonomous AnyTLS replacement dials after this generation is
+    /// Rebind autonomous pooled replacement dials after this generation is
     /// published. Reused pools must stop consulting the predecessor's gate.
     pub fn activate_background_dial_admission(&self) {
         let admission = CapturedDialAdmission(DialAdmission::for_registry(self));
         for runtime in self.nodes.values() {
             if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
                 anytls.pool.set_dial_admission(admission.clone());
+            }
+            if let Some(xhttp) = &runtime.xhttp {
+                xhttp.set_dial_admission(admission.clone());
             }
         }
     }
