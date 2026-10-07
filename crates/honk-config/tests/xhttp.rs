@@ -22,6 +22,40 @@ fn flat(options: Value) -> Result<Node, serde_json::Error> {
 }
 
 #[test]
+fn extra_request_fields_fill_only_absent_top_level_claims() {
+    let extra = json!({"host":"front.example", "path":"api", "mode":"stream-up"});
+    let canonical = link("type=xhttp&host=front.example&path=api&mode=stream-up");
+    let from_extra = link(&format!("type=xhttp&{}", extra_uri(extra.clone())));
+    assert_eq!(from_extra.outbound, canonical.outbound);
+    assert_eq!(from_extra.id, canonical.id);
+    let defaults = link(&format!("type=xhttp&host=&path=&mode=&{}", extra_uri(extra.clone())));
+    assert_eq!(defaults.id, link("type=xhttp").id);
+    let overriding = link(&format!("type=xhttp&host=front.example&path=api&mode=stream-up&{}&{}", extra_uri(extra.clone()), extra_uri(json!({"host":"other.example", "path":"other", "mode":"auto"}))));
+    assert_eq!(overriding.id, canonical.id);
+    for top_level in [false, true] {
+        let mut fixture = json!({"add":"example.com", "port":443, "id":UUID, "net":"xhttp", "tls":"tls", "extra":extra});
+        if top_level {
+            fixture["host"] = json!("");
+            fixture["path"] = json!("");
+            fixture["mode"] = json!("");
+        }
+        let node = Node::from_share_link(&format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(fixture.to_string()))).unwrap();
+        fixture.as_object_mut().unwrap().remove("extra");
+        if !top_level {
+            fixture["host"] = json!("front.example");
+            fixture["path"] = json!("api");
+            fixture["mode"] = json!("stream-up");
+        }
+        let canonical = Node::from_share_link(&format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(fixture.to_string()))).unwrap();
+        assert_eq!(node.outbound, canonical.outbound);
+        assert_eq!(node.id, canonical.id);
+    }
+    for extra in [json!({"mode":"gun"}), json!({"path":"/bad#fragment"}), json!({"host":"bad host"}), json!({"host":null})] {
+        assert!(Node::from_share_link(&format!("vless://{UUID}@example.com:443?type=xhttp&{}", extra_uri(extra))).is_err());
+    }
+}
+
+#[test]
 fn vmess_exported_xhttp_mode_and_empty_alpn_are_canonical() {
     let parse = |fixture: Value| Node::from_share_link(&format!("vmess://{}",
         base64::engine::general_purpose::STANDARD.encode(fixture.to_string())));
@@ -379,6 +413,9 @@ fn vmess_json_preserves_xhttp_top_fields_and_supported_extra() {
 fn duplicate_json_claims_cannot_hide_invalid_xhttp_inputs() {
     for extra in [
         r#"{"noGRPCHeader":null,"noGRPCHeader":false}"#,
+        r#"{"host":"front.example","host":"front.example"}"#,
+        r#"{"path":"api","path":"/api/"}"#,
+        r#"{"mode":"auto","mode":"auto"}"#,
         r#"{"headers":{"x-a":"one","x-a":"two"}}"#,
         r#"{"headers":{"x-a":"one","x-a":"one"}}"#,
         r#"[{},100,false,1000000,30]"#,

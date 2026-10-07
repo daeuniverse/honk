@@ -79,36 +79,28 @@ pub(super) fn apply_xhttp_query(
             .map(|path| Ok(Some(XhttpOptions::normalize_path(path)))),
         "XHTTP path claims conflict",
     )
-    .map_err(invalid)?
-    .unwrap_or_else(|| "/".into());
+    .map_err(invalid)?;
     let host = coalesce_equal(
-        query.values("host").map(|host| Ok(Some(host.to_string()))),
+        query.values("host").map(|host| Ok(Some(host))),
         "XHTTP host claims conflict",
     )
-    .map_err(invalid)?
-    .filter(|host| !host.is_empty());
+    .map_err(invalid)?;
     let mode = coalesce_equal(
         query.values("mode").map(|mode| mode.parse().map(Some)),
         "XHTTP mode claims conflict",
     )
-    .map_err(invalid)?
-    .unwrap_or_default();
-    let options = XhttpOptions {
-        path,
-        host,
-        mode,
-        ..Default::default()
-    };
+    .map_err(invalid)?;
     let extra = coalesce_equal(
         query.values("extra").map(|extra| {
-            let mut claim = options.clone();
-            claim.apply_xray_extra(XrayExtra::parse(extra)?)?;
-            Ok(Some(claim))
+            XhttpOptions::from_xray_extra(Some(XrayExtra::parse(extra)?), path.as_deref(), host, mode).map(Some)
         }),
         "XHTTP extra claims conflict",
     )
     .map_err(invalid)?;
-    transport.xhttp = Some(extra.unwrap_or(options));
+    transport.xhttp = Some(match extra {
+        Some(options) => options,
+        None => XhttpOptions::from_xray_extra(None, path.as_deref(), host, mode).map_err(invalid)?,
+    });
     transport.transport = "xhttp".into();
     let alpn = coalesce_equal(
         query.values("alpn").map(|value| {
@@ -154,16 +146,7 @@ pub(super) fn apply_vmess_xhttp(
     ).map_err(|_| invalid())? {
         tls.skip_cert_verify = insecure;
     }
-    let mut options = XhttpOptions {
-        path: json.path.clone().unwrap_or_else(|| "/".into()),
-        host: json.host.clone(),
-        mode: mode.unwrap_or_default(),
-        ..Default::default()
-    };
-    if let Some(extra) = extra {
-        options.apply_xray_extra(extra).map_err(|_| invalid())?;
-    }
-    options.normalize().map_err(|_| invalid())?;
+    let options = XhttpOptions::from_xray_extra(extra, json.path.as_deref(), json.host.as_deref(), mode).map_err(|_| invalid())?;
     stream.transport = "xhttp".into();
     stream.xhttp = Some(options);
     if let Some(alpn) = &json.alpn {

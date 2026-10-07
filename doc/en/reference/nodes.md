@@ -210,7 +210,7 @@ node {
 
 `path` defaults to `/`; normalization adds leading/trailing slashes before the query without cleaning dot segments or percent escapes. HTTP `host` is independent of the dial address and SNI, falling back to SNI and then the server host. A directly constructed node must call `normalize_stream_transport()` before deriving its ID; immutable admission rejects noncanonical XHTTP spelling/options/ALPN. The path component is a decoded literal, escaped on the wire like Xray: a literal `%` becomes `%25`, spaces and UTF-8 bytes are percent-encoded, and the configured query is unchanged; URI share-link values are percent-decoded once beforehand, so `path=%2Fxhttp%2F` still sends `/xhttp/`, while Mihomo paths are literal YAML strings.
 
-URI `extra` accepts a percent-encoded JSON object with only these fields:
+URI `extra` accepts a percent-encoded JSON object containing `host`, `path` and `mode` with the same meaning, normalization and validation as the top-level fields, plus only the options below. Extra request fields fill absent top-level fields; explicit top-level presence wins even when empty. Repeated URI extras coalesce only when their effective canonical options agree.
 
 | Xray extra key | Flat `xhttp` field | Default | Supported bounds |
 | --- | --- | --- | --- |

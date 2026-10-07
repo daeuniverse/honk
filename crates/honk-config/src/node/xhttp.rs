@@ -219,6 +219,12 @@ pub(super) fn deserialize_xhttp<'de, D: Deserializer<'de>>(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct XrayExtra {
+    #[serde(default, deserialize_with = "present_option")]
+    host: Option<String>,
+    #[serde(default, deserialize_with = "present_option")]
+    path: Option<String>,
+    #[serde(default, deserialize_with = "present_option")]
+    mode: Option<XhttpMode>,
     #[serde(default, deserialize_with = "extra_headers")]
     headers: Option<BTreeMap<String, String>>,
     #[serde(default, rename = "xPaddingBytes", deserialize_with = "extra_padding")]
@@ -405,22 +411,33 @@ impl XhttpOptions {
         Ok(())
     }
 
-    pub(crate) fn apply_xray_extra(&mut self, extra: XrayExtra) -> Result<(), &'static str> {
-        if let Some(value) = extra.headers {
-            self.headers = value;
+    pub(crate) fn from_xray_extra(
+        extra: Option<XrayExtra>,
+        path: Option<&str>,
+        host: Option<&str>,
+        mode: Option<XhttpMode>,
+    ) -> Result<Self, &'static str> {
+        let mut options = Self::default();
+        if let Some(extra) = extra {
+            options.path = extra.path.unwrap_or(options.path);
+            options.host = extra.host;
+            options.mode = extra.mode.unwrap_or_default();
+            options.headers = extra.headers.unwrap_or_default();
+            options.x_padding_bytes = extra.x_padding_bytes.unwrap_or(Self::DEFAULT_PADDING);
+            options.no_grpc_header = extra.no_grpc_header.unwrap_or_default();
+            options.sc_max_each_post_bytes = extra.sc_max_each_post_bytes.unwrap_or(Self::DEFAULT_POST);
+            options.sc_min_posts_interval_ms = extra.sc_min_posts_interval_ms.unwrap_or(Self::DEFAULT_INTERVAL);
         }
-        if let Some(value) = extra.x_padding_bytes {
-            self.x_padding_bytes = value;
+        if let Some(path) = path {
+            options.path = path.to_owned();
         }
-        if let Some(value) = extra.no_grpc_header {
-            self.no_grpc_header = value;
+        if let Some(host) = host {
+            options.host = Some(host.to_owned());
         }
-        if let Some(value) = extra.sc_max_each_post_bytes {
-            self.sc_max_each_post_bytes = value;
+        if let Some(mode) = mode {
+            options.mode = mode;
         }
-        if let Some(value) = extra.sc_min_posts_interval_ms {
-            self.sc_min_posts_interval_ms = value;
-        }
-        self.normalize()
+        options.normalize()?;
+        Ok(options)
     }
 }
