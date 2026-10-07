@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{AnyTlsRuntime, NodeRuntime, ProtocolRuntime, WarmRetention};
+use super::{AnyTlsRuntime, CapturedDialAdmission, NodeRuntime, ProtocolRuntime, WarmRetention};
 use crate::proxy::transport::xhttp::XhttpRuntime;
 
 trait PooledLifecycle {
@@ -10,6 +10,7 @@ trait PooledLifecycle {
     fn reap_unretained_idle(&self) -> usize;
     fn live_session_count(&self) -> usize;
     fn is_warm_or_stateless_for(&self, requirement: crate::proxy::WarmRequirement) -> bool;
+    fn bind_dial_admission(&self, admission: &CapturedDialAdmission);
 }
 
 impl PooledLifecycle for AnyTlsRuntime {
@@ -27,6 +28,9 @@ impl PooledLifecycle for AnyTlsRuntime {
     }
     fn shutdown(&self) {
         self.pool.shutdown();
+    }
+    fn bind_dial_admission(&self, admission: &CapturedDialAdmission) {
+        self.pool.set_dial_admission(admission.clone());
     }
     fn reap_unretained_idle(&self) -> usize {
         0
@@ -59,6 +63,7 @@ impl PooledLifecycle for super::VlessRuntime {
     fn is_warm_or_stateless_for(&self, requirement: crate::proxy::WarmRequirement) -> bool {
         self.is_warm_or_stateless_for(requirement)
     }
+    fn bind_dial_admission(&self, _: &CapturedDialAdmission) {}
 }
 
 impl PooledLifecycle for XhttpRuntime {
@@ -79,6 +84,9 @@ impl PooledLifecycle for XhttpRuntime {
     }
     fn is_warm_or_stateless_for(&self, _: crate::proxy::WarmRequirement) -> bool {
         self.pool.has_usable_session()
+    }
+    fn bind_dial_admission(&self, admission: &CapturedDialAdmission) {
+        self.set_dial_admission(admission.clone());
     }
 }
 
@@ -107,6 +115,12 @@ impl NodeRuntime {
     fn sync_pooled_retention(&self, retention: u8, was_unretained: bool) {
         for pool in self.pooled_lifecycles() {
             pool.sync_warm_retention(retention, was_unretained);
+        }
+    }
+
+    pub(super) fn bind_dial_admission(&self, admission: &CapturedDialAdmission) {
+        for pool in self.pooled_lifecycles() {
+            pool.bind_dial_admission(admission);
         }
     }
 

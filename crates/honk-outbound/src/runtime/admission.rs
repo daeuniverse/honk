@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock};
 use std::task::Poll;
 
-use super::{OutboundRuntimeRegistry, ProtocolRuntime};
+use super::OutboundRuntimeRegistry;
 
 #[derive(Clone)]
 struct DialAdmission {
@@ -334,12 +334,7 @@ impl OutboundRuntimeRegistry {
     pub fn activate_background_dial_admission(&self) {
         let admission = CapturedDialAdmission(DialAdmission::for_registry(self));
         for runtime in self.nodes.values() {
-            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
-                anytls.pool.set_dial_admission(admission.clone());
-            }
-            if let Some(xhttp) = &runtime.xhttp {
-                xhttp.set_dial_admission(admission.clone());
-            }
+            runtime.bind_dial_admission(&admission);
         }
     }
 }
