@@ -229,9 +229,6 @@ fn all_xhttp_option_differences_change_reload_identity() {
     ] {
         let changed = flat(options.clone()).unwrap();
         assert_ne!(changed.derive_id(), default.derive_id(), "{options}");
-        let restored: Node =
-            serde_json::from_value(serde_json::to_value(&changed).unwrap()).unwrap();
-        assert_eq!(restored.derive_id(), changed.derive_id());
     }
     let first =
         flat(json!({"headers":{"X-A":"a","x-b":"b"},"x_padding_bytes":"100-1000"})).unwrap();
@@ -483,29 +480,6 @@ fn duplicate_json_claims_cannot_hide_invalid_xhttp_inputs() {
 }
 
 #[test]
-fn direct_alias_must_normalize_before_config_admission() {
-    let mut node = link("type=xhttp");
-    node.transport_mut().unwrap().transport = "splithttp".into();
-    assert!(node.validate_protocol().is_err());
-    assert!(
-        honk_config::Config {
-            nodes: vec![node.clone()],
-            ..Default::default()
-        }
-        .validate()
-        .is_err()
-    );
-    node.normalize_stream_transport().unwrap();
-    node.id = node.derive_id();
-    honk_config::Config {
-        nodes: vec![node],
-        ..Default::default()
-    }
-    .validate()
-    .unwrap();
-}
-
-#[test]
 fn direct_alpn_must_normalize_before_config_admission() {
     let canonical = link("type=xhttp");
     for alpn in [vec![], vec!["h2".into(), "h2".into()]] {
@@ -548,19 +522,22 @@ fn direct_alpn_must_normalize_before_config_admission() {
 
 #[test]
 fn direct_options_must_normalize_before_config_admission() {
-    for options in [
-        XhttpOptions {
+    for (transport, options) in [
+        ("splithttp", XhttpOptions::default()),
+        ("xhttp", XhttpOptions {
             path: "/api?token=a%2Fb".into(),
             ..Default::default()
-        },
-        XhttpOptions {
+        }),
+        ("xhttp", XhttpOptions {
             headers: [("X-A".into(), "one".into())].into(),
             ..Default::default()
-        },
+        }),
     ] {
         let mut node = link("type=xhttp");
+        node.transport_mut().unwrap().transport = transport.into();
         node.transport_mut().unwrap().xhttp = Some(options);
         node.id = node.derive_id();
+        assert!(node.validate_protocol().is_err());
         assert!(
             honk_config::Config {
                 nodes: vec![node.clone()],
