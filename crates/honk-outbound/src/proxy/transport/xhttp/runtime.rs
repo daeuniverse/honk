@@ -289,7 +289,7 @@ impl XhttpRuntime {
         let driver = tokio::spawn(admission.scope(async move {
             let upload = async {
                 match upload {
-                    Upload::StreamOne(upload) | Upload::StreamUp(upload) => {
+                    Upload::Streaming(upload) => {
                         streaming_upload(upload, driver_flow.clone()).await
                     }
                     Upload::Packet(lane) => {

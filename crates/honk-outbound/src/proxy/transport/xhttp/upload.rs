@@ -42,8 +42,7 @@ impl UploadLane {
 }
 
 pub(super) enum Upload {
-    StreamOne(UploadRequest),
-    StreamUp(UploadRequest),
+    Streaming(UploadRequest),
     Packet(Arc<UploadLane>),
 }
 
@@ -58,13 +57,13 @@ impl Upload {
         let reader = ResponseReader::new(response, session.clone(), None);
         (
             reader,
-            Self::StreamOne(UploadRequest::new(send, permit, session, None)),
+            Self::Streaming(UploadRequest::new(send, permit, session, None)),
         )
     }
     pub(super) fn stream_up(download: ResponseReader, upload: Request) -> (ResponseReader, Self) {
         (
             download,
-            Self::StreamUp(UploadRequest::from_request(upload)),
+            Self::Streaming(UploadRequest::from_request(upload)),
         )
     }
     pub(super) fn packet(
@@ -330,9 +329,13 @@ pub(super) async fn packet_upload(
         .await?;
         last = Instant::now();
         seq += 1;
-        let mut upload = UploadRequest::from_request(request);
-        let response = upload.response.take().unwrap();
-        let response_session = upload.session.clone();
+        let Request {
+            response,
+            send,
+            permit,
+            session: response_session,
+        } = request;
+        let mut upload = UploadRequest::new(send, permit, response_session.clone(), None);
         // A response is drained concurrently while this body is still blocked by flow control.
         // The next POST is admitted after physical body flush, NOT after response completion.
         let mut drain = Box::pin(drain_response(response, response_session));
