@@ -3,7 +3,8 @@ use super::request::{RequestTemplate, ResolvedMode, sample};
 use super::session::connect;
 use super::stream::{Flow, FlowPermit, FlushBarriers, XhttpStream};
 use super::upload::{
-    RequestContext, Upload, UploadLane, carrier_closed, packet_upload, streaming_upload,
+    RequestContext, Upload, UploadLane, UploadRequest, carrier_closed, packet_upload,
+    streaming_upload,
 };
 use super::{MAX_CARRIERS, MAX_REQUESTS, STREAM_WRITE, XhttpPreparation, XhttpSession};
 use crate::proxy::{AsyncReadWrite, transport::maybe_tls_wrap};
@@ -283,7 +284,10 @@ impl XhttpRuntime {
                 let upload = context
                     .request_with_retry(template.request(&session, None, true, None)?, false, None)
                     .await?;
-                Upload::stream_up(download, upload)
+                (
+                    download,
+                    Upload::Streaming(UploadRequest::from_request(upload)),
+                )
             }
             ResolvedMode::PacketUp => {
                 let download = context
@@ -292,7 +296,7 @@ impl XhttpRuntime {
                 let download = Upload::download(download);
                 // Reserve alongside GET so one-request peers cannot strand the upload.
                 let (session, permit) = preparation.reserve(runtime, tcp.clone(), timeout).await?;
-                Upload::packet(download, UploadLane::new(session, permit))
+                (download, Upload::Packet(UploadLane::new(session, permit)))
             }
         };
         anyhow::ensure!(!self.is_retired(), "XHTTP runtime retired");

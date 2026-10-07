@@ -60,18 +60,6 @@ impl Upload {
             Self::Streaming(UploadRequest::new(send, permit, session, None)),
         )
     }
-    pub(super) fn stream_up(download: ResponseReader, upload: Request) -> (ResponseReader, Self) {
-        (
-            download,
-            Self::Streaming(UploadRequest::from_request(upload)),
-        )
-    }
-    pub(super) fn packet(
-        download: ResponseReader,
-        lane: Arc<UploadLane>,
-    ) -> (ResponseReader, Self) {
-        (download, Self::Packet(lane))
-    }
     pub(super) fn download(request: Request) -> ResponseReader {
         let mut reader = ResponseReader::new(request.response, request.session, Some(request.send));
         reader.permit = Some(request.permit);
@@ -101,7 +89,7 @@ impl UploadRequest {
             pending: Arc::new(AtomicUsize::new(0)),
         }
     }
-    fn from_request(request: Request) -> Self {
+    pub(super) fn from_request(request: Request) -> Self {
         Self::new(
             request.send,
             request.permit,
