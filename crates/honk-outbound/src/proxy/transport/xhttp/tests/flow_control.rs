@@ -26,8 +26,21 @@ async fn packet_flush_coalesces_datagrams_during_post_pacing() {
         assert_eq!(receive(first.request.body_mut(), 32).await, [0; 32]);
         eof(first.request.body_mut()).await;
         response(&mut first.respond, 200, true);
+        stream.flush().await.unwrap();
+        stream.write_all(&[1; 32]).await.unwrap();
+        let server = async {
+            let mut post = peer.next().await;
+            let second_at = tokio::time::Instant::now();
+            assert!(second_at.duration_since(first_at) >= Duration::from_millis(195));
+            assert_eq!(receive(post.request.body_mut(), 32).await, [1; 32]);
+            eof(post.request.body_mut()).await;
+            response(&mut post.respond, 200, true);
+            second_at
+        };
+        let (flushed, second_at) = tokio::join!(stream.flush(), server);
+        flushed.unwrap();
         let client = async {
-            for value in 1..13u8 {
+            for value in 2..13u8 {
                 stream.write_all(&[value; 32]).await.unwrap();
                 stream.flush().await.unwrap();
                 tokio::task::yield_now().await;
@@ -35,9 +48,9 @@ async fn packet_flush_coalesces_datagrams_during_post_pacing() {
             stream.shutdown().await.unwrap();
         };
         let server = async {
-            let mut received = vec![0; 32];
-            let mut posts = 1;
-            let mut last = Some(first_at);
+            let mut received = [vec![0; 32], vec![1; 32]].concat();
+            let mut posts = 2;
+            let mut last = Some(second_at);
             while received.len() < 13 * 32 {
                 let mut post = peer.next().await;
                 let now = tokio::time::Instant::now();
@@ -69,7 +82,78 @@ async fn packet_flush_coalesces_datagrams_during_post_pacing() {
 }
 
 #[tokio::test]
-async fn packet_first_flush_waits_for_the_first_post_then_stops_waiting() {
+async fn packet_trojan_setup_and_first_datagram_flush_wait_for_all_bytes() {
+    packet_flush_barriers(None, 2).await;
+}
+
+#[tokio::test]
+async fn packet_plain_vless_setup_and_first_datagram_flush_wait_for_all_bytes() {
+    packet_flush_barriers(Some(false), 2).await;
+}
+
+#[tokio::test]
+async fn packet_encrypted_vless_setup_and_first_datagram_flush_wait_for_all_bytes() {
+    packet_flush_barriers(Some(true), 3).await;
+}
+
+async fn packet_flush_barriers(vless: Option<bool>, barriers: u8) {
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(1).await;
+        let owner = peer.runtime(XhttpMode::PacketUp, 97);
+        let owner = if let Some(encrypted) = vless {
+            let mut node = (*owner.runtime().node).clone();
+            node.outbound = OutboundConfig::Vless(honk_config::node::VlessConfig {
+                uuid: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
+                encryption: encrypted.then(|| {
+                    "mlkem768x25519plus.native.1rtt.100-35-35.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into()
+                }),
+                transport: node.transport().unwrap().clone(),
+                tls: node.tls().unwrap().clone(),
+                ..Default::default()
+            });
+            node.id = node.derive_id();
+            NodeRuntime::try_ephemeral_guarded(&node).unwrap()
+        } else {
+            owner
+        };
+        let runtime = owner.runtime();
+        let mut stream = open(&runtime).await;
+        let _download = peer.next().await;
+        peer.wait_settings(&runtime).await;
+        for value in 0..barriers {
+            stream.flush().await.unwrap();
+            stream.write_all(&[value; 97]).await.unwrap();
+            let mut post = peer.next().await;
+            let first = post.request.body_mut().data().await.unwrap().unwrap();
+            assert!(!first.is_empty() && first.len() < 97);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), stream.flush())
+                    .await
+                    .is_err(),
+                "barrier flush {value} acknowledged bytes still held behind the peer's one-byte window"
+            );
+            let remaining = 97 - first.len();
+            post.request.body_mut().flow_control().release_capacity(first.len()).unwrap();
+            let server = async {
+                assert_eq!(receive(post.request.body_mut(), remaining).await, vec![value; remaining]);
+                eof(post.request.body_mut()).await;
+                response(&mut post.respond, 200, true);
+            };
+            let (flushed, ()) = tokio::join!(stream.flush(), server);
+            flushed.unwrap();
+        }
+        stream.write_all(&[0x4a; 97]).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(50), stream.flush())
+            .await
+            .expect("later flush waited for its own POST")
+            .unwrap();
+    })
+    .await
+    .expect("packet barrier exchange stalled");
+}
+
+#[tokio::test]
+async fn packet_first_datagram_flush_waits_for_its_last_post() {
     tokio::time::timeout(DEADLINE, async {
         let mut peer = Peer::new(1).await;
         let owner = peer.runtime(XhttpMode::PacketUp, 97);
@@ -77,7 +161,20 @@ async fn packet_first_flush_waits_for_the_first_post_then_stops_waiting() {
         let mut stream = open(&runtime).await;
         let _download = peer.next().await;
         peer.wait_settings(&runtime).await;
-        stream.write_all(&[0x49; 97]).await.unwrap();
+        stream.write_all(b"header").await.unwrap();
+        let server = async {
+            let mut post = peer.next().await;
+            assert_eq!(receive(post.request.body_mut(), 6).await, b"header");
+            eof(post.request.body_mut()).await;
+            response(&mut post.respond, 200, true);
+        };
+        let (flushed, ()) = tokio::join!(stream.flush(), server);
+        flushed.unwrap();
+        stream.write_all(&[0x49; 194]).await.unwrap();
+        let mut post = peer.next().await;
+        assert_eq!(receive(post.request.body_mut(), 97).await, vec![0x49; 97]);
+        eof(post.request.body_mut()).await;
+        response(&mut post.respond, 200, true);
         let mut post = peer.next().await;
         let first = post.request.body_mut().data().await.unwrap().unwrap();
         assert!(!first.is_empty() && first.len() < 97);
@@ -85,7 +182,7 @@ async fn packet_first_flush_waits_for_the_first_post_then_stops_waiting() {
             tokio::time::timeout(Duration::from_millis(50), stream.flush())
                 .await
                 .is_err(),
-            "first flush acknowledged bytes still held behind the peer's one-byte window"
+            "first datagram confirmed before its final POST left the peer window"
         );
         let remaining = 97 - first.len();
         post.request
@@ -103,14 +200,58 @@ async fn packet_first_flush_waits_for_the_first_post_then_stops_waiting() {
         };
         let (flushed, ()) = tokio::join!(stream.flush(), server);
         flushed.unwrap();
-        stream.write_all(&[0x4a; 97]).await.unwrap();
-        tokio::time::timeout(Duration::from_millis(50), stream.flush())
-            .await
-            .expect("later flush waited for its own POST")
-            .unwrap();
     })
     .await
-    .expect("packet first-flush exchange stalled");
+    .expect("multi-POST first datagram exchange stalled");
+}
+
+#[tokio::test]
+async fn packet_trojan_confirmed_send_waits_for_the_first_datagram_frame() {
+    use crate::proxy::{PacketOutbound, trojan::TrojanHandler};
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(1).await;
+        let owner = peer.runtime(XhttpMode::PacketUp, 4096);
+        let runtime = owner.runtime();
+        let target = "1.2.3.4:53".parse().unwrap();
+        let handler = TrojanHandler::new();
+        let client = handler.dial_udp_transport_runtime(runtime.clone(), target, None, DEADLINE);
+        let server = async {
+            let download = peer.next().await;
+            peer.wait_settings(&runtime).await;
+            let mut header = peer.next().await;
+            let length = header.request.headers()["content-length"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let bytes = receive(header.request.body_mut(), length).await;
+            assert_eq!(bytes[58], 3);
+            eof(header.request.body_mut()).await;
+            response(&mut header.respond, 200, true);
+            download
+        };
+        let (transport, _download) = tokio::join!(client, server);
+        let transport = transport.unwrap();
+        let send = transport.send_packet_confirmed(b"query");
+        tokio::pin!(send);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut send)
+                .await
+                .is_err(),
+            "confirmed Trojan datagram returned before its frame left the peer window"
+        );
+        let mut post = peer.next().await;
+        let server = async {
+            let frame = receive(post.request.body_mut(), 16).await;
+            assert_eq!(frame, b"\x01\x01\x02\x03\x04\x00\x35\x00\x05\r\nquery");
+            eof(post.request.body_mut()).await;
+            response(&mut post.respond, 200, true);
+        };
+        let (sent, ()) = tokio::join!(send, server);
+        sent.unwrap();
+    })
+    .await
+    .expect("Trojan confirmation exchange stalled");
 }
 
 #[tokio::test]

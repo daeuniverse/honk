@@ -1,7 +1,7 @@
 use super::preparation::PreparationState;
 use super::request::{RequestTemplate, ResolvedMode, sample};
 use super::session::connect;
-use super::stream::{Flow, FlowPermit, XhttpStream};
+use super::stream::{Flow, FlowPermit, FlushBarriers, XhttpStream};
 use super::upload::{
     RequestContext, Upload, UploadLane, carrier_closed, packet_upload, streaming_upload,
 };
@@ -47,6 +47,15 @@ pub(crate) struct XhttpRuntime {
     pub(super) lifecycle: Mutex<Lifecycle>,
     template: Result<RequestTemplate, crate::SharedError>,
     pub(super) lifecycle_changed: Notify,
+}
+
+fn packet_flush_barriers(node: &Node) -> FlushBarriers {
+    // Setup + first application flush; Encryption's handshake needs an extra barrier.
+    // Keep that extra barrier on resumed 0-RTT to avoid depending on mutable ticket state.
+    FlushBarriers {
+        remaining: 2 + u8::from(node.vless().is_some_and(|vless| vless.is_encrypted())),
+        settled_prefix: 0,
+    }
 }
 
 impl XhttpRuntime {
@@ -317,7 +326,8 @@ impl XhttpRuntime {
         Ok(Box::new(XhttpStream {
             download,
             flow,
-            packet_up: template.mode == ResolvedMode::PacketUp,
+            packet_flush_barriers: (template.mode == ResolvedMode::PacketUp)
+                .then(|| packet_flush_barriers(&runtime.node)),
             driver: driver.abort_handle(),
             _runtime: runtime.clone(),
             _flow_permit: flow_permit,

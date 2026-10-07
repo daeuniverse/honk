@@ -84,10 +84,15 @@ impl Drop for FlowPermit {
     }
 }
 
+pub(super) struct FlushBarriers {
+    pub(super) remaining: u8,
+    pub(super) settled_prefix: u64,
+}
+
 pub(super) struct XhttpStream {
     pub(super) download: ResponseReader,
     pub(super) flow: Arc<Flow>,
-    pub(super) packet_up: bool,
+    pub(super) packet_flush_barriers: Option<FlushBarriers>,
     pub(super) driver: tokio::task::AbortHandle,
     pub(super) _runtime: Arc<NodeRuntime>,
     pub(super) _flow_permit: FlowPermit,
@@ -206,18 +211,23 @@ impl AsyncWrite for XhttpStream {
         if let Some(error) = &state.error {
             return Poll::Ready(Err(clone_error(error)));
         }
-        // Core confirms a flow's first datagram through flush, so packet-up waits for the
-        // first POST body to leave; later flushes must not serialize datagrams behind pacing.
-        let settled = if self.packet_up {
-            state.accepted == 0 || state.flushed > 0
-        } else {
-            state.flushed == state.accepted
-        };
-        if settled {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
+        let accepted = state.accepted;
+        let flushed = state.flushed;
+        drop(state);
+        // Setup flushes precede core's first datagram; later barriers would defeat batching.
+        if let Some(barriers) = &mut self.packet_flush_barriers {
+            if barriers.remaining == 0 || accepted == barriers.settled_prefix {
+                return Poll::Ready(Ok(()));
+            }
+            if flushed < accepted {
+                return Poll::Pending;
+            }
+            barriers.remaining -= 1;
+            barriers.settled_prefix = accepted;
+        } else if flushed != accepted {
+            return Poll::Pending;
         }
+        Poll::Ready(Ok(()))
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_control(cx)?;
