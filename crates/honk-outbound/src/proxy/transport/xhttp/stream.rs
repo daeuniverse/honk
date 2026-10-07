@@ -19,7 +19,6 @@ pub(super) struct WriteState {
     pub(super) bytes: BytesMut,
     pub(super) accepted: u64,
     pub(super) flushed: u64,
-    pub(super) flush_to: u64,
     pub(super) shutdown: bool,
     pub(super) finished: bool,
     pub(super) error: Option<Arc<io::Error>>,
@@ -44,7 +43,6 @@ impl Flow {
                 bytes: BytesMut::new(),
                 accepted: 0,
                 flushed: 0,
-                flush_to: 0,
                 shutdown: false,
                 finished: false,
                 error: None,
@@ -89,6 +87,7 @@ impl Drop for FlowPermit {
 pub(super) struct XhttpStream {
     pub(super) download: ResponseReader,
     pub(super) flow: Arc<Flow>,
+    pub(super) packet_up: bool,
     pub(super) driver: tokio::task::AbortHandle,
     pub(super) _runtime: Arc<NodeRuntime>,
     pub(super) _flow_permit: FlowPermit,
@@ -203,11 +202,13 @@ impl AsyncWrite for XhttpStream {
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_control(cx)?;
-        let mut state = self.flow.state.lock();
+        let state = self.flow.state.lock();
         if let Some(error) = &state.error {
             return Poll::Ready(Err(clone_error(error)));
         }
-        state.flush_to = state.accepted;
+        if self.packet_up {
+            return Poll::Ready(Ok(()));
+        }
         if state.flushed == state.accepted {
             return Poll::Ready(Ok(()));
         }

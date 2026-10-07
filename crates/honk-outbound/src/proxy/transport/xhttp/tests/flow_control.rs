@@ -1,6 +1,79 @@
 use super::*;
 
 #[tokio::test]
+async fn packet_flush_coalesces_datagrams_during_post_pacing() {
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(4096).await;
+        let owner = peer.runtime(XhttpMode::PacketUp, 4096);
+        let mut node = (*owner.runtime().node).clone();
+        node.transport_mut()
+            .unwrap()
+            .xhttp
+            .as_mut()
+            .unwrap()
+            .sc_min_posts_interval_ms = XhttpRange { min: 200, max: 200 };
+        node.id = node.derive_id();
+        let owner = NodeRuntime::try_ephemeral_guarded(&node).unwrap();
+        let runtime = owner.runtime();
+        let mut stream = open(&runtime).await;
+        let mut download = peer.next().await;
+        response(&mut download.respond, 200, false);
+        let started = tokio::time::Instant::now();
+        stream.write_all(&[0; 32]).await.unwrap();
+        let mut first = tokio::time::timeout(Duration::from_millis(100), peer.next())
+            .await
+            .expect("idle upload waited for an extra batch delay");
+        let first_at = tokio::time::Instant::now();
+        assert_eq!(receive(first.request.body_mut(), 32).await, [0; 32]);
+        eof(first.request.body_mut()).await;
+        response(&mut first.respond, 200, true);
+        let client = async {
+            for value in 1..13u8 {
+                stream.write_all(&[value; 32]).await.unwrap();
+                stream.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            stream.shutdown().await.unwrap();
+        };
+        let server = async {
+            let mut received = vec![0; 32];
+            let mut posts = 1;
+            let mut last = Some(first_at);
+            while received.len() < 13 * 32 {
+                let mut post = peer.next().await;
+                let now = tokio::time::Instant::now();
+                if let Some(last) = last {
+                    assert!(now.duration_since(last) >= Duration::from_millis(195));
+                }
+                last = Some(now);
+                let length = post.request.headers()["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                received.extend(receive(post.request.body_mut(), length).await);
+                eof(post.request.body_mut()).await;
+                response(&mut post.respond, 200, true);
+                posts += 1;
+            }
+            assert_eq!(
+                received,
+                (0..13u8).flat_map(|value| [value; 32]).collect::<Vec<_>>()
+            );
+            posts
+        };
+        let ((), posts) = tokio::join!(client, server);
+        eprintln!(
+            "packet flush loop: {posts} POSTs in {:?}",
+            started.elapsed()
+        );
+        assert!(posts <= 3, "per-datagram flush serialized paced POSTs");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn packet_posts_aggregate_and_pipeline_without_waiting_for_prior_response() {
     tokio::time::timeout(DEADLINE, async {
         let mut peer = Peer::new(2).await;
@@ -34,7 +107,7 @@ async fn packet_posts_aggregate_and_pipeline_without_waiting_for_prior_response(
         );
         stream.write_all(b"last").await.unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), stream.flush())
+            tokio::time::timeout(Duration::from_millis(50), stream.write(b"blocked"))
                 .await
                 .is_err(),
             "unanswered POST bound did not apply backpressure"
@@ -169,12 +242,8 @@ async fn split_reader_and_writer_keep_independent_wakeups_under_small_windows() 
 }
 
 #[tokio::test]
-async fn flush_waits_for_real_peer_window_capacity_in_every_upload_mode() {
-    for mode in [
-        XhttpMode::PacketUp,
-        XhttpMode::StreamUp,
-        XhttpMode::StreamOne,
-    ] {
+async fn flush_waits_for_real_peer_window_capacity_in_streaming_modes() {
+    for mode in [XhttpMode::StreamUp, XhttpMode::StreamOne] {
         tokio::time::timeout(DEADLINE, async {
             let mut peer = Peer::new(1).await;
             let owner = peer.runtime(mode, 97);
@@ -188,9 +257,6 @@ async fn flush_waits_for_real_peer_window_capacity_in_every_upload_mode() {
             };
             peer.wait_settings(&runtime).await;
             stream.write_all(&[0x49; 97]).await.unwrap();
-            if mode == XhttpMode::PacketUp {
-                upload = Some(peer.next().await);
-            }
             let body = match &mut upload {
                 Some(upload) => upload.request.body_mut(),
                 None => download.request.body_mut(),

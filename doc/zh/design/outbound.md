@@ -309,11 +309,11 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 
 每条 carrier 最多保留 2048 个本地 reset 请求（16 个准入窗口），使用 h2 默认的一秒在途 frame 宽限期，并保留其默认、有限的终身 1024 次协议错误 reset 预算；持续的短 flow churn 会在旧 reset 状态过期前取消多个准入窗口，因此保留数量必须高于活跃请求上限。
 
-Stream-one 使用一个 POST，stream-up 使用 GET 与流式 POST，packet-up 使用 GET 与有序有限 POST。建链无需等待响应头即可返回可写流。上传响应中的 padding 持续排空并丢弃，不记作应用 RX。Packet-up 聚合已取得所有权的字节并限制未完成响应数，不会每次应用 write 都发一个 POST；前一个 body 物理写完后即可继续后续 POST，不必等待它的响应。
+Stream-one 使用一个 POST，stream-up 使用 GET 与流式 POST，packet-up 使用 GET 与有序有限 POST。建链无需等待响应头即可返回可写流。上传响应中的 padding 持续排空并丢弃，不记作应用 RX。Packet-up 在空闲后的首批数据到达时立即发送，不额外等待凑批。连续 POST 遵守 `scMinPostsIntervalMs`；POST 等待节奏间隔或其 body 正在发送时接纳的字节合并到下一次 POST。每流字节缓冲和最多八个未完成响应的 POST 限制背压；前一个 body 物理写完后即可继续后续 POST，不必等待它的响应。
 
 Legacy 上传 padding 的 Referer 使用配置的基础 path，并将其 query 替换为生成的 `x_padding` 值；请求本身保留配置的 query。
 
-Flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新；缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 等待各 POST 的终端响应，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
+Stream-one 与 stream-up 的 flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新。Packet-up 的 flush 检查保留的错误且不延迟上传，但不等待 POST，因此逐 datagram 的 write/flush 循环仍可跨节奏间隔合并批次。未调用 shutdown 就丢弃 packet-up stream 会丢弃已接纳但尚未上传的字节；shutdown 是其唯一的上传完成屏障。缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 的 shutdown 等待每个已接纳字节所属 POST 的响应完成并检查状态，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
 
 Stream-up 上传响应错误已经就绪时，优先于同时完成的请求 END_STREAM 处理，因此 shutdown 返回该拒绝错误，而不是报告半关闭成功。
 

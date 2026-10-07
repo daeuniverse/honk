@@ -121,27 +121,18 @@ pub(super) async fn take_batch(
     delay: Duration,
     last: Instant,
 ) -> io::Result<Option<Bytes>> {
-    let mut deadline = None;
     loop {
         let notified = flow.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let (has_data, immediate, shutdown) = {
+        let (has_data, shutdown) = {
             let state = flow.state.lock();
             if let Some(error) = &state.error {
                 return Err(clone_error(error));
             }
-            (
-                !state.bytes.is_empty(),
-                state.flush_to > state.flushed || state.bytes.len() == flow.limit,
-                state.shutdown,
-            )
+            (!state.bytes.is_empty(), state.shutdown)
         };
         if has_data {
-            if !immediate && !shutdown && !delay.is_zero() {
-                let deadline = *deadline.get_or_insert_with(|| Instant::now() + delay);
-                tokio::select! { _ = &mut notified => { continue; }, _ = tokio::time::sleep_until(deadline) => {} }
-            }
             let next = last + delay;
             if next > Instant::now() {
                 tokio::time::sleep_until(next).await;

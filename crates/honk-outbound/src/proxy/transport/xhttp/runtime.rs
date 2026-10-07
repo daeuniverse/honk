@@ -317,6 +317,7 @@ impl XhttpRuntime {
         Ok(Box::new(XhttpStream {
             download,
             flow,
+            packet_up: template.mode == ResolvedMode::PacketUp,
             driver: driver.abort_handle(),
             _runtime: runtime.clone(),
             _flow_permit: flow_permit,

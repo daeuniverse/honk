@@ -193,6 +193,7 @@ async fn ready_stream_upload_refusal_precedes_shutdown_completion() {
                 stream: Mutex::new(XhttpStream {
                     download: Upload::download(download),
                     flow: flow.clone(),
+                    packet_up: false,
                     driver: driver.abort_handle(),
                     _runtime: runtime.clone(),
                     _flow_permit: FlowPermit {
