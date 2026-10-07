@@ -316,7 +316,7 @@ Stream-one 使用一个 POST，stream-up 使用 GET 与流式 POST，packet-up �
 
 Legacy 上传 padding 的 Referer 使用配置的基础 path，并将其 query 替换为生成的 `x_padding` 值；请求本身保留配置的 query。
 
-Stream-one 与 stream-up 的 flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新。Packet-up 的 flush 检查保留的错误且不延迟上传，但不等待 POST，因此逐 datagram 的 write/flush 循环仍可跨节奏间隔合并批次。未调用 shutdown 就丢弃 packet-up stream 会丢弃已接纳但尚未上传的字节；shutdown 是其唯一的上传完成屏障。缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 的 shutdown 等待每个已接纳字节所属 POST 的响应完成并检查状态，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
+Stream-one 与 stream-up 的 flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新。Packet-up 的首次 flush 等待该 flow 的第一个 POST 请求体物理刷新（core 对首个 datagram 的确认依赖它）；之后的 packet-up flush 只检查保留的错误且不等待 POST，因此逐 datagram 的 write/flush 循环可跨节奏间隔合并批次。未调用 shutdown 就丢弃 packet-up stream 会丢弃已接纳但尚未上传的字节；shutdown 是其唯一的上传完成屏障。缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 的 shutdown 等待每个已接纳字节所属 POST 的响应完成并检查状态，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
 
 如果对端缩小 stream 上限导致已保留的 packet-up 上传 lane 不可用，则先将该 carrier 转为 draining，再接纳 replacement。已有 GET 保持存活，replacement 获取上传容量；旧 reservation 不会占住可复用 carrier 上限。
 

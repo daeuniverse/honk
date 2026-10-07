@@ -18,7 +18,6 @@ async fn packet_flush_coalesces_datagrams_during_post_pacing() {
         let mut stream = open(&runtime).await;
         let mut download = peer.next().await;
         response(&mut download.respond, 200, false);
-        let started = tokio::time::Instant::now();
         stream.write_all(&[0; 32]).await.unwrap();
         let mut first = tokio::time::timeout(Duration::from_millis(100), peer.next())
             .await
@@ -63,14 +62,55 @@ async fn packet_flush_coalesces_datagrams_during_post_pacing() {
             posts
         };
         let ((), posts) = tokio::join!(client, server);
-        eprintln!(
-            "packet flush loop: {posts} POSTs in {:?}",
-            started.elapsed()
-        );
         assert!(posts <= 3, "per-datagram flush serialized paced POSTs");
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn packet_first_flush_waits_for_the_first_post_then_stops_waiting() {
+    tokio::time::timeout(DEADLINE, async {
+        let mut peer = Peer::new(1).await;
+        let owner = peer.runtime(XhttpMode::PacketUp, 97);
+        let runtime = owner.runtime();
+        let mut stream = open(&runtime).await;
+        let _download = peer.next().await;
+        peer.wait_settings(&runtime).await;
+        stream.write_all(&[0x49; 97]).await.unwrap();
+        let mut post = peer.next().await;
+        let first = post.request.body_mut().data().await.unwrap().unwrap();
+        assert!(!first.is_empty() && first.len() < 97);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.flush())
+                .await
+                .is_err(),
+            "first flush acknowledged bytes still held behind the peer's one-byte window"
+        );
+        let remaining = 97 - first.len();
+        post.request
+            .body_mut()
+            .flow_control()
+            .release_capacity(first.len())
+            .unwrap();
+        let server = async {
+            assert_eq!(
+                receive(post.request.body_mut(), remaining).await,
+                vec![0x49; remaining]
+            );
+            eof(post.request.body_mut()).await;
+            response(&mut post.respond, 200, true);
+        };
+        let (flushed, ()) = tokio::join!(stream.flush(), server);
+        flushed.unwrap();
+        stream.write_all(&[0x4a; 97]).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(50), stream.flush())
+            .await
+            .expect("later flush waited for its own POST")
+            .unwrap();
+    })
+    .await
+    .expect("packet first-flush exchange stalled");
 }
 
 #[tokio::test]

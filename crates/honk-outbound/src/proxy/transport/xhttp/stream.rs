@@ -206,15 +206,18 @@ impl AsyncWrite for XhttpStream {
         if let Some(error) = &state.error {
             return Poll::Ready(Err(clone_error(error)));
         }
-        if self.packet_up {
-            return Poll::Ready(Ok(()));
+        // Core confirms a flow's first datagram through flush, so packet-up waits for the
+        // first POST body to leave; later flushes must not serialize datagrams behind pacing.
+        let settled = if self.packet_up {
+            state.accepted == 0 || state.flushed > 0
+        } else {
+            state.flushed == state.accepted
+        };
+        if settled {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
         }
-        if state.flushed == state.accepted {
-            return Poll::Ready(Ok(()));
-        }
-        drop(state);
-        self.flow.changed.notify_one();
-        Poll::Pending
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_control(cx)?;
