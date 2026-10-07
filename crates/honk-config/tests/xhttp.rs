@@ -22,6 +22,20 @@ fn flat(options: Value) -> Result<Node, serde_json::Error> {
 }
 
 #[test]
+fn literal_path_admission_keeps_raw_query_validation() {
+    for path in ["/a b/", "/<>/", "/雪/", "/a%2Fb/?raw=a%2Fb&keep=1"] {
+        let node = flat(json!({"path":path})).unwrap();
+        assert_eq!(node.transport().unwrap().xhttp.as_ref().unwrap().path, path);
+        let query = url::form_urlencoded::Serializer::new(String::from("type=xhttp&"))
+            .append_pair("path", path).finish();
+        assert_eq!(node.derive_id(), link(&query).id);
+    }
+    for path in ["/a\t/", "/a\u{7f}/", "/a\0/", "/a#fragment/", "/a/?q=a b", "/a/?q=<>"] {
+        assert!(flat(json!({"path":path})).is_err(), "{path:?}");
+    }
+}
+
+#[test]
 fn extra_request_fields_fill_only_absent_top_level_claims() {
     let extra = json!({"host":"front.example", "path":"api", "mode":"stream-up"});
     let canonical = link("type=xhttp&host=front.example&path=api&mode=stream-up");

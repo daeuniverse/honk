@@ -362,8 +362,9 @@ impl XhttpOptions {
             return Err("XHTTP path must be normalized before admission");
         }
         if self.path.contains('#')
-            || self.path.bytes().any(|byte| byte <= b' ' || byte == 127)
-            || self.path.parse::<http::uri::PathAndQuery>().is_err()
+            || self.path.bytes().any(|byte| byte < b' ' || byte == 127)
+            // The normalized trailing slash lets the URI parser check only the unescaped query.
+            || self.path[path.len() - 1..].parse::<http::uri::PathAndQuery>().is_err()
         {
             return Err("invalid XHTTP path");
         }

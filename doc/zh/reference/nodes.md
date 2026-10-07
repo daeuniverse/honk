@@ -207,7 +207,7 @@ node {
 
 `mode=auto|packet-up|stream-up|stream-one` 默认为 `auto`。VMess JSON 在 `net=xhttp|splithttp` 时也接受 v2rayN 用 `type` 表示 mode；显式 `mode` 与 `type` 必须一致。JSON `fp` 接受但忽略；`insecure` 与 `allowInsecure` 使用共用布尔值词汇控制证书校验，且必须一致。URI、VMess JSON 与 Mihomo 导入时会 trim ALPN 字符串及列表成员并忽略空项；未指定时选择 `h2`。Auto 对普通 TLS 或明文选择 packet-up，对 REALITY 选择 stream-one。Packet-up 用有序有限 POST body 与同 session 的 GET；stream-up 用独立流式 POST 和 GET；stream-one 用一个双向 POST。即使 header 伪装为 gRPC/SSE，body 仍是原始代理字节。
 
-`path` 默认为 `/`；在 query 之前补首尾斜杠，不清理 dot segment 或百分号转义。HTTP `host` 与拨号地址、SNI 独立，依次回退到 SNI、服务端 host。直接构造节点必须先调用 `normalize_stream_transport()`，再派生 ID；不可变准入会拒绝非规范 XHTTP 名称、参数及 ALPN。Path 部分是解码后的字面值，发送时按 Xray 规则转义：字面 `%` 变为 `%25`，空格及 UTF-8 字节使用百分号编码，配置的 query 保持不变；URI 分享链接参数在此之前只解码一次，因此 `path=%2Fxhttp%2F` 仍发送 `/xhttp/`，而 Mihomo path 使用 YAML 字符串字面值。
+`path` 默认为 `/`；在 query 之前补首尾斜杠，不清理 dot segment 或百分号转义。HTTP `host` 与拨号地址、SNI 独立，依次回退到 SNI、服务端 host。直接构造节点必须先调用 `normalize_stream_transport()`，再派生 ID；不可变准入会拒绝非规范 XHTTP 名称、参数及 ALPN。Path 部分是解码后的字面值，发送时按 Xray 规则转义：字面 `%` 变为 `%25`，空格、`<`、`>` 及 UTF-8 字节使用百分号编码，配置的 query 保持不变。准入会拒绝任何位置的控制字节、DEL 与 `#`，并按原始 HTTP URI 语法校验 query（因此 query 中的字面空格必须预先进行百分号编码）。URI 分享链接参数在此之前只解码一次，因此 `path=%2Fxhttp%2F` 仍发送 `/xhttp/`，而 Mihomo path 使用 YAML 字符串字面值。
 
 URI `extra` 接受百分号编码的 JSON 对象，可含 `host`、`path`、`mode`，其含义、规范化与校验和顶层字段相同，并仅支持下表选项。Extra 请求字段只填充缺失的顶层字段；显式顶层字段即使为空也优先。重复 URI extra 仅在有效规范选项一致时合并。
 
