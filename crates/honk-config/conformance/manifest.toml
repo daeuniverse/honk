@@ -1868,7 +1868,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-configuration-02"
-source = { file = "doc/zh/configuration.md", lines = "61-117" }
+source = { file = "doc/zh/configuration.md", lines = "61-118" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1880,7 +1880,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-03"
-source = { file = "doc/zh/configuration.md", lines = "125-193" }
+source = { file = "doc/zh/configuration.md", lines = "126-195" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1892,7 +1892,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-04"
-source = { file = "doc/zh/configuration.md", lines = "240-252" }
+source = { file = "doc/zh/configuration.md", lines = "242-254" }
 wrap = ""
 layer = "structure"
 honk = "accept"
