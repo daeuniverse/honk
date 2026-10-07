@@ -263,6 +263,19 @@ fn parse_vmess_link(payload: &str) -> Result<Node, ConfigError> {
     json.into_node()
 }
 
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum VmessXhttpClaim<T> {
+    Parsed(T),
+    Ignored(serde::de::IgnoredAny),
+}
+
+#[derive(serde::Deserialize)]
+struct VmessExtra(
+    #[serde(deserialize_with = "crate::node::deserialize_xray_extra")]
+    Option<crate::node::XrayExtra>,
+);
+
 /// Field set of a base64-JSON `vmess://` share link (v2rayN schema).
 ///
 /// `port`/`aid` are modelled as [`serde_json::Value`] because exporters
@@ -299,9 +312,9 @@ struct VmessLinkJson {
     /// XHTTP ALPN is validated and retained; other legacy VMess links ignore it.
     alpn: Option<String>,
     #[serde(default, deserialize_with = "crate::node::present_option")]
-    mode: Option<crate::node::XhttpMode>,
-    #[serde(default, deserialize_with = "crate::node::deserialize_xray_extra")]
-    extra: Option<crate::node::XrayExtra>,
+    mode: Option<VmessXhttpClaim<crate::node::XhttpMode>>,
+    #[serde(default, deserialize_with = "crate::node::present_option")]
+    extra: Option<VmessXhttpClaim<VmessExtra>>,
     #[serde(flatten)]
     additional: std::collections::BTreeMap<String, serde_json::Value>,
 }
@@ -332,13 +345,18 @@ impl VmessLinkJson {
             ..Default::default()
         };
         if transport_kind == "xhttp" {
-            let mode = self.mode.take();
-            let extra = self.extra.take();
+            let invalid = || ConfigError::Parse("invalid VMess XHTTP option".into());
+            let mode = match self.mode.take() {
+                Some(VmessXhttpClaim::Parsed(mode)) => Some(mode),
+                Some(VmessXhttpClaim::Ignored(_)) => return Err(invalid()),
+                None => None,
+            };
+            let extra = match self.extra.take() {
+                Some(VmessXhttpClaim::Parsed(extra)) => extra.0,
+                Some(VmessXhttpClaim::Ignored(_)) => return Err(invalid()),
+                None => None,
+            };
             xhttp::apply_vmess_xhttp(&self, mode, extra, &mut stream, &mut tls)?;
-        } else if self.extra.is_some() || self.mode.is_some() {
-            return Err(ConfigError::Parse(
-                "XHTTP options require XHTTP transport".into(),
-            ));
         }
         let host_claim = self.host.filter(|host| !host.is_empty());
         let host_sni_claim = optional_text([host_claim.as_deref()])

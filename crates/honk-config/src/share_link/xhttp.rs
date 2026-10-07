@@ -22,18 +22,14 @@ pub(super) fn apply_xhttp_query(
 ) -> Result<bool, DetailedConfigError> {
     let invalid = |message| query_error(source, &["xhttp"], "invalid-config-value", message);
     let Some(transport) = node.transport_mut() else {
-        return if query.1 || query.contains_key("extra") || query.contains_key("mode") {
+        return if query.1 {
             Err(invalid("XHTTP options require a stream protocol"))
         } else {
             Ok(false)
         };
     };
     if xhttp_stream_transport(&transport.transport) != Ok("xhttp") {
-        return if query.contains_key("extra") || query.contains_key("mode") {
-            Err(invalid("XHTTP options require XHTTP transport"))
-        } else {
-            Ok(false)
-        };
+        return Ok(false);
     }
     for (key, _) in &query.0 {
         if !matches!(

@@ -22,6 +22,26 @@ fn flat(options: Value) -> Result<Node, serde_json::Error> {
 }
 
 #[test]
+fn legacy_transports_ignore_unrelated_mode_and_extra() {
+    for transport in ["tcp", "ws", "grpc"] {
+        for scheme in ["vless", "trojan"] {
+            let base = format!("{scheme}://{UUID}@example.com:443?type={transport}&path=/svc&serviceName=svc");
+            let canonical = Node::from_share_link(&base).unwrap();
+            for suffix in ["&mode=gun", "&mode=multi&extra=", "&extra=not-json"] {
+                let node = Node::from_share_link(&format!("{base}{suffix}")).unwrap();
+                assert_eq!(node.outbound, canonical.outbound);
+                assert_eq!(node.id, canonical.id);
+            }
+        }
+        let fixture = json!({"add":"example.com", "port":443, "id":UUID, "net":transport,
+            "mode":"gun", "extra":{"unrelated":null}});
+        let node = Node::from_share_link(&format!("vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(fixture.to_string()))).unwrap();
+        assert_eq!(node.transport().unwrap().transport, transport);
+    }
+}
+
+#[test]
 fn aliases_defaults_and_normalized_paths_share_identity() {
     let canonical = link("type=xhttp");
     assert_eq!(
@@ -514,8 +534,6 @@ fn nonstream_uri_protocols_reject_xhttp_claims_instead_of_discarding_them() {
             "type=xhttp",
             "network=splithttp",
             "type=xhttp&extra=%7B%7D",
-            "extra=null",
-            "mode=auto",
         ] {
             let mut diagnostics = Vec::new();
             let error = Node::from_share_link_with_detailed_diagnostics(
