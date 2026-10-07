@@ -403,6 +403,7 @@ fn xhttp_probe_shape_is_supported_without_exposing_options() {
     let mut invalid = node.clone();
     invalid.vless_mut().unwrap().multiplex =
         VlessMultiplex::xray(8, 8, honk_config::node::Udp443Policy::Allow);
+    invalid.id = invalid.derive_id();
     assert_eq!(
         classify_vless_node(&invalid),
         ProbeEligibility::InvalidConfig("invalid-config")
