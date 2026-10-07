@@ -44,6 +44,13 @@ fn literal_path_admission_keeps_raw_query_validation() {
 }
 
 #[test]
+fn path_length_is_bounded_before_escaping_can_overflow_the_request_target() {
+    let longest = format!("/{}/", "a".repeat(16 * 1024 - 2));
+    flat(json!({"path": longest})).unwrap();
+    assert!(flat(json!({"path": format!("{longest}a/")})).is_err());
+}
+
+#[test]
 fn extra_request_fields_fill_only_absent_top_level_claims() {
     let extra = json!({"host":"front.example", "path":"api", "mode":"stream-up"});
     let canonical = link("type=xhttp&host=front.example&path=api&mode=stream-up");

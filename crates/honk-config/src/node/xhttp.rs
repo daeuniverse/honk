@@ -311,6 +311,7 @@ impl XhttpOptions {
         max: 1_000_000,
     };
     const DEFAULT_INTERVAL: XhttpRange = XhttpRange { min: 30, max: 30 };
+    const MAX_PATH_BYTES: usize = 16 * 1024;
 
     /// Dot segments and escapes are wire data, not URL resolution instructions.
     pub fn normalize_path(value: &str) -> String {
@@ -361,7 +362,9 @@ impl XhttpOptions {
         if !path.starts_with('/') || !path.ends_with('/') {
             return Err("XHTTP path must be normalized before admission");
         }
-        if self.path.contains('#')
+        // Escaping can triple a path byte; the request target must stay inside the HTTP parser's limit.
+        if self.path.len() > Self::MAX_PATH_BYTES
+            || self.path.contains('#')
             || self.path.bytes().any(|byte| byte < b' ' || byte == 127)
             // The normalized trailing slash lets the URI parser check only the unescaped query.
             || self.path[path.len() - 1..].parse::<http::uri::PathAndQuery>().is_err()
