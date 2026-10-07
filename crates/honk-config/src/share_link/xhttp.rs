@@ -112,9 +112,9 @@ pub(super) fn apply_xhttp_query(
     transport.transport = "xhttp".into();
     let alpn = coalesce_equal(
         query.values("alpn").map(|value| {
-            let mut protocols = value.split(',').map(str::to_string).collect::<Vec<_>>();
+            let mut protocols = value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
             protocols.dedup();
-            Ok(Some(protocols))
+            Ok((!protocols.is_empty()).then_some(protocols))
         }),
         "XHTTP ALPN claims conflict",
     )
@@ -133,13 +133,26 @@ pub(super) fn apply_vmess_xhttp(
     tls: &mut TlsOptions,
 ) -> Result<(), ConfigError> {
     let invalid = || ConfigError::Parse("unsupported or invalid VMess XHTTP option".into());
-    if json
-        .r#type
-        .as_deref()
-        .is_some_and(|value| !matches!(value, "" | "none"))
-        || json.additional.keys().any(|key| key != "v")
+    if json.additional.keys().any(|key| !matches!(key.as_str(), "v" | "fp" | "insecure" | "allowInsecure"))
     {
         return Err(invalid());
+    }
+    let mode = coalesce_equal(
+        mode.map(Some).into_iter().map(Ok).chain(json.r#type.as_deref().filter(|value| !matches!(*value, "" | "none")).map(|value| value.parse().map(Some))),
+        "XHTTP mode claims conflict",
+    ).map_err(|_| invalid())?;
+    if let Some(insecure) = coalesce_equal(
+        ["insecure", "allowInsecure"].into_iter().filter_map(|key| json.additional.get(key)).map(|value| {
+            match value {
+                serde_json::Value::Bool(value) => Ok(Some(*value)),
+                serde_json::Value::Number(value) if value.as_u64() == Some(0) => Ok(Some(false)),
+                serde_json::Value::Number(value) if value.as_u64() == Some(1) => Ok(Some(true)),
+                serde_json::Value::String(value) => crate::options::vocab::verification_text(value).map(Some),
+                _ => Err("invalid certificate verification boolean"),
+            }
+        }), "conflicting certificate verification aliases",
+    ).map_err(|_| invalid())? {
+        tls.skip_cert_verify = insecure;
     }
     let mut options = XhttpOptions {
         path: json.path.clone().unwrap_or_else(|| "/".into()),

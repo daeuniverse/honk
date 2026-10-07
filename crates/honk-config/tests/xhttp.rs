@@ -22,6 +22,36 @@ fn flat(options: Value) -> Result<Node, serde_json::Error> {
 }
 
 #[test]
+fn vmess_exported_xhttp_mode_and_empty_alpn_are_canonical() {
+    let parse = |fixture: Value| Node::from_share_link(&format!("vmess://{}",
+        base64::engine::general_purpose::STANDARD.encode(fixture.to_string())));
+    for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+        let base = json!({"add":"example.com", "port":443, "id":UUID, "net":"xhttp", "tls":"tls", "mode":mode});
+        let canonical = parse(base.clone()).unwrap();
+        let mut exported = base;
+        exported.as_object_mut().unwrap().remove("mode");
+        exported["type"] = json!(mode);
+        exported["fp"] = json!("chrome");
+        exported["insecure"] = json!(false);
+        for alpn in ["", " , ", " h2, ,h2 "] {
+            exported["alpn"] = json!(alpn);
+            let node = parse(exported.clone()).unwrap();
+            assert_eq!(node.outbound, canonical.outbound);
+            assert_eq!(node.id, canonical.id);
+        }
+        exported["insecure"] = json!(true);
+        assert!(parse(exported.clone()).unwrap().tls().unwrap().skip_cert_verify);
+        exported["mode"] = json!(if mode == "auto" { "stream-one" } else { "auto" });
+        assert!(parse(exported).is_err());
+    }
+    for alpn in ["", " , ", " h2, ,h2 "] {
+        let query = url::form_urlencoded::Serializer::new(String::from("type=xhttp&"))
+            .append_pair("alpn", alpn).finish();
+        assert_eq!(link(&query).id, link("type=xhttp").id);
+    }
+}
+
+#[test]
 fn xhttp_uri_exporter_metadata_preserves_tls_and_request_options() {
     for scheme in ["trojan", "vless"] {
         let base = format!("{scheme}://{UUID}@example.com:443?type=xhttp&security=reality&pbk=key&sid=&spx=/&sni=tls.example&alpn=h2&host=front.example&path=/api&mode=auto&allowInsecure=1&insecure=1");

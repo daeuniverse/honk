@@ -327,7 +327,7 @@ fn truncated_all_invalid_body_keeps_terminal_failure() {
 #[test]
 fn xhttp_mihomo_options_reach_canonical_nodes_and_identity() {
     let body = r#"proxies:
-  - {name: first, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: splithttp, alpn: [h2], xhttp-opts: {path: api, host: front.example, mode: stream-up, headers: {X-B: b, x-a: a}, x-padding-bytes: 123-456, no-grpc-header: true, sc-max-each-post-bytes: 4096, sc-min-posts-interval-ms: 0-50}}
+  - {name: first, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: splithttp, alpn: [' h2 ', '', ' '], xhttp-opts: {path: api, host: front.example, mode: stream-up, headers: {X-B: b, x-a: a}, x-padding-bytes: 123-456, no-grpc-header: true, sc-max-each-post-bytes: 4096, sc-min-posts-interval-ms: 0-50}}
   - {name: alias, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {path: /api/, host: front.example, mode: stream-up, headers: {X-A: a, x-b: b}, x-padding-bytes: {min: 123, max: 456}, no-grpc-header: true, sc-max-each-post-bytes: '4096', sc-min-posts-interval-ms: {min: 0, max: 50}}}
   - {name: changed, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {path: /changed}}
 "#;
