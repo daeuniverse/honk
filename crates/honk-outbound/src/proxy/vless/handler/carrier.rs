@@ -27,11 +27,7 @@ impl VLessHandler {
         if node.is_xhttp() {
             let stream =
                 crate::proxy::transport::wrap_transport(node, tcp, connect_timeout).await?;
-            return if let Some(config) = encryption {
-                Ok(start(config.connect(stream).await?, &header, vision).await?)
-            } else {
-                Ok(start(stream, &header, vision).await?)
-            };
+            return start_boxed(encryption, stream, &header, vision).await;
         }
         if encryption.is_none()
             && vision.is_some()
@@ -69,10 +65,7 @@ impl VLessHandler {
             None => stream,
         };
         let stream = crate::proxy::transport::wrap_after_tls(node, stream).await?;
-        if let Some(config) = encryption {
-            return Ok(start(config.connect(stream).await?, &header, vision).await?);
-        }
-        Ok(start(stream, &header, vision).await?)
+        start_boxed(encryption, stream, &header, vision).await
     }
 
     pub(super) async fn dial_base(
@@ -130,12 +123,11 @@ impl VLessHandler {
                     crate::proxy::transport::prepare_transport_runtime(runtime, None, timeout)
                         .await?;
                 let vision = runtime.node.vless().unwrap().is_vision().then_some(uuid);
-                let stream = if let Some(config) = self.encryption_config(&runtime.node)? {
-                    start(config.connect(stream).await?, &header, vision).await?
-                } else {
-                    start(stream, &header, vision).await?
-                };
-                Ok((stream, preparation))
+                let encryption = self.encryption_config(&runtime.node)?;
+                Ok((
+                    start_boxed(encryption, stream, &header, vision).await?,
+                    preparation,
+                ))
             })
             .await
     }
@@ -189,4 +181,18 @@ impl VLessHandler {
         self.prepare_retained_carrier(runtime, uuid, header, timeout)
             .await
     }
+}
+
+/// Completes the VLESS request on a boxed carrier, layering the configured
+/// encryption underneath so every outer transport shares one completion path.
+async fn start_boxed(
+    encryption: Option<Arc<crate::proxy::vless::encryption::ClientConfig>>,
+    stream: Box<dyn AsyncReadWrite>,
+    header: &[u8],
+    vision: Option<[u8; 16]>,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+    Ok(match encryption {
+        Some(config) => start(config.connect(stream).await?, header, vision).await?,
+        None => start(stream, header, vision).await?,
+    })
 }
