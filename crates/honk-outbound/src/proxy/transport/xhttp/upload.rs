@@ -403,6 +403,8 @@ impl RequestContext<'_> {
             return Ok((session, RequestOwner::Pool { _permit: permit }));
         };
         if !lane.session.reserved_lane_usable() {
+            // Retained lanes must not pin unusable carriers inside the reusable cap.
+            lane.session.begin_drain();
             let (session, permit) = self.reserve().await?;
             *lane = UploadLane::new(session, permit);
         }
