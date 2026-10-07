@@ -315,7 +315,7 @@ fn resolve_stream_transport<'a>(
             source,
             &["transport"],
             "invalid-config-value",
-            "stream transport must be tcp, ws, or grpc; aliases must agree",
+            "stream transport must be tcp, ws, grpc, or xhttp (splithttp); aliases must agree",
         )
     };
     let mut resolved = None;
@@ -371,7 +371,7 @@ pub(super) fn apply_transport(
                 source,
                 &["transport"],
                 "invalid-config-value",
-                "stream transport must be tcp, ws, or grpc; aliases must agree",
+                "stream transport must be tcp, ws, grpc, or xhttp (splithttp); aliases must agree",
             )
         })?;
         match transport_kind {

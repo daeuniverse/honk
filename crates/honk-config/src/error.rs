@@ -149,7 +149,7 @@ impl DetailedConfigError {
                 | "unsupported VMess obfs transport" => Some((
                     "invalid-config-value",
                     SettingPath::new("nodes").field("transport"),
-                    "stream transport must be tcp, ws, or grpc; aliases must agree",
+                    "stream transport must be tcp, ws, grpc, or xhttp (splithttp); aliases must agree",
                 )),
                 "invalid certificate verification boolean"
                 | "conflicting certificate verification aliases" => Some((
