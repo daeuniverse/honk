@@ -22,6 +22,19 @@ fn flat(options: Value) -> Result<Node, serde_json::Error> {
 }
 
 #[test]
+fn xhttp_uri_exporter_metadata_preserves_tls_and_request_options() {
+    for scheme in ["trojan", "vless"] {
+        let base = format!("{scheme}://{UUID}@example.com:443?type=xhttp&security=reality&pbk=key&sid=&spx=/&sni=tls.example&alpn=h2&host=front.example&path=/api&mode=auto&allowInsecure=1&insecure=1");
+        let canonical = Node::from_share_link(&base).unwrap();
+        let exported = Node::from_share_link(&format!("{base}&fp=chrome&headerType=none&flow=&encryption=none&extra=%7B%7D")).unwrap();
+        assert_eq!(exported.transport(), canonical.transport());
+        assert_eq!(exported.tls(), canonical.tls());
+        assert!(exported.tls().unwrap().skip_cert_verify);
+    }
+    assert!(Node::from_share_link(&format!("vless://{UUID}@example.com:443?type=xhttp&headerType=http")).is_err());
+}
+
+#[test]
 fn legacy_transports_ignore_unrelated_mode_and_extra() {
     for transport in ["tcp", "ws", "grpc"] {
         for scheme in ["vless", "trojan"] {

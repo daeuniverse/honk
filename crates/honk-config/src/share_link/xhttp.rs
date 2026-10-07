@@ -31,8 +31,8 @@ pub(super) fn apply_xhttp_query(
     if xhttp_stream_transport(&transport.transport) != Ok("xhttp") {
         return Ok(false);
     }
-    for (key, _) in &query.0 {
-        if !matches!(
+    for (key, value) in &query.0 {
+        if !(key == "headerType" && matches!(value.as_str(), "" | "none")) && !matches!(
             key.as_str(),
             "type"
                 | "network"
@@ -45,6 +45,7 @@ pub(super) fn apply_xhttp_query(
                 | "tls"
                 | "sni"
                 | "peer"
+                | "fp"
                 | "allowInsecure"
                 | "allow_insecure"
                 | "insecure"

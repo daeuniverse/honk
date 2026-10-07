@@ -221,7 +221,7 @@ URI `extra` 接受百分号编码的 JSON 对象，仅支持：
 
 结构化范围接受无符号标量、`min-max` 字符串或 `{"min":N,"max":N}`。Header 名称规范化为小写，等价别名合并；冲突别名、控制字符与传输层管理的 header（`host`、`content-type`、`content-length`、`referer`、hop-by-hop header、trailers）会被拒绝。URI/VMess extra JSON 在转为 map 前拒绝重复成员。Padding 始终启用。这些范围是本地安全上限，不保证每个对端或 CDN 都接受。
 
-存在 extra 时，顶层 `host`、`path`、`mode` 保持权威。未知或未实现的参数，包括 `downloadSettings`、`xmux`、其他 session/sequence/payload placement、自定义上传方法、padding 混淆 profile，即使为 null 或空值也会拒绝整个节点。Mihomo 订阅使用对应 `xhttp-opts`；官方 sing-box 与 client-record 的 XHTTP transport 仍不支持。
+存在 extra 时，顶层 `host`、`path`、`mode` 保持权威。URI `fp` 接受但忽略，指纹由全局 TLS 模式控制；`headerType=none` 或空值接受但忽略，因为 XHTTP 自行管理 HTTP framing。证书校验别名（`allowInsecure`、`allow_insecure`、`insecure`）保留共用 TLS 语义，且必须一致。未知或未实现的参数，包括 `downloadSettings`、`xmux`、其他 session/sequence/payload placement、自定义上传方法、padding 混淆 profile，即使为 null 或空值也会拒绝整个节点。Mihomo 订阅使用对应 `xhttp-opts`；官方 sing-box 与 client-record 的 XHTTP transport 仍不支持。
 
 XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP 权限、packet encoding 与 UDP/443 策略不变。Packet-up 没有上传 EOF 的 wire 标记：shutdown 刷新已经接受的上传字节并保留 GET 等待应用最终回复；关闭逻辑流才结束其请求。
 
