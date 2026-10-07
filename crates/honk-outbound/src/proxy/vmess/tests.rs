@@ -204,6 +204,125 @@ async fn dropping_vmess_stream_closes_physical_transport() {
     .unwrap();
 }
 
+#[derive(Debug, Default)]
+struct RecordedUpload {
+    wire: Vec<u8>,
+    delivered: usize,
+    flushes: usize,
+}
+
+#[derive(Debug)]
+struct RecordingTransport(
+    Arc<parking_lot::Mutex<RecordedUpload>>,
+    Arc<tokio::sync::Notify>,
+);
+
+impl AsyncRead for RecordingTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for RecordingTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.0.lock().wire.extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut recording = self.0.lock();
+        recording.delivered = recording.wire.len();
+        recording.flushes += 1;
+        self.1.notify_one();
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+#[tokio::test]
+async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
+    const WRITES: usize = 64;
+    const WRITE_SIZE: usize = 8192;
+    let payload = vec![0xa5; WRITES * WRITE_SIZE];
+    let (mut client, mut relay_client) = tokio::io::duplex(payload.len());
+    for write in payload.as_chunks::<WRITE_SIZE>().0 {
+        client.write_all(write).await.unwrap();
+    }
+    let recording = Arc::new(parking_lot::Mutex::new(RecordedUpload::default()));
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let transport = RecordingTransport(recording.clone(), changed.clone());
+    let header = b"request-header";
+    let relay = tokio::spawn(async move {
+        vmess_relay(
+            Box::new(transport),
+            &mut relay_client,
+            header.to_vec(),
+            fixed_session(),
+        )
+        .await
+    });
+    let wire_length =
+        header.len() + payload.len() + payload.len().div_ceil(CHUNK_MAX_LEN) * (2 + GCM_TAG_LEN);
+    let wait_for_delivery = |length| {
+        let recording = recording.clone();
+        let changed = changed.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let notified = changed.notified();
+                    if recording.lock().delivered >= length {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("idle VMess producer did not flush its upload");
+        }
+    };
+    wait_for_delivery(wire_length).await;
+    let idle_flushes = {
+        let recording = recording.lock();
+        assert!(
+            recording.flushes < WRITES / 4,
+            "queued burst flushed {} times",
+            recording.flushes
+        );
+        assert_eq!(&recording.wire[..header.len()], header);
+        let mut body = BodyChunks::new(&fixed_session().req_key, &fixed_session().req_iv).unwrap();
+        let mut wire = &recording.wire[header.len()..recording.delivered];
+        let mut decoded = Vec::new();
+        while !wire.is_empty() {
+            let length = body.decode_len(wire[..2].try_into().unwrap()) as usize;
+            let mut chunk = wire[2..2 + length].to_vec();
+            let length = body.open_chunk(&mut chunk).unwrap();
+            decoded.extend_from_slice(&chunk[..length]);
+            wire = &wire[2 + chunk.len()..];
+        }
+        assert_eq!(decoded, payload);
+        recording.flushes
+    };
+    client.shutdown().await.unwrap();
+    wait_for_delivery(wire_length + 2 + GCM_TAG_LEN).await;
+    assert!(
+        recording.lock().flushes > idle_flushes,
+        "upload terminator was not flushed"
+    );
+    relay.abort();
+    assert!(relay.await.unwrap_err().is_cancelled());
+}
+
 /// End-to-end over the WebSocket transport: a mock server parses the
 /// real AEAD wire format — auth ID, sealed header length, sealed header
 /// (version/option/security/address) — exactly like a sing-box/Xray

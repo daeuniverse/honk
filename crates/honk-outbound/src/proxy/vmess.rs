@@ -2,6 +2,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use honk_config::node::Node;
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -645,13 +646,18 @@ async fn vmess_relay(
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
         loop {
-            let n = client_read.read(&mut buf).await?;
+            let n = match client_read.read(&mut buf).now_or_never() {
+                Some(read) => read?,
+                None => {
+                    server_write.flush().await?;
+                    client_read.read(&mut buf).await?
+                }
+            };
             if n == 0 {
                 break;
             }
             let chunk = body.seal_chunk(&buf[..n]);
             server_write.write_all(&chunk).await?;
-            server_write.flush().await?;
         }
         let term = body.seal_chunk(&[]);
         server_write.write_all(&term).await?;
