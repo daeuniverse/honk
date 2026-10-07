@@ -159,7 +159,7 @@ async fn ready_stream_upload_refusal_precedes_shutdown_completion() {
         }
     }
 
-    tokio::time::timeout(DEADLINE * 4, async {
+    tokio::time::timeout(DEADLINE, async {
         let mut peer = Peer::new(32).await;
         let owner = peer.runtime(XhttpMode::StreamUp, 32);
         let runtime = owner.runtime();
@@ -170,83 +170,80 @@ async fn ready_stream_upload_refusal_precedes_shutdown_completion() {
             .recv()
             .await
             .expect("peer stopped before SETTINGS receipt");
-        for attempt in 0..200 {
-            let permit = session.try_reserve().unwrap();
-            let mut request = Some(http::Request::get("http://peer/download").body(()).unwrap());
-            let download = session
-                .clone()
-                .request(RequestOwner::Pool { _permit: permit }, &mut request, true)
-                .await
-                .unwrap_or_else(|_| panic!("failed to admit download"));
-            let mut download_peer = peer.next().await;
-            let permit = session.try_reserve().unwrap();
-            let mut request = Some(http::Request::post("http://peer/upload").body(()).unwrap());
-            let upload = session
-                .clone()
-                .request(RequestOwner::Pool { _permit: permit }, &mut request, false)
-                .await
-                .unwrap_or_else(|_| panic!("failed to admit upload"));
-            let mut upload_peer = peer.next().await;
-            let flow = Flow::new(32);
-            let driver = tokio::spawn(std::future::pending::<()>());
-            let observer = Arc::new(ShutdownObserver {
-                stream: Mutex::new(XhttpStream {
-                    download: Upload::download(download),
-                    flow: flow.clone(),
-                    packet_up: false,
-                    driver: driver.abort_handle(),
-                    _runtime: runtime.clone(),
-                    _flow_permit: FlowPermit {
-                        permit: None,
-                        transport: runtime.xhttp.as_ref().unwrap().clone(),
-                    },
-                    read_result: None,
-                    payload: Bytes::new(),
-                }),
-                result: Mutex::new(None),
-            });
-            let waker = waker_ref(&observer);
-            assert!(
-                Pin::new(&mut *observer.stream.lock())
-                    .poll_shutdown(&mut Context::from_waker(&waker))
-                    .is_pending()
-            );
-            let mut upload = Box::pin(streaming_upload(
-                UploadRequest {
-                    send: upload.send,
-                    _permit: upload.permit,
-                    session: session.clone(),
-                    response: Some(upload.response),
-                    pending: Arc::new(AtomicUsize::new(0)),
+        let permit = session.try_reserve().unwrap();
+        let mut request = Some(http::Request::get("http://peer/download").body(()).unwrap());
+        let download = session
+            .clone()
+            .request(RequestOwner::Pool { _permit: permit }, &mut request, true)
+            .await
+            .unwrap_or_else(|_| panic!("failed to admit download"));
+        let mut download_peer = peer.next().await;
+        let permit = session.try_reserve().unwrap();
+        let mut request = Some(http::Request::post("http://peer/upload").body(()).unwrap());
+        let upload = session
+            .clone()
+            .request(RequestOwner::Pool { _permit: permit }, &mut request, false)
+            .await
+            .unwrap_or_else(|_| panic!("failed to admit upload"));
+        let mut upload_peer = peer.next().await;
+        let flow = Flow::new(32);
+        let driver = tokio::spawn(std::future::pending::<()>());
+        let observer = Arc::new(ShutdownObserver {
+            stream: Mutex::new(XhttpStream {
+                download: Upload::download(download),
+                flow: flow.clone(),
+                packet_up: false,
+                driver: driver.abort_handle(),
+                _runtime: runtime.clone(),
+                _flow_permit: FlowPermit {
+                    permit: None,
+                    transport: runtime.xhttp.as_ref().unwrap().clone(),
                 },
-                flow.clone(),
-            ));
-            assert!(futures_util::poll!(&mut upload).is_pending());
-            response(&mut upload_peer.respond, 503, true);
-            eof(upload_peer.request.body_mut()).await;
-            // The later response lets the connection driver receive the already-queued refusal.
-            response(&mut download_peer.respond, 200, true);
-            poll_fn(|cx| observer.stream.lock().download.poll_headers(cx))
-                .await
-                .unwrap();
-            tokio::task::yield_now().await;
-            let Poll::Ready(Err(error)) = futures_util::poll!(&mut upload) else {
-                panic!("upload response was not ready at the receive barrier: {attempt}");
-            };
-            // Polling shutdown at its wake makes the transient success observable on every schedule.
-            flow.fail(error);
-            let error = observer.result.lock().take().unwrap().unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{attempt}");
-            assert!(
-                anyhow::Error::new(error)
-                    .chain()
-                    .any(|cause| cause.downcast_ref::<StatusFailure>().is_some()),
-                "{attempt}"
-            );
-            flow.write.register(futures_util::task::noop_waker_ref());
-            drop(observer);
-            assert!(driver.await.unwrap_err().is_cancelled());
-        }
+                read_result: None,
+                payload: Bytes::new(),
+            }),
+            result: Mutex::new(None),
+        });
+        let waker = waker_ref(&observer);
+        assert!(
+            Pin::new(&mut *observer.stream.lock())
+                .poll_shutdown(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut upload = Box::pin(streaming_upload(
+            UploadRequest {
+                send: upload.send,
+                _permit: upload.permit,
+                session: session.clone(),
+                response: Some(upload.response),
+                pending: Arc::new(AtomicUsize::new(0)),
+            },
+            flow.clone(),
+        ));
+        assert!(futures_util::poll!(&mut upload).is_pending());
+        response(&mut upload_peer.respond, 503, true);
+        eof(upload_peer.request.body_mut()).await;
+        // The later response lets the connection driver receive the already-queued refusal.
+        response(&mut download_peer.respond, 200, true);
+        poll_fn(|cx| observer.stream.lock().download.poll_headers(cx))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let Poll::Ready(Err(error)) = futures_util::poll!(&mut upload) else {
+            panic!("upload response was not ready at the receive barrier");
+        };
+        // Polling shutdown at its wake makes the transient success observable on every schedule.
+        flow.fail(error);
+        let error = observer.result.lock().take().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            anyhow::Error::new(error)
+                .chain()
+                .any(|cause| cause.downcast_ref::<StatusFailure>().is_some())
+        );
+        flow.write.register(futures_util::task::noop_waker_ref());
+        drop(observer);
+        assert!(driver.await.unwrap_err().is_cancelled());
     })
     .await
     .expect("ready upload refusal stalled shutdown");

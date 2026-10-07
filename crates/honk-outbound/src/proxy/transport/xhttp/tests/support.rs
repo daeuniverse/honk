@@ -128,33 +128,38 @@ impl Peer {
     }
 
     pub(super) fn runtime(&self, mode: XhttpMode, post_limit: u32) -> EphemeralRuntimeGuard {
-        let mut node = Node {
-            name: "xhttp-real-peer".into(),
-            address: self.address.ip().to_string(),
-            port: self.address.port(),
-            outbound: OutboundConfig::Trojan(Default::default()),
-            ..Node::default()
-        };
-        node.tls_mut().unwrap().enabled = false;
-        let transport = node.transport_mut().unwrap();
-        transport.transport = "xhttp".into();
-        transport.xhttp = Some(XhttpOptions {
-            path: format!("{PREFIX}?{QUERY}"),
-            host: Some("peer.example".into()),
-            mode,
-            headers: [("x-peer-test".into(), "raw".into())].into(),
-            x_padding_bytes: XhttpRange { min: 7, max: 7 },
-            sc_max_each_post_bytes: XhttpRange {
-                min: post_limit,
-                max: post_limit,
-            },
-            sc_min_posts_interval_ms: XhttpRange { min: 0, max: 0 },
-            ..XhttpOptions::default()
-        });
+        let mut node = node(mode, post_limit);
+        node.address = self.address.ip().to_string();
+        node.port = self.address.port();
         node.normalize_stream_transport().unwrap();
         node.id = node.derive_id();
         NodeRuntime::try_ephemeral_guarded(&node).unwrap()
     }
+}
+
+pub(super) fn node(mode: XhttpMode, post_limit: u32) -> Node {
+    let mut node = Node {
+        name: "xhttp-real-peer".into(),
+        outbound: OutboundConfig::Trojan(Default::default()),
+        ..Node::default()
+    };
+    node.tls_mut().unwrap().enabled = false;
+    let transport = node.transport_mut().unwrap();
+    transport.transport = "xhttp".into();
+    transport.xhttp = Some(XhttpOptions {
+        path: format!("{PREFIX}?{QUERY}"),
+        host: Some("peer.example".into()),
+        mode,
+        headers: [("x-peer-test".into(), "raw".into())].into(),
+        x_padding_bytes: XhttpRange { min: 7, max: 7 },
+        sc_max_each_post_bytes: XhttpRange {
+            min: post_limit,
+            max: post_limit,
+        },
+        sc_min_posts_interval_ms: XhttpRange { min: 0, max: 0 },
+        ..XhttpOptions::default()
+    });
+    node
 }
 
 impl Drop for Peer {

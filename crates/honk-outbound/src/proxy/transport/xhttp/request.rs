@@ -168,23 +168,3 @@ pub(super) fn sample(range: XhttpRange) -> u32 {
     use rand::RngExt;
     rand::rng().random_range(range.min..=range.max)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::escape_path;
-
-    #[test]
-    fn path_escaping_matches_go_url_path_mode() {
-        for (path, expected) in [
-            ("/xhttp/Az09-_.~/", "/xhttp/Az09-_.~/"),
-            ("/a%2Fb/", "/a%252Fb/"),
-            ("/a b/", "/a%20b/"),
-            ("/雪/é/", "/%E9%9B%AA/%C3%A9/"),
-            ("/!'()*/", "/%21%27%28%29%2A/"),
-            ("/$&+,:;=@/", "/$&+,:;=@/"),
-            ("/a#b/", "/a%23b/"),
-        ] {
-            assert_eq!(escape_path(path.to_owned()), expected, "{path}");
-        }
-    }
-}

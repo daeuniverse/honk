@@ -132,11 +132,9 @@ async fn stream_up_drains_large_upload_response_padding_without_exposing_it() {
     .expect("upload response padding was not concurrently drained");
 }
 
-#[tokio::test]
-async fn referer_replaces_configured_padding_query_with_sampled_padding() {
-    let peer = Peer::new(32).await;
-    let owner = peer.runtime(XhttpMode::StreamUp, 32);
-    let mut node = (*owner.runtime().node).clone();
+#[test]
+fn referer_replaces_configured_padding_query_with_sampled_padding() {
+    let mut node = node(XhttpMode::StreamUp, 32);
     let options = node.transport_mut().unwrap().xhttp.as_mut().unwrap();
     options.path = "/p/?x_padding=old&token=retained".into();
     options.x_padding_bytes = XhttpRange { min: 5, max: 9 };
@@ -153,12 +151,18 @@ async fn referer_replaces_configured_padding_query_with_sampled_padding() {
     }
 }
 
-#[tokio::test]
-async fn request_escapes_literal_path_without_reencoding_the_query() {
-    let peer = Peer::new(32).await;
-    let owner = peer.runtime(XhttpMode::StreamUp, 32);
-    let mut node = (*owner.runtime().node).clone();
-    for (path, expected) in [("/a%2Fb/", "/a%252Fb/"), ("/雪/", "/%E9%9B%AA/")] {
+#[test]
+fn request_escapes_literal_path_without_reencoding_the_query() {
+    let mut node = node(XhttpMode::StreamUp, 32);
+    for (path, expected) in [
+        ("/xhttp/Az09-_.~/", "/xhttp/Az09-_.~/"),
+        ("/a%2Fb/", "/a%252Fb/"),
+        ("/a b/", "/a%20b/"),
+        ("/雪/é/", "/%E9%9B%AA/%C3%A9/"),
+        ("/!'()*/", "/%21%27%28%29%2A/"),
+        ("/$&+,:;=@/", "/$&+,:;=@/"),
+        ("/a#b/", "/a%23b/"),
+    ] {
         node.transport_mut().unwrap().xhttp.as_mut().unwrap().path =
             format!("{path}?token=a%2Fb&empty=");
         let template = super::super::request::RequestTemplate::new(&node).unwrap();
