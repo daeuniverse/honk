@@ -72,6 +72,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
 | `ech_config` | string? | null | 来自 `ech_config` 或 `echconfig` 的 Base64 ECHConfigList |
 | `ech_config_path` | string? | null | 结构化 loader 中指向 base64 ECHConfigList 的路径；不是分享链接 query |
+| `ech_doh` | string? | null | 来自 `ech=<qname>[+<doh-url>]` 的动态 ECH 源 |
 | `reality_public_key` | string? | null | 来自 `pbk` 的 REALITY X25519 公钥 |
 | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
@@ -407,9 +408,10 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。target TLS record 的缓冲�
 | --- | --- |
 | `ech_config=<base64>` / `echconfig=<base64>` | 静态 ECHConfigList；隐含 `ech_enabled` 且优先 |
 | `ech_config_path` | 结构化 loader 文件路径；两者同时存在时 `ech_config` 优先 |
+| `ech=<qname>[+<doh-url>]` | 获取 `qname` 的 HTTPS 记录中的 ECHConfigList：带 `+<doh-url>` 时通过该 DoH 端点获取（bypass 标记，按记录 TTL 刷新）；只写 `qname` 时走 bootstrap DNS 路径（同 `ech=1`）；隐含 `ech_enabled` |
 | `ech=1` / `ech=true` | 没有静态配置时开启 DNS HTTPS-RR 发现 |
 
-静态配置会提供真实 ECH，ECH 被拒绝时握手 fail-closed。发现是尽力而为且 fail-open：找不到 ECHConfigList 时，握手不带真实 ECH 继续；`utls` 仍发送 ECH GREASE。发现使用 bootstrap resolver，未配置时使用系统首个 nameserver，并按域名缓存结果。同一组控制项也适用于 QUIC 协议。
+静态配置会提供真实 ECH，ECH 被拒绝时握手 fail-closed。DoH 源由按源的后台任务获取：节点首次拨号时执行第一次获取，之后每次成功后每 15 分钟刷新一次；刷新失败保留上一次的配置，并在首次成功前每分钟重试。发现是尽力而为且 fail-open：找不到 ECHConfigList 时，握手不带真实 ECH 继续；`utls` 仍发送 ECH GREASE。发现使用 bootstrap resolver，未配置时使用系统首个 nameserver，并按域名缓存结果。优先级为：静态配置、DoH 源、发现。同一组控制项也适用于 QUIC 协议。
 
 ## 分享链接 scheme
 

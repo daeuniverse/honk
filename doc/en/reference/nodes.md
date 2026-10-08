@@ -72,6 +72,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
 | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |
 | `ech_config_path` | string? | null | Structured-loader path to a base64 ECHConfigList; not a share-link query |
+| `ech_doh` | string? | null | Dynamic ECH source from `ech=<qname>[+<doh-url>]` |
 | `reality_public_key` | string? | null | REALITY X25519 public key from `pbk` |
 | `reality_short_id` | string? | null | REALITY short ID from `sid` |
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
@@ -408,9 +409,10 @@ Per-node ECH controls are:
 | --- | --- |
 | `ech_config=<base64>` / `echconfig=<base64>` | Static ECHConfigList; implies `ech_enabled` and takes precedence |
 | `ech_config_path` | Structured-loader file path; `ech_config` wins when both exist |
+| `ech=<qname>[+<doh-url>]` | Fetch the ECHConfigList from `qname`'s HTTPS record: with `+<doh-url>` via that DoH endpoint (bypass-marked, refreshed on the record TTL); a bare `qname` resolves through the bootstrap DNS path like `ech=1`; implies `ech_enabled` |
 | `ech=1` / `ech=true` | Enable DNS HTTPS-RR discovery when no static config exists |
 
-A static config offers real ECH and ECH rejection fails the handshake closed. Discovery is best-effort and fail-open: if no ECHConfigList is found, the handshake continues without real ECH; `utls` still emits ECH GREASE. Discovery uses the bootstrap resolver or the first system nameserver and caches results by domain. The same controls apply to QUIC protocols.
+A static config offers real ECH and ECH rejection fails the handshake closed. A DoH source is fetched by a per-source background task: the first fetch runs when the node first dials, then every 15 minutes after each success; a failed refresh keeps the previous config and retries every minute until the first success. Discovery is best-effort and fail-open: if no ECHConfigList is found, the handshake continues without real ECH; `utls` still emits ECH GREASE. Discovery uses the bootstrap resolver or the first system nameserver and caches results by domain. Precedence is static config, then DoH source, then discovery. The same controls apply to QUIC protocols.
 
 ## Share-link schemes
 
