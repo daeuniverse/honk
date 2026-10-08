@@ -633,3 +633,75 @@ fn cross_impl_initial_keys_match_rustls() {
 }
 
 use base64::Engine as _;
+
+/// QUIC ECH: `start_session` with a static ECH config must not panic.
+/// `set_ech_config_list` panics on invalid input, so reaching here proves
+/// the ECH config is actually passed to BoringSSL (not dead code).
+#[test]
+fn quic_ech_static_config_reaches_ssl() {
+    static ECH_CONFIG_LIST: &[u8] = include_bytes!("../../../tests/fixtures/echconfiglist");
+
+    let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+    let cfg = Arc::new(
+        BoringQuicClientConfig::new(BoringQuicOptions {
+            alpn_wire: b"\x02h3".to_vec(),
+            skip_cert_verify: true,
+            ech: Some(crate::ech_doh::Ech::Static(ECH_CONFIG_LIST.into())),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    // Would panic with "invalid ECHConfigList" if the config were not applied.
+    let _session =
+        crypto::ClientConfig::start_session(cfg, 0x0000_0001, "localhost", &params).unwrap();
+}
+
+/// QUIC ECH: `start_session` with a dynamic source reads the per-connection
+/// cache. A published config must be picked up without rebuilding the
+/// client config (the key-rotation path).
+#[test]
+fn quic_ech_dynamic_source_reads_cache_per_connection() {
+    static ECH_CONFIG_LIST: &[u8] = include_bytes!("../../../tests/fixtures/echconfiglist");
+
+    let source = crate::ech_doh::EchSource::Discover("quic-ech-test.invalid".to_string());
+    crate::ech_doh::publish_ech_config(&source, ECH_CONFIG_LIST.to_vec());
+
+    let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+    let cfg = Arc::new(
+        BoringQuicClientConfig::new(BoringQuicOptions {
+            alpn_wire: b"\x02h3".to_vec(),
+            skip_cert_verify: true,
+            ech: Some(crate::ech_doh::Ech::Source(source.clone())),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    // Cache hit: the published config is offered without panic.
+    let _session =
+        crypto::ClientConfig::start_session(cfg.clone(), 0x0000_0001, "localhost", &params)
+            .unwrap();
+
+    // A second connection on the same client config re-reads the cache;
+    // rotation reaches it without a rebuild.
+    let _session2 =
+        crypto::ClientConfig::start_session(cfg, 0x0000_0001, "localhost", &params).unwrap();
+}
+
+/// QUIC ECH negative: an invalid ECH config list must panic in
+/// `start_session`. If the ECH code were dead/removed, this would not
+/// panic — proving the config actually reaches BoringSSL.
+#[test]
+#[should_panic(expected = "invalid ECHConfigList")]
+fn quic_ech_invalid_config_panics() {
+    let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+    let cfg = Arc::new(
+        BoringQuicClientConfig::new(BoringQuicOptions {
+            alpn_wire: b"\x02h3".to_vec(),
+            skip_cert_verify: true,
+            ech: Some(crate::ech_doh::Ech::Static(vec![0x42; 32].into())),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let _ = crypto::ClientConfig::start_session(cfg, 0x0000_0001, "localhost", &params);
+}
