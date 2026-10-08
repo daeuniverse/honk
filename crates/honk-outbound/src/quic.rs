@@ -311,31 +311,22 @@ pub async fn client_config(
         .iter()
         .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
         .collect::<Vec<u8>>();
-    let ech_doh = crate::ech_doh::parse_node_ech_source(node)?;
-    // Warm the ECH caches: the cold path awaits the first fetch (bounded)
-    // so the runtime never starts without ECH when one is obtainable.
-    // `start_session` then resolves per-connection, so later refreshes
-    // reach long-lived runtimes.
-    let ech_config_list = crate::tls::load_ech_config_list(node)?.map(Arc::new);
-    let mut doh_source = None;
-    let mut discovery_domain = None;
-    if ech_config_list.is_none() {
-        match ech_doh {
-            Some(crate::ech_doh::EchFetchSource::BootstrapDns(qname)) => {
-                crate::tls::discover_ech_config(&qname).await;
-                discovery_domain = Some(qname);
-            }
-            Some(crate::ech_doh::EchFetchSource::Doh(source)) => {
-                crate::ech_doh::ech_doh_config(&source).await;
-                doh_source = Some(source);
-            }
-            None if tls.ech_enabled => {
-                let name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
-                crate::tls::discover_ech_config(&name).await;
-                discovery_domain = Some(name);
-            }
-            _ => {}
+    // Resolve ECH once. `DiscoverSni` is pinned to the configured SNI (or
+    // host) here; `start_session` then resolves per-connection from the TTL
+    // cache, so key rotation reaches long-lived runtimes.
+    let ech = match crate::ech_doh::Ech::resolve(node)? {
+        Some(crate::ech_doh::Ech::DiscoverSni) => {
+            let domain = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+            Some(crate::ech_doh::Ech::Source(
+                crate::ech_doh::EchSource::Discover(domain),
+            ))
         }
+        other => other,
+    };
+    // Warm the cache: the first connection waits for the fetch (bounded)
+    // instead of leaking the SNI.
+    if let Some(crate::ech_doh::Ech::Source(source)) = &ech {
+        crate::ech_doh::ech_config(source).await;
     }
     let pin_sha256 = tls
         .pin_sha256
@@ -354,9 +345,7 @@ pub async fn client_config(
             alpn_wire,
             skip_cert_verify: tls.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
-            ech_config_list,
-            ech_doh: doh_source,
-            ech_discovery_domain: discovery_domain,
+            ech,
             pin_sha256,
             ticket_key: Some(format!(
                 "{}|{}|{}|{}",

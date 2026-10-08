@@ -87,7 +87,9 @@ fn connector_accepts_valid_ech_source_without_network() {
     node.tls_mut().unwrap().ech_doh = Some("cloudflare-ech.com+https://223.5.5.5/dns-query".into());
     assert!(validate_connector_config(&node).is_ok());
     let connector = build_connector(&node).unwrap();
-    let crate::ech_doh::EchFetchSource::Doh(source) = connector.ech_doh.unwrap() else {
+    let crate::ech_doh::Ech::Source(crate::ech_doh::EchSource::Doh(source)) =
+        connector.ech.unwrap()
+    else {
         panic!("expected Doh");
     };
     assert_eq!(source.qname, "cloudflare-ech.com");
@@ -97,8 +99,10 @@ fn connector_accepts_valid_ech_source_without_network() {
     node.tls_mut().unwrap().ech_doh = Some("cloudflare-ech.com".into());
     assert!(validate_connector_config(&node).is_ok());
     let connector = build_connector(&node).unwrap();
-    let crate::ech_doh::EchFetchSource::BootstrapDns(qname) = connector.ech_doh.unwrap() else {
-        panic!("expected BootstrapDns");
+    let crate::ech_doh::Ech::Source(crate::ech_doh::EchSource::Discover(qname)) =
+        connector.ech.unwrap()
+    else {
+        panic!("expected Discover");
     };
     assert_eq!(qname, "cloudflare-ech.com");
 }
@@ -401,8 +405,9 @@ async fn discover_ech_config_caches_positive_and_negative() {
     crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
         "udp://{addr}"
     )));
-    let first = discover_ech_config("ech-pos-unique.test").await;
-    let second = discover_ech_config("ech-pos-unique.test").await;
+    let source = crate::ech_doh::EchSource::Discover("ech-pos-unique.test".to_string());
+    let first = crate::ech_doh::ech_config(&source).await;
+    let second = crate::ech_doh::ech_config(&source).await;
     assert_eq!(first.as_deref(), Some(b"\x00\x01ech-bytes".as_slice()));
     assert_eq!(second, first);
     assert_eq!(count.load(AOrd::SeqCst), 1, "second lookup must hit cache");
@@ -412,8 +417,9 @@ async fn discover_ech_config_caches_positive_and_negative() {
     crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
         "udp://{addr}"
     )));
-    assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
-    assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
+    let neg = crate::ech_doh::EchSource::Discover("ech-neg-unique.test".to_string());
+    assert_eq!(crate::ech_doh::ech_config(&neg).await, None);
+    assert_eq!(crate::ech_doh::ech_config(&neg).await, None);
     assert_eq!(
         count.load(AOrd::SeqCst),
         1,
@@ -421,7 +427,8 @@ async fn discover_ech_config_caches_positive_and_negative() {
     );
 
     // IP literals never query.
-    assert_eq!(discover_ech_config("203.0.113.7").await, None);
+    let ip = crate::ech_doh::EchSource::Discover("203.0.113.7".to_string());
+    assert_eq!(crate::ech_doh::ech_config(&ip).await, None);
     crate::bootstrap::set_global(None);
 }
 

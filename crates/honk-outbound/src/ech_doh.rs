@@ -1,47 +1,43 @@
-//! Dynamic ECH config fetch over DNS-over-HTTPS.
+//! ECH config resolution: static, DNS discovery, or DoH.
 //!
 //! A node can carry `ech=<qname>+<doh-url>` in its share-link `ech`
 //! parameter (e.g. `ech=cloudflare-ech.com+https://223.5.5.5/dns-query`):
 //! the ECHConfigList is read from the `ech` SvcParam of `qname`'s HTTPS
 //! record, fetched with a DNS-over-HTTPS POST to the given endpoint.
-//! A bare `ech=<qname>` (no URL) is *not* fetched here; it resolves through
-//! the bootstrap DNS path (`discover_ech_config`), honoring the user's own
-//! resolver instead of a hard-coded third party.
+//! A bare `ech=<qname>` (no URL) resolves through the bootstrap DNS path
+//! (`EchSource::Discover`), honoring the user's own resolver instead of a
+//! hard-coded third party.
 //!
-//! Each distinct DoH source gets one background refresher. The first dial
-//! after (re)start awaits the first fetch with a bounded timeout; if that
-//! fetch fails, the dial proceeds without ECH while the refresher retries
-//! every minute. The refresher renews the config on the record TTL
-//! (floored at 60s); a failed refresh keeps the previous config.
-//! Refreshers for sources no dial has consulted for
-//! [`ECH_DOH_IDLE_TIMEOUT`] stop themselves, so a reload drops stale
-//! sources. Static `ech_config`/`ech_config_path` still win over this
-//! source.
+//! Resolution is on-demand against a single TTL cache keyed by source.
+//! A cache miss fetches inline with a bounded timeout — the first TLS dial
+//! after (re)start therefore waits for the fetch instead of leaking the
+//! SNI in cleartext — and fail-open past it. QUIC resolves per-connection
+//! from the cache and triggers a background refill on a miss, so key
+//! rotation reaches long-lived runtimes without blocking the handshake.
+//! Static `ech_config`/`ech_config_path` still win over dynamic sources.
 //!
 //! Every socket here (DoH host resolution through the bootstrap resolver,
 //! the TCP dial) carries the bypass mark, so honk's own eBPF datapath never
 //! routes this host-originated traffic through a proxy — possibly the very
 //! ECH node waiting for the config.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bytes::Bytes;
 
-/// How long the refresher waits between attempts before the first success.
-const ECH_DOH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
-/// Bound for the cold first fetch on the dial path (fail-open past it).
-const ECH_DOH_COLD_TIMEOUT: Duration = Duration::from_secs(10);
-/// Per-stage budget inside a fetch: TCP connect, TLS handshake and the
+/// Per-stage budget inside a DoH fetch: TCP connect, TLS handshake and the
 /// H2 exchange each get this long.
 const ECH_DOH_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// A refresher whose source saw no dial for this long stops itself.
-const ECH_DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const ECH_DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cap on a DoH response body; an ECH answer is a few hundred bytes.
 const ECH_DOH_MAX_BODY: usize = 64 * 1024;
+/// TTL clamp for positive cache entries, and negative-cache lifetime.
+const ECH_TTL_MIN: u32 = 60;
+const ECH_TTL_MAX: u32 = 86400;
+const ECH_NEGATIVE_TTL: u32 = 300;
 
 /// A parsed DoH endpoint: host, port and path, computed once.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -114,21 +110,48 @@ pub(crate) struct EchDohSource {
     pub endpoint: DohEndpoint,
 }
 
-/// Where a share-link `ech` value resolves.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EchFetchSource {
-    /// Bare `ech=<qname>`: HTTPS RR through the bootstrap resolver
-    /// (the user's own DNS config; see `discover_ech_config`).
-    BootstrapDns(String),
+/// A dynamic ECH source: the cache key and the fetch transport.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum EchSource {
+    /// HTTPS RR via the bootstrap resolver (bare `ech=<qname>` or
+    /// `ech_enabled`); lowercased domain without a trailing dot.
+    Discover(String),
     /// `ech=<qname>+<doh-url>`: DoH fetch from the explicit endpoint.
     Doh(EchDohSource),
 }
 
+/// Fully resolved ECH origin for a connector, decided once at build time.
+#[derive(Clone, Debug)]
+pub(crate) enum Ech {
+    /// Static `ech_config`/`ech_config_path`.
+    Static(Arc<[u8]>),
+    /// Dynamic source; resolved against the TTL cache per dial/connection.
+    Source(EchSource),
+    /// `ech_enabled`: discover via the connect-time SNI. TLS resolves this
+    /// in `connect`; QUIC resolves it at build time from the configured
+    /// SNI or host.
+    DiscoverSni,
+}
+
+impl Ech {
+    /// Resolve a node's ECH origin once. Static config wins, then
+    /// `ech=<qname>[+<doh-url>]`, then `ech_enabled`.
+    pub(crate) fn resolve(node: &honk_config::node::Node) -> anyhow::Result<Option<Ech>> {
+        if let Some(list) = crate::tls::load_ech_config_list(node)? {
+            return Ok(Some(Ech::Static(list.into())));
+        }
+        if let Some(source) = parse_node_ech_source(node)? {
+            return Ok(Some(Ech::Source(source)));
+        }
+        let enabled = node.tls().is_some_and(|tls| tls.ech_enabled);
+        Ok(enabled.then_some(Ech::DiscoverSni))
+    }
+}
+
 /// Parse a node's `ech` value once; `None` when the node carries none.
-/// All construction sites use this so the parse is never duplicated.
 pub(crate) fn parse_node_ech_source(
     node: &honk_config::node::Node,
-) -> anyhow::Result<Option<EchFetchSource>> {
+) -> anyhow::Result<Option<EchSource>> {
     node.tls()
         .and_then(|tls| tls.ech_doh.as_deref())
         .map(parse_ech_source)
@@ -138,212 +161,125 @@ pub(crate) fn parse_node_ech_source(
 
 /// Parse a share-link `ech` value into its fetch source. Validation is the
 /// strict honk-config parser, so config-time and outbound agree.
-pub(crate) fn parse_ech_source(raw: &str) -> anyhow::Result<EchFetchSource> {
+pub(crate) fn parse_ech_source(raw: &str) -> anyhow::Result<EchSource> {
     let parts = honk_config::node::TlsOptions::parse_ech_doh(raw)
         .map_err(|message| anyhow::anyhow!("invalid ech source {raw:?}: {message}"))?;
     match parts.url {
-        Some(url) => Ok(EchFetchSource::Doh(EchDohSource {
+        Some(url) => Ok(EchSource::Doh(EchDohSource {
             qname: parts.qname,
             endpoint: DohEndpoint::parse(&url)?,
             url,
         })),
-        None => Ok(EchFetchSource::BootstrapDns(parts.qname)),
+        None => Ok(EchSource::Discover(parts.qname)),
     }
 }
 
-/// Per-source fetch state. The config lock is only ever held for a plain
-/// swap or clone — never across `.await` — so a dial can never observe a
-/// half-written config or race the refresher into skipping ECH.
-struct EchDohSlot {
-    config: parking_lot::RwLock<Option<Arc<Vec<u8>>>>,
-    last_used: parking_lot::Mutex<Instant>,
-    /// Serializes the cold first fetch so concurrent dials share one.
-    cold: tokio::sync::Mutex<()>,
+struct EchCacheEntry {
+    config: Option<Arc<[u8]>>,
+    expires: Instant,
 }
 
-impl EchDohSlot {
-    fn new() -> Self {
-        Self {
-            config: parking_lot::RwLock::new(None),
-            last_used: parking_lot::Mutex::new(Instant::now()),
-            cold: tokio::sync::Mutex::new(()),
+static ECH_CACHE: LazyLock<Mutex<HashMap<EchSource, EchCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cache_get(source: &EchSource) -> Option<Option<Arc<[u8]>>> {
+    ECH_CACHE
+        .lock()
+        .unwrap()
+        .get(source)
+        .filter(|hit| hit.expires > Instant::now())
+        .map(|hit| hit.config.clone())
+}
+
+fn cache_put(source: &EchSource, config: Option<Arc<[u8]>>, ttl: u32) {
+    ECH_CACHE.lock().unwrap().insert(
+        source.clone(),
+        EchCacheEntry {
+            config,
+            expires: Instant::now() + Duration::from_secs(ttl as u64),
+        },
+    );
+}
+
+/// Fetch `(ECHConfigList, ttl)` for a source. `None` when the lookup
+/// yields no ECH record; failures are `Err`.
+type EchFetchFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<Option<(Vec<u8>, u32)>>> + Send + 'a>,
+>;
+
+fn fetch_source(source: &EchSource) -> EchFetchFuture<'_> {
+    Box::pin(async move {
+        match source {
+            EchSource::Discover(domain) => {
+                if domain.is_empty() || domain.parse::<std::net::IpAddr>().is_ok() {
+                    return Ok(None);
+                }
+                let query = tokio::time::timeout(
+                    ECH_DISCOVER_TIMEOUT,
+                    crate::bootstrap::query_ech_config(domain),
+                )
+                .await
+                .context("ECH discovery timed out")?;
+                Ok(query?)
+            }
+            EchSource::Doh(doh) => Ok(Some(fetch_ech_via_doh(doh).await?)),
         }
-    }
-}
-
-static ECH_DOH_CACHE: LazyLock<dashmap::DashMap<EchDohSource, Arc<EchDohSlot>>> =
-    LazyLock::new(dashmap::DashMap::new);
-/// Sources with a live refresher task.
-static REFRESH_TASKS: LazyLock<dashmap::DashMap<EchDohSource, ()>> =
-    LazyLock::new(dashmap::DashMap::new);
-
-/// Boxed future returning a fetched ECHConfigList and its TTL.
-type EchFetchFuture = Pin<Box<dyn Future<Output = anyhow::Result<(Vec<u8>, u32)>> + Send>>;
-
-/// Boxed fetch used by the cold path and the refresh loop; production
-/// passes [`real_fetch`], tests inject stubs.
-type EchDohFetch = fn(&EchDohSource) -> EchFetchFuture;
-
-fn real_fetch(source: &EchDohSource) -> EchFetchFuture {
-    let source = source.clone();
-    Box::pin(async move { fetch_ech_via_doh(&source).await })
-}
-
-/// Refresh wait from a DNS TTL, floored like the discovery cache.
-fn ttl_wait(ttl: u32) -> Duration {
-    Duration::from_secs(ttl.clamp(60, 86400) as u64)
-}
-
-fn spawn_refresher(
-    source: EchDohSource,
-    slot: Arc<EchDohSlot>,
-    fetch: EchDohFetch,
-    first_wait: Duration,
-) {
-    if REFRESH_TASKS.insert(source.clone(), ()).is_some() {
-        return;
-    }
-    tokio::spawn(refresh_loop(
-        source,
-        slot,
-        fetch,
-        first_wait,
-        ECH_DOH_RETRY_INTERVAL,
-        ECH_DOH_IDLE_TIMEOUT,
-    ));
-}
-
-/// Freshest fetched ECHConfigList for a DoH source, or `None` when no fetch
-/// has succeeded yet. The cold path awaits the first fetch with a bounded
-/// timeout instead of sending the SNI in cleartext — fail-open past it, as
-/// the connect-time `ech=1` discovery is.
-pub(crate) async fn ech_doh_config(source: &EchDohSource) -> Option<Arc<Vec<u8>>> {
-    ech_doh_config_with(source, real_fetch).await
-}
-
-/// Synchronous read of the DoH cache: for per-connection resolution
-/// (QUIC `start_session`) so refreshes reach later connections.
-pub(crate) fn cached_ech_doh_config(source: &EchDohSource) -> Option<Arc<Vec<u8>>> {
-    ECH_DOH_CACHE.get(source).and_then(|slot| {
-        // A per-connection read counts as use: without this, QUIC-only nodes
-        // would look idle to the refresher and lose their config 30 minutes
-        // after start while connections never stopped.
-        *slot.last_used.lock() = Instant::now();
-        slot.config.read().clone()
     })
 }
 
-/// Publish server-offered ECH retry configs into the slot (e.g. after an
-/// `ECH_REJECTED` handshake): the next dial uses them immediately instead
-/// of waiting for the next refresh.
-pub(crate) fn publish_config(source: &EchDohSource, config: Vec<u8>) {
-    if let Some(slot) = ECH_DOH_CACHE.get(source) {
-        *slot.config.write() = Some(Arc::new(config));
-        *slot.last_used.lock() = Instant::now();
+/// Resolve a source's ECHConfigList: cache hit, or a bounded inline fetch
+/// on miss/expiry (fail-open). TLS dials call this; the first dial after
+/// (re)start waits for the fetch instead of leaking the SNI.
+pub(crate) async fn ech_config(source: &EchSource) -> Option<Arc<[u8]>> {
+    if let Some(hit) = cache_get(source) {
+        return hit;
     }
-}
-
-async fn ech_doh_config_with(source: &EchDohSource, fetch: EchDohFetch) -> Option<Arc<Vec<u8>>> {
-    let slot = ECH_DOH_CACHE
-        .entry(source.clone())
-        .or_insert_with(|| Arc::new(EchDohSlot::new()))
-        .clone();
-    if let Some(config) = cached_ech_doh_config(source) {
-        *slot.last_used.lock() = Instant::now();
-        return Some(config);
-    }
-    // Cold: one dial performs the first fetch; concurrent dials wait for it
-    // (bounded) and then share the result.
-    let _guard = tokio::time::timeout(ECH_DOH_COLD_TIMEOUT, slot.cold.lock())
-        .await
-        .ok()?;
-    if let Some(config) = slot.config.read().clone() {
-        *slot.last_used.lock() = Instant::now();
-        return Some(config);
-    }
-    if REFRESH_TASKS.contains_key(source) {
-        // A refresher is already retrying in the background; fail open
-        // rather than adding dial latency.
-        return None;
-    }
-    *slot.last_used.lock() = Instant::now();
-    match tokio::time::timeout(ECH_DOH_COLD_TIMEOUT, fetch(source)).await {
-        Ok(Ok((config, ttl))) => {
-            let config = Arc::new(config);
-            *slot.config.write() = Some(config.clone());
-            spawn_refresher(source.clone(), slot.clone(), fetch, ttl_wait(ttl));
+    match fetch_source(source).await {
+        Ok(Some((config, ttl))) => {
+            let config: Arc<[u8]> = config.into();
+            tracing::debug!("resolved ECH config");
+            cache_put(
+                source,
+                Some(config.clone()),
+                ttl.clamp(ECH_TTL_MIN, ECH_TTL_MAX),
+            );
             Some(config)
         }
-        Ok(Err(error)) => {
-            tracing::warn!(
-                qname = %source.qname,
-                url = %source.url,
-                %error,
-                "ECH DoH first fetch failed; retrying in the background"
-            );
-            spawn_refresher(source.clone(), slot.clone(), fetch, ECH_DOH_RETRY_INTERVAL);
+        Ok(None) => {
+            cache_put(source, None, ECH_NEGATIVE_TTL);
             None
         }
-        Err(_) => {
-            tracing::warn!(
-                qname = %source.qname,
-                url = %source.url,
-                "ECH DoH first fetch timed out; retrying in the background"
-            );
-            spawn_refresher(source.clone(), slot.clone(), fetch, ECH_DOH_RETRY_INTERVAL);
+        Err(error) => {
+            tracing::debug!(%error, "ECH fetch failed; proceeding without ECH");
+            // Don't cache failures: the next dial retries.
             None
         }
     }
 }
 
-/// Fetch loop for one source: the first fetch already ran on the cold dial
-/// path, so this renews every `interval` after a success and retries every
-/// minute after a failure, keeping the previous config. Stops itself once
-/// the source goes idle past [`ECH_DOH_IDLE_TIMEOUT`] (e.g. after a reload
-/// drops the node), removing its cache entry.
-async fn refresh_loop(
-    source: EchDohSource,
-    slot: Arc<EchDohSlot>,
-    fetch: EchDohFetch,
-    first_wait: Duration,
-    retry_interval: Duration,
-    idle_timeout: Duration,
-) {
-    let mut wait = first_wait;
-    loop {
-        tokio::time::sleep(wait).await;
-        if slot.last_used.lock().elapsed() > idle_timeout {
-            ECH_DOH_CACHE.remove(&source);
-            REFRESH_TASKS.remove(&source);
-            tracing::debug!(
-                qname = %source.qname,
-                "stopping idle ECH DoH refresher"
-            );
-            return;
-        }
-        match fetch(&source).await {
-            Ok((config, ttl)) => {
-                tracing::debug!(
-                    qname = %source.qname,
-                    bytes = config.len(),
-                    ttl,
-                    "refreshed ECH config via DoH"
-                );
-                *slot.config.write() = Some(Arc::new(config));
-                // Honor the record TTL (floored), like the DNS discovery cache.
-                wait = ttl_wait(ttl);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    qname = %source.qname,
-                    url = %source.url,
-                    %error,
-                    "ECH DoH refresh failed; keeping previous config"
-                );
-                wait = retry_interval;
-            }
-        }
-    }
+/// Synchronous cache read for per-connection resolution (QUIC
+/// `start_session`). Returns `None` on miss/expiry; call
+/// [`spawn_ech_refresh`] to refill in the background.
+pub(crate) fn cached_ech_config(source: &EchSource) -> Option<Arc<[u8]>> {
+    cache_get(source).flatten()
+}
+
+/// Publish server-offered ECH retry configs (e.g. after `ECH_REJECTED`),
+/// replacing the cached entry so the next dial uses them immediately.
+pub(crate) fn publish_ech_config(source: &EchSource, config: Vec<u8>) {
+    // Retry configs carry no TTL; keep them like a fresh lookup.
+    cache_put(source, Some(config.into()), 3600);
+}
+
+/// Refill a source's cache entry in the background. QUIC calls this when
+/// `start_session` finds no valid entry, so key rotation reaches
+/// long-lived runtimes without blocking the handshake.
+pub(crate) fn spawn_ech_refresh(source: EchSource) {
+    tokio::spawn(async move {
+        // `ech_config` rechecks the cache first, so concurrent triggers
+        // collapse into one fetch.
+        ech_config(&source).await;
+    });
 }
 
 /// One RFC 8484 POST over HTTP/2: returns the raw DNS response message,
@@ -396,7 +332,7 @@ where
 /// Fetch `(ECHConfigList, ttl)` for the source's qname via its DoH endpoint.
 /// The dial carries the bypass mark: this is host-originated traffic that
 /// must never be routed through a proxy by honk's own eBPF datapath.
-pub(crate) async fn fetch_ech_via_doh(source: &EchDohSource) -> anyhow::Result<(Vec<u8>, u32)> {
+async fn fetch_ech_via_doh(source: &EchDohSource) -> anyhow::Result<(Vec<u8>, u32)> {
     let endpoint = &source.endpoint;
     // `connect_outbound` resolves, races and bypass-marks; the dial address
     // always carries an explicit port.

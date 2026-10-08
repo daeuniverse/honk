@@ -549,15 +549,8 @@ pub struct BoringQuicOptions {
     pub skip_cert_verify: bool,
     /// Chrome ClientHello fingerprint.
     pub chrome: bool,
-    /// Static ECHConfigList; ECH GREASE applies when `chrome` and unset.
-    pub ech_config_list: Option<Arc<Vec<u8>>>,
-    /// Dynamic ECH DoH source (`ech=<qname>+<doh-url>`): resolved
-    /// per-connection from the refresh cache so later connections see
-    /// refreshes; `client_config` warms the cache first.
-    pub(crate) ech_doh: Option<crate::ech_doh::EchDohSource>,
-    /// `ech_enabled` discovery domain: read per-connection from the
-    /// discovery cache (warmed by `client_config`).
-    pub(crate) ech_discovery_domain: Option<String>,
+    /// ECH origin, resolved once at build time (`None` means no ECH).
+    pub(crate) ech: Option<crate::ech_doh::Ech>,
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
     pub pin_sha256: Option<[u8; 32]>,
@@ -572,9 +565,7 @@ pub struct BoringQuicClientConfig {
     ctx: SslContext,
     alpn_wire: Vec<u8>,
     chrome: bool,
-    ech_config_list: Option<Arc<Vec<u8>>>,
-    ech_doh: Option<crate::ech_doh::EchDohSource>,
-    ech_discovery_domain: Option<String>,
+    ech: Option<crate::ech_doh::Ech>,
     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
     has_pin: bool,
     /// Session-ticket cache key (defaults to the server name when unset).
@@ -588,9 +579,7 @@ impl BoringQuicClientConfig {
             alpn_wire,
             skip_cert_verify,
             chrome,
-            ech_config_list,
-            ech_doh,
-            ech_discovery_domain,
+            ech,
             pin_sha256,
             ticket_key,
         } = options;
@@ -630,9 +619,7 @@ impl BoringQuicClientConfig {
             ctx: builder.build(),
             alpn_wire,
             chrome,
-            ech_config_list,
-            ech_doh,
-            ech_discovery_domain,
+            ech,
             has_pin: pin_sha256.is_some(),
             ticket_key,
         })
@@ -697,22 +684,25 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             ssl.set_permute_extensions(true);
             crate::tls::set_chrome_key_shares_ssl_ref(&ssl).expect("SSL_set1_client_key_shares");
         }
-        // ECH is resolved per-connection so cache refreshes (DoH or
-        // discovery) reach later connections on a long-lived runtime.
-        let ech = self
-            .ech_config_list
-            .clone()
-            .or_else(|| {
-                self.ech_doh
-                    .as_ref()
-                    .and_then(crate::ech_doh::cached_ech_doh_config)
-            })
-            .or_else(|| {
-                self.ech_discovery_domain
-                    .as_deref()
-                    .and_then(crate::tls::cached_discovery_config)
-                    .map(Arc::new)
-            });
+        // ECH is resolved per-connection from the TTL cache so key rotation
+        // reaches later connections on a long-lived runtime. On a miss, a
+        // background refill is triggered; this connection proceeds without
+        // ECH (GREASE in Chrome mode) rather than blocking the handshake.
+        let ech = match &self.ech {
+            Some(crate::ech_doh::Ech::Static(list)) => Some(list.clone()),
+            Some(crate::ech_doh::Ech::Source(source)) => {
+                match crate::ech_doh::cached_ech_config(source) {
+                    Some(config) => Some(config),
+                    None => {
+                        crate::ech_doh::spawn_ech_refresh(source.clone());
+                        None
+                    }
+                }
+            }
+            // QUIC pins `DiscoverSni` to a concrete domain at build time.
+            Some(crate::ech_doh::Ech::DiscoverSni) => None,
+            None => None,
+        };
         match ech {
             Some(list) => ssl
                 .set_ech_config_list(&list)

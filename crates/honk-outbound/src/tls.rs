@@ -6,10 +6,10 @@
 //! ECH: when a node carries an ECHConfigList (`ech_config` / `ech_config_path`)
 //! the connector offers real ECH via `SSL_set1_ech_config_list`;
 //! `ech=<qname>+<doh-url>` fetches the list for `qname`'s HTTPS record from
-//! the given DoH endpoint and refreshes it every 15 minutes
-//! ([`crate::ech_doh`]); a bare `ech=<qname>` and `ech_enabled` without
-//! either trigger DNS HTTPS-RR discovery (RFC 9460) at connect time;
-//! without any of these, Chrome mode sends ECH GREASE like a real browser.
+//! the given DoH endpoint ([`crate::ech_doh`]); a bare `ech=<qname>` and
+//! `ech_enabled` without either trigger DNS HTTPS-RR discovery (RFC 9460)
+//! at connect time; without any of these, Chrome mode sends ECH GREASE like
+//! a real browser.
 //!
 //! Controlled by global config: tls_implementation ("tls"|"utls"), utls_imitate
 //! (only the Chrome profile exists; other values warn and fall back).
@@ -31,7 +31,7 @@ use boring::x509::store::X509StoreBuilder;
 use foreign_types::ForeignTypeRef;
 use honk_config::node::Node;
 
-use crate::ech_doh::EchFetchSource;
+use crate::ech_doh::{Ech, EchSource};
 
 /// TLS client stream produced by [`TlsConnector::connect`].
 pub type TlsStream<S> = tokio_boring::SslStream<S>;
@@ -186,21 +186,15 @@ pub struct TlsConnector {
     connector: SslConnector,
     chrome: bool,
     alps: bool,
-    ech_config_list: Option<Arc<Vec<u8>>>,
-    /// `ech_enabled` without a static config: discover via DNS HTTPS RR at
-    /// connect time (best-effort, fail-open).
-    ech_discovery: bool,
-    /// `ech=<qname>[+<doh-url>]`: ECHConfigList for a bare qname is discovered
-    /// via DNS HTTPS RR at connect time; an explicit DoH URL is fetched and
-    /// refreshed by a per-source background task.
-    ech_doh: Option<EchFetchSource>,
+    /// ECH origin, resolved once at build time. `None` means no ECH.
+    ech: Option<Ech>,
 }
 
 impl TlsConnector {
     /// Per-connection `Ssl` configuration: applies the parts of the Chrome
     /// profile that only exist per-SSL (permuted extensions, key shares,
     /// ALPS, ECH) — BoringSSL has no ctx-level API for these.
-    fn configuration(&self, ech: Option<Arc<Vec<u8>>>) -> anyhow::Result<ConnectConfiguration> {
+    fn configuration(&self, ech: Option<Arc<[u8]>>) -> anyhow::Result<ConnectConfiguration> {
         let mut cfg = self.connector.configure()?;
         if self.chrome {
             cfg.set_permute_extensions(true);
@@ -224,18 +218,17 @@ impl TlsConnector {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let ech = match &self.ech_config_list {
-            Some(list) => Some(list.clone()),
-            None => match &self.ech_doh {
-                // A bare qname resolves through the bootstrap DNS path
-                // (the user's own resolver); an explicit URL uses DoH.
-                Some(EchFetchSource::BootstrapDns(qname)) => {
-                    discover_ech_config(qname).await.map(Arc::new)
-                }
-                Some(EchFetchSource::Doh(source)) => crate::ech_doh::ech_doh_config(source).await,
-                None if self.ech_discovery => discover_ech_config(domain).await.map(Arc::new),
-                None => None,
-            },
+        let (ech, source) = match &self.ech {
+            Some(Ech::Static(list)) => (Some(list.clone()), None),
+            Some(Ech::Source(source)) => (
+                crate::ech_doh::ech_config(source).await,
+                Some(source.clone()),
+            ),
+            Some(Ech::DiscoverSni) => {
+                let source = EchSource::Discover(domain.to_string());
+                (crate::ech_doh::ech_config(&source).await, Some(source))
+            }
+            None => (None, None),
         };
         let cfg = self.configuration(ech.clone())?;
         match tokio_boring::connect(cfg, domain, stream).await {
@@ -257,23 +250,13 @@ impl TlsConnector {
                 if rejected
                     && let Some(ssl) = e.ssl()
                     && let Some(retry) = ssl.get_ech_retry_configs()
+                    && let Some(source) = source
                 {
                     tracing::info!(
                         sni = domain,
                         "ECH rejected; publishing server retry configs for next dial"
                     );
-                    match &self.ech_doh {
-                        Some(EchFetchSource::Doh(source)) => {
-                            crate::ech_doh::publish_config(source, retry.to_vec())
-                        }
-                        Some(EchFetchSource::BootstrapDns(qname)) => {
-                            publish_discovery_config(qname, retry.to_vec())
-                        }
-                        None if self.ech_discovery => {
-                            publish_discovery_config(domain, retry.to_vec())
-                        }
-                        _ => {}
-                    }
+                    crate::ech_doh::publish_ech_config(&source, retry.to_vec());
                 }
                 Err(anyhow::anyhow!("TLS handshake with {domain} failed: {e}"))
             }
@@ -355,10 +338,18 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("invalid base64 ECHConfigList")
 }
 
-/// Resolve the node's ECHConfigList, if any. Explicit `ech_config` wins over
-/// `ech_config_path`. `ech_enabled` without configs is handled separately at
-/// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]), and
-/// `ech=<qname>[+<doh-url>]` via the DoH refresh cache ([`crate::ech_doh`]).
+/// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460).
+/// Thin wrapper over the unified ECH cache for external tools.
+pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
+    crate::ech_doh::ech_config(&crate::ech_doh::EchSource::Discover(domain.to_string()))
+        .await
+        .map(|arc| arc.to_vec())
+}
+
+/// Resolve the node's static ECHConfigList, if any. Explicit `ech_config`
+/// wins over `ech_config_path`. Dynamic sources (`ech_enabled`,
+/// `ech=<qname>[+<doh-url>]`) are resolved separately via
+/// [`crate::ech_doh::Ech`].
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(tls) = node.tls() else {
         return Ok(None);
@@ -431,80 +422,6 @@ pub fn chrome_mode() -> bool {
     USE_CHROME_TLS.load(Ordering::Acquire)
 }
 
-/// Process-wide cache for DNS-discovered ECHConfigLists (RFC 9460 HTTPS RR).
-struct EchCacheEntry {
-    config: Option<Vec<u8>>,
-    expires: std::time::Instant,
-}
-
-static ECH_DISCOVERY_CACHE: LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
-> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460),
-/// cached per domain (positive: record TTL clamped to 60s..1d; negative:
-/// 5 min). Best-effort and fail-open: any failure yields `None`, unlike
-/// explicit `ech_config` which is fail-closed.
-pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
-    let key = domain.trim_end_matches('.').to_ascii_lowercase();
-    if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
-        return None;
-    }
-    if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
-        && hit.expires > std::time::Instant::now()
-    {
-        return hit.config.clone();
-    }
-    let (config, ttl) = match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        crate::bootstrap::query_ech_config(&key),
-    )
-    .await
-    {
-        Ok(Ok(Some((ech, ttl)))) => (Some(ech), ttl.clamp(60, 86400)),
-        _ => (None, 300),
-    };
-    if config.is_some() {
-        tracing::debug!(domain = %key, "discovered ECH config via DNS HTTPS RR");
-    }
-    ECH_DISCOVERY_CACHE.lock().unwrap().insert(
-        key,
-        EchCacheEntry {
-            config: config.clone(),
-            expires: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64),
-        },
-    );
-    config
-}
-
-/// Synchronous read of the discovery cache: for per-connection resolution
-/// (QUIC `start_session`) so refreshes reach later connections. Returns
-/// `None` when nothing is cached or the entry expired; the async
-/// [`discover_ech_config`] populates it.
-pub(crate) fn cached_discovery_config(domain: &str) -> Option<Vec<u8>> {
-    let key = domain.trim_end_matches('.').to_ascii_lowercase();
-    ECH_DISCOVERY_CACHE
-        .lock()
-        .unwrap()
-        .get(&key)
-        .filter(|hit| hit.expires > std::time::Instant::now())
-        .and_then(|hit| hit.config.clone())
-}
-
-/// Publish server-offered ECH retry configs into the discovery cache (e.g.
-/// after an `ECH_REJECTED` handshake), replacing the stale entry.
-pub(crate) fn publish_discovery_config(domain: &str, config: Vec<u8>) {
-    let key = domain.trim_end_matches('.').to_ascii_lowercase();
-    // Retry configs carry no TTL; keep them for an hour like a fresh lookup.
-    ECH_DISCOVERY_CACHE.lock().unwrap().insert(
-        key,
-        EchCacheEntry {
-            config: Some(config),
-            expires: std::time::Instant::now() + std::time::Duration::from_secs(3600),
-        },
-    );
-}
-
 /// Build the shared BoringSSL trust and protocol defaults.
 fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnectorBuilder> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
@@ -574,8 +491,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         )
     })?;
     let chrome = chrome_mode();
-    let ech_config_list = load_ech_config_list(node)?;
-    let ech_doh = crate::ech_doh::parse_node_ech_source(node)?;
+    let ech = crate::ech_doh::Ech::resolve(node)?;
 
     let pin = match tls.pin_sha256.as_deref() {
         Some(s) => Some(parse_pin_sha256(s).ok_or_else(|| {
@@ -636,9 +552,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         connector: builder.build(),
         chrome,
         alps,
-        ech_discovery: tls.ech_enabled && ech_config_list.is_none() && ech_doh.is_none(),
-        ech_config_list: ech_config_list.map(Arc::new),
-        ech_doh,
+        ech,
     })
 }
 
@@ -658,9 +572,7 @@ pub fn build_dns_connector(
         connector: builder.build(),
         chrome,
         alps: chrome && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
-        ech_config_list: None,
-        ech_discovery: false,
-        ech_doh: None,
+        ech: None,
     })
 }
 

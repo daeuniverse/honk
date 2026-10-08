@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Real DoH response captured from `https://223.5.5.5/dns-query?dns=...`
 /// for `cloudflare-ech.com` type 65 (195 bytes).
@@ -28,19 +27,23 @@ const EXPECTED_ECH: &[u8] = &[
     0x68, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00,
 ];
 
-fn test_source(qname: &str) -> EchDohSource {
+fn test_doh_source(qname: &str) -> EchSource {
     let url = "https://127.0.0.1:1/dns-query".to_string();
     let endpoint = DohEndpoint::parse(&url).unwrap();
-    EchDohSource {
+    EchSource::Doh(EchDohSource {
         qname: qname.to_string(),
         url,
         endpoint,
-    }
+    })
+}
+
+fn test_discover_source(domain: &str) -> EchSource {
+    EchSource::Discover(domain.to_string())
 }
 
 #[test]
 fn parse_accepts_plus_and_space_separators() {
-    let EchFetchSource::Doh(source) =
+    let EchSource::Doh(source) =
         parse_ech_source("cloudflare-ech.com+https://223.5.5.5/dns-query").unwrap()
     else {
         panic!("expected Doh");
@@ -50,7 +53,7 @@ fn parse_accepts_plus_and_space_separators() {
 
     // A literal `+` decodes to a space in query strings; both spellings
     // must yield the same source.
-    let EchFetchSource::Doh(spaced) =
+    let EchSource::Doh(spaced) =
         parse_ech_source("cloudflare-ech.com https://223.5.5.5/dns-query").unwrap()
     else {
         panic!("expected Doh");
@@ -60,16 +63,15 @@ fn parse_accepts_plus_and_space_separators() {
 
 #[test]
 fn parse_bare_qname_uses_bootstrap_dns() {
-    let EchFetchSource::BootstrapDns(qname) = parse_ech_source("cloudflare-ech.com").unwrap()
-    else {
-        panic!("expected BootstrapDns");
+    let EchSource::Discover(qname) = parse_ech_source("cloudflare-ech.com").unwrap() else {
+        panic!("expected Discover");
     };
     assert_eq!(qname, "cloudflare-ech.com");
 }
 
 #[test]
 fn parse_normalizes_qname_and_keeps_url_parts() {
-    let EchFetchSource::Doh(source) =
+    let EchSource::Doh(source) =
         parse_ech_source("  Example.COM.+https://doh.example:8443/dns-query?dns=abc ").unwrap()
     else {
         panic!("expected Doh");
@@ -232,158 +234,55 @@ async fn doh_post_round_trips_dns_response() {
     server.abort();
 }
 
-static FETCH_CALLS_COLD: AtomicUsize = AtomicUsize::new(0);
-static FETCH_CALLS_REFRESH: AtomicUsize = AtomicUsize::new(0);
-static FETCH_CALLS_FAIL: AtomicUsize = AtomicUsize::new(0);
-
-fn stub_fetch_cold(_source: &EchDohSource) -> super::EchFetchFuture {
-    Box::pin(async move {
-        let n = FETCH_CALLS_COLD.fetch_add(1, Ordering::SeqCst);
-        Ok((vec![n as u8; 8], 60))
-    })
+#[test]
+fn cache_miss_returns_none() {
+    let source = test_discover_source("cache-miss.invalid");
+    assert!(cached_ech_config(&source).is_none());
 }
 
-fn stub_fetch_refresh(_source: &EchDohSource) -> super::EchFetchFuture {
-    Box::pin(async move {
-        FETCH_CALLS_REFRESH.fetch_add(1, Ordering::SeqCst);
-        Ok((vec![1; 8], 60))
-    })
+#[test]
+fn published_config_is_visible_to_later_reads() {
+    // QUIC `start_session` and TLS `connect` read the cache per-connection;
+    // a published config (e.g. ECH_REJECTED retry configs) must be visible
+    // immediately.
+    let source = test_doh_source("publish.invalid");
+    publish_ech_config(&source, vec![2; 4]);
+    let cached = cached_ech_config(&source).unwrap();
+    assert_eq!(&*cached, &[2; 4]);
+    ECH_CACHE.lock().unwrap().remove(&source);
 }
 
-fn stub_failing(_source: &EchDohSource) -> super::EchFetchFuture {
-    Box::pin(async move {
-        FETCH_CALLS_FAIL.fetch_add(1, Ordering::SeqCst);
-        Err(anyhow::anyhow!("boom"))
-    })
-}
-
-async fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !condition() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
-}
-
-#[tokio::test]
-async fn cold_path_waits_for_first_fetch() {
-    FETCH_CALLS_COLD.store(0, Ordering::SeqCst);
-    let source = test_source("cold-wait.invalid");
-    // No refresher running: the cold path must fetch inline and return it.
-    let config = ech_doh_config_with(&source, stub_fetch_cold).await.unwrap();
-    assert_eq!(*config, vec![0; 8]);
-    assert_eq!(FETCH_CALLS_COLD.load(Ordering::SeqCst), 1);
-    // Second call hits the cache without another fetch.
-    let cached = ech_doh_config_with(&source, stub_fetch_cold).await.unwrap();
-    assert!(Arc::ptr_eq(&config, &cached));
-    assert_eq!(FETCH_CALLS_COLD.load(Ordering::SeqCst), 1);
-    REFRESH_TASKS.remove(&source);
-    ECH_DOH_CACHE.remove(&source);
-}
-
-#[tokio::test]
-async fn cold_path_fails_open_and_schedules_background_retry() {
-    let source = test_source("cold-fail.invalid");
-    assert!(ech_doh_config_with(&source, stub_failing).await.is_none());
-    // The refresher is scheduled to keep retrying; this dial fails open.
-    assert!(REFRESH_TASKS.contains_key(&source));
-    REFRESH_TASKS.remove(&source);
-    ECH_DOH_CACHE.remove(&source);
-}
-
-#[tokio::test]
-async fn refresh_loop_renews_config() {
-    let source = test_source("refresh-renew.invalid");
-    let slot = Arc::new(EchDohSlot::new());
-    *slot.config.write() = Some(Arc::new(vec![9; 4]));
-    let refresher = tokio::spawn(refresh_loop(
+#[test]
+fn cache_entry_expires() {
+    let source = test_discover_source("cache-expire.invalid");
+    ECH_CACHE.lock().unwrap().insert(
         source.clone(),
-        slot.clone(),
-        stub_fetch_refresh,
-        Duration::from_millis(50),
-        Duration::from_millis(20),
-        Duration::from_secs(60),
-    ));
-    // One refresh cycle replaces the stale config.
-    wait_for(
-        || {
-            slot.config
-                .read()
-                .as_ref()
-                .is_some_and(|c| **c != vec![9; 4])
+        EchCacheEntry {
+            config: Some(vec![1; 4].into()),
+            expires: Instant::now() - Duration::from_secs(1),
         },
-        "periodic refresh",
-    )
-    .await;
-    assert_eq!(**slot.config.read().as_ref().unwrap(), vec![1; 8]);
-    refresher.abort();
-    REFRESH_TASKS.remove(&source);
-    ECH_DOH_CACHE.remove(&source);
-}
-
-#[tokio::test]
-async fn refresh_loop_keeps_stale_config_on_failure() {
-    FETCH_CALLS_FAIL.store(0, Ordering::SeqCst);
-    let source = test_source("refresh-fail.invalid");
-    let slot = Arc::new(EchDohSlot::new());
-    *slot.config.write() = Some(Arc::new(vec![7; 4]));
-    let refresher = tokio::spawn(refresh_loop(
-        source.clone(),
-        slot.clone(),
-        stub_failing,
-        Duration::from_millis(20),
-        Duration::from_millis(20),
-        Duration::from_secs(60),
-    ));
-    // Wait until a refresh was actually attempted (and failed).
-    wait_for(
-        || FETCH_CALLS_FAIL.load(Ordering::SeqCst) >= 1,
-        "failed refresh attempt",
-    )
-    .await;
-    let cached = slot.config.read().clone().unwrap();
-    assert_eq!(
-        *cached,
-        vec![7; 4],
-        "failed refresh must keep the old config"
     );
-    refresher.abort();
-    REFRESH_TASKS.remove(&source);
-    ECH_DOH_CACHE.remove(&source);
+    assert!(cached_ech_config(&source).is_none());
+    ECH_CACHE.lock().unwrap().remove(&source);
 }
 
-#[tokio::test]
-async fn published_config_reaches_later_reads() {
-    // `start_session` (QUIC) and `connect` (TLS) read the cache
-    // per-connection; a published config must be visible immediately.
-    let source = test_source("publish.invalid");
-    let slot = Arc::new(EchDohSlot::new());
-    *slot.config.write() = Some(Arc::new(vec![1; 4]));
-    ECH_DOH_CACHE.insert(source.clone(), slot);
-    assert_eq!(*cached_ech_doh_config(&source).unwrap(), vec![1; 4]);
-    publish_config(&source, vec![2; 4]);
-    assert_eq!(*cached_ech_doh_config(&source).unwrap(), vec![2; 4]);
-    ECH_DOH_CACHE.remove(&source);
+#[test]
+fn negative_entry_caches_the_absence() {
+    let source = test_discover_source("cache-negative.invalid");
+    cache_put(&source, None, 60);
+    // A negative entry is a hit (Some(None)): `cached_ech_config` flattens
+    // it to `None`, but the entry exists so no refetch is triggered.
+    assert!(cache_get(&source).is_some());
+    assert!(cached_ech_config(&source).is_none());
+    ECH_CACHE.lock().unwrap().remove(&source);
 }
 
-#[tokio::test]
-async fn refresh_loop_stops_when_idle() {
-    let source = test_source("idle-reap.invalid");
-    let slot = Arc::new(EchDohSlot::new());
-    *slot.last_used.lock() = Instant::now() - ECH_DOH_IDLE_TIMEOUT - Duration::from_secs(1);
-    REFRESH_TASKS.insert(source.clone(), ());
-    ECH_DOH_CACHE.insert(source.clone(), slot.clone());
-    let refresher = tokio::spawn(refresh_loop(
-        source.clone(),
-        slot,
-        stub_fetch_refresh,
-        Duration::from_millis(20),
-        Duration::from_millis(20),
-        ECH_DOH_IDLE_TIMEOUT,
-    ));
-    wait_for(|| !REFRESH_TASKS.contains_key(&source), "idle reaper").await;
-    assert!(!ECH_DOH_CACHE.contains_key(&source));
-    let _ = refresher.await;
+#[test]
+fn discover_and_doh_sources_do_not_share_entries() {
+    let discover = test_discover_source("shared.invalid");
+    let doh = test_doh_source("shared.invalid");
+    assert_ne!(discover, doh);
+    publish_ech_config(&discover, vec![1; 4]);
+    assert!(cached_ech_config(&doh).is_none());
+    ECH_CACHE.lock().unwrap().remove(&discover);
 }
