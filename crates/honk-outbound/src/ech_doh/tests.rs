@@ -121,6 +121,40 @@ fn endpoint_parse_and_authority() {
 }
 
 #[test]
+fn dial_addr_always_carries_an_explicit_port() {
+    // `connect_marked` requires `host:port`; omitting 443 used to make every
+    // default-port fetch fail, and `[v6]` without a port split inside the
+    // address.
+    let endpoint = DohEndpoint::parse("https://223.5.5.5/dns-query").unwrap();
+    assert_eq!(endpoint.dial_addr(), "223.5.5.5:443");
+
+    let endpoint = DohEndpoint::parse("https://[2001:db8::1]/dns-query").unwrap();
+    assert_eq!(endpoint.dial_addr(), "[2001:db8::1]:443");
+
+    let endpoint = DohEndpoint::parse("https://example.com:8443/dns-query").unwrap();
+    assert_eq!(endpoint.dial_addr(), "example.com:8443");
+
+    let endpoint = DohEndpoint::parse("https://[::1]:8443/dns-query").unwrap();
+    assert_eq!(endpoint.dial_addr(), "[::1]:8443");
+}
+
+#[tokio::test]
+async fn dial_addr_connects_through_connect_outbound() {
+    // End-to-end through the real dial path: the formatted address must be
+    // accepted by `connect_outbound` (bypass-marked TCP).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = DohEndpoint::parse(&format!("https://127.0.0.1:{port}/dns-query")).unwrap();
+    let dial_addr = endpoint.dial_addr();
+    let (accepted, connected) = tokio::join!(
+        listener.accept(),
+        crate::util::connect_outbound(&dial_addr, Duration::from_secs(5)),
+    );
+    accepted.unwrap();
+    connected.unwrap();
+}
+
+#[test]
 fn https_rr_query_wire_format() {
     let query = crate::bootstrap::build_query("cloudflare-ech.com", crate::bootstrap::QTYPE_HTTPS);
     // id(2) flags(2) qdcount(2) an/ns/ar(6) qname qtype(2) qclass(2)

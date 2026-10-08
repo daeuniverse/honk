@@ -9,13 +9,14 @@
 //! resolver instead of a hard-coded third party.
 //!
 //! Each distinct DoH source gets one background refresher. The first dial
-//! after (re)start awaits the first fetch with a bounded timeout — dials
-//! never go out without ECH while a config is obtainable — then the
-//! refresher renews it on the record TTL (floored at 60s); failures retry
-//! every minute. A failed refresh keeps the previous config. Refreshers
-//! for sources no dial has consulted for [`ECH_DOH_IDLE_TIMEOUT`] stop
-//! themselves, so a reload drops stale sources. Static
-//! `ech_config`/`ech_config_path` still win over this source.
+//! after (re)start awaits the first fetch with a bounded timeout; if that
+//! fetch fails, the dial proceeds without ECH while the refresher retries
+//! every minute. The refresher renews the config on the record TTL
+//! (floored at 60s); a failed refresh keeps the previous config.
+//! Refreshers for sources no dial has consulted for
+//! [`ECH_DOH_IDLE_TIMEOUT`] stop themselves, so a reload drops stale
+//! sources. Static `ech_config`/`ech_config_path` still win over this
+//! source.
 //!
 //! Every socket here (DoH host resolution through the bootstrap resolver,
 //! the TCP dial) carries the bypass mark, so honk's own eBPF datapath never
@@ -30,11 +31,12 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use bytes::Bytes;
 
-/// Retry cadence until the first successful fetch of a source.
+/// How long the refresher waits between attempts before the first success.
 const ECH_DOH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// Bound for the cold first fetch on the dial path (fail-open past it).
 const ECH_DOH_COLD_TIMEOUT: Duration = Duration::from_secs(10);
-/// I/O budget for one fetch (TCP+TLS+h2+query).
+/// Per-stage budget inside a fetch: TCP connect, TLS handshake and the
+/// H2 exchange each get this long.
 const ECH_DOH_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// A refresher whose source saw no dial for this long stops itself.
 const ECH_DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -44,10 +46,10 @@ const ECH_DOH_MAX_BODY: usize = 64 * 1024;
 /// A parsed DoH endpoint: host, port and path, computed once.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DohEndpoint {
-    /// Host without IPv6 brackets.
+    /// Without IPv6 brackets; `dial_addr` re-adds them.
     host: String,
     port: u16,
-    /// Path plus query; a bare `/` defaults to `/dns-query` (RFC 8484).
+    /// Path plus query; a bare `/` falls back to `/dns-query`.
     path: String,
 }
 
@@ -74,7 +76,18 @@ impl DohEndpoint {
         Ok(Self { host, port, path })
     }
 
-    /// `host[:port]` with IPv6 brackets, for dialing and `:authority`.
+    /// `host:port` with IPv6 brackets, always explicit: `connect_marked`
+    /// requires the port, and omitting 443 breaks its `rsplit_once(':')`
+    /// parse (or splits inside a bracketed IPv6 literal).
+    fn dial_addr(&self) -> String {
+        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    /// Value for the `:authority` pseudo-header; the default port is omitted.
     fn authority(&self) -> String {
         let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
             format!("[{}]", self.host)
@@ -97,7 +110,7 @@ pub(crate) struct EchDohSource {
     pub qname: String,
     /// The DoH endpoint URL as configured (`https://...`).
     pub url: String,
-    /// Parsed endpoint (host/port/path), computed once.
+    /// Endpoint parsed once at construction.
     pub endpoint: DohEndpoint,
 }
 
@@ -211,9 +224,13 @@ pub(crate) async fn ech_doh_config(source: &EchDohSource) -> Option<Arc<Vec<u8>>
 /// Synchronous read of the DoH cache: for per-connection resolution
 /// (QUIC `start_session`) so refreshes reach later connections.
 pub(crate) fn cached_ech_doh_config(source: &EchDohSource) -> Option<Arc<Vec<u8>>> {
-    ECH_DOH_CACHE
-        .get(source)
-        .and_then(|slot| slot.config.read().clone())
+    ECH_DOH_CACHE.get(source).and_then(|slot| {
+        // A per-connection read counts as use: without this, QUIC-only nodes
+        // would look idle to the refresher and lose their config 30 minutes
+        // after start while connections never stopped.
+        *slot.last_used.lock() = Instant::now();
+        slot.config.read().clone()
+    })
 }
 
 /// Publish server-offered ECH retry configs into the slot (e.g. after an
@@ -381,11 +398,12 @@ where
 /// must never be routed through a proxy by honk's own eBPF datapath.
 pub(crate) async fn fetch_ech_via_doh(source: &EchDohSource) -> anyhow::Result<(Vec<u8>, u32)> {
     let endpoint = &source.endpoint;
-    // `connect_outbound` resolves, races and bypass-marks.
-    let authority = endpoint.authority();
-    let tcp = crate::util::connect_outbound(&authority, ECH_DOH_FETCH_TIMEOUT)
+    // `connect_outbound` resolves, races and bypass-marks; the dial address
+    // always carries an explicit port.
+    let dial_addr = endpoint.dial_addr();
+    let tcp = crate::util::connect_outbound(&dial_addr, ECH_DOH_FETCH_TIMEOUT)
         .await
-        .with_context(|| format!("DoH TCP connect to {authority}"))?;
+        .with_context(|| format!("DoH TCP connect to {dial_addr}"))?;
     let connector =
         crate::tls::build_dns_connector(false, b"\x02h2").context("DoH TLS connector")?;
     let tls = tokio::time::timeout(
@@ -399,6 +417,7 @@ pub(crate) async fn fetch_ech_via_doh(source: &EchDohSource) -> anyhow::Result<(
         anyhow::bail!("DoH endpoint {} did not negotiate h2", endpoint.host);
     }
     let query = crate::bootstrap::build_query(&source.qname, crate::bootstrap::QTYPE_HTTPS);
+    let authority = endpoint.authority();
     let body = tokio::time::timeout(
         ECH_DOH_FETCH_TIMEOUT,
         doh_h2_post(tls, &authority, &endpoint.path, &query),
