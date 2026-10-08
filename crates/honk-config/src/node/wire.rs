@@ -115,6 +115,8 @@ struct FlatNode {
     #[serde(default)]
     ech_config_path: Option<String>,
     #[serde(default)]
+    ech_doh: Option<String>,
+    #[serde(default)]
     reality_public_key: Option<String>,
     #[serde(default)]
     reality_short_id: Option<String>,
@@ -365,6 +367,7 @@ impl FlatNode {
         strip!(self.ech_enabled && !tls, ech_enabled);
         strip!(self.ech_config.is_some() && !tls, ech_config);
         strip!(self.ech_config_path.is_some() && !tls, ech_config_path);
+        strip!(self.ech_doh.is_some() && !tls, ech_doh);
         strip!(
             self.reality_public_key.is_some() && !reality,
             reality_public_key
@@ -482,6 +485,7 @@ impl FlatNode {
             ech_enabled: self.ech_enabled,
             ech_config: self.ech_config.take(),
             ech_config_path: self.ech_config_path.take(),
+            ech_doh: self.ech_doh.take(),
             reality_public_key: self.reality_public_key.take(),
             reality_short_id: self.reality_short_id.take(),
             reality_spider_x: self.reality_spider_x.take(),
@@ -738,6 +742,7 @@ struct WireOptions<'a> {
     ech_enabled: bool,
     ech_config: Option<&'a str>,
     ech_config_path: Option<&'a str>,
+    ech_doh: Option<&'a str>,
     reality_public_key: Option<&'a str>,
     reality_short_id: Option<&'a str>,
     reality_spider_x: Option<&'a str>,
@@ -786,6 +791,7 @@ impl<'a> WireOptions<'a> {
         self.ech_enabled = tls.ech_enabled;
         self.ech_config = tls.ech_config.as_deref();
         self.ech_config_path = tls.ech_config_path.as_deref();
+        self.ech_doh = tls.ech_doh.as_deref();
         self.reality_public_key = tls.reality_public_key.as_deref();
         self.reality_short_id = tls.reality_short_id.as_deref();
         self.reality_spider_x = tls.reality_spider_x.as_deref();

@@ -1255,6 +1255,7 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
         "ech_enabled" => "ech_enabled",
         "ech_config" => "ech_config",
         "ech_config_path" => "ech_config_path",
+        "ech_doh" => "ech_doh",
         "reality_public_key" => "reality_public_key",
         "reality_short_id" => "reality_short_id",
         "reality_spider_x" => "reality_spider_x",

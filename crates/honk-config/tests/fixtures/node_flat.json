@@ -21,6 +21,7 @@
   "ech_enabled": true,
   "ech_config": "AAECAw==",
   "ech_config_path": null,
+  "ech_doh": null,
   "reality_public_key": "reality-public-key",
   "reality_short_id": "0123456789abcdef",
   "reality_spider_x": "/spider",

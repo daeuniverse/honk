@@ -3,6 +3,77 @@ use crate::types::NodeProtocol;
 
 use super::{VlessConfig, identity_field};
 
+/// Parsed `ech=<qname>[+<doh-url>]` share-link value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchDohParts {
+    /// Lowercased owner name, without a trailing dot.
+    pub qname: String,
+    /// DoH endpoint URL, or `None` for a bare qname (resolved through the
+    /// bootstrap DNS path instead of DoH).
+    pub url: Option<String>,
+}
+
+impl TlsOptions {
+    /// Strict parse of the share-link `ech` value `<qname>[+<doh-url>]`.
+    /// The separator may be `+` (percent-encoded `%2B`) or a space (a
+    /// literal `+` decodes to a space in query strings). A bare `<qname>`
+    /// yields `url: None`. Fails closed on anything that is not a domain
+    /// name plus an `https://` URL.
+    pub fn parse_ech_doh(raw: &str) -> Result<EchDohParts, &'static str> {
+        let raw = raw.trim();
+        let (qname, url) = match raw.find(['+', ' ']) {
+            Some(sep) => {
+                let (qname, rest) = raw.split_at(sep);
+                (qname.trim(), Some(rest[1..].trim()))
+            }
+            None => (raw, None),
+        };
+        let qname = qname.trim_end_matches('.');
+        if qname.is_empty() || qname.len() > 253 {
+            return Err("ECH source has an empty or overlong qname");
+        }
+        // A bare qname must be dotted: without a `+<url>` part, `ech=1`
+        // and `ech=true` are the boolean discovery spellings, not names.
+        if url.is_none() && !qname.contains('.') {
+            return Err("ECH qname must be a dotted domain name");
+        }
+        if qname.parse::<std::net::IpAddr>().is_ok() {
+            return Err("ECH qname must be a domain name, not an IP literal");
+        }
+        for label in qname.split('.') {
+            if label.is_empty() || label.len() > 63 {
+                return Err("ECH qname has a bad label");
+            }
+            if !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err("ECH qname has a bad label");
+            }
+        }
+        let url = match url {
+            Some(url) => {
+                if url.is_empty() {
+                    return Err("ECH source has an empty DoH URL");
+                }
+                let parsed = url::Url::parse(url).map_err(|_| "ECH DoH URL is invalid")?;
+                if parsed.scheme() != "https" {
+                    return Err("ECH DoH URL must use https");
+                }
+                if parsed.host_str().is_none_or(str::is_empty) {
+                    return Err("ECH DoH URL has no host");
+                }
+                Some(url.to_string())
+            }
+            None => None,
+        };
+        Ok(EchDohParts {
+            qname: qname.to_ascii_lowercase(),
+            url,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TlsOptions {
     pub enabled: bool,
@@ -11,6 +82,10 @@ pub struct TlsOptions {
     pub ech_enabled: bool,
     pub ech_config: Option<String>,
     pub ech_config_path: Option<String>,
+    /// Raw `<qname>[+<https-url>]` DoH source from the share-link `ech`
+    /// parameter (e.g. `cloudflare-ech.com+https://223.5.5.5/dns-query`).
+    /// Parsed and validated by honk-outbound; implies `ech_enabled`.
+    pub ech_doh: Option<String>,
     pub reality_public_key: Option<String>,
     pub reality_short_id: Option<String>,
     pub reality_spider_x: Option<String>,

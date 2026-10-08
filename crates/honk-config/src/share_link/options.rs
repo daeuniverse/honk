@@ -3,8 +3,8 @@
 use crate::diagnostic::{SettingPath, SourceRef};
 use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
 use crate::node::{
-    Hysteria2Config, Node, OutboundConfig, QuicOptions, Udp443Policy, VlessConfig, VlessMultiplex,
-    VlessUdpEncoding,
+    Hysteria2Config, Node, OutboundConfig, QuicOptions, TlsOptions, Udp443Policy, VlessConfig,
+    VlessMultiplex, VlessUdpEncoding,
 };
 use crate::options::vocab::{
     coalesce_equal, optional_flow, optional_text, verification_text, vmess_cipher,
@@ -144,6 +144,19 @@ pub(super) fn parse_query(
         }
     }
     Ok(query)
+}
+
+/// Recognize a dynamic ECH source in the share-link `ech` parameter:
+/// `<qname>[+<https-url>]` (e.g. `cloudflare-ech.com+https://223.5.5.5/dns-query`),
+/// or a bare `<qname>` (resolved through the bootstrap DNS path).
+/// The separator may arrive as `+` (percent-encoded `%2B`) or as a space
+/// (a literal `+` decodes to a space in query strings). Returns the trimmed
+/// raw value for `ech_doh`.
+fn ech_doh_source(value: &str) -> Option<String> {
+    let value = value.trim();
+    TlsOptions::parse_ech_doh(value)
+        .ok()
+        .map(|_| value.to_string())
 }
 
 pub(super) fn apply_tls(
@@ -288,7 +301,12 @@ pub(super) fn apply_tls(
             tls.ech_enabled = true;
             tls.ech_config = Some(value.clone());
         } else if let Some(value) = query.get("ech") {
-            tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
+            if let Some(raw) = ech_doh_source(value) {
+                tls.ech_enabled = true;
+                tls.ech_doh = Some(raw);
+            } else {
+                tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
+            }
         }
         if reality {
             tls.enabled = true;

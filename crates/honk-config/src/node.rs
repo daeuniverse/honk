@@ -114,6 +114,13 @@ impl Node {
         {
             transport.normalize()?;
         }
+        // A dynamic ECH source implies ECH: structured nodes may set
+        // `ech_doh` without `ech_enabled`.
+        if let Some(tls) = self.tls_mut()
+            && tls.ech_doh.is_some()
+        {
+            tls.ech_enabled = true;
+        }
         if self.is_xhttp() {
             let tls = self.tls_mut().expect("stream transports have TLS options");
             XhttpOptions::normalize_alpn(&mut tls.alpn);

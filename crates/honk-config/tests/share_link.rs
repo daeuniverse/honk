@@ -1172,6 +1172,55 @@ fn test_ech_query_params() {
     .unwrap();
     assert!(node.tls().unwrap().ech_enabled);
     assert!(node.tls().unwrap().ech_config.is_none());
+
+    // ech=<qname>+<doh-url> selects dynamic DoH fetch and enables ECH.
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=&ech=cloudflare-ech.com%2Bhttps%3A%2F%2F223.5.5.5%2Fdns-query",
+    )
+    .unwrap();
+    let tls = node.tls().unwrap();
+    assert!(tls.ech_enabled);
+    assert_eq!(
+        tls.ech_doh.as_deref(),
+        Some("cloudflare-ech.com+https://223.5.5.5/dns-query")
+    );
+    assert!(tls.ech_config.is_none());
+
+    // A literal '+' in the query string decodes to a space; that spelling
+    // selects the DoH source too.
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=&ech=cloudflare-ech.com+https://223.5.5.5/dns-query",
+    )
+    .unwrap();
+    assert_eq!(
+        node.tls().unwrap().ech_doh.as_deref(),
+        Some("cloudflare-ech.com https://223.5.5.5/dns-query")
+    );
+
+    // Non-URL ech values keep the old boolean meaning.
+    let node = Node::from_share_link(
+        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?ech=yes",
+    )
+    .unwrap();
+    assert!(!node.tls().unwrap().ech_enabled);
+    assert!(node.tls().unwrap().ech_doh.is_none());
+
+    // A bare ech=<qname> selects the default DoH endpoint.
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=&ech=cloudflare-ech.com",
+    )
+    .unwrap();
+    let tls = node.tls().unwrap();
+    assert!(tls.ech_enabled);
+    assert_eq!(tls.ech_doh.as_deref(), Some("cloudflare-ech.com"));
+
+    // A bare IP is not a qname: ignored like any other non-boolean value.
+    let node = Node::from_share_link(
+        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?ech=192.0.2.1",
+    )
+    .unwrap();
+    assert!(!node.tls().unwrap().ech_enabled);
+    assert!(node.tls().unwrap().ech_doh.is_none());
 }
 
 #[test]
