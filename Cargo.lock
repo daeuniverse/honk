@@ -1587,6 +1587,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "criterion",
+ "dashmap",
  "foreign-types",
  "futures-util",
  "h2",
@@ -1616,6 +1617,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-root-certs",
 ]

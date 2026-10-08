@@ -67,6 +67,42 @@ fn test_node() -> Node {
     }
 }
 
+#[test]
+fn connector_rejects_invalid_ech_source() {
+    let mut node = test_node();
+    node.tls_mut().unwrap().ech_doh = Some("bad!qname+https://223.5.5.5/dns-query".into());
+    let error = build_connector(&node).unwrap_err();
+    assert!(
+        error.to_string().contains("invalid ech source"),
+        "{error:?}"
+    );
+    let mut node = test_node();
+    node.tls_mut().unwrap().ech_doh = Some("cloudflare-ech.com+http://223.5.5.5/dns-query".into());
+    assert!(validate_connector_config(&node).is_err());
+}
+
+#[test]
+fn connector_accepts_valid_ech_source_without_network() {
+    let mut node = test_node();
+    node.tls_mut().unwrap().ech_doh = Some("cloudflare-ech.com+https://223.5.5.5/dns-query".into());
+    assert!(validate_connector_config(&node).is_ok());
+    let connector = build_connector(&node).unwrap();
+    let crate::ech_doh::EchFetchSource::Doh(source) = connector.ech_doh.unwrap() else {
+        panic!("expected Doh");
+    };
+    assert_eq!(source.qname, "cloudflare-ech.com");
+    assert_eq!(source.url, "https://223.5.5.5/dns-query");
+
+    let mut node = test_node();
+    node.tls_mut().unwrap().ech_doh = Some("cloudflare-ech.com".into());
+    assert!(validate_connector_config(&node).is_ok());
+    let connector = build_connector(&node).unwrap();
+    let crate::ech_doh::EchFetchSource::BootstrapDns(qname) = connector.ech_doh.unwrap() else {
+        panic!("expected BootstrapDns");
+    };
+    assert_eq!(qname, "cloudflare-ech.com");
+}
+
 #[tokio::test]
 async fn handshake_standard_and_chrome() {
     for chrome in [false, true] {

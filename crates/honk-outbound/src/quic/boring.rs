@@ -551,6 +551,13 @@ pub struct BoringQuicOptions {
     pub chrome: bool,
     /// Static ECHConfigList; ECH GREASE applies when `chrome` and unset.
     pub ech_config_list: Option<Arc<Vec<u8>>>,
+    /// Dynamic ECH DoH source (`ech=<qname>+<doh-url>`): resolved
+    /// per-connection from the refresh cache so later connections see
+    /// refreshes; `client_config` warms the cache first.
+    pub(crate) ech_doh: Option<crate::ech_doh::EchDohSource>,
+    /// `ech_enabled` discovery domain: read per-connection from the
+    /// discovery cache (warmed by `client_config`).
+    pub(crate) ech_discovery_domain: Option<String>,
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
     pub pin_sha256: Option<[u8; 32]>,
@@ -566,6 +573,8 @@ pub struct BoringQuicClientConfig {
     alpn_wire: Vec<u8>,
     chrome: bool,
     ech_config_list: Option<Arc<Vec<u8>>>,
+    ech_doh: Option<crate::ech_doh::EchDohSource>,
+    ech_discovery_domain: Option<String>,
     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
     has_pin: bool,
     /// Session-ticket cache key (defaults to the server name when unset).
@@ -580,6 +589,8 @@ impl BoringQuicClientConfig {
             skip_cert_verify,
             chrome,
             ech_config_list,
+            ech_doh,
+            ech_discovery_domain,
             pin_sha256,
             ticket_key,
         } = options;
@@ -620,6 +631,8 @@ impl BoringQuicClientConfig {
             alpn_wire,
             chrome,
             ech_config_list,
+            ech_doh,
+            ech_discovery_domain,
             has_pin: pin_sha256.is_some(),
             ticket_key,
         })
@@ -684,9 +697,25 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             ssl.set_permute_extensions(true);
             crate::tls::set_chrome_key_shares_ssl_ref(&ssl).expect("SSL_set1_client_key_shares");
         }
-        match &self.ech_config_list {
+        // ECH is resolved per-connection so cache refreshes (DoH or
+        // discovery) reach later connections on a long-lived runtime.
+        let ech = self
+            .ech_config_list
+            .clone()
+            .or_else(|| {
+                self.ech_doh
+                    .as_ref()
+                    .and_then(crate::ech_doh::cached_ech_doh_config)
+            })
+            .or_else(|| {
+                self.ech_discovery_domain
+                    .as_deref()
+                    .and_then(crate::tls::cached_discovery_config)
+                    .map(Arc::new)
+            });
+        match ech {
             Some(list) => ssl
-                .set_ech_config_list(list)
+                .set_ech_config_list(&list)
                 .expect("invalid ECHConfigList"),
             None if self.chrome => ssl.set_enable_ech_grease(true),
             None => {}

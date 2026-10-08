@@ -215,7 +215,7 @@ impl BootstrapResolver {
 /// Whether `resp` answers `query` (as built by [`build_query`]): same ID, QR
 /// set, same opcode and exactly the sent question. Names are case-insensitive
 /// in DNS, so only the name ignores ASCII case; type and class must match exactly.
-fn answers_query(query: &[u8], resp: &[u8]) -> bool {
+pub(crate) fn answers_query(query: &[u8], resp: &[u8]) -> bool {
     let (name, type_class) = query[12..].split_at(query.len() - 16);
     resp.len() >= 12
         && resp[..2] == query[..2]
@@ -244,7 +244,7 @@ fn system_nameserver() -> Option<SocketAddr> {
 }
 
 /// DNS qtype for HTTPS service-binding records (RFC 9460).
-const QTYPE_HTTPS: u16 = 65;
+pub(crate) const QTYPE_HTTPS: u16 = 65;
 /// SVCB SvcParam key carrying the ECHConfigList.
 const SVCB_KEY_ECH: u16 = 5;
 
@@ -277,7 +277,7 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
 /// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
 /// a DNS response. AliasMode records (priority != 0) carry no SvcParams and
 /// are skipped.
-fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
+pub(crate) fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
     if msg.len() < 12 {
         return None;
     }
@@ -336,7 +336,7 @@ fn parse_svcb_ech_param(rdata: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Build a minimal DNS query (RD set, single question).
-fn build_query(host: &str, qtype: u16) -> Vec<u8> {
+pub(crate) fn build_query(host: &str, qtype: u16) -> Vec<u8> {
     let mut q = Vec::with_capacity(host.len() + 18);
     q.extend_from_slice(&rand::random::<u16>().to_be_bytes()); // id
     q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD

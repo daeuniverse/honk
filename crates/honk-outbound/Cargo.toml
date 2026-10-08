@@ -48,6 +48,9 @@ quinn-proto.workspace = true
 # HTTP/2 client for the urltest latency probe (urltest.rs)
 h2.workspace = true
 http.workspace = true
+# DoH endpoint parsing (ech_doh.rs) and the per-source ECH refresh cache
+url.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true

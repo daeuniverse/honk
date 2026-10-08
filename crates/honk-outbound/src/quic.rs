@@ -286,7 +286,8 @@ impl QuicClientOptions {
 ///
 /// TLS is the BoringSSL backend in [`crate::quic::boring`] (Chrome fingerprint
 /// when `tls_implementation = "utls"`, ECH when the node carries one —
-/// static config, or DNS HTTPS-RR discovery when only `ech_enabled` is set,
+/// static config, `ech=<qname>+<doh-url>` DoH fetch, `ech=<qname>` bootstrap
+/// discovery, or DNS HTTPS-RR discovery when only `ech_enabled` is set,
 /// pinSHA256 when `tls_pin_sha256` is set).
 pub async fn client_config(
     node: &honk_config::node::Node,
@@ -310,14 +311,32 @@ pub async fn client_config(
         .iter()
         .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
         .collect::<Vec<u8>>();
-    let ech = match crate::tls::load_ech_config_list(node)? {
-        Some(list) => Some(Arc::new(list)),
-        None if tls.ech_enabled => {
-            let name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
-            crate::tls::discover_ech_config(&name).await.map(Arc::new)
+    let ech_doh = crate::ech_doh::parse_node_ech_source(node)?;
+    // Warm the ECH caches: the cold path awaits the first fetch (bounded)
+    // so the runtime never starts without ECH when one is obtainable.
+    // `start_session` then resolves per-connection, so later refreshes
+    // reach long-lived runtimes.
+    let ech_config_list = crate::tls::load_ech_config_list(node)?.map(Arc::new);
+    let mut doh_source = None;
+    let mut discovery_domain = None;
+    if ech_config_list.is_none() {
+        match ech_doh {
+            Some(crate::ech_doh::EchFetchSource::BootstrapDns(qname)) => {
+                crate::tls::discover_ech_config(&qname).await;
+                discovery_domain = Some(qname);
+            }
+            Some(crate::ech_doh::EchFetchSource::Doh(source)) => {
+                crate::ech_doh::ech_doh_config(&source).await;
+                doh_source = Some(source);
+            }
+            None if tls.ech_enabled => {
+                let name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+                crate::tls::discover_ech_config(&name).await;
+                discovery_domain = Some(name);
+            }
+            _ => {}
         }
-        None => None,
-    };
+    }
     let pin_sha256 = tls
         .pin_sha256
         .as_deref()
@@ -335,7 +354,9 @@ pub async fn client_config(
             alpn_wire,
             skip_cert_verify: tls.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
-            ech_config_list: ech,
+            ech_config_list,
+            ech_doh: doh_source,
+            ech_discovery_domain: discovery_domain,
             pin_sha256,
             ticket_key: Some(format!(
                 "{}|{}|{}|{}",

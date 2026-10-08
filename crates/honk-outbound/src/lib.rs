@@ -10,6 +10,7 @@ mod address_race;
 pub mod alive;
 pub mod bootstrap;
 pub mod descriptor;
+pub(crate) mod ech_doh;
 pub mod group;
 pub mod proxy;
 pub mod quic;
