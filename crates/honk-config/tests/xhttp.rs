@@ -921,3 +921,36 @@ fn download_view_admission_covers_every_adapter() {
         "immutable admission must reject a noncanonical download path"
     );
 }
+
+#[test]
+fn download_address_must_be_a_dialable_host_and_is_normalized() {
+    let with_address = |address: &str| {
+        let mut settings = download_settings();
+        settings["address"] = json!(address);
+        download_link(json!({"downloadSettings": settings}), "")
+    };
+    for bad in [
+        "bad host",
+        "down.example:8443",
+        "down.example/x",
+        "2001:db8::1",
+        "user@down.example",
+        "  ",
+    ] {
+        assert!(with_address(bad).is_err(), "{bad:?}");
+    }
+    let canonical = with_address("down.example").unwrap();
+    assert_eq!(with_address(" DOWN.Example ").unwrap().id, canonical.id);
+    let download = canonical.transport().unwrap().xhttp.as_ref().unwrap();
+    assert_eq!(
+        download.download.as_deref().unwrap().address,
+        "down.example"
+    );
+    let flat_download =
+        |address: &str| flat(json!({"download": {"address": address, "port": 443}}));
+    assert_eq!(
+        flat_download("DOWN.example").unwrap().derive_id(),
+        flat_download("down.example").unwrap().derive_id()
+    );
+    assert!(flat_download("down.example:443").is_err());
+}

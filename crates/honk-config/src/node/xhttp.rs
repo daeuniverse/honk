@@ -160,6 +160,30 @@ fn default_padding() -> XhttpRange {
     XhttpOptions::DEFAULT_PADDING
 }
 
+impl XhttpDownload {
+    fn normalize(&mut self) {
+        self.address = self.address.trim().to_ascii_lowercase();
+        self.path = XhttpOptions::normalize_path(&self.path);
+        self.host = self.host.take().filter(|host| !host.is_empty());
+        self.server_name = self.server_name.take().filter(|name| !name.is_empty());
+    }
+
+    /// The dialer joins `address:port` textually, so only names and IPv4 literals can be dialed;
+    /// anything else would be admitted here and fail on every flow.
+    fn validate_address(&self) -> Result<(), &'static str> {
+        if self.address.is_empty()
+            || !self.address.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'.' | b'_')
+            })
+        {
+            return Err("XHTTP download address must be a normalized hostname or IPv4 address");
+        }
+        Ok(())
+    }
+}
+
 impl Default for XhttpOptions {
     fn default() -> Self {
         Self {
@@ -527,9 +551,7 @@ impl XhttpOptions {
         }
         self.headers = headers;
         if let Some(download) = &mut self.download {
-            download.path = Self::normalize_path(&download.path);
-            download.host = download.host.take().filter(|host| !host.is_empty());
-            download.server_name = download.server_name.take().filter(|name| !name.is_empty());
+            download.normalize();
         }
         self.validate()
     }
@@ -602,9 +624,12 @@ impl XhttpOptions {
         if bytes > 16 * 1024 {
             return Err("XHTTP headers exceed supported bounds");
         }
-        // Xray and mihomo refuse this combination; the download view validates the rest.
-        if self.download.is_some() && self.mode == XhttpMode::StreamOne {
-            return Err("XHTTP download settings cannot use stream-one mode");
+        if let Some(download) = &self.download {
+            // Xray and mihomo refuse this combination; the download view validates the rest.
+            if self.mode == XhttpMode::StreamOne {
+                return Err("XHTTP download settings cannot use stream-one mode");
+            }
+            download.validate_address()?;
         }
         Ok(())
     }
