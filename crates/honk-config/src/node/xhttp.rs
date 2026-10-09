@@ -130,6 +130,34 @@ pub struct XhttpOptions {
         deserialize_with = "interval_range"
     )]
     pub sc_min_posts_interval_ms: XhttpRange,
+    /// Absent options serialize nothing, keeping existing XHTTP node IDs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download: Option<Box<XhttpDownload>>,
+}
+
+/// Xray `downloadSettings`: GET requests use their own endpoint and request
+/// shape. Like Xray, nothing is inherited from the upload side; the TLS name
+/// falls back to the address, never to the upload SNI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownload {
+    pub address: String,
+    pub port: u16,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default = "default_path")]
+    pub path: String,
+    #[serde(default = "default_padding", deserialize_with = "padding_range")]
+    pub x_padding_bytes: XhttpRange,
+}
+
+fn default_path() -> String {
+    "/".into()
+}
+fn default_padding() -> XhttpRange {
+    XhttpOptions::DEFAULT_PADDING
 }
 
 impl Default for XhttpOptions {
@@ -143,6 +171,7 @@ impl Default for XhttpOptions {
             no_grpc_header: false,
             sc_max_each_post_bytes: Self::DEFAULT_POST,
             sc_min_posts_interval_ms: Self::DEFAULT_INTERVAL,
+            download: None,
         }
     }
 }
@@ -243,6 +272,151 @@ pub(crate) struct XrayExtra {
         deserialize_with = "extra_interval"
     )]
     sc_min_posts_interval_ms: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "downloadSettings",
+        deserialize_with = "present_option"
+    )]
+    download_settings: Option<XrayDownload>,
+    // Xray reads these only in its server hub; a client checks the type and sends nothing.
+    #[serde(default, rename = "noSSEHeader", deserialize_with = "present_option")]
+    _no_sse_header: Option<bool>,
+    #[serde(
+        default,
+        rename = "scMaxBufferedPosts",
+        deserialize_with = "present_option"
+    )]
+    _sc_max_buffered_posts: Option<i64>,
+    #[serde(
+        default,
+        rename = "scStreamUpServerSecs",
+        deserialize_with = "present_option"
+    )]
+    _sc_stream_up_server_secs: Option<XhttpRange>,
+    #[serde(default, rename = "xmux", deserialize_with = "present_option")]
+    _xmux: Option<DefaultXmux>,
+}
+
+/// XMUX that is all-zero or exactly Xray's fill-in for an omitted XMUX
+/// (`infra/conf/transport_internet.go`). Accepting it adds no deviation beyond
+/// honk's fixed carrier reuse; any other value rejects.
+pub struct DefaultXmux;
+
+impl<'de> Deserialize<'de> for DefaultXmux {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Xray reads omitted members and empty strings as zero.
+        #[derive(PartialEq)]
+        struct Range(XhttpRange);
+        impl Default for Range {
+            fn default() -> Self {
+                Self(XhttpRange { min: 0, max: 0 })
+            }
+        }
+        impl<'de> Deserialize<'de> for Range {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserialize_range(deserializer, Some(Self::default().0)).map(Self)
+            }
+        }
+        // Xray spells these in camelCase, mihomo `reuse-settings` in kebab-case.
+        #[derive(Deserialize, Default, PartialEq)]
+        #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+        struct Xmux {
+            #[serde(alias = "max-concurrency")]
+            max_concurrency: Range,
+            #[serde(alias = "max-connections")]
+            max_connections: Range,
+            #[serde(alias = "c-max-reuse-times")]
+            c_max_reuse_times: Range,
+            #[serde(alias = "h-max-request-times")]
+            h_max_request_times: Range,
+            #[serde(alias = "h-max-reusable-secs")]
+            h_max_reusable_secs: Range,
+            #[serde(alias = "h-keep-alive-period")]
+            h_keep_alive_period: i64,
+        }
+        let range = |min, max| Range(XhttpRange { min, max });
+        let filled = Xmux {
+            max_concurrency: range(1, 1),
+            h_max_request_times: range(600, 900),
+            h_max_reusable_secs: range(1800, 3000),
+            ..Xmux::default()
+        };
+        let xmux = Xmux::deserialize(deserializer)?;
+        if xmux == Xmux::default() || xmux == filled {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom("unsupported XHTTP XMUX option"))
+        }
+    }
+}
+
+/// Xray `downloadSettings` (a StreamConfig) as exporters write it. Only an
+/// H2-over-TLS XHTTP endpoint is representable; known null members are absent,
+/// as in Go's decoder, and unknown members reject whatever their value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XrayDownload {
+    address: String,
+    port: u16,
+    network: String,
+    security: String,
+    alpn: Option<Vec<String>>,
+    #[serde(rename = "tlsSettings")]
+    tls_settings: Option<XrayDownloadTls>,
+    #[serde(rename = "xhttpSettings")]
+    xhttp_settings: Option<XrayDownloadXhttp>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct XrayDownloadTls {
+    #[serde(rename = "serverName")]
+    server_name: Option<String>,
+    // Global TLS mode owns the fingerprint, as for the upload `fp`.
+    #[serde(rename = "fingerprint")]
+    _fingerprint: Option<String>,
+    alpn: Option<Vec<String>>,
+    #[serde(rename = "allowInsecure")]
+    allow_insecure: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct XrayDownloadXhttp {
+    path: Option<String>,
+    host: Option<String>,
+    // GET carries no mode; the upload side resolves it.
+    #[serde(rename = "mode")]
+    _mode: Option<XhttpMode>,
+}
+
+impl XrayDownload {
+    pub fn into_download(self) -> Result<XhttpDownload, &'static str> {
+        let tls = self.tls_settings.unwrap_or_default();
+        let xhttp = self.xhttp_settings.unwrap_or_default();
+        let h2_only = |alpn: Option<Vec<String>>| {
+            let mut alpn = alpn.unwrap_or_default();
+            XhttpOptions::normalize_alpn(&mut alpn);
+            alpn.is_empty() || alpn == ["h2"]
+        };
+        if self.address.trim().is_empty()
+            || crate::options::vocab::xhttp_stream_transport(&self.network) != Ok("xhttp")
+            || !self.security.eq_ignore_ascii_case("tls")
+            || !h2_only(self.alpn)
+            || !h2_only(tls.alpn)
+            || tls.allow_insecure == Some(true)
+        {
+            return Err("unsupported XHTTP download settings");
+        }
+        Ok(XhttpDownload {
+            address: self.address,
+            port: self.port,
+            server_name: tls.server_name,
+            host: xhttp.host,
+            path: xhttp.path.unwrap_or_else(default_path),
+            x_padding_bytes: XhttpOptions::DEFAULT_PADDING,
+        })
+    }
 }
 
 pub(crate) fn present_option<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -352,6 +526,11 @@ impl XhttpOptions {
             merge_header(&mut headers, name, value)?;
         }
         self.headers = headers;
+        if let Some(download) = &mut self.download {
+            download.path = Self::normalize_path(&download.path);
+            download.host = download.host.take().filter(|host| !host.is_empty());
+            download.server_name = download.server_name.take().filter(|name| !name.is_empty());
+        }
         self.validate()
     }
 
@@ -423,6 +602,10 @@ impl XhttpOptions {
         if bytes > 16 * 1024 {
             return Err("XHTTP headers exceed supported bounds");
         }
+        // Xray and mihomo refuse this combination; the download view validates the rest.
+        if self.download.is_some() && self.mode == XhttpMode::StreamOne {
+            return Err("XHTTP download settings cannot use stream-one mode");
+        }
         Ok(())
     }
 
@@ -445,6 +628,11 @@ impl XhttpOptions {
             options.sc_min_posts_interval_ms = extra
                 .sc_min_posts_interval_ms
                 .unwrap_or(Self::DEFAULT_INTERVAL);
+            options.download = extra
+                .download_settings
+                .map(XrayDownload::into_download)
+                .transpose()?
+                .map(Box::new);
         }
         if let Some(path) = path {
             options.path = path.to_owned();

@@ -208,6 +208,17 @@ impl Node {
             .map_err(|message| ValidationFailure::new(Some("reality_public_key"), message))?
             .is_some();
         if self.is_xhttp() {
+            if let Some(view) = self.xhttp_download_view() {
+                // REALITY's auto mode would also need Xray's stream-up switch for download peers.
+                if reality {
+                    return Err(ValidationFailure::new(
+                        Some("xhttp"),
+                        "XHTTP download settings require a non-REALITY upload",
+                    ));
+                }
+                view.validate_inner()
+                    .map_err(|failure| ValidationFailure::new(Some("xhttp"), failure.message))?;
+            }
             return tls
                 .check_xhttp_alpn()
                 .map_err(|message| ValidationFailure::new(Some("tls_alpn"), message));

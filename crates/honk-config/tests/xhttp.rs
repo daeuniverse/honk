@@ -316,7 +316,6 @@ fn all_xhttp_option_differences_change_reload_identity() {
 fn raw_unsupported_options_ranges_and_headers_fail_closed() {
     for field in [
         "downloadSettings",
-        "xmux",
         "reuseSettings",
         "sessionPlacement",
         "seqPlacement",
@@ -685,4 +684,240 @@ fn nonstream_uri_protocols_reject_xhttp_claims_instead_of_discarding_them() {
             assert_eq!(error.diagnostic.code, "invalid-config-value");
         }
     }
+}
+
+fn download_settings() -> Value {
+    json!({"address":"down.example","port":8443,"network":"xhttp","security":"tls",
+        "alpn":["h2"],"tlsSettings":{"serverName":"down-sni.example","fingerprint":"chrome"},
+        "xhttpSettings":{"path":"down","mode":"auto","host":null}})
+}
+
+fn download_link(extra: Value, query: &str) -> Result<Node, honk_config::ConfigError> {
+    Node::from_share_link(&format!(
+        "vless://{UUID}@example.com:443?type=xhttp&security=tls&sni=up.example&{query}&{}",
+        extra_uri(extra)
+    ))
+}
+
+#[test]
+fn download_settings_map_to_an_uninherited_download_peer() {
+    let node = download_link(
+        json!({"downloadSettings": download_settings(), "headers":{"X-Up":"1"}}),
+        "allowInsecure=1&pinSHA256=0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    .unwrap();
+    let options = node.transport().unwrap().xhttp.as_ref().unwrap();
+    let download = options.download.as_deref().unwrap();
+    assert_eq!(
+        (
+            download.address.as_str(),
+            download.port,
+            download.path.as_str()
+        ),
+        ("down.example", 8443, "/down/")
+    );
+    assert_eq!(download.server_name.as_deref(), Some("down-sni.example"));
+    assert_eq!(download.host, None);
+    assert_eq!(
+        download.x_padding_bytes,
+        XhttpRange {
+            min: 100,
+            max: 1000
+        }
+    );
+
+    let view = node.xhttp_download_view().unwrap();
+    assert_eq!((view.host(), view.port), ("down.example", 8443));
+    let tls = view.tls().unwrap();
+    assert!(tls.enabled && !tls.skip_cert_verify && tls.pin_sha256.is_none());
+    assert_eq!(tls.sni.as_deref(), Some("down-sni.example"));
+    let view_options = view.transport().unwrap().xhttp.as_ref().unwrap();
+    assert!(view_options.headers.is_empty() && view_options.download.is_none());
+    assert_eq!(view_options.path, "/down/");
+    assert!(link("type=xhttp").xhttp_download_view().is_none());
+
+    let wire = serde_json::to_value(&node).unwrap();
+    let restored: Node = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored.outbound, node.outbound);
+    assert_eq!(restored.derive_id(), node.id);
+    let mut moved = download_settings();
+    moved["address"] = json!("elsewhere.example");
+    assert_ne!(
+        download_link(json!({"downloadSettings": moved}), "")
+            .unwrap()
+            .id,
+        download_link(json!({"downloadSettings": download_settings()}), "")
+            .unwrap()
+            .id
+    );
+    assert!(
+        serde_json::to_value(XhttpOptions::default())
+            .unwrap()
+            .get("download")
+            .is_none(),
+        "absent download settings must not change existing XHTTP IDs"
+    );
+}
+
+#[test]
+fn download_settings_reject_unrepresentable_peers() {
+    let base = download_settings();
+    let mut cases = Vec::new();
+    for (pointer, value) in [
+        ("/security", json!("reality")),
+        ("/security", json!("none")),
+        ("/network", json!("ws")),
+        ("/network", Value::Null),
+        ("/address", json!("")),
+        ("/alpn", json!(["http/1.1"])),
+        ("/tlsSettings/alpn", json!(["h2", "http/1.1"])),
+        ("/tlsSettings/allowInsecure", json!(true)),
+        ("/tlsSettings/pinnedPeerCertSha256", json!("00")),
+        ("/tlsSettings/echConfigList", json!("x")),
+        ("/xhttpSettings/extra", json!({})),
+        ("/xhttpSettings/headers", json!({})),
+        ("/xhttpSettings/mode", json!("invalid")),
+        ("/realitySettings", json!({})),
+        ("/sockopt", json!({})),
+        ("/unknown", Value::Null),
+    ] {
+        let mut settings = base.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        settings.pointer_mut(parent).unwrap()[key] = value;
+        cases.push(settings);
+    }
+    let mut missing = base.clone();
+    missing.as_object_mut().unwrap().remove("network");
+    cases.push(missing);
+    for settings in cases {
+        assert!(
+            download_link(json!({"downloadSettings": settings}), "").is_err(),
+            "{settings}"
+        );
+    }
+    let extra = json!({"downloadSettings": base});
+    download_link(extra.clone(), "").unwrap();
+    assert!(download_link(extra.clone(), "mode=stream-one").is_err());
+    assert!(
+        Node::from_share_link(&format!(
+            "vless://{UUID}@example.com:443?type=xhttp&security=reality&pbk=key&{}",
+            extra_uri(extra)
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn server_only_extras_and_default_xmux_are_checked_then_dropped() {
+    let plain = link("type=xhttp");
+    let filled = json!({"maxConcurrency":"1","maxConnections":0,"cMaxReuseTimes":"",
+        "hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0});
+    for extra in [
+        json!({"noSSEHeader":true,"scMaxBufferedPosts":60,"scStreamUpServerSecs":"5-10"}),
+        json!({"xmux":{}}),
+        json!({"xmux":filled}),
+        json!({"xmux":{"max-concurrency":"1","h-max-request-times":"600-900","h-max-reusable-secs":"1800-3000"}}),
+    ] {
+        let node = link(&format!("type=xhttp&{}", extra_uri(extra.clone())));
+        assert_eq!(node.id, plain.id, "{extra}");
+    }
+    for extra in [
+        json!({"noSSEHeader":"yes"}),
+        json!({"noSSEHeader":null}),
+        json!({"scStreamUpServerSecs":"10-5"}),
+        json!({"xmux":{"maxConcurrency":"2"}}),
+        json!({"xmux":{"maxConcurrency":"1","hMaxRequestTimes":"600-900"}}),
+        json!({"xmux":{"maxConcurrency":"1","max-concurrency":"1"}}),
+        json!({"xmux":{"unknown":0}}),
+        json!({"xmux":null}),
+    ] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://{UUID}@example.com:443?type=xhttp&{}",
+                extra_uri(extra.clone())
+            ))
+            .is_err(),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn inert_uri_metadata_is_accepted_only_with_inert_values() {
+    let plain = link("type=xhttp");
+    let referer = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("headers", r#"{"Referer":"https://per-node.example/"}"#)
+        .finish();
+    for query in [
+        "quicSecurity=none".to_owned(),
+        "quicSecurity=".to_owned(),
+        "serviceName=".to_owned(),
+        referer,
+    ] {
+        assert_eq!(link(&format!("type=xhttp&{query}")).id, plain.id, "{query}");
+    }
+    for query in [
+        "quicSecurity=aes-128-gcm".to_owned(),
+        "serviceName=grpc".to_owned(),
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("headers", r#"{"Referer":"a","X-Other":"b"}"#)
+            .finish(),
+        "headers=referer".to_owned(),
+    ] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://{UUID}@example.com:443?type=xhttp&{query}"
+            ))
+            .is_err(),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn download_view_admission_covers_every_adapter() {
+    let base = json!({"address":"down.example","port":8443,"server_name":"down-sni.example","path":"down"});
+    let node = flat(json!({"download": base})).unwrap();
+    let download = node
+        .transport()
+        .unwrap()
+        .xhttp
+        .as_ref()
+        .unwrap()
+        .download
+        .as_deref()
+        .unwrap();
+    assert_eq!(download.path, "/down/");
+    for (key, value) in [
+        ("port", json!(0)),
+        ("address", json!(" ")),
+        ("host", json!("user@front.example")),
+        ("path", json!("/a#b/")),
+        ("x_padding_bytes", json!(0)),
+        ("headers", json!({})),
+    ] {
+        let mut download = base.clone();
+        download[key] = value;
+        assert!(flat(json!({"download": download})).is_err(), "{key}");
+    }
+    for (pointer, value) in [
+        ("/port", json!(0)),
+        ("/xhttpSettings/host", json!("user@front.example")),
+        ("/xhttpSettings/path", json!("/a#b/")),
+    ] {
+        let mut settings = download_settings();
+        *settings.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            download_link(json!({"downloadSettings": settings}), "").is_err(),
+            "{pointer}"
+        );
+    }
+    let mut direct = download_link(json!({"downloadSettings": download_settings()}), "").unwrap();
+    direct.validate().unwrap();
+    let options = direct.transport_mut().unwrap().xhttp.as_mut().unwrap();
+    options.download.as_mut().unwrap().path = "down".into();
+    assert!(
+        direct.validate().is_err(),
+        "immutable admission must reject a noncanonical download path"
+    );
 }
