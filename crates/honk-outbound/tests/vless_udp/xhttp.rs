@@ -200,7 +200,7 @@ async fn independent_xhttp_h2_peer_preserves_uot_v2_datagrams() {
             let expected = 23 + MAGIC.len() + 13;
             let mut packet_inputs = std::collections::BTreeMap::new();
             let mut next_sequence = 0_u64;
-            while received.len() < expected {
+            while received.len() < expected || download.is_none() {
                 let (request, mut respond) = requests.recv().await.unwrap();
                 if request.method() == http::Method::GET {
                     download = Some(
