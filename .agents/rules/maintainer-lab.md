@@ -8,12 +8,12 @@ Install boring-sys prerequisites (`AGENTS.md`, Technology stack) and its REALITY
 at pinned `/root/code/boring-rprx/boring-sys`. Cross-build with `ci/zig*`, not containers.
 
 REALITY / xtls-rprx-vision interop uses two live servers, not the unprivileged suite:
-- Lab `10.10.10.70`: sing-box 1.12, systemd `sing-box-rprx`, `/etc/sing-box/rprx.json`.
+- LAN lab host: sing-box 1.12, systemd `sing-box-rprx`, `/etc/sing-box/rprx.json`.
   Ports: 8443 vless+reality+vision; 8444 vless+reality; 8445 vmess+ws+tls self-signed
   (require `skip_cert_verify`/`insecure=1`); 8446 vmess bare tcp.
-  LAN HTTP: `10.10.10.70:18080`, systemd `bench-http18080`.
-- Public `103.238.129.118`: Xray 26.3.27, same ports, `xray-rprx.service`, degraded
+  LAN HTTP on port 18080 of the same host, systemd `bench-http18080`.
+- Public host: Xray 26.3.27, same ports, `xray-rprx.service`, degraded
   ~75 ms / ~15% loss.
-JA4 was verified on .70 with `/usr/local/bin/ja4probe` (`ja4probe`, source
+JA4 was verified on the LAN lab host with `/usr/local/bin/ja4probe` (`ja4probe`, source
 `/root/code/ja4probe`). The manual lab driver is `honk-outbound/examples/reality_lab59.rs`;
 production ClientHello/authentication checks live in `honk-outbound/src/reality/wire_tests.rs`.
