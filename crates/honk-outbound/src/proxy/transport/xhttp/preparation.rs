@@ -33,7 +33,7 @@ struct State {
 /// One candidate's unpublished physical sessions for one peer. Shared sessions remain pool-owned.
 pub(super) struct PreparationState {
     transport: Arc<XhttpRuntime>,
-    peer: Peer,
+    pub(super) peer: Peer,
     state: Mutex<State>,
     changed: Notify,
 }
