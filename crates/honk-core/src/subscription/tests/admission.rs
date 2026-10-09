@@ -368,7 +368,6 @@ fn xhttp_mihomo_options_reach_canonical_nodes_and_identity() {
 fn xhttp_unsupported_raw_presence_salvages_siblings_and_redacts_errors() {
     for field in [
         "download-settings",
-        "reuse-settings",
         "session-placement",
         "seq-placement",
         "uplink-data-placement",
@@ -481,4 +480,149 @@ fn vmess_xhttp_tls_and_plain_entries_survive_subscription_dedup() {
         nodes[0].tls().unwrap().enabled,
         nodes[1].tls().unwrap().enabled
     );
+}
+
+const XMUX_FILLED: &str = r#"{"maxConcurrency":"1","maxConnections":"0","cMaxReuseTimes":"0","hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0}"#;
+
+/// A panel export of one download-split subscription: two upload/download
+/// pairs, plus a copy of the first that differs only in name (and, in URI
+/// form, a per-node Referer).
+fn split_download_exports() -> (String, String) {
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let pairs = [
+        ("first", "up1.example", "down1.example", "r1"),
+        ("second", "up2.example", "up2.example", "r2"),
+        ("copy", "up1.example", "down1.example", "r3"),
+    ];
+    let mut uris = String::new();
+    let mut clash = String::from("proxies:\n");
+    for (name, up, down, referer) in pairs {
+        let download = serde_json::json!({"address":down,"port":443,"network":"xhttp",
+            "security":"tls","alpn":["h2"],"tlsSettings":{"serverName":format!("sni.{down}"),"fingerprint":"chrome"},
+            "xhttpSettings":{"path":"/down","mode":"auto","host":null}});
+        let extra = serde_json::json!({"xmux":serde_json::from_str::<serde_json::Value>(XMUX_FILLED).unwrap(),
+            "noSSEHeader":false,"scMaxBufferedPosts":60,"scStreamUpServerSecs":"5-10","downloadSettings":download});
+        let mut link = reqwest::Url::parse(&format!("vless://{uuid}@{up}:443")).unwrap();
+        link.set_fragment(Some(name));
+        link.query_pairs_mut()
+            .append_pair("encryption", "mlkem768x25519plus.test")
+            .append_pair("flow", "xtls-rprx-vision")
+            .append_pair("security", "tls")
+            .append_pair("sni", &format!("sni.{up}"))
+            .append_pair("alpn", "h2")
+            .append_pair("fp", "chrome")
+            .append_pair("type", "xhttp")
+            .append_pair("path", "/up")
+            .append_pair("host", "")
+            .append_pair("mode", "auto")
+            .append_pair("quicSecurity", "none")
+            .append_pair("serviceName", "")
+            .append_pair(
+                "headers",
+                &format!(r#"{{"Referer":"https://{referer}.example/"}}"#),
+            )
+            .append_pair("extra", &extra.to_string());
+        uris.push_str(&format!("{link}\n"));
+        let download = format!(
+            "{{address: {down}, port: 443, network: xhttp, security: tls, alpn: [h2], tlsSettings: {{serverName: sni.{down}, fingerprint: chrome}}, xhttpSettings: {{path: /down, mode: auto}}, x-padding-bytes: 100-1000, no-grpc-header: false, no-sse-header: false, sc-max-buffered-posts: 60, sc-max-each-post-bytes: '1000000', sc-min-posts-interval-ms: '5', sc-stream-up-server-secs: 5-10, reuse-settings: {XMUX_FILLED}, xmux: {XMUX_FILLED}}}"
+        );
+        clash.push_str(&format!(
+            "  - {{name: {name}, type: vless, server: {up}, port: 443, uuid: {uuid}, udp: true, tls: true, servername: sni.{up}, alpn: [h2], client-fingerprint: chrome, flow: xtls-rprx-vision, encryption: mlkem768x25519plus.test, network: xhttp, xhttp-opts: {{path: /up, mode: auto, no-sse-header: false, sc-max-buffered-posts: 60, sc-stream-up-server-secs: 5-10, xmux: {XMUX_FILLED}, reuse-settings: {XMUX_FILLED}, download-settings: {download}}}}}\n"
+        ));
+    }
+    (
+        base64::engine::general_purpose::STANDARD.encode(uris),
+        clash,
+    )
+}
+
+#[test]
+fn uri_and_clash_exports_of_a_download_split_subscription_import_identically() {
+    let (uris, clash) = split_download_exports();
+    let mut ids = Vec::new();
+    for body in [uris, clash] {
+        let mut diagnostics = Vec::new();
+        let nodes = parse_subscription_content_with_diagnostics(
+            &Subscription::default(),
+            &body,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "duplicate-subscription-entry");
+        let downloads = nodes
+            .iter()
+            .map(|node| {
+                let view = node
+                    .xhttp_download_view()
+                    .expect("download peer survives import");
+                (
+                    view.host().to_owned(),
+                    view.tls().unwrap().sni.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            downloads,
+            [
+                ("down1.example".into(), "sni.down1.example".into()),
+                ("up2.example".into(), "sni.up2.example".into())
+            ]
+        );
+        ids.push(
+            nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+    assert_eq!(ids[0], ids[1]);
+}
+
+#[test]
+fn clash_download_settings_reject_mihomo_inheritance_and_non_mappings() {
+    let (_, clash) = split_download_exports();
+    let first = clash.lines().nth(1).unwrap();
+    for (from, to) in [
+        (
+            "download-settings: {",
+            "download-settings: {server: other.example, ",
+        ),
+        (
+            "download-settings: {",
+            "download-settings: {servername: other.example, ",
+        ),
+        ("download-settings: {", "download-settings: {tls: true, "),
+        (
+            "download-settings: {",
+            "download-settings: {unknown: null, ",
+        ),
+        ("x-padding-bytes: 100-1000", "x-padding-bytes: 0"),
+        ("security: tls, alpn", "security: reality, alpn"),
+        ("xmux: {", "xmux: {unknown: 0, "),
+        (
+            "no-sse-header: false, sc-max-buffered",
+            "no-sse-header: maybe, sc-max-buffered",
+        ),
+        (
+            "xhttp-opts: {",
+            "xhttp-opts: {download: {address: x, port: 1}, ",
+        ),
+    ] {
+        let body = format!("proxies:\n{}\n", first.replacen(from, to, 1));
+        assert!(
+            parse_subscription_content(&Subscription::default(), &body).is_err(),
+            "{to}"
+        );
+    }
+    for value in ["null", "''", "false", "{server: other.example}"] {
+        let body = format!(
+            "proxies: [{{name: invalid, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {{download-settings: {value}}}}}]"
+        );
+        assert!(
+            parse_subscription_content(&Subscription::default(), &body).is_err(),
+            "{value}"
+        );
+    }
 }

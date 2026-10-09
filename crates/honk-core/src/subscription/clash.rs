@@ -2,6 +2,7 @@
 
 mod fields;
 pub(super) mod options;
+mod xhttp;
 
 use honk_config::node::{Node, OutboundConfig};
 use honk_config::options::vocab::{optional_flow, packet_network, xhttp_stream_transport};
@@ -464,9 +465,7 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
         if !transport.is_xhttp() {
             return Err("XHTTP options require XHTTP transport");
         }
-        value.as_mapping().ok_or("xhttp-opts must be a mapping")?;
-        transport.xhttp =
-            Some(serde_yaml::from_value(value.clone()).map_err(|_| "invalid XHTTP options")?);
+        transport.xhttp = Some(xhttp::options(value)?);
     }
     if let Some(transport) = node.transport_mut() {
         if let Some(options) = yaml_value(mapping, "ws-opts").filter(|value| yaml_active(value)) {
