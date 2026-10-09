@@ -39,9 +39,10 @@ pub(super) fn apply_xhttp_query(
             "serviceName" => value.is_empty(),
             "headers" => serde_json::from_str::<std::collections::BTreeMap<String, String>>(value)
                 .is_ok_and(|headers| {
-                    headers
-                        .keys()
-                        .all(|name| name.eq_ignore_ascii_case("referer"))
+                    headers.len() == 1
+                        && headers
+                            .keys()
+                            .all(|name| name.eq_ignore_ascii_case("referer"))
                 }),
             _ => false,
         };

@@ -863,6 +863,7 @@ fn inert_uri_metadata_is_accepted_only_with_inert_values() {
             .append_pair("headers", r#"{"Referer":"a","X-Other":"b"}"#)
             .finish(),
         "headers=referer".to_owned(),
+        "headers=%7B%7D".to_owned(),
     ] {
         assert!(
             Node::from_share_link(&format!(
