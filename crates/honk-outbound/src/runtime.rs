@@ -658,6 +658,20 @@ impl EphemeralRuntimeGuard {
             runtime.close().await;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_xhttp(
+        node: &Node,
+        xhttp: Arc<crate::proxy::transport::xhttp::XhttpRuntime>,
+    ) -> Self {
+        let mut runtime = NodeRuntime::try_ephemeral(node).unwrap();
+        Arc::get_mut(&mut runtime)
+            .expect("a fresh ephemeral runtime is unshared")
+            .xhttp = Some(xhttp);
+        Self {
+            runtime: Some(runtime),
+        }
+    }
 }
 
 impl Drop for EphemeralRuntimeGuard {

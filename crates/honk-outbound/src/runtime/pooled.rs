@@ -77,13 +77,13 @@ impl PooledLifecycle for XhttpRuntime {
         self.shutdown();
     }
     fn reap_unretained_idle(&self) -> usize {
-        self.pool.reap_unretained_idle()
+        self.pools().map(|pool| pool.reap_unretained_idle()).sum()
     }
     fn live_session_count(&self) -> usize {
-        self.pool.live_session_count()
+        self.pools().map(|pool| pool.live_session_count()).sum()
     }
     fn is_warm_or_stateless_for(&self, _: crate::proxy::WarmRequirement) -> bool {
-        self.pool.has_usable_session()
+        self.pools().all(|pool| pool.has_usable_session())
     }
     fn bind_dial_admission(&self, admission: &CapturedDialAdmission) {
         self.set_dial_admission(admission.clone());

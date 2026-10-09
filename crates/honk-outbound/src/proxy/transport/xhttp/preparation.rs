@@ -4,7 +4,8 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use parking_lot::Mutex;
 use tokio::{net::TcpStream, sync::Notify};
 
-use super::{MAX_CARRIERS, XhttpRuntime, XhttpSession, runtime::Phase};
+use super::runtime::{Lifecycle, Peer, Phase};
+use super::{MAX_CARRIERS, XhttpRuntime, XhttpSession};
 use crate::runtime::NodeRuntime;
 use crate::session::{
     DetachedSessionReservation, ManagedSession, SessionPermit, SessionState, SpeculativeCheckout,
@@ -29,17 +30,19 @@ struct State {
     sessions: Vec<(Arc<XhttpSession>, DetachedSessionReservation<XhttpSession>)>,
 }
 
-/// One candidate's unpublished physical sessions. Shared sessions remain pool-owned.
+/// One candidate's unpublished physical sessions for one peer. Shared sessions remain pool-owned.
 pub(super) struct PreparationState {
     transport: Arc<XhttpRuntime>,
+    peer: Peer,
     state: Mutex<State>,
     changed: Notify,
 }
 
 impl PreparationState {
-    pub(super) fn new(transport: Arc<XhttpRuntime>) -> Arc<Self> {
+    pub(super) fn new(transport: Arc<XhttpRuntime>, peer: Peer) -> Arc<Self> {
         Arc::new(Self {
             transport,
+            peer,
             state: Mutex::new(State {
                 phase: PhaseState::Open,
                 sessions: Vec::new(),
@@ -107,7 +110,7 @@ impl PreparationState {
             };
             drop(closed);
             if committed {
-                return self.transport.reserve_pooled(runtime, tcp, timeout).await;
+                return self.peer.reserve(runtime, tcp, timeout).await;
             }
             // Poll all private capacity notifications before checking their reservations.
             // These sessions remain invisible to shared pool checkout until winner commit.
@@ -121,13 +124,13 @@ impl PreparationState {
             }
             for session in sessions.iter().flatten() {
                 if session.state() == SessionState::Active
-                    && let Some(permit) = self.transport.pool.try_reserve(session)
+                    && let Some(permit) = self.peer.pool.try_reserve(session)
                 {
                     return Ok((session.clone(), permit));
                 }
             }
             let checkout = tokio::select! {
-                result = self.transport.pool.checkout_speculative() => result?,
+                result = self.peer.pool.checkout_speculative() => result?,
                 error = self.cancellation_error() => return Err(error),
                 _ = &mut changed => continue,
                 _ = wakeups.next(), if !wakeups.is_empty() => continue,
@@ -139,7 +142,7 @@ impl PreparationState {
                 }
                 SpeculativeCheckout::Detached(mut reservation) => {
                     let session = tokio::select! {
-                        result = XhttpRuntime::dial(runtime.clone(), tcp.clone(), timeout) => result?,
+                        result = XhttpRuntime::dial(runtime.clone(), self.peer.node.clone(), tcp.clone(), timeout) => result?,
                         _ = reservation.cancelled() => anyhow::bail!("XHTTP pool retired during preparation"),
                         error = self.cancellation_error() => return Err(error),
                     };
@@ -173,9 +176,7 @@ impl PreparationState {
         drop(sessions);
     }
 
-    fn commit(&self) -> anyhow::Result<()> {
-        // The lifecycle lock fences publication against retirement and shutdown.
-        let lifecycle = self.transport.lifecycle.lock();
+    fn commit(&self, lifecycle: &Lifecycle) -> anyhow::Result<()> {
         let mut state = self.state.lock();
         state.phase.ensure_open()?;
         anyhow::ensure!(!lifecycle.is_retired(), "XHTTP runtime retired");
@@ -196,20 +197,27 @@ impl PreparationState {
 
 /// Winner-only publication guard. Dropping a loser closes only its private sessions.
 pub(crate) struct XhttpPreparation {
-    state: Arc<PreparationState>,
+    states: Vec<Arc<PreparationState>>,
 }
 
 impl XhttpPreparation {
-    pub(super) fn new(state: Arc<PreparationState>) -> Self {
-        Self { state }
+    /// `states` publish in order, each into its own peer's pool.
+    pub(super) fn new(states: Vec<Arc<PreparationState>>) -> Self {
+        Self { states }
     }
     pub(crate) fn commit(self) -> anyhow::Result<()> {
-        self.state.commit()
+        // The lifecycle lock fences publication against retirement and shutdown.
+        let lifecycle = self.states[0].transport.lifecycle.lock();
+        self.states
+            .iter()
+            .try_for_each(|state| state.commit(&lifecycle))
     }
 }
 
 impl Drop for XhttpPreparation {
     fn drop(&mut self) {
-        self.state.cancel();
+        for state in &self.states {
+            state.cancel();
+        }
     }
 }
