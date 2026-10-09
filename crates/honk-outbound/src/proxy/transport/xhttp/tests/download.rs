@@ -32,6 +32,29 @@ fn split(
     )
 }
 
+#[test]
+fn download_settings_give_the_node_runtime_a_download_pool() {
+    let mut node = node(XhttpMode::PacketUp, 32);
+    assert_eq!(XhttpRuntime::new(&node).unwrap().pools().count(), 1);
+    node.transport_mut()
+        .unwrap()
+        .xhttp
+        .as_mut()
+        .unwrap()
+        .download = Some(Box::new(honk_config::node::XhttpDownload {
+        address: "down.example".into(),
+        port: 443,
+        server_name: None,
+        host: None,
+        path: "/down/".into(),
+        x_padding_bytes: XhttpRange {
+            min: 100,
+            max: 1000,
+        },
+    }));
+    assert_eq!(XhttpRuntime::new(&node).unwrap().pools().count(), 2);
+}
+
 #[tokio::test]
 async fn warm_retire_and_shutdown_reach_the_download_peer() {
     tokio::time::timeout(DEADLINE, async {
