@@ -434,31 +434,23 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     if !eligibility.is_supported() {
         return ProbeOutcome::skipped(&node, eligibility);
     }
-    probe_supported_node(registry, &node, targets).await
-}
-
-async fn probe_supported_node(
-    registry: &ProxyRegistry,
-    node: &Node,
-    targets: &ProbeTargets,
-) -> ProbeOutcome {
     // Probes give each phase its own budget, so the node deadline caps every
     // column separately: one slow column must not erase finished siblings.
     let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
-    let timed_out = ProbeOutcome::timed_out(registry, node, targets);
+    let timed_out = ProbeOutcome::timed_out(registry, &node, targets);
     async fn bounded<T>(deadline: Duration, fallback: T, probe: impl Future<Output = T>) -> T {
         tokio::time::timeout(deadline, probe)
             .await
             .unwrap_or(fallback)
     }
     let (server_families, v4, v6, udp_dns, udp_quic, urltest) = tokio::join!(
-        bounded(deadline, (false, false), server_families(node)),
+        bounded(deadline, (false, false), server_families(&node)),
         bounded(
             deadline,
             timed_out.v4,
             probe_family(
                 registry,
-                node,
+                &node,
                 &targets.host,
                 targets.port,
                 false,
@@ -471,7 +463,7 @@ async fn probe_supported_node(
             timed_out.v6,
             probe_family(
                 registry,
-                node,
+                &node,
                 &targets.host,
                 targets.port,
                 true,
@@ -484,7 +476,7 @@ async fn probe_supported_node(
             timed_out.udp_dns,
             probe_udp_dns(
                 registry,
-                node,
+                &node,
                 &targets.udp_dns,
                 targets.dns_resolver.as_deref(),
                 targets.timeout,
@@ -493,14 +485,20 @@ async fn probe_supported_node(
         bounded(
             deadline,
             timed_out.udp_quic,
-            probe_udp_quic(registry, node, &targets.host, targets.port, targets.timeout)
+            probe_udp_quic(
+                registry,
+                &node,
+                &targets.host,
+                targets.port,
+                targets.timeout
+            )
         ),
         bounded(
             deadline,
             timed_out.urltest,
             probe_urltest(
                 registry,
-                node,
+                &node,
                 targets.url.as_deref().unwrap_or_default(),
                 targets.timeout,
             )
@@ -508,9 +506,6 @@ async fn probe_supported_node(
     );
 
     ProbeOutcome {
-        node_name: node.name.clone(),
-        shape: probe_shape(node),
-        eligibility: ProbeEligibility::Supported,
         server_v4: server_families.0,
         server_v6: server_families.1,
         v4,
@@ -518,6 +513,7 @@ async fn probe_supported_node(
         urltest,
         udp_dns,
         udp_quic,
+        ..timed_out
     }
 }
 
