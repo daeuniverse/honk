@@ -22,17 +22,7 @@ async fn drop_cancels_pending_requests_and_releases_logical_permits() {
                 stream.write_all(b"pending").await.unwrap();
                 upload = Some(peer.next().await);
             }
-            assert!(
-                runtime
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .upload
-                    .pool
-                    .metrics()
-                    .streams
-                    > 0
-            );
+            assert!(upload_pool(&runtime).metrics().streams > 0);
             drop(stream);
             wait_released(&runtime).await;
             assert_eq!(
@@ -234,16 +224,7 @@ async fn one_stream_peer_uses_second_carrier_for_upload_without_blocking_active_
                 assert_eq!(reply, b"both-carriers");
             };
             tokio::join!(server, client);
-            assert_eq!(
-                runtime
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .upload
-                    .pool
-                    .live_session_count(),
-                2
-            );
+            assert_eq!(upload_pool(&runtime).live_session_count(), 2);
             assert!(
                 peer.requests.try_recv().is_err(),
                 "bounded upload was replayed"

@@ -282,17 +282,7 @@ async fn packet_posts_aggregate_and_pipeline_without_waiting_for_prior_response(
             flushed.unwrap();
             held.push(post);
         }
-        assert_eq!(
-            runtime
-                .xhttp
-                .as_ref()
-                .unwrap()
-                .upload
-                .pool
-                .metrics()
-                .streams,
-            MAX_PIPELINE + 1
-        );
+        assert_eq!(upload_pool(&runtime).metrics().streams, MAX_PIPELINE + 1);
         stream.write_all(b"last").await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(50), stream.write(b"blocked"))

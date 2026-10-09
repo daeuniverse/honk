@@ -117,16 +117,7 @@ async fn concurrent_one_stream_opens_keep_the_first_upload_live_until_drop() {
                 assert_eq!(reply, b"second-progress");
             };
             tokio::join!(server, client);
-            assert_eq!(
-                runtime
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .upload
-                    .pool
-                    .live_session_count(),
-                2
-            );
+            assert_eq!(upload_pool(&runtime).live_session_count(), 2);
             drop(second);
             wait_released(&runtime).await;
             while let Some(result) = clients.join_next().await {
@@ -408,27 +399,8 @@ async fn ordinary_tls_setup_deadline_releases_carrier_and_allows_another_physica
                 "setup must retain its factual timeout: {error:#}"
             );
             socket_closed(&mut tcp).await;
-            assert_eq!(
-                runtime
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .upload
-                    .pool
-                    .live_session_count(),
-                0
-            );
-            assert_eq!(
-                runtime
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .upload
-                    .pool
-                    .metrics()
-                    .streams,
-                0
-            );
+            assert_eq!(upload_pool(&runtime).live_session_count(), 0);
+            assert_eq!(upload_pool(&runtime).metrics().streams, 0);
             let permit =
                 tokio::time::timeout(Duration::from_millis(500), gate.acquire_dial_permit())
                     .await
@@ -468,17 +440,8 @@ async fn cancelling_guarded_tls_setup_closes_pending_driver_and_releases_physica
         }
         drop(owner);
         socket_closed(&mut tcp).await;
-        assert!(runtime.xhttp.as_ref().unwrap().upload.pool.is_retired());
-        assert_eq!(
-            runtime
-                .xhttp
-                .as_ref()
-                .unwrap()
-                .upload
-                .pool
-                .live_session_count(),
-            0
-        );
+        assert!(upload_pool(&runtime).is_retired());
+        assert_eq!(upload_pool(&runtime).live_session_count(), 0);
         let permit = tokio::time::timeout(Duration::from_millis(500), gate.acquire_dial_permit())
             .await
             .expect("cancelled guarded TLS setup retained physical admission");
