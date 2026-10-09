@@ -36,7 +36,7 @@ UDP 对象。
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score 与健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
 | Session pool | `session/{maintenance,speculative}.rs` |
-| Stream transport | `proxy/transport/{grpc,h2_io}.rs`；`proxy/transport/xhttp/{preparation,request,response,runtime,session,stream,upload}.rs` |
+| Stream transport | `proxy/transport/{grpc,h2_io}.rs`；`proxy/transport/xhttp/{browser,preparation,request,response,runtime,session,stream,upload}.rs` |
 | Pooled runtime 生命周期 | `runtime/pooled.rs` |
 
 共享状态仍留在共同父模块中，子模块不公开这些字段。REALITY、TLS、stream transport
@@ -308,7 +308,7 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 
 #### XHTTP carrier 与逻辑流所有权
 
-`proxy/transport/xhttp.rs` 将原始 H2 body 适配为已有 stream 契约，持有节点级 `SessionPool`，不是新代理协议或 loopback relay。Pool 最多保留两条可复用物理 carrier；draining carrier 可在既有进程 FD/VLESS-carrier gate 下与 replacement 短暂重叠。物理 driver 拥有 socket、观测和 carrier permit；HTTP 请求与逻辑代理流使用独立 reservation。对端公布的并发 stream 上限保持权威，包括零、一与后续缩小。
+`proxy/transport/xhttp.rs` 将原始 H2 body 适配为已有 stream 契约，持有节点级 `SessionPool`，不是新代理协议或 loopback relay。下载设置会增加第二个 peer，带独立的 pool 与拨号节点，只承载 GET；调用方传入的 socket 始终属于上传 peer；winner commit 在同一次 lifecycle 锁内先发布下载 pool、再发布上传 pool，因此下载 carrier 已断开时两者都不发布。每个 pool 最多保留两条可复用物理 carrier；draining carrier 可在既有进程 FD/VLESS-carrier gate 下与 replacement 短暂重叠。物理 driver 拥有 socket、观测和 carrier permit；HTTP 请求与逻辑代理流使用独立 reservation。对端公布的并发 stream 上限保持权威，包括零、一与后续缩小。
 
 每条 carrier 最多保留 2048 个本地 reset 请求（16 个准入窗口），使用 h2 默认的一秒在途 frame 宽限期，并保留其默认、有限的终身 1024 次协议错误 reset 预算；持续的短 flow churn 会在旧 reset 状态过期前取消多个准入窗口，因此保留数量必须高于活跃请求上限。
 
