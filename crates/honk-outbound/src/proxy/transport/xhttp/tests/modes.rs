@@ -179,8 +179,28 @@ fn request_escapes_literal_path_without_reencoding_the_query() {
 }
 
 #[test]
+fn chrome_major_matches_xrays_random_delay_estimate() {
+    use super::super::browser::chrome_major_at;
+
+    let max_r = f64::from_bits(1.0_f64.to_bits() - 1);
+    // Xray 836a6fed `common/utils/browser.go`: 144 + trunc((days - 20466 - 35
+    // - floor(r² * 105)) / 35); r ∈ [0, 1), so the extreme delays are 0 and 104.
+    for (secs, earliest, latest) in [
+        (1_768_262_400, 143, 141), // 2026-01-13 UTC
+        (1_791_504_000, 150, 147), // 2026-10-09 UTC
+        (1_799_798_400, 153, 150), // 2027-01-13 UTC
+    ] {
+        assert_eq!(chrome_major_at(secs, 0.0), earliest);
+        assert_eq!(chrome_major_at(secs, max_r), latest);
+    }
+    let first_step = 1_768_262_400 + 70 * 86_400;
+    assert_eq!(chrome_major_at(first_step - 1, 0.0), 144);
+    assert_eq!(chrome_major_at(first_step, 0.0), 145);
+}
+
+#[test]
 fn absent_user_agent_sends_xrays_chrome_fetch_headers() {
-    use super::super::browser::{chrome_major, sec_ch_ua};
+    use super::super::browser::sec_ch_ua;
     // Reference strings from Xray v26.3.27 `getGreasedChUa(major, "chrome")`.
     for (major, expected) in [
         (
@@ -202,9 +222,6 @@ fn absent_user_agent_sends_xrays_chrome_fetch_headers() {
     ] {
         assert_eq!(sec_ch_ua(major), expected);
     }
-    assert_eq!(chrome_major(0), 144);
-    assert_eq!(chrome_major(1_768_262_400 + 35 * 86_400 - 1), 144);
-    assert_eq!(chrome_major(1_768_262_400 + 35 * 86_400), 145);
 
     let mut node = node(XhttpMode::PacketUp, 32);
     let headers = &mut node

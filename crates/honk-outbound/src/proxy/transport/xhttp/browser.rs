@@ -1,16 +1,24 @@
 //! Xray's default XHTTP request headers (`common/utils/browser.go`): Chrome `fetch()` on Windows.
 
+use std::sync::LazyLock;
+
 use http::{HeaderMap, HeaderName, HeaderValue, header};
 
-/// Chrome 144 shipped on 2026-01-13. Xray advances one major per 25–45 days
-/// from a CPU-seeded PRNG; the mean step keeps its estimate without the seed.
-pub(super) fn chrome_major(unix_secs: u64) -> u64 {
-    const CHROME_144: u64 = 1_768_262_400;
-    144 + unix_secs.saturating_sub(CHROME_144) / (35 * 86_400)
+/// Match Xray `common/utils/browser.go` at 836a6fed385b902e437dde43ee9adc82d23a5303.
+pub(super) fn chrome_major_at(unix_secs: u64, r: f64) -> i64 {
+    const CHROME_144_DAY: i64 = 1_768_262_400 / 86_400;
+    let day = (unix_secs / 86_400) as i64;
+    let random_delay = (r * r * 105.0).floor() as i64;
+    144 + (day - CHROME_144_DAY - 35 - random_delay) / 35
+}
+
+fn chrome_major(unix_secs: u64) -> i64 {
+    static RANDOM_FACTOR: LazyLock<f64> = LazyLock::new(rand::random::<f64>);
+    chrome_major_at(unix_secs, *RANDOM_FACTOR)
 }
 
 /// Chromium's brand GREASE, as Xray's `getGreasedChUa(major, "chrome")`.
-pub(super) fn sec_ch_ua(major: u64) -> String {
+pub(super) fn sec_ch_ua(major: i64) -> String {
     const GREASE: [&str; 11] = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
     const VERSIONS: [&str; 3] = ["8", "99", "24"];
     const ORDERS: [[usize; 3]; 6] = [
