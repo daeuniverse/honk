@@ -4,7 +4,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use parking_lot::Mutex;
 use tokio::{net::TcpStream, sync::Notify};
 
-use super::runtime::{Lifecycle, Peer, Phase};
+use super::runtime::{Peer, Phase};
 use super::{MAX_CARRIERS, XhttpRuntime, XhttpSession};
 use crate::runtime::NodeRuntime;
 use crate::session::{
@@ -175,24 +175,6 @@ impl PreparationState {
         self.changed.notify_waiters();
         drop(sessions);
     }
-
-    fn commit(&self, lifecycle: &Lifecycle) -> anyhow::Result<()> {
-        let mut state = self.state.lock();
-        state.phase.ensure_open()?;
-        anyhow::ensure!(!lifecycle.is_retired(), "XHTTP runtime retired");
-        if state.phase == PhaseState::Committed {
-            return Ok(());
-        }
-        DetachedSessionReservation::commit_all(
-            std::mem::take(&mut state.sessions)
-                .into_iter()
-                .map(|(_, reservation)| reservation)
-                .collect(),
-        )?;
-        state.phase = PhaseState::Committed;
-        self.changed.notify_waiters();
-        Ok(())
-    }
 }
 
 /// Winner-only publication guard. Dropping a loser closes only its private sessions.
@@ -201,16 +183,34 @@ pub(crate) struct XhttpPreparation {
 }
 
 impl XhttpPreparation {
-    /// `states` publish in order, each into its own peer's pool.
+    /// Each state publishes into its own peer's pool.
     pub(super) fn new(states: Vec<Arc<PreparationState>>) -> Self {
         Self { states }
     }
     pub(crate) fn commit(self) -> anyhow::Result<()> {
         // The lifecycle lock fences publication against retirement and shutdown.
         let lifecycle = self.states[0].transport.lifecycle.lock();
-        self.states
-            .iter()
-            .try_for_each(|state| state.commit(&lifecycle))
+        anyhow::ensure!(!lifecycle.is_retired(), "XHTTP runtime retired");
+        let mut states: Vec<_> = self.states.iter().map(|state| state.state.lock()).collect();
+        for state in &states {
+            state.phase.ensure_open()?;
+        }
+        // One validation covers every peer: a dead carrier on either side publishes neither.
+        DetachedSessionReservation::commit_all(
+            states
+                .iter_mut()
+                .flat_map(|state| std::mem::take(&mut state.sessions))
+                .map(|(_, reservation)| reservation)
+                .collect(),
+        )?;
+        for state in &mut states {
+            state.phase = PhaseState::Committed;
+        }
+        drop(states);
+        for state in &self.states {
+            state.changed.notify_waiters();
+        }
+        Ok(())
     }
 }
 

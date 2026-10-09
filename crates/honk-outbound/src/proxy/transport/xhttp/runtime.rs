@@ -298,7 +298,6 @@ impl XhttpRuntime {
             .download
             .as_ref()
             .map(|download| PreparationState::new(self.clone(), download.clone()));
-        // Download publishes first: if its carrier died, the winner publishes nothing.
         let preparation =
             XhttpPreparation::new(download.iter().cloned().chain([state.clone()]).collect());
         let stream = tokio::select! {

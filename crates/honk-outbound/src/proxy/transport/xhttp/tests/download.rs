@@ -140,3 +140,25 @@ async fn dead_download_carrier_fails_commit_without_publishing_either_peer() {
     .await
     .expect("dead download carrier stalled the preparation");
 }
+
+#[tokio::test]
+async fn dead_upload_carrier_fails_commit_without_publishing_either_peer() {
+    tokio::time::timeout(DEADLINE, async {
+        let mut upload_peer = Peer::new(32).await;
+        let mut download_peer = Peer::new(32).await;
+        let (owner, transport) = split(&upload_peer, &download_peer, XhttpMode::StreamUp);
+        let runtime = owner.runtime();
+        let (mut stream, preparation) = transport.prepare(&runtime, None, DEADLINE).await.unwrap();
+        let _get = download_peer.next().await;
+        upload_peer.next().await;
+        drop(upload_peer);
+        assert!(stream.read(&mut [0; 1]).await.is_err());
+        assert!(preparation.commit().is_err());
+        drop(stream);
+        for pool in transport.pools() {
+            assert_eq!(pool.live_session_count(), 0);
+        }
+    })
+    .await
+    .expect("dead upload carrier stalled the preparation");
+}

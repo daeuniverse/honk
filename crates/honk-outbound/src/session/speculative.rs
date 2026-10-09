@@ -209,27 +209,38 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
         }
     }
 
-    /// Publish one preparation's physical sessions under a single pool lock.
-    /// Every reservation is validated before any session becomes reusable.
+    /// Publish one winner's physical sessions, which may span pools, while holding
+    /// every owning pool lock. Every reservation is validated before any session
+    /// becomes reusable.
     pub(crate) fn commit_all(mut reservations: Vec<Self>) -> anyhow::Result<()> {
-        let Some(first) = reservations.first() else {
-            return Ok(());
-        };
-        let owner = Arc::clone(&first.pool);
-        anyhow::ensure!(
-            reservations
+        let mut owners: Vec<Arc<SessionPool<S>>> = Vec::new();
+        for reservation in &reservations {
+            if !owners
                 .iter()
-                .all(|reservation| Arc::ptr_eq(&owner, &reservation.pool)),
-            "detached sessions belong to different pools"
-        );
+                .any(|owner| Arc::ptr_eq(owner, &reservation.pool))
+            {
+                owners.push(Arc::clone(&reservation.pool));
+            }
+        }
+        // A fixed lock order keeps concurrent multi-pool commits deadlock-free.
+        owners.sort_by_key(|owner| Arc::as_ptr(owner) as usize);
+        let owner_of = |reservation: &Self| {
+            owners
+                .iter()
+                .position(|owner| Arc::ptr_eq(owner, &reservation.pool))
+                .expect("reservation owner")
+        };
         {
-            let mut pool = owner.pool.lock();
-            if owner.state() != PoolState::Running {
+            let mut pools: Vec<_> = owners.iter().map(|owner| owner.pool.lock()).collect();
+            if owners
+                .iter()
+                .any(|owner| owner.state() != PoolState::Running)
+            {
                 return Err(SessionPool::<S>::pool_closed_err());
             }
             // Validate the entire winner before exposing any member to other flows.
             for reservation in &reservations {
-                let session = pool
+                let session = pools[owner_of(reservation)]
                     .provisional
                     .get(&reservation.slot_id)
                     .and_then(Option::as_ref);
@@ -239,24 +250,31 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
                     _ => return Err(SessionPool::<S>::pool_closed_err()),
                 }
             }
-            pool.sessions.retain(|session| !session.is_closed());
-            let mut active = pool
-                .sessions
-                .iter()
-                .filter(|session| session.state() == SessionState::Active)
-                .count();
-            active += usize::from(pool.dial_done.is_some());
+            let mut active: Vec<usize> = pools
+                .iter_mut()
+                .map(|pool| {
+                    pool.sessions.retain(|session| !session.is_closed());
+                    pool.sessions
+                        .iter()
+                        .filter(|session| session.state() == SessionState::Active)
+                        .count()
+                        + usize::from(pool.dial_done.is_some())
+                })
+                .collect();
             for reservation in &mut reservations {
-                let session = pool
+                let index = owner_of(reservation);
+                let session = pools[index]
                     .provisional
                     .remove(&reservation.slot_id)
                     .flatten()
                     .expect("validated detached session");
-                reservation.publish(&mut pool, session, &mut active);
+                reservation.publish(&mut pools[index], session, &mut active[index]);
                 reservation.active = false;
             }
-        };
-        owner.capacity_notify.notify_waiters();
+        }
+        for owner in &owners {
+            owner.capacity_notify.notify_waiters();
+        }
         Ok(())
     }
 
