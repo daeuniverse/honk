@@ -626,3 +626,49 @@ fn clash_download_settings_reject_mihomo_inheritance_and_non_mappings() {
         );
     }
 }
+
+#[test]
+fn ignored_xhttp_options_are_type_checked_alike_in_both_spellings() {
+    // The Clash adapter and the share-link `extra` keep separate lists of these.
+    for (clash, uri, good, bad) in [
+        ("xmux", Some("xmux"), "{}", r#"{"maxConcurrency":"2"}"#),
+        ("reuse-settings", None, "{}", r#"{"max-concurrency":"2"}"#),
+        ("no-sse-header", Some("noSSEHeader"), "true", r#""yes""#),
+        (
+            "sc-max-buffered-posts",
+            Some("scMaxBufferedPosts"),
+            "60",
+            "-1",
+        ),
+        (
+            "sc-stream-up-server-secs",
+            Some("scStreamUpServerSecs"),
+            r#""5-10""#,
+            r#""a-b""#,
+        ),
+    ] {
+        let clash_accepts = |value: &str| {
+            let body = format!(
+                "proxies: [{{name: n, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {{{clash}: {value}}}}}]"
+            );
+            parse_subscription_content(&Subscription::default(), &body).is_ok()
+        };
+        assert!(clash_accepts(good), "{clash}");
+        assert!(!clash_accepts(bad), "{clash}");
+        let Some(uri) = uri else { continue };
+        let uri_accepts = |value: &str| {
+            let mut url = reqwest::Url::parse("http://x/").unwrap();
+            url.query_pairs_mut()
+                .append_pair("type", "xhttp")
+                .append_pair("security", "tls")
+                .append_pair("extra", &format!(r#"{{"{uri}":{value}}}"#));
+            honk_config::node::Node::from_share_link(&format!(
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{}#n",
+                url.query().unwrap()
+            ))
+            .is_ok()
+        };
+        assert!(uri_accepts(good), "{uri}");
+        assert!(!uri_accepts(bad), "{uri}");
+    }
+}

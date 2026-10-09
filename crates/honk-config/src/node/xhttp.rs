@@ -320,7 +320,7 @@ pub(crate) struct XrayExtra {
         rename = "scMaxBufferedPosts",
         deserialize_with = "present_option"
     )]
-    _sc_max_buffered_posts: Option<i64>,
+    _sc_max_buffered_posts: Option<u64>,
     #[serde(
         default,
         rename = "scStreamUpServerSecs",

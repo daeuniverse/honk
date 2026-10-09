@@ -38,7 +38,7 @@ fn drop_checked<T: serde::de::DeserializeOwned>(
 /// Server-only options and default XMUX leave a client's requests unchanged.
 fn drop_server_claims(options: &mut Mapping) -> Result<(), &'static str> {
     drop_checked::<bool>(options, "no-sse-header")?;
-    drop_checked::<i64>(options, "sc-max-buffered-posts")?;
+    drop_checked::<u64>(options, "sc-max-buffered-posts")?;
     drop_checked::<XhttpRange>(options, "sc-stream-up-server-secs")?;
     drop_checked::<DefaultXmux>(options, "xmux")?;
     drop_checked::<DefaultXmux>(options, "reuse-settings")
