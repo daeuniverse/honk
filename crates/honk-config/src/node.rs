@@ -13,7 +13,7 @@ pub use validation::validate_node_collection;
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
-pub use xhttp::{XhttpMode, XhttpOptions, XhttpRange};
+pub use xhttp::{DefaultXmux, XhttpDownload, XhttpMode, XhttpOptions, XhttpRange, XrayDownload};
 pub(crate) use xhttp::{XrayExtra, deserialize_xray_extra, present_option};
 
 /// Deserialize a group-tag list from either an array (`["hk", "jp"]`) or a
@@ -123,6 +123,36 @@ impl Node {
             tls.check_xhttp_alpn()?;
         }
         Ok(())
+    }
+
+    /// The XHTTP download peer as its own dial target. Only protocol
+    /// credentials and upload-only request options carry over; TLS is rebuilt
+    /// so upload pins, insecure verification, ECH and REALITY never apply.
+    pub fn xhttp_download_view(&self) -> Option<Node> {
+        let download = self
+            .transport()?
+            .xhttp
+            .as_ref()?
+            .download
+            .as_deref()?
+            .clone();
+        let mut view = self.clone();
+        view.address = format!("{}:{}", download.address, download.port);
+        view.host = download.address;
+        view.port = download.port;
+        let options = view.transport_mut()?.xhttp.as_mut()?;
+        options.path = download.path;
+        options.host = download.host;
+        options.headers.clear();
+        options.x_padding_bytes = download.x_padding_bytes;
+        options.download = None;
+        *view.tls_mut()? = TlsOptions {
+            enabled: true,
+            sni: download.server_name,
+            alpn: vec!["h2".into()],
+            ..TlsOptions::default()
+        };
+        Some(view)
     }
 
     /// Get the effective host (use host field or parse from address).

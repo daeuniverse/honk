@@ -32,7 +32,20 @@ pub(super) fn apply_xhttp_query(
         return Ok(false);
     }
     for (key, value) in &query.0 {
-        if !(key == "headerType" && matches!(value.as_str(), "" | "none"))
+        // Exporter metadata with no XHTTP request effect. Xray's padding overwrites
+        // any Referer header, so a Referer-only header claim never reaches the wire.
+        let inert = match key.as_str() {
+            "headerType" | "quicSecurity" => matches!(value.as_str(), "" | "none"),
+            "serviceName" => value.is_empty(),
+            "headers" => serde_json::from_str::<std::collections::BTreeMap<String, String>>(value)
+                .is_ok_and(|headers| {
+                    headers
+                        .keys()
+                        .all(|name| name.eq_ignore_ascii_case("referer"))
+                }),
+            _ => false,
+        };
+        if !inert
             && !matches!(
                 key.as_str(),
                 "type"
