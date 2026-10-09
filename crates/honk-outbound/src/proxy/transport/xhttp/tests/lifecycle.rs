@@ -138,8 +138,11 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         let owner = peer.runtime(XhttpMode::PacketUp, 32);
         let runtime = owner.runtime();
         let transport = runtime.xhttp.as_ref().unwrap();
-        let state = super::super::preparation::PreparationState::new(transport.clone());
-        let preparation = super::super::XhttpPreparation::new(state.clone());
+        let state = super::super::preparation::PreparationState::new(
+            transport.clone(),
+            transport.upload(&runtime),
+        );
+        let preparation = super::super::XhttpPreparation::new(vec![state.clone()]);
         let tcp = Arc::new(parking_lot::Mutex::new(None));
         let path = uuid::Uuid::new_v4().to_string();
         let mut sessions = Vec::new();

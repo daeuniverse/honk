@@ -377,6 +377,7 @@ fn shared_io_error(error: anyhow::Error) -> io::Error {
     io::Error::other(crate::SharedError::new(error))
 }
 
+#[derive(Clone)]
 pub(super) struct RequestContext<'a> {
     pub(super) runtime: &'a Arc<NodeRuntime>,
     pub(super) tcp: Arc<Mutex<Option<TcpStream>>>,
