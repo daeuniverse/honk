@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::TlsOptions;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum XhttpMode {
@@ -36,6 +38,14 @@ impl std::str::FromStr for XhttpMode {
             _ => Err("invalid XHTTP mode"),
         }
     }
+}
+
+/// The mode a node actually speaks: `auto` resolved against the carrier security.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XhttpResolvedMode {
+    PacketUp,
+    StreamUp,
+    StreamOne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -632,6 +642,18 @@ impl XhttpOptions {
             download.validate_address()?;
         }
         Ok(())
+    }
+
+    /// `auto` becomes stream-one over REALITY and packet-up otherwise.
+    pub fn resolved_mode(&self, tls: &TlsOptions) -> Result<XhttpResolvedMode, &'static str> {
+        let reality = (self.mode == XhttpMode::Auto || !tls.enabled)
+            && tls.effective_reality_public_key()?.is_some();
+        Ok(match self.mode {
+            XhttpMode::Auto if reality => XhttpResolvedMode::StreamOne,
+            XhttpMode::Auto | XhttpMode::PacketUp => XhttpResolvedMode::PacketUp,
+            XhttpMode::StreamUp => XhttpResolvedMode::StreamUp,
+            XhttpMode::StreamOne => XhttpResolvedMode::StreamOne,
+        })
     }
 
     pub(crate) fn from_xray_extra(

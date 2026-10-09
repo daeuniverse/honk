@@ -954,3 +954,41 @@ fn download_address_must_be_a_dialable_host_and_is_normalized() {
     );
     assert!(flat_download("down.example:443").is_err());
 }
+
+#[test]
+fn auto_mode_resolves_to_stream_one_only_over_reality() {
+    use honk_config::node::{TlsOptions, XhttpResolvedMode::*};
+    let reality = |enabled| TlsOptions {
+        enabled,
+        reality_public_key: Some("key".into()),
+        ..TlsOptions::default()
+    };
+    let carriers = [
+        TlsOptions::default(),
+        TlsOptions {
+            enabled: true,
+            ..TlsOptions::default()
+        },
+        reality(true),
+        reality(false),
+    ];
+    for (mode, expected) in [
+        (XhttpMode::Auto, [PacketUp, PacketUp, StreamOne, StreamOne]),
+        (XhttpMode::PacketUp, [PacketUp; 4]),
+        (XhttpMode::StreamUp, [StreamUp; 4]),
+        (XhttpMode::StreamOne, [StreamOne; 4]),
+    ] {
+        let options = XhttpOptions {
+            mode,
+            ..XhttpOptions::default()
+        };
+        for (tls, expected) in carriers.iter().zip(expected) {
+            assert_eq!(options.resolved_mode(tls), Ok(expected), "{mode:?} {tls:?}");
+        }
+    }
+    let incomplete = TlsOptions {
+        reality_short_id: Some("ab".into()),
+        ..TlsOptions::default()
+    };
+    assert!(XhttpOptions::default().resolved_mode(&incomplete).is_err());
+}

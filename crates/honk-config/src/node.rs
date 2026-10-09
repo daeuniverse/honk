@@ -13,7 +13,10 @@ pub use validation::validate_node_collection;
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
-pub use xhttp::{DefaultXmux, XhttpDownload, XhttpMode, XhttpOptions, XhttpRange, XrayDownload};
+pub use xhttp::{
+    DefaultXmux, XhttpDownload, XhttpMode, XhttpOptions, XhttpRange, XhttpResolvedMode,
+    XrayDownload,
+};
 pub(crate) use xhttp::{XrayExtra, deserialize_xray_extra, present_option};
 
 /// Deserialize a group-tag list from either an array (`["hk", "jp"]`) or a

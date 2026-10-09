@@ -1,11 +1,6 @@
-use honk_config::node::{Node, XhttpMode, XhttpRange};
+use honk_config::node::{Node, XhttpRange};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ResolvedMode {
-    PacketUp,
-    StreamUp,
-    StreamOne,
-}
+pub(super) use honk_config::node::XhttpResolvedMode as ResolvedMode;
 
 #[derive(Debug)]
 pub(super) struct RequestTemplate {
@@ -29,19 +24,7 @@ impl RequestTemplate {
             .and_then(|transport| transport.xhttp.as_ref())
             .ok_or_else(|| anyhow::anyhow!("XHTTP options missing"))?;
         let tls = node.tls().unwrap();
-        let reality = if options.mode == XhttpMode::Auto || !tls.enabled {
-            tls.effective_reality_public_key()
-                .map_err(anyhow::Error::msg)?
-                .is_some()
-        } else {
-            false
-        };
-        let mode = match options.mode {
-            XhttpMode::Auto if reality => ResolvedMode::StreamOne,
-            XhttpMode::Auto | XhttpMode::PacketUp => ResolvedMode::PacketUp,
-            XhttpMode::StreamUp => ResolvedMode::StreamUp,
-            XhttpMode::StreamOne => ResolvedMode::StreamOne,
-        };
+        let mode = options.resolved_mode(tls).map_err(anyhow::Error::msg)?;
         let scheme = if tls.is_secure() {
             http::uri::Scheme::HTTPS
         } else {
