@@ -22,7 +22,17 @@ async fn drop_cancels_pending_requests_and_releases_logical_permits() {
                 stream.write_all(b"pending").await.unwrap();
                 upload = Some(peer.next().await);
             }
-            assert!(runtime.xhttp.as_ref().unwrap().pool.metrics().streams > 0);
+            assert!(
+                runtime
+                    .xhttp
+                    .as_ref()
+                    .unwrap()
+                    .upload
+                    .pool
+                    .metrics()
+                    .streams
+                    > 0
+            );
             drop(stream);
             wait_released(&runtime).await;
             assert_eq!(
@@ -78,8 +88,8 @@ async fn logical_capacity_refusal_does_not_dial_and_drop_returns_admission() {
             requests.iter().map(|request| request.carrier).collect();
         assert!((1..=2).contains(&carriers.len()));
         let transport = runtime.xhttp.as_ref().unwrap();
-        let before_refusal = transport.pool.live_session_count();
-        assert_eq!(transport.pool.metrics().streams, MAX_REQUESTS);
+        let before_refusal = transport.upload.pool.live_session_count();
+        assert_eq!(transport.upload.pool.metrics().streams, MAX_REQUESTS);
         let refused = transport.open(&runtime, None, DEADLINE).await;
         let error = match refused {
             Err(error) => error,
@@ -89,7 +99,7 @@ async fn logical_capacity_refusal_does_not_dial_and_drop_returns_admission() {
             cause.downcast_ref::<crate::proxy::PacketRejection>(),
             Some(crate::proxy::PacketRejection::Capacity)
         )));
-        assert_eq!(transport.pool.live_session_count(), before_refusal);
+        assert_eq!(transport.upload.pool.live_session_count(), before_refusal);
         assert!(
             peer.requests.try_recv().is_err(),
             "capacity refusal issued a request"
@@ -108,7 +118,7 @@ async fn logical_capacity_refusal_does_not_dial_and_drop_returns_admission() {
         drop(replacement);
         drop(streams);
         wait_released(&runtime).await;
-        let sessions = transport.pool.live_session_count();
+        let sessions = transport.upload.pool.live_session_count();
         assert!((1..=2).contains(&sessions));
     })
     .await
@@ -170,7 +180,7 @@ async fn cancelling_open_behind_two_full_peer_carriers_returns_admission_without
             peer.requests.try_recv().is_err(),
             "cancelled pending open published a request later"
         );
-        assert_eq!(transport.pool.live_session_count(), 2);
+        assert_eq!(transport.upload.pool.live_session_count(), 2);
         drop(replacement);
         drop(first);
         assert_eq!(
@@ -224,7 +234,16 @@ async fn one_stream_peer_uses_second_carrier_for_upload_without_blocking_active_
                 assert_eq!(reply, b"both-carriers");
             };
             tokio::join!(server, client);
-            assert_eq!(runtime.xhttp.as_ref().unwrap().pool.live_session_count(), 2);
+            assert_eq!(
+                runtime
+                    .xhttp
+                    .as_ref()
+                    .unwrap()
+                    .upload
+                    .pool
+                    .live_session_count(),
+                2
+            );
             assert!(
                 peer.requests.try_recv().is_err(),
                 "bounded upload was replayed"

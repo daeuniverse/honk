@@ -117,7 +117,16 @@ async fn concurrent_one_stream_opens_keep_the_first_upload_live_until_drop() {
                 assert_eq!(reply, b"second-progress");
             };
             tokio::join!(server, client);
-            assert_eq!(runtime.xhttp.as_ref().unwrap().pool.live_session_count(), 2);
+            assert_eq!(
+                runtime
+                    .xhttp
+                    .as_ref()
+                    .unwrap()
+                    .upload
+                    .pool
+                    .live_session_count(),
+                2
+            );
             drop(second);
             wait_released(&runtime).await;
             while let Some(result) = clients.join_next().await {
@@ -140,9 +149,10 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         let transport = runtime.xhttp.as_ref().unwrap();
         let state = super::super::preparation::PreparationState::new(
             transport.clone(),
-            transport.upload(&runtime),
+            transport.upload.clone(),
         );
-        let preparation = super::super::XhttpPreparation::new(vec![state.clone()]);
+        let preparation =
+            super::super::XhttpPreparation::new(transport.clone(), vec![state.clone()]);
         let tcp = Arc::new(parking_lot::Mutex::new(None));
         let path = uuid::Uuid::new_v4().to_string();
         let mut sessions = Vec::new();
@@ -154,6 +164,7 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
                 .unwrap();
             let mut request = Some(
                 transport
+                    .upload
                     .template()
                     .unwrap()
                     .request(&path, post.then_some(0), post, Some(0))
@@ -174,7 +185,7 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         assert_eq!(upload.request.method(), http::Method::POST);
         assert_ne!(download.carrier, upload.carrier);
         response(&mut upload.respond, 200, true);
-        assert_eq!(transport.pool.live_session_count(), 0);
+        assert_eq!(transport.upload.pool.live_session_count(), 0);
         sessions[0].begin_drain();
         sessions[1].close();
         let (replacement, permit) = tokio::time::timeout(
@@ -187,6 +198,7 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         assert!(!Arc::ptr_eq(&replacement, &sessions[1]));
         let mut request = Some(
             transport
+                .upload
                 .template()
                 .unwrap()
                 .request(&path, Some(1), true, Some(0))
@@ -205,7 +217,7 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         preparation
             .commit()
             .expect("closed private carrier poisoned winner commit");
-        assert_eq!(transport.pool.live_session_count(), 2);
+        assert_eq!(transport.upload.pool.live_session_count(), 2);
         assert_eq!(sessions[0].state(), SessionState::Draining);
         assert!(!sessions[0].is_closed());
         assert_eq!(replacement.state(), SessionState::Active);
@@ -396,8 +408,27 @@ async fn ordinary_tls_setup_deadline_releases_carrier_and_allows_another_physica
                 "setup must retain its factual timeout: {error:#}"
             );
             socket_closed(&mut tcp).await;
-            assert_eq!(runtime.xhttp.as_ref().unwrap().pool.live_session_count(), 0);
-            assert_eq!(runtime.xhttp.as_ref().unwrap().pool.metrics().streams, 0);
+            assert_eq!(
+                runtime
+                    .xhttp
+                    .as_ref()
+                    .unwrap()
+                    .upload
+                    .pool
+                    .live_session_count(),
+                0
+            );
+            assert_eq!(
+                runtime
+                    .xhttp
+                    .as_ref()
+                    .unwrap()
+                    .upload
+                    .pool
+                    .metrics()
+                    .streams,
+                0
+            );
             let permit =
                 tokio::time::timeout(Duration::from_millis(500), gate.acquire_dial_permit())
                     .await
@@ -437,8 +468,17 @@ async fn cancelling_guarded_tls_setup_closes_pending_driver_and_releases_physica
         }
         drop(owner);
         socket_closed(&mut tcp).await;
-        assert!(runtime.xhttp.as_ref().unwrap().pool.is_retired());
-        assert_eq!(runtime.xhttp.as_ref().unwrap().pool.live_session_count(), 0);
+        assert!(runtime.xhttp.as_ref().unwrap().upload.pool.is_retired());
+        assert_eq!(
+            runtime
+                .xhttp
+                .as_ref()
+                .unwrap()
+                .upload
+                .pool
+                .live_session_count(),
+            0
+        );
         let permit = tokio::time::timeout(Duration::from_millis(500), gate.acquire_dial_permit())
             .await
             .expect("cancelled guarded TLS setup retained physical admission");

@@ -24,18 +24,18 @@ async fn xhttp_ownership_survives_reload_but_dns_and_ephemeral_are_independent()
         let xhttp = runtime.xhttp.as_ref().unwrap();
         assert_eq!(runtime.warm_counts(), WarmCounts::default());
         assert!(!runtime.is_warm_or_stateless_for(WarmRequirement::Session));
-        assert!(!xhttp.pool.is_warm_retained());
+        assert!(!xhttp.upload.pool.is_warm_retained());
 
         let cancelled = runtime.retain_warm(WarmRetention::Selector).await;
-        assert!(xhttp.pool.is_warm_retained());
+        assert!(xhttp.upload.pool.is_warm_retained());
         drop(cancelled);
-        assert!(!xhttp.pool.is_warm_retained());
+        assert!(!xhttp.upload.pool.is_warm_retained());
         runtime.retain_warm(WarmRetention::Selector).await.commit();
         runtime.retain_warm(WarmRetention::Udp).await.commit();
         runtime.release_warm(WarmRetention::Selector).await;
-        assert!(xhttp.pool.is_warm_retained());
+        assert!(xhttp.upload.pool.is_warm_retained());
         runtime.release_warm(WarmRetention::Udp).await;
-        assert!(!xhttp.pool.is_warm_retained());
+        assert!(!xhttp.upload.pool.is_warm_retained());
 
         let dns = first.fork_for_dns().unwrap();
         let dns_runtime = dns.get(&node.id).unwrap();
@@ -45,8 +45,8 @@ async fn xhttp_ownership_survives_reload_but_dns_and_ephemeral_are_independent()
         let ephemeral = owner.runtime();
         assert!(!Arc::ptr_eq(xhttp, ephemeral.xhttp.as_ref().unwrap()));
         drop(owner);
-        assert!(ephemeral.xhttp.as_ref().unwrap().pool.is_retired());
-        assert!(!xhttp.pool.is_retired());
+        assert!(ephemeral.xhttp.as_ref().unwrap().upload.pool.is_retired());
+        assert!(!xhttp.upload.pool.is_retired());
 
         let (successor, moved) =
             OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 1, Some(&first))
@@ -55,13 +55,13 @@ async fn xhttp_ownership_survives_reload_but_dns_and_ephemeral_are_independent()
         first.mark_moved_out(moved);
         first.retire_reusable_state().await;
         first.shutdown().await;
-        assert!(!xhttp.pool.is_retired());
+        assert!(!xhttp.upload.pool.is_retired());
         dns.retire_reusable_state().await;
-        assert!(dns_xhttp.pool.is_retired());
-        assert!(!xhttp.pool.is_retired());
+        assert!(dns_xhttp.upload.pool.is_retired());
+        assert!(!xhttp.upload.pool.is_retired());
         successor.retire_reusable_state().await;
-        assert!(xhttp.pool.is_retired());
-        assert!(xhttp.pool.checkout_speculative().await.is_err());
+        assert!(xhttp.upload.pool.is_retired());
+        assert!(xhttp.upload.pool.checkout_speculative().await.is_err());
         successor.shutdown().await;
         dns.shutdown().await;
     }
@@ -678,7 +678,7 @@ async fn retired_xhttp_runtime_rejects_provisional_winner_without_publishing() {
         .unwrap()
         .unwrap();
     assert_eq!(runtime.warm_counts().sessions, 0);
-    assert!(runtime.xhttp.as_ref().unwrap().pool.is_retired());
+    assert!(runtime.xhttp.as_ref().unwrap().upload.pool.is_retired());
     registry.shutdown().await;
     peer.abort();
     assert!(peer.await.unwrap_err().is_cancelled());

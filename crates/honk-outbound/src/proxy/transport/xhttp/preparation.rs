@@ -179,17 +179,18 @@ impl PreparationState {
 
 /// Winner-only publication guard. Dropping a loser closes only its private sessions.
 pub(crate) struct XhttpPreparation {
+    transport: Arc<XhttpRuntime>,
     states: Vec<Arc<PreparationState>>,
 }
 
 impl XhttpPreparation {
     /// Each state publishes into its own peer's pool.
-    pub(super) fn new(states: Vec<Arc<PreparationState>>) -> Self {
-        Self { states }
+    pub(super) fn new(transport: Arc<XhttpRuntime>, states: Vec<Arc<PreparationState>>) -> Self {
+        Self { transport, states }
     }
     pub(crate) fn commit(self) -> anyhow::Result<()> {
         // The lifecycle lock fences publication against retirement and shutdown.
-        let lifecycle = self.states[0].transport.lifecycle.lock();
+        let lifecycle = self.transport.lifecycle.lock();
         anyhow::ensure!(!lifecycle.is_retired(), "XHTTP runtime retired");
         let mut states: Vec<_> = self.states.iter().map(|state| state.state.lock()).collect();
         for state in &states {

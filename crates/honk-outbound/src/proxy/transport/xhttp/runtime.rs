@@ -43,17 +43,25 @@ type SharedTemplate = Arc<Result<RequestTemplate, crate::SharedError>>;
 
 /// One endpoint: its dial node, carriers and request shape.
 #[derive(Debug, Clone)]
-pub(super) struct Peer {
+pub(crate) struct Peer {
     pub(super) node: Arc<Node>,
-    pub(super) pool: Arc<SessionPool<XhttpSession>>,
+    pub(crate) pool: Arc<SessionPool<XhttpSession>>,
     template: SharedTemplate,
 }
 
-fn template_for(node: &Node) -> SharedTemplate {
-    Arc::new(RequestTemplate::new(node).map_err(crate::SharedError::new))
-}
-
 impl Peer {
+    fn new(node: Node) -> Self {
+        Self {
+            template: Arc::new(RequestTemplate::new(&node).map_err(crate::SharedError::new)),
+            node: Arc::new(node),
+            pool: Arc::new(SessionPool::new(SessionPoolConfig {
+                max_sessions: MAX_CARRIERS,
+                max_streams_per_session: MAX_REQUESTS,
+                ..SessionPoolConfig::default()
+            })),
+        }
+    }
+
     pub(super) fn template(&self) -> anyhow::Result<&RequestTemplate> {
         self.template
             .as_ref()
@@ -82,24 +90,15 @@ impl Peer {
     }
 }
 
-fn carrier_pool() -> Arc<SessionPool<XhttpSession>> {
-    Arc::new(SessionPool::new(SessionPoolConfig {
-        max_sessions: MAX_CARRIERS,
-        max_streams_per_session: MAX_REQUESTS,
-        ..SessionPoolConfig::default()
-    }))
-}
-
 #[derive(Debug)]
 pub(crate) struct XhttpRuntime {
     /// Upload carriers, and GET carriers too without a download peer.
-    pub(crate) pool: Arc<SessionPool<XhttpSession>>,
+    pub(crate) upload: Peer,
     download: Option<Peer>,
     // Leave room for uploads: GET-only packet flows cannot consume every request slot.
     flows: Arc<Semaphore>,
     admission: tokio::sync::Mutex<()>,
     pub(super) lifecycle: Mutex<Lifecycle>,
-    template: SharedTemplate,
     pub(super) lifecycle_changed: Notify,
 }
 
@@ -120,33 +119,24 @@ impl XhttpRuntime {
 
     pub(super) fn with_download(node: &Node, download: Option<Node>) -> Arc<Self> {
         Arc::new(Self {
-            pool: carrier_pool(),
-            download: download.map(|node| Peer {
-                template: template_for(&node),
-                node: Arc::new(node),
-                pool: carrier_pool(),
-            }),
+            upload: Peer::new(node.clone()),
+            download: download.map(Peer::new),
             flows: Arc::new(Semaphore::new(MAX_REQUESTS)),
             admission: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(Lifecycle {
                 phase: Phase::Running,
                 warm_retained: false,
             }),
-            template: template_for(node),
             lifecycle_changed: Notify::new(),
         })
     }
 
-    pub(crate) fn pools(&self) -> impl Iterator<Item = &Arc<SessionPool<XhttpSession>>> {
-        std::iter::once(&self.pool).chain(self.download.as_ref().map(|download| &download.pool))
+    fn peers(&self) -> impl Iterator<Item = &Peer> {
+        std::iter::once(&self.upload).chain(self.download.as_ref())
     }
 
-    pub(super) fn upload(&self, runtime: &NodeRuntime) -> Peer {
-        Peer {
-            node: runtime.node.clone(),
-            pool: self.pool.clone(),
-            template: self.template.clone(),
-        }
+    pub(crate) fn pools(&self) -> impl Iterator<Item = &Arc<SessionPool<XhttpSession>>> {
+        self.peers().map(|peer| &peer.pool)
     }
 
     pub(crate) fn set_dial_admission(&self, admission: crate::runtime::CapturedDialAdmission) {
@@ -191,13 +181,6 @@ impl XhttpRuntime {
 
     pub(super) fn is_retired(&self) -> bool {
         self.lifecycle.lock().is_retired()
-    }
-
-    pub(super) fn template(&self) -> anyhow::Result<&RequestTemplate> {
-        self.template
-            .as_ref()
-            .as_ref()
-            .map_err(|error| anyhow::Error::new(error.clone()))
     }
 
     pub(super) fn finish_retirement(&self) {
@@ -264,8 +247,7 @@ impl XhttpRuntime {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no XHTTP runtime"))?;
         anyhow::ensure!(!transport.is_retired(), "XHTTP runtime retired");
-        let download = transport.download.as_ref();
-        for peer in std::iter::once(&transport.upload(runtime)).chain(download) {
+        for peer in transport.peers() {
             let runtime = runtime.clone();
             let node = peer.node.clone();
             peer.pool
@@ -293,13 +275,15 @@ impl XhttpRuntime {
         tcp: Option<TcpStream>,
         timeout: Duration,
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, XhttpPreparation)> {
-        let state = PreparationState::new(self.clone(), self.upload(runtime));
+        let state = PreparationState::new(self.clone(), self.upload.clone());
         let download = self
             .download
             .as_ref()
             .map(|download| PreparationState::new(self.clone(), download.clone()));
-        let preparation =
-            XhttpPreparation::new(download.iter().cloned().chain([state.clone()]).collect());
+        let preparation = XhttpPreparation::new(
+            self.clone(),
+            download.iter().cloned().chain([state.clone()]).collect(),
+        );
         let stream = tokio::select! {
             result = self.open_inner(runtime, tcp, timeout, state, download) => result?,
             _ = self.retired() => anyhow::bail!("XHTTP runtime retired"),
@@ -327,7 +311,7 @@ impl XhttpRuntime {
             permit: Some(flow_permit),
             transport: self.clone(),
         };
-        let template = self.template()?;
+        let template = self.upload.template()?;
         let session = match template.mode {
             ResolvedMode::StreamOne => String::new(),
             ResolvedMode::PacketUp | ResolvedMode::StreamUp => uuid::Uuid::new_v4().to_string(),
@@ -341,17 +325,16 @@ impl XhttpRuntime {
         };
         // The GET template and carriers come from one peer. A supplied socket reaches the upload
         // endpoint, so the download peer dials its own.
-        let (get, get_context) = match &download_preparation {
-            Some(preparation) => (
-                preparation.peer.template()?,
-                RequestContext {
-                    runtime,
-                    tcp: Arc::new(Mutex::new(None)),
-                    timeout,
-                    preparation,
-                },
-            ),
-            None => (template, context.clone()),
+        let (get_preparation, get_tcp) = match &download_preparation {
+            Some(download) => (download, Arc::new(Mutex::new(None))),
+            None => (&preparation, tcp.clone()),
+        };
+        let get = get_preparation.peer.template()?;
+        let get_context = RequestContext {
+            runtime,
+            tcp: get_tcp,
+            timeout,
+            preparation: get_preparation,
         };
         let (download, upload) = match template.mode {
             ResolvedMode::StreamOne => {

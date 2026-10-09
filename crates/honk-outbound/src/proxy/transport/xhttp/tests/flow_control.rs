@@ -283,7 +283,14 @@ async fn packet_posts_aggregate_and_pipeline_without_waiting_for_prior_response(
             held.push(post);
         }
         assert_eq!(
-            runtime.xhttp.as_ref().unwrap().pool.metrics().streams,
+            runtime
+                .xhttp
+                .as_ref()
+                .unwrap()
+                .upload
+                .pool
+                .metrics()
+                .streams,
             MAX_PIPELINE + 1
         );
         stream.write_all(b"last").await.unwrap();

@@ -112,7 +112,13 @@ impl Peer {
     }
 
     pub(super) async fn wait_settings(&mut self, runtime: &NodeRuntime) {
-        let carriers = runtime.xhttp.as_ref().unwrap().pool.live_session_count();
+        let carriers = runtime
+            .xhttp
+            .as_ref()
+            .unwrap()
+            .upload
+            .pool
+            .live_session_count();
         // An acknowledged PING follows the server SETTINGS on each physical carrier.
         tokio::time::timeout(DEADLINE, async {
             while self.settings_count < carriers {
@@ -199,6 +205,7 @@ pub(super) async fn carrier(runtime: &Arc<NodeRuntime>) -> Arc<XhttpSession> {
         .xhttp
         .as_ref()
         .unwrap()
+        .upload
         .pool
         .offer(|| async { anyhow::bail!("the test expected the existing carrier") })
         .await
@@ -288,7 +295,16 @@ pub(super) async fn send(body: &mut h2::SendStream<Bytes>, mut bytes: Bytes, end
 
 pub(super) async fn wait_released(runtime: &NodeRuntime) {
     tokio::time::timeout(DEADLINE, async {
-        while runtime.xhttp.as_ref().unwrap().pool.metrics().streams != 0 {
+        while runtime
+            .xhttp
+            .as_ref()
+            .unwrap()
+            .upload
+            .pool
+            .metrics()
+            .streams
+            != 0
+        {
             tokio::task::yield_now().await;
         }
     })

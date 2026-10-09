@@ -128,7 +128,7 @@ async fn get_reaches_only_the_download_peer_and_supplied_socket_stays_upload() {
             assert_eq!(&received, b"down");
 
             preparation.commit().unwrap();
-            assert_eq!(transport.pool.live_session_count(), 1);
+            assert_eq!(transport.upload.pool.live_session_count(), 1);
             assert_eq!(
                 transport
                     .pools()
