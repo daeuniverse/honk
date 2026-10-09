@@ -417,3 +417,42 @@ fn xhttp_probe_shape_is_supported_without_exposing_options() {
         ProbeEligibility::ExpectedUnsupported("vision-non-tcp")
     );
 }
+
+#[tokio::test]
+async fn slow_column_keeps_finished_sibling_results() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // URLTest's warm-up answers well inside its phase budget and the measured
+    // request never does, so its phases outlast the node deadline.
+    let timeout = Duration::from_secs(2);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = stream.read(&mut [0; 1024]).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let closed_port = tokio::net::TcpSocket::new_v4().unwrap();
+    closed_port.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = closed_port.local_addr().unwrap();
+    let targets = ProbeTargets {
+        host: closed.ip().to_string(),
+        port: closed.port(),
+        url: Some(format!("http://{slow}/")),
+        timeout,
+        v4: Some(closed),
+        v6: Some(closed),
+        udp_dns: UdpCheckTarget::Literal(closed),
+        dns_resolver: None,
+    };
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let outcome = probe_node(&registry, direct_node(), &targets).await;
+    server.abort();
+    assert_eq!(outcome.urltest, Some(Err(ProbeFailureKind::Timeout)));
+    assert_eq!(outcome.v4, Some(Err(ProbeFailureKind::Exchange)));
+    assert_eq!(outcome.v6, Some(Err(ProbeFailureKind::Exchange)));
+}
