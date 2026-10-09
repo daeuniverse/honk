@@ -434,12 +434,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     if !eligibility.is_supported() {
         return ProbeOutcome::skipped(&node, eligibility);
     }
-
-    let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
-    match tokio::time::timeout(deadline, probe_supported_node(registry, &node, targets)).await {
-        Ok(outcome) => outcome,
-        Err(_) => ProbeOutcome::timed_out(registry, &node, targets),
-    }
+    probe_supported_node(registry, &node, targets).await
 }
 
 async fn probe_supported_node(
@@ -447,39 +442,68 @@ async fn probe_supported_node(
     node: &Node,
     targets: &ProbeTargets,
 ) -> ProbeOutcome {
-    let server_families = server_families(node).await;
-    let (v4, v6, udp_dns, udp_quic, urltest) = tokio::join!(
-        probe_family(
-            registry,
-            node,
-            &targets.host,
-            targets.port,
-            false,
-            targets.timeout,
-            targets.v4,
+    // Probes give each phase its own budget, so the node deadline caps every
+    // column separately: one slow column must not erase finished siblings.
+    let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
+    let timed_out = ProbeOutcome::timed_out(registry, node, targets);
+    async fn bounded<T>(deadline: Duration, fallback: T, probe: impl Future<Output = T>) -> T {
+        tokio::time::timeout(deadline, probe)
+            .await
+            .unwrap_or(fallback)
+    }
+    let (server_families, v4, v6, udp_dns, udp_quic, urltest) = tokio::join!(
+        bounded(deadline, (false, false), server_families(node)),
+        bounded(
+            deadline,
+            timed_out.v4,
+            probe_family(
+                registry,
+                node,
+                &targets.host,
+                targets.port,
+                false,
+                targets.timeout,
+                targets.v4,
+            )
         ),
-        probe_family(
-            registry,
-            node,
-            &targets.host,
-            targets.port,
-            true,
-            targets.timeout,
-            targets.v6,
+        bounded(
+            deadline,
+            timed_out.v6,
+            probe_family(
+                registry,
+                node,
+                &targets.host,
+                targets.port,
+                true,
+                targets.timeout,
+                targets.v6,
+            )
         ),
-        probe_udp_dns(
-            registry,
-            node,
-            &targets.udp_dns,
-            targets.dns_resolver.as_deref(),
-            targets.timeout,
+        bounded(
+            deadline,
+            timed_out.udp_dns,
+            probe_udp_dns(
+                registry,
+                node,
+                &targets.udp_dns,
+                targets.dns_resolver.as_deref(),
+                targets.timeout,
+            )
         ),
-        probe_udp_quic(registry, node, &targets.host, targets.port, targets.timeout),
-        probe_urltest(
-            registry,
-            node,
-            targets.url.as_deref().unwrap_or_default(),
-            targets.timeout,
+        bounded(
+            deadline,
+            timed_out.udp_quic,
+            probe_udp_quic(registry, node, &targets.host, targets.port, targets.timeout)
+        ),
+        bounded(
+            deadline,
+            timed_out.urltest,
+            probe_urltest(
+                registry,
+                node,
+                targets.url.as_deref().unwrap_or_default(),
+                targets.timeout,
+            )
         ),
     );
 
