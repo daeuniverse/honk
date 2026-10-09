@@ -70,6 +70,7 @@ impl RequestTemplate {
                 value.parse()?,
             );
         }
+        super::browser::apply_chrome_fetch(&mut headers);
         let referer = format!(
             "{scheme}://{authority}{}?x_padding=",
             escape_path(prefix.to_owned())

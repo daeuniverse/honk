@@ -7,6 +7,7 @@ const STREAM_WRITE: usize = 16 * 1024;
 const RECEIVE_WINDOW: u32 = 256 * 1024;
 const CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
 
+mod browser;
 mod preparation;
 pub(crate) use preparation::XhttpPreparation;
 
