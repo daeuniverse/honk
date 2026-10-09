@@ -1766,7 +1766,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-03"
-source = { file = "doc/en/reference/nodes.md", lines = "267-269" }
+source = { file = "doc/en/reference/nodes.md", lines = "271-273" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1777,7 +1777,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-04"
-source = { file = "doc/en/reference/nodes.md", lines = "320-325" }
+source = { file = "doc/en/reference/nodes.md", lines = "324-329" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2072,7 +2072,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-03"
-source = { file = "doc/zh/reference/nodes.md", lines = "266-268" }
+source = { file = "doc/zh/reference/nodes.md", lines = "270-272" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2083,7 +2083,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-04"
-source = { file = "doc/zh/reference/nodes.md", lines = "319-324" }
+source = { file = "doc/zh/reference/nodes.md", lines = "323-328" }
 wrap = ""
 layer = "structure"
 honk = "accept"

@@ -161,6 +161,8 @@ Probe eligibility is `supported`, `invalid-uuid`, `invalid-reality`, `invalid-co
 
 UDP DNS target resolution, packet-transport setup, send, and receive share one `--timeout` budget. A resolution failure or timeout is reported only in the DNS column; TCP, URLTest, and QUIC probes continue. Unsupported UDP nodes skip this resolution, and a failed hostname is never replaced with another target.
 
+Each column of a node is capped separately at `--timeout` plus one second. URLTest and the family probes give dial, target TLS and each exchange their own `--timeout`, so a slow cold carrier setup can reach that cap; the column then reports `timeout` (or `n/a` where UDP policy rejects the target) while the other columns keep their results.
+
 UDP DNS hostname targets use a shared asynchronous resolver with the first numeric nameserver in `/etc/resolv.conf` (UDP port `53`) and `/etc/hosts` when present, rather than blocking NSS lookup. This path does not apply NSS plugins or resolver search suffixes. An unavailable resolver is a DNS-column `resolve` failure, not a fallback to a public resolver; literal targets need no resolver.
 
 VLESS carrier/session reuse follows the runtime and normalized wire shape, so changing the canonical UDP/mux queries can change node identity and pool reuse. Shared physical-carrier capacity is global, while XUDP's 8-byte Global ID is scoped by honk's runtime/client/path/destination source identity rather than treated as a process-wide collision-free NAT key. See the [node reference](./nodes.md#vless-udp-and-multiplexing) and canonical [VLESS outbound design](../design/outbound.md#sourcesession-ownership-and-capacity).

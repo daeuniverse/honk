@@ -39,7 +39,7 @@ Implementations are split into ordinary Rust modules:
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score and health | `group/score/{evidence,ranking,feedback}.rs`; `alive/{health,urltest}.rs` |
 | Session pool | `session/{maintenance,speculative}.rs` |
-| Stream transports | `proxy/transport/{grpc,h2_io}.rs`; `proxy/transport/xhttp/{preparation,request,response,runtime,session,stream,upload}.rs` |
+| Stream transports | `proxy/transport/{grpc,h2_io}.rs`; `proxy/transport/xhttp/{browser,preparation,request,response,runtime,session,stream,upload}.rs` |
 | Pooled runtime lifecycle | `runtime/pooled.rs` |
 
 Common state remains at the shared ancestor; child implementations do not make
@@ -334,7 +334,7 @@ response-header and body-decoding failures reach the stream owner instead of EOF
 
 #### XHTTP carrier and logical-flow ownership
 
-`proxy/transport/xhttp.rs` adapts raw H2 bodies to the existing stream contract. It owns a node-local `SessionPool`, not a second proxy protocol or loopback relay. The pool keeps at most two reusable physical carriers; draining carriers may overlap replacements under the existing process descriptor and VLESS-carrier gates. Physical drivers retain their socket, observation and carrier permit; HTTP requests and logical proxy flows hold separate reservations. The peer's advertised concurrent-stream limit remains authoritative, including zero, one and later reductions.
+`proxy/transport/xhttp.rs` adapts raw H2 bodies to the existing stream contract. It owns a node-local `SessionPool`, not a second proxy protocol or loopback relay. Download settings add a second peer with its own pool and dial node, which carries only GETs; a caller-supplied socket always belongs to the upload peer, and winner commit publishes the download pool before the upload pool under one lifecycle lock, so a dead download carrier publishes neither. Each pool keeps at most two reusable physical carriers; draining carriers may overlap replacements under the existing process descriptor and VLESS-carrier gates. Physical drivers retain their socket, observation and carrier permit; HTTP requests and logical proxy flows hold separate reservations. The peer's advertised concurrent-stream limit remains authoritative, including zero, one and later reductions.
 
 Each carrier retains up to 2048 locally reset requests (16 admission windows) for h2's default one-second in-flight-frame grace period and keeps its bounded default lifetime budget of 1024 protocol-error resets; steady short-flow churn can cancel several admission windows before old reset state expires, so retention must exceed the active-request bound.
 
