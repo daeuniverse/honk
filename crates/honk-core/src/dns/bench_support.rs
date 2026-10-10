@@ -124,7 +124,12 @@ impl RuntimeBenchmark {
     }
 
     pub fn acquire_generation(&self) -> u64 {
-        self.provider.acquire().runtime().generation().get()
+        self.provider
+            .try_acquire()
+            .expect("benchmark DNS runtime is active")
+            .runtime()
+            .generation()
+            .get()
     }
 
     pub fn publish_next(&mut self) {

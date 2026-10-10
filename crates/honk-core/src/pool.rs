@@ -551,6 +551,17 @@ impl ConnectionPool {
         drop(removed);
     }
 
+    pub(crate) fn clear(&self) {
+        let mut state = self.state.lock();
+        let removed = std::mem::take(&mut state.entries);
+        state.total = 0;
+        state.ready_targets.clear();
+        state.warm_dials.clear();
+        state.hot.clear();
+        drop(state);
+        drop(removed);
+    }
+
     pub(crate) async fn prune_expired(&self) -> usize {
         #[cfg(test)]
         self.pause_at("janitor_before_store");

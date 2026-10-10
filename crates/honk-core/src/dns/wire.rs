@@ -48,6 +48,10 @@ pub(crate) fn extract_ips_from_dns_response(response: &[u8]) -> Vec<IpAddr> {
 /// Extract A/AAAA answer records as `(ip, ttl)` pairs from a wire-format
 /// DNS response. Non-address record types are skipped.
 pub(crate) fn extract_ips_with_ttl(response: &[u8]) -> Vec<(IpAddr, u32)> {
+    extract_ips_with_ttl_bounded(response, usize::MAX)
+}
+
+pub(crate) fn extract_ips_with_ttl_bounded(response: &[u8], limit: usize) -> Vec<(IpAddr, u32)> {
     let mut out = Vec::new();
     if response.len() < 12 {
         return out;
@@ -67,6 +71,9 @@ pub(crate) fn extract_ips_with_ttl(response: &[u8]) -> Vec<(IpAddr, u32)> {
     }
 
     for _ in 0..ancount {
+        if out.len() == limit {
+            break;
+        }
         if !skip_dns_name(response, &mut pos) {
             break;
         }

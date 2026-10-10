@@ -24,6 +24,7 @@ fn key(index: u16) -> FlightKey {
         &honk_config::dns::DnsStrategy::Both,
         1,
         DnsRequestMeta::EMPTY,
+        None,
     )
 }
 
@@ -108,6 +109,7 @@ fn strict_and_compatibility_resolves_do_not_share_a_flight() {
         &honk_config::dns::DnsStrategy::Both,
         1,
         DnsRequestMeta::EMPTY,
+        None,
     )) else {
         panic!("strict leader");
     };
@@ -117,6 +119,7 @@ fn strict_and_compatibility_resolves_do_not_share_a_flight() {
         &honk_config::dns::DnsStrategy::Both,
         1,
         DnsRequestMeta::EMPTY,
+        None,
     )) else {
         panic!("compatibility leader");
     };
@@ -135,6 +138,7 @@ fn preference_sensitive_sources_do_not_share_a_flight() {
             &honk_config::dns::DnsStrategy::PreferIpv4,
             28,
             DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+            None,
         )) else {
             panic!("source leader");
         };
@@ -154,6 +158,7 @@ fn preference_irrelevant_sources_share_a_flight() {
             &honk_config::dns::DnsStrategy::Both,
             28,
             DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+            None,
         )
     };
     let FlightRole::Leader(_leader) = flights.acquire(key_for("192.0.2.1")) else {

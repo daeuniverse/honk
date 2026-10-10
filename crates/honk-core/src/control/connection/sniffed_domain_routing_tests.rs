@@ -11,6 +11,12 @@ fn handoff(outbound: u8, must: u8) -> HandoffResult {
         mac: [0; 6],
         pname: [0; 16],
         pid: 0,
+        #[cfg(feature = "native-api")]
+        trace_id: 0,
+        #[cfg(feature = "native-api")]
+        capture: None,
+        #[cfg(feature = "native-api")]
+        capture_gap: Some("not_instrumented"),
     }
 }
 
@@ -30,6 +36,8 @@ fn direct_mark_preserves_rule_and_clears_override() {
             mark,
             matched_rule: None,
             reroute_by_sniffed_domain: false,
+            #[cfg(feature = "native-api")]
+            native_route: None,
         };
         decision.apply_final_outbound(replacement.map(str::to_owned));
         assert_eq!(decision.outbound, final_outbound);

@@ -46,6 +46,23 @@ impl GeoRequirements {
         }
     }
 
+    /// The sorted category names `kind` must contain, without attribute selectors.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn codes(&self, kind: &str) -> Vec<String> {
+        let mut codes: Vec<String> = match kind {
+            "geosite" => self
+                .geosite_codes
+                .iter()
+                .map(|code| split_geosite_code(code).0)
+                .collect(),
+            "geoip" => self.geoip_codes.iter().cloned().collect(),
+            _ => Vec::new(),
+        };
+        codes.sort();
+        codes.dedup();
+        codes
+    }
+
     pub(crate) fn union(&self, other: &Self) -> Self {
         let mut union = self.clone();
         union
@@ -56,22 +73,42 @@ impl GeoRequirements {
     }
 }
 
+#[cfg(feature = "native-api")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GeoAssetSnapshot {
+    pub(crate) kind: &'static str,
+    pub(crate) path: Option<std::path::PathBuf>,
+    pub(crate) sha256: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) modified_at: Option<std::time::SystemTime>,
+}
+
 #[derive(Clone)]
 enum GeoSource {
     Unused,
     Missing,
+    #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
     Present {
         bytes: Option<Arc<[u8]>>,
         content_digest: [u8; 32],
+        path: Option<std::path::PathBuf>,
+        modified_at: Option<std::time::SystemTime>,
     },
 }
 
 impl GeoSource {
+    #[cfg(test)]
     fn present(bytes: Vec<u8>) -> Self {
+        Self::captured(bytes.into())
+    }
+
+    fn captured(bytes: Arc<[u8]>) -> Self {
         let content_digest = Sha256::digest(&bytes).into();
         Self::Present {
-            bytes: Some(bytes.into()),
+            bytes: Some(bytes),
             content_digest,
+            path: None,
+            modified_at: None,
         }
     }
 
@@ -79,6 +116,8 @@ impl GeoSource {
         Self::Present {
             bytes: None,
             content_digest,
+            path: None,
+            modified_at: None,
         }
     }
     fn bytes(&self) -> Option<&[u8]> {
@@ -86,6 +125,46 @@ impl GeoSource {
             Self::Present { bytes, .. } => bytes.as_deref(),
             Self::Unused | Self::Missing => None,
         }
+    }
+
+    fn with_metadata(
+        mut self,
+        source_path: Option<std::path::PathBuf>,
+        source_modified_at: Option<std::time::SystemTime>,
+    ) -> Self {
+        if let Self::Present {
+            path, modified_at, ..
+        } = &mut self
+        {
+            *path = source_path;
+            *modified_at = source_modified_at;
+        }
+        self
+    }
+
+    #[cfg(feature = "native-api")]
+    fn snapshot(&self, kind: &'static str) -> Option<GeoAssetSnapshot> {
+        use std::fmt::Write as _;
+        let Self::Present {
+            bytes: Some(bytes),
+            content_digest,
+            path,
+            modified_at,
+        } = self
+        else {
+            return None;
+        };
+        let mut sha256 = String::with_capacity(64);
+        for byte in content_digest {
+            write!(sha256, "{byte:02x}").expect("writing to a String is infallible");
+        }
+        Some(GeoAssetSnapshot {
+            kind,
+            path: path.clone(),
+            sha256,
+            size_bytes: bytes.len() as u64,
+            modified_at: *modified_at,
+        })
     }
 }
 
@@ -96,11 +175,146 @@ pub(crate) struct GeoSourceSet {
     fingerprint: [u8; 32],
 }
 
+#[cfg(feature = "native-api")]
+impl std::fmt::Debug for GeoSourceSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoSourceSet")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GeoSourceSet {
     pub(crate) fn load(requirements: &GeoRequirements) -> Self {
         let geosite = capture_source(!requirements.geosite_codes.is_empty(), "geosite.dat");
         let geoip = capture_source(!requirements.geoip_codes.is_empty(), "geoip.dat");
         Self::from_sources(geosite, geoip)
+    }
+
+    #[cfg(all(feature = "native-api", test))]
+    pub(crate) fn load_captured(
+        requirements: &GeoRequirements,
+        data_dir: &std::path::Path,
+        mut read: impl FnMut(&std::path::Path) -> std::io::Result<Arc<[u8]>>,
+    ) -> std::io::Result<Self> {
+        let sources = Self::capture_for_admission(requirements, data_dir, |_, path| read(path))?;
+        sources.validate(requirements)?;
+        Ok(sources)
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn capture_for_admission(
+        requirements: &GeoRequirements,
+        data_dir: &std::path::Path,
+        mut read: impl FnMut(&'static str, &std::path::Path) -> std::io::Result<Arc<[u8]>>,
+    ) -> std::io::Result<Self> {
+        let mut capture = |required: bool, kind: &'static str, name: &str| {
+            if !required {
+                return Ok(GeoSource::Unused);
+            }
+            let path = find_dat_from(name, data_dir)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            read(kind, &path)
+                .map(|bytes| GeoSource::captured(bytes).with_metadata(Some(path), None))
+        };
+        let geosite = capture(
+            !requirements.geosite_codes.is_empty(),
+            "geosite",
+            "geosite.dat",
+        )?;
+        let geoip = capture(!requirements.geoip_codes.is_empty(), "geoip", "geoip.dat")?;
+        Ok(Self::from_sources(geosite, geoip))
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn from_assets(
+        requirements: &GeoRequirements,
+        assets: Vec<(GeoAssetSnapshot, Arc<[u8]>)>,
+    ) -> std::io::Result<Self> {
+        let mut geosite = GeoSource::Unused;
+        let mut geoip = GeoSource::Unused;
+        for (snapshot, bytes) in assets {
+            let source = match snapshot.kind {
+                "geosite" => &mut geosite,
+                "geoip" => &mut geoip,
+                _ => return Err(std::io::ErrorKind::InvalidData.into()),
+            };
+            if !matches!(source, GeoSource::Unused) {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            validate_downloaded_asset(snapshot.kind, &bytes)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let captured = GeoSource::captured(bytes);
+            let actual = captured.snapshot(snapshot.kind).expect("captured bytes");
+            if actual.sha256 != snapshot.sha256 || actual.size_bytes != snapshot.size_bytes {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            *source = captured.with_metadata(snapshot.path, snapshot.modified_at);
+        }
+        let sources = Self::from_sources(geosite, geoip);
+        sources.validate(requirements)?;
+        sources.contain(requirements)?;
+        Ok(sources)
+    }
+
+    /// A replacement file must define every category the configuration uses:
+    /// a missing one would silently turn its rules into never-matching ones.
+    #[cfg(feature = "native-api")]
+    fn contain(&self, requirements: &GeoRequirements) -> std::io::Result<()> {
+        let missing = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+        if let Some(bytes) = self.geosite.bytes() {
+            let index = parse_geosite_index_inner(bytes, &requirements.geosite_codes, true)
+                .map_err(|_| missing())?;
+            if requirements
+                .codes("geosite")
+                .iter()
+                .any(|code| !index.contains_key(code))
+            {
+                return Err(missing());
+            }
+        }
+        if let Some(bytes) = self.geoip.bytes() {
+            let index =
+                parse_geoip_index(bytes, &requirements.geoip_codes).map_err(|_| missing())?;
+            if requirements
+                .geoip_codes
+                .iter()
+                .any(|code| !index.contains_key(code))
+            {
+                return Err(missing());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn validate(&self, requirements: &GeoRequirements) -> std::io::Result<()> {
+        let invalid = |_| std::io::Error::from(std::io::ErrorKind::InvalidData);
+        if !requirements.geosite_codes.is_empty() {
+            let bytes = self.geosite.bytes().ok_or(std::io::ErrorKind::NotFound)?;
+            parse_geosite_index_inner(bytes, &requirements.geosite_codes, true).map_err(invalid)?;
+        }
+        if !requirements.geoip_codes.is_empty() {
+            let bytes = self.geoip.bytes().ok_or(std::io::ErrorKind::NotFound)?;
+            parse_geoip_index(bytes, &requirements.geoip_codes).map_err(invalid)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn snapshots(&self, requirements: &GeoRequirements) -> Vec<GeoAssetSnapshot> {
+        [
+            (
+                !requirements.geosite_codes.is_empty(),
+                "geosite",
+                &self.geosite,
+            ),
+            (!requirements.geoip_codes.is_empty(), "geoip", &self.geoip),
+        ]
+        .into_iter()
+        .filter(|(required, _, _)| *required)
+        .filter_map(|(_, kind, source)| source.snapshot(kind))
+        .collect()
     }
 
     pub(crate) fn probe_union(first: &GeoRequirements, second: &GeoRequirements) -> Self {
@@ -159,13 +373,35 @@ fn capture_source(required: bool, name: &str) -> GeoSource {
         );
         return GeoSource::Missing;
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => GeoSource::present(bytes),
+    match capture_file(&path) {
+        Ok(source) => source,
         Err(error) => {
             tracing::warn!("failed to read {}: {}", path.display(), error);
             GeoSource::Missing
         }
     }
+}
+
+fn capture_file(path: &std::path::Path) -> std::io::Result<GeoSource> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata().ok();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let modified_at = before
+        .zip(file.metadata().ok())
+        .and_then(|(before, after)| {
+            (before.is_file()
+                && before.len() == bytes.len() as u64
+                && before.len() == after.len()
+                && before.modified().ok() == after.modified().ok()
+                && before.ctime() == after.ctime()
+                && before.ctime_nsec() == after.ctime_nsec())
+            .then(|| after.modified().ok())
+            .flatten()
+        });
+    Ok(GeoSource::captured(bytes.into())
+        .with_metadata(Some(std::path::absolute(path)?), modified_at))
 }
 
 fn probe_source_digest(required: bool, find: fn() -> Option<std::path::PathBuf>) -> GeoSource {
@@ -328,7 +564,7 @@ impl GeoAssets {
                 tracing::debug!("expanded geosite codes into {} domain matchers", out.len());
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     "geosite.dat unavailable; geosite conditions {:?} match nothing",
                     codes
                 );
@@ -387,7 +623,7 @@ impl GeoAssets {
                     }
                 }
                 None => {
-                    tracing::warn!(
+                    tracing::debug!(
                         "geoip.dat unavailable; geoip condition '{}' matches nothing",
                         code
                     );
@@ -422,13 +658,17 @@ pub fn find_geosite_dat() -> Option<std::path::PathBuf> {
 }
 
 fn find_dat(name: &str) -> Option<std::path::PathBuf> {
+    find_dat_from(name, honk_config::paths::data_dir())
+}
+
+fn find_dat_from(name: &str, data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Ok(asset) = std::env::var("DAE_LOCATION_ASSET") {
         let path = std::path::Path::new(&asset).join(name);
         if path.is_file() {
             return Some(path);
         }
     }
-    let mut path = honk_config::paths::resolve_artifact_path(name);
+    let mut path = data_dir.join(name);
     if path.is_file() {
         return Some(path);
     }
@@ -459,6 +699,14 @@ fn find_dat(name: &str) -> Option<std::path::PathBuf> {
 fn parse_geosite_index(
     data: &[u8],
     codes: &std::collections::HashSet<String>,
+) -> anyhow::Result<std::collections::HashMap<String, IndexedGeosite>> {
+    parse_geosite_index_inner(data, codes, false)
+}
+
+fn parse_geosite_index_inner(
+    data: &[u8],
+    codes: &std::collections::HashSet<String>,
+    strict: bool,
 ) -> anyhow::Result<std::collections::HashMap<String, IndexedGeosite>> {
     use std::collections::HashSet;
     let mut bases: HashSet<String> = HashSet::with_capacity(codes.len());
@@ -500,6 +748,7 @@ fn parse_geosite_index(
                     }
                 }
                 Ok(None) => {}
+                Err(error) if strict => return Err(error),
                 Err(e) => {
                     tracing::warn!("skipping invalid geosite entry in '{}': {}", code, e);
                 }
@@ -1100,9 +1349,118 @@ fn split_geoip_entry(data: &[u8]) -> anyhow::Result<(Option<String>, Vec<&[u8]>)
     Ok((country_code, raw_cidrs))
 }
 
+#[cfg(feature = "native-api")]
+fn validate_downloaded_asset(kind: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut decoder = ProtoDecoder::new(bytes);
+    while !decoder.is_empty() {
+        let (tag, wire) = decoder.read_tag()?;
+        if tag != 1 {
+            decoder.skip_field(wire)?;
+            continue;
+        }
+        anyhow::ensure!(wire == 2, "invalid asset entry wire type");
+        let entry = decoder.read_len_delimited()?;
+        if kind == "geosite" {
+            let (_, domains) = split_geosite_entry(entry)?;
+            for domain in domains {
+                parse_geosite_domain(domain)?;
+            }
+        } else {
+            let (_, cidrs) = split_geoip_entry(entry)?;
+            for cidr in cidrs {
+                parse_cidr(cidr)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn captured_geo_metadata_survives_disk_replacement() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let path = directory.path().join("geosite.dat");
+        let relative = path.strip_prefix(std::env::current_dir().unwrap()).unwrap();
+        let bytes = geosite_dat(&[("test", vec![domain_msg(3, "old.example", &[])])]);
+        std::fs::write(&path, &bytes).unwrap();
+        let modified_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let sources =
+            GeoSourceSet::from_sources(capture_file(relative).unwrap(), GeoSource::Unused);
+        std::fs::write(&path, b"no longer a geo database").unwrap();
+        let config = honk_config::parser::parse_dae_config(
+            "routing {\n domain(geosite:test) -> block\n fallback: direct\n }",
+        )
+        .unwrap();
+        let router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+        let asset = &router.geo_assets()[0];
+        assert_eq!(asset.kind, "geosite");
+        assert_eq!(asset.path, Some(std::path::absolute(&path).unwrap()));
+        assert_eq!(asset.sha256, crate::configuration::digest(&bytes));
+        assert_eq!(asset.size_bytes, bytes.len() as u64);
+        assert_eq!(asset.modified_at, Some(modified_at));
+        let connection = |domain: &str| ConnectionInfo {
+            domain: Some(domain.into()),
+            dst_ip: "192.0.2.1".parse().unwrap(),
+            dst_port: 443,
+            src_ip: "192.0.2.2".parse().unwrap(),
+            src_port: 12345,
+            protocol: "tcp",
+            process_name: None,
+            mac: None,
+            dscp: None,
+        };
+        assert_eq!(router.route(&connection("old.example")), "block");
+        assert_eq!(router.route(&connection("new.example")), "direct");
+
+        let requirements = router.geo_requirements();
+        let synthetic = GeoSourceSet::from_bytes(bytes.clone(), Vec::new()).snapshots(requirements);
+        assert_eq!(synthetic[0].path, None);
+        assert_eq!(synthetic[0].modified_at, None);
+        let overlay = GeoSourceSet::load_captured(requirements, directory.path(), |_| {
+            Ok(Arc::from(bytes.as_slice()))
+        })
+        .unwrap()
+        .snapshots(requirements);
+        assert!(overlay[0].path.is_some());
+        assert_eq!(overlay[0].modified_at, None);
+
+        let mut mismatched = asset.clone();
+        mismatched.sha256 = "0".repeat(64);
+        assert!(GeoSourceSet::from_assets(requirements, vec![(mismatched, bytes.into())]).is_err());
+    }
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn offline_geo_rejects_malformed_bytes_without_changing_runtime_leniency() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("geosite.dat"), []).unwrap();
+        let mut requirements = GeoRequirements::default();
+        requirements.add_geosite("test");
+        let malformed = geosite_dat(&[("test", vec![domain_msg(1, "[", &[])])]);
+        assert!(parse_geosite_index(&malformed, &requirements.geosite_codes).is_ok());
+        let result = GeoSourceSet::load_captured(&requirements, directory.path(), |_| {
+            Ok(malformed.clone().into())
+        });
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let result = GeoSourceSet::load_captured(&requirements, directory.path(), |_| {
+            Err(std::io::ErrorKind::NotFound.into())
+        });
+        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::NotFound);
+        let result = GeoSourceSet::load_captured(&requirements, directory.path(), |_| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn geoip_code_expanding_to_nothing_warns_like_geosite() {

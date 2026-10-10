@@ -82,7 +82,7 @@ pub async fn consume_dae_events(
                     _ => "unknown",
                 };
                 if is_overflow {
-                    warn!(target: "honk-ebpf", event = kind, pid = ev.pid, pname = %pname, l4proto = ev.l4proto, %sip, sport = ev.sport, %dip, dport = ev.dport, outbound = ev.outbound, "eBPF conntrack overflow");
+                    debug!(target: "honk-ebpf", event = kind, pid = ev.pid, pname = %pname, l4proto = ev.l4proto, %sip, sport = ev.sport, %dip, dport = ev.dport, outbound = ev.outbound, "eBPF conntrack overflow");
                 } else if is_token_exhaustion {
                     warn!(target: "honk-ebpf", event = kind, "UDP decision token allocator exhausted");
                 } else {

@@ -121,7 +121,7 @@ async fn packet_up_replacement_obeys_the_published_successor_admission() {
         node.normalize_stream_transport().unwrap();
         node.id = node.derive_id();
         let (first, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
-            std::slice::from_ref(&node), 1, 4, 4, None,
+            std::slice::from_ref(&node), 1, 4, 4, false, None,
         )
         .unwrap();
         first.activate_background_dial_admission();
@@ -137,7 +137,7 @@ async fn packet_up_replacement_obeys_the_published_successor_admission() {
         let _reply = response(&mut download.respond, 200, false);
 
         let (successor, moved) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
-            std::slice::from_ref(&node), 1, 4, 4, Some(&first),
+            std::slice::from_ref(&node), 1, 4, 4, false, Some(&first),
         )
         .unwrap();
         assert!(Arc::ptr_eq(&runtime, &successor.get(&node.id).unwrap()));

@@ -81,7 +81,7 @@ quinn.workspace = true
 h3 = { workspace = true, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn.workspace = true
 
-# Persistence (cache_file / cachedb)
+# Persistence (state database)
 rusqlite.workspace = true
 
 # Misc
@@ -100,9 +100,15 @@ sha2.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 
-# Debug HTTP API / Clash API (both need axum; clash-api also needs ws)
-axum = { workspace = true, optional = true, features = ["ws"] }
+# Independent HTTP APIs; only Clash needs WebSocket support.
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+serde_path_to_error = { workspace = true, optional = true }
+# The embedded UI keeps only compressed text; clients without gzip or br get it decoded.
+flate2 = { workspace = true, optional = true }
 
 # External UI auto-download (clash-api)
 zip = { workspace = true, optional = true }
@@ -112,7 +118,10 @@ default = ["clash-api", "mimalloc", "rprx"]
 # Enable real eBPF support (requires Linux kernel 6.12+)
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
-clash-api = ["dep:axum", "dep:tower-http", "dep:zip"]
+clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
+native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
+# Embed the pinned doona distribution from HONK_DOONA_DIR at build time.
+native-ui = ["native-api", "dep:brotli", "dep:flate2"]
 # Route the shipped binary's allocations through mimalloc (see main.rs)
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
@@ -124,6 +133,8 @@ reload-bench-counters = ["reload-bench"]
 
 [build-dependencies]
 anyhow.workspace = true
+brotli = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 aya-ebpf-bindings.workspace = true
@@ -137,9 +148,11 @@ boring.workspace = true
 tokio-boring.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
+brotli.workspace = true
 criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 futures-util = "0.3"
 stats_alloc = "0.1.10"
+jsonschema = { version = "0.58", default-features = false }
 
 [[bench]]
 name = "dns"

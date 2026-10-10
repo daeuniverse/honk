@@ -37,6 +37,8 @@ const TAG_LEN: usize = 16;
 const FRAME_HEADER_LEN: usize = 5;
 const MAX_FRAME_PLAINTEXT: usize = 8192;
 const MAX_FRAME_CIPHERTEXT: usize = 16_640;
+/// Largest write buffer kept between frames; a larger first-frame prewrite is not.
+const MAX_RETAINED_WIRE: usize = FRAME_HEADER_LEN + MAX_FRAME_PLAINTEXT + TAG_LEN;
 const MAX_NONCE: [u8; NONCE_LEN] = [u8::MAX; NONCE_LEN];
 const KDF_CTR: &[u8] = b"VLESS";
 
@@ -685,8 +687,9 @@ pub(crate) struct EncryptedStream {
     recv_header_xor: direct::HeaderXor,
     direct_write: bool,
     send_header_xor: direct::HeaderXor,
-    /// Reused random-mode Direct wire buffer; native modes never allocate it.
-    direct_wire: Vec<u8>,
+    /// Write buffer reused while traffic flows; empty while `pending_write`
+    /// owns it and released once the stream flushes idle.
+    write_wire: Vec<u8>,
     ticket_use: Option<TicketUse>,
 }
 
@@ -732,7 +735,7 @@ impl EncryptedStream {
             recv_header_xor: direct::HeaderXor::default(),
             direct_write: false,
             send_header_xor: direct::HeaderXor::default(),
-            direct_wire: Vec::new(),
+            write_wire: Vec::new(),
             ticket_use,
         }
     }
@@ -742,26 +745,24 @@ impl EncryptedStream {
         let mut header = [23, 3, 3, 0, 0];
         header[3..].copy_from_slice(&encode_length(plaintext_len + TAG_LEN));
         let rekey = self.send.nonce == MAX_NONCE;
-        let mut body = Vec::with_capacity(plaintext_len + TAG_LEN);
+        let prewrite = self.prewrite.as_deref().unwrap_or_default();
+        let header_start = prewrite.len();
+        let mut wire = std::mem::take(&mut self.write_wire);
+        wire.clear();
+        wire.reserve_exact(header_start + FRAME_HEADER_LEN + plaintext_len + TAG_LEN);
+        wire.extend_from_slice(prewrite);
+        wire.extend_from_slice(&header);
+        // The AEAD appends, so the ciphertext lands after the unmasked header.
         self.send
-            .seal(&plaintext[..plaintext_len], &header, &mut body)?;
+            .seal(&plaintext[..plaintext_len], &header, &mut wire)?;
         if rekey {
-            let mut context = Vec::with_capacity(header.len() + body.len());
-            context.extend_from_slice(&header);
-            context.extend_from_slice(&body);
-            self.send = StreamAead::new(&context, &self.united_key, self.use_aes)
+            self.send = StreamAead::new(&wire[header_start..], &self.united_key, self.use_aes)
                 .map_err(io::Error::other)?;
         }
         if let Some(xor) = self.send_xor.as_mut() {
-            xor.apply(&mut header);
+            xor.apply(&mut wire[header_start..header_start + FRAME_HEADER_LEN]);
         }
-        let prewrite_len = self.prewrite.as_ref().map_or(0, Vec::len);
-        let mut wire = Vec::with_capacity(prewrite_len + header.len() + body.len());
-        if let Some(prewrite) = self.prewrite.take() {
-            wire.extend_from_slice(&prewrite);
-        }
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(&body);
+        self.prewrite = None;
         Ok((wire, plaintext_len))
     }
 
@@ -785,8 +786,8 @@ impl EncryptedStream {
             .pending_write
             .take()
             .expect("completed pending write exists");
-        if self.direct_write {
-            self.direct_wire = done.wire;
+        if done.wire.capacity() <= MAX_RETAINED_WIRE {
+            self.write_wire = done.wire;
         }
         Poll::Ready(Ok(done.plaintext_len))
     }
@@ -807,6 +808,10 @@ impl EncryptedStream {
             self.read_plaintext_offset = 0;
         }
         true
+    }
+
+    fn at_frame_boundary(&self) -> bool {
+        matches!(self.read_phase, ReadPhase::Header) && self.read_offset == 0
     }
 
     fn invalidate_ticket(&mut self) {
@@ -853,7 +858,12 @@ impl AsyncWrite for EncryptedStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        Pin::new(&mut *self.inner).poll_flush(cx)
+        let flushed = Pin::new(&mut *self.inner).poll_flush(cx);
+        if flushed.is_ready() {
+            // The relay flushes once its source would block: release until traffic resumes.
+            self.write_wire = Vec::new();
+        }
+        flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -891,7 +901,7 @@ impl AsyncRead for EncryptedStream {
                 };
                 match poll {
                     Poll::Ready(Ok(())) if read == 0 => {
-                        if start == 0 && matches!(self.read_phase, ReadPhase::Header) {
+                        if self.at_frame_boundary() {
                             self.read_eof = true;
                             return Poll::Ready(Ok(()));
                         }
@@ -906,7 +916,13 @@ impl AsyncRead for EncryptedStream {
                         self.invalidate_ticket();
                         return Poll::Ready(Err(error));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if self.at_frame_boundary() {
+                            // Idle at a frame boundary: keep only the header buffer.
+                            self.read_plaintext = Vec::new();
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
 
@@ -944,6 +960,7 @@ impl AsyncRead for EncryptedStream {
                 }
                 ReadPhase::Header => {
                     let mut header: [u8; FRAME_HEADER_LEN] = wire
+                        .as_slice()
                         .try_into()
                         .expect("VLESS Encryption frame header length");
                     if let Some(xor) = self.recv_xor.as_mut() {
@@ -963,7 +980,14 @@ impl AsyncRead for EncryptedStream {
                         header,
                         ciphertext_len,
                     };
-                    self.read_wire = vec![0; ciphertext_len];
+                    // The drained plaintext buffer receives the body; the header
+                    // buffer waits in the empty plaintext slot until it returns.
+                    std::mem::swap(&mut wire, &mut self.read_plaintext);
+                    self.read_plaintext.clear();
+                    wire.clear();
+                    wire.reserve_exact(ciphertext_len);
+                    wire.resize(ciphertext_len, 0);
+                    self.read_wire = wire;
                 }
                 ReadPhase::Body {
                     header,
@@ -998,10 +1022,12 @@ impl AsyncRead for EncryptedStream {
                     }
                     wire.truncate(plaintext_len);
                     self.ticket_use = None;
-                    self.read_plaintext = wire;
+                    let mut header_wire = std::mem::replace(&mut self.read_plaintext, wire);
                     self.read_plaintext_offset = 0;
                     self.read_phase = ReadPhase::Header;
-                    self.read_wire = vec![0; FRAME_HEADER_LEN];
+                    header_wire.clear();
+                    header_wire.resize(FRAME_HEADER_LEN, 0);
+                    self.read_wire = header_wire;
                     if self.copy_plaintext(output) {
                         return Poll::Ready(Ok(()));
                     }
@@ -1011,269 +1037,8 @@ impl AsyncRead for EncryptedStream {
     }
 }
 
-mod raw_blake3 {
-    const IV: [u32; 8] = [
-        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
-        0x5BE0CD19,
-    ];
-    const CHUNK_START: u32 = 1;
-    const CHUNK_END: u32 = 2;
-    const PARENT: u32 = 4;
-    const ROOT: u32 = 8;
-    const DERIVE_KEY_CONTEXT: u32 = 32;
-    const DERIVE_KEY_MATERIAL: u32 = 64;
-    const CHUNK_LEN: usize = 1024;
-    const BLOCK_LEN: usize = 64;
-    const MSG_SCHEDULE: [[usize; 16]; 7] = [
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
-        [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
-        [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
-        [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
-        [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
-        [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
-    ];
-
-    #[derive(Clone, Copy)]
-    struct Output {
-        input_cv: [u32; 8],
-        block: [u32; 16],
-        counter: u64,
-        block_len: u32,
-        flags: u32,
-    }
-
-    impl Output {
-        fn chaining_value(self) -> [u32; 8] {
-            compress(
-                self.input_cv,
-                self.block,
-                self.counter,
-                self.block_len,
-                self.flags,
-            )[..8]
-                .try_into()
-                .expect("BLAKE3 chaining value length")
-        }
-
-        fn root_hash(self) -> [u8; 32] {
-            let words = compress(
-                self.input_cv,
-                self.block,
-                0,
-                self.block_len,
-                self.flags | ROOT,
-            );
-            let mut output = [0u8; 32];
-            for (chunk, word) in output.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-                chunk.copy_from_slice(&word.to_le_bytes());
-            }
-            output
-        }
-    }
-
-    pub(super) fn derive_key(context: &[u8], material: &[u8]) -> [u8; 32] {
-        let context_key = hash(context, IV, DERIVE_KEY_CONTEXT);
-        let mut key_words = [0u32; 8];
-        for (word, bytes) in key_words
-            .iter_mut()
-            .zip(context_key.as_chunks::<4>().0.iter())
-        {
-            *word = u32::from_le_bytes(*bytes);
-        }
-        hash(material, key_words, DERIVE_KEY_MATERIAL)
-    }
-
-    fn hash(mut input: &[u8], key: [u32; 8], flags: u32) -> [u8; 32] {
-        let mut stack = Vec::<[u32; 8]>::new();
-        let mut chunk_counter = 0u64;
-        while input.len() > CHUNK_LEN {
-            let mut cv =
-                chunk_output(&input[..CHUNK_LEN], key, chunk_counter, flags).chaining_value();
-            let mut total_chunks = chunk_counter + 1;
-            while total_chunks & 1 == 0 {
-                cv = parent_output(stack.pop().expect("left BLAKE3 subtree"), cv, key, flags)
-                    .chaining_value();
-                total_chunks >>= 1;
-            }
-            stack.push(cv);
-            input = &input[CHUNK_LEN..];
-            chunk_counter += 1;
-        }
-        let mut output = chunk_output(input, key, chunk_counter, flags);
-        while let Some(left) = stack.pop() {
-            output = parent_output(left, output.chaining_value(), key, flags);
-        }
-        output.root_hash()
-    }
-
-    fn chunk_output(input: &[u8], key: [u32; 8], counter: u64, flags: u32) -> Output {
-        let mut cv = key;
-        let mut offset = 0;
-        while input.len().saturating_sub(offset) > BLOCK_LEN {
-            let block = words(&input[offset..offset + BLOCK_LEN]);
-            let block_flags = flags | if offset == 0 { CHUNK_START } else { 0 };
-            cv = compress(cv, block, counter, BLOCK_LEN as u32, block_flags)[..8]
-                .try_into()
-                .expect("BLAKE3 chaining value length");
-            offset += BLOCK_LEN;
-        }
-        let remaining = &input[offset..];
-        Output {
-            input_cv: cv,
-            block: words(remaining),
-            counter,
-            block_len: remaining.len() as u32,
-            flags: flags | CHUNK_END | if offset == 0 { CHUNK_START } else { 0 },
-        }
-    }
-
-    fn parent_output(left: [u32; 8], right: [u32; 8], key: [u32; 8], flags: u32) -> Output {
-        let mut block = [0u32; 16];
-        block[..8].copy_from_slice(&left);
-        block[8..].copy_from_slice(&right);
-        Output {
-            input_cv: key,
-            block,
-            counter: 0,
-            block_len: BLOCK_LEN as u32,
-            flags: flags | PARENT,
-        }
-    }
-
-    fn words(bytes: &[u8]) -> [u32; 16] {
-        let mut block = [0u8; BLOCK_LEN];
-        block[..bytes.len()].copy_from_slice(bytes);
-        let mut words = [0u32; 16];
-        for (word, bytes) in words.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
-            *word = u32::from_le_bytes(*bytes);
-        }
-        words
-    }
-
-    fn compress(
-        cv: [u32; 8],
-        block: [u32; 16],
-        counter: u64,
-        block_len: u32,
-        flags: u32,
-    ) -> [u32; 16] {
-        let mut state = [
-            cv[0],
-            cv[1],
-            cv[2],
-            cv[3],
-            cv[4],
-            cv[5],
-            cv[6],
-            cv[7],
-            IV[0],
-            IV[1],
-            IV[2],
-            IV[3],
-            counter as u32,
-            (counter >> 32) as u32,
-            block_len,
-            flags,
-        ];
-        for schedule in MSG_SCHEDULE {
-            round(&mut state, &block, &schedule);
-        }
-        for i in 0..8 {
-            state[i] ^= state[i + 8];
-            state[i + 8] ^= cv[i];
-        }
-        state
-    }
-
-    fn round(state: &mut [u32; 16], message: &[u32; 16], schedule: &[usize; 16]) {
-        g(
-            state,
-            0,
-            4,
-            8,
-            12,
-            message[schedule[0]],
-            message[schedule[1]],
-        );
-        g(
-            state,
-            1,
-            5,
-            9,
-            13,
-            message[schedule[2]],
-            message[schedule[3]],
-        );
-        g(
-            state,
-            2,
-            6,
-            10,
-            14,
-            message[schedule[4]],
-            message[schedule[5]],
-        );
-        g(
-            state,
-            3,
-            7,
-            11,
-            15,
-            message[schedule[6]],
-            message[schedule[7]],
-        );
-        g(
-            state,
-            0,
-            5,
-            10,
-            15,
-            message[schedule[8]],
-            message[schedule[9]],
-        );
-        g(
-            state,
-            1,
-            6,
-            11,
-            12,
-            message[schedule[10]],
-            message[schedule[11]],
-        );
-        g(
-            state,
-            2,
-            7,
-            8,
-            13,
-            message[schedule[12]],
-            message[schedule[13]],
-        );
-        g(
-            state,
-            3,
-            4,
-            9,
-            14,
-            message[schedule[14]],
-            message[schedule[15]],
-        );
-    }
-
-    fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
-        state[a] = state[a].wrapping_add(state[b]).wrapping_add(x);
-        state[d] = (state[d] ^ state[a]).rotate_right(16);
-        state[c] = state[c].wrapping_add(state[d]);
-        state[b] = (state[b] ^ state[c]).rotate_right(12);
-        state[a] = state[a].wrapping_add(state[b]).wrapping_add(y);
-        state[d] = (state[d] ^ state[a]).rotate_right(8);
-        state[c] = state[c].wrapping_add(state[d]);
-        state[b] = (state[b] ^ state[c]).rotate_right(7);
-    }
-}
-
 mod direct;
+mod raw_blake3;
 
 #[cfg(test)]
 mod tests;

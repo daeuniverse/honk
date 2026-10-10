@@ -59,6 +59,8 @@ pub(crate) struct PreparedQuery {
     domain: Arc<str>,
     qtype: u16,
     plan: RequestPlan,
+    #[cfg(feature = "native-api")]
+    request_source: super::outcome::RouteSource,
 }
 
 pub(crate) struct ParsedQuery {
@@ -122,7 +124,7 @@ impl DnsEngine {
         ingress: IngressProfile,
     ) -> Result<PreparedQuery, EngineError> {
         let parsed = Self::parse_query(raw_query, ingress)?;
-        self.prepare_parsed(parsed, metadata, false)
+        self.prepare_parsed(parsed, metadata, false, None, None)
     }
 
     pub(crate) fn parse_query(
@@ -152,6 +154,8 @@ impl DnsEngine {
         parsed: ParsedQuery,
         metadata: DnsRequestMeta,
         compatibility: bool,
+        forced: Option<&UpstreamTag>,
+        evidence: Option<&mut super::outcome::RouteSource>,
     ) -> Result<PreparedQuery, EngineError> {
         let ParsedQuery {
             query,
@@ -163,18 +167,26 @@ impl DnsEngine {
             qtype,
             metadata,
         };
-        let plan = match self.planner.plan_request(context) {
-            Err(PlanError::MissingOriginalDestination) if compatibility => {
-                RequestPlan::Exchange(RequestScope::Upstream(UpstreamTag::new("default")?))
-            }
+        let (plan, source) = match self
+            .planner
+            .plan_request_with_source(context, forced, evidence)
+        {
+            Err(PlanError::MissingOriginalDestination) if compatibility => (
+                RequestPlan::Exchange(RequestScope::Upstream(UpstreamTag::new("default")?)),
+                super::outcome::RouteSource::Default,
+            ),
             result => result?,
         };
+        #[cfg(not(feature = "native-api"))]
+        let _ = source;
         Ok(PreparedQuery {
             key_identity: KeyIdentity::new(&query, self.policy_id.clone()),
             query,
             domain,
             qtype,
             plan,
+            #[cfg(feature = "native-api")]
+            request_source: source,
         })
     }
 
@@ -278,6 +290,11 @@ impl ParsedQuery {
 }
 
 impl PreparedQuery {
+    #[cfg(feature = "native-api")]
+    pub(crate) const fn request_source(&self) -> super::outcome::RouteSource {
+        self.request_source
+    }
+
     pub(crate) const fn query(&self) -> &QueryContext {
         &self.query
     }

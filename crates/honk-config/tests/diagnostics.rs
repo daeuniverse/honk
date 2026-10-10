@@ -91,6 +91,110 @@ mod parser_warnings {
     }
 
     #[test]
+    fn misplaced_experimental_keys_are_named_by_schema_name_only() {
+        let native = "native API setting belongs inside native_api { }";
+        let unknown = "unknown experimental setting";
+        let nfqueue = "unknown NFQUEUE setting; only enabled is supported";
+        for (input, code, setting, message) in [
+            (
+                "experimental {\n config_write: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.config_write",
+                native,
+            ),
+            (
+                "experimental {\n record_logs: false\n}\n",
+                "unknown-experimental-setting",
+                "experimental.record_logs",
+                native,
+            ),
+            (
+                "experimental {\n external_ui: PRIVATE_UI\n}\n",
+                "unknown-experimental-setting",
+                "experimental.external_ui",
+                "clash API setting belongs inside clash_api { }",
+            ),
+            (
+                "experimental {\n store_dns: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.store_dns",
+                "cache file setting belongs inside cache_file { }",
+            ),
+            (
+                "experimental {\n secret: PRIVATE_SECRET\n}\n",
+                "unknown-experimental-setting",
+                "experimental.secret",
+                unknown,
+            ),
+            (
+                "experimental {\n enabled: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.enabled",
+                unknown,
+            ),
+            (
+                "experimental {\n nfqueue_enable: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.nfqueue_enable",
+                unknown,
+            ),
+            (
+                "experimental {\n PRIVATE_KEY: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental",
+                unknown,
+            ),
+            (
+                "experimental {\n PRIVATE_BLOCK {\n }\n}\n",
+                "unknown-experimental-setting",
+                "experimental",
+                unknown,
+            ),
+            (
+                "experimental {\n native_api {\n external_ui: PRIVATE_UI\n }\n}\n",
+                "unknown-native-api-setting",
+                "experimental.native_api.external_ui",
+                "unknown native API setting",
+            ),
+            (
+                "experimental {\n native_api {\n PRIVATE_KEY: true\n }\n}\n",
+                "unknown-native-api-setting",
+                "experimental.native_api",
+                "unknown native API setting",
+            ),
+            (
+                "experimental {\n udp_nfqueue {\n nfqueue_enable: true\n }\n}\n",
+                "unknown-nfqueue-setting",
+                "experimental.udp_nfqueue.nfqueue_enable",
+                nfqueue,
+            ),
+            (
+                "experimental {\n udp_nfqueue {\n PRIVATE_KEY: true\n }\n}\n",
+                "unknown-nfqueue-setting",
+                "experimental.udp_nfqueue",
+                nfqueue,
+            ),
+        ] {
+            let mut detailed = Vec::new();
+            let error = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+                input,
+                &mut detailed,
+            )
+            .unwrap_err();
+            assert_eq!(
+                (
+                    error.diagnostic.code,
+                    error.diagnostic.setting.to_string().as_str(),
+                    error.diagnostic.message,
+                ),
+                (code, setting, message),
+                "{input}"
+            );
+            assert!(!format!("{error:?} {detailed:?}").contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
     fn removed_settings_retain_safe_migration_causes() {
         for (input, path, code, replacement) in [
             (
@@ -267,6 +371,113 @@ mod config_loaders {
             assert_eq!(diagnostics.len(), 2, "{extension}: {diagnostics:?}");
             assert!(!format!("{:?}", &diagnostics[1..]).contains("secret"));
         }
+    }
+
+    #[test]
+    fn structured_loaders_ignore_removed_native_destination_keys_with_warnings() {
+        let root = serde_json::json!({"experimental": {"native_api": {
+            "record_flows": false,
+            "probe_allowed_cidrs": {"PRIVATE": false},
+            "probe_allowed_ports": [0, 65536, "PRIVATE"]
+        }}});
+        for (extension, text) in [
+            ("json", serde_json::to_string(&root).unwrap()),
+            ("yaml", serde_yaml::to_string(&root).unwrap()),
+            ("toml", toml::to_string(&root).unwrap()),
+            ("dae", serde_json::to_string(&root).unwrap()),
+        ] {
+            let file = tempfile::Builder::new()
+                .suffix(&format!(".{extension}"))
+                .tempfile()
+                .unwrap();
+            std::fs::write(file.path(), text).unwrap();
+            let mut diagnostics = Vec::new();
+            let config = Config::from_file_with_detailed_diagnostics(
+                file.path().to_str().unwrap(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(!config.experimental.native_api.record_flows);
+            assert_eq!(diagnostics.len(), 2, "{extension}: {diagnostics:?}");
+            for key in ["probe_allowed_cidrs", "probe_allowed_ports"] {
+                let notice = diagnostics
+                    .iter()
+                    .find(|notice| {
+                        notice.setting.to_string() == format!("experimental.native_api.{key}")
+                    })
+                    .unwrap();
+                assert_eq!(notice.code, "legacy-config-warning");
+                assert_eq!(notice.severity, honk_config::diagnostic::Severity::Warning);
+                assert!(
+                    notice.message.contains("removed") && notice.message.contains("can be deleted")
+                );
+                assert!(!serde_json::to_string(&config).unwrap().contains(key));
+            }
+            assert!(!format!("{diagnostics:?}").contains("PRIVATE"));
+        }
+        let invalid = r#"{"experimental":{"native_api":{"record_flows":"PRIVATE"}}}"#;
+        let error =
+            Config::from_json_str_with_detailed_diagnostics(invalid, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.diagnostic.setting.to_string(), "experimental");
+        let input = r#"{"experimental":{"native_api":{"probe_allowed_cidrs":null,"probe_allowed_ports":null}}}"#;
+        let mut diagnostics = Vec::new();
+        Config::from_json_str_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            Config::from_json_str(r#"{"experimental":{"native_api":{"probe_allowed_port":[]}}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_cache_file_keys_warn_in_dae_and_structured_input() {
+        let dae = "experimental { cache_file { enabled: true\n path: 'cache.db' }\n cache_file { cache_id: 'gw' } }\n";
+        let mut diagnostics = Vec::new();
+        honk_config::parser::parse_dae_config_with_detailed_diagnostics(dae, &mut diagnostics)
+            .unwrap();
+        let warned = |diagnostics: &[honk_config::diagnostic::DetailedDiagnostic]| {
+            diagnostics
+                .iter()
+                .filter(|d| d.code == "legacy-cache-file")
+                .map(|d| d.setting.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            warned(&diagnostics),
+            [
+                "experimental.cache_file.path",
+                "experimental.cache_file.cache_id"
+            ]
+        );
+
+        let file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "[experimental.cache_file]\nenabled = true\npath = \"cache.db\"\ncache_id = \"gw\"\n",
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let config = Config::from_file_with_detailed_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            warned(&diagnostics),
+            [
+                "experimental.cache_file.path",
+                "experimental.cache_file.cache_id"
+            ]
+        );
+        assert_eq!(
+            config.experimental.cache_file.legacy_cache_file(),
+            (Some("cache.db"), Some("gw"))
+        );
+        let serialized = serde_json::to_value(&config.experimental.cache_file).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!({"enabled": true, "store_dns": false})
+        );
     }
 
     #[test]
@@ -545,6 +756,127 @@ mod detailed_diagnostics {
     }
 
     #[test]
+    fn legacy_fallbacks_name_the_field_and_expected_form_but_not_the_value() {
+        let sources = DiagnosticSources::new(None);
+        let validation = |text: &str| honk_config::ConfigError::Validation(text.into());
+        for (original, setting, message) in [
+            (
+                validation("global.dial_mode PRIVATE"),
+                "global.dial_mode",
+                "expected ip, domain, domain+, or domain++",
+            ),
+            (
+                validation("global.data_dir PRIVATE"),
+                "global.data_dir",
+                "expected a non-empty absolute path",
+            ),
+            (
+                validation("global.check_interval PRIVATE"),
+                "global.check_interval",
+                "expected a positive duration",
+            ),
+            (
+                validation("global.tproxy_mark PRIVATE"),
+                "global.tproxy_mark",
+                "expected the compiled datapath mark",
+            ),
+            (
+                validation("global.so_mark_from_dae PRIVATE"),
+                "global.so_mark_from_dae",
+                "expected a mark clear of datapath-reserved and TPROXY bits",
+            ),
+            (
+                validation("invalid dns.bind \"PRIVATE\": invalid host"),
+                "dns.bind",
+                "expected IP:port or a udp://, tcp:// or tcp+udp:// host:port",
+            ),
+            (
+                honk_config::ConfigError::UnknownProtocol("PRIVATE".into()),
+                "nodes.protocol",
+                "unknown node protocol; expected ss, trojan, vmess, vless, socks5, hysteria2, tuic, juicity, anytls, direct or block",
+            ),
+            (
+                honk_config::ConfigError::UnsupportedPolicy("PRIVATE".into()),
+                "groups.policy",
+                "unsupported group policy; expected selector, urltest, loadbalance, fallback or score",
+            ),
+            (
+                honk_config::ConfigError::Parse("PRIVATE".into()),
+                "config",
+                "invalid configuration",
+            ),
+        ] {
+            let error = DetailedConfigError::from_legacy(original, sources.root());
+            assert_eq!(
+                (
+                    error.diagnostic.setting.to_string().as_str(),
+                    error.diagnostic.message
+                ),
+                (setting, message)
+            );
+            assert!(!format!("{error:?} {error}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn parser_errors_name_the_entry_being_read() {
+        for (input, code, setting) in [
+            (
+                "group {\n PRIVATE_GROUP {\n  policy: honk\n }\n}\n",
+                "unsupported-policy",
+                "groups[1].policy",
+            ),
+            (
+                "group {\n first {\n  policy: selector\n }\n PRIVATE_GROUP {\n  icon: PRIVATE\n }\n}\n",
+                "invalid-config-value",
+                "groups[2].icon",
+            ),
+            (
+                "node {\n first: 'socks5://192.0.2.1:1080'\n PRIVATE: 'ssr://PRIVATE@192.0.2.2:1'\n}\n",
+                "unknown-protocol",
+                "nodes[2].protocol",
+            ),
+            ("routing {\n PRIVATE)\n}\n", "config-parse", "routing"),
+        ] {
+            let error = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+                input,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                (error.diagnostic.code, error.diagnostic.setting.to_string()),
+                (code, setting.to_owned()),
+                "{input}"
+            );
+            assert!(!format!("{error:?}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn ignored_blocks_and_dns_keys_list_the_valid_names() {
+        let mut diagnostics = Vec::new();
+        honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+            "PRIVATE_BLOCK {\n}\ndns {\n PRIVATE_KEY: 1\n PRIVATE_STATEMENT\n}\n",
+            &mut diagnostics,
+        )
+        .unwrap();
+        let message = |code: &str| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("{code}: {diagnostics:?}"))
+                .message
+        };
+        let block = message("unknown-block");
+        for root in honk_config::parser::cursor::Root::ALL {
+            assert!(block.contains(root.name()), "{block}");
+        }
+        assert!(message("unknown-key").contains("max_cache_size"));
+        assert!(message("unknown-statement").contains("fixed_domain_ttl"));
+        assert!(!format!("{diagnostics:?}").contains("PRIVATE"));
+    }
+
+    #[test]
     fn source_metadata_retains_include_ancestry_without_input() {
         let sources = DiagnosticSources::new(Some("entry.dae".into()));
         let child = sources.add(Some("child.dae".into()), Some(0));
@@ -724,7 +1056,7 @@ mod detailed_diagnostics {
             assert_eq!(error.diagnostic.code, "unknown-protocol");
             assert_eq!(error.diagnostic.line, Some(if included { 3 } else { 4 }));
             assert_eq!(error.diagnostic.entry_index, Some(3));
-            assert_eq!(error.diagnostic.setting.to_string(), "nodes[3]");
+            assert_eq!(error.diagnostic.setting.to_string(), "nodes[3].protocol");
             let source_text = if included {
                 format!("node {{\n{remaining}}}\n")
             } else {
@@ -766,44 +1098,6 @@ mod structured_warnings {
         diagnostic::{DiagnosticSources, SafeValue},
     };
     use serde::de::DeserializeSeed;
-
-    #[test]
-    fn ineffective_group_option_is_safe_data_for_structured_formats() {
-        let mut config = Config::default();
-        config.groups.push(honk_config::node::Group {
-            name: "PRIVATE_GROUP".into(),
-            interrupt_connections: true,
-            ..Default::default()
-        });
-        let mut constructed = Vec::new();
-        let source = DiagnosticSources::new(None).root();
-        config.append_diagnostics(source.clone(), &mut constructed);
-        config.append_diagnostics(source, &mut constructed);
-        assert_eq!(constructed.len(), 1);
-        assert_eq!(constructed[0].code, "ineffective-option");
-        for (extension, body) in [
-            ("json", serde_json::to_string(&config).unwrap()),
-            ("yaml", serde_yaml::to_string(&config).unwrap()),
-            ("toml", toml::to_string(&config).unwrap()),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join(format!("config.{extension}"));
-            std::fs::write(&path, body).unwrap();
-            let mut diagnostics = Vec::new();
-            Config::from_file_with_detailed_diagnostics(path.to_str().unwrap(), &mut diagnostics)
-                .unwrap();
-            let warning = diagnostics
-                .iter()
-                .find(|d| d.code == "ineffective-option")
-                .unwrap();
-            assert_eq!(
-                warning.setting.to_string(),
-                "groups[1].interrupt_connections"
-            );
-            assert_eq!(warning.entry_index, Some(1));
-            assert!(!format!("{diagnostics:?}").contains("PRIVATE_GROUP"));
-        }
-    }
 
     #[test]
     fn api_exposure_warning_covers_custom_binds_without_values() {
@@ -894,27 +1188,6 @@ mod structured_warnings {
     }
 
     #[test]
-    fn group_warning_survives_later_structured_node_failure() {
-        let input = r#"{
-        "groups": [
-            {
-                "name": "g",
-                "interrupt_connections": true
-            }
-        ],
-        "nodes": [{}]
-    }"#;
-        let mut diagnostics = Vec::new();
-        assert!(Config::from_json_str_with_detailed_diagnostics(input, &mut diagnostics).is_err());
-        assert_warning_precedes_terminal(&diagnostics, "ineffective-option");
-        assert_eq!(
-            diagnostics[0].setting.to_string(),
-            "groups[1].interrupt_connections"
-        );
-        assert_eq!(diagnostics[0].entry_index, Some(1));
-    }
-
-    #[test]
     fn api_warning_survives_later_structured_node_failure() {
         let input = r#"{
         "experimental": {
@@ -933,22 +1206,5 @@ mod structured_warnings {
         );
         let rendered = format!("{diagnostics:?}");
         assert!(!rendered.contains("0.0.0.0:9090"));
-    }
-
-    #[test]
-    fn group_warning_survives_later_sequence_subscription_failure() {
-        let input = serde_json::json!([
-            {},
-            {},
-            {},
-            [],
-            [{"name": "g", "interrupt_connections": true}],
-            [{}],
-            {}
-        ])
-        .to_string();
-        let mut diagnostics = Vec::new();
-        assert!(Config::from_json_str_with_detailed_diagnostics(&input, &mut diagnostics).is_err());
-        assert_warning_precedes_terminal(&diagnostics, "ineffective-option");
     }
 }

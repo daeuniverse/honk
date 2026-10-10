@@ -115,7 +115,7 @@ async fn overflow_flush_progress_resets_stall_age() {
 }
 
 /// Below the emergency hard cap admission always parks, however stale the
-/// stream; only the watchdog reaps on stall age.
+/// stream: only a tripped cap ever reaps on stall age.
 #[tokio::test(start_paused = true)]
 async fn overflow_admit_below_hard_cap_never_kills() {
     let mut overflow = OverflowState::default();
@@ -159,7 +159,6 @@ async fn overflow_admit_hard_cap_reaps_past_grace_stream() {
         panic!("past-grace stream at the hard cap must be reaped")
     };
     assert_eq!(victim.sid, 1);
-    assert_eq!(victim.limit, OverflowLimit::SessionFrames);
     assert!(victim.stalled_for >= OVERFLOW_STALL_GRACE);
     assert!(!overflow.has(1));
 

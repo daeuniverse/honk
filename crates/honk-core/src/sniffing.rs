@@ -41,14 +41,12 @@ use tracing::debug;
 /// This is a hard bound: untrusted length fields never grow the buffer.
 const MAX_CLIENT_HELLO_SIZE: usize = 4096;
 
-/// Supported traffic types detected by sniffing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Supported traffic types detected by sniffing; the domain lives in
+/// [`SniffResult::domain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficType {
-    /// TLS traffic with optional SNI hostname
-    Tls { sni: Option<String> },
-    /// HTTP traffic with host header
-    Http { host: Option<String> },
-    /// Unknown traffic type
+    Tls,
+    Http,
     Unknown,
 }
 
@@ -76,9 +74,7 @@ impl SniffResult {
     /// Create a result with a domain extracted from TLS SNI.
     pub fn tls_sni(domain: String, buffered: Vec<u8>) -> Self {
         Self {
-            traffic_type: TrafficType::Tls {
-                sni: Some(domain.clone()),
-            },
+            traffic_type: TrafficType::Tls,
             domain: Some(domain),
             buffered,
         }
@@ -132,9 +128,7 @@ pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
     }
     if let Some(host) = parse_http_host(&data) {
         return SniffResult {
-            traffic_type: TrafficType::Http {
-                host: Some(host.clone()),
-            },
+            traffic_type: TrafficType::Http,
             domain: Some(host),
             buffered: data,
         };
@@ -413,9 +407,12 @@ fn parse_http_host(data: &[u8]) -> Option<String> {
     }
 
     for line in text.lines() {
-        let lower = line.trim().to_lowercase();
-        if lower.starts_with("host:") {
-            let host = line.trim()["host:".len()..].trim();
+        let line = line.trim();
+        if line
+            .get(.."host:".len())
+            .is_some_and(|name| name.eq_ignore_ascii_case("host:"))
+        {
+            let host = line["host:".len()..].trim();
             let host = host.split(':').next().unwrap_or(host);
             if !host.is_empty() && is_valid_hostname(host) {
                 return Some(host.to_lowercase());
@@ -609,12 +606,7 @@ mod tests {
         writer.await.unwrap();
 
         assert_eq!(result.domain.as_deref(), Some("fragmented.example.com"));
-        assert_eq!(
-            result.traffic_type,
-            TrafficType::Http {
-                host: Some("fragmented.example.com".to_string())
-            }
-        );
+        assert_eq!(result.traffic_type, TrafficType::Http);
         assert_eq!(result.buffered, request);
     }
 

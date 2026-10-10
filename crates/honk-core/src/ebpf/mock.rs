@@ -54,6 +54,11 @@ pub struct MockEbpfBackend {
     descriptor: RoutingPolicyDescriptor,
     next_generation: u64,
     next_domain_map_id: u32,
+    next_trace_policy: u32,
+    #[cfg(feature = "native-api")]
+    trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
+    pub route_witnesses: HashMap<u32, KernelRouteWitness>,
+    next_trace_id: u32,
     /// TCP connection states (TuplesKey → ConnState)
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
@@ -76,10 +81,15 @@ pub struct MockEbpfBackend {
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
+    listener_socket_slots: HashMap<u32, std::os::fd::RawFd>,
+    #[cfg(test)]
+    pub listener_clear_fault_at: Option<u32>,
     /// Every mode-policy write, shared so tests can inspect boxed backends.
     pub datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
     pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub dynamic_attach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    pub dynamic_attach_fault: bool,
     pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     #[cfg(feature = "reload-bench-counters")]
@@ -106,12 +116,35 @@ pub struct MockEbpfBackend {
     datapath_flags_write_origin: DatapathFlagsWriteOrigin,
     #[cfg(test)]
     datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
+    #[cfg(test)]
+    pub datapath_observation_fixture: Option<super::DatapathObservation>,
+    #[cfg(test)]
+    pub pname_support: super::PnameSupport,
 }
 
 impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn capture_route_witness(&mut self, mut witness: KernelRouteWitness) -> u32 {
+        if witness.output.flags & ROUTE_TRACE_ENABLED == 0 {
+            return 0;
+        }
+        if self.next_trace_id >= ROUTE_TRACE_LOST - 1 {
+            return ROUTE_TRACE_LOST;
+        }
+        self.next_trace_id += 1;
+        let id = self.next_trace_id;
+        witness.capture_id = id;
+        if self.route_witnesses.len() >= ROUTE_TRACE_CAPACITY as usize
+            && let Some(oldest) = self.route_witnesses.keys().min().copied()
+        {
+            self.route_witnesses.remove(&oldest);
+        }
+        self.route_witnesses.insert(id, witness);
+        id
     }
 
     #[cfg(feature = "reload-bench-counters")]
@@ -379,6 +412,19 @@ impl MockEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for MockEbpfBackend {
+    fn observe_datapath(&self) -> super::DatapathObservation {
+        #[cfg(test)]
+        if let Some(observation) = &self.datapath_observation_fixture {
+            return observation.clone();
+        }
+        super::DatapathObservation::unknown(super::DatapathKind::Mock)
+    }
+
+    #[cfg(test)]
+    fn pname_support(&self) -> super::PnameSupport {
+        self.pname_support
+    }
+
     fn inject_routing_fault(
         &mut self,
         phase: RoutingPushPhase,
@@ -441,12 +487,36 @@ impl EbpfBackend for MockEbpfBackend {
     }
     fn publish_listener_sockets(
         &mut self,
-        _tcp4_fd: std::os::fd::RawFd,
-        _tcp6_fd: std::os::fd::RawFd,
-        _udp4_fds: &[std::os::fd::RawFd],
-        _udp6_fds: &[std::os::fd::RawFd],
+        tcp4_fd: std::os::fd::RawFd,
+        tcp6_fd: std::os::fd::RawFd,
+        udp4_fds: &[std::os::fd::RawFd],
+        udp6_fds: &[std::os::fd::RawFd],
     ) -> anyhow::Result<()> {
+        self.listener_socket_slots.insert(0, tcp4_fd);
+        self.listener_socket_slots.insert(1, tcp6_fd);
+        for (base, fds) in [(2, udp4_fds), (6, udp6_fds)] {
+            for (offset, fd) in fds.iter().enumerate() {
+                self.listener_socket_slots.insert(base + offset as u32, *fd);
+            }
+        }
         self.listener_sockets_published = true;
+        Ok(())
+    }
+
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.datapath_ready,
+            "datapath admission must be closed before clearing listeners"
+        );
+        self.listener_sockets_published = false;
+        for key in 0..10 {
+            #[cfg(test)]
+            if self.listener_clear_fault_at == Some(key) {
+                self.listener_clear_fault_at = None;
+                anyhow::bail!("injected listener clear failure");
+            }
+            self.listener_socket_slots.remove(&key);
+        }
         Ok(())
     }
 
@@ -540,6 +610,15 @@ impl EbpfBackend for MockEbpfBackend {
                 "mock UDP staging quiescence rejected {token}: {result:?}"
             );
         }
+        if self.routing_generation.is_some() {
+            let generation = self
+                .next_generation
+                .checked_add(1)
+                .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
+                .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+            self.next_generation = generation;
+            self.descriptor.generation = generation;
+        }
         Ok(())
     }
 
@@ -562,6 +641,12 @@ impl EbpfBackend for MockEbpfBackend {
             self.active_slot
         );
         let slot = self.active_slot ^ 1;
+        let trace_policy = if plan.trace_enabled() {
+            self.next_trace_policy = self.next_trace_policy.saturating_add(1);
+            self.next_trace_policy
+        } else {
+            0
+        };
         self.take_routing_fault(RoutingPushPhase::DomainRouting)?;
         let domain: HashMap<_, _> = learned_domains
             .iter()
@@ -598,7 +683,7 @@ impl EbpfBackend for MockEbpfBackend {
             features: plan.features,
             generation,
             domain_map_id,
-            reserved: 0,
+            trace_policy,
         };
         self.next_generation = generation;
         self.next_domain_map_id = domain_map_id;
@@ -904,6 +989,39 @@ impl EbpfBackend for MockEbpfBackend {
             .remove(&Self::tuples_key_bytes(key)))
     }
 
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries.bind(
+                self.descriptor.trace_policy,
+                owner.fingerprint,
+                dictionary,
+            );
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        key: &TuplesKey,
+        reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
+        if reference.trace_id == 0 {
+            return Err("kernel_trace_not_captured");
+        }
+        if reference.trace_id == ROUTE_TRACE_LOST {
+            return Err("kernel_trace_lost");
+        }
+        let witness = self
+            .route_witnesses
+            .get(&reference.trace_id)
+            .ok_or("kernel_trace_sidecar_missing")?;
+        self.trace_dictionaries.capture(witness, key, reference)
+    }
+
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>> {
         Ok(self.cookie_pids.get(&cookie).copied())
     }
@@ -1109,6 +1227,11 @@ impl EbpfBackend for MockEbpfBackend {
         _role: super::IfaceRole,
         _single_homed: bool,
     ) -> anyhow::Result<super::DynamicHooks> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.dynamic_attach_fault,
+            "injected dynamic attach failure"
+        );
         self.dynamic_attach_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(super::DynamicHooks {
@@ -1125,12 +1248,14 @@ impl EbpfBackend for MockEbpfBackend {
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.datapath_ready = false;
         self.listener_sockets_published = false;
+        self.listener_socket_slots.clear();
         self.routing_generation = None;
         self.descriptor = RoutingPolicyDescriptor::default();
         self.tcp_conn_states.clear();
         self.udp_conn_states.clear();
         self.redirect_tracks.clear();
         self.routing_handoffs.get_mut().clear();
+        self.route_witnesses.clear();
         self.cookie_pids.clear();
         self.outbound_alive.clear();
         self.bpf_stats.clear();
@@ -1245,6 +1370,35 @@ mod tests {
         assert!(backend.datapath_ready);
         backend.set_datapath_ready(false).unwrap();
         assert!(!backend.datapath_ready);
+    }
+
+    #[test]
+    fn listener_clear_rejects_live_admission_and_fences_partial_failure() {
+        let mut backend = MockEbpfBackend::new();
+        backend
+            .publish_listener_sockets(10, 11, &[12, 13, 14, 15], &[16, 17, 18, 19])
+            .unwrap();
+        backend.set_datapath_ready(true).unwrap();
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(backend.listener_sockets_published);
+        assert_eq!(backend.listener_socket_slots.len(), 10);
+        backend.set_datapath_ready(false).unwrap();
+        backend.listener_clear_fault_at = Some(4);
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(!backend.listener_sockets_published);
+        assert!(!backend.datapath_ready);
+        assert!(!backend.listener_socket_slots.contains_key(&3));
+        assert_eq!(backend.listener_socket_slots.get(&4), Some(&14));
+        assert!(backend.set_datapath_ready(true).is_err());
+        backend.clear_listener_sockets().unwrap();
+        assert!(backend.listener_socket_slots.is_empty());
+        assert!(backend.set_datapath_ready(true).is_err());
+        backend
+            .publish_listener_sockets(20, 21, &[22, 23, 24, 25], &[])
+            .unwrap();
+        assert_eq!(backend.listener_socket_slots.len(), 6);
+        assert!(!backend.listener_socket_slots.contains_key(&6));
+        backend.set_datapath_ready(true).unwrap();
     }
 
     fn decision_test_key() -> TuplesKey {
@@ -1877,6 +2031,7 @@ mod tests {
                 ..Default::default()
             },
             routing_generation: 0,
+            ..Default::default()
         };
         backend
             .routing_handoffs
@@ -1956,6 +2111,23 @@ mod tests {
         assert_eq!(backend.get_bpf_stats(1).unwrap(), Some(250));
         assert_eq!(backend.get_bpf_stats(99).unwrap(), Some(999));
         assert!(backend.get_bpf_stats(50).unwrap().is_none());
+    }
+
+    #[test]
+    fn trace_capture_exhaustion_and_cleanup_never_reuse_ids() {
+        let mut backend = MockEbpfBackend::new();
+        let mut witness = KernelRouteWitness::default();
+        assert_eq!(backend.capture_route_witness(witness), 0);
+        witness.output.flags = ROUTE_TRACE_ENABLED;
+        let first = backend.capture_route_witness(witness);
+        futures::executor::block_on(backend.cleanup()).unwrap();
+        assert!(backend.capture_route_witness(witness) > first);
+        backend.next_trace_id = ROUTE_TRACE_LOST - 2;
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST - 1);
+        backend.route_witnesses.clear();
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST);
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST);
+        assert!(backend.route_witnesses.is_empty());
     }
 
     #[test]

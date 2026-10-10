@@ -5,6 +5,7 @@
 //! The primary configuration format is the original dae syntax
 //! (`global { ... } node { ... } routing { ... }`), parsed by [`parser`].
 
+pub mod assets;
 pub mod check;
 pub mod config;
 pub mod diagnostic;

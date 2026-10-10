@@ -354,7 +354,7 @@ async fn socket_closed(tcp: &mut TcpStream) {
 }
 
 fn physical_gate() -> OutboundRuntimeRegistry {
-    OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None)
+    OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)
         .unwrap()
         .0
 }

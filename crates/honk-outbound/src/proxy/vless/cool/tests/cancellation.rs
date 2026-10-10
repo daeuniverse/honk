@@ -514,7 +514,6 @@ async fn cancelled_tcp_write_does_not_send_or_replay_bytes() {
     tokio::task::yield_now().await;
     assert!(gate.waker.lock().is_some());
     for id in 2..=WRITER_QUEUE_CAPACITY as u16 + 1 {
-        let (done, _wait) = oneshot::channel();
         assert!(
             session
                 .writer
@@ -522,7 +521,7 @@ async fn cancelled_tcp_write_does_not_send_or_replay_bytes() {
                 .try_send(WriterCommand {
                     frame: end_frame(id),
                     flush: false,
-                    done,
+                    done: None,
                 })
                 .is_ok()
         );

@@ -322,7 +322,13 @@ fn selector_applies_its_chosen_subgroup_when_committed_peek_is_empty() {
         .begin()
         .unwrap()
         .finish(ScoreOutcome::Cancelled);
-    manager.set_selector_choice("choice", &nodes[1].name);
+    manager
+        .set_selector_choice(
+            "choice",
+            &nodes[1].name,
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     assert!(
         manager
             .get_score_selection_for_network("score", SelectionNetwork::Tcp)
@@ -380,7 +386,13 @@ fn representative_reconciliation_preserves_a_health_filtered_direct_leaf() {
         BTreeSet::from([nodes[0].id, nodes[1].id])
     );
     alive.report_unavailable_forced(nodes[0].id, ProbeDomain::Tcp, IpVersion::V4);
-    manager.set_selector_choice("choice", &nodes[2].name);
+    manager
+        .set_selector_choice(
+            "choice",
+            &nodes[2].name,
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let changed = manager.selection_plan_for_target("score", &target);
     assert_eq!(changed.entries[0].node.id, nodes[2].id);
     assert_eq!(
@@ -474,7 +486,13 @@ fn duplicate_group_uuids_do_not_alias_serving_slots() {
     let pending = manager.selection_plan_for_target("score", &target);
     let before = committed_ids(&manager, "score", &nodes);
     assert_eq!(before, nodes[..3].iter().map(|node| node.id).collect());
-    manager.set_selector_choice("outside", &nodes[7].name);
+    manager
+        .set_selector_choice(
+            "outside",
+            &nodes[7].name,
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     drop(manager.selection_plan_for_target("score", &target));
     assert_eq!(committed_ids(&manager, "score", &nodes), before);
     pending.entries[0]
@@ -578,7 +596,13 @@ fn withdrawn_children_are_replaced(change_choice: bool) {
                 alive.report_unavailable_forced(unavailable.id, domain, IpVersion::V4);
             }
             if change_choice {
-                manager.set_selector_choice(&format!("child-{index}"), &unavailable.name);
+                manager
+                    .set_selector_choice(
+                        &format!("child-{index}"),
+                        &unavailable.name,
+                        crate::group::SelectorNetworks::Both,
+                    )
+                    .unwrap();
                 assert!(manager.is_node_selectable_for_domain(
                     pair[0].id,
                     ProbeDomain::DataUdp,

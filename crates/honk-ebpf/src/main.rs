@@ -16,6 +16,7 @@ pub mod ingress;
 pub mod log_shim;
 pub mod maps;
 pub mod process_name;
+mod receive_trace;
 pub mod route;
 pub mod routing;
 pub mod sk;

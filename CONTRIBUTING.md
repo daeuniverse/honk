@@ -23,7 +23,7 @@ The following carry honk's core invariants — generation ownership, lock orderi
 - `crates/honk-ebpf-common/` (shared kernel/userspace ABI, aya `Pod` implementations)
 - `crates/honk-core/src/control/reload/` (transaction, fingerprints, retention decisions)
 - `crates/honk-core/src/control/routing_matcher.rs` and the eBPF publication pipeline
-- Lock acquisition order across `config`, `router`, `ebpf`, `group_manager`, `outbound_id_map`, `active_routing_plan`, `runtime_registry`, `reload_lock`
+- Lock acquisition order across `config`, `router`, `datapath_flags` publication, `ebpf`, `group_manager`, `outbound_id_map`, `active_routing_plan`, `runtime_registry`, `reload_lock` (the actual publication sequence is documented in [`doc/en/design/control-plane.md`](doc/en/design/control-plane.md#reload-and-runtime-generations))
 - `unsafe` code anywhere in the repository
 - Failure/replay/degradation paths (datapath health, drain, NFQUEUE fencing)
 

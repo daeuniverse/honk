@@ -24,6 +24,7 @@ use network_types::{
 ///   offset 30: padding: [u8; 2]
 ///   offset 32: pname: [u8; TASK_COMM_LEN] (process name)
 ///   offset 48: pid: u32
+///   offset 52: trace_id: u32 (immutable route witness, independent of decision_token)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnState {
@@ -36,6 +37,7 @@ pub struct ConnState {
     pub padding: [u8; 2],
     pub pname: [u8; TASK_COMM_LEN],
     pub pid: u32,
+    pub trace_id: u32,
 }
 
 const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 56);
@@ -51,6 +53,7 @@ const _CONN_STATE_MAC_OFFSET: () = assert!(core::mem::offset_of!(ConnState, mac)
 const _CONN_STATE_PADDING_OFFSET: () = assert!(core::mem::offset_of!(ConnState, padding) == 30);
 const _CONN_STATE_PNAME_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pname) == 32);
 const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid) == 48);
+const _: () = assert!(core::mem::offset_of!(ConnState, trace_id) == 52);
 
 // Matches the C enum bpf_stats_key.
 // The C enum's underlying type defaults to int (32-bit); use u32 for compatibility.
@@ -180,7 +183,11 @@ pub struct ConntrackArgs {
     pub mac: [u8; 6],
     pub padding: [u8; 2],
     pub pname: [u8; TASK_COMM_LEN],
+    pub trace_id: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 40);
+const _: () = assert!(core::mem::offset_of!(ConntrackArgs, trace_id) == 36);
 
 impl ConntrackArgs {
     #[inline(always)]

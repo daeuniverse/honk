@@ -142,7 +142,8 @@ struct FrameSendFailure {
 struct WriterCommand {
     frame: Bytes,
     flush: bool,
-    done: oneshot::Sender<Result<(), FrameSendFailure>>,
+    /// `None` when nobody awaits the write; failures still reach the session.
+    done: Option<oneshot::Sender<Result<(), FrameSendFailure>>>,
 }
 
 #[derive(Clone)]
@@ -198,7 +199,11 @@ impl CarrierWriter {
         if let Some(admitted) = admitted {
             admitted.store(true, Ordering::Release);
         }
-        permit.send(WriterCommand { frame, flush, done });
+        permit.send(WriterCommand {
+            frame,
+            flush,
+            done: Some(done),
+        });
         wait.await.unwrap_or_else(|_| {
             Err(FrameSendFailure {
                 failure: self
@@ -276,6 +281,7 @@ pub struct VlessCoolSession {
     children: Mutex<HashMap<u16, ChildSink>>,
     ending_ids: Mutex<HashSet<u16>>,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    task_scope: crate::runtime::TaskScope,
 }
 
 impl std::fmt::Debug for VlessCoolSession {
@@ -324,7 +330,8 @@ impl Drop for ChildCancellationGuard {
 }
 
 impl VlessCoolSession {
-    fn install_task(&self, task: tokio::task::AbortHandle) {
+    fn install_task(&self, task: Option<tokio::task::AbortHandle>) {
+        let Some(task) = task else { return };
         let mut tasks = self.tasks.lock();
         if self.is_closed() {
             task.abort();
@@ -345,7 +352,7 @@ impl VlessCoolSession {
                 "Mux.Cool peer referenced an unissued session ID",
             ));
         }
-        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        tokio::runtime::Handle::try_current().map_err(|error| {
             io::Error::other(format!(
                 "Mux.Cool END scheduling requires a Tokio runtime: {error}"
             ))
@@ -355,7 +362,7 @@ impl VlessCoolSession {
         }
         let session = Arc::clone(self);
         let writer = self.writer.clone();
-        runtime.spawn(async move {
+        let _ = self.task_scope.spawn(async move {
             let failure =
                 match tokio::time::timeout(WRITER_IO_TIMEOUT, writer.send(end_frame(id), true))
                     .await
@@ -743,7 +750,9 @@ async fn run_writer<W: AsyncWrite + Unpin>(
         });
         match result {
             Ok(()) => {
-                let _ = command.done.send(Ok(()));
+                if let Some(done) = command.done {
+                    let _ = done.send(Ok(()));
+                }
             }
             Err(error) => {
                 let failure = FrameSendFailure {
@@ -753,7 +762,9 @@ async fn run_writer<W: AsyncWrite + Unpin>(
                 if let Some(session) = session.upgrade() {
                     session.fail(failure.failure.clone());
                 }
-                let _ = command.done.send(Err(failure));
+                if let Some(done) = command.done {
+                    let _ = done.send(Err(failure));
+                }
                 return;
             }
         }
@@ -813,11 +824,12 @@ pub(crate) fn connect(
         ending_ids: Mutex::new(HashSet::new()),
         receive_budget: Arc::new(tokio::sync::Semaphore::new(RECEIVE_BYTE_BUDGET)),
         tasks: Mutex::new(Vec::with_capacity(2)),
+        task_scope: crate::runtime::TaskScope::capture(),
     });
-    let writer_task = tokio::spawn(run_writer(writer, rx, Arc::downgrade(&session)));
-    session.install_task(writer_task.abort_handle());
-    let reader_task = tokio::spawn(run_reader(reader, Arc::downgrade(&session)));
-    session.install_task(reader_task.abort_handle());
+    let writer_task = crate::runtime::spawn_owned(run_writer(writer, rx, Arc::downgrade(&session)));
+    session.install_task(writer_task);
+    let reader_task = crate::runtime::spawn_owned(run_reader(reader, Arc::downgrade(&session)));
+    session.install_task(reader_task);
     session
 }
 

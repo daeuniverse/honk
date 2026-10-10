@@ -15,7 +15,8 @@ use crate::{ConfigDiagnostic, ConfigError};
 pub(super) fn parse_group_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Result<Vec<Group>, ConfigError> {
+    tolerance: u64,
+) -> Result<Vec<Group>, super::ParseFailure> {
     let mut groups = Vec::new();
 
     for root in section {
@@ -33,12 +34,29 @@ pub(super) fn parse_group_section(
                 );
                 continue;
             };
-            diagnostics.begin_group_text(group_text, groups.len() + 1);
+            let index = groups.len() + 1;
+            diagnostics.begin_group_text(group_text, index);
 
             let mut group = Group {
                 name: group_text.raw().to_owned(),
                 ..Default::default()
             };
+            for child in segment.body().into_iter().flatten() {
+                if let Some(header) = read::block_header(&child)
+                    && let Some(field) =
+                        ["icon", "tolerance", "idle_timeout", "interrupt_connections"]
+                            .into_iter()
+                            .find(|field| header.raw().trim_end_matches(':').trim() == *field)
+                {
+                    return Err(group_scalar_error(
+                        header,
+                        index,
+                        field,
+                        "group scalar does not accept a nested block",
+                    )
+                    .into());
+                }
+            }
             let mut fields: HashMap<&str, Text<'_, '_>> = HashMap::new();
             for statement in
                 read::child_statements(&segment, diagnostics, super::cursor::BodySyntax::Statements)
@@ -52,7 +70,19 @@ pub(super) fn parse_group_section(
                     );
                     continue;
                 };
-                if !["filter", "policy", "final", "default", "check_url"].contains(&key.raw()) {
+                if ![
+                    "filter",
+                    "policy",
+                    "final",
+                    "default",
+                    "check_url",
+                    "icon",
+                    "tolerance",
+                    "idle_timeout",
+                    "interrupt_connections",
+                ]
+                .contains(&key.raw())
+                {
                     key.notice(
                         diagnostics,
                         Severity::Warning,
@@ -73,6 +103,9 @@ pub(super) fn parse_group_section(
             if let Some(policy) = fields.get("policy").copied() {
                 group.policy = parse_group_policy(policy, &group.name, diagnostics)?;
             }
+            if group.policy == GroupPolicy::URLTest {
+                group.tolerance = tolerance;
+            }
             if let Some(value) = fields.get("final").copied() {
                 group.final_outbound = Some(value.raw().to_owned());
             }
@@ -82,12 +115,72 @@ pub(super) fn parse_group_section(
             if let Some(value) = fields.get("check_url").copied() {
                 group.check_url = Some(value.raw().to_owned());
             }
+            if let Some(value) = fields.get("icon").copied() {
+                if !Group::valid_icon(value.raw()) {
+                    return Err(
+                        group_scalar_error(value, index, "icon", Group::INVALID_ICON).into(),
+                    );
+                }
+                group.icon = Some(value.raw().to_owned());
+            }
+            if let Some(value) = fields.get("tolerance").copied() {
+                group.own.tolerance = true;
+                group.tolerance = value.raw().parse::<u64>().map_err(|_| {
+                    group_scalar_error(
+                        value,
+                        index,
+                        "tolerance",
+                        "tolerance must be a nonnegative integer in milliseconds",
+                    )
+                })?;
+            }
+            if let Some(value) = fields.get("idle_timeout").copied() {
+                group.idle_timeout = Some(value.raw().parse::<u64>().map_err(|_| {
+                    group_scalar_error(
+                        value,
+                        index,
+                        "idle_timeout",
+                        "idle timeout must be a nonnegative integer in seconds",
+                    )
+                })?);
+            }
+            if let Some(value) = fields.get("interrupt_connections").copied() {
+                group.own.interrupt_connections = true;
+                group.interrupt_connections =
+                    super::scalars::strict_bool(value.raw()).ok_or_else(|| {
+                        group_scalar_error(
+                            value,
+                            index,
+                            "interrupt_connections",
+                            "interrupt_connections must be a boolean",
+                        )
+                    })?;
+            }
 
             groups.push(group);
         }
     }
 
     Ok(groups)
+}
+
+fn group_scalar_error(
+    value: Text<'_, '_>,
+    index: usize,
+    field: &'static str,
+    message: &'static str,
+) -> crate::error::DetailedConfigError {
+    let mut error = crate::error::DetailedConfigError::new(
+        crate::error::ErrorCategory::Validation,
+        "invalid-config-value",
+        value.source.reference(),
+        crate::diagnostic::SettingPath::new("groups")
+            .index(index)
+            .field(field),
+        message,
+    );
+    error.diagnostic.line = Some(value.source.location(value.span.start).0);
+    error
 }
 
 fn append_filter(group: &mut Group, filter: Text<'_, '_>, diagnostics: &mut ParserDiagnostics<'_>) {

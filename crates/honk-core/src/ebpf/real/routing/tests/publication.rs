@@ -329,7 +329,8 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
         true,
     )];
     let router = Router::new(&rules, "direct").unwrap();
-    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
+    let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
+    plan.enable_trace(true);
     let mut connection = golden::connection();
     connection.dst_port = 53;
     let input = input(&connection);
@@ -337,19 +338,28 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
         .await
         .unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
+    backend
+        .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED)
+        .unwrap();
     let initial = backend.routing_policy_generation();
     let decision = backend.run_routing_test(&input).unwrap().decision;
     assert_eq!(decision.outbound, 2);
     assert_eq!(decision.must, 1);
     let before = published_descriptor(&backend);
+    assert_ne!(before.trace_policy, 0);
 
     backend
-        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
+        .set_datapath_flags(
+            DATAPATH_FLAG_NFQ_ENABLED | honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED,
+        )
         .unwrap();
     backend.quiesce_udp_staging().unwrap();
     let fenced = backend.routing_policy_generation();
     assert!(fenced > initial);
     assert_eq!(backend.run_routing_test(&input).unwrap().decision, decision);
+    let fenced_trace = backend.run_routing_test(&input).unwrap().trace;
+    assert_eq!(fenced_trace.policy_id, before.trace_policy);
+    assert_eq!(fenced_trace.generation, fenced);
     assert_eq!(
         published_descriptor(&backend),
         honk_ebpf_common::RoutingPolicyDescriptor {
@@ -358,7 +368,11 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
         }
     );
     backend
-        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+        .set_datapath_flags(
+            DATAPATH_FLAG_NFQ_ENABLED
+                | DATAPATH_FLAG_NFQ_READY
+                | honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED,
+        )
         .unwrap();
 
     freeze_root(&backend);
@@ -367,13 +381,18 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     assert!(reserved > fenced);
     assert_eq!(backend.routing_policy_generation(), fenced);
     backend
-        .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
+        .set_datapath_flags(
+            DATAPATH_FLAG_NFQ_ENABLED | honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED,
+        )
         .unwrap();
     assert!(backend.quiesce_udp_staging().is_err());
     let failed_fence = backend.routing_generation_sequence.get(&0, 0).unwrap();
     assert!(failed_fence > reserved);
     assert_eq!(backend.routing_policy_generation(), fenced);
     assert_eq!(backend.run_routing_test(&input).unwrap().decision, decision);
+    let preserved_trace = backend.run_routing_test(&input).unwrap().trace;
+    assert_eq!(preserved_trace.policy_id, before.trace_policy);
+    assert_eq!(preserved_trace.generation, fenced);
     assert_eq!(
         published_descriptor(&backend),
         honk_ebpf_common::RoutingPolicyDescriptor {
@@ -388,7 +407,7 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     );
     assert_eq!(
         backend.array_get::<u32>("DATAPATH_FLAGS_MAP", 0).unwrap(),
-        Some(DATAPATH_FLAG_NFQ_ENABLED)
+        Some(DATAPATH_FLAG_NFQ_ENABLED | honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED)
     );
     drop(backend);
 

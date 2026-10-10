@@ -20,7 +20,7 @@ async fn parsed_vless_has_no_backend_without_rprx() {
 async fn assert_no_vless_backend(node: Node) {
     let generation = Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap());
     let fork = generation.fork_for_dns().unwrap();
-    let ephemeral = NodeRuntime::try_ephemeral_guarded(&node).unwrap();
+    let mut ephemeral = NodeRuntime::try_ephemeral_guarded(&node).unwrap();
     let (successor, reused) = OutboundRuntimeRegistry::build_reusing(
         std::slice::from_ref(&node),
         1,
@@ -61,7 +61,7 @@ async fn assert_no_vless_backend(node: Node) {
             .await
             .is_err()
     );
-    ephemeral.close().await;
+    ephemeral.close().await.unwrap();
     fork.shutdown().await;
     generation.shutdown().await;
     successor.shutdown().await;

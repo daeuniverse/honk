@@ -2,8 +2,6 @@ use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::warn;
-
 /// One-release projection of detailed diagnostics. Data entrypoints never log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigDiagnostic {
@@ -11,14 +9,6 @@ pub struct ConfigDiagnostic {
     /// Arbitrary values are redacted; filters retain ordinals and policies are withheld.
     pub value: String,
     pub message: String,
-}
-
-/// Log each diagnostic as a structured warning. The plain entry points call this
-/// at parse time; the daemon calls it once its subscriber is installed.
-pub fn report_diagnostics(diagnostics: &[ConfigDiagnostic]) {
-    for d in diagnostics {
-        warn!(setting = %d.setting, value = %d.value, "{}", d.message);
-    }
 }
 
 /// Metadata only: diagnostic ownership must never keep input buffers alive.
@@ -257,6 +247,8 @@ pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> Detailed
         SettingPath::new("groups").field("policy")
     } else if d.setting.starts_with("group.") && d.setting.ends_with(".filter") {
         SettingPath::new("groups").field("filter")
+    } else if d.setting.starts_with("subscription.") && d.setting.ends_with(".cache") {
+        SettingPath::new("subscriptions").field("cache")
     } else if d.setting.starts_with("subscription.") {
         SettingPath::new("subscriptions").field("interval")
     } else if d.setting.starts_with("dns.fixed_domain_ttl.") {
@@ -293,6 +285,7 @@ pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> Detailed
         "duration is not milliseconds, `ms` or `s`; keeping the default (100ms)",
         "duration is not milliseconds, `ms` or `s`; keeping the default (30ms)",
         "value is not a boolean spelling honk recognises; using fallback false",
+        "value is not a boolean; using fallback true",
         "honk could not parse this port as a decimal in 0-65535; using fallback 12345",
         "honk could not parse this port as a decimal in 0-65535; using fallback 0",
         "honk could not parse this mark as a u32; using fallback 0",
@@ -322,6 +315,86 @@ pub(crate) fn legacy_nfqueue_warning(source: SourceRef) -> DetailedDiagnostic {
     )
 }
 
+macro_rules! legacy_assets_key {
+    ($block:literal, $key:literal, $replacement:literal) => {
+        (
+            $block,
+            $key,
+            concat!(
+                "experimental.",
+                $block,
+                ".",
+                $key,
+                " is deprecated; migrate to ",
+                $replacement
+            ),
+        )
+    };
+}
+
+/// Old `experimental` download keys, the block that holds each, and the
+/// warning that names the `assets` path replacing it.
+pub(crate) const LEGACY_ASSETS_KEYS: [(&str, &str, &str); 5] = [
+    legacy_assets_key!(
+        "native_api",
+        "geosite_download_url",
+        "assets.geodata.geosite"
+    ),
+    legacy_assets_key!("native_api", "geoip_download_url", "assets.geodata.geoip"),
+    legacy_assets_key!(
+        "native_api",
+        "geodata_download_detour",
+        "assets.geodata.route"
+    ),
+    legacy_assets_key!("clash_api", "external_ui_download_url", "assets.ui.url"),
+    legacy_assets_key!(
+        "clash_api",
+        "external_ui_download_detour",
+        "assets.ui.route"
+    ),
+];
+
+pub(crate) fn legacy_assets_warning(
+    source: SourceRef,
+    block: &'static str,
+    key: &'static str,
+    message: &'static str,
+) -> DetailedDiagnostic {
+    DetailedDiagnostic::warning(
+        "legacy-assets-key",
+        source,
+        SettingPath::new("experimental").field(block).field(key),
+        SafeValue::Redacted,
+        message,
+    )
+}
+
+pub(crate) fn legacy_cache_file_warning(
+    source: SourceRef,
+    key: &'static str,
+) -> DetailedDiagnostic {
+    let message = match key {
+        "path" => {
+            "experimental.cache_file.path no longer has an effect; state is kept in `<data_dir>/state/honk.db`"
+        }
+        "cache_id" => {
+            "experimental.cache_file.cache_id no longer has an effect; state is kept in `<data_dir>/state/honk.db`"
+        }
+        _ => {
+            "experimental.cache_file.store_fakeip no longer has an effect; state is kept in `<data_dir>/state/honk.db`"
+        }
+    };
+    DetailedDiagnostic::warning(
+        "legacy-cache-file",
+        source,
+        SettingPath::new("experimental")
+            .field("cache_file")
+            .field(key),
+        SafeValue::Redacted,
+        message,
+    )
+}
+
 /// Called by the outer attempt owner, not by nested readers or format probes.
 pub fn finish_attempt<T>(
     result: Result<T, crate::error::DetailedConfigError>,
@@ -340,11 +413,9 @@ pub fn report_detailed_diagnostics(diagnostics: &[DetailedDiagnostic]) {
             Severity::Info => {
                 tracing::info!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
             }
-            Severity::Warning => {
+            // Non-terminal: loading continues, so even error-severity findings warn.
+            Severity::Warning | Severity::Error => {
                 tracing::warn!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
-            }
-            Severity::Error => {
-                tracing::error!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
             }
         }
     }

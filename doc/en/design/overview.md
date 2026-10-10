@@ -11,7 +11,7 @@ Its configuration syntax and TC datapath derive from dae and remain dae-compatib
 - Intercept Linux LAN-forwarded and host-originated traffic with an eBPF transparent-proxy datapath.
 - Keep the native `.dae` configuration syntax as the primary and only documented configuration format.
 - Provide multi-protocol outbounds, Selector/URLTest/LoadBalance/Fallback/Score groups, health checks, and a Clash-compatible control API.
-- Ship an engine-only `honk-core` binary rather than a separate GraphQL service or bundled dashboard application.
+- Ship one `honk-core` engine rather than a separate GraphQL service; optionally embed the pinned doona client with `native-ui`.
 
 ### Non-goals
 
@@ -64,7 +64,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 - `src/share_link.rs` is the sole `Node::from_share_link` parser. `src/share_link/options.rs` maps URI packet encoding and independent mux controls into the canonical protocol model, then normalization/validation precedes identity derivation. It does not retain a second VLESS mode model.
 - `src/node/wire.rs` is the sole flat serde adapter. It rejects the removed VLESS legacy field by raw presence, including `null`; the same field on non-VLESS input remains only a compatibility artifact. `VlessConfig.network`, `udp_encoding`, and `multiplex` determine identity, so a canonical cutover can change a VLESS `Node.id` without changing VMess behavior or identity.
 - Canonical VLESS behavior is summarized in [Outbound design](./outbound.md#vless-wire-contracts); field-level syntax and URI values belong in the [node reference](../reference/nodes.md).
-- `src/experimental.rs`: `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }. The dae parser explicitly whitelists both current nested sections. It accepts the deprecated `udp_nfqueue` section only as a migration input and warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
+- `src/experimental.rs`: `ExperimentalConfig` owns `clash_api`, `native_api`, and `cache_file`. Native settings are strict, independent and require a restart. Opt-in `native-api` (build with `--features native-api` or `native-ui`; release builds include it) provides userspace observations, bounded histories, source-owned Group PATCH and main-entry administration, plus verified-geodata activation. Its listener is disabled by default. `.dae` remains authoritative. Per-network automatic-policy pin/clear is enabled; pins belong to the current GroupManager and disappear on activation. Credential-bearing sources are read-only. Returned content masks listener-secret values rather than omitting bodies. Native mode and full kernel transparency stay gated. Default-off `native-ui` embeds licensed pinned doona assets obtained at packaging time through `ci/fetch-doona.sh` and `.github/ci/pins.env`. `build.rs` reads the absolute `HONK_DOONA_DIR`, with no runtime fetching or frontend build. The dae parser explicitly whitelists the nested sections. It accepts the deprecated `udp_nfqueue` section only as a migration input and warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 11 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ## High-level data path
@@ -103,7 +103,7 @@ flowchart TB
 ## Runtime invariants
 
 - **Bypass-mark discipline:** dials, probes, DNS upstreams, HTTP downloads, QUIC endpoints, and transparent listeners carry the process-configured bypass mark. Nonzero direct rule marks replace its low 30 bits and carry `CLASSIFIED_MARK`; policy rules must mask with `0x3fffffff`. Accepted TCP sockets have the listener mark cleared; ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
-- **Anyfrom UDP replies:** proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. Replying from the TPROXY listener exposes the `dae0` source and fails on the return path.
+- **Anyfrom UDP replies:** proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. Replying from the TPROXY listener exposes the `dae0` source and fails on the return path. A reply from an alternate full-cone source returns through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, and never teaches the datapath a native reverse direction for the client's next packet to that source.
 - **DNS source boundary:** transparent and `dns.bind` adapters derive the logical client source from the socket peer; flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope, while each policy generation's domain-predicate projection remains global and source-independent.
 - **VLESS source boundary:** shared XUDP/Mux.Cool reuse is indexed by reused runtime, normalized client, UDP path, and actual-peer/original-destination reply projection. The full five-tuple endpoint map still owns routing, token/generation, and per-flow Score; the source session owns its one receiver and transport health.
 - **Network-namespace discipline:** the process remains in the host netns. It enters `daens` only through scoped, fully synchronous `with_daens_netns` calls; no `.await` may occur across `setns`, and failure to restore the original namespace aborts the process.
@@ -127,10 +127,14 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the static `honk-ebpf` object, and userspace compiles policy extensions at runtime. Requires Linux kernel 6.12+ at runtime. |
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
-| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
+| `native-api` | no | Independent HTTP/1.1 native observations, opt-in accepted-source administration and local-directory UI, with owned bounded connections, strict bearer/Host/Origin checks, and no dependency on Clash. |
+| `native-ui` | no | Includes `native-api` and embeds assets from the pinned doona distribution for `ui: embedded`; no runtime extraction, download or frontend build. |
+| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio, and sets mimalloc's purge delay to 100 ms unless `MIMALLOC_PURGE_DELAY` says otherwise. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
 `mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested, startup logs a warning and disables NFQUEUE staging for that process; the config file is unchanged.
+
+When embedding eBPF, `build.rs` rebuilds with the kernel crate's pinned compiler and standalone release policy, not inherited host `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_*` profiling overrides. The compiler sidecar must be no older than the embedding build script, so an embedding-policy change invalidates previously built objects. Explicit `--bpf-object` artifacts and manual kernel builds remain the caller's responsibility.
 
 ## Authorship disclosure
 

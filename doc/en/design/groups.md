@@ -12,7 +12,9 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-A reload builds a complete replacement `GroupManager`, migrates Selector choices whose group and member tag still exist via `migrate_selector_choices_from`, installs interrupt, warm-up, and persistence callbacks before publication, and swaps the inner `Arc`. Readers therefore see either the old or the new manager, never a partially rebuilt graph.
+A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager.
+
+Shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` when its name is unchanged, regardless of insertion, deletion or reordering. A rename creates a new group rather than transferring the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -36,11 +38,17 @@ UDP selection first excludes forwarding leaves whose canonical protocol/configur
 
 | Policy | Runtime behavior |
 | --- | --- |
-| Selector | TCP and UDP resolve the runtime choice, then `group.default`, then the first declared member independently of health; only missing/non-member tags fall through. No eligible candidate for that member invokes only the group's explicit `final` or the same-leaf TCP last resort above; without either, the plan is empty. GroupManager resolves finals at every nested level. The Clash API changes the runtime choice. `PersistCallback` stores effective writes in `cache.db` via honk-core's `cachedb`; when `interrupt_connections` is enabled, `InterruptCallback` removes tracking records but does not cancel live relays. Typed configuration diagnostics warn about this limitation. |
+| Selector | TCP and UDP resolve their separate concrete runtime member choices, then `group.default`, then the first declared member independently of health. Only missing/non-member choices fall through. An ineligible chosen member invokes only explicit `final` or the same-leaf TCP last resort; otherwise the plan is empty. Native writes choose TCP, UDP or atomic both; Clash writes both and displays TCP. `PersistCallback` stores each changed network's identity in the cache. |
 | URLTest | Chooses the lowest halving moving average, keeps independent TCP and UDP selections, applies tolerance hysteresis, and re-evaluates lazily on dial and selection queries. A real selection change may invoke `InterruptCallback`. |
 | LoadBalance | Round-robins eligible members in declaration order. Every group owns independent `AtomicUsize` cursors for TCP and UDP. Rotation never invokes `InterruptCallback`. |
 | Fallback | Pins the first eligible member in declaration order independently for TCP and UDP. The pin stays until that member dies; recovery of an earlier member does not cause failback. |
 | Score | With `policy: score`, chooses one health-eligible leaf using observed reliability, fresh target-aware quality and bounded validation. Historical sample volume is not a performance bonus. Selector remains the default. |
+
+Selector validation/publication is one shared transition; callbacks run after synchronous guards are released. `interrupt_connections` captures the pre-transition transport owners by their actual selected group path and network, then closes them outside manager/entry locks. The response reports interruption only after confirmed completion. TCP closes its exact UUID owner; UDP retires its token/generation-bound view and waits for backend/driver/reply fences. Shared XUDP siblings and the carrier remain alive. This path is independent of optional native flow recording, not a deletion of tracking metadata.
+
+Concurrent closes of the same captured owner share its real completion and inherit a failed retirement; they do not report `Gone` merely because it is already Closing or Failed. A missing or replaced owner remains `Gone`. Automatic interrupt callbacks only start retirement; callers that require confirmation wait on that owner's completion.
+
+Native group observations are read-only, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload. It does not create a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. An automatic-policy pin lives only in the running GroupManager, so an activation drops it; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups).
 
 ### Score scoring and lifecycle
 
@@ -128,6 +136,8 @@ A full child resolution that yields no candidate can withdraw that child's retai
 
 Every pending policy-selected attempt rechecks its captured ordinary-pool obligations at begin, under the evidence lock and before node-specific I/O. Departure or an uninitialized pool refuses the attempt with typed cancellation and refunds unbegun reservations; neither an ordinary stale plan nor a retry can downgrade that refusal into free work. Already-begun attempts and relays retain their lifetime and settlement rules. A new retry, although it retains its original business identity, must pass admission again. Active connections may therefore span retired pool members; k is not a limit on the historical union of live connection leaves.
 
+Native pins that make an automatic group act as a Selector impose no ordinary Score-pool obligation for that owner. Attribution and any nested ordinary Score owners' pool obligations remain intact. Candidate observations retain member-specific health exclusions even when subgroup aliases share a leaf; Score utility and eligibility reasons update only surviving rows.
+
 An explicit `final` bypasses only its own group's ordinary pool; any ordinary Score ancestor still constrains its selected leaf. The sole-TCP-leaf recovery path enters the same pool, without permitting an unchosen Selector sibling. Independent health probes and warm-up observations are not policy-selected business and keep their existing scope. Probe baselines remain available; comparison-cell admission follows serving membership, with the existing exceptions for four recent Apply winners and initial collection. Original currency, identity and TTL rules are unchanged. Membership checks are bounded by k; pool reranking sorts candidates and rotation scans them once.
 
 A recent failure exclusion removes an ineligible member from pending validation until its failure is older than the performance evidence age. Exclusion does not measure the member as equivalent or nonregressing, and decaying layer weights can make it eligible again earlier. Response degradation, which reopens comparison freshness, compares a setup or response sample only with the same exact target's history; aggregate cells mix targets of unrelated latency, so aggregate comparisons reopen on carrier pressure rather than cross-target differences.
@@ -181,7 +191,7 @@ IPv6 health-family retries prefer a usable ordinary IPv4 proxy path before a
 final, without changing the business target family. Missing or cyclic finals
 remain refusals; no transport error or terminal packet rejection is retried here.
 
-Selector captures a concrete node or sub-group member before candidate expansion and health filtering; repeated node tags bind the first matching declared `NodeId`. Parents retain the existing subgroup Peek, parent-health gate, and serving-commit order, so unchosen Score state is not advanced. For both TCP and UDP, a failed serving commit cannot restore the earlier peek; only a configured final may continue selection. Candidates retain their originating subgroup reference instead of rediscovering it from a display tag. A chosen automatic sub-group may still select a different leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice, while explicit delay tests may inspect all members for recovery.
+Selector captures a concrete node or sub-group member before candidate expansion and health filtering. Name-based defaults and Clash writes bind the first matching declared member; native IDs can select a particular direct member even when display tags collide. Serving resolves only the chosen subgroup with Apply and then applies the parent health gate; it neither peeks at unchosen siblings nor requires a committed child Peek to succeed before Apply. For both TCP and UDP, an unavailable chosen path can continue only through its configured final. Candidates retain their originating subgroup reference rather than rediscovering it from a display tag. A chosen automatic sub-group may select another leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice, while explicit delay tests may still inspect all members for recovery.
 
 Display and API output retain member tags even when the physical dial reaches a deeper leaf; serving selection retains concrete node or subgroup identity separately:
 
@@ -228,7 +238,7 @@ A dead state normally needs two consecutive probe successes to recover. `notify_
 
 Typed policy, size, and `PacketRejection::Capacity` refusals are terminal for the candidate but health- and Score-neutral; CLI callers receive the capacity error rather than `NotApplicable`. Packet-local congestion, idle expiry after a reply, intentional retirement, node-death cancellation, and shutdown are also health-neutral. An alive-to-dead transition invokes the control-plane callback with `(NodeId, name)`, purging pooled connections and UDP endpoints. Skip UDP-domain death while its sibling UDP domain is explicitly alive, so a blocked `:53` probe does not purge working flows.
 
-The last real TCP delay sample per node is written to `cache.db` every 60 seconds and restored at startup only when it is at most 24 hours old. Liveness is never restored from the cache. Synthetic 10-second placeholders are flagged, excluded from display history and the moving average, and never persisted as the last real sample; selection demotion lives on the failure-strike counters, not on the placeholder.
+The last real TCP delay sample per node is written to the state db every 60 seconds and restored at startup only when it is at most 24 hours old. Liveness is never restored from the cache. Synthetic 10-second placeholders are flagged, excluded from display history and the moving average, and never persisted as the last real sample; selection demotion lives on the failure-strike counters, not on the placeholder.
 
 - `src/alive/` APIs include `register_node`, `notify_check_*`, `report_*_traffic`, and `record_dial_failure`. Group tables and `(member tag, check_url)` state remain name-keyed: groups have no NodeId; members may be sub-groups (sing-box RealTag).
   `mod.rs`: state, thresholds, registries, eBPF connectivity-push callback. `probe.rs`: HTTP/raw-connect `probe_node`, DNS-through-`dial_udp_transport` `probe_node_udp`, concurrent cycles. `collection.rs`: `DialerCollection` latencies, moving averages, and dial-failure tracking. `latencies.rs`: O(1), cap-10 ring; measurement `SystemTime` gives real Clash history times. `last_real_sample()` excludes synthetic entries, preventing bogus dashboard 10000ms.
@@ -263,7 +273,7 @@ Warm-up has three independent mechanisms:
 | Mechanism | Candidate and lifetime | Retained resource | Bounds |
 | --- | --- | --- | --- |
 | Startup preconnect | One startup-only pass; current group picks first, then config order. Only bare-TCP-poolable proxy nodes qualify. | One bare server TCP connection deposited in the pool | `'auto'` selects at most 8 nodes; `0` disables it. It owns no policy-retention bit. |
-| Selector pin | Always tracks every Selector's configured leaf, including an unhealthy explicit choice; shared leaves are UUID-deduplicated. | The reusable session selected by the TCP path (AnyTLS or VLESS H2/shared Mux.Cool), one QUIC client/connection, or otherwise one bare server TCP | Effective-choice changes wake immediately; a 10-second pass repairs lost, consumed, or expired state. |
+| Selector pin | Tracks every Selector's TCP choice, including an unhealthy explicit choice; shared leaves are UUID-deduplicated. | The reusable session selected by the TCP path (AnyTLS or VLESS H2/shared Mux.Cool), one QUIC client/connection, or otherwise one bare server TCP | Effective-choice changes wake immediately; a 10-second pass repairs lost, consumed, or expired state. |
 | UDP warm set | Opt-in; re-ranks each group's top `min(N, 3)` reusable UDP leaves for each address family on every pass, then UUID-deduplicates globally. | The reusable state selected by the UDP path, including a VLESS H2/shared/separate Mux.Cool pool, or a QUIC client | At most 4 warm attempts run concurrently; the retained process set is re-ranked and capped at `4 × N`. |
 
 Selector and UDP ownership are independent bits on reusable node runtimes.
@@ -278,6 +288,8 @@ including AnyTLS, VLESS pools/source key, and QUIC state. Changed configuration
 gets a fresh runtime. The existing outbound maintenance pass reaps unretained
 idle VLESS carriers together with its other idle resources; no new protocol
 timer is created.
+
+Native probes capture member-to-leaf associations and generation owners without advancing policy state. Real raw-TCP, HTTP and TCP/UDP DNS measurements retain transport/purpose/family/warmth; obsolete or cancelled results do not publish fresh health. Probes, geodata and shared downloads use configured targets without an address or port allowlist. Whoever can write the configuration or control subscription content decides those targets; provider content is trusted configuration. Probe resolution remains pinned. See [bounded probes](../reference/api.md#bounded-probes).
 
 ## Dial admission budget
 

@@ -47,6 +47,10 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
         &dns.local_addr().unwrap().to_string(),
     ));
     let candidates = [&node];
+    #[cfg(feature = "native-api")]
+    let selection_chains = HashMap::new();
+    #[cfg(feature = "native-api")]
+    let observation = ConnectionObservation::default();
     let score_group = honk_config::group::Group {
         name: "score".into(),
         policy: honk_config::group::GroupPolicy::Score,
@@ -71,6 +75,7 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
             target,
             None,
             "score",
+            crate::stats::OutboundKind::Group,
             None,
             Duration::from_millis(100),
             tokio::time::Instant::now() + Duration::from_secs(10),
@@ -78,6 +83,10 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
             IpVersion::V4,
             &feedback,
             false,
+            #[cfg(feature = "native-api")]
+            &selection_chains,
+            #[cfg(feature = "native-api")]
+            &observation,
         ),
         async {
             let mut packet = [0; 512];
@@ -241,6 +250,7 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
                 target,
                 None,
                 "score",
+                crate::stats::OutboundKind::Group,
                 None,
                 Duration::from_millis(5),
                 tokio::time::Instant::now() + Duration::from_secs(1),
@@ -248,6 +258,10 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
                 IpVersion::V4,
                 &feedback,
                 false,
+                #[cfg(feature = "native-api")]
+                &HashMap::new(),
+                #[cfg(feature = "native-api")]
+                &ConnectionObservation::default(),
             )
             .await;
         let error = match result {
@@ -445,12 +459,13 @@ async fn direct_race_preserves_per_flow_marks() {
             honk_outbound::proxy::DirectMark::new(0x456),
             None,
         ] {
-            let (stream, _, _) = handle
+            let winner = handle
                 .race_candidates(
                     &[&node],
                     target,
                     None,
                     "direct",
+                    crate::stats::OutboundKind::Builtin,
                     direct_mark,
                     Duration::from_secs(1),
                     tokio::time::Instant::now() + Duration::from_secs(2),
@@ -462,10 +477,15 @@ async fn direct_race_preserves_per_flow_marks() {
                     },
                     &HashMap::new(),
                     false,
+                    #[cfg(feature = "native-api")]
+                    &HashMap::new(),
+                    #[cfg(feature = "native-api")]
+                    &ConnectionObservation::default(),
                 )
                 .await
                 .unwrap()
                 .unwrap();
+            let stream = winner.stream;
             let socket = stream
                 .stream
                 .as_ref()

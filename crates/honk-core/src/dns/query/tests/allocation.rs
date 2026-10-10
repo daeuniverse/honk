@@ -106,3 +106,33 @@ fn pointer_chain_query(hops: u16) -> Vec<u8> {
     }
     wire
 }
+
+const VALIDATE_ALLOCATION_CHILD: &str = "HONK_VALIDATE_ALLOCATION_CHILD";
+
+#[test]
+fn udp_query_validation_does_not_allocate() {
+    if std::env::var_os(VALIDATE_ALLOCATION_CHILD).is_some() {
+        let wire = crate::dns::forwarder::build_dns_query("www.example.com", 1);
+        let region = Region::new(GLOBAL);
+        crate::dns::query::validate_exact_dns_query(&wire).expect("valid query");
+        let allocations = region.change().allocations;
+        assert_eq!(allocations, 0, "validation allocated {allocations} times");
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "dns::query::tests::allocation::udp_query_validation_does_not_allocate",
+            "--nocapture",
+        ])
+        .env(VALIDATE_ALLOCATION_CHILD, "1")
+        .output()
+        .expect("isolated allocation test");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

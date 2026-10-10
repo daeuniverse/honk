@@ -770,6 +770,81 @@ fn test_geoip_private_route() {
 }
 
 #[test]
+fn equal_ip_networks_share_one_matcher_across_routing_and_dns() {
+    use crate::dns::routing::DnsRouter;
+
+    use_repo_geo_assets();
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n u: 'udp://127.0.0.1:53'\n }\n routing { response {\n\
+         ip(geoip:private) -> accept\n !ip(198.18.0.0/15, geoip:private) -> reject\n\
+         fallback: u\n } } }\n\
+         routing {\n dip(geoip:private) && dport(443) -> block\n dip(geoip:private) -> direct\n\
+         dip(198.18.0.0/15, geoip:private) -> proxy\n !dip(geoip:private) && dport(53) -> alt\n\
+         fallback: fb\n }",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let sources = GeoSourceSet::load(&requirements);
+    let mut shared = SharedMatchers::default();
+    let router = Router::from_config_sharing(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_sharing(&config.dns, &sources, &mut shared).unwrap();
+    drop(shared);
+    let unshared_router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+    let unshared_dns = DnsRouter::new_with_geo_sources(&config.dns, &sources).unwrap();
+
+    let routed: Vec<_> = router
+        .compiled_routes()
+        .iter()
+        .flat_map(|route| &route.conditions)
+        .filter_map(|condition| match &condition.predicate {
+            CompiledPredicate::DestinationIp(matcher) => Some(matcher),
+            _ => None,
+        })
+        .collect();
+    let answered = dns.answer_ip_tries();
+    let [geo, geo_again, literal, negated] = routed[..] else {
+        panic!("expected four destination IP conditions");
+    };
+    assert!(Arc::ptr_eq(geo, geo_again) && Arc::ptr_eq(geo, negated));
+    assert!(Arc::ptr_eq(geo.trie(), answered[0]) && Arc::ptr_eq(literal.trie(), answered[1]));
+    assert!(!Arc::ptr_eq(geo, literal));
+    assert_eq!(
+        router.policy_fingerprint(),
+        unshared_router.policy_fingerprint()
+    );
+
+    let mut conn = make_conn(None, None);
+    for ip in [
+        "10.0.0.1",
+        "8.8.8.8",
+        "198.18.0.1",
+        "fd00::1",
+        "2001:4860::1",
+    ] {
+        conn.dst_ip = ip.parse().unwrap();
+        for port in [53, 80, 443] {
+            conn.dst_port = port;
+            assert_eq!(router.route(&conn), unshared_router.route(&conn), "{ip}");
+        }
+        let response = |dns: &DnsRouter| dns.select_response("a.test", 1, &[conn.dst_ip], "u");
+        assert_eq!(response(&dns), response(&unshared_dns), "{ip}");
+    }
+
+    let (matcher, trie) = (Arc::downgrade(geo), Arc::downgrade(geo.trie()));
+    drop(router);
+    assert!(
+        matcher.upgrade().is_none(),
+        "DNS must keep only the trie, not the network list"
+    );
+    drop(dns);
+    assert!(
+        trie.upgrade().is_none(),
+        "the build must not outlive its routers"
+    );
+}
+
+#[test]
 fn test_geosite_route() {
     use_repo_geo_assets();
 
@@ -793,6 +868,79 @@ fn test_geosite_route() {
 
     conn.domain = Some("www.google.com".into());
     assert_eq!(router.route(&conn), "proxy");
+}
+
+#[test]
+fn geosite_selectors_share_one_matcher_across_routing_and_dns() {
+    use crate::dns::routing::DnsRouter;
+
+    use_repo_geo_assets();
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n u: 'udp://127.0.0.1:53'\n }\n routing {\n\
+         request {\n qname(geosite:category-games@CN) -> reject\n qname(geosite:CN) -> u\n\
+         fallback: asis\n }\n response {\n qname(geosite:category-games) -> reject\n\
+         fallback: accept\n } } }\n\
+         routing {\n domain(geosite:cn, geosite:category-games@cn) -> direct\n\
+         domain(geosite:category-games) -> games\n !domain(geosite:private) && dport(53) -> alt\n\
+         fallback: fb\n }",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let sources = GeoSourceSet::load(&requirements);
+    let mut shared = SharedMatchers::default();
+    let router = Router::from_config_sharing(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_sharing(&config.dns, &sources, &mut shared).unwrap();
+    drop(shared);
+    let unshared_router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+    let unshared_dns = DnsRouter::new_with_geo_sources(&config.dns, &sources).unwrap();
+
+    let [cn, games_cn, games, private] = router.geosite_matchers()[..] else {
+        panic!("expected four routing geosite selectors");
+    };
+    let [dns_games_cn, dns_cn, dns_games] = dns.geosite_matchers()[..] else {
+        panic!("expected three DNS geosite selectors");
+    };
+    assert!(Arc::ptr_eq(cn, dns_cn) && Arc::ptr_eq(games_cn, dns_games_cn));
+    assert!(Arc::ptr_eq(games, dns_games));
+    assert!(!Arc::ptr_eq(games, games_cn) && !Arc::ptr_eq(cn, private));
+    assert_eq!(
+        router.policy_fingerprint(),
+        unshared_router.policy_fingerprint()
+    );
+
+    let mut conn = make_conn(None, None);
+    for domain in [
+        "www.baidu.com",
+        "WWW.QQ.com",
+        "store.steampowered.com",
+        "www.steamchina.com",
+        "localhost",
+        "example.org",
+    ] {
+        conn.domain = Some(domain.into());
+        for port in [53, 443] {
+            conn.dst_port = port;
+            let route = router.route(&conn);
+            assert_eq!(route, unshared_router.route(&conn), "{domain}");
+        }
+        let lower = domain.to_ascii_lowercase();
+        assert_eq!(
+            dns.select_request(&lower, 1),
+            unshared_dns.select_request(&lower, 1)
+        );
+        assert_eq!(
+            dns.select_response(&lower, 1, &[], "u"),
+            unshared_dns.select_response(&lower, 1, &[], "u")
+        );
+    }
+
+    let old = Arc::downgrade(cn);
+    drop((router, dns));
+    assert!(
+        old.upgrade().is_none(),
+        "the build must not outlive its routers"
+    );
 }
 
 #[test]
@@ -1069,6 +1217,67 @@ fn test_geosite_matcher_semantics() {
 
     // Empty matcher never matches
     assert!(!GeositeMatcher::default().matches("example.com"));
+}
+
+#[test]
+fn geosite_matchers_intern_on_exact_expansions() {
+    use GeositeDomain::{Domain, Full, Keyword};
+    let mut registry = DomainRegistry::default();
+    let mut intern = |domains: Vec<GeositeDomain>| {
+        registry
+            .intern(DomainMatcher::new(&[], &[], &[], &[], &domains, Vec::new()).unwrap())
+            .unwrap()
+    };
+    let base = intern(vec![Domain("Example.COM".into()), Keyword("Tube".into())]);
+    let normalized = intern(vec![
+        Keyword("Tube".into()),
+        Domain("example.com".into()),
+        Domain("EXAMPLE.com".into()),
+    ]);
+    let kind = intern(vec![Full("example.com".into()), Keyword("Tube".into())]);
+    let keyword_case = intern(vec![Domain("example.com".into()), Keyword("tube".into())]);
+    assert_eq!(base, normalized);
+    assert_ne!(base, kind);
+    assert_ne!(base, keyword_case);
+    assert_ne!(kind, keyword_case);
+}
+
+#[test]
+fn geosite_policy_fingerprint_covers_the_exact_expansion() {
+    use_repo_geo_assets();
+    let rules = vec![RoutingRule {
+        name: "geosite-cn-direct".into(),
+        condition: RoutingCondition {
+            geosite: vec!["cn".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "proxy").unwrap();
+    let requirements = GeoRequirements::for_traffic(&rules);
+    let sources = GeoSourceSet::load(&requirements);
+    let (exact, _) = DomainMatcher::new(
+        &[],
+        &[],
+        &[],
+        &[],
+        &GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(!exact.is_empty());
+    assert_eq!(
+        router.policy_fingerprint(),
+        fingerprint::policy(
+            &router.routes.routes,
+            std::slice::from_ref(&exact),
+            &router.fallback,
+            router.routes.geo_fingerprint,
+        )
+    );
 }
 
 #[test]
@@ -1437,4 +1646,14 @@ fn bare_ip_in_dip_sip_parses_as_host_route() {
     assert_eq!(hit("10.9.9.9", "192.168.222.2"), "direct");
     assert_eq!(hit("10.9.9.8", "192.168.222.2"), "proxy");
     assert_eq!(hit("10.9.9.9", "192.168.222.3"), "proxy");
+}
+
+#[test]
+fn lowercase_copies_only_names_that_change() {
+    assert!(matches!(
+        lowercase("www.example.com"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    assert_eq!(lowercase("WWW.Example.com"), "www.example.com");
+    assert_eq!(lowercase("É.example"), "é.example");
 }

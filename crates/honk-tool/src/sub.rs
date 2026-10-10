@@ -281,6 +281,8 @@ async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
         url: source,
         sub_type: SubscriptionType::Custom,
         user_agent: args.ua.clone(),
+        // A one-off probe has no routing to follow.
+        download_detour: "direct".into(),
         ..Default::default()
     };
     if args.source != "-" && std::path::Path::new(&sub.url).exists() {
@@ -483,7 +485,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
             )
         ),
         bounded(
-            deadline,
+            deadline.saturating_add(Duration::from_secs(2)),
             timed_out.udp_quic,
             probe_udp_quic(
                 registry,
@@ -526,12 +528,14 @@ async fn probe_urltest(
     let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
-    let guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
+    let mut guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
         Ok(guard) => guard,
         Err(_) => return Some(Err(ProbeFailureKind::Admission)),
     };
     let measured = urltest_node(&guard.runtime(), entry.tcp.as_ref(), url, timeout).await;
-    guard.close().await;
+    if let Err(error) = guard.close().await {
+        eprintln!("probe runtime cleanup failed: {error}");
+    }
     Some(measured.map_err(|_| ProbeFailureKind::Exchange))
 }
 
@@ -629,7 +633,7 @@ async fn probe_family(
         return Some(Err(ProbeFailureKind::Handler));
     };
     let url = format!("https://{url_host}/");
-    let guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
+    let mut guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
         Ok(guard) => guard,
         Err(_) => return Some(Err(ProbeFailureKind::Admission)),
     };
@@ -641,7 +645,9 @@ async fn probe_family(
         timeout,
     )
     .await;
-    guard.close().await;
+    if let Err(error) = guard.close().await {
+        eprintln!("probe runtime cleanup failed: {error}");
+    }
     Some(measured.map_err(|_| ProbeFailureKind::Exchange))
 }
 

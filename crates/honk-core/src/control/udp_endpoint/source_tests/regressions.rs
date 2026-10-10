@@ -92,7 +92,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
         Arc::clone(endpoint_c.source_reply_socket()),
         Arc::clone(&alive),
         Arc::clone(&stats),
-        node.name.clone(),
+        stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease_c.commit_ready(Arc::clone(&endpoint_c)));
@@ -136,7 +136,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
     drop(endpoint_b);
     drop(endpoint_c);
     wait_source_removed(&pool, &scope).await;
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -200,7 +200,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
             client_dst: target,
             alive_set: Arc::clone(&alive),
             stats: Arc::clone(&stats),
-            outbound_tracker: stats.outbound_tracker(&node.name),
+            outbound_tracker: stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
             health_family: honk_outbound::alive::IpVersion::V4,
         },
         UdpDriverStart {
@@ -242,7 +242,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
 
     drop(driver);
     drop(endpoint);
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -321,7 +321,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     }
     pool.remove(client_addr, target_a);
     drop(endpoint_a);
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     wait_source_removed(&pool, &scope).await;
     let Err(error) = stale.commit(&pool).await else {
         panic!("retired source attachment must reject commit");
@@ -490,7 +490,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         Arc::clone(endpoint_a.source_reply_socket()),
         Arc::clone(&alive),
         Arc::clone(&stats),
-        node.name.clone(),
+        stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     let mut driver_b = pool.spawn_driver(
         client_addr,
@@ -502,7 +502,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         Arc::clone(endpoint_b.source_reply_socket()),
         Arc::clone(&alive),
         Arc::clone(&stats),
-        node.name.clone(),
+        stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     driver_a.wait_ready().await.unwrap();
     driver_b.wait_ready().await.unwrap();
@@ -601,7 +601,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     drop(endpoint_b);
     drop(owner);
     wait_source_removed(&pool, &scope).await;
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -766,7 +766,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         drop(endpoint_b);
         drop(owner);
         drop(transport);
-        assert!(pool.shutdown().await);
+        assert!(pool.shutdown().await.joined);
         generation.shutdown().await;
         wire_task.abort();
         let _ = wire_task.await;
@@ -904,7 +904,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
         Ok(winners) => winners,
         Err(panic) => std::panic::resume_unwind(panic),
     };
-    assert!(shutdown);
+    assert!(shutdown.joined);
     assert_eq!(
         bound_winner, other.id,
         "late local cancellation must not consume the shared source's I/O failure",

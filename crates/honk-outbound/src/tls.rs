@@ -242,7 +242,7 @@ impl TlsConnector {
                     && let Some(ssl) = e.ssl()
                     && ssl.get_ech_retry_configs().is_some()
                 {
-                    tracing::info!(
+                    tracing::debug!(
                         sni = domain,
                         "ECH rejected; server offered retry ECH configs (not persisted)"
                     );
@@ -331,6 +331,19 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
 /// `ech_config_path`. `ech_enabled` without configs is handled separately at
 /// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
+    load_ech_config_list_with_reader(node, |path| read_dependency(node, path))
+}
+
+fn read_dependency(node: &Node, path: &str) -> anyhow::Result<String> {
+    let path = honk_config::paths::resolve_dependency_path(path);
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("node {}: read {}", node.name, path.display()))
+}
+
+fn load_ech_config_list_with_reader(
+    node: &Node,
+    read: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(tls) = node.tls() else {
         return Ok(None);
     };
@@ -340,9 +353,7 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
             .with_context(|| format!("node {}: ech_config", node.name));
     }
     if let Some(path) = &tls.ech_config_path {
-        let path = honk_config::paths::resolve_dependency_path(path);
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("node {}: read {}", node.name, path.display()))?;
+        let contents = read(path)?;
         return decode_ech_config_list(&contents)
             .map(Some)
             .with_context(|| format!("node {}: ech_config_path", node.name));
@@ -353,10 +364,19 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
 /// root store. Runtime registries use this before publication; connectors are
 /// built lazily when a node first enters the active working set.
 pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
+    validate_connector_config_with_ech_reader(node, |path| read_dependency(node, path))
+}
+
+/// Validate the same TLS inputs using caller-authorized, captured ECH bytes.
+/// Inline ECH takes precedence; this never performs discovery or constructs a connector.
+pub fn validate_connector_config_with_ech_reader(
+    node: &Node,
+    read: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
     if node.tls().is_some_and(|tls| !tls.alpn.is_empty()) {
         node.validate_protocol()?;
     }
-    load_ech_config_list(node)?;
+    load_ech_config_list_with_reader(node, read)?;
     if let Some(pin) = node.tls().and_then(|tls| tls.pin_sha256.as_deref())
         && parse_pin_sha256(pin).is_none()
     {
@@ -448,17 +468,58 @@ pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
 }
 
 /// Build the shared BoringSSL trust and protocol defaults.
+///
+/// `SslConnector::builder` parses the OS CA bundle into the context's own
+/// cert store (~0.8 MiB of C heap) and `set_verify_cert_store` would only
+/// override it for verification, leaving that copy resident. Replacing the
+/// store itself frees the copy and shares the process-wide one.
 fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnectorBuilder> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-    if skip_cert_verify {
-        builder.set_verify(SslVerifyMode::NONE);
+    builder.set_cert_store(root_store()?);
+    builder.set_verify(if skip_cert_verify {
+        SslVerifyMode::NONE
     } else {
-        builder.set_verify(SslVerifyMode::PEER);
-        builder.set_verify_cert_store(root_store()?)?;
-    }
+        SslVerifyMode::PEER
+    });
     Ok(builder)
+}
+
+/// Everything that shapes an `SslConnector` context. Building one costs the
+/// OS CA bundle parse (several ms of CPU, transient C heap), so dials share
+/// contexts per shape instead of building one per connection.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ConnectorKey {
+    reality: bool,
+    skip_verify: bool,
+    pin: Option<[u8; 32]>,
+    alpn: Option<Vec<u8>>,
+    chrome: bool,
+}
+
+/// Shapes only multiply with distinct pins or ALPN overrides; past this the
+/// cache restarts empty. Handshakes in flight keep their own context clone.
+// ponytail: restart-on-full instead of an LRU; add one if pinned fleets thrash it.
+const MAX_SHARED_CONNECTORS: usize = 128;
+
+fn shared_connector(
+    key: ConnectorKey,
+    build: impl FnOnce() -> anyhow::Result<SslConnector>,
+) -> anyhow::Result<SslConnector> {
+    static CACHE: LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<ConnectorKey, SslConnector>>,
+    > = LazyLock::new(Default::default);
+    let mut cache = CACHE.lock();
+    if let Some(connector) = cache.get(&key) {
+        return Ok(connector.clone());
+    }
+    let connector = build()?;
+    if cache.len() >= MAX_SHARED_CONNECTORS {
+        cache.clear();
+    }
+    cache.insert(key, connector.clone());
+    Ok(connector)
 }
 
 /// Parse a `pinSHA256` value (hex, optionally colon-separated) into 32 bytes.
@@ -562,19 +623,30 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         })
     };
     let alpn_wire = custom_alpn.as_deref().or(default_alpn);
-    let mut builder = base_builder(tls.skip_cert_verify || pin.is_some())?;
-    if let Some(pin) = pin {
-        builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
-    }
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-    }
-    if let Some(alpn_wire) = alpn_wire {
-        builder.set_alpn_protos(alpn_wire)?;
-    }
+    let skip_verify = tls.skip_cert_verify || pin.is_some();
+    let key = ConnectorKey {
+        reality: false,
+        skip_verify,
+        pin,
+        alpn: alpn_wire.map(<[u8]>::to_vec),
+        chrome,
+    };
+    let connector = shared_connector(key, || {
+        let mut builder = base_builder(skip_verify)?;
+        if let Some(pin) = pin {
+            builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
+        }
+        if chrome {
+            apply_chrome_ctx(&mut builder)?;
+        }
+        if let Some(alpn_wire) = alpn_wire {
+            builder.set_alpn_protos(alpn_wire)?;
+        }
+        Ok(builder.build())
+    })?;
 
     Ok(TlsConnector {
-        connector: builder.build(),
+        connector,
         chrome,
         alps,
         ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
@@ -628,14 +700,23 @@ mod batch_read_tests;
 /// `reality::verify_server_certificate`. Chrome mode configures the ctx-level
 /// emulation fields. REALITY callers never restore a cached SSL session.
 pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
-    let mut builder = base_builder(true)?;
-    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-        builder.set_cipher_list(CHROME_CIPHER_LIST)?;
-        builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
-        builder.enable_ocsp_stapling();
-        builder.enable_signed_cert_timestamps();
-    }
-    Ok(builder.build())
+    let key = ConnectorKey {
+        reality: true,
+        skip_verify: true,
+        pin: None,
+        alpn: None,
+        chrome,
+    };
+    shared_connector(key, || {
+        let mut builder = base_builder(true)?;
+        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+        if chrome {
+            apply_chrome_ctx(&mut builder)?;
+            builder.set_cipher_list(CHROME_CIPHER_LIST)?;
+            builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+            builder.enable_ocsp_stapling();
+            builder.enable_signed_cert_timestamps();
+        }
+        Ok(builder.build())
+    })
 }

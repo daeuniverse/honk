@@ -2,6 +2,27 @@ use super::*;
 
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+const SO_RCVPRIORITY_OPT: libc::c_int = 82;
+
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+pub(super) fn set_so_recvpriority(socket: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let status = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_RCVPRIORITY_OPT,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as _,
+        )
+    };
+    if status < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 #[cfg(target_os = "linux")]
 fn set_ip_transparent(socket: &Socket, is_v6: bool) -> io::Result<()> {
     if is_v6 {
@@ -53,6 +74,7 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     socket.set_nonblocking(true)?;
     socket.set_cloexec(true)?;
     socket.set_reuse_address(true)?;
+    set_client_keepalive(&socket)?;
     if domain == Domain::IPV6 {
         // Keep the v6 listener v6-only so it does not conflict with the v4 listener.
         socket.set_only_v6(true)?;
@@ -71,6 +93,25 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     socket.listen(128)?;
 
     Ok(socket.into())
+}
+
+// A dead client is reaped after IDLE + INTERVAL * RETRIES = about an hour of silence.
+const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(3600);
+#[cfg(target_os = "linux")]
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(target_os = "linux")]
+const CLIENT_KEEPALIVE_RETRIES: u32 = 4;
+
+/// Accepted sockets inherit these. A client that vanishes without FIN/RST
+/// otherwise pins its relay and both sockets until the upstream closes; a
+/// live idle client answers the probes, so long connections are untouched.
+fn set_client_keepalive(socket: &Socket) -> io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new().with_time(CLIENT_KEEPALIVE_IDLE);
+    #[cfg(target_os = "linux")]
+    let keepalive = keepalive
+        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
+        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+    socket.set_tcp_keepalive(&keepalive)
 }
 
 /// Clear the inherited bypass mark on an accepted transparent socket.
@@ -227,6 +268,12 @@ pub(super) async fn send_udp_reply_from_orig_dst(
     if original_dst.port() == 53 {
         match send_dns_reply_cached(data, client_addr, original_dst).await {
             Some(Ok(n)) => {
+                let fallback = &DNS_REPLY_FALLBACK[usize::from(original_dst.is_ipv6())];
+                if fallback.load(std::sync::atomic::Ordering::Relaxed)
+                    && fallback.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    info!("cached DNS reply socket recovered");
+                }
                 debug!(
                     "UDP reply sent to {} from {} ({} bytes)",
                     client_addr, original_dst, n
@@ -234,7 +281,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
                 return Ok(n);
             }
             Some(Err(e)) => {
-                warn!(
+                debug!(
                     "UDP reply to {} from {} failed: {}",
                     client_addr, original_dst, e
                 );
@@ -254,7 +301,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
             Ok(n)
         }
         Err(e) => {
-            warn!(
+            debug!(
                 "UDP reply to {} from {} failed: {}",
                 client_addr, original_dst, e
             );
@@ -337,6 +384,14 @@ fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
 static DNS_REPLY_SOCK_V4: Mutex<Option<Arc<UdpSocket>>> = Mutex::new(None);
 #[cfg(target_os = "linux")]
 static DNS_REPLY_SOCK_V6: Mutex<Option<Arc<UdpSocket>>> = Mutex::new(None);
+
+/// Per-family flag set while cached DNS replies fall back to one-shot
+/// sockets, so a persistent failure warns once per episode, not per reply.
+#[cfg(target_os = "linux")]
+static DNS_REPLY_FALLBACK: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
 
 /// Source port every DNS reply is sent from (the port clients send queries to).
 #[cfg(target_os = "linux")]
@@ -471,7 +526,9 @@ async fn send_dns_reply_cached(
     let sock = match get_dns_reply_socket(is_v6) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
+            crate::logging::warn_on_entry!(
+                !DNS_REPLY_FALLBACK[usize::from(is_v6)]
+                    .swap(true, std::sync::atomic::Ordering::Relaxed),
                 "cached DNS reply socket unavailable ({}); falling back to one-shot",
                 e
             );
@@ -499,7 +556,9 @@ async fn send_dns_reply_cached(
     let sock = match replace_dns_reply_socket(is_v6, &sock) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
+            crate::logging::warn_on_entry!(
+                !DNS_REPLY_FALLBACK[usize::from(is_v6)]
+                    .swap(true, std::sync::atomic::Ordering::Relaxed),
                 "cached DNS reply socket rebuild failed ({}); falling back to one-shot",
                 e
             );
@@ -598,11 +657,14 @@ pub(super) async fn send_to_with_src(
         .await
 }
 
-// Accommodate IPv6 ORIGDST, PKTINFO, and one native packet-mark record. Capacity
-// is validated before scalar receives and when each reusable batch is built.
+// Accommodate IPv6 ORIGDST, PKTINFO, packet mark and optional priority records.
+// Capacity is validated before scalar receives and when each batch is built.
 const CMSG_CONTROL_CAPACITY: usize = 256;
 const UDP_RECV_BATCH_SIZE: usize = 8;
 const UDP_RECV_PACKET_CAPACITY: usize = 64 * 1024;
+// The receive trace rejects batches beyond its kernel record.
+const _: () =
+    assert!(UDP_RECV_BATCH_SIZE == honk_ebpf_common::receive_trace::RECEIVE_TRACE_BATCH_SIZE);
 
 /// Raw recvmsg control storage whose first byte is naturally aligned for a
 /// `cmsghdr`. The zero-length field carries `cmsghdr`'s ABI alignment without
@@ -634,6 +696,7 @@ pub(super) fn cmsg_control_capacity_is_sufficient() -> bool {
     let Some(required) = cmsg_space(std::mem::size_of::<libc::sockaddr_in6>())
         .checked_add(cmsg_space(std::mem::size_of::<libc::in6_pktinfo>()))
         .and_then(|required| required.checked_add(cmsg_space(std::mem::size_of::<u32>())))
+        .and_then(|required| required.checked_add(cmsg_space(std::mem::size_of::<u32>())))
     else {
         return false;
     };
@@ -649,6 +712,8 @@ pub(super) struct UdpRecvMeta {
     pub(super) packet_dst_ip: Option<std::net::IpAddr>,
     pub(super) packet_ifindex: Option<u32>,
     pub(super) packet_mark: Option<u32>,
+    #[cfg(any(feature = "native-api", test))]
+    pub(super) packet_priority: Option<u32>,
     pub(super) local_addr: SocketAddr,
 }
 
@@ -681,6 +746,8 @@ pub(super) struct UdpRecvBatch {
     results: [Option<io::Result<UdpRecvPacket>>; UDP_RECV_BATCH_SIZE],
     received: usize,
     limit: usize,
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    trace: Option<crate::ebpf::real::receive_trace::ReceiveRegistration>,
 }
 
 impl UdpRecvBatch {
@@ -697,7 +764,7 @@ impl UdpRecvBatch {
         if !cmsg_control_capacity_is_sufficient() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "recvmmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, and SO_MARK",
+                "recvmmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, mark and priority",
             ));
         }
         let slots = std::array::from_fn(|_| UdpRecvStorage::new(packet_capacity));
@@ -715,7 +782,32 @@ impl UdpRecvBatch {
             results: std::array::from_fn(|_| None),
             received: 0,
             limit: UDP_RECV_BATCH_SIZE,
+            #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+            trace: None,
         })
+    }
+
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    pub(super) fn enable_trace(
+        &mut self,
+        socket: &UdpSocket,
+        trace: Option<Arc<crate::ebpf::real::receive_trace::ReceiveTrace>>,
+    ) -> io::Result<()> {
+        if set_so_recvpriority(socket).is_ok() {
+            return Ok(());
+        }
+        let trace = trace.ok_or_else(|| io::Error::other("UDP receive trace unavailable"))?;
+        self.register_trace(socket, &trace)
+    }
+
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    fn register_trace(
+        &mut self,
+        socket: &UdpSocket,
+        trace: &Arc<crate::ebpf::real::receive_trace::ReceiveTrace>,
+    ) -> io::Result<()> {
+        self.trace = Some(trace.register(socket.as_raw_fd())?);
+        Ok(())
     }
 
     pub(super) fn len(&self) -> usize {
@@ -759,6 +851,9 @@ impl UdpRecvBatch {
             message.msg_controllen = CMSG_CONTROL_CAPACITY as _;
         }
 
+        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+        let trace_armed = self.trace.as_mut().is_some_and(|trace| trace.begin(fd));
+
         // SAFETY: every mmsghdr points to live, disjoint storage above and the
         // kernel writes at most UDP_RECV_BATCH_SIZE entries synchronously.
         let count = unsafe {
@@ -770,8 +865,30 @@ impl UdpRecvBatch {
                 std::ptr::null_mut(),
             )
         };
-        if count < 0 {
-            let error = io::Error::last_os_error();
+        let receive_error = (count < 0).then(io::Error::last_os_error);
+        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+        let trace_packets = self
+            .trace
+            .as_mut()
+            // Nothing was consumed, so the armed batch stays valid for the next receive.
+            .filter(|_| {
+                !receive_error
+                    .as_ref()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            })
+            .and_then(|trace| {
+                let packets = trace.finish(count.max(0) as usize);
+                trace_armed.then_some(packets).flatten()
+            })
+            .filter(|packets| {
+                messages[..count.max(0) as usize]
+                    .iter()
+                    .enumerate()
+                    .all(|(index, message)| {
+                        packets[index].valid == 0 || packets[index].length == message.msg_len
+                    })
+            });
+        if let Some(error) = receive_error {
             if error.kind() == io::ErrorKind::WouldBlock {
                 self.limit = 1;
             }
@@ -811,6 +928,19 @@ impl UdpRecvBatch {
                     message.msg_hdr.msg_flags,
                     local_addr,
                 )?;
+                #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+                let meta = if let Some(packets) = trace_packets {
+                    UdpRecvMeta {
+                        packet_priority: crate::ebpf::real::receive_trace::packet_priority(
+                            packets[index],
+                            message.msg_len,
+                            meta.packet_mark,
+                        ),
+                        ..meta
+                    }
+                } else {
+                    meta
+                };
                 Ok(UdpRecvPacket {
                     length,
                     source,
@@ -863,7 +993,7 @@ fn recvmsg_origdst(
     if !cmsg_control_capacity_is_sufficient() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "recvmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, and SO_MARK",
+            "recvmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, mark and priority",
         ));
     }
     // CmsgStorage is naturally aligned and the checked CMSG_SPACE total keeps
@@ -909,8 +1039,8 @@ fn recvmsg_origdst(
 }
 
 /// Parse the returned ancillary byte range without looking past
-/// `msg_controllen`. Every recognized record must be complete and decodable;
-/// malformed ancillary data is an InvalidData error, never missing metadata.
+/// `msg_controllen`. Malformed routing metadata remains an InvalidData error;
+/// optional priority metadata only loses trace evidence.
 /// The production buffer is cmsghdr-aligned, while unaligned reads here keep
 /// this validator safe for any slice used by focused tests.
 pub(super) fn parse_cmsg_control(
@@ -931,6 +1061,10 @@ pub(super) fn parse_cmsg_control(
     let mut packet_dst_ip = None;
     let mut packet_ifindex = None;
     let mut packet_mark = None;
+    #[cfg(any(feature = "native-api", test))]
+    let mut packet_priority = None;
+    #[cfg(any(feature = "native-api", test))]
+    let mut priority_seen = false;
     while offset < control.len() {
         if control.len() - offset < header_len {
             return Err(io::Error::new(
@@ -1012,6 +1146,16 @@ pub(super) fn parse_cmsg_control(
             }
             // SAFETY: the exact native-u32 payload length was checked above.
             packet_mark = Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<u32>()) });
+        } else if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SO_PRIORITY {
+            #[cfg(any(feature = "native-api", test))]
+            {
+                packet_priority = if priority_seen {
+                    None
+                } else {
+                    <[u8; 4]>::try_from(data).ok().map(u32::from_ne_bytes)
+                };
+                priority_seen = true;
+            }
         }
 
         let next = offset
@@ -1036,6 +1180,8 @@ pub(super) fn parse_cmsg_control(
         packet_dst_ip,
         packet_ifindex,
         packet_mark,
+        #[cfg(any(feature = "native-api", test))]
+        packet_priority,
         local_addr,
     })
 }

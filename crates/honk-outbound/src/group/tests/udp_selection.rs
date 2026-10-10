@@ -336,13 +336,17 @@ fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
         let manager =
             GroupManager::with_alive_set(&[selector.clone(), parent.clone()], &nodes, alive_set);
         for node in &nodes[..2] {
-            manager.set_selector_choice("selector", &node.name);
+            manager
+                .set_selector_choice("selector", &node.name, SelectorNetworks::Both)
+                .unwrap();
             assert_udp_selection(&manager, "selector", None);
             assert_udp_selection(&manager, "parent", None);
             assert_eq!(manager.select_node("selector").unwrap().id, node.id);
         }
         for selected in ["udp", "block", "direct"] {
-            manager.set_selector_choice("selector", selected);
+            manager
+                .set_selector_choice("selector", selected, SelectorNetworks::Both)
+                .unwrap();
             assert_udp_selection(&manager, "selector", Some(selected));
             assert_udp_selection(&manager, "parent", Some(selected));
         }
@@ -367,9 +371,13 @@ fn selector_udp_choice_does_not_fall_back_to_default_or_sibling() {
         }
     }
     assert_udp_selection(&manager, "selector", None);
-    manager.set_selector_choice("selector", "a");
+    manager
+        .set_selector_choice("selector", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "selector", Some("a"));
-    manager.set_selector_choice("selector", "b");
+    manager
+        .set_selector_choice("selector", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "selector", None);
     assert_eq!(manager.select_node("selector").unwrap().name, "b");
 
@@ -380,11 +388,16 @@ fn selector_udp_choice_does_not_fall_back_to_default_or_sibling() {
         }
     }
     assert_udp_selection(&manager, "selector", Some("b"));
-    manager.set_selector_choice("selector", "a");
+    manager
+        .set_selector_choice("selector", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "selector", None);
 
-    manager.set_selector_choice("selector", "removed");
-    assert_udp_selection(&manager, "selector", Some("b"));
+    assert_eq!(
+        manager.set_selector_choice("selector", "removed", SelectorNetworks::Both),
+        Err(SelectorError::NotMember)
+    );
+    assert_udp_selection(&manager, "selector", None);
 }
 
 #[test]
@@ -413,10 +426,16 @@ fn selector_udp_nested_choice_preserves_subgroup_policy_boundary() {
         }
     }
     assert_udp_selection(&manager, "parent", None);
-    manager.set_selector_choice("child", "b");
+    manager
+        .set_selector_choice("child", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "parent", Some("b"));
-    manager.set_selector_choice("child", "a");
-    manager.set_selector_choice("parent", "automatic");
+    manager
+        .set_selector_choice("child", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    manager
+        .set_selector_choice("parent", "automatic", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "parent", Some("b"));
 
     for ipver in [IpVersion::V4, IpVersion::V6] {
@@ -425,7 +444,9 @@ fn selector_udp_nested_choice_preserves_subgroup_policy_boundary() {
         }
     }
     assert_udp_selection(&manager, "parent", None);
-    manager.set_selector_choice("parent", "outside");
+    manager
+        .set_selector_choice("parent", "outside", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "parent", Some("outside"));
 }
 
@@ -442,7 +463,9 @@ fn selector_udp_health_family_fallback_keeps_the_selected_member() {
         alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V6);
     }
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive));
-    manager.set_selector_choice("selector", "a");
+    manager
+        .set_selector_choice("selector", "a", crate::group::SelectorNetworks::Both)
+        .unwrap();
     let context = ScoreSelectionContext {
         target_family: Some(IpVersion::V6),
         target: Some(ScoreTarget::domain("ipv6.example", 443)),
@@ -669,9 +692,13 @@ fn nested_score_udp_final_is_explicit_and_health_checked() {
         [nodes[1].id]
     );
 
-    manager.set_selector_choice("parent", "empty");
+    manager
+        .set_selector_choice("parent", "empty", crate::group::SelectorNetworks::Both)
+        .unwrap();
     assert_udp_selection(&manager, "parent", None);
-    manager.set_selector_choice("parent", "child");
+    manager
+        .set_selector_choice("parent", "child", crate::group::SelectorNetworks::Both)
+        .unwrap();
     for family in [IpVersion::V4, IpVersion::V6] {
         for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
             alive.report_unavailable_forced(nodes[1].id, domain, family);
@@ -737,7 +764,9 @@ fn final_peek_and_unselected_subgroups_do_not_advance_rotation() {
     parent.nodes.push(nodes[2].id);
     let manager = GroupManager::new(&[parent, child, final_group], &nodes);
     assert_eq!(manager.select_node("parent").unwrap().id, nodes[2].id);
-    manager.set_selector_choice("parent", "child");
+    manager
+        .set_selector_choice("parent", "child", crate::group::SelectorNetworks::Both)
+        .unwrap();
     for _ in 0..2 {
         assert_eq!(
             manager

@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use honk_config::dns::DnsConfig;
@@ -63,21 +63,9 @@ impl DnsResolver {
     pub async fn resolve_for_source(
         &self,
         domain: &str,
-        source_ip: IpAddr,
+        source: SocketAddr,
     ) -> anyhow::Result<ResolvedAddr> {
-        self.service
-            .resolve_name_for_source(domain, source_ip)
-            .await
-    }
-
-    pub async fn resolve_first_ipv4(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let result = self.resolve(domain).await?;
-        Ok(result.ipv4.first().copied())
-    }
-
-    pub async fn resolve_first_ipv6(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let result = self.resolve(domain).await?;
-        Ok(result.ipv6.first().copied())
+        self.service.resolve_name_for_source(domain, source).await
     }
 }
 

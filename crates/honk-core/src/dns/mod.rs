@@ -39,3 +39,5 @@ pub(crate) mod wire;
 
 pub use resolver::{DnsResolver, ResolvedAddr};
 pub use service::DnsService;
+#[cfg(feature = "native-api")]
+pub(crate) use service::{DiagnosticError, DiagnosticFailure, PinnedNameResolver};

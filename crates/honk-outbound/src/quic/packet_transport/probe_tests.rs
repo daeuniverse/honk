@@ -437,8 +437,8 @@ async fn packet_transport_socket_accepts_full_cone_reply_metadata() {
     assert_eq!(meta[0].addr, remote);
 }
 
-#[tokio::test]
-async fn handshake_crosses_packet_transport_adapter() {
+/// One successful probe through the adapter against a local QUIC server.
+async fn probe_local_server() {
     let (server, remote) = testutil::server_endpoint(&[b"h3"], true).unwrap();
     let server_task = tokio::spawn(async move {
         server.accept().await.unwrap().await.unwrap();
@@ -462,8 +462,259 @@ async fn handshake_crosses_packet_transport_adapter() {
         "localhost",
         &config,
         Duration::from_secs(5),
+        crate::alive::ProbeCancellation::default(),
     )
     .await
     .unwrap();
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn handshake_crosses_packet_transport_adapter() {
+    probe_local_server().await;
+}
+
+const TEARDOWN_LOG_CHILD: &str = "HONK_QUIC_TEARDOWN_LOG_CHILD";
+
+struct EndpointErrors(Arc<AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EndpointErrors {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let metadata = event.metadata();
+        if metadata.target() == "quinn::endpoint" && *metadata.level() == tracing::Level::ERROR {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Closing after a successful probe is intentional; quinn must not see it as
+/// a broken socket, which it logs at ERROR.
+#[tokio::test]
+async fn successful_probe_close_logs_no_endpoint_error() {
+    if std::env::var_os(TEARDOWN_LOG_CHILD).is_some() {
+        use tracing_subscriber::prelude::*;
+        let errors = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(EndpointErrors(Arc::clone(&errors))),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            probe_local_server().await;
+        }
+        assert_eq!(errors.load(Ordering::SeqCst), 0);
+        return;
+    }
+
+    // The child owns the global subscriber, so parallel tests cannot share
+    // its callsite interest.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "quic::packet_transport::probe_tests::successful_probe_close_logs_no_endpoint_error",
+            "--nocapture",
+        ])
+        .env(TEARDOWN_LOG_CHILD, "1")
+        .output()
+        .expect("isolated teardown log test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" 1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_handshake_timeout_does_not_retire_health_owner() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = peer.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(remote).await.unwrap();
+        let transport = Arc::new(UdpPacketTransport { socket, remote });
+        let retained = Arc::downgrade(&transport);
+        let node = honk_config::node::Node {
+            outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
+            ..Default::default()
+        };
+        let mut config = client_config(&node, &[b"h3"], QuicClientOptions::default())
+            .await
+            .unwrap();
+        let mut timing = quinn::TransportConfig::default();
+        timing.initial_rtt(Duration::from_secs(1));
+        config.transport_config(Arc::new(timing));
+        let owner = Arc::new(crate::alive::AliveDialerSet::new());
+        let request = tokio::spawn({
+            let owner = Arc::clone(&owner);
+            async move {
+                owner
+                    .run_external_probe(move |cancel| async move {
+                        quic_handshake_probe(
+                            transport,
+                            remote,
+                            "localhost",
+                            &config,
+                            Duration::from_millis(10),
+                            cancel,
+                        )
+                        .await
+                    })
+                    .await
+            }
+        });
+        let mut initial = [0; 1500];
+        let (received, _) = peer.recv_from(&mut initial).await.unwrap();
+        assert!(
+            received >= 1200,
+            "a real QUIC Initial reached the silent peer"
+        );
+        let error = request.await.unwrap().unwrap().unwrap_err();
+        assert!(error.to_string().contains("QUIC handshake timeout"));
+        assert!(
+            retained.upgrade().is_none(),
+            "measurement completion must join the transport workers"
+        );
+        assert_eq!(owner.run_external_probe(|_| async { 42 }).await, Ok(42));
+        owner.shutdown_health_checks().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[derive(Debug)]
+struct PanicReceiveTransport {
+    inner: UdpPacketTransport,
+    panicked: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl PacketTransport for PanicReceiveTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.inner.remote
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        self.inner.send_packet(data).await
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.inner.recv_packet(buf).await?;
+        self.panicked.notify_one();
+        panic!("injected packet receiver panic");
+    }
+}
+
+#[tokio::test]
+async fn endpoint_close_keeps_worker_panic_failure_after_first_join() {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let remote = peer.local_addr().unwrap();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(remote).await.unwrap();
+    peer.send_to(b"panic", socket.local_addr().unwrap())
+        .await
+        .unwrap();
+    let panicked = Arc::new(tokio::sync::Notify::new());
+    let endpoint = packet_transport_endpoint(
+        Arc::new(PanicReceiveTransport {
+            inner: UdpPacketTransport { socket, remote },
+            panicked: Arc::clone(&panicked),
+        }),
+        remote,
+    )
+    .unwrap();
+    panicked.notified().await;
+    assert!(!endpoint.close(Duration::from_secs(1)).await);
+    assert!(!endpoint.close(Duration::from_secs(1)).await);
+}
+
+#[derive(Debug)]
+struct PanicDriverRuntime {
+    inner: Arc<dyn quinn::Runtime>,
+    panicked: Arc<tokio::sync::Notify>,
+}
+
+impl quinn::Runtime for PanicDriverRuntime {
+    fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+        self.inner.new_timer(deadline)
+    }
+
+    fn spawn(&self, mut future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        let panicked = Arc::clone(&self.panicked);
+        self.inner.spawn(Box::pin(async move {
+            std::future::poll_fn(|cx| {
+                let _ = future.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            // Inject outside Quinn's mutexes, which intentionally poison on panic.
+            drop(future);
+            panicked.notify_one();
+            panic!("injected Quinn driver-task panic");
+        }));
+    }
+
+    fn wrap_udp_socket(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+        self.inner.wrap_udp_socket(socket)
+    }
+
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+}
+
+#[tokio::test]
+async fn endpoint_close_retains_quinn_driver_panic_in_both_owners() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = peer.local_addr().unwrap();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect(remote).await.unwrap();
+        let parent = Arc::new(crate::runtime::TaskOwner::production());
+        let drivers = Arc::new(crate::runtime::TaskOwner::production());
+        let panicked = Arc::new(tokio::sync::Notify::new());
+        let runtime = Arc::new(PanicDriverRuntime {
+            inner: Arc::new(PacketTransportRuntime {
+                inner: quinn::default_runtime().unwrap(),
+                tasks: Arc::downgrade(&drivers),
+                parent: Some(Arc::downgrade(&parent)),
+            }),
+            panicked: Arc::clone(&panicked),
+        });
+        let (socket, sender, receiver) = TransportQuinnSocket::prepare(
+            Arc::new(UdpPacketTransport {
+                socket: udp,
+                remote,
+            }),
+            remote,
+            false,
+        );
+        let endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config_with_mtu(1252).unwrap(),
+            None,
+            socket.clone(),
+            runtime,
+        )
+        .unwrap();
+        socket
+            .start_workers(Some(&parent), sender, receiver)
+            .unwrap();
+        let endpoint = PacketTransportEndpoint {
+            endpoint,
+            socket,
+            drivers,
+        };
+        panicked.notified().await;
+        assert!(!endpoint.close(Duration::from_millis(1)).await);
+        assert!(!endpoint.close(Duration::from_millis(1)).await);
+        parent.close().await;
+        assert!(
+            parent.has_failed(),
+            "parent teardown must retain driver failure"
+        );
+    })
+    .await
+    .unwrap();
 }

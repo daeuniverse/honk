@@ -32,6 +32,7 @@ group {
 | ------- | -------- | ------ | ---- |
 | （子节名） | `name` | 必填 | 在路由和 API 中用作出站的组 tag。 |
 | `policy` | `policy` | `selector` | 成员选择策略；接受的拼写见下表。 |
+| `icon` | `icon` | `null` | 经过校验的绝对 HTTP(S) URL 或 data URI，最多 2048 个字符，无空白或控制字符；HTTP(S) 不得含凭据，data URI 必须含逗号。向原生组摘要和详情返回时遮蔽其中至少 8 字节长的监听凭据值，不推测或下载图标。 |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | 按节点名选择节点。解析器把匹配结果解析为节点 UUID。 |
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
@@ -39,16 +40,16 @@ group {
 | `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组嵌套在其他组中时同样生效。Final 节点仍受健康检查约束；缺失或成环的 final 会拒绝，不会隐式直连。 |
 | `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。Selector 会忽略该字段并告警。 |
 | —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
-| —（dae 中不可配置） | `tolerance` | `50` | URLTest 切换阈值，单位为毫秒。dae URLTest 组接收 `global.check_tolerance`；运行时的有效下限为 1 ms。 |
-| —（dae 中不可配置） | `idle_timeout` | `null` | URLTest 在不活跃后暂停探测的阈值，单位为秒。值为 `null` 时，健康检查层使用 1800 秒。 |
-| —（dae 中不可配置） | `interrupt_connections` | `false` | 请求在选择变化时移除连接跟踪记录，不会取消正在运行的转发任务。值为 true 时在 `groups[index].interrupt_connections` 产生 `ineffective-option`，结构化配置和通过代码构造的配置也不例外。 |
+| `tolerance` | `tolerance` | `50` | 非负整数毫秒；dae URLTest 组未显式设置时继承 `global.check_tolerance`，显式值优先；运行时有效下限为 1 ms。 |
+| `idle_timeout` | `idle_timeout` | `null` | 非负整数秒，URLTest 不活跃后暂停探测的阈值；省略时健康层使用 1800 秒。 |
+| `interrupt_connections` | `interrupt_connections` | `false` | 选择变化时按捕获的组身份/路径与网络关闭精确旧 TCP/UDP owner，不再仅移除 tracker；共享 XUDP 只退役匹配 view。严格布尔值。 |
 | —（dae 中不可配置） | `id` | 随机 UUID | 字段缺失时生成的内部组标识。 |
 
 ## 策略
 
 | 规范名 | 接受的 dae 拼写 | 行为 |
 | ------ | --------------- | ---- |
-| `selector` | `selector`、`select`、`fixed`、`fixed(0)` | 在健康过滤前依次使用运行时选择、`default` 和第一个现存成员，TCP 与 UDP 语义一致。健康状态不会把有效选择替换成兄弟成员。选择可以是直接节点或嵌套组 tag。 |
+| `selector` | `selector`、`select`、`fixed`、`fixed(0)` | TCP/UDP 各自维护运行时选择，在健康过滤前依次使用对应网络的选择、`default` 和第一个现存成员。健康状态不会把有效选择替换成兄弟成员；选择可为直接节点或嵌套组 tag。 |
 | `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 使用减半移动平均 `(prev + sample) / 2` 和 tolerance 选择延迟最低的存活成员；TCP 与 UDP 选择相互独立。 |
 | `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。 |
 | `fallback` | `fallback` | 分别为 TCP 和 UDP 按声明顺序固定第一个存活成员；更靠前的成员恢复后不会立即 failback。 |
@@ -68,6 +69,10 @@ UDP 资格同时要求协议／配置支持和健康条件；VMess 与显式仅�
 若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍可把同一节点作为最后尝试，但当前 Selector 选择路径必须能到达它。这不能绕过选中的空子组，也不表示回退到 `direct`。节点保持 dead，直到真实流量或探测使其恢复；UDP 继续正常排除死亡成员。最后尝试服务会记录限流警告（每组 60 秒）。
 
 每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。
+
+原生 `PUT /api/v1/groups/{groupId}/selection` 接受直接成员的 `member_id` 和必填 `network: "tcp"|"udp"|"both"`，用于更新选择；`both` 一次校验、原子发布，TCP 写入不改变 UDP。Clash 写入映射为 `both`，`now` 明确显示 TCP 选择。两者共用 control/reload 所有者、分网络持久化与预热回调；中断只影响实际发生选择变化的网络，且按既有流量捕获的组路径匹配，不用当前叶节点列表倒推。Selector 固定预热跟随 TCP 选择，UDP 预热集使用 UDP 选择。
+
+组 PATCH 通过解析器记录的来源位置修改可写 `.dae` 的 `policy`、`default`、`final`、`tolerance`、`idle_timeout`、`interrupt_connections` 和 `check_url`，保留其他原文字节并经完整校验、持久写入与真实重载；不是只改内存。需要组 ETag 的强 `If-Match`，与源文件哈希独立校验；写后激活被拒绝不回滚磁盘。`icon` 可在配置或源编辑器修改，不属于受限 PATCH 字段。自动策略组可在运行时固定成员，下次配置激活或通过 DELETE 请求清除固定成员时失效，详见[原生组控制](./api.md#节点与组)。
 
 ### Score 策略
 

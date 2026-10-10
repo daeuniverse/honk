@@ -186,15 +186,14 @@ pub(super) struct InitializingEndpoint {
     pub(super) queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
     pub(super) flow_slots: Arc<Semaphore>,
     pub(super) endpoint_permit: Mutex<Option<OwnedSemaphorePermit>>,
-    /// A tracker registered after route selection but before the Ready
-    /// transition. It must be removed if this initialization is cancelled.
-    pub(super) tracker_id: Mutex<Option<String>>,
     /// Finalized transport winner for this generation. Bound only after
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
     pub(super) selected_node: Mutex<Option<uuid::Uuid>>,
     pub(super) cancelled: AtomicBool,
     pub(super) cancel_notify: Notify,
+    #[cfg(feature = "native-api")]
+    pub(super) native_terminal: std::sync::OnceLock<observation::SharedTerminal>,
 }
 
 impl InitializingEndpoint {
@@ -204,19 +203,6 @@ impl InitializingEndpoint {
 
     pub(super) fn take_endpoint_permit(&self) -> Option<OwnedSemaphorePermit> {
         self.endpoint_permit.lock().take()
-    }
-
-    pub(super) fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let mut current = self.tracker_id.lock();
-        if current.is_some() {
-            return false;
-        }
-        *current = Some(tracker_id);
-        true
-    }
-
-    pub(super) fn take_tracker_id(&self) -> Option<String> {
-        self.tracker_id.lock().take()
     }
 
     pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) {
@@ -263,7 +249,13 @@ pub(super) struct ReadyEndpoint {
 pub(super) enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
-    Retiring { generation: u64, token: u32 },
+    Retiring {
+        generation: u64,
+        token: u32,
+        io: Option<Arc<RetirementIo>>,
+        #[cfg(feature = "native-api")]
+        native_terminal: Option<observation::SharedTerminal>,
+    },
 }
 
 impl EndpointEntry {
@@ -289,7 +281,7 @@ impl EndpointEntry {
 
     pub(super) fn retire(&self) -> Option<String> {
         match self {
-            Self::Initializing(entry) => entry.take_tracker_id(),
+            Self::Initializing(_) => None,
             Self::Ready(entry) => {
                 entry.alive.store(false, Ordering::Release);
                 entry.endpoint.kill();
@@ -338,9 +330,84 @@ pub(in crate::control) struct UdpInitLease {
     _initializer_guard: UdpInitializerGuard,
     connection_guard: Option<ActiveConnectionGuard>,
     committed: bool,
+    #[cfg(feature = "native-api")]
+    packet_route: Option<crate::control::udp_ingress::PacketRoute>,
+    #[cfg(feature = "native-api")]
+    packet_trace_id: Option<u32>,
 }
 
 impl UdpInitLease {
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_packet_trace_id(&mut self, trace_id: Option<u32>) {
+        self.packet_trace_id =
+            trace_id.filter(|id| *id != 0 && *id != honk_ebpf_common::ROUTE_TRACE_LOST);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn packet_trace_id(&self) -> Option<u32> {
+        self.packet_trace_id
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_packet_route(
+        &mut self,
+        capture: Option<crate::control::udp_ingress::PacketRoute>,
+    ) {
+        self.packet_route = capture;
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn take_packet_route(
+        &mut self,
+    ) -> Option<crate::control::udp_ingress::PacketRoute> {
+        self.packet_route.take()
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_native_flow(
+        &self,
+        flow: Option<Arc<crate::observe::flows::FlowGuard>>,
+    ) -> Option<observation::SharedTerminal> {
+        let flow = flow?;
+        let terminal = Arc::clone(
+            self.initializer
+                .native_terminal
+                .get_or_init(|| observation::NativeUdpTerminal::new(Arc::clone(&flow), false)),
+        );
+        if let Some(mut entry) = self.pool.endpoints.get_mut(&self.key) {
+            if let EndpointEntry::Retiring {
+                generation,
+                token,
+                native_terminal,
+                ..
+            } = entry.value_mut()
+                && *generation == self.generation
+                && *token == self.decision_token
+            {
+                *native_terminal = Some(Arc::clone(&terminal));
+            }
+        } else {
+            flow.mark_gap(honk_outbound::runtime::flow_observation::GapReason::RetirementOwnerLost);
+        }
+        Some(terminal)
+    }
+
+    #[cfg(not(feature = "native-api"))]
+    #[inline]
+    pub(in crate::control) fn set_native_flow(
+        &self,
+        _flow: Option<Arc<crate::observe::flows::FlowGuard>>,
+    ) -> Option<observation::SharedTerminal> {
+        None
+    }
+
+    pub(in crate::control) fn native_terminal(&self) -> Option<observation::SharedTerminal> {
+        #[cfg(feature = "native-api")]
+        return self.initializer.native_terminal.get().cloned();
+        #[cfg(not(feature = "native-api"))]
+        None
+    }
+
     pub(in crate::control) fn client_addr(&self) -> SocketAddr {
         SocketAddr::new(self.key.client_ip(), self.key.client_port)
     }
@@ -382,24 +449,6 @@ impl UdpInitLease {
     pub(in crate::control) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
         debug_assert!(self.connection_guard.is_none());
         self.connection_guard = Some(guard);
-    }
-
-    /// Associate a tracker created after route selection with this exact
-    /// Initializing incarnation. If commit never happens, `Drop` transfers it
-    /// to the removal sink; Ready cleanup continues to use `UdpEndpoint`.
-    pub(in crate::control) fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let Some(entry) = self.pool.endpoints.get(&self.key) else {
-            return false;
-        };
-        match entry.value() {
-            EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token =>
-            {
-                initializing.set_tracker_id(tracker_id)
-            }
-            _ => false,
-        }
     }
 
     /// Bind the finalized transport winner (NodeId) to this Initializing
@@ -552,6 +601,9 @@ impl UdpInitLease {
         let entry = occupied.insert(EndpointEntry::Retiring {
             generation: self.generation,
             token: self.decision_token,
+            io: None,
+            #[cfg(feature = "native-api")]
+            native_terminal: self.initializer.native_terminal.get().cloned(),
         });
         drop(occupied);
         let conn_id = entry.retire();
@@ -695,36 +747,48 @@ impl UdpEndpointPool {
         data: DatagramPayload<'_>,
         enqueued_at: u32,
         stats: &StatsManager,
+        #[cfg(feature = "native-api")] native_terminal: Option<&observation::SharedTerminal>,
     ) -> EndpointReservation {
-        if sender.is_closed() {
-            stats.record_udp_queue_closed();
-            return EndpointReservation::QueueClosed;
-        }
-        let packet = match self.make_packet_at(data, flow_slots, enqueued_at) {
-            Ok(packet) => packet,
-            Err(PacketAdmissionError::FlowQueueFull) => {
-                stats.record_udp_flow_queue_full();
-                return EndpointReservation::QueueFull;
-            }
-            Err(PacketAdmissionError::GlobalPayloadFull) => {
-                stats.record_udp_global_payload_full();
-                return EndpointReservation::QueueFull;
-            }
-        };
-        match sender.try_send(packet) {
-            Ok(()) => {
-                stats.record_udp_queue_accepted();
-                EndpointReservation::Enqueued
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                stats.record_udp_flow_queue_full();
-                EndpointReservation::QueueFull
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+        let result = (|| {
+            if sender.is_closed() {
                 stats.record_udp_queue_closed();
-                EndpointReservation::QueueClosed
+                return EndpointReservation::QueueClosed;
+            }
+            let packet = match self.make_packet_at(data, flow_slots, enqueued_at) {
+                Ok(packet) => packet,
+                Err(PacketAdmissionError::FlowQueueFull) => {
+                    stats.record_udp_flow_queue_full();
+                    return EndpointReservation::QueueFull;
+                }
+                Err(PacketAdmissionError::GlobalPayloadFull) => {
+                    stats.record_udp_global_payload_full();
+                    return EndpointReservation::QueueFull;
+                }
+            };
+            match sender.try_send(packet) {
+                Ok(()) => {
+                    stats.record_udp_queue_accepted();
+                    EndpointReservation::Enqueued
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stats.record_udp_flow_queue_full();
+                    EndpointReservation::QueueFull
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    stats.record_udp_queue_closed();
+                    EndpointReservation::QueueClosed
+                }
+            }
+        })();
+        #[cfg(feature = "native-api")]
+        if let Some(terminal) = native_terminal {
+            match &result {
+                EndpointReservation::QueueFull => terminal.packet_drop("queue_capacity"),
+                EndpointReservation::QueueClosed => terminal.packet_drop("queue_closed"),
+                _ => {}
             }
         }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -787,10 +851,11 @@ impl UdpEndpointPool {
             queue_rx: Mutex::new(Some(queue_rx)),
             flow_slots,
             endpoint_permit: Mutex::new(Some(endpoint_permit)),
-            tracker_id: Mutex::new(None),
             selected_node: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),
+            #[cfg(feature = "native-api")]
+            native_terminal: std::sync::OnceLock::new(),
         });
         let key = *vacant.key();
         vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
@@ -808,6 +873,10 @@ impl UdpEndpointPool {
             initializer,
             _initializer_guard: initializer_guard,
             connection_guard: None,
+            #[cfg(feature = "native-api")]
+            packet_route: None,
+            #[cfg(feature = "native-api")]
+            packet_trace_id: None,
             committed: false,
         })
     }
@@ -900,6 +969,8 @@ impl UdpEndpointPool {
                                 data.clone(),
                                 enqueued_at,
                                 stats,
+                                #[cfg(feature = "native-api")]
+                                initializing.native_terminal.get(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (initializing.decision_token, initializing.generation)
@@ -922,6 +993,8 @@ impl UdpEndpointPool {
                                 data.clone(),
                                 enqueued_at,
                                 stats,
+                                #[cfg(feature = "native-api")]
+                                ready.endpoint.native.terminal(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (ready.decision_token, ready.generation)
@@ -1022,6 +1095,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
                     ),
                     EndpointEntry::Ready(ready)
                         if ready.alive.load(Ordering::Acquire)
@@ -1033,6 +1108,8 @@ impl UdpEndpointPool {
                             DatagramPayload::Owned(data),
                             enqueued_at,
                             stats,
+                            #[cfg(feature = "native-api")]
+                            ready.endpoint.native.terminal(),
                         )
                     }
                     EndpointEntry::Ready(_) | EndpointEntry::Retiring { .. } => {
@@ -1114,6 +1191,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
                     ),
                 )
             }
@@ -1130,6 +1209,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        ready.endpoint.native.terminal(),
                     ),
                 )
             }
@@ -1200,6 +1281,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Borrowed(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        ready.endpoint.native.terminal(),
                     ),
                     (ready.decision_token, ready.generation),
                 )

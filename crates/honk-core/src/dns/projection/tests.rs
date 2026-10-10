@@ -1,10 +1,11 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+use honk_outbound::alive::IpVersion;
 
-use super::state::DesiredState;
+use super::state::{DesiredState, family_of};
 use super::worker;
 use super::{ProjectionObservation, RoutingProjection, RoutingProjectionSnapshot};
 use crate::ebpf::maps;
@@ -51,8 +52,16 @@ fn snapshot(generation: u64, a: u32, b: u32) -> Arc<RoutingProjectionSnapshot> {
 fn positive<'a>(domain: &'a str, ips: &'a [IpAddr], ttl: Duration) -> ProjectionObservation<'a> {
     ProjectionObservation::Positive {
         domain,
+        family: ips.first().map_or(IpVersion::V4, |ip| family_of(*ip)),
         ips,
         advertised_ttl: ttl,
+    }
+}
+
+fn clear_v4(domain: &str) -> ProjectionObservation<'_> {
+    ProjectionObservation::Clear {
+        domain,
+        family: IpVersion::V4,
     }
 }
 
@@ -81,7 +90,7 @@ async fn shared_ip_clear_and_expiry_recompute_owner_or() {
     assert_eq!(batch.sets[0].bitmap.bitmap, [3, 0, 0, 0, 0, 0, 0, 0]);
     assert!(state.commit_success(&batch.sets, &batch.removes));
 
-    state.observe(ProjectionObservation::Clear { domain: "a.test" }, now);
+    state.observe(clear_v4("a.test"), now);
     assert_eq!(
         state.batch(now).sets[0].bitmap.bitmap,
         [2, 0, 0, 0, 0, 0, 0, 0]
@@ -89,6 +98,61 @@ async fn shared_ip_clear_and_expiry_recompute_owner_or() {
     tokio::time::advance(Duration::from_secs(5)).await;
     state.expire(tokio::time::Instant::now());
     assert_eq!(state.batch(tokio::time::Instant::now()).removes[0], ip);
+}
+
+#[tokio::test(start_paused = true)]
+async fn address_families_are_owned_independently_until_nxdomain() {
+    let now = tokio::time::Instant::now();
+    let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 3));
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    state.observe(positive("a.test", &[v4], Duration::from_secs(30)), now);
+    state.observe(positive("a.test", &[v6], Duration::from_secs(30)), now);
+    assert!(state.desired.contains_key(&v4) && state.desired.contains_key(&v6));
+
+    state.observe(
+        ProjectionObservation::Clear {
+            domain: "a.test",
+            family: IpVersion::V6,
+        },
+        now,
+    );
+    assert!(state.desired.contains_key(&v4) && !state.desired.contains_key(&v6));
+
+    state.observe(positive("a.test", &[v6], Duration::from_secs(30)), now);
+    state.observe(ProjectionObservation::ClearName { domain: "a.test" }, now);
+    assert!(state.desired.is_empty());
+
+    // A mapped AAAA answer shares the IPv4 key; clearing AAAA must keep A's fact.
+    let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 3).to_ipv6_mapped());
+    state.observe(positive("a.test", &[v4], Duration::from_secs(30)), now);
+    state.observe(positive("a.test", &[mapped], Duration::from_secs(30)), now);
+    state.observe(
+        ProjectionObservation::Clear {
+            domain: "a.test",
+            family: IpVersion::V6,
+        },
+        now,
+    );
+    assert!(state.desired.contains_key(&v4));
+}
+
+#[tokio::test(start_paused = true)]
+async fn address_family_owners_expire_independently() {
+    let now = tokio::time::Instant::now();
+    let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 4));
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    state.observe(positive("a.test", &[v4], Duration::from_secs(30)), now);
+    state.observe(positive("a.test", &[v6], Duration::from_secs(60)), now);
+
+    let later = now + Duration::from_secs(31);
+    state.expire(later);
+    assert!(!state.desired.contains_key(&v4) && state.desired.contains_key(&v6));
+
+    state.observe(positive("a.test", &[v4], Duration::from_secs(60)), later);
+    state.expire(now + Duration::from_secs(61));
+    assert!(state.desired.contains_key(&v4) && !state.desired.contains_key(&v6));
 }
 
 #[tokio::test(start_paused = true)]
@@ -101,6 +165,7 @@ async fn positive_refresh_uses_advertised_ttl_and_retain_keeps_owner() {
     state.observe(
         ProjectionObservation::Positive {
             domain: "a.test",
+            family: IpVersion::V4,
             ips: &[ip],
             advertised_ttl: Duration::from_secs(2),
         },
@@ -285,7 +350,7 @@ async fn ip_capacity_prefers_matching_facts_and_bounds_reload_projection() {
     assert_eq!(admitted.sets[0].bitmap.bitmap[0], 2);
     state.commit_success(&admitted.sets, &[]);
     assert_eq!(state.applied.len(), IP_CAPACITY);
-    state.observe(ProjectionObservation::Clear { domain: "b.test" }, now);
+    state.observe(clear_v4("b.test"), now);
     state.observe(positive("a.test", &matching, Duration::from_secs(300)), now);
     assert!(state.desired.contains_key(&matching[IP_CAPACITY - 1]));
 
@@ -412,7 +477,7 @@ fn retired_projection_ips_do_not_accumulate_memory() {
         state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
         let batch = state.batch(now);
         assert!(state.commit_success(&batch.sets, &batch.removes));
-        state.observe(ProjectionObservation::Clear { domain: "a.test" }, now);
+        state.observe(clear_v4("a.test"), now);
         let batch = state.batch(now);
         assert!(state.commit_success(&batch.sets, &batch.removes));
     }
@@ -443,7 +508,7 @@ async fn million_hot_owner_refreshes_keep_heaps_bounded() {
         );
     }
 
-    assert_eq!(state.owners.len(), 1);
+    assert_eq!(state.owner_domains().len(), 1);
     assert!(state.expiry_deadlines.len() <= 65);
     assert!(state.eviction_order.len() <= 65);
 }
@@ -475,7 +540,11 @@ async fn refresh_and_ip_replacement_preserve_ttl() {
     );
     assert_eq!(replacement.removes, vec![old_ip]);
     assert!(!state.reverse.contains_key(&old_ip));
-    assert!(state.reverse[&new_ip].contains("a.test"));
+    assert!(
+        state.reverse[&new_ip]
+            .iter()
+            .any(|(domain, _)| &**domain == "a.test")
+    );
     state.expire(now + Duration::from_secs(29));
     assert_eq!(state.owner_domains(), vec!["a.test".to_owned()]);
     state.expire(now + Duration::from_secs(31));

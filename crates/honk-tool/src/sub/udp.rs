@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use honk_config::node::Node;
@@ -108,28 +108,6 @@ async fn resolve_udp_check_target(
     }
 }
 
-fn next_rand(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-fn rand_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64 | 1)
-        .unwrap_or(0x9e3779b97f4a7c15)
-}
-
-pub(super) fn build_dns_probe_query(id: u16) -> Vec<u8> {
-    let mut query = honk_core::dns::forwarder::build_dns_query("google.com", 1);
-    query[..2].copy_from_slice(&id.to_be_bytes());
-    query
-}
-
 /// UDP probe: one minimal DNS A query through the node's UDP transport.
 /// Proves the node's UDP relay path end to end (mirrors the engine's
 /// `probe_node_udp` health check).
@@ -156,21 +134,10 @@ pub(super) async fn probe_udp_dns(
             .dial_udp_transport(node, dns_server, None, timeout)
             .await
             .map_err(|_| ProbeFailureKind::Exchange)?;
-
-        let mut rng = rand_seed();
-        let id = next_rand(&mut rng) as u16;
-        let query = build_dns_probe_query(id);
-
-        let start = Instant::now();
-        transport
-            .send_packet(&query)
+        honk_core::dns::forwarder::udp_dns_probe(&*transport)
             .await
-            .map_err(|_| ProbeFailureKind::Exchange)?;
-        let mut buf = [0u8; 512];
-        match transport.recv_packet(&mut buf).await {
-            Ok((n, _)) if n >= 2 && buf[0] == query[0] && buf[1] == query[1] => Ok(start.elapsed()),
-            Ok(_) | Err(_) => Err(ProbeFailureKind::Exchange),
-        }
+            .map(|sample| sample.latency)
+            .map_err(|_| ProbeFailureKind::Exchange)
     })
     .await;
     Some(match result {
@@ -237,8 +204,16 @@ pub(super) async fn probe_udp_quic(
     };
 
     Some(
-        honk_outbound::quic::quic_handshake_probe(transport, addr, url_host, &config, timeout)
-            .await
-            .map_err(|_| ProbeFailureKind::Exchange),
+        honk_outbound::quic::quic_handshake_probe(
+            transport,
+            addr,
+            url_host,
+            &config,
+            timeout,
+            honk_outbound::alive::ProbeCancellation::default(),
+        )
+        .await
+        .map(|measurement| measurement.latency)
+        .map_err(|_| ProbeFailureKind::Exchange),
     )
 }

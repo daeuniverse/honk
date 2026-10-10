@@ -36,7 +36,7 @@ native-direct 与已有流缓存路径保持原生执行。
 切换后保留当前用户态匹配语义：
 
 - 普通 domain pattern/suffix/keyword/regex 与 geosite 在同一条件内按 OR 匹配。
-  suffix、regex、keyword、大小写和 geosite 属性行为不变。
+  否定作用于整个并集。suffix、regex、keyword、大小写和 geosite 属性行为不变。
 - 目的/源 IP 保留 IPv4/IPv6 身份，覆盖 `/0`、裸主机地址及重叠前缀。
 - 端口区间包含两端；TCP/UDP 和 IPv4/IPv6 mask 可以同时包含两种值。
 - pname 保留配置端 15 字节规范化及子串匹配语义。内核进程字节按照 handoff 相同的
@@ -99,9 +99,18 @@ String 和 allocator 对象都不跨边界。
 `RoutingDecision` 包含 outbound、mark、must、domain-finality 与 RuleId；独立的
 标量返回码区分成功结果与 evaluator 不可用/执行失败。
 
+`RoutingInput.flags` 分别保存 MAC 存在位与 direct-finality 许可。静态 caller 从本次
+用于执行策略的同一份 Rule-mode flags 快照重建许可，不再次读取 map。输入仍为
+128 字节；loader 拒绝最后一个字段仍为 `mac_present` 的旧外部 eBPF 对象，使用
+此用户态 compiler 前必须重新构建这些对象。
+
 `domain_final` 表示在当前 dial mode 下，后续域名观察不能改变这一阶段的路由：
 policy 没有域名谓词、禁用了域名重路由，或已经取得完整的 learned-domain bitmap。
-它是 policy-generation 内的数据，不是另行发布、可能错代的全局路由 flag。
+Rule 模式下，如果从首条 live 规则到当前命中规则（包含当前）的前缀都不依赖域名，
+普通 direct action 也可成为 final：后置域名规则不能覆盖 first-match。folded-false
+规则不计入前缀，正向和取反的域名谓词都计入；fallback 使用同一个前缀证明。
+未捕获到 Rule-mode 许可时不应用这个额外证明，以保持 Global 模式原有的交接
+与域名嗅探权限。
 
 非 DNS 流量中，非 `must` 的 direct 结果若域名 finality 尚未确定，交接给用户态时
 必须编码为 `ControlPlaneRouting`；若仍写成最终 direct，TCP/UDP 初始化会跳过嗅探。

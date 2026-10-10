@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::ReadBuf;
 
-use super::{AesCtr, EncryptedStream, FRAME_HEADER_LEN, PendingWrite, ReadPhase};
+use super::{AesCtr, EncryptedStream, FRAME_HEADER_LEN, PendingWrite};
 
 /// One direction of Xray `XorConn`: XOR each TLS-shaped header and skip its
 /// body by the plaintext header's length.
@@ -72,13 +72,15 @@ impl EncryptedStream {
             return Poll::Ready(Ok(()));
         }
         if !self.direct_read {
-            if !matches!(self.read_phase, ReadPhase::Header) || self.read_offset != 0 {
+            if !self.at_frame_boundary() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "VLESS Encryption Direct switch outside a frame boundary",
                 )));
             }
             self.direct_read = true;
+            // Drained above; reads no longer pass through the plaintext buffer.
+            self.read_plaintext = Vec::new();
         }
 
         let start = output.filled().len();
@@ -119,8 +121,9 @@ impl EncryptedStream {
         let input = &input[..input.len().min(super::MAX_FRAME_PLAINTEXT)];
         // Header XOR advances the keystream, so retries must resend these
         // exact bytes instead of re-encoding the caller's buffer.
-        let mut wire = std::mem::take(&mut self.direct_wire);
+        let mut wire = std::mem::take(&mut self.write_wire);
         wire.clear();
+        wire.reserve_exact(input.len());
         wire.extend_from_slice(input);
         self.send_header_xor.apply(xor, &mut wire, true);
         self.pending_write = Some(PendingWrite {

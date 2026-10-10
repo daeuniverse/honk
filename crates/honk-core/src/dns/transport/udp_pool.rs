@@ -92,6 +92,31 @@ impl UdpPool {
         timeout: Duration,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
+        let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
+            Some(address),
+            honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
+        );
+        let result = Self::new_tracked_inner(address, timeout, active_tasks).await;
+        if let Some(observation) = &mut observation {
+            observation.finish(
+                if result.is_ok() {
+                    honk_outbound::runtime::flow_observation::TransportStatus::Succeeded
+                } else {
+                    honk_outbound::runtime::flow_observation::TransportStatus::Failed
+                },
+                result.as_ref().err().map(|_| {
+                    honk_outbound::runtime::flow_observation::TransportError::UdpSocketFailed
+                }),
+            );
+        }
+        result
+    }
+
+    async fn new_tracked_inner(
+        address: SocketAddr,
+        timeout: Duration,
+        active_tasks: Arc<AtomicUsize>,
+    ) -> anyhow::Result<Arc<Self>> {
         let domain = if address.is_ipv4() {
             socket2::Domain::IPV4
         } else {

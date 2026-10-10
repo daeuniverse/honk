@@ -398,6 +398,8 @@ fn empty_response_preserves_exact_question_and_sanitizes_edns() {
 }
 mod asis_transport;
 mod cache_routing;
+#[cfg(feature = "native-api")]
+mod diagnostic;
 mod family_and_negative;
 mod rule_pipeline;
 mod service_flush;

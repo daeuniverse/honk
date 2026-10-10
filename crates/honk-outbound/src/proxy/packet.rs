@@ -15,7 +15,7 @@ pub struct QuicSendToken {
     pub(crate) ack_epoch: u64,
     pub(crate) ack_baseline: u64,
     pub(crate) sent_baseline: u64,
-    pub(crate) started_at: u64,
+    active: bool,
 }
 
 impl QuicSendToken {
@@ -23,25 +23,20 @@ impl QuicSendToken {
         ack_epoch: 0,
         ack_baseline: 0,
         sent_baseline: 0,
-        started_at: 0,
+        active: false,
     };
 
-    pub(crate) fn new(
-        ack_epoch: u64,
-        ack_baseline: u64,
-        sent_baseline: u64,
-        started_at: u64,
-    ) -> Self {
+    pub(crate) fn new(ack_epoch: u64, ack_baseline: u64, sent_baseline: u64) -> Self {
         Self {
             ack_epoch,
             ack_baseline,
             sent_baseline,
-            started_at,
+            active: true,
         }
     }
 
     pub(crate) fn is_active(self) -> bool {
-        self.started_at != 0
+        self.active
     }
 }
 
@@ -256,7 +251,7 @@ impl<T: ?Sized + Send + Sync + 'static> PreparedUdpTransport<T> {
         Fut: Future<Output = anyhow::Result<Arc<T>>> + Send + 'static,
     {
         Self {
-            commit: Box::pin(commit),
+            commit: Box::pin(crate::runtime::TaskScope::capture().scope_owned(commit)),
         }
     }
     /// Wrap an already-authoritative ordinary transport. This deliberately
@@ -286,14 +281,17 @@ where
     if !matches!(runtime.runtime, crate::runtime::ProtocolRuntime::Quic(_)) {
         anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
     }
-    let transport = prepare(Arc::clone(&client)).await?;
-    Ok(PreparedUdpTransport::new(async move {
-        let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
-            anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
-        };
-        quic.publish_client(client).await?;
-        Ok(transport)
-    }))
+    let task_scope = runtime.task_scope();
+    let transport = runtime.scope_tasks(prepare(Arc::clone(&client))).await?;
+    Ok(PreparedUdpTransport::new(task_scope.scope_owned(
+        async move {
+            let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+                anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
+            };
+            quic.publish_client(client).await?;
+            Ok(transport)
+        },
+    )))
 }
 
 /// Adapter presenting a raw `UdpSocket` (e.g. the direct handler's

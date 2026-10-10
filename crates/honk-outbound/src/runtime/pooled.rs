@@ -18,9 +18,6 @@ impl PooledLifecycle for AnyTlsRuntime {
         if retention == 0 || was_unretained {
             self.pool.set_warm_retained(retention != 0);
         }
-        if retention == 0 {
-            self.tls.evict();
-        }
     }
     fn retire(&self) {
         self.pool.retire();
@@ -189,8 +186,12 @@ impl NodeRuntime {
             let runtime = Arc::clone(self);
             // Spawn before awaiting so cancellation of the releasing caller
             // cannot strand a client after the ownership bit reached zero.
-            let cleanup = tokio::spawn(async move { runtime.release_if_unretained().await });
-            let _ = cleanup.await;
+            let (finished, done) = tokio::sync::oneshot::channel();
+            let _ = self.task_scope().spawn(async move {
+                runtime.release_if_unretained().await;
+                let _ = finished.send(());
+            });
+            let _ = done.await;
         }
     }
 
@@ -215,11 +216,19 @@ impl NodeRuntime {
     /// mux pool sessions (connections + drivers), or one cached QUIC client
     /// (connection + endpoint driver). Terminal for the runtime; idempotent.
     pub async fn close(&self) {
+        #[cfg(feature = "owned-tasks")]
+        if let Some(owner) = &self.task_owner {
+            owner.abort();
+        }
         self.shutdown_pools();
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.close(),
             ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
             _ => {}
+        }
+        #[cfg(feature = "owned-tasks")]
+        if let Some(owner) = &self.task_owner {
+            owner.close().await;
         }
     }
 }
@@ -263,9 +272,12 @@ impl Drop for WarmAttempt {
         self.runtime.sync_pooled_retention(*retention, false);
         if *retention == 0 && matches!(&self.runtime.runtime, ProtocolRuntime::Quic(_)) {
             drop(retention);
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if tokio::runtime::Handle::try_current().is_ok() {
                 let runtime = Arc::clone(&self.runtime);
-                handle.spawn(async move { runtime.release_if_unretained().await });
+                let _ = self
+                    .runtime
+                    .task_scope()
+                    .spawn(async move { runtime.release_if_unretained().await });
             }
         }
     }

@@ -50,7 +50,7 @@ async fn head_fallback_does_not_certify_the_configured_get_latency() {
             reporter.finish_setup_only();
         }
     }
-    let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&nodes[1]).unwrap();
+    let mut guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&nodes[1]).unwrap();
     for _ in 0..4 {
         let feedback = manager
             .feedback_for_node(nodes[1].id, context.clone())
@@ -70,7 +70,7 @@ async fn head_fallback_does_not_certify_the_configured_get_latency() {
         .expect("URLTest must preserve its valid HEAD fallback");
     }
     peer.await.unwrap();
-    guard.close().await;
+    guard.close().await.unwrap();
     assert_eq!(
         manager.get_score_selection_for_network("score", SelectionNetwork::Tcp),
         Some("stable".into()),

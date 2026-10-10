@@ -210,13 +210,13 @@ pub(super) async fn publish_snapshot_forwarder(
     forwarder: Arc<DnsForwarder>,
 ) {
     let provider = controller.runtime_provider();
-    let current = provider.acquire();
+    let current = provider.current();
     let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
         generation: crate::dns::runtime::RuntimeGeneration::new(
-            current.runtime().generation().get().saturating_add(1),
+            current.generation().get().saturating_add(1),
         ),
         forwarder: Arc::clone(&forwarder),
-        routing_projection: Arc::clone(current.runtime().routing_projection()),
+        routing_projection: Arc::clone(current.routing_projection()),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
         udp_query_limit: 256,

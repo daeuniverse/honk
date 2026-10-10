@@ -1,10 +1,10 @@
-//! Native eBPF emitter for the fixed RoutingInput/Decision ABI.
+//! Native eBPF emitter for the fixed RoutingInput/KernelRouteOutput ABI.
 //!
 //! The emitter produces only a function body.  The backend supplies the real
 //! freplace prototype, BTF and map lifetime; R1 is `*const RoutingInput` and
-//! R2 is `*mut RoutingDecision`.
+//! R2 is `*mut KernelRouteOutput`.
 
-use super::{KernelAction, KernelCondition, KernelPredicate, RoutingPushPlan};
+use super::{KernelAction, KernelCondition, KernelPredicate, KernelTraceLayout, RoutingPushPlan};
 use anyhow::{Context, ensure};
 use aya_obj::generated::{
     BPF_ALU64, BPF_AND, BPF_B, BPF_CALL, BPF_DW, BPF_EXIT, BPF_IMM, BPF_JA, BPF_JEQ, BPF_JGE,
@@ -12,8 +12,11 @@ use aya_obj::generated::{
     BPF_STX, BPF_W, BPF_X, bpf_insn,
 };
 use honk_ebpf_common::{
-    ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
-    ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
+    KernelRouteOutput, ROUTE_FACT_PRESENT_SHIFT, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_ENABLED,
+    ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW, ROUTE_TRACE_VALUES,
+    ROUTE_TRACE_VERSION, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
+    ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_INPUT_ALLOW_DIRECT_FINALITY,
+    ROUTING_INPUT_MAC_PRESENT, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
 };
 
 const R0: u8 = 0;
@@ -25,6 +28,7 @@ const R5: u8 = 5;
 const R6: u8 = 6;
 const R7: u8 = 7;
 const R8: u8 = 8;
+const R9: u8 = 9;
 const R10: u8 = 10;
 const MAP_LOOKUP_ELEM: i32 = 1;
 const BPF_INSTRUCTION_CAPACITY: usize = 1_000_000;
@@ -45,12 +49,17 @@ const INPUT_PROTO: i16 = std::mem::offset_of!(RoutingInput, l4proto) as i16;
 const INPUT_VERSION: i16 = std::mem::offset_of!(RoutingInput, ip_version) as i16;
 const INPUT_DSCP: i16 = std::mem::offset_of!(RoutingInput, dscp) as i16;
 const INPUT_PNAME_LEN: i16 = std::mem::offset_of!(RoutingInput, pname_len) as i16;
-const INPUT_MAC_PRESENT: i16 = std::mem::offset_of!(RoutingInput, mac_present) as i16;
+const INPUT_FLAGS: i16 = std::mem::offset_of!(RoutingInput, flags) as i16;
 const OUTBOUND: i16 = std::mem::offset_of!(RoutingDecision, outbound) as i16;
 const MARK: i16 = std::mem::offset_of!(RoutingDecision, mark) as i16;
 const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
 const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
 const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
+const TRACE_FLAGS: i16 = std::mem::offset_of!(KernelRouteOutput, flags) as i16;
+const TRACE_FACT_STATE: i16 = std::mem::offset_of!(KernelRouteOutput, fact_state) as i16;
+const TRACE_INPUT: i16 = std::mem::offset_of!(KernelRouteOutput, input) as i16;
+const TRACE_DOMAIN: i16 = std::mem::offset_of!(KernelRouteOutput, domain_bitmap) as i16;
+const TRACE_OUTCOMES: i16 = std::mem::offset_of!(KernelRouteOutput, outcomes) as i16;
 const DIRECT_MARK_INDEX: i16 = std::mem::offset_of!(RoutingDecision, direct_mark_index) as i16;
 
 /// One lookup category. Each owns a 32-byte stack area holding its
@@ -91,6 +100,7 @@ pub struct RoutingSourceLine {
 pub struct RoutingBytecode {
     pub insns: Vec<bpf_insn>,
     pub lines: Vec<RoutingSourceLine>,
+    pub trace_layout: Option<KernelTraceLayout>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +111,7 @@ struct Assembler {
     lines: Vec<RoutingSourceLine>,
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label)>,
+    trace_layout: Option<KernelTraceLayout>,
 }
 
 impl Assembler {
@@ -110,6 +121,7 @@ impl Assembler {
             lines: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
+            trace_layout: None,
         }
     }
 
@@ -177,6 +189,7 @@ impl Assembler {
         Ok(RoutingBytecode {
             insns: self.insns,
             lines: self.lines,
+            trace_layout: self.trace_layout,
         })
     }
 
@@ -254,7 +267,7 @@ impl Assembler {
 /// store would make the mask a constant again.
 const READY: u8 = R8;
 
-/// Emit a complete RoutingInput -> RoutingDecision function body.
+/// Emit a complete RoutingInput -> KernelRouteOutput function body.
 pub fn emit_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
@@ -272,6 +285,7 @@ pub fn emit_routing_program(
     }
 
     let mut asm = Assembler::new();
+    asm.trace_layout = plan.trace_layout();
     asm.source(0, "routing function prologue");
     for register in [R1, R2] {
         let nonnull = asm.label();
@@ -299,58 +313,68 @@ pub fn emit_routing_program(
             asm.stx_dw(R10, R1, kind.area() + word * 8)?;
         }
     }
+    emit_trace_init(&mut asm)?;
 
     if plan.has_domain_rules {
         emit_fact_lookup(&mut asm, FactKind::Domain, &fds)?;
     }
 
+    let domain_reroute = plan.features & ROUTING_FEATURE_DOMAIN_REROUTE != 0;
+    let mut domain_prefix = false;
+    let mut trace_slot = 0;
     for rule in &plan.rules {
+        let rule_slot = trace_slot;
+        trace_slot += 1 + rule.conditions.len();
         // BPF rejects structurally unreachable instructions before evaluating predicates.
-        if rule
-            .conditions
-            .iter()
-            .any(|condition| !condition.not && predicate_is_empty(&condition.predicate))
-        {
+        if rule.folded_false() {
             continue;
         }
         asm.source(rule.id + 1, rule.source.as_str());
         let fail = asm.label();
         let mut conditional = false;
-        let port_first = |condition: &&KernelCondition| {
-            matches!(
-                condition.predicate,
-                KernelPredicate::DestinationPort(_) | KernelPredicate::SourcePort(_)
-            )
-        };
-        for condition in rule
-            .conditions
-            .iter()
-            .filter(|condition| !predicate_is_empty(&condition.predicate))
-            .filter(port_first)
-            .chain(
-                rule.conditions
-                    .iter()
-                    .filter(|condition| !predicate_is_empty(&condition.predicate))
-                    .filter(|condition| !port_first(condition)),
-            )
-        {
+        for (rank, (_, condition)) in rule.runtime_conditions().enumerate() {
+            domain_prefix |= matches!(condition.predicate, KernelPredicate::Domain(_));
             let pass = asm.label();
-            emit_condition(&mut asm, condition, pass, fail, &fds)?;
+            if plan.trace_enabled {
+                let missed = asm.label();
+                emit_condition(&mut asm, condition, pass, missed, &fds)?;
+                asm.bind(missed);
+                emit_trace_outcome(&mut asm, rule_slot + 1 + rank, ROUTE_TRACE_NOT_MATCHED)?;
+                asm.ja(fail)?;
+            } else {
+                emit_condition(&mut asm, condition, pass, fail, &fds)?;
+            }
             conditional = true;
             asm.bind(pass);
+            emit_trace_outcome(&mut asm, rule_slot + 1 + rank, ROUTE_TRACE_MATCHED)?;
         }
-        emit_action(&mut asm, rule.action, Some(rule.id))?;
+        emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_MATCHED)?;
+        emit_action(
+            &mut asm,
+            rule.action,
+            Some(rule.id),
+            domain_reroute && !domain_prefix,
+        )?;
+        emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
         if !conditional {
             return asm.finish();
         }
         asm.bind(fail);
+        emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_NOT_MATCHED)?;
     }
 
     // The prologue's zero MARK seeds READY, so fallback options are stored only here.
     asm.source(0, "fallback");
-    emit_action(&mut asm, plan.fallback, None)?;
+    emit_trace_outcome(&mut asm, trace_slot, ROUTE_TRACE_MATCHED)?;
+    emit_action(
+        &mut asm,
+        plan.fallback,
+        None,
+        domain_reroute && !domain_prefix,
+    )?;
+    emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
     asm.mov_imm(R0, 0)?;
     asm.exit()?;
     asm.finish()
@@ -360,7 +384,19 @@ fn emit_action(
     asm: &mut Assembler,
     action: KernelAction,
     rule_id: Option<u32>,
+    refine_direct_finality: bool,
 ) -> anyhow::Result<()> {
+    if refine_direct_finality
+        && action.outbound == honk_ebpf_common::OutboundIndex::Direct as u8
+        && !action.must
+    {
+        let not_final = asm.label();
+        asm.ldx_w(R0, R6, INPUT_FLAGS)?;
+        asm.and_imm(R0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32)?;
+        asm.jump(BPF_JEQ, R0, 0, not_final)?;
+        asm.st_imm(R7, DOMAIN_FINAL, 1)?;
+        asm.bind(not_final);
+    }
     if rule_id.is_some() {
         asm.st_imm(R7, OUTBOUND, action.outbound as i32)?;
     }
@@ -481,21 +517,6 @@ fn validate_plan(plan: &RoutingPushPlan) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn predicate_is_empty(predicate: &KernelPredicate) -> bool {
-    match predicate {
-        KernelPredicate::DestinationPort(ranges) | KernelPredicate::SourcePort(ranges) => {
-            ranges.is_empty()
-        }
-        KernelPredicate::Protocol(mask) | KernelPredicate::IpVersion(mask) => *mask == 0,
-        KernelPredicate::Dscp(values) => values.is_empty(),
-        KernelPredicate::ProcessName(names) => names.is_empty(),
-        KernelPredicate::Domain(_)
-        | KernelPredicate::DestinationIp(_)
-        | KernelPredicate::SourceIp(_)
-        | KernelPredicate::Mac(_) => false,
-    }
-}
-
 fn emit_condition(
     asm: &mut Assembler,
     condition: &KernelCondition,
@@ -506,6 +527,75 @@ fn emit_condition(
     let on_true = if condition.not { fail } else { pass };
     let on_false = if condition.not { pass } else { fail };
     emit_predicate(asm, &condition.predicate, on_true, on_false, fds)
+}
+
+fn emit_trace_init(asm: &mut Assembler) -> anyhow::Result<()> {
+    if asm.trace_layout.is_none() {
+        return Ok(());
+    }
+    let disabled = asm.label();
+    asm.ldx_w(R9, R7, TRACE_FLAGS)?;
+    asm.and_imm(R9, ROUTE_TRACE_ENABLED as i32)?;
+    asm.jump(BPF_JEQ, R9, 0, disabled)?;
+    asm.st_imm(
+        R7,
+        TRACE_FLAGS,
+        (ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED) as i32,
+    )?;
+    asm.st_imm(R7, TRACE_FACT_STATE, 0)?;
+    for word in 0..ROUTE_TRACE_WORDS {
+        asm.st_imm(R7, TRACE_OUTCOMES + (word * 4) as i16, 0)?;
+    }
+    for word in 0..FACT_BYTES / 4 {
+        asm.st_imm(R7, TRACE_DOMAIN + word * 4, 0)?;
+    }
+    for word in 0..std::mem::size_of::<RoutingInput>() / 4 {
+        asm.ldx_w(R1, R6, (word * 4) as i16)?;
+        asm.stx_w(R7, R1, TRACE_INPUT + (word * 4) as i16)?;
+    }
+    asm.bind(disabled);
+    Ok(())
+}
+
+/// Every site is reached at most once. OR preserves adjacent two-bit values;
+/// a capture budget miss records loss, never short-circuits the routing code.
+fn emit_trace_outcome(asm: &mut Assembler, slot: usize, result: u32) -> anyhow::Result<()> {
+    if slot >= ROUTE_TRACE_VALUES {
+        emit_trace_or(asm, TRACE_FLAGS, ROUTE_TRACE_OVERFLOW)
+    } else {
+        emit_trace_or(
+            asm,
+            TRACE_OUTCOMES + (slot / 16 * 4) as i16,
+            result << (slot % 16 * 2),
+        )
+    }
+}
+
+fn emit_trace_or(asm: &mut Assembler, offset: i16, bits: u32) -> anyhow::Result<()> {
+    if asm.trace_layout.is_none() {
+        return Ok(());
+    }
+    let disabled = asm.label();
+    asm.jump(BPF_JEQ, R9, 0, disabled)?;
+    asm.ldx_w(R1, R7, offset)?;
+    asm.or_imm(R1, bits as i32)?;
+    asm.stx_w(R7, R1, offset)?;
+    asm.bind(disabled);
+    Ok(())
+}
+
+fn emit_trace_domain(asm: &mut Assembler) -> anyhow::Result<()> {
+    if asm.trace_layout.is_none() {
+        return Ok(());
+    }
+    let disabled = asm.label();
+    asm.jump(BPF_JEQ, R9, 0, disabled)?;
+    for word in 0..FACT_BYTES / 8 {
+        asm.ldx_dw(R1, R10, FactKind::Domain.area() + word * 8)?;
+        asm.stx_dw(R7, R1, TRACE_DOMAIN + word * 8)?;
+    }
+    asm.bind(disabled);
+    Ok(())
 }
 
 /// Test one bit of a lazily resolved category. The READY bit is set only
@@ -704,7 +794,8 @@ fn emit_fact_lookup(
             load_map_fd(asm, fds.domain)?;
         }
         FactKind::Mac => {
-            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
+            asm.ldx_w(R0, R6, INPUT_FLAGS)?;
+            asm.and_imm(R0, ROUTING_INPUT_MAC_PRESENT as i32)?;
             asm.jump(BPF_JEQ, R0, 0, absent)?;
             write_key_from_input(asm, INPUT_MAC, 128)?;
             load_map_fd(asm, fds.mac)?;
@@ -738,6 +829,11 @@ fn emit_fact_lookup(
         asm.ldx_dw(R1, R0, word * 8)?;
         asm.stx_dw(R10, R1, kind.area() + word * 8)?;
     }
+    emit_trace_or(
+        asm,
+        TRACE_FACT_STATE,
+        (1 << kind as u32) << ROUTE_FACT_PRESENT_SHIFT,
+    )?;
     asm.ja(done)?;
     asm.bind(absent);
     asm.mov_imm(R1, 0)?;
@@ -745,6 +841,10 @@ fn emit_fact_lookup(
         asm.stx_dw(R10, R1, kind.area() + word * 8)?;
     }
     asm.bind(done);
+    emit_trace_or(asm, TRACE_FACT_STATE, 1 << kind as u32)?;
+    if matches!(kind, FactKind::Domain) {
+        emit_trace_domain(asm)?;
+    }
     Ok(())
 }
 

@@ -79,6 +79,9 @@ pub async fn resolve_with(
     host: &str,
 ) -> io::Result<Vec<IpAddr>> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Some(ip) = crate::runtime::pinned_server_address(host) {
+        return Ok(vec![ip]);
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
@@ -89,9 +92,20 @@ pub async fn resolve_with(
             Err(e) => tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e),
         }
     }
+    resolve_system(host).await
+}
+
+/// `/etc/hosts`, then bypass-marked queries to the first numeric system nameserver.
+/// A hosts answer is observed as its own lookup; each nameserver query observes itself.
+async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
         let addrs = hosts_addresses(&contents, host);
         if !addrs.is_empty() {
+            if let Some(mut observation) =
+                LookupObservation::start(host, "UNKNOWN", LookupOrigin::Hosts)
+            {
+                observation.finish(Ok::<_, &io::Error>(addrs.iter().copied()));
+            }
             return Ok(addrs);
         }
     }
@@ -135,8 +149,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl BootstrapResolver {
     /// Query A and AAAA records for `host` directly from the configured
-    /// server over bypass-marked sockets.
-    async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+    /// server over bypass-marked sockets, without a system-resolver fallback.
+    pub async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         // Separate budgets: a stalled or failing family must not discard the other's answer.
         match tokio::join!(self.query_family(host, 1), self.query_family(host, 28)) {
             (Err(e), Err(_)) => Err(e),
@@ -145,12 +159,27 @@ impl BootstrapResolver {
     }
 
     async fn query_family(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        let msg = tokio::time::timeout(QUERY_TIMEOUT, self.query_raw(host, qtype))
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out")
-            })??;
-        parse_answers(&msg, qtype)
+        let mut observation = LookupObservation::start(
+            host,
+            qtype_name(qtype),
+            LookupOrigin::Upstream(self.server, if self.use_tcp { "tcp" } else { "udp" }),
+        );
+        let result = async {
+            let msg = tokio::time::timeout(QUERY_TIMEOUT, self.query_raw(host, qtype))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out")
+                })??;
+            parse_answers(&msg, qtype)
+        };
+        let result = match &observation {
+            Some(observation) => observation.child().scope(result).await,
+            None => result.await,
+        };
+        if let Some(observation) = &mut observation {
+            observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
+        }
+        result
     }
 
     /// Send a single query and return the raw response that answers it.
@@ -270,8 +299,23 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
             }
         }
     };
-    let msg = resolver.query_raw(host, QTYPE_HTTPS).await?;
-    Ok(parse_https_rr_ech(&msg))
+    let mut observation = LookupObservation::start(
+        host,
+        "HTTPS",
+        LookupOrigin::Upstream(
+            resolver.server,
+            if resolver.use_tcp { "tcp" } else { "udp" },
+        ),
+    );
+    let operation = resolver.query_raw(host, QTYPE_HTTPS);
+    let result = match &observation {
+        Some(observation) => observation.child().scope(operation).await,
+        None => operation.await,
+    };
+    if let Some(observation) = &mut observation {
+        observation.finish(result.as_ref().map(|_| std::iter::empty()));
+    }
+    Ok(parse_https_rr_ech(&result?))
 }
 
 /// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
@@ -425,6 +469,127 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
         pos += 1 + len as usize;
         if pos > msg.len() {
             return Err(bad());
+        }
+    }
+}
+
+/// Human-readable qtype name for logs and flow observations.
+pub fn qtype_name(qtype: u16) -> &'static str {
+    match qtype {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        65 => "HTTPS",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Where an observed lookup's answer comes from.
+enum LookupOrigin {
+    /// `/etc/hosts`, without a DNS exchange.
+    Hosts,
+    /// A bypass-marked exchange with this nameserver over this transport.
+    Upstream(SocketAddr, &'static str),
+}
+
+struct LookupObservation {
+    observer: crate::runtime::flow_observation::FlowObserver,
+    data: crate::runtime::flow_observation::DnsLookup,
+    finished: bool,
+}
+
+impl LookupObservation {
+    fn start(host: &str, qtype: &str, origin: LookupOrigin) -> Option<Self> {
+        use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
+        let observer = current()?;
+        if host.is_empty() || host.len() > 253 {
+            observer.publish(FlowEvent::Gap(
+                crate::runtime::flow_observation::GapReason::Redacted,
+            ));
+            return None;
+        }
+        let context = observer.context();
+        let (source, upstream) = match origin {
+            LookupOrigin::Hosts => ("hosts", None),
+            LookupOrigin::Upstream(address, transport) => ("upstream", Some((address, transport))),
+        };
+        let data = DnsLookup {
+            lookup_id: uuid::Uuid::new_v4(),
+            parent_lookup_id: context.lookup_id,
+            attempt_id: context.attempt_id,
+            purpose: context.dns_purpose,
+            name: host.to_owned(),
+            qtype: qtype.to_owned(),
+            source,
+            upstream_transport: upstream.map(|(_, transport)| transport),
+            carrier_transport: upstream.map(|(_, transport)| transport),
+            cache: "bypass",
+            cache_entry_id: None,
+            upstream: upstream.map(|(address, _)| address.to_string()),
+            route_evaluation_ids: Vec::new(),
+            status: "started",
+            addresses: Vec::new(),
+            selected_ip: None,
+            error: None,
+        };
+        observer.publish(FlowEvent::Dns(data.clone()));
+        Some(Self {
+            observer,
+            data,
+            finished: false,
+        })
+    }
+
+    fn child(&self) -> crate::runtime::flow_observation::FlowObserver {
+        let mut context = self.observer.context();
+        context.lookup_id = Some(self.data.lookup_id);
+        self.observer.with_context(context)
+    }
+
+    fn finish<I: Iterator<Item = IpAddr>>(&mut self, result: Result<I, &io::Error>) {
+        use crate::runtime::flow_observation::FlowEvent;
+        self.finished = true;
+        match result {
+            Ok(addresses) => {
+                self.data.status = "succeeded";
+                for address in addresses {
+                    if self.data.addresses.contains(&address) {
+                        continue;
+                    }
+                    if self.data.addresses.len() == 32 {
+                        self.observer.publish(FlowEvent::Gap(
+                            crate::runtime::flow_observation::GapReason::BufferOverflow,
+                        ));
+                        break;
+                    }
+                    self.data.addresses.push(address);
+                }
+            }
+            Err(error) => {
+                self.data.status = "failed";
+                self.data.error = Some(if error.kind() == io::ErrorKind::TimedOut {
+                    "timeout"
+                } else {
+                    "resolution_failed"
+                });
+            }
+        }
+        self.observer.publish(FlowEvent::Dns(self.data.clone()));
+    }
+}
+
+impl Drop for LookupObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.data.status = "cancelled";
+            self.data.error = Some("cancelled");
+            self.observer
+                .publish(crate::runtime::flow_observation::FlowEvent::Dns(
+                    self.data.clone(),
+                ));
         }
     }
 }

@@ -228,7 +228,7 @@ async fn packet_policy_precedes_every_vless_dial_path() {
     .unwrap_err();
     assert!(super::super::is_packet_rejection(&direct));
 
-    let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
+    let mut owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
     let runtime = owner.runtime();
     let runtime_error = tokio::time::timeout(
         deadline,
@@ -246,7 +246,7 @@ async fn packet_policy_precedes_every_vless_dial_path() {
     .expect("speculative VLESS target policy blocked during preflight")
     .unwrap_err();
     assert!(super::super::is_packet_rejection(&speculative_error));
-    owner.close().await;
+    owner.close().await.unwrap();
 
     let disabled = Node::from_share_link(&format!(
         "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@127.0.0.1:{port}?security=none&udp=0#disabled"

@@ -34,6 +34,67 @@ async fn fragmented_and_coalesced_responses_are_demultiplexed() {
     session.close();
 }
 
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn shared_xudp_records_each_business_target_once_without_carrying_opener_context() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observe = |flow_id| {
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id,
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |context, event| {
+                if let FlowEvent::Milestone { milestone } = event {
+                    events.lock().push((context.flow_id, milestone.as_str()));
+                }
+            }),
+        )
+    };
+    let first = observe(uuid::Uuid::new_v4());
+    let second = observe(uuid::Uuid::new_v4());
+    let (client, mut wire) = tokio::io::duplex(1 << 16);
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
+    let transport = first
+        .scope(open_xudp(
+            Arc::clone(&session),
+            session.try_reserve().unwrap(),
+            udp_target(),
+            None,
+            [1; 8],
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("shared child failed to open"));
+    assert!(
+        events.lock().is_empty(),
+        "opening a deferred child sends no target"
+    );
+    for observer in [&first, &first, &second] {
+        observer
+            .scope(transport.send_to(udp_target(), None, b"dns", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_wire_frame(&mut wire).await.payload.unwrap(),
+            Bytes::from_static(b"dns")
+        );
+    }
+    assert_eq!(
+        &*events.lock(),
+        &[
+            (first.context().flow_id, "target_request_sent"),
+            (second.context().flow_id, "target_request_sent"),
+        ]
+    );
+    drop(transport);
+    session.close();
+}
+
 #[tokio::test]
 async fn tcp_receive_budget_waits_for_transient_reader_backpressure() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);

@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 
 struct Registry {
     closed: bool,
+    failed: bool,
     tasks: JoinSet<()>,
 }
 
@@ -18,6 +19,7 @@ impl RefreshTasks {
         Arc::new(Self {
             registry: Mutex::new(Registry {
                 closed: false,
+                failed: false,
                 tasks: JoinSet::new(),
             }),
         })
@@ -25,29 +27,44 @@ impl RefreshTasks {
 
     pub(super) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
         let mut registry = self.registry.lock();
-        while registry.tasks.try_join_next().is_some() {}
+        while let Some(result) = registry.tasks.try_join_next() {
+            registry.failed |= result.is_err_and(|error| !error.is_cancelled());
+        }
         if registry.closed {
             return false;
         }
 
+        #[cfg(feature = "native-api")]
+        let task = honk_outbound::runtime::TaskScope::capture().scope_owned(task);
         registry.tasks.spawn(task);
         true
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(super) fn request_shutdown(&self) {
+        let mut registry = self.registry.lock();
+        registry.closed = true;
+        registry.tasks.abort_all();
+    }
+
+    pub(super) async fn shutdown(&self) -> bool {
         let mut tasks = {
             let mut registry = self.registry.lock();
             registry.closed = true;
             std::mem::take(&mut registry.tasks)
         };
         tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        while let Some(result) = tasks.join_next().await {
+            self.registry.lock().failed |= result.is_err_and(|error| !error.is_cancelled());
+        }
+        !self.registry.lock().failed
     }
 
     #[cfg(test)]
     pub(super) fn active(&self) -> usize {
         let mut registry = self.registry.lock();
-        while registry.tasks.try_join_next().is_some() {}
+        while let Some(result) = registry.tasks.try_join_next() {
+            registry.failed |= result.is_err_and(|error| !error.is_cancelled());
+        }
         registry.tasks.len()
     }
 }

@@ -1,5 +1,5 @@
 use aya_ebpf::Global;
-use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, RingBuf, SockMap};
+use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SockMap};
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
     BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
@@ -138,6 +138,16 @@ pub fn udp_decision_retiring(key: &TuplesKey) -> bool {
 pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = HashMap::new();
 
 #[btf_map]
+/// LAN framing of the client side of a redirected non-DNS UDP flow, keyed by the
+/// client address and port alone (destination zeroed, token cleared). A reply
+/// from a peer the client never contacted has no exact `REDIRECT_TRACK` entry
+/// but must still reach the same client. Kernel LRU eviction is approximate:
+/// near capacity, and sooner with many CPUs, it can drop a quiet client before
+/// the map is full. That only restores the previous behaviour for that client,
+/// unlike the plain hashes above, so no userspace sweep owns it.
+pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
+
+#[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
 /// timeout).
 pub static ROUTING_HANDOFF_MAP: HashMap<
@@ -146,6 +156,23 @@ pub static ROUTING_HANDOFF_MAP: HashMap<
     MAX_ROUTING_HANDOFF_NUM,
     1,
 > = HashMap::new();
+
+#[repr(C)]
+pub struct RouteTraceSequence {
+    pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
+    pub next: u32,
+}
+
+// Instance-local: unlike the UDP decision allocator, this map is never reused.
+#[btf_map]
+pub static ROUTE_TRACE_SEQUENCE: Array<RouteTraceSequence, 1> = Array::new();
+
+#[btf_map]
+pub static ROUTE_TRACE_MAP: LruHashMap<
+    u32,
+    honk_ebpf_common::KernelRouteWitness,
+    { honk_ebpf_common::ROUTE_TRACE_CAPACITY as usize },
+> = LruHashMap::new();
 
 /// Stable one-entry policy root. The backend atomically swaps the immutable
 /// descriptor map only after every inactive target slot and its generation-owned

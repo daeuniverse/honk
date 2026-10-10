@@ -1,8 +1,7 @@
-//! Rollback-safe exact-key DNS cache persistence.
+//! Exact-key DNS cache persistence in the state db's `dns_answer` table.
 //!
-//! Version-two entries live under `dns:v2:` and never modify or consume the
-//! legacy `dns:` representation. A bounded actor owns SQLite writes and
-//! linearizes explicit flushes with an epoch barrier.
+//! A bounded actor owns SQLite writes and linearizes explicit flushes with an
+//! epoch barrier.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::cache::{CacheKey, DnsCacheService};
 use super::policy::PolicyId;
-use crate::cachedb::CacheDb;
+use crate::state::cache::CacheDb;
 
 mod codec;
 mod counters {
@@ -25,6 +24,8 @@ mod counters {
         pub dropped_full: u64,
         pub dropped_pending_full: u64,
         pub dropped_closed: u64,
+        pub oversize: u64,
+        pub budget_skipped: u64,
         pub old_epoch_discarded: u64,
         pub written: u64,
         pub restored: u64,
@@ -43,6 +44,8 @@ mod counters {
         pub(super) dropped_full: AtomicU64,
         pub(super) dropped_pending_full: AtomicU64,
         pub(super) dropped_closed: AtomicU64,
+        pub(super) oversize: AtomicU64,
+        pub(super) budget_skipped: AtomicU64,
         pub(super) old_epoch_discarded: AtomicU64,
         pub(super) written: AtomicU64,
         pub(super) restored: AtomicU64,
@@ -62,6 +65,8 @@ mod counters {
                 dropped_full: self.dropped_full.load(Ordering::Relaxed),
                 dropped_pending_full: self.dropped_pending_full.load(Ordering::Relaxed),
                 dropped_closed: self.dropped_closed.load(Ordering::Relaxed),
+                oversize: self.oversize.load(Ordering::Relaxed),
+                budget_skipped: self.budget_skipped.load(Ordering::Relaxed),
                 old_epoch_discarded: self.old_epoch_discarded.load(Ordering::Relaxed),
                 written: self.written.load(Ordering::Relaxed),
                 restored: self.restored.load(Ordering::Relaxed),
@@ -80,7 +85,7 @@ mod worker;
 use counters::CounterSet;
 pub use counters::PersistCounters;
 
-const COMMAND_CAPACITY: usize = 4096;
+const COMMAND_CAPACITY: usize = 1024;
 
 struct Put {
     epoch: u64,
@@ -95,8 +100,15 @@ enum Command {
         epoch: u64,
         ack: oneshot::Sender<Result<(), PersistControlError>>,
     },
+    #[cfg(any(feature = "native-api", test))]
+    Invalidate {
+        epoch: u64,
+        selection: PersistInvalidation,
+        ack: oneshot::Sender<Result<(), PersistControlError>>,
+    },
     Restore {
         cache: Arc<DnsCacheService>,
+        publication_epoch: super::cache::PublicationEpoch,
         policy: Option<PolicyId>,
         ack: oneshot::Sender<usize>,
     },
@@ -115,6 +127,89 @@ pub enum PersistControlError {
     WorkerFailed,
     #[error("DNS persistence database operation failed: {0}")]
     Database(String),
+}
+
+pub(crate) enum PersistInvalidation {
+    All,
+    #[cfg(any(feature = "native-api", test))]
+    Keys(Vec<CacheKey>),
+    #[cfg(any(feature = "native-api", test))]
+    Name {
+        name: String,
+        types: Vec<u16>,
+    },
+}
+
+pub(crate) struct ReservedInvalidation<'a> {
+    permit: mpsc::Permit<'a, Command>,
+    persister: &'a DnsCachePersister,
+}
+
+pub(crate) struct PendingInvalidation {
+    receive: oneshot::Receiver<Result<(), PersistControlError>>,
+    #[cfg(test)]
+    gate: Option<FlushGate>,
+}
+
+impl ReservedInvalidation<'_> {
+    pub(crate) fn send(self, selection: PersistInvalidation) -> PendingInvalidation {
+        let epoch = self
+            .persister
+            .epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                epoch.checked_add(1)
+            })
+            .expect("DNS persistence epoch exhausted")
+            + 1;
+        let (ack, receive) = oneshot::channel();
+        let command = match selection {
+            PersistInvalidation::All => Command::Flush { epoch, ack },
+            #[cfg(any(feature = "native-api", test))]
+            selection => Command::Invalidate {
+                epoch,
+                selection,
+                ack,
+            },
+        };
+        self.persister
+            .counters
+            .queued
+            .fetch_add(1, Ordering::Relaxed);
+        self.permit.send(command);
+        PendingInvalidation {
+            receive,
+            #[cfg(test)]
+            gate: self
+                .persister
+                .flush_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        }
+    }
+}
+
+impl PendingInvalidation {
+    pub(crate) async fn complete(self) -> Result<(), PersistControlError> {
+        #[cfg(test)]
+        if let Some(gate) = self.gate {
+            gate.entered.notify_one();
+            gate.release
+                .acquire()
+                .await
+                .unwrap_or_else(|_| unreachable!("test flush gate remains open"))
+                .forget();
+        }
+        let result = self
+            .receive
+            .await
+            .map_err(|_| PersistControlError::AckDropped)
+            .and_then(std::convert::identity);
+        if let Err(error) = &result {
+            record_flush_failure(error);
+        }
+        result
+    }
 }
 
 #[derive(Clone)]
@@ -163,6 +258,12 @@ impl DnsCachePersister {
     }
 
     pub(crate) fn save(&self, key: CacheKey, response: bytes::Bytes, expire_at_unix: u64) {
+        // Cannot fit once encoded; `receive_put` checks the exact size.
+        if response.len() > worker::MAX_ENTRY_BYTES {
+            self.counters.oversize.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(reason = "oversize", "DNS persistence write dropped");
+            return;
+        }
         let command = Command::Put(Put {
             epoch: self.epoch.load(Ordering::SeqCst),
             key,
@@ -196,8 +297,14 @@ impl DnsCachePersister {
         policy: Option<PolicyId>,
     ) -> Result<usize, PersistControlError> {
         let (ack, receive) = oneshot::channel();
-        self.send_control(Command::Restore { cache, policy, ack })
-            .await?;
+        let publication_epoch = cache.publication_epoch();
+        self.send_control(Command::Restore {
+            cache,
+            publication_epoch,
+            policy,
+            ack,
+        })
+        .await?;
         receive.await.map_err(|_| PersistControlError::AckDropped)
     }
 
@@ -211,35 +318,25 @@ impl DnsCachePersister {
     }
 
     pub async fn flush(&self) -> Result<(), PersistControlError> {
-        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst).saturating_add(1);
-        let (ack, receive) = oneshot::channel();
-        if let Err(error) = self.send_control(Command::Flush { epoch, ack }).await {
-            record_flush_failure(&error);
-            return Err(error);
-        }
-        #[cfg(test)]
-        let flush_gate = self
-            .flush_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        #[cfg(test)]
-        if let Some(gate) = flush_gate {
-            gate.entered.notify_one();
-            gate.release
-                .acquire()
-                .await
-                .unwrap_or_else(|_| unreachable!("test flush gate remains open"))
-                .forget();
-        }
-        let result = receive
+        self.reserve_invalidation()
+            .await?
+            .send(PersistInvalidation::All)
+            .complete()
             .await
-            .map_err(|_| PersistControlError::AckDropped)
-            .and_then(std::convert::identity);
-        if let Err(error) = &result {
-            record_flush_failure(error);
-        }
-        result
+    }
+
+    pub(crate) async fn reserve_invalidation(
+        &self,
+    ) -> Result<ReservedInvalidation<'_>, PersistControlError> {
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| PersistControlError::Closed)?;
+        Ok(ReservedInvalidation {
+            permit,
+            persister: self,
+        })
     }
 
     #[cfg(test)]
@@ -284,11 +381,13 @@ impl DnsCachePersister {
     }
 
     async fn send_control(&self, command: Command) -> Result<(), PersistControlError> {
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| PersistControlError::Closed)?;
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send(command).await.is_err() {
-            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(PersistControlError::Closed);
-        }
+        permit.send(command);
         Ok(())
     }
 }

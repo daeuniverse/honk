@@ -5,6 +5,7 @@ use crate::dns::query::is_exact_dns_query;
 #[test]
 fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: Some(addr("0.0.0.0:53")),
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
         packet_ifindex: None,
@@ -17,6 +18,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
 #[test]
 fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: Some(addr("203.0.113.10:4444")),
         packet_dst_ip: Some("198.51.100.10".parse().unwrap()),
         packet_ifindex: None,
@@ -44,6 +46,7 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V4(expected_ip)));
 
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip,
         packet_ifindex: None,
@@ -69,6 +72,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_ip)));
 
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip,
         packet_ifindex: None,
@@ -84,6 +88,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
 fn udp_original_dst_uses_non_wildcard_local_fallback() {
     let local_addr = addr("192.0.2.20:5353");
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip: None,
         packet_ifindex: None,
@@ -103,6 +108,7 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
 fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
     for local_addr in [addr("0.0.0.0:15000"), addr("[::]:15000")] {
         let meta = UdpRecvMeta {
+            packet_priority: None,
             original_dst_cmsg: None,
             packet_dst_ip: None,
             packet_ifindex: None,
@@ -116,6 +122,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
 #[test]
 fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     let packet_meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
         packet_ifindex: None,
@@ -124,6 +131,7 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     };
     let local_fallback = addr("192.0.2.20:5353");
     let fallback_meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip: None,
         packet_ifindex: None,

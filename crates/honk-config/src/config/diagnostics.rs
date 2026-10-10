@@ -14,14 +14,6 @@ impl Config {
                 diagnostics.push(diagnostic);
             }
         };
-        for (index, group) in self.groups.iter().enumerate() {
-            if group.interrupt_connections {
-                emit(ineffective_group_option_diagnostic(
-                    source.clone(),
-                    index + 1,
-                ));
-            }
-        }
         if let Some(diagnostic) = self
             .experimental
             .clash_api
@@ -30,23 +22,6 @@ impl Config {
             emit(diagnostic);
         }
     }
-}
-
-pub(crate) fn ineffective_group_option_diagnostic(
-    source: SourceRef,
-    index: usize,
-) -> DetailedDiagnostic {
-    let mut diagnostic = DetailedDiagnostic::warning(
-        "ineffective-option",
-        source,
-        SettingPath::new("groups")
-            .index(index)
-            .field("interrupt_connections"),
-        SafeValue::Redacted,
-        "selection changes remove connection tracking but do not cancel live relays",
-    );
-    diagnostic.entry_index = Some(index);
-    diagnostic
 }
 
 impl crate::experimental::ClashApiConfig {

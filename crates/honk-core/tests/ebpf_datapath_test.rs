@@ -21,6 +21,7 @@ use std::ptr;
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
 const TC_ACT_REDIRECT: u32 = 7;
+const TC_ACT_PIPE: u32 = 3;
 const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -71,6 +72,7 @@ struct Run {
     return_value: u32,
     data_size_out: u32,
     mark: u32,
+    data: Vec<u8>,
 }
 
 impl Fixture {
@@ -160,6 +162,7 @@ impl Fixture {
             return_value: result.return_value,
             data_size_out: result.data_size_out,
             mark: returned.mark,
+            data: output[..result.data_size_out as usize].to_vec(),
         }
     }
 }
@@ -191,6 +194,16 @@ fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize {
     let map = bpf.map(name).expect("hash map present");
     let hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
     hash.keys().map(Result::unwrap).count()
+}
+
+fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V> {
+    let map = bpf.map(name).expect("hash map present");
+    let hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
+    match hash.get(&key, 0) {
+        Ok(value) => Some(value),
+        Err(MapError::KeyNotFound) => None,
+        Err(error) => panic!("read {name}: {error}"),
+    }
 }
 
 fn outbound_stats(bpf: &Ebpf, outbound: u8) -> OutboundStatsCounters {
@@ -528,6 +541,79 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
         assert_eq!(after.rx_packets, before.rx_packets);
         assert_eq!(after.rx_bytes, before.rx_bytes);
     }
+}
+
+#[test]
+#[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
+fn proxy_replies_do_not_create_reverse_udp_state() {
+    let fixture = Fixture::load();
+    let client = [10, 0, 0, 2];
+    let peer = [198, 51, 100, 9];
+    // The fixture's dae0 is ifindex 1. A reply forwarded from the WAN still
+    // learns the reverse direction.
+    for (port, ingress_ifindex, learned) in [(40000, 1, false), (40001, 2, true)] {
+        let reply = udp_packet(peer, client, 3478, port, 19);
+        let input = SkbInput {
+            ingress_ifindex,
+            ..Default::default()
+        };
+        assert_eq!(
+            fixture.run("lan_egress_l2", &reply, input).return_value,
+            TC_ACT_PIPE
+        );
+        let state: Option<ConnState> = get_hash(
+            &fixture.bpf,
+            "CONN_STATE_MAP",
+            tuple(client, peer, port, 3478, IPPROTO_UDP),
+        );
+        assert_eq!(
+            state.map(|state| state.is_wan_ingress_direction),
+            learned.then_some(1),
+            "ingress {ingress_ifindex}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
+fn replies_from_uncontacted_peers_reach_the_client() {
+    let mut fixture = Fixture::load();
+    let client = [10, 0, 0, 3];
+    let contacted = [198, 51, 100, 3];
+    let key = tuple(client, contacted, 41000, 443, IPPROTO_UDP);
+    let state = cached_state(
+        TEST_OUTBOUND,
+        UdpDecisionState::Proxy as u8,
+        44,
+        false,
+        false,
+    );
+    put_hash(&mut fixture.bpf, "CONN_STATE_MAP", key, state).unwrap();
+    let packet = udp_packet(client, contacted, 41000, 443, 3);
+    let run = fixture.run("lan_ingress_l2", &packet, SkbInput::default());
+    assert_eq!(run.return_value, TC_ACT_REDIRECT);
+
+    // Delivered back to the client's MAC, attributed to no outbound.
+    let foreign = udp_packet([198, 51, 100, 9], client, 3478, 41000, 19);
+    let run = fixture.run("dae0_ingress", &foreign, SkbInput::default());
+    assert_eq!(run.return_value, TC_ACT_REDIRECT);
+    assert_eq!(&run.data[0..6], &[0x02, 0, 0, 0, 0, 1]);
+    assert_eq!(outbound_stats(&fixture.bpf, TEST_OUTBOUND).rx_packets, 0);
+
+    // The listener's own link address and another client port never match.
+    for packet in [
+        udp_packet([169, 254, 0, 11], client, 12345, 41000, 19),
+        udp_packet([198, 51, 100, 9], client, 3478, 41001, 19),
+    ] {
+        let run = fixture.run("dae0_ingress", &packet, SkbInput::default());
+        assert_eq!(run.return_value, TC_ACT_OK);
+    }
+
+    // The contacted peer's reply keeps its exact record and attribution.
+    let reply = udp_packet(contacted, client, 443, 41000, 19);
+    let run = fixture.run("dae0_ingress", &reply, SkbInput::default());
+    assert_eq!(run.return_value, TC_ACT_REDIRECT);
+    assert_eq!(outbound_stats(&fixture.bpf, TEST_OUTBOUND).rx_packets, 1);
 }
 
 #[test]

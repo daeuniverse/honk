@@ -51,9 +51,11 @@ pub struct RoutingHandoffEntry {
     pub last_seen_ns: u64,
     pub result: RoutingResult,
     pub routing_generation: u64,
+    pub trace_id: u32,
+    pub trace_padding: u32,
 }
 
-const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 56);
+const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 64);
 const _ROUTING_HANDOFF_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RoutingHandoffEntry>() == 8);
 const _ROUTING_HANDOFF_LAST_SEEN_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingHandoffEntry, last_seen_ns) == 0);
@@ -66,8 +68,10 @@ const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
         + core::mem::offset_of!(RoutingResult, decision_token)
         == 44
 );
+const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_id) == 56);
+const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_padding) == 60);
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct DomainRouting {
     pub bitmap: [u32; ROUTING_BITMAP_WORDS],

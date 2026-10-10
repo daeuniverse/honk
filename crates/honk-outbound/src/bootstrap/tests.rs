@@ -284,6 +284,92 @@ async fn test_query_ech_config_via_bootstrap_udp() {
     assert_eq!(query_ech_config("1.2.3.4").await.unwrap(), None);
 }
 
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn observed_bootstrap_lookup_preserves_source_lineage_and_cancellation() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    use std::sync::Arc;
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let parent = uuid::Uuid::new_v4();
+    let attempt = uuid::Uuid::new_v4();
+    let observer = FlowObserver::new(
+        FlowContext {
+            flow_id: uuid::Uuid::new_v4(),
+            generation: 19,
+            attempt_id: Some(attempt),
+            lookup_id: Some(parent),
+            dns_purpose: "dial_target",
+        },
+        Arc::new(move |context, event| captured.lock().push((context, event))),
+    );
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let resolver = BootstrapResolver {
+        server: address,
+        use_tcp: false,
+    };
+    let peer = tokio::spawn(async move {
+        let mut buf = [0; 512];
+        let (size, peer) = server.recv_from(&mut buf).await.unwrap();
+        let mut response = buf[..size].to_vec();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 1;
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 9]);
+        server.send_to(&response, peer).await.unwrap();
+        server
+    });
+    let (addresses, selection) = observer
+        .scope(crate::runtime::flow_observation::observe_resolution(
+            resolver.query_family("target.example", 1),
+        ))
+        .await;
+    let addresses = addresses.unwrap();
+    assert_eq!(addresses, ["127.0.0.9".parse::<IpAddr>().unwrap()]);
+    assert!(events.lock().iter().all(|(_, event)| match event {
+        FlowEvent::Dns(lookup) => lookup.selected_ip.is_none(),
+        _ => true,
+    }));
+    selection.unwrap().selected_ip(addresses[0]);
+    let server = peer.await.unwrap();
+    let mut cancelled = Box::pin(observer.scope(resolver.query_family("cancel.example", 28)));
+    let mut query = [0; 512];
+    tokio::select! {
+        result = &mut cancelled => panic!("silent DNS peer unexpectedly completed: {result:?}"),
+        result = server.recv_from(&mut query) => { result.unwrap(); }
+    }
+    drop(cancelled);
+    let events = events.lock();
+    let lookups: Vec<_> = events
+        .iter()
+        .filter_map(|(context, event)| match event {
+            FlowEvent::Dns(lookup) => {
+                assert_eq!(context.generation, 19);
+                assert_eq!(lookup.parent_lookup_id, Some(parent));
+                assert_eq!(lookup.attempt_id, Some(attempt));
+                assert_eq!(lookup.purpose, "dial_target");
+                assert_eq!(lookup.source, "upstream");
+                assert_eq!(lookup.upstream_transport, Some("udp"));
+                Some(lookup)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lookups
+            .iter()
+            .map(|lookup| lookup.status)
+            .collect::<Vec<_>>(),
+        ["started", "succeeded", "succeeded", "started", "cancelled"]
+    );
+    assert_eq!(lookups[0].lookup_id, lookups[1].lookup_id);
+    assert_eq!(lookups[1].lookup_id, lookups[2].lookup_id);
+    assert_eq!(lookups[2].selected_ip, Some(addresses[0]));
+    assert_eq!(lookups[3].lookup_id, lookups[4].lookup_id);
+    assert_ne!(lookups[0].lookup_id, lookups[3].lookup_id);
+}
+
 #[test]
 fn system_hosts_matches_aliases_and_address_families() {
     let hosts = "# 192.0.2.1 hidden\n\

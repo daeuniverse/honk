@@ -264,6 +264,7 @@ async fn c20_authorized_refresh_admits_reserved_provider_name() {
         )
         .await
         .unwrap()
+        .accepted()
     );
     let handle = cp.config_handle();
     let after = handle.read().await;
@@ -328,6 +329,7 @@ async fn c20_startup_post_prepare_admits_reserved_provider_name() {
     let subscription = Subscription {
         name: "provider".into(),
         url: format!("http://{}/subscription", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         ..Default::default()
     };
     let server = tokio::spawn(async move {

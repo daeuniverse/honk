@@ -50,14 +50,13 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 }
 
-/// Below the hard caps parking never kills, however stale the stream:
-/// only the stall watchdog reaps it, strictly after a full grace
-/// without flush progress.
+/// Below the hard caps parking never kills, however long the reader pauses:
+/// the stream stays registered with its parked bytes and resumes in order.
 #[tokio::test(start_paused = true)]
-async fn large_parked_stream_reaps_via_watchdog_only_after_stall_grace() {
+async fn parked_stream_survives_long_pause_without_pressure() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
     let sid = 41;
-    let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
     for _ in 0..STREAM_QUEUE_CAP {
         tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
             .unwrap();
@@ -75,7 +74,7 @@ async fn large_parked_stream_reaps_via_watchdog_only_after_stall_grace() {
     session
         .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])))
         .await;
-    tokio::time::advance(OVERFLOW_STALL_GRACE - OVERFLOW_WATCHDOG_TICK).await;
+    tokio::time::advance(OVERFLOW_STALL_GRACE * 3).await;
     tokio::task::yield_now().await;
     assert!(session.streams.lock().unwrap().contains_key(&sid));
     assert!(!session.killed_streams.lock().unwrap().contains(&sid));
@@ -84,11 +83,16 @@ async fn large_parked_stream_reaps_via_watchdog_only_after_stall_grace() {
         TEST_STREAM_BURST_BYTES + 1
     );
 
-    tokio::time::advance(OVERFLOW_WATCHDOG_TICK * 2).await;
-    tokio::task::yield_now().await;
-    assert!(!session.streams.lock().unwrap().contains_key(&sid));
-    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+    while rx.try_recv().is_ok() {}
+    session.flush_overflow(sid);
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+    for expected in [vec![0; TEST_STREAM_BURST_BYTES], vec![1]] {
+        let Ok(StreamEvent::Data(payload)) = rx.try_recv() else {
+            panic!("parked payload lost across the pause");
+        };
+        assert_eq!(payload, expected);
+    }
+    assert!(session.streams.lock().unwrap().contains_key(&sid));
     assert!(!session.is_closed());
     session.close();
 }
@@ -508,8 +512,8 @@ async fn overflow_preserves_data_before_fin() {
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 }
 
-/// A FIN delivered through a sender cloned before watchdog retirement must
-/// preserve the stream reset instead of turning the retirement into EOF.
+/// A FIN delivered through a sender cloned before the overflow kill must
+/// preserve the stream reset instead of turning the kill into EOF.
 #[tokio::test]
 async fn stale_remote_fin_after_overflow_kill_is_reset() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
@@ -533,10 +537,7 @@ async fn stale_remote_fin_after_overflow_kill_is_reset() {
     session.dispatch_fin(sid).await;
     assert!(session.remote_fin.lock().contains(&sid));
 
-    let victim = session
-        .overflow
-        .lock()
-        .take_victim(sid, OverflowLimit::StallGrace);
+    let victim = session.overflow.lock().take_victim(sid);
     session.kill_overflow_victim(victim);
     assert!(session.killed_streams.lock().unwrap().contains(&sid));
 
@@ -575,10 +576,7 @@ async fn killed_stream_tombstone_follows_stream_owner() {
         .overflow
         .lock()
         .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])));
-    let victim = session
-        .overflow
-        .lock()
-        .take_victim(sid, OverflowLimit::StallGrace);
+    let victim = session.overflow.lock().take_victim(sid);
     session.kill_overflow_victim(victim);
     assert!(session.killed_streams.lock().unwrap().contains(&sid));
     drop(stream);
@@ -601,10 +599,7 @@ async fn killed_stream_tombstone_follows_stream_owner() {
         .overflow
         .lock()
         .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])));
-    let victim = session
-        .overflow
-        .lock()
-        .take_victim(sid, OverflowLimit::StallGrace);
+    let victim = session.overflow.lock().take_victim(sid);
     drop(stream);
     session.kill_overflow_victim(victim);
     assert!(!session.killed_streams.lock().unwrap().contains(&sid));
@@ -631,10 +626,7 @@ async fn session_close_preserves_killed_reset_until_owner_reads() {
         .overflow
         .lock()
         .push_back(sid, StreamEvent::Data(InboundPayload::for_test(vec![1])));
-    let victim = session
-        .overflow
-        .lock()
-        .take_victim(sid, OverflowLimit::StallGrace);
+    let victim = session.overflow.lock().take_victim(sid);
     session.kill_overflow_victim(victim);
     session.close();
     assert!(session.killed_streams.lock().unwrap().contains(&sid));
@@ -647,10 +639,10 @@ async fn session_close_preserves_killed_reset_until_owner_reads() {
     assert!(!session.killed_streams.lock().unwrap().contains(&sid));
 }
 
-/// 3B-2: a stalled stream is first parked in the session overflow
-/// (non-blocking); a large parked queue does not kill inside the grace, but
-/// afterward the watchdog reaps just that stream. Queued data drains before
-/// the reader sees a reset (never a clean EOF), and the session survives.
+/// A stalled stream is first parked in the session overflow (non-blocking)
+/// and survives until the session frame cap is hit with it past the grace;
+/// only then is just that stream reset. Queued data drains before the
+/// reader sees a reset (never a clean EOF), and the session survives.
 #[tokio::test(start_paused = true)]
 async fn test_hol_slow_consumer_reset_after_queue_drains() {
     let (session, _server) = establish_test_session("127.0.0.1:443").await;
@@ -669,19 +661,23 @@ async fn test_hol_slow_consumer_reset_after_queue_drains() {
     }
     drop(sink); // the test's clone must not keep the channel alive
 
-    session.dispatch_data(sid, vec![2u8; 8]).await;
+    for _ in 0..SESSION_OVERFLOW_HARD_CAP {
+        session.dispatch_data(sid, vec![2u8; 8]).await;
+    }
     assert!(
         session.streams.lock().unwrap().get(&sid).is_some(),
         "overflow parking must not kill the stream"
     );
+    assert_eq!(
+        session.overflow.lock().usage().frames,
+        SESSION_OVERFLOW_HARD_CAP
+    );
 
-    for _ in 0..TEST_OVERFLOW_BURST_FRAMES {
-        session.dispatch_data(sid, vec![2u8; 8]).await;
-    }
-    assert!(session.streams.lock().unwrap().get(&sid).is_some());
-
-    tokio::time::advance(OVERFLOW_STALL_GRACE + OVERFLOW_WATCHDOG_TICK).await;
-    tokio::task::yield_now().await;
+    // The cap holds the demux in bounded wait rounds until the grace
+    // expires; the paused clock auto-advances through them.
+    let started = tokio::time::Instant::now();
+    session.dispatch_data(sid, vec![3u8; 8]).await;
+    assert!(started.elapsed() >= OVERFLOW_STALL_GRACE);
     assert!(session.streams.lock().unwrap().get(&sid).is_none());
     let mut buf = vec![0u8; STREAM_QUEUE_CAP * 8];
     stream.read_exact(&mut buf).await.unwrap();
@@ -804,79 +800,5 @@ async fn demux_large_overflow_never_blocks_sibling_streams() {
     assert_eq!(data, [7u8; 4]);
     assert!(session.streams.lock().unwrap().contains_key(&slow_sid));
     assert!(!session.killed_streams.lock().unwrap().contains(&slow_sid));
-    session.close();
-}
-
-/// Flush progress pushes the reap deadline out: a stream that keeps
-/// draining is spared; once progress stops, the full grace applies.
-#[tokio::test(start_paused = true)]
-async fn overflow_watchdog_spares_streams_with_flush_progress() {
-    let (session, _server) = establish_test_session("127.0.0.1:443").await;
-    let sid = 44;
-    let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
-    for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
-            .unwrap();
-    }
-    session
-        .streams
-        .lock()
-        .unwrap()
-        .insert(sid, StreamSink::Tcp(tx));
-    session
-        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])))
-        .await;
-    session
-        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![2; 8])))
-        .await;
-
-    tokio::time::advance(Duration::from_secs(2)).await;
-    match rx.recv().await {
-        Some(StreamEvent::Data(_)) => {}
-        _ => panic!("queued data must drain"),
-    }
-    session.flush_overflow(sid);
-    assert_eq!(session.overflow.lock().stream_usage(sid).frames, 1);
-
-    tokio::time::advance(Duration::from_secs(2)).await;
-    tokio::task::yield_now().await;
-    assert!(session.streams.lock().unwrap().contains_key(&sid));
-    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
-
-    tokio::time::advance(OVERFLOW_STALL_GRACE + OVERFLOW_WATCHDOG_TICK).await;
-    tokio::task::yield_now().await;
-    assert!(!session.streams.lock().unwrap().contains_key(&sid));
-    assert!(session.killed_streams.lock().unwrap().contains(&sid));
-    session.close();
-}
-
-/// The watchdog retires once the overflow drains; the next park
-/// respawns it.
-#[tokio::test(start_paused = true)]
-async fn overflow_watchdog_retires_when_the_overflow_drains() {
-    let (session, _server) = establish_test_session("127.0.0.1:443").await;
-    let sid = 45;
-    let (tx, mut rx) = mpsc::channel(STREAM_QUEUE_CAP);
-    for _ in 0..STREAM_QUEUE_CAP {
-        tx.try_send(StreamEvent::Data(InboundPayload::for_test(vec![0])))
-            .unwrap();
-    }
-    session
-        .streams
-        .lock()
-        .unwrap()
-        .insert(sid, StreamSink::Tcp(tx));
-    session
-        .park_overflow(sid, StreamEvent::Data(InboundPayload::for_test(vec![1; 8])))
-        .await;
-    assert!(session.watchdog.lock().unwrap().is_some());
-
-    while rx.try_recv().is_ok() {}
-    session.flush_overflow(sid);
-    while rx.try_recv().is_ok() {}
-    assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
-    tokio::time::advance(OVERFLOW_WATCHDOG_TICK * 2).await;
-    tokio::task::yield_now().await;
-    assert!(session.watchdog.lock().unwrap().is_none());
     session.close();
 }

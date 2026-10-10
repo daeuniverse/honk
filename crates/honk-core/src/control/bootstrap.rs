@@ -51,9 +51,11 @@ impl ControlPlane {
             dns_forwarder,
             dns_upstream_pool,
             ResourceBudget::for_nofile(MAX_EFFECTIVE_NOFILE),
+            Arc::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_upstream_pool_and_budget(
         config: Config,
         mut ebpf: Box<dyn EbpfBackend>,
@@ -62,6 +64,7 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
         dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
         resource_budget: ResourceBudget,
+        degradations: Arc<crate::degradations::Degradations>,
     ) -> anyhow::Result<Self> {
         config.validate_assembled()?;
         honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
@@ -125,6 +128,7 @@ impl ControlPlane {
                 dial_limit,
                 resource_budget.transient_dials,
                 resource_budget.vless_carriers,
+                config.experimental.native_api.enabled,
                 None,
             )
             .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
@@ -149,17 +153,12 @@ impl ControlPlane {
         );
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
-        {
-            let gm_cell = group_manager.clone();
-            alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
-                gm_cell
-                    .read()
-                    .delay_test_members(group)
-                    .into_iter()
-                    .map(|(tag, node)| (tag, node.name))
-                    .collect()
-            })));
-        }
+        install_url_member_resolver(
+            &alive_set,
+            group_manager.clone(),
+            #[cfg(feature = "native-api")]
+            None,
+        );
 
         let pinned_router = Arc::new(router.clone());
         let pinned_groups = group_manager.read().clone();
@@ -170,6 +169,7 @@ impl ControlPlane {
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
+        let interrupt_groups = config.groups.clone();
         let config_arc = Arc::new(RwLock::new(Arc::new(config)));
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
@@ -228,8 +228,10 @@ impl ControlPlane {
                 crate::config_diagnostics::ActiveDiagnostics::default(),
             )),
             reload_lock: tokio::sync::Mutex::new(()),
-            log_file_override: None,
-            effective_log_file,
+            log_files: LogFiles {
+                cli_override: None,
+                effective: effective_log_file,
+            },
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
@@ -256,15 +258,23 @@ impl ControlPlane {
             connection_tracker: Arc::new(ConnectionTracker::new()),
             tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
+            mode_db: None,
+            state_db: None,
+            state_tick: cache::StateTick::default(),
+            degradations,
+            quic_score_target: None,
             outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.active_tcp_flows,
             )),
+            tcp_admission_target: Arc::new(std::sync::atomic::AtomicUsize::new(
+                resource_budget.active_tcp_flows,
+            )),
             udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.udp_slow_path,
             )),
-            background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            health_task: None,
             udp_warm_task: tokio::sync::Mutex::new(None),
             udp_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             selector_warm_task: tokio::sync::Mutex::new(None),
@@ -276,6 +286,18 @@ impl ControlPlane {
             #[cfg(feature = "ebpf")]
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            #[cfg(feature = "native-api")]
+            phase: None,
+            #[cfg(feature = "native-api")]
+            configuration: None,
+            native: None,
+            #[cfg(feature = "native-api")]
+            native_owner: None,
+            #[cfg(feature = "native-api")]
+            subscriptions: None,
+            shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "clash-api")]
+            ui_download: Arc::new(tokio::sync::Mutex::new(None)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
@@ -289,8 +311,12 @@ impl ControlPlane {
         // its tracked connections so they re-dial through the new node.
         install_interrupt_callback(
             &control_plane.group_manager.read(),
-            &control_plane.group_manager,
+            &interrupt_groups,
             &control_plane.connection_tracker,
+            &control_plane.diagnostics,
+            0,
+            #[cfg(feature = "native-api")]
+            None,
         );
         install_selector_warm_callback(
             &control_plane.group_manager.read(),
@@ -308,14 +334,16 @@ impl ControlPlane {
         log_file_override: Option<PathBuf>,
         effective_log_file: Option<PathBuf>,
     ) {
-        self.log_file_override = log_file_override;
-        self.effective_log_file = effective_log_file;
+        self.log_files = LogFiles {
+            cli_override: log_file_override,
+            effective: effective_log_file,
+        };
     }
 
     /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition
     /// reports death. Installing this at construction covers blocked dials and
     /// driver-ready work before `run()` has created listener tasks.
-    fn install_node_death_callback(&self) {
+    pub(super) fn install_node_death_callback(&self) {
         let pool = self.connection_pool.clone();
         let udp_pool = self.udp_pool.clone();
         let config_for_purge = self.config.clone();
@@ -334,4 +362,107 @@ impl ControlPlane {
             },
         )));
     }
+
+    /// Makes the engine record into `native`; runs before the engine serves traffic.
+    #[cfg(feature = "native-api")]
+    pub(crate) async fn attach_observation(
+        &mut self,
+        native: Arc<crate::observe::Observation>,
+        owner: Arc<dyn crate::observe::Owner>,
+    ) {
+        self.alive_set.enable_health_history();
+        install_url_member_resolver(
+            &self.alive_set,
+            self.group_manager.clone(),
+            Some(Arc::clone(&native)),
+        );
+        let config = Arc::clone(&*self.config.read().await);
+        let provider = self.dns_controller.runtime_provider();
+        let dictionary = crate::observe::flows::kernel::KernelTraceDictionary::prepare(
+            &native.instance_id,
+            provider.current_generation().get(),
+            &*self.router.read().await,
+            &config,
+            &self.active_routing_plan.read(),
+        );
+        if let Some(dictionary) = dictionary {
+            self.ebpf
+                .write()
+                .await
+                .bind_kernel_trace_dictionary(dictionary);
+        }
+        provider
+            .current()
+            .bind_flow_catalog(native.catalog.snapshot());
+        provider.enable_lifecycle();
+        self.dns_controller
+            .dns_service()
+            .attach_observer(Arc::downgrade(&native.dns));
+        install_interrupt_callback(
+            &self.group_manager.read(),
+            &config.groups,
+            &self.connection_tracker,
+            &self.diagnostics,
+            self.diagnostics.read().generation,
+            Some(&native),
+        );
+        self.configuration = Some(Arc::clone(&native.sources));
+        self.native = Some(native);
+        self.native_owner = Some(owner);
+    }
+}
+
+fn install_url_member_resolver(
+    alive_set: &crate::outbound::AliveDialerSet,
+    group_manager: SharedGroupManager,
+    #[cfg(feature = "native-api")] native: Option<Arc<crate::observe::Observation>>,
+) {
+    alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
+        let manager = group_manager.read();
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native {
+            let identity = native.catalog.snapshot();
+            let group_id = identity
+                .groups
+                .get(group)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok());
+            return manager
+                .delay_test_targets(group)
+                .into_iter()
+                .map(|(member, node)| {
+                    let (tag, member_id) = match member {
+                        honk_outbound::group::GroupMember::Node(member) => {
+                            (member.name.clone(), Some(member.id))
+                        }
+                        honk_outbound::group::GroupMember::Group(member) => (
+                            member.name.clone(),
+                            identity
+                                .groups
+                                .get(&member.name)
+                                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+                        ),
+                    };
+                    honk_outbound::alive::UrlProbeMember {
+                        tag,
+                        leaf: node.id,
+                        native: group_id.zip(member_id).map(|(group_id, member_id)| {
+                            honk_outbound::alive::GroupProbeContext {
+                                group_id,
+                                member_id,
+                            }
+                        }),
+                    }
+                })
+                .collect();
+        }
+        manager
+            .delay_test_members(group)
+            .into_iter()
+            .map(|(tag, node)| honk_outbound::alive::UrlProbeMember {
+                tag,
+                leaf: node.id,
+                native: None,
+            })
+            .collect()
+    })));
 }

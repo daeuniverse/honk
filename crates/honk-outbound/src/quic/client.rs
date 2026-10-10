@@ -39,7 +39,7 @@ fn spawn_tracked_connection_cleanup<C: Send + Sync + 'static>(
     owner: Weak<C>,
     monitor: Arc<QuicClientConnectionMonitor>,
 ) {
-    tokio::spawn(async move {
+    let _ = crate::runtime::spawn_owned(async move {
         let _monitor = monitor;
         let mut removed = false;
         loop {
@@ -102,6 +102,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             endpoint_factory: None,
             mtu: 1252,
             flow_control_profiles: Arc::new(AdaptiveFlowProfiles::default()),
+            task_scope: crate::runtime::TaskScope::capture(),
             state: Arc::new(Mutex::new(State {
                 endpoint: None,
                 conn: None,
@@ -170,7 +171,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
-        self.connection_with_inner(connect_timeout, setup, |_, _| {})
+        self.task_scope
+            .scope(self.connection_with_inner(connect_timeout, setup, |_, _| {}))
             .await
     }
 
@@ -184,10 +186,13 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
-        self.connection_with_inner(connect_timeout, setup, |ctx, _| {
-            ctx.enable_telemetry();
-        })
-        .await
+        self.task_scope
+            .scope(
+                self.connection_with_inner(connect_timeout, setup, |ctx, _| {
+                    ctx.enable_telemetry();
+                }),
+            )
+            .await
     }
 
     async fn connection_with_inner<F, Fut, H>(
@@ -216,6 +221,15 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             // The QUIC connection is already admitted and reusable; time the
             // logical stream before its protocol open can block or cancel.
             crate::runtime::start_scoped_dial();
+            if let Some(observer) = crate::runtime::flow_observation::current() {
+                observer.publish(
+                    crate::runtime::flow_observation::FlowEvent::TransportAttached {
+                        server_addr: Some(conn.remote_address()),
+                        resolution_location:
+                            crate::runtime::flow_observation::ResolutionLocation::Unknown,
+                    },
+                );
+            }
             if metrics_enabled {
                 on_publish(ctx.as_ref(), &conn);
             }
@@ -224,8 +238,10 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         state.conn = None;
 
         let host = format!("{}:{}", self.server_host, self.server_port);
-        let addrs: Vec<SocketAddr> = crate::bootstrap::resolve(&self.server_host)
-            .await
+        let resolution = crate::bootstrap::resolve(&self.server_host);
+        let (resolved, selection) =
+            crate::runtime::flow_observation::observe_resolution(resolution).await;
+        let addrs: Vec<SocketAddr> = resolved
             .with_context(|| format!("resolve {host}"))?
             .into_iter()
             .map(|ip| SocketAddr::new(ip, self.server_port))
@@ -245,34 +261,53 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 .as_ref()
                 .filter(|(cached_ipv6, _)| *cached_ipv6 == ipv6)
                 .map(|(_, endpoint)| endpoint.clone());
+            let selection = selection.as_ref();
             async move {
                 let endpoint = match endpoint {
                     Some(endpoint) => endpoint,
-                    None => match &self.endpoint_factory {
-                        Some(factory) => factory(ipv6),
-                        None => client_endpoint_with_mtu(ipv6, self.mtu),
+                    None => {
+                        crate::runtime::new_owned_quic_endpoint(|| match &self.endpoint_factory {
+                            Some(factory) => factory(ipv6),
+                            None => client_endpoint_with_mtu(ipv6, self.mtu),
+                        })
+                        .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?
                     }
-                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?,
                 };
+                if let Some(selection) = selection {
+                    selection.selected_ip(server_addr.ip());
+                }
                 let mut last_error = None;
                 // Keep retries inside one address job: the shared scheduler
                 // races addresses for this node, never protocol attempts or nodes.
                 for attempt in 1..=3u8 {
+                    let mut observation = crate::runtime::flow_observation::TransportAttempt::start(
+                        Some(server_addr), crate::runtime::flow_observation::ResolutionLocation::Unknown);
                     let connecting = match endpoint.connect_with(
                         dial_config.clone(),
                         server_addr,
                         &self.server_name,
                     ) {
                         Ok(connecting) => connecting,
-                        Err(error) => return Err(error.into()),
+                        Err(error) => {
+                            if let Some(observation) = observation.as_mut() {
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectFailed));
+                            }
+                            return Err(error.into());
+                        }
                     };
                     match tokio::time::timeout(connect_timeout, connecting).await {
                         Err(_) => {
+                            if let Some(observation) = observation.as_mut() {
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectTimeout));
+                            }
                             last_error = Some(anyhow!(
                                 "QUIC connect to {server_addr} timed out (attempt {attempt})"
                             ));
                         }
                         Ok(Err(error)) => {
+                            if let Some(observation) = observation.as_mut() {
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectFailed));
+                            }
                             last_error = Some(
                                 crate::proxy::NodeFailure(anyhow::Error::new(error).context(
                                     format!("QUIC connect to {server_addr} (attempt {attempt})"),
@@ -280,7 +315,12 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                                 .into(),
                             );
                         }
-                        Ok(Ok(connection)) => return Ok((connection, endpoint, ipv6)),
+                        Ok(Ok(connection)) => {
+                            if let Some(observation) = observation.as_mut() {
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Succeeded, None);
+                            }
+                            return Ok((connection, endpoint, ipv6));
+                        }
                     }
                 }
                 Err(last_error.unwrap_or_else(|| anyhow!("QUIC connect to {server_addr} failed")))
@@ -301,6 +341,9 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 return Err(crate::proxy::quic_carrier_error(error));
             }
         };
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         let ctx = Arc::new(ctx);
         if state.quality.is_some() {
             on_publish(ctx.as_ref(), &conn);
@@ -361,15 +404,18 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// in-flight dial's single-flight section so its late connection is also
     /// closed; a try-lock skip would leak that connection and endpoint driver.
     pub async fn force_close(&self) {
-        let mut state = self.state.lock().await;
-        state.closed = true;
-        state.conn = None;
-        for tracked in state.connections.drain(..) {
-            tracked
-                .connection
-                .close(VarInt::from_u32(0), b"generation shutdown");
-        }
-        if let Some((_, endpoint)) = state.endpoint.take() {
+        let endpoint = {
+            let mut state = self.state.lock().await;
+            state.closed = true;
+            state.conn = None;
+            for tracked in state.connections.drain(..) {
+                tracked
+                    .connection
+                    .close(VarInt::from_u32(0), b"generation shutdown");
+            }
+            state.endpoint.take().map(|(_, endpoint)| endpoint)
+        };
+        if let Some(endpoint) = endpoint {
             endpoint.close(VarInt::from_u32(0), b"generation shutdown");
         }
     }

@@ -323,6 +323,58 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
     assert!(relay.await.unwrap_err().is_cancelled());
 }
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn runtime_shutdown_joins_vmess_relay_with_live_stream() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let physical = TcpStream::connect(endpoint).await?;
+    let (mut peer, _) = listener.accept().await?;
+    let mut node = Node {
+        name: "owned-vmess".into(),
+        address: endpoint.to_string(),
+        host: endpoint.ip().to_string(),
+        port: endpoint.port(),
+        outbound: honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some(UUID.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let (registry, _) = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )?;
+    let runtime = registry.get(&node.id).unwrap();
+    let uuid = uuid::Uuid::parse_str(UUID)?;
+    let target = "192.0.2.1:80".parse()?;
+    let stream = runtime
+        .scope_tasks(async {
+            VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None)
+        })
+        .await?;
+    let mut first = [0];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_exact(&mut first),
+    )
+    .await??;
+    tokio::time::timeout(std::time::Duration::from_secs(1), registry.shutdown()).await?;
+    let mut remaining_header = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_to_end(&mut remaining_header),
+    )
+    .await??;
+    drop(stream);
+    Ok(())
+}
+
 /// End-to-end over the WebSocket transport: a mock server parses the
 /// real AEAD wire format — auth ID, sealed header length, sealed header
 /// (version/option/security/address) — exactly like a sing-box/Xray
@@ -542,4 +594,50 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
             assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
         }
     }
+}
+
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn deferred_request_observation_follows_relay_write_not_stream_construction() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = std::sync::Arc::clone(&events);
+    let observer = FlowObserver::new(
+        FlowContext {
+            flow_id: uuid::Uuid::new_v4(),
+            generation: 11,
+            attempt_id: Some(uuid::Uuid::new_v4()),
+            lookup_id: None,
+            dns_purpose: "proxy_server",
+        },
+        std::sync::Arc::new(move |_, event| captured.lock().push(event)),
+    );
+    let (physical, mut peer) = tokio::io::duplex(4096);
+    let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+    let stream = observer
+        .scope(async {
+            VmessHandler::perform_handshake(
+                uuid.as_bytes(),
+                Box::new(physical),
+                "127.0.0.1:80".parse().unwrap(),
+                None,
+            )
+            .unwrap()
+        })
+        .await;
+    assert!(
+        events.lock().is_empty(),
+        "constructing a deferred relay has sent nothing"
+    );
+    let mut first = [0];
+    peer.read_exact(&mut first).await.unwrap();
+    assert!(matches!(
+        events.lock().as_slice(),
+        [FlowEvent::Milestone {
+            milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
+        }]
+    ));
+    drop(stream);
+    let mut remaining = Vec::new();
+    peer.read_to_end(&mut remaining).await.unwrap();
 }

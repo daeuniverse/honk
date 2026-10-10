@@ -52,6 +52,8 @@ pub struct Config {
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    #[serde(default)]
+    pub assets: crate::assets::AssetsConfig,
 }
 
 /// Global configuration matching dae `global { ... }` section.
@@ -511,13 +513,41 @@ impl Config {
         finish_attempt(result, diagnostics)
     }
 
+    /// Load a bounded dae candidate, retaining the exact consumed source bytes.
+    /// Overlay paths must already be authorized by the caller.
+    pub fn from_dae_file_with_sources(
+        path: &std::path::Path,
+        overlay: &std::collections::HashMap<std::path::PathBuf, std::sync::Arc<str>>,
+        limits: crate::parser::SourceLimits,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> Result<crate::parser::LoadedConfig, DetailedConfigError> {
+        let mut loaded = crate::parser::load_dae_sources(path, overlay, limits, diagnostics)?;
+        loaded.config.derive_node_ids();
+        Ok(loaded)
+    }
+
+    /// Load a dae tree held entirely in memory; see
+    /// [`load_dae_sources_in_memory`](crate::parser::load_dae_sources_in_memory).
+    pub fn from_dae_sources_in_memory(
+        path: &std::path::Path,
+        sources: &std::collections::HashMap<std::path::PathBuf, std::sync::Arc<str>>,
+        limits: crate::parser::SourceLimits,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> Result<crate::parser::LoadedConfig, DetailedConfigError> {
+        let mut loaded =
+            crate::parser::load_dae_sources_in_memory(path, sources, limits, diagnostics)?;
+        loaded.config.derive_node_ids();
+        Ok(loaded)
+    }
+
     fn load_file_attempt(
         path: &str,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<Self, DetailedConfigError> {
         let source = DiagnosticSources::new(Some(path.into())).root();
-        let content = std::fs::read_to_string(path)
-            .map_err(|error| DetailedConfigError::from_legacy(error.into(), source.clone()))?;
+        let content: std::sync::Arc<str> = std::fs::read_to_string(path)
+            .map_err(|error| DetailedConfigError::from_legacy(error.into(), source.clone()))?
+            .into();
         let ext = std::path::Path::new(path)
             .extension()
             .and_then(|ext| ext.to_str())
@@ -529,8 +559,12 @@ impl Config {
             Some("toml") => &[ConfigFormat::Toml, ConfigFormat::Yaml, ConfigFormat::Json],
             _ => {
                 let mut semantic = false;
-                let result =
-                    crate::parser::parse_dae_config_file_attempt(path, diagnostics, &mut semantic);
+                let result = crate::parser::parse_dae_config_file_attempt(
+                    path,
+                    Some(content.clone()),
+                    diagnostics,
+                    &mut semantic,
+                );
                 match result {
                     Ok(mut config) => {
                         config.derive_node_ids();
@@ -667,6 +701,7 @@ impl Config {
     }
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
+        self.experimental.native_api.validate_detailed(source)?;
         if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
         {
             error.diagnostic.source = source.clone();
@@ -783,8 +818,33 @@ impl Config {
         Ok(())
     }
 
+    /// A download detour: empty or `routing` for the routing rules, `direct`,
+    /// or a group name.
+    fn valid_download_detour(&self, detour: &str) -> bool {
+        matches!(detour, "" | Self::BUILTIN_DIRECT_NODE | "routing")
+            || self.groups.iter().any(|group| group.name == detour)
+    }
+
     fn validate_references_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         const MAX_USER_GROUPS: usize = 0xFC - 2;
+        if !self.valid_download_detour(&self.assets.route) {
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("assets").field("route"),
+                "invalid-assets-route",
+                "assets route must be direct, routing or a group",
+            ));
+        }
+        if !self.valid_download_detour(&self.experimental.native_api.geodata_download_detour) {
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("experimental")
+                    .field("native_api")
+                    .field("geodata_download_detour"),
+                "invalid-geodata-detour-target",
+                "geodata download detour must be direct, routing or a group",
+            ));
+        }
         if self.groups.len() > MAX_USER_GROUPS {
             return Err(config_validation_error(
                 source,
@@ -794,6 +854,18 @@ impl Config {
             ));
         }
         for (index, group) in self.groups.iter().enumerate() {
+            if group
+                .icon
+                .as_deref()
+                .is_some_and(|icon| !crate::node::Group::valid_icon(icon))
+            {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("groups").index(index + 1).field("icon"),
+                    "invalid-config-value",
+                    crate::node::Group::INVALID_ICON,
+                ));
+            }
             if group.name.is_empty() {
                 return Err(config_validation_error(
                     source,
@@ -877,6 +949,16 @@ impl Config {
                         .field("url"),
                     "invalid-config-value",
                     "subscription URL must use http:// or https://",
+                ));
+            }
+            if !self.valid_download_detour(&subscription.download_detour) {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("subscriptions")
+                        .index(index + 1)
+                        .field("download_detour"),
+                    "invalid-subscription-detour-target",
+                    "subscription download detour must be direct, routing or a group",
                 ));
             }
         }
@@ -1187,6 +1269,7 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                     "groups" if entry_index.is_some() => [
                         "id",
                         "name",
+                        "icon",
                         "policy",
                         "nodes",
                         "filters",
@@ -1211,6 +1294,8 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                         "user_agent",
                         "headers",
                         "enabled",
+                        "cache",
+                        "download_detour",
                         "last_updated",
                         "node_count",
                         "created_at",

@@ -74,6 +74,7 @@ mod tests {
             ))
         })
         .await
+        .map(|(value, _)| value)
         .unwrap();
         running.await.unwrap();
         let mut close = Box::pin(slot.close(|task| async move {

@@ -5,7 +5,10 @@ use honk_outbound::runtime::OutboundRuntimeRegistry;
 use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+mod closure;
 mod cross_source;
+#[cfg(feature = "native-api")]
+mod native_flow_tests;
 mod regressions;
 mod score;
 
@@ -241,6 +244,7 @@ fn source_runtime(
             capacity,
             capacity,
             capacity,
+            false,
             None,
         )
         .unwrap()
@@ -292,7 +296,7 @@ fn source_endpoint(
         target,
         None,
         Arc::new(pool.create_reply_socket(target).unwrap()),
-        stats.outbound_tracker("core-source-vless"),
+        stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
         node_id,
         honk_outbound::alive::IpVersion::V4,
         reporter,
@@ -339,7 +343,7 @@ fn install_source(
         target,
         None,
         reply_socket,
-        stats.outbound_tracker("core-source-vless"),
+        stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
         node_id,
         honk_outbound::alive::IpVersion::V4,
         None,
@@ -461,6 +465,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
             8,
             8,
             8,
+            false,
             None,
         )
         .unwrap()
@@ -706,16 +711,14 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         removed_a.generation
     ));
     drop(endpoint_a);
-    assert!(
-        matches!(pool.classify_source_reply(&owner, target_a), SourceReplyTarget::Foreign(peer) if peer == target_a)
-    );
+    assert!(matches!(
+        pool.classify_source_reply(&owner, target_a),
+        SourceReplyTarget::Drop
+    ));
     replies[&first.connection]
         .send((target_a, b"foreign-a".to_vec()))
         .unwrap();
-    assert_eq!(
-        receive_reply(&client).await,
-        (b"foreign-a".to_vec(), target_a)
-    );
+    assert_no_reply(&client).await;
     assert_eq!(endpoint_b.byte_counters().1.load(Ordering::Relaxed), 7);
 
     endpoint_b.send_packet(b"b-alive", false).await.unwrap();
@@ -895,7 +898,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     ));
     drop(endpoint_c);
     drop(replacement);
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -988,7 +991,7 @@ async fn pending_attachment_survives_last_binding_retirement() {
     drop(cancelled);
     let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
     wait_source_removed(&pool, &scope).await;
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;

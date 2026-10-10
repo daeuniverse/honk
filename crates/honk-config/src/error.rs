@@ -248,12 +248,23 @@ impl DetailedConfigError {
                             "client_subnet" => {
                                 "expected empty, auto, auto(IPv4), IPv4, or IPv4/prefix"
                             }
+                            "dial_mode" => "expected ip, domain, domain+, or domain++",
+                            "data_dir" => "expected a non-empty absolute path",
+                            "check_interval" => "expected a positive duration",
+                            "tproxy_mark" => "expected the compiled datapath mark",
+                            "so_mark_from_dae" => {
+                                "expected a mark clear of datapath-reserved and TPROXY bits"
+                            }
+                            "bind" => {
+                                "expected IP:port or a udp://, tcp:// or tcp+udp:// host:port"
+                            }
                             _ => "invalid configuration value",
                         },
                     );
                 }
             }
         }
+        let mut setting = SettingPath::new("config");
         let (code, message) = match category {
             ErrorCategory::Io(_) => ("config-io", "configuration IO failed"),
             ErrorCategory::Parse => ("config-parse", "invalid configuration"),
@@ -262,10 +273,22 @@ impl DetailedConfigError {
             ErrorCategory::Serialization => {
                 ("config-serialization", "configuration serialization failed")
             }
-            ErrorCategory::UnknownProtocol => ("unknown-protocol", "unknown node protocol"),
-            ErrorCategory::UnsupportedPolicy => ("unsupported-policy", "unsupported group policy"),
+            ErrorCategory::UnknownProtocol => {
+                setting = SettingPath::new("nodes").field("protocol");
+                (
+                    "unknown-protocol",
+                    "unknown node protocol; expected ss, trojan, vmess, vless, socks5, hysteria2, tuic, juicity, anytls, direct or block",
+                )
+            }
+            ErrorCategory::UnsupportedPolicy => {
+                setting = SettingPath::new("groups").field("policy");
+                (
+                    "unsupported-policy",
+                    "unsupported group policy; expected selector, urltest, loadbalance, fallback or score",
+                )
+            }
         };
-        Self::new(category, code, source, SettingPath::new("config"), message)
+        Self::new(category, code, source, setting, message)
     }
 
     pub fn into_legacy(self) -> ConfigError {

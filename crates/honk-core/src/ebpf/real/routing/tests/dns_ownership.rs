@@ -20,6 +20,7 @@ use std::time::Duration;
 mod direct_mode;
 mod failures;
 mod network;
+mod trace;
 
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
@@ -140,6 +141,7 @@ struct Run {
     verdict: u32,
     mark: u32,
     cb: [u32; 5],
+    priority: u32,
 }
 
 fn isolated(f: impl FnOnce() + Send + 'static) {
@@ -267,6 +269,7 @@ fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) ->
         verdict: result.return_value,
         mark: returned.mark,
         cb: returned.cb,
+        priority: returned.priority,
     }
 }
 
@@ -601,12 +604,16 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                         assert_eq!(entry.result.must, 0);
                         assert_eq!(entry.result.mark, 0);
                         assert_eq!(entry.result.decision_token, 0);
-                        assert_eq!(entry.routing_generation, 0);
                     }
                     assert_eq!(
                         hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                         before_conn,
                         "DNS UDP must not allocate conn state"
+                    );
+                    assert_eq!(
+                        hash_count::<RedirectTuple, RedirectEntry>(&backend, "CLIENT_REPLY_TRACK"),
+                        0,
+                        "DNS UDP must not record client reply framing"
                     );
                     assert_eq!(
                         backend.udp_decision_sequence_status().unwrap(),
@@ -731,7 +738,6 @@ fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
             assert_eq!(nonmust_handoff.result.mark, 0x404);
             assert_eq!(nonmust_handoff.result.dscp, 0);
             assert_eq!(nonmust_handoff.result.decision_token, 0);
-            assert_eq!(nonmust_handoff.routing_generation, 0);
             for (label, packet, packet_run, expected) in [
                 ("raw", raw.as_slice(), &raw_run, raw_route.to_mark()),
                 (

@@ -20,9 +20,11 @@ pub(super) const SESSION_OVERFLOW_HARD_CAP: usize = 768;
 /// quota — a full quota must not break stream termination — but are not
 /// unbounded: the stream is already terminating, so extras are dropped.
 const MAX_OVERFLOW_TERMINAL_EVENTS: usize = 2;
-/// How long a parked stream may go without flush progress before the
-/// watchdog judges it a stuck consumer and resets it. Parked bytes are
-/// not a stall — only the absence of reader progress is.
+/// How long a parked stream may go without flush progress before it is
+/// eligible for reaping once a resource gate trips (the session frame cap
+/// here, the shared byte budget in `inbound`). Parked bytes are not a
+/// stall — only the absence of reader progress is — and without pressure a
+/// slow reader is never reset.
 pub(super) const OVERFLOW_STALL_GRACE: Duration = Duration::from_secs(3);
 /// One bounded wait round at an emergency hard cap with no stream past
 /// the grace. Sized well above the 12–16ms reader-task startup delay
@@ -30,9 +32,6 @@ pub(super) const OVERFLOW_STALL_GRACE: Duration = Duration::from_secs(3);
 /// wait immediately), and far below the stall grace so a genuinely stuck
 /// consumer is reaped the round it crosses the grace.
 pub(super) const OVERFLOW_EMERGENCY_WAIT: Duration = Duration::from_millis(100);
-/// Overflow watchdog tick. The task is spawned by the first park,
-/// retires when the overflow drains, and is aborted on session close.
-pub(super) const OVERFLOW_WATCHDOG_TICK: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 pub(super) struct StreamOverflow {
@@ -42,22 +41,6 @@ pub(super) struct StreamOverflow {
     bytes: usize,
     terminal_events: usize,
     last_progress_at: Option<tokio::time::Instant>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum OverflowLimit {
-    SessionFrames,
-    /// Watchdog reap: no flush progress for a full stall grace.
-    StallGrace,
-}
-
-impl OverflowLimit {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SessionFrames => "session_frames",
-            Self::StallGrace => "stall_grace",
-        }
-    }
 }
 
 pub(super) enum OverflowAction {
@@ -75,9 +58,6 @@ pub(super) enum OverflowAction {
 }
 
 impl OverflowState {
-    fn is_empty(&self) -> bool {
-        self.streams.is_empty()
-    }
     pub(super) fn has(&self, sid: u32) -> bool {
         self.streams.contains_key(&sid)
     }
@@ -252,10 +232,9 @@ impl OverflowState {
 
     /// Detach a parked stream's overflow and snapshot its usage for the
     /// kill log line.
-    pub(super) fn take_victim(&mut self, sid: u32, limit: OverflowLimit) -> OverflowVictim {
+    pub(super) fn take_victim(&mut self, sid: u32) -> OverflowVictim {
         let victim = OverflowVictim {
             sid,
-            limit,
             session: self.usage(),
             stream: self.stream_usage(sid),
             stalled_for: self.stalled_for(sid),
@@ -266,8 +245,8 @@ impl OverflowState {
 
     /// Emergency session-wide bound on parked data frames. Payload bytes are
     /// already bounded across every owner by the pool semaphore.
-    fn hard_limit(&self) -> Option<OverflowLimit> {
-        (self.frames >= SESSION_OVERFLOW_HARD_CAP).then_some(OverflowLimit::SessionFrames)
+    fn at_hard_cap(&self) -> bool {
+        self.frames >= SESSION_OVERFLOW_HARD_CAP
     }
 
     /// One wait round at a hard cap, clamped to the nearest grace expiry
@@ -282,10 +261,9 @@ impl OverflowState {
 
     /// Admit an overflow-bound event, parking it inline or returning the
     /// verdict for the caller to execute outside the lock. Below the
-    /// emergency hard caps every frame parks and the watchdog reaps
-    /// consumers stalled past [`OVERFLOW_STALL_GRACE`]. At a hard cap a
-    /// past-grace stream is reaped on the spot; with every stalled stream
-    /// inside the grace the caller waits bounded
+    /// session frame cap every frame parks, however stale the stream. At the
+    /// cap a stream past [`OVERFLOW_STALL_GRACE`] is reaped on the spot;
+    /// with every stalled stream inside the grace the caller waits bounded
     /// [`OVERFLOW_EMERGENCY_WAIT`] rounds for flush progress (woken via
     /// the session overflow notify) — bounded TCP-style backpressure, and
     /// each elapsed round re-judges, so a stream is only ever reaped once
@@ -305,12 +283,12 @@ impl OverflowState {
             self.push_back(sid, event);
             return OverflowAction::Parked;
         }
-        let Some(hard) = self.hard_limit() else {
+        if !self.at_hard_cap() {
             self.push_back(sid, event);
             return OverflowAction::Parked;
-        };
+        }
         if let Some(victim_sid) = self.most_stalled_past_grace() {
-            return OverflowAction::Kill(self.take_victim(victim_sid, hard), event);
+            return OverflowAction::Kill(self.take_victim(victim_sid), event);
         }
         OverflowAction::Wait(event, self.emergency_wait())
     }
@@ -350,8 +328,6 @@ impl AnyTlsSession {
         warn!(
             session = self.seq,
             victim_sid = victim.sid,
-            cap_reason = victim.limit.as_str(),
-            after_stall_grace = victim.stalled_for >= OVERFLOW_STALL_GRACE,
             session_frames = victim.session.frames,
             session_bytes = victim.session.bytes,
             stream_frames = victim.stream.frames,
@@ -386,7 +362,6 @@ impl AnyTlsSession {
                     if !self.overflow_sink_is_live(sid) {
                         self.discard_overflow(sid);
                     }
-                    self.ensure_watchdog();
                     return;
                 }
                 OverflowAction::Dropped => return,
@@ -402,42 +377,6 @@ impl AnyTlsSession {
                     event = returned;
                     let _ = tokio::time::timeout(wait_for, wait).await;
                 }
-            }
-        }
-    }
-
-    fn ensure_watchdog(self: &Arc<Self>) {
-        if self.overflow.lock().is_empty() {
-            return;
-        }
-        let mut handle = self.watchdog.lock().unwrap();
-        if handle.is_none() {
-            let session = Arc::clone(self);
-            *handle = Some(
-                tokio::spawn(async move { session.run_overflow_watchdog().await }).abort_handle(),
-            );
-        }
-    }
-
-    async fn run_overflow_watchdog(self: &Arc<Self>) {
-        let mut ticker = tokio::time::interval(OVERFLOW_WATCHDOG_TICK);
-        loop {
-            ticker.tick().await;
-            if self.is_closed() {
-                return;
-            }
-            let victim = {
-                let mut overflow = self.overflow.lock();
-                if overflow.is_empty() {
-                    *self.watchdog.lock().unwrap() = None;
-                    return;
-                }
-                overflow
-                    .most_stalled_past_grace()
-                    .map(|sid| overflow.take_victim(sid, OverflowLimit::StallGrace))
-            };
-            if let Some(victim) = victim {
-                self.kill_overflow_victim(victim);
             }
         }
     }

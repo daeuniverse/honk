@@ -56,8 +56,7 @@ impl TrojanHandler {
         let (mut stream, preparation) =
             Self::prepare_transport(node, runtime, tcp, connect_timeout).await?;
         preparation.commit()?;
-        stream.write_all(&header).await?;
-        stream.flush().await?;
+        super::transport::write_request(&mut stream, &header).await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -133,8 +132,7 @@ impl TrojanHandler {
         header.push(CMD_UDP);
         header.extend_from_slice(&addr_header);
         header.extend_from_slice(CRLF);
-        control.write_all(&header).await?;
-        control.flush().await?;
+        super::transport::write_request(&mut control, &header).await?;
 
         let (rd, wr) = tokio::io::split(control);
         Ok(Arc::new(TrojanUdpTransport {

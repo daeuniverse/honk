@@ -25,6 +25,23 @@ impl AliveDialerSet {
         if !should_notify() {
             return;
         }
+        // Callers notify only on a flip, so this logs once per transition.
+        let name = self.node_name(node_id);
+        if alive {
+            tracing::info!(
+                "Node '{}' revived (domain={:?}, ipver={:?})",
+                name,
+                domain,
+                ipver
+            );
+        } else {
+            tracing::warn!(
+                "Node '{}' marked dead (domain={:?}, ipver={:?})",
+                name,
+                domain,
+                ipver
+            );
+        }
         let resolver = self.outbound_resolver.read().clone();
         let outbound = resolver.map_or(Some(0), |resolve| resolve(node_id));
         let ebpf_callback = self.ebpf_callback.read().clone();
@@ -35,7 +52,6 @@ impl AliveDialerSet {
         }
         if !alive && should_notify() && !self.udp_sibling_explicitly_alive(node_id, domain) {
             let cb = self.death_callback.read().clone();
-            let name = self.node_name(node_id);
             if let Some(cb) = cb
                 && should_notify()
             {
@@ -287,12 +303,6 @@ impl AliveDialerSet {
         });
         if !was_alive {
             self.push_ebpf(node_id, domain, ipver, true);
-            tracing::info!(
-                "Node '{}' revived via traffic (domain={:?}, ipver={:?})",
-                node_id,
-                domain,
-                ipver
-            );
         }
     }
 

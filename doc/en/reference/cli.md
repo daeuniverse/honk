@@ -14,13 +14,15 @@ honk-core [OPTIONS] [COMMAND]
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `-c`, `--config PATH` | `/etc/honk/config.dae` | Configuration entry file. `mode`, `proxy`, and `delay` also read this path. `reload` ignores it and signals the running instance, which reloads its own startup path. |
+| `-c`, `--config PATH` | `/etc/honk/config.dae` | Configuration entry file. With `--store db` it is read only while the db is empty, or by an API import. `mode`, `proxy`, and `delay` also read this path in file mode. `reload` ignores it and signals the running instance, which reloads its own startup path. |
 | `--log-file PATH` | Unset | Override `global.log_file` for this engine process without rewriting the configuration. Relative paths resolve below `global.data_dir`; console logging remains enabled. While set, SIGHUP ignores changes to the shadowed config value unless the effective destination changes. |
 | `-b`, `--bpf-object PATH` | Embedded object | Override the object embedded by an `ebpf` build. Used only by the real backend. |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | Root for pinned eBPF maps. |
 | `--disable-timestamp` | Off | Omit the timestamp from console log lines. Use it under systemd or another logger that stamps each line itself; the file selected by `--log-file` or `global.log_file` keeps its timestamps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
 | `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
+| `--store file\|db` | `file` | `db` runs from the revisions in `<data-dir>/state/honk.db` and imports `-c` into an empty db. See the [configuration db](./api.md#configuration-db---store-db). |
+| `--data-dir PATH` | `/var/lib/honk` | Data directory holding the state db, `state/honk.db`. It must equal `global.data_dir`. Used by `--store db`, `config export` and `admin reset`. |
 
 Both binaries provide `-h`/`--help` and `-v`/`--version`.
 
@@ -41,6 +43,15 @@ The source comment records the intended order as `--debug` → `RUST_LOG` → `g
 
 See the [global configuration reference](./global.md) for `log_level`.
 
+Levels carry fixed meanings, so the default `info` stays low-rate:
+
+| Level | Meaning |
+| --- | --- |
+| `error` | Configured function is lost until an operator acts: activation committed degraded, the process stops, a subsystem stops permanently, or an internal invariant breaks. |
+| `warn` | Degraded but running, logged once when the state is entered: a fallback, a resource ceiling, a node or group becoming unavailable, a rejected configuration while the previous one keeps running. A failure repeated per DNS query (SERVFAIL, singleflight saturation) warns at most every 10 seconds. |
+| `info` | Start, stop, activation, operator actions and recovery from a warned state. |
+| `debug` | Single connection, request and DNS query outcomes, including individual dial and relay failures, and periodic maintenance results. Native flows record the same per-flow outcomes. |
+
 ### Subcommands
 
 | Command | Current behavior | Persistence / runtime effect |
@@ -48,7 +59,11 @@ See the [global configuration reference](./global.md) for `log_level`.
 | `reload` | Reads the PID from the locked `/run/honk-core.lock` and sends `SIGHUP`. | Reports successful signal delivery only. The running process later logs `applied` or `rejected`. Mock instances do not own the lock. |
 | `mode <rule\|global\|direct>` | Loads `--config`, assigns the supplied string to `experimental.clash_api.default_mode`, and validates before rewriting structured-format files. `.dae` files are rejected unchanged because the writer cannot preserve dae syntax, comments, or includes; edit those sources directly or use `.toml`, `.yaml`, or `.json`. | File-only; it does not contact the running engine or change dial mode. The accepted strings differ from the normal dial-mode values `ip`, `domain`, `domain+`, and `domain++`. |
 | `proxy <group> <node>` | Checks that the group and node names each exist, then prints the requested selection. It does not check membership. | Nothing is written and no running engine is contacted. |
+| `config export --out PATH [--without-secrets]` | Writes the active revision of the configuration db as one `.dae` file, with listener secrets restored unless `--without-secrets`. It reads the db through a query-only connection that opens read-write, whether or not a daemon runs. Closing it never checkpoints or deletes `honk.db-wal`; apart from the `-shm` index SQLite may create, the only write it can cause is rolling back a journal a crash left. It publishes the file only once it is complete. | Creates `PATH` with mode 0600 and refuses an existing file. |
+| `admin reset` | Deletes the password-mode administrator from the state db under `--data-dir`, so the next start opens setup again. | Refused while any honk-core, mock mode included, has that state db open. |
 | `delay <node> [-u\|--url HOST:PORT]` | Opens one raw TCP connection with a five-second timeout and prints elapsed milliseconds. Without `--url`, it uses the node server address. | Not proxied, not an HTTP URLTest, and no running engine is contacted. |
+
+With `--store db`, `proxy` and `delay` read the active revision and `mode` refuses.
 
 A real-datapath process holds the lock for its lifetime. `reload` verifies that the file is still locked before trusting its PID; successful `kill(2)` delivery does not mean the candidate configuration passed validation or restart-required checks.
 
@@ -59,10 +74,12 @@ An exhausted [compiled-routing publication counter](../design/routing.md#synchro
 | Variable | Scope | Current behavior |
 | --- | --- | --- |
 | `RUST_LOG` | Both binaries | Tracing filter. It has the effective `honk-core` precedence described above; `honk-tool` otherwise defaults to `warn`. |
-| `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Highest-precedence dashboard ZIP URL; overrides `external_ui_download_url` when a configured external-UI directory needs downloading. |
+| `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Highest-precedence dashboard ZIP URL; overrides `assets.ui.url` when a configured external-UI directory needs downloading. |
 | `HONK_POOL_DISABLE=1` | `honk-core` | Bypasses both ready-stream and bare-TCP pools and performs fresh dials. The code also accepts case-insensitive `true`; the value is cached on first use. |
 | `HONK_QUIC_GSO=0|1` | QUIC outbounds | Forces UDP GSO off/on. Without an override, the conservative 1252-byte MTU keeps GSO off, while an explicit larger `mtu` enables batches capped at 16 segments. |
 | `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |
+| `MIMALLOC_PURGE_DELAY` | `honk-core` with `mimalloc` | mimalloc's own purge delay in milliseconds: how long freed pages stay committed before they are returned to the OS. honk starts with `100` (mimalloc v3's default is `1000`), which lowers RSS under connection, probe and DNS churn without a measurable bulk-relay throughput or CPU change; any value set in the environment takes precedence, including an unparsable one, which leaves mimalloc's `1000`. `0` purges immediately (lowest RSS, slightly more CPU) and `-1` never purges. |
+| `TOKIO_WORKER_THREADS` | `honk-core` | Tokio's own worker count. `honk-core` builds a default multi-thread runtime, so it follows the core count. It must be a positive integer: `0` or a non-number makes Tokio panic at startup. Every worker keeps its own allocator heap, so a lower value reduces RSS on many-core gateways (lab, 120 connections plus DNS on a 4-core host: about 85 MiB with 16 workers, 66 MiB with 8 and 60 MiB with 4, CPU within noise). The relay path runs on these workers; size the value to the traffic. |
 | `HONK_VMLINUX_BTF` | `honk-core` with `ebpf` | Overrides the raw kernel BTF file used to resolve process-name offsets. Without it, honk checks `/sys/kernel/btf/vmlinux` and then `/usr/lib/debug/boot/vmlinux`; if runtime BTF offsets or verifier-safe kernel argv access are unavailable, pname synchronously falls back to the calling thread's `comm`. |
 | `DAE_LOCATION_ASSET` | Geo loading in both binaries | Directory checked first for `geoip.dat` and `geosite.dat`. |
 
@@ -161,7 +178,7 @@ Probe eligibility is `supported`, `invalid-uuid`, `invalid-reality`, `invalid-co
 
 UDP DNS target resolution, packet-transport setup, send, and receive share one `--timeout` budget. A resolution failure or timeout is reported only in the DNS column; TCP, URLTest, and QUIC probes continue. Unsupported UDP nodes skip this resolution, and a failed hostname is never replaced with another target.
 
-Each column of a node is capped separately at `--timeout` plus one second. URLTest and the family probes give dial, target TLS and each exchange their own `--timeout`, so a slow cold carrier setup can reach that cap; the column then reports `timeout` (or `n/a` where UDP policy rejects the target) while the other columns keep their results.
+Each non-QUIC column of a node is capped separately at `--timeout` plus one second. URLTest and the family probes give dial, target TLS and each exchange their own `--timeout`, so a slow cold carrier setup can reach that cap; the column then reports `timeout` (or `n/a` where UDP policy rejects the target) while the other columns keep their results. The QUIC column allows two additional seconds for joined teardown; cleanup time is not a latency sample.
 
 UDP DNS hostname targets use a shared asynchronous resolver with the first numeric nameserver in `/etc/resolv.conf` (UDP port `53`) and `/etc/hosts` when present, rather than blocking NSS lookup. This path does not apply NSS plugins or resolver search suffixes. An unavailable resolver is a DNS-column `resolve` failure, not a fallback to a public resolver; literal targets need no resolver.
 

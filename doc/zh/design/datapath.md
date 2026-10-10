@@ -62,9 +62,9 @@ flowchart LR
 | --- | --- | --- |
 | `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/控制平面及非 DNS 本地流量，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数，以及可选的歧义 UDP 暂存。 |
 | `wan_ingress_l2`, `wan_ingress_l3` | WAN TC ingress | 刷新反向连接状态；单网卡拓扑不挂载。 |
-| `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态并抑制本机生成的 ICMPv6 Redirect 数据包；单网卡拓扑在共用接口上跳过。 |
+| `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态，但来自 `dae0` 的 UDP 包只刷新已有条目、不创建新条目；并抑制本机生成的 ICMPv6 Redirect 数据包；单网卡拓扑在共用接口上跳过。 |
 | `wan_egress_l2`, `wan_egress_l3` | WAN TC egress | 路由主机发起的 TCP/UDP，使用进程名与控制平面 bypass 数据，检查出站连通性，缓存决策并重定向代理流量。 |
-| `dae0_ingress` | 主机 `dae0` 的 TC ingress | 反查 `REDIRECT_TRACK`，恢复原始 MAC/接口交付，并统计 RX 流量。 |
+| `dae0_ingress` | 主机 `dae0` 的 TC ingress | 反查 `REDIRECT_TRACK`，恢复原始 MAC/接口交付，并统计 RX 流量。没有精确记录的 UDP 回复改用客户端的 `CLIENT_REPLY_TRACK` 帧信息，且不计入 RX。 |
 | `dae0peer_ingress` | `daens` `dae0peer` 的必需 TC ingress | 校验重定向数据包，恢复跨链路保存的逐报文 UDP53 路由/代际 mark，对普通重定向应用 `TPROXY_MARK`，并用 `bpf_sk_assign` 把 UDP 和新 TCP 交给监听器。 |
 | `tproxy_sk_lookup` | `daens` 中的 `sk_lookup` | 用 `LISTEN_SOCKET_MAP` 中的透明监听器覆盖普通套接字查找。 |
 | `tproxy_wan_cg_sock_create`, `tproxy_wan_cg_sock_release` | cgroup `sock_create`, `sock_release` | 创建/刷新或删除套接字 cookie 到 PID/`comm` 的条目。 |
@@ -80,7 +80,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 - `lan_ingress_l2/l3` — LAN 分类、路由和重定向，以及有序策略下的 DNS 所有权、`CLASSIFIED_MARK` 去重；NFQUEUE 已启用且 ready 时，仅将有歧义的非 DNS UDP 决策以唯一 token 暂存为 Pending；已启用但未 ready 时 fail-closed（`src/ingress.rs`）。
 - `wan_ingress_l2/l3` — 反向 conntrack 刷新，单网卡时跳过。
 - `lan_egress_l2/l3`、`wan_egress_l2/l3`（`src/egress.rs`）— 反向 conn state；本机流量路由（经 `COOKIE_PID_MAP` 匹配 pname、控制面旁路、`OUTBOUND_CONNECTIVITY_MAP` 活性及重定向控制面）。存活的非 DNS WAN UDP 条目只查询缓存路由；未命中时求值一次路由，再发布完整 conntrack 元数据。
-- `dae0_ingress` — 回复路径：按 `RedirectEntry.outbound` 统计 RX 流量、重写 MAC 并重定向到原 LAN 接口。
+- `dae0_ingress` — 回复路径：按 `RedirectEntry.outbound` 统计 RX 流量、重写 MAC 并重定向到原 LAN 接口。客户端从未联系过的对端发来的 UDP 回复使用仅含客户端的记录，不归属任何出站；来自 honk 自身链路地址的回复永不使用。
 - LAN egress 仅抑制本机发起的 ICMPv6 Redirect，使用扩展头遍历后的 ICMPv6 header；转发的 Redirect 与其他 ICMPv6 仍放行。`honk-core/tests/ebpf_datapath_test.rs` 通过 `BPF_PROG_TEST_RUN` 检查 L2、通过隔离 TUN 接口检查 L3，并覆盖精确 tuple RX 计数与 cached-route 策略。
 - `dae0peer_ingress` — 必须恢复 UDP53 路由/代际 provenance，并在 `daens` 中经 `LISTEN_SOCKET_MAP` 用 `bpf_sk_assign` 交付 TPROXY listener。
 - `tproxy_sk_lookup`（`src/sk_lookup.rs`）— 透明 listener：key 0/1 为 TCP4/TCP6，2..5 为 UDP4，6..9 为 UDP6。v4/v6 UDP listener-key 读取保留在 `#[inline(never)]` 子程序中。opt-level=2 时，LLVM 会把地址族分支转成通过计算 ctx offset 的 load，导致 verifier 报告 "dereference of modified ctx ptr"；新的分支选择 ctx 读取须保留此形态。
@@ -94,6 +94,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | --- | --- |
 | `CONN_STATE_MAP` | 不预分配的普通 hash，最多 524,288 项。保存每流 TCP/UDP 状态和已发布路由元数据；用户空间负责压力驱逐。 |
 | `REDIRECT_TRACK` | 不预分配的 65,536 项 hash。把有方向的五元组映射到原始 MAC/接口、出站、时间戳和决策身份，用于恢复回复路径。 |
+| `CLIENT_REPLY_TRACK` | 16,384 项 LRU hash。把非 DNS UDP 客户端地址和端口（目的字段清零）映射到与 `REDIRECT_TRACK` 相同的帧信息记录（token 已清除），使未联系过的对端的回复无需经过主机转发即可到达客户端。内核 LRU 淘汰是近似的：接近容量时（CPU 越多越明显），近期未发包的客户端可能在表满之前就被淘汰。该客户端的这类回复随后退回主机转发；不会造成错误路由，也没有用户空间清扫。 |
 | `ROUTING_HANDOFF_MAP` | 不预分配的 65,536 项 hash；TCP SYN handoff 包含已提交策略代际，暂存 UDP 携带 decision token。原始 must UDP/53 不发布 tuple handoff，所有权使用逐报文 mark；非 must UDP/53 保留供畸形 payload 回退使用的事实。 |
 | `ROUTING_POLICY_ROOT` | 单项 map-in-map，选择不可变 policy descriptor 和两个同步生成函数槽之一。root 成功替换返回后，旧 non-sleepable 读者已完成 grace。 |
 | 按代持有的 IP/MAC 索引 | 分离的目的/源 IPv4、IPv6 LPM maps 及 MAC LPM。value 是完整的本代谓词 bitmap，更具体前缀继承祖先位。 |
@@ -182,7 +183,7 @@ LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 N
 
 | 有效模式 | 路由时策略 |
 | --- | --- |
-| `Rule`（也包括没有 Clash 模式覆盖） | 仅当 SNI 不可能改变结果时，才卸载非 `must` 的 `direct` 结果：不存在域名类重新求值，或 DNS 学习已提供该流的域名 bitmap。否则用户空间在 sniff 后重新路由。 |
+| `Rule`（也包括没有 Clash 模式覆盖） | 仅当 SNI 不可能改变结果时，才卸载非 `must` 的 `direct` 结果：不存在域名类重新求值、DNS 学习已提供该流的域名 bitmap，或从首条 live 规则到当前 direct 规则（包含当前）的前缀没有域名谓词。后置域名规则不再阻止卸载；前置或当前规则中尚未确定的域名谓词仍保持保守。 |
 | `Direct` | LAN ingress、WAN TCP 与 WAN UDP 都把每个非 `must`、非 `block` 流归一化为 `direct` 并卸载；不经过代理健康门控。仅当规则本身路由到 `direct` 时才保留规则 mark。与用户空间模式覆盖不同，这里不参考 SNI，因此只能靠 sniff 域名命中的 `block` 或 `must` 规则不会生效。 |
 | `Global` | 全局选择恰为 `direct` 时使用相同的全 direct 策略。其他全局选择让非 final 流留在用户空间，以应用所选出站。 |
 
@@ -204,7 +205,7 @@ LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 N
 
 Conn-state sweep 通常每 60 秒运行。占用率达到 70% 时，间隔降为 15 秒；达到 85% 时进入 pressure mode，每个两秒 tick 都执行 sweep。内核 overflow 计数增长也会启动 pressure mode，作为 fail-closed 的最后保障。`CONN_STATE_OCCUPANCY` 合并 per-CPU 内核插入/删除、用户空间删除计数，以及 sweep 时的精确重新校准。有界 auxiliary map 扫描（`REDIRECT_TRACK`、`COOKIE_PID_MAP`、`ROUTING_HANDOFF_MAP`）在最近一次扫描未完成或覆盖至少 85% 的 65,536 项容量时，使用 8 秒的激进清理周期。
 
-每个出站的流量计数器均为 per-CPU。路由结果产生时，`lan_ingress` 对重定向和 direct 卸载结果都统计 TX 数据包与字节。`dae0_ingress` 在 `REDIRECT_TRACK` 识别返回流量所属出站后统计 RX 数据包与字节。未分类的直通流量与丢包没有出站计数。
+每个出站的流量计数器均为 per-CPU。路由结果产生时，`lan_ingress` 对重定向和 direct 卸载结果都统计 TX 数据包与字节。`dae0_ingress` 在 `REDIRECT_TRACK` 识别返回流量所属出站后统计 RX 数据包与字节；经 `CLIENT_REPLY_TRACK` 交付的回复没有对应出站，不计数。未分类的直通流量与丢包没有出站计数。
 
 Backend API 使用 `TuplesKey`/`ConnState`、有界 map 扫描和条件退役。旧 `ConnTuple` CRUD、字符串 IP/域名路由、参数缓存 setter 与 backend 统计适配器已删除；加载时配置的 `DaeParam` global、带 generation fence 的 IP/规则位投影、`StatsManager` 和 pinned `OUTBOUND_STATS` 仍是正式路径。
 

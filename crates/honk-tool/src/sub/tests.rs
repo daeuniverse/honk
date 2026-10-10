@@ -1,4 +1,3 @@
-use super::udp::build_dns_probe_query;
 use super::*;
 
 #[test]
@@ -161,13 +160,6 @@ async fn udp_policy_denied_target_skips_quic_resolution() {
         .await,
         None
     );
-}
-
-#[test]
-fn dns_probe_query_has_full_header_and_google_a_question() {
-    let query = build_dns_probe_query(0x1234);
-    assert_eq!(&query[..12], &[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(&query[12..], b"\x06google\x03com\x00\x00\x01\x00\x01");
 }
 
 fn vless_node() -> Node {

@@ -58,29 +58,16 @@ const LEVEL_INITIAL: usize = 0;
 const LEVEL_HANDSHAKE: usize = 2;
 const LEVEL_APPLICATION: usize = 3;
 
-/// HKDF-Expand-Label `info` block (RFC 8446 §7.1).
-fn expand_label_info(label: &str, out_len: usize) -> Vec<u8> {
-    let full_label = format!("tls13 {label}");
-    let mut info = Vec::with_capacity(3 + full_label.len() + 1);
-    info.extend_from_slice(&(out_len as u16).to_be_bytes());
-    info.push(full_label.len() as u8);
-    info.extend_from_slice(full_label.as_bytes());
-    info.push(0); // empty context
-    info
-}
-
 /// HKDF-Expand-Label (RFC 8446 §7.1), SHA-256 variant.
 fn hkdf_expand_label_sha256(secret: &[u8], label: &str, out: &mut [u8]) {
     let hk = Hkdf::<Sha256>::from_prk(secret).expect("traffic secret shorter than hash");
-    hk.expand(&expand_label_info(label, out.len()), out)
-        .expect("okm length within limits");
+    super::hkdf_expand_label(&hk, label.as_bytes(), out).expect("okm length within limits");
 }
 
 /// HKDF-Expand-Label (RFC 8446 §7.1), SHA-384 variant.
 fn hkdf_expand_label_sha384(secret: &[u8], label: &str, out: &mut [u8]) {
     let hk = Hkdf::<Sha384>::from_prk(secret).expect("traffic secret shorter than hash");
-    hk.expand(&expand_label_info(label, out.len()), out)
-        .expect("okm length within limits");
+    super::hkdf_expand_label(&hk, label.as_bytes(), out).expect("okm length within limits");
 }
 
 /// A TLS 1.3 traffic secret plus the suite it belongs to.

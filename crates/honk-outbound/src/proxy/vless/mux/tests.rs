@@ -878,6 +878,72 @@ async fn mux_refusal_distinguishes_target_status_from_http_envelope() {
     }
 }
 
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn target_evidence_requires_mux_body_status_not_http_success() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    for status in [0, 1] {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observer = FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            {
+                let events = Arc::clone(&events);
+                Arc::new(move |_, event| {
+                    if let FlowEvent::Milestone { milestone } = event {
+                        events.lock().push(milestone.as_str());
+                    }
+                })
+            },
+        );
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let io = server_carrier(server, false).await;
+            let mut connection = h2::server::handshake(io).await.unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let response = if status == 0 {
+                Bytes::from_static(b"\0x")
+            } else {
+                Bytes::from_static(b"\x01\x01x")
+            };
+            send.send_data(response, true).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let session = connect(Box::new(client), false).await.unwrap();
+        let mut stream = observer
+            .scope(Arc::clone(&session).open_stream(
+                session.try_reserve().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("logical stream failed to open"));
+        assert_eq!(&*events.lock(), &["target_request_sent"]);
+        let result = stream.read_u8().await;
+        if status == 0 {
+            assert_eq!(result.unwrap(), b'x');
+            assert_eq!(
+                &*events.lock(),
+                &["target_request_sent", "target_confirmed"]
+            );
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+            assert_eq!(&*events.lock(), &["target_request_sent"]);
+        }
+        drop(stream);
+        session.close();
+        server.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn logical_writes_wait_for_h2_flow_control() {
     const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;

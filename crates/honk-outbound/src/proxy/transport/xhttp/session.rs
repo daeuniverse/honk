@@ -299,7 +299,7 @@ pub(super) async fn connect(inner: Box<dyn AsyncReadWrite>) -> anyhow::Result<Ar
         progress,
     });
     let weak = Arc::downgrade(&session);
-    let driver = tokio::spawn(async move {
+    let driver = crate::runtime::spawn_owned(async move {
         let result = poll_fn(|cx| {
             let result = Pin::new(&mut connection).poll(cx);
             if let Some(session) = weak.upgrade() {
@@ -342,7 +342,7 @@ pub(super) async fn connect(inner: Box<dyn AsyncReadWrite>) -> anyhow::Result<Ar
             session.wake();
         }
     });
-    *session.driver.lock() = Some(driver.abort_handle());
+    *session.driver.lock() = driver;
     Ok(session)
 }
 pub(super) enum RequestOwner {

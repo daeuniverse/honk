@@ -37,6 +37,7 @@ async fn acquisition_initializes_once_when_128_callers_race() {
                 Ok::<_, anyhow::Error>(7_u8)
             })
             .await
+            .map(|(value, _)| value)
         });
     }
 
@@ -67,6 +68,7 @@ async fn builder_abort_wakes_waiters_and_allows_recovery() {
                 Ok::<_, anyhow::Error>(1_u8)
             })
             .await
+            .map(|(value, _)| value)
     });
     started_rx.await.expect("builder started");
     let gate = Arc::new(tokio::sync::Barrier::new(129));
@@ -78,6 +80,7 @@ async fn builder_abort_wakes_waiters_and_allows_recovery() {
             gate.wait().await;
             slot.acquire(|| async { Ok::<_, anyhow::Error>(2_u8) })
                 .await
+                .map(|(value, _)| value)
         });
     }
     gate.wait().await;
@@ -97,6 +100,7 @@ async fn builder_abort_wakes_waiters_and_allows_recovery() {
     let recovered = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(3_u8) })
         .await
+        .map(|(value, _)| value)
         .expect("retry succeeds");
     assert_eq!(*recovered, 3);
     assert_eq!(slot.init_count(), 2);
@@ -120,6 +124,7 @@ async fn builder_error_is_fanned_out_to_waiters() {
                 )
             })
             .await
+            .map(|(value, _)| value)
     });
     started_rx.await.expect("builder started");
     let gate = Arc::new(tokio::sync::Barrier::new(129));
@@ -131,6 +136,7 @@ async fn builder_error_is_fanned_out_to_waiters() {
             gate.wait().await;
             slot.acquire(|| async { Ok::<_, anyhow::Error>(9_u8) })
                 .await
+                .map(|(value, _)| value)
         });
     }
     gate.wait().await;
@@ -172,6 +178,7 @@ async fn close_is_idempotent() {
     let closes = Arc::new(AtomicUsize::new(0));
     slot.acquire(|| async { Ok::<_, anyhow::Error>(5_u8) })
         .await
+        .map(|(value, _)| value)
         .expect("resource");
 
     // When
@@ -208,6 +215,7 @@ async fn repeated_builder_interruption_never_leaves_a_stale_slot() {
                     std::future::pending::<anyhow::Result<u8>>().await
                 })
                 .await
+                .map(|(value, _)| value)
         });
         started_rx.await.expect("builder started");
         builder.abort();
@@ -217,6 +225,7 @@ async fn repeated_builder_interruption_never_leaves_a_stale_slot() {
     let value = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(11_u8) })
         .await
+        .map(|(value, _)| value)
         .expect("recovered resource");
 
     // Then
@@ -230,6 +239,7 @@ async fn cancelled_close_preserves_cleanup_for_waiting_close() {
     let resource = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
+        .map(|(value, _)| value)
         .expect("resource");
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let mut first = Box::pin(slot.close(|resource| async move {
@@ -260,6 +270,7 @@ async fn cancelled_close_allows_acquire_to_finish_original_teardown() {
     let resource = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
+        .map(|(value, _)| value)
         .expect("resource");
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let mut closing = Box::pin(slot.close(|resource| async move {
@@ -275,7 +286,7 @@ async fn cancelled_close_allows_acquire_to_finish_original_teardown() {
     }));
     assert!(futures::poll!(acquiring.as_mut()).is_pending());
     release_tx.send(()).expect("original cleanup retained");
-    let replacement = tokio::time::timeout(Duration::from_secs(1), acquiring)
+    let (replacement, _) = tokio::time::timeout(Duration::from_secs(1), acquiring)
         .await
         .expect("ordinary acquire resumes teardown")
         .expect("replacement");
@@ -305,6 +316,7 @@ async fn retained_failure_does_not_keep_driver_alive() {
             ))
         })
         .await
+        .map(|(value, _)| value)
         .unwrap();
     running.await.unwrap();
     let error = anyhow::Error::new(SessionFailure::new(
@@ -336,6 +348,7 @@ async fn stale_retirement_cannot_close_a_replacement() {
     let original = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
+        .map(|(value, _)| value)
         .expect("original");
     let failure = anyhow::Error::new(SessionFailure::new(
         Arc::clone(&original),
@@ -353,6 +366,7 @@ async fn stale_retirement_cannot_close_a_replacement() {
     let replacement = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
+        .map(|(value, _)| value)
         .expect("replacement");
 
     slot.retire(&observed, |resource| async move {
@@ -362,6 +376,7 @@ async fn stale_retirement_cannot_close_a_replacement() {
     let current = slot
         .acquire(|| async { panic!("replacement must remain available") })
         .await
+        .map(|(value, _)| value)
         .expect("current session");
     assert!(Arc::ptr_eq(&current, &replacement));
     assert_eq!(replacement.load(Ordering::SeqCst), 0);
@@ -375,6 +390,7 @@ async fn stale_retirement_does_not_wait_for_another_build() {
     let original = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(1_u8) })
         .await
+        .map(|(value, _)| value)
         .expect("original");
     slot.retire(&original, |_| async {}).await;
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -391,7 +407,7 @@ async fn stale_retirement_does_not_wait_for_another_build() {
     .await
     .expect("stale retirement does not wait for a different build");
     release_tx.send(()).expect("release replacement");
-    assert_eq!(*building.await.expect("replacement"), 2);
+    assert_eq!(*building.await.expect("replacement").0, 2);
     assert_eq!(slot.close_count(), 1);
 }
 
@@ -401,6 +417,7 @@ async fn concurrent_closer_cannot_close_a_replacement() {
     let original = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
+        .map(|(value, _)| value)
         .expect("original");
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let mut first = Box::pin(slot.close(|resource| async move {
@@ -418,12 +435,14 @@ async fn concurrent_closer_cannot_close_a_replacement() {
     let replacement = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
+        .map(|(value, _)| value)
         .expect("replacement");
     second.await;
 
     let current = slot
         .acquire(|| async { panic!("replacement must remain available") })
         .await
+        .map(|(value, _)| value)
         .expect("current session");
     assert!(Arc::ptr_eq(&current, &replacement));
     assert_eq!(original.load(Ordering::SeqCst), 1);

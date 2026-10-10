@@ -70,6 +70,141 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
     .expect("the connection must close on abort");
 }
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() {
+    use futures_util::FutureExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let mut guard =
+        crate::runtime::NodeRuntime::try_ephemeral_guarded(&anytls_node("native-joined")).unwrap();
+    let runtime = guard.runtime();
+    let (session, mut server) = runtime
+        .scope_tasks(async { Ok(establish_test_session("native-joined").await) })
+        .await
+        .unwrap();
+    expect_handshake(&mut server).await;
+    let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+        panic!("expected AnyTLS runtime")
+    };
+    anytls.pool.insert(&session);
+    session.close();
+    assert_eq!(anytls.pool.live_session_count(), 0);
+    guard.close().await.unwrap();
+    assert!(matches!(
+        server.read(&mut [0; 1]).now_or_never(),
+        Some(Ok(0))
+    ));
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_ephemeral_close_joins_cancelled_pool_factory_before_releasing_capacity() {
+    use futures_util::FutureExt as _;
+
+    let mut guard =
+        crate::runtime::NodeRuntime::try_ephemeral_guarded(&anytls_node("native-factory")).unwrap();
+    let runtime = guard.runtime();
+    let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+        panic!("expected AnyTLS runtime")
+    };
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    let mut offer = Box::pin(runtime.scope_tasks(anytls.pool.offer(move || async move {
+        let _permit = permit;
+        std::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
+    })));
+    assert!(offer.as_mut().now_or_never().is_none());
+    drop(offer);
+    guard.close().await.unwrap();
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(!anytls.pool.has_usable_session());
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_production_factory_and_drivers_travel_with_reused_runtime() {
+    use futures_util::FutureExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let node = zero_idle_anytls_node("owned-production");
+    let first = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap()
+    .0;
+    let runtime = first.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    AnyTlsHandler::ensure_janitor(&node, &pool, Some(Arc::clone(&runtime)));
+    let (wire_tx, wire_rx) = tokio::sync::oneshot::channel();
+    let session = pool
+        .offer(move || async move {
+            let (session, server) = establish_test_session("owned-production").await;
+            wire_tx.send(server).unwrap();
+            Ok(session)
+        })
+        .await
+        .unwrap();
+    let mut server = wire_rx.await.unwrap();
+    expect_handshake(&mut server).await;
+    let (successor, reused) = crate::runtime::OutboundRuntimeRegistry::build_reusing(
+        std::slice::from_ref(&node),
+        1,
+        Some(&first),
+    )
+    .unwrap();
+    first.mark_moved_out(reused);
+    first.shutdown().await;
+    assert!(!session.is_closed());
+    assert!(session.try_reserve().is_some());
+    successor.shutdown().await;
+    assert!(session.is_closed());
+    assert!(matches!(
+        server.read(&mut [0; 1]).now_or_never(),
+        Some(Ok(0))
+    ));
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_production_close_joins_factory_cancelled_before_first_poll() {
+    use futures_util::FutureExt as _;
+
+    let node = zero_idle_anytls_node("unpolled-production");
+    let generation = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap()
+    .0;
+    let runtime = generation.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    let mut offer = Box::pin(pool.offer(move || async move {
+        let _permit = permit;
+        std::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
+    }));
+    assert!(offer.as_mut().now_or_never().is_none());
+    drop(offer);
+    generation.shutdown().await;
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(
+        pool.offer(|| async { panic!("closed pool must not invoke factory") })
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn ephemeral_runtime_close_releases_session_and_connection() {
     let node = anytls_node("ephemeral-probe");

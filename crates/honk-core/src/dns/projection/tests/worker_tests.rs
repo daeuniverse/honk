@@ -72,7 +72,7 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
         .expect("initial write");
     assert!(state.commit_success(&initial.sets, &[]));
 
-    state.observe(ProjectionObservation::Clear { domain: "a.test" }, now);
+    state.observe(clear_v4("a.test"), now);
     let stale_remove = state.batch(now);
     state.observe(positive("b.test", &[ip], Duration::from_secs(30)), now);
     backend.remove_domain_ip_bitmap(&key).expect("stale remove");
@@ -288,7 +288,7 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
         publication.commit(Arc::clone(&new), Some(published));
         drop(backend);
         if !expire_during_publication {
-            projection.submit(new, ProjectionObservation::Clear { domain: "a.test" });
+            projection.submit(new, clear_v4("a.test"));
         }
         worker::flush_for_test(&projection, &ebpf).await;
         assert!(

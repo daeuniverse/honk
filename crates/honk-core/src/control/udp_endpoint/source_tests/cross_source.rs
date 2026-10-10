@@ -20,6 +20,7 @@ async fn different_sources_share_only_aggregated_carriers() {
                 8,
                 8,
                 8,
+                false,
                 None,
             )
             .unwrap()
@@ -98,7 +99,7 @@ async fn different_sources_share_only_aggregated_carriers() {
         assert_eq!(keep.status, STATUS_KEEP);
         assert_eq!(keep.payload.as_deref(), Some(b"survivor".as_slice()));
         endpoints.clear();
-        assert!(pool.shutdown().await);
+        assert!(pool.shutdown().await.joined);
         generation.shutdown().await;
         wire_task.abort();
         let _ = wire_task.await;
@@ -156,7 +157,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
             remote,
             None,
             Arc::new(pool.create_reply_socket(original).unwrap()),
-            stats.outbound_tracker("core-source-vless"),
+            stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,
             None,
@@ -177,7 +178,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
         assert_eq!(receive_reply(&client).await, (b"reply".to_vec(), original));
     }
     endpoints.clear();
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;

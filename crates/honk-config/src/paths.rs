@@ -112,8 +112,14 @@ fn resolve_path_with_legacy_from(
 /// path resolves to the configured data-directory location for clear errors
 /// and future creation.
 pub fn resolve_dependency_path(path: impl AsRef<Path>) -> PathBuf {
+    resolve_dependency_path_from(path, data_dir())
+}
+
+/// Resolve a read-only dependency against an explicit effective data directory.
+/// This does not install or modify the process-wide runtime directory.
+pub fn resolve_dependency_path_from(path: impl AsRef<Path>, data_dir: &Path) -> PathBuf {
     let path = path.as_ref();
-    resolve_path_with_legacy_from(path, data_dir(), Path::new(LEGACY_DATA_DIR), Some(path))
+    resolve_path_with_legacy_from(path, data_dir, Path::new(LEGACY_DATA_DIR), Some(path))
 }
 
 #[cfg(test)]

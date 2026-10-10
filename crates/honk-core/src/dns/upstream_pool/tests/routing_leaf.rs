@@ -50,7 +50,14 @@ async fn resolve_dial_route_group_uses_group_manager_selector() {
     let mut group = test_group("proxy", GroupPolicy::Selector, vec![alpha.id, beta.id]);
     group.default = Some("beta".into());
     let group_manager = GroupManager::new(&[group], &[alpha.clone(), beta.clone()]).into_shared();
-    group_manager.read().set_selector_choice("proxy", "alpha");
+    group_manager
+        .read()
+        .set_selector_choice(
+            "proxy",
+            "alpha",
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let upstream = DnsUpstream {
         outbound: Some("proxy".into()),
         ..make_upstream("google", "192.0.2.53:53", DnsProtocol::Https)
@@ -74,7 +81,12 @@ async fn resolve_dial_route_group_uses_group_manager_selector() {
         .as_ref()
         .unwrap()
         .read()
-        .set_selector_choice("proxy", "beta");
+        .set_selector_choice(
+            "proxy",
+            "beta",
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     assert_eq!(
         pool.resolve_dial_route(&pool.entries["google"])
             .await

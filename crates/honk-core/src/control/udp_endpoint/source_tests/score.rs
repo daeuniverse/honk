@@ -117,7 +117,9 @@ impl ScoreSourceFixture {
             reply_socket_slots: Arc::new(Semaphore::new(MAX_REPLY_SOCKETS_PER_ENDPOINT)),
             client_addr: self.client_addr,
             alive_set: Arc::clone(&self.alive),
-            outbound_tracker: self.stats.outbound_tracker("core-source-vless"),
+            outbound_tracker: self
+                .stats
+                .outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             stats: Arc::clone(&self.stats),
             health_family: honk_outbound::alive::IpVersion::V4,
         };
@@ -130,7 +132,7 @@ impl ScoreSourceFixture {
     }
 
     async fn shutdown(self) {
-        assert!(self.pool.shutdown().await);
+        assert!(self.pool.shutdown().await.joined);
         self.generation.shutdown().await;
         self.wire_task.abort();
         let _ = self.wire_task.await;

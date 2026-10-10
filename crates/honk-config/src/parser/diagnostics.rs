@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::read::Text;
 use crate::diagnostic::{
-    ConfigDiagnostic, DetailedDiagnostic, SafeValue, SettingPath, SourceRef, project_legacy,
+    ConfigDiagnostic, DetailedDiagnostic, SafeValue, SettingPath, SettingSegment, SourceRef,
+    project_legacy,
 };
 use crate::error::DetailedConfigError;
 
@@ -37,6 +38,8 @@ pub(super) struct ParserDiagnostics<'a> {
     entry: Option<usize>,
     notices: Vec<(usize, DetailedDiagnostic)>,
     root: &'static str,
+    /// The top-level block being read, for errors that carry no setting path.
+    section: Option<&'static str>,
     attempt_start: usize,
 }
 
@@ -45,6 +48,7 @@ impl<'a> ParserDiagnostics<'a> {
         Self {
             attempt_start: output.len(),
             root: "config",
+            section: None,
             output,
             current: Location {
                 source,
@@ -186,6 +190,7 @@ impl<'a> ParserDiagnostics<'a> {
             "group" => "groups",
             _ => "config",
         };
+        self.section = super::cursor::Root::parse(name).map(super::cursor::Root::name);
         self.group = None;
         self.subscription = None;
         self.entry = None;
@@ -234,9 +239,11 @@ impl<'a> ParserDiagnostics<'a> {
                 }
             }
         } else if let Some(index) = self.subscription {
-            diagnostic.setting = SettingPath::new("subscriptions")
-                .index(index)
-                .field("interval");
+            if let Some(crate::diagnostic::SettingSegment::Field(field)) =
+                diagnostic.setting.0.last().cloned()
+            {
+                diagnostic.setting = SettingPath::new("subscriptions").index(index).field(field);
+            }
             diagnostic.entry_index = Some(index);
         } else if ttl && let Some(index) = self.entry {
             diagnostic.setting = SettingPath::new("dns")
@@ -366,6 +373,32 @@ impl<'a> ParserDiagnostics<'a> {
         {
             error.diagnostic.setting = error.diagnostic.setting.clone().index(index);
             error.diagnostic.entry_index = Some(index);
+        }
+        // Legacy prose carries no position: name the section and entry being read.
+        let setting = &mut error.diagnostic.setting;
+        match error.diagnostic.code {
+            "unknown-protocol" => {
+                if let Some(entry) = self.entry {
+                    setting.0.insert(1, SettingSegment::Index(entry));
+                    error.diagnostic.entry_index = Some(entry);
+                }
+            }
+            "unsupported-policy" => {
+                if let Some(group) = self.group {
+                    setting.0.insert(1, SettingSegment::Index(group));
+                }
+            }
+            "config-parse" | "config-validation" if *setting == SettingPath::new("config") => {
+                if self.root != "config" {
+                    *setting = SettingPath::new(self.root);
+                    if let Some(index) = self.group.or(self.entry).or(self.subscription) {
+                        *setting = setting.clone().index(index);
+                    }
+                } else if let Some(section) = self.section {
+                    *setting = SettingPath::new(section);
+                }
+            }
+            _ => {}
         }
         error
     }

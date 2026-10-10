@@ -297,7 +297,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
         let pool = Arc::clone(self);
         let shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(pool.run_janitor(idle_timeout, prewarm, shutdown_rx));
+        let _ = self
+            .task_scope
+            .spawn(pool.run_janitor(idle_timeout, prewarm, shutdown_rx));
     }
 
     /// Retire the pool without cutting live streams. New offers, inserts,
@@ -341,7 +343,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
 
         let pool = Arc::clone(&self.pool);
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        let _ = self.task_scope.spawn(async move {
             loop {
                 let (to_close, empty) = {
                     let mut pool = pool.lock();

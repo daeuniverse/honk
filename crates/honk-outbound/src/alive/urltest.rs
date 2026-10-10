@@ -1,7 +1,7 @@
 use super::collection::DialerCollection;
 use super::{
     AliveDialerSet, DEFAULT_URLTEST_IDLE_TIMEOUT, ProbeDomain, RECOVERY_SUCCESSES_NEEDED,
-    UrlMemberResolver, UrlProbeState, probe_backoff, probe_failure_threshold,
+    UrlMemberResolver, UrlProbeMember, UrlProbeState, probe_backoff, probe_failure_threshold,
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -51,6 +51,7 @@ impl AliveDialerSet {
             for (group, url) in groups {
                 map.insert(group.clone(), url.clone());
             }
+            self.reset_group_health_observations();
         }
         let active_urls: HashSet<String> = self.group_check_urls.read().values().cloned().collect();
         self.url_check_ips
@@ -79,10 +80,9 @@ impl AliveDialerSet {
         *self.url_member_resolver.write() = resolver;
     }
 
-    /// Resolve a custom-URL group's members to `(tag, leaf)` pairs through
-    /// the installed resolver. Empty when no resolver is installed (tests
-    /// drive the per-url state directly).
-    pub fn url_members_for(&self, group: &str) -> Vec<(String, String)> {
+    /// Resolve custom-check members with their captured leaf identities.
+    /// Empty when no resolver is installed.
+    pub fn url_members_for(&self, group: &str) -> Vec<UrlProbeMember> {
         self.url_member_resolver
             .read()
             .as_ref()

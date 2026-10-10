@@ -80,6 +80,8 @@ pub struct ParsedPacket {
     pub listener_l4proto: u8,
     pub is_fragmented: u8,
     pub routing_input: honk_ebpf_common::RoutingInput,
+    pub route_witness: honk_ebpf_common::KernelRouteWitness,
+    pub trace_id: u32,
 }
 
 /// Malformed packet: invalid header, bad length, too many extension headers.

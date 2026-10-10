@@ -45,7 +45,7 @@ fn test_config_dae_parses() {
         .parse::<std::net::SocketAddr>()
         .expect("config.dae controller must be a numeric socket address");
     assert!(controller.ip().is_loopback());
-    assert!(config.experimental.cache_file.enabled);
+    assert_eq!(config.experimental.cache_file.enabled, Some(true));
 }
 
 #[test]
@@ -60,6 +60,8 @@ fn test_config_min_dae_parses() {
     assert_eq!(config.groups[0].name, "iris");
     assert_eq!(config.routing.rules.len(), 1);
     assert_eq!(config.routing.default_outbound, "direct");
+    assert!(config.experimental.cache_file.stores_selections());
+    assert!(!config.experimental.cache_file.stores_mode());
 }
 
 #[test]
@@ -83,6 +85,9 @@ fn test_example_dae_parses() {
         config.experimental.clash_api.external_controller,
         "127.0.0.1:9090"
     );
-    assert!(config.experimental.cache_file.enabled);
-    assert_eq!(config.experimental.cache_file.path, "cache.db");
+    assert_eq!(config.experimental.cache_file.enabled, Some(true));
+    assert_eq!(
+        config.experimental.cache_file.legacy_cache_file(),
+        (None, None)
+    );
 }

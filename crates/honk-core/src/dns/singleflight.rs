@@ -20,6 +20,7 @@ pub(crate) enum FlightKey {
         cache_key: CacheKey,
         mode: ResolveMode,
         prefer_meta: Option<DnsRequestMeta>,
+        prefer_forced: Option<super::planner::UpstreamTag>,
     },
     Refresh(CacheKey),
 }
@@ -31,6 +32,7 @@ impl FlightKey {
         strategy: &DnsStrategy,
         qtype: u16,
         metadata: DnsRequestMeta,
+        forced: Option<&super::planner::UpstreamTag>,
     ) -> Self {
         let prefer_meta = matches!(
             (strategy, qtype),
@@ -41,6 +43,7 @@ impl FlightKey {
             cache_key,
             mode,
             prefer_meta,
+            prefer_forced: prefer_meta.and(forced.cloned()),
         }
     }
 
@@ -107,7 +110,7 @@ impl Singleflight {
             if sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
-                tracing::warn!(
+                crate::logging::warn_throttled!(
                     saturation = "waiters",
                     action = "reject",
                     "DNS singleflight saturated"
@@ -129,7 +132,7 @@ impl Singleflight {
         if entries.len() >= MAX_ACTIVE_FLIGHTS {
             self.counters.rejections.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
-            tracing::warn!(
+            crate::logging::warn_throttled!(
                 saturation = "keys",
                 action = "reject",
                 "DNS singleflight saturated"

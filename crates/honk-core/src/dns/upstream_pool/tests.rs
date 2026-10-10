@@ -112,6 +112,7 @@ fn test_group(
     Group {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
+        icon: None,
         policy,
         nodes: node_ids,
         filters: vec![],
@@ -123,6 +124,7 @@ fn test_group(
         tolerance: 50,
         idle_timeout: None,
         interrupt_connections: false,
+        own: Default::default(),
         created_at: chrono::Utc::now(),
     }
 }

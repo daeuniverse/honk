@@ -368,6 +368,23 @@ mod subscription_syntax {
     }
 
     #[test]
+    fn invalid_subscription_cache_reports_the_cache_field() {
+        let input = "subscription {\n paid: {\n  url: 'http://paid'\n  cache: maybe\n }\n}\nrouting {\n fallback: direct\n}\n";
+        let (config, diagnostics) = parse(input);
+        assert!(config.subscriptions[0].cache);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "legacy-config-warning")
+            .unwrap();
+        assert_eq!(diagnostic.setting.to_string(), "subscriptions[1].cache");
+        assert_eq!(
+            diagnostic.message,
+            "value is not a boolean; using fallback true"
+        );
+        assert_eq!(&input[diagnostic.span.clone().unwrap()], "maybe");
+    }
+
+    #[test]
     fn compact_tokens_inside_user_agents_remain_data() {
         let (config, diagnostics) =
             parse("subscription { paid: 'https://example.com/sub'(agent {} worker) }");

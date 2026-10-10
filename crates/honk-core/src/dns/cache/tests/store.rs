@@ -69,42 +69,38 @@ fn test_lru_eviction() {
 }
 
 #[test]
-fn wire_byte_budget_evicts_with_entry_slots_remaining() {
+fn only_the_entry_count_limits_large_answers() {
     let mut cache = DnsCache::new(32);
     let keys: Vec<String> = (0..1000)
         .map(|index| format!("large-same-shard-{index}:1"))
         .filter(|key| cache.shard_index(key) == 0)
         .take(2)
         .collect();
-    let first = keys.first().expect("first key").clone();
-    let second = keys.get(1).expect("second key").clone();
 
-    cache.put(first.clone(), vec![0; 40_000], 300);
-    cache.put(second.clone(), vec![0; 40_000], 300);
+    for key in &keys {
+        cache.put(key.clone(), vec![0; 70_000], 300);
+    }
 
-    assert!(cache.get(&first).is_none());
-    assert!(cache.get(&second).is_some());
-}
-
-#[test]
-fn wire_byte_budget_rejects_an_oversized_key() {
-    let mut cache = DnsCache::new(1);
-    let key = "x".repeat(70_000);
-
-    cache.put(key.clone(), vec![0; 1], 300);
-
-    assert!(cache.get(&key).is_none());
+    assert!(keys.iter().all(|key| cache.get(key).is_some()));
 }
 
 #[test]
 fn shard_capacities_sum_exactly_and_clamp_count() {
-    for capacity in 1..=33 {
+    for capacity in (1..=33).chain([10_000, 99_999, 100_000]) {
         let cache = DnsCache::new(capacity);
         let capacities = cache.shard_capacities();
         assert_eq!(capacities.len(), capacity.min(16));
         assert_eq!(capacities.iter().sum::<usize>(), capacity);
         assert!(capacities.windows(2).all(|pair| pair[0] >= pair[1]));
         assert!(capacities.windows(2).all(|pair| pair[0] - pair[1] <= 1));
+    }
+}
+
+#[test]
+fn max_cache_size_is_clamped_to_one_hundred_thousand() {
+    for requested in [100_001, 1_000_000_000, usize::MAX] {
+        let capacities = DnsCache::new(requested).shard_capacities();
+        assert_eq!(capacities.iter().sum::<usize>(), 100_000, "{requested}");
     }
 }
 

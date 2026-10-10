@@ -381,6 +381,8 @@ A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机�
 
 `src/tls.rs` 提供 BoringSSL TLS client；进程级 `set_tls_mode` 选择 TLS profile。`build_reality_connector(chrome)` 使用 `reality.rs` 的握手后 ed25519 认证替代 PKI，只允许 TLS 1.3 且不提供 REALITY resumption。显式结构化 TCP ALPN 在 tls/utls 模式下都传入 `build_connector`；空列表保留 profile 默认值，Chrome ALPS 取决于列表是否精确包含 `h2`。Registry 发布与直接 connector 构造都会校验非空 override；共享 stream dispatch 在选择 plaintext 或 REALITY 前校验，直接 QUIC 配置会拒绝 TCP ALPN，而不会忽略它。
 
+`build_connector` 与 `build_reality_connector` 返回共享的 BoringSSL context：每种（REALITY、是否验证、pin、ALPN 覆盖、Chrome 模式）组合一个，保存在进程级缓存中，达到 128 种组合时清空重建。每个 context 持有进程级 webpki 信任库，而不是 `SslConnector::builder` 默认解析的系统 CA 证书包，因此拨号不再解析证书，存活连接也不会各自占用一份 CA 副本。
+
 ### 进程级 TLS profile
 
 `tls_implementation = "utls"` 在进程范围启用唯一实现的 Chrome-oriented
@@ -646,9 +648,12 @@ Encryption 可以包装 direct 与 Xray/Mux.Cool path，包括受支持的 Visio
 outer transport 与 random 模式逐 record 的 header XOR 保持不变，并遵循 Xray
 `XorConn`，包括其对 TLS 形态 header 的跳过规则。这不表示 encrypted Vision 会
 cut over 到 raw socket。
-random-mode Direct 每次 write 最多确认并复制 8 KiB，保留 codec 既有的有界
-pending-write buffer。Header XOR 状态跨这些短写保留；native Direct 不增加
-wire-copy buffer。
+random-mode Direct 每次 write 最多确认并复制 8 KiB。Header XOR 状态跨这些短写
+保留；native Direct 不增加 wire-copy buffer。
+数据持续流动时，codec 复用一块写缓冲（与 random-mode Direct 共用），并在两块
+读缓冲之间轮换，因此稳定传输的 frame 不再分配。超过一个最大 frame 的写缓冲
+（例如较大的 0-RTT prewrite）用完即丢弃。flush 完成后释放写缓冲；读取在 frame
+边界等待时释放明文缓冲，所以空闲 stream 只保留 5 字节 header 缓冲。
 
 ## QUIC 栈
 
@@ -701,15 +706,15 @@ flow 可以在旧 clone 上完成。移除最后一份 warm 所有权只会移�
 IPv4/IPv6 各自的有界流控 profile（包括自适应接收/发送下限与冷却期）属于 runtime，而不是可选的
 client 槽，因此 warm 释放、重建与 speculative client 会复用同一份已学习路径画像。
 
-每条池化 QUIC connection 每秒采样一次 Quinn 路径与 UDP I/O 计数器，汇总到 `/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。同一份采样使用 honk Quinn 中应用已交付/对端已确认的 stream 计数器、connection-credit gauge 与 stream-blocked frame，驱动按地址族保存的流控 profile。收发方向使用 10 秒 goodput EWMA；SRTT >= 80 ms 且连续三个样本确认高 BDP 时，将 connection 接收或发送下限向 `2 x BDP` 提高。对端的 `DATA_BLOCKED` 使 connection 接收样本无需满足 RTT 条件即可合格，并把接收下限的目标设为 `max(adaptive_window(BDP), 2 × current_window)`，因为按受限速率计算的 `2 x BDP` 不会使窗口增长；仍需连续三个样本并遵守下述冷却。stream 接收下限单独由 `STREAM_DATA_BLOCKED` 触发加倍，不要求连续三个样本，因为 connection 聚合 goodput 无法判断单条 stream 的需求。每个下限最大 32 MiB，独立执行五分钟升档冷却，不自动缩小；无需重连即可更新当前 connection 与当前及后续 stream。零进度样本只有在对应 connection credit 仍受压时才会保留尚未完成的升档 streak。原生 TUIC 与 Hysteria2 UDP endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`。连续三次发送超时，或超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC 报文被确认，endpoint 会被退役并关闭该 connection，让下一条流重新拨号。发送成功重置连续发送超时计数；确认进度同时重置两个时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn PING 保活，包括无法发送协议心跳数据报的 UDP-over-stream 回退路径。
+每条池化 QUIC connection 每秒采样一次 Quinn 路径与 UDP I/O 计数器，汇总到 `/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。同一份采样使用 honk Quinn 中应用已交付/对端已确认的 stream 计数器、connection-credit gauge 与 stream-blocked frame，驱动按地址族保存的流控 profile。收发方向使用 10 秒 goodput EWMA；SRTT >= 80 ms 且连续三个样本确认高 BDP 时，将 connection 接收或发送下限向 `2 x BDP` 提高。对端的 `DATA_BLOCKED` 使 connection 接收样本无需满足 RTT 条件即可合格，并把接收下限的目标设为 `max(adaptive_window(BDP), 2 × current_window)`，因为按受限速率计算的 `2 x BDP` 不会使窗口增长；仍需连续三个样本并遵守下述冷却。stream 接收下限单独由 `STREAM_DATA_BLOCKED` 触发加倍，不要求连续三个样本，因为 connection 聚合 goodput 无法判断单条 stream 的需求。每个下限最大 32 MiB，独立执行五分钟升档冷却，不自动缩小；无需重连即可更新当前 connection 与当前及后续 stream。零进度样本只有在对应 connection credit 仍受压时才会保留尚未完成的升档 streak。原生 TUIC 与 Hysteria2 UDP endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`；仅发送超时不会关闭 connection，因为 Quinn 会在拥塞控制占用容量时挂起发送。只有在最近一次确认之后发出的 ack-eliciting 报文至少有三个仍未确认，且超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC 报文被确认时，路径 watchdog 才会关闭该 connection 并退役 endpoint，让下一条流重新拨号。确认进度会重置该时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn PING 保活，包括无法发送协议心跳数据报的 UDP-over-stream 回退路径。
 
 ### 协议契约
 
 | 协议 | 认证与 TCP | UDP | Transport 策略 |
 | --- | --- | --- | --- |
-| TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，可由节点覆盖 |
-| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口 |
-| Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口 |
+| TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB，可由节点覆盖 |
+| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB |
+| Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口，connection 窗口同样自动调整 |
 
 Go `juicity-server` v0.4.3 有实现层面的 UDP relay 限制：它申请的 1,500 字节
 buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包。互操作实测
@@ -729,14 +734,14 @@ Hysteria2 沿用 sing-quic 的惰性 TCP 建立方式：打开双向流后拨号
 到 listener。接收 metadata 把回包源端口重写为 nominal remote 端口，
 使 QUIC 只看到一个稳定 peer。
 
-quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。已测得在 RTT 为 75 ms、丢包率为 15% 的链路上将窗口从 32 MiB 降至 8 MiB，不影响吞吐。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
+quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。它从 8 MiB 起步，honk 的 quinn fork（`TransportConfig::receive_window_autotune`）按 quic-go 的方式增长：一个 epoch 内应用读走超过半个窗口、且读走该比例耗时少于 `4 × 比例 × RTT` 时翻倍，上限取 32 MiB 与配置窗口中较大者。增长只由应用实际读走的字节驱动，处理缓慢的接收方不会放大窗口，窗口也不会缩小。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
 
 ## AnyTLS session 引擎
 
 `src/proxy/anytls/mod.rs` 实现 sing-anytls 多路复用，handler 无状态。每个
-generation 的 `NodeRuntime::AnyTls` 拥有一个 `SessionPool<AnyTlsSession>` 与 lazy
-materialize 的 BoringSSL connector。无 generation 调用使用由 guard 持有的
-ephemeral 等价对象。
+generation 的 `NodeRuntime::AnyTls` 拥有一个 `SessionPool<AnyTlsSession>` 与首次
+拨号时构建的 BoringSSL connector；TLS context 按 shape 共享，因此 connector 不做
+空闲回收。无 generation 调用使用由 guard 持有的 ephemeral 等价对象。
 
 ### Pool 与 session 生命周期
 
@@ -758,8 +763,9 @@ least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每�
 即加入按 SID 跟踪的 pending 集合，SYNACK 只结清自己的 SID——无关 stream 的应答
 不会清除其他 stream 的 deadline，本地拆流同样取消对应定时器。SYN 写出三秒后
 仍 pending 的 open，若窗口内 session 仍有入站帧（服务端活着只是未应答该开流）
-则只重置该 stream；窗口内完全静默才退役物理 session，让 pool 重新拨号而不是
-继续复用已死 carrier。
+则只重置该 stream。窗口内完全静默不表示 carrier 已失效：突发丢包会让所有 stream
+同时静默，之后 TCP 仍会送达。此时只重置该 open，并让 session 退出轮转。
+仅当再静默十秒才连同其 stream 一起退役，pool 会重新拨号，而不继续复用已失效的 carrier。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor（`anytls_min_idle_session`）与 `anytls_idle_session_timeout` 输入同一个节点局部 janitor。Selector 或
@@ -798,13 +804,13 @@ pending chunk，也不会重复入队。
 顺序将 frame 暂存到 overflow，不等待队列，保证 sibling 进度，并保留精确的
 frame/byte 计数。
 
-第一个 parked frame 启动每 250 ms tick
-一次的 watchdog。只有整整 3 秒没有成功 overflow flush 的 stream 才被
-reset；仅存在 queued byte 不是 stall 证据。
-
-Emergency hard limit 为每 session 768 个 parked frame；retained payload
-字节数由下文的 pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，
-admission 立即 reap 它。否则 demultiplexer 以有界
+没有独立的计时器会 reset parked stream：reader 可以暂停任意长时间，仅存在
+queued byte 不是 stall 证据。Emergency hard limit 为每 session 768 个 parked
+data frame（每个 SID 最多两个 terminal event）；达到该上限时，只有整整 3 秒
+没有成功 overflow flush 的 stream 才会被 reset。retained payload 字节数由下文的
+pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，达到 hard limit
+时 admission 立即 reap 它。
+否则 demultiplexer 以有界
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
 在 reader progress 后重新判断。这覆盖已测得的 9.4 Gbps 下 12–16 ms reader 启动延迟；正常读取端的首次 flush 通过 `overflow_notify` 唤醒等待。每次移除都把对应 overflow counter 归零。
 

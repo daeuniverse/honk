@@ -9,22 +9,30 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
-pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
+pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
+pub(crate) mod degradations;
 pub mod dns;
+pub(crate) mod download_route;
 pub mod ebpf;
+mod logging;
 mod marked_http;
 pub mod mode;
+#[cfg(feature = "native-api")]
+pub mod native_api;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;
+#[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
+pub(crate) mod observe;
 pub mod pool;
 pub mod relay;
 pub mod routing;
 pub mod sniffing;
+pub mod state;
 pub mod stats;
 pub mod subscription;
 
@@ -34,6 +42,10 @@ pub use honk_outbound::proxy;
 
 /// Build-time release tag or Git description; package version without Git metadata.
 pub const VERSION: &str = env!("HONK_VERSION");
+/// The commit this binary was built from; empty when the build had no Git checkout.
+pub const REVISION: &str = env!("HONK_REVISION");
+/// The target triple this binary was built for.
+pub const TARGET: &str = env!("HONK_TARGET");
 
 use clap::Parser;
 use honk_config::Config;
@@ -41,8 +53,14 @@ use honk_config::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SettingPath, finish_attempt, report_detailed_diagnostics,
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
+use logging::{
+    LOG_FILE_LIMIT, LocalTime, QUIET_LOG_TARGETS, RotatingLogFile, console_ansi, console_log_layer,
+    resolved_log_file_path,
+};
+use state::startup::{claim_state, open_state_db};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 /// Raise the soft descriptor limit toward the hard maximum, then return the
 /// one startup snapshot used to size every control-plane descriptor owner.
@@ -81,31 +99,6 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
     Ok(usize::try_from(active_soft)
         .unwrap_or(control::MAX_EFFECTIVE_NOFILE)
         .min(control::MAX_EFFECTIVE_NOFILE))
-}
-async fn request_runtime_reload(
-    reload_tx: &tokio::sync::mpsc::Sender<control::ControlCommand>,
-    subscription_supervisor: &subscription::SubscriptionSupervisorHandle,
-    request_id: u64,
-    config: Config,
-    diagnostics: Vec<DetailedDiagnostic>,
-) -> anyhow::Result<()> {
-    let (result, applied) = tokio::sync::oneshot::channel();
-    reload_tx
-        .send(control::ControlCommand::ReloadConfig {
-            request_id,
-            config: Box::new(config),
-            diagnostics,
-            result,
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("command send failed: {error}"))?;
-    if let Some(authorized) = applied
-        .await
-        .map_err(|error| anyhow::anyhow!("result channel failed: {error}"))?
-    {
-        subscription_supervisor.reconcile(authorized).await?;
-    }
-    Ok(())
 }
 
 #[cfg(feature = "ebpf")]
@@ -198,6 +191,35 @@ pub enum ClashCommand {
     },
     /// Ask the running instance to reload its configured file
     Reload,
+    /// Read the configuration db
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+    /// Manage the password-mode administrator
+    Admin {
+        #[command(subcommand)]
+        action: AdminCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Delete the administrator record so that setup opens again; refused while honk-core runs
+    Reset,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write the active revision as one dae file, listener secrets included
+    Export {
+        /// New file to write; an existing one is refused
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Leave the listener secrets out
+        #[arg(long)]
+        without_secrets: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -241,19 +263,78 @@ pub struct Cli {
     /// Use mock eBPF backend (for testing without kernel support)
     #[arg(long)]
     pub mock_ebpf: bool,
+
+    /// Where the administered configuration lives: the `-c` file tree, or the
+    /// revisions in `<data-dir>/state/honk.db`
+    #[arg(long, value_enum, default_value = "file")]
+    pub store: ConfigStore,
+
+    /// Runtime data directory holding the state db; must equal `global.data_dir`
+    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR, global = true)]
+    pub data_dir: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigStore {
+    File,
+    Db,
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
+    let read_config = || -> anyhow::Result<Config> {
+        match cli.store {
+            ConfigStore::File => Ok(Config::from_file(cli.config.to_str().unwrap())?),
+            #[cfg(feature = "native-api")]
+            ConfigStore::Db => {
+                let text = native_api::store::db::export(&cli.data_dir, true)
+                    .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+                Ok(honk_config::parser::parse_dae_config(&text)?)
+            }
+            #[cfg(not(feature = "native-api"))]
+            ConfigStore::Db => anyhow::bail!("--store db needs the native-api feature"),
+        }
+    };
 
     match cmd {
+        #[cfg(feature = "native-api")]
+        ClashCommand::Config {
+            action:
+                ConfigCommand::Export {
+                    out,
+                    without_secrets,
+                },
+        } => {
+            native_api::store::db::export_to(&cli.data_dir, out, !without_secrets)?;
+            println!(
+                "Exported the active configuration revision to {}",
+                out.display()
+            );
+        }
+        #[cfg(not(feature = "native-api"))]
+        ClashCommand::Config { .. } => anyhow::bail!("config export needs the native-api feature"),
+        ClashCommand::Admin {
+            action: AdminCommand::Reset,
+        } => {
+            let deleted = state::reset_admin(&cli.data_dir)
+                .map_err(|error| anyhow::anyhow!("admin reset: {error}"))?;
+            if deleted {
+                println!("Deleted the administrator; setup is open again");
+            } else {
+                println!("No administrator was set up");
+            }
+        }
         ClashCommand::Reload => {
             let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
             println!("Reload requested for honk-core process {pid}");
         }
         ClashCommand::Mode { mode } => {
+            anyhow::ensure!(
+                cli.store == ConfigStore::File,
+                "mode edits the -c file; with --store db, change default_mode through the native API"
+            );
             let valid_modes = ["rule", "global", "direct"];
             if !valid_modes.contains(&mode.as_str()) {
                 anyhow::bail!(
@@ -270,7 +351,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Mode set to {}", mode);
         }
         ClashCommand::Proxy { group, node } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let group_exists = config.groups.iter().any(|g| g.name == *group);
             if !group_exists {
                 anyhow::bail!("Group '{}' not found in configuration", group);
@@ -282,7 +363,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Proxy group '{}' set to '{}'", group, node);
         }
         ClashCommand::Delay { node, url } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             config.validate()?;
             honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
             honk_outbound::bootstrap::set_global(
@@ -389,20 +470,24 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
 /// under it — the restart race that hung the lab for a day). Waits up
 /// to 240s for the previous instance to exit (busy gateways can take
 /// well over 90s to drain), then fails loudly.
+///
+/// It is taken before the configuration or the state db is opened, so a
+/// successor that fails to take it leaves nothing behind.
 fn acquire_instance_lock(
-    _bpf_pin_root: &std::path::Path,
+    path: &std::path::Path,
+    wait: std::time::Duration,
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
-    // /run (not the bpffs pin root, which rejects regular files).
-    let path = std::path::PathBuf::from(INSTANCE_LOCK_PATH);
     let mut file = std::fs::File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let deadline = std::time::Instant::now() + wait;
+    let holder =
+        || running_instance_pid(path).map_or_else(|_| String::new(), |pid| format!(" (PID {pid})"));
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -413,9 +498,12 @@ fn acquire_instance_lock(
             Err((f, _)) if std::time::Instant::now() < deadline => {
                 file = f; // the failed lock hands the file back for the retry
                 if !logged {
-                    info!(
-                        "another honk-core instance is shutting down; \
-                         waiting for the datapath lock at {}",
+                    // Logging is not set up yet.
+                    eprintln!(
+                        "honk-core: another honk-core instance{} is shutting down; \
+                         waiting up to {}s for the datapath lock at {}",
+                        holder(),
+                        wait.as_secs(),
                         path.display()
                     );
                     logged = true;
@@ -424,13 +512,40 @@ fn acquire_instance_lock(
             }
             Err((_, e)) => {
                 anyhow::bail!(
-                    "another honk-core instance holds {} ({}); refusing to start",
+                    "another honk-core instance{} did not release {} within {}s ({}); \
+                     refusing to start",
+                    holder(),
                     path.display(),
+                    wait.as_secs(),
                     e
                 )
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSTANCE_LOCK: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Only the real datapath owns fixed dae0/daens/TC resources. Mock mode must
+/// remain usable without access to the process-global /run lock.
+fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    #[cfg(test)]
+    if let Some(path) = TEST_INSTANCE_LOCK.with(|path| path.borrow().clone()) {
+        return acquire_instance_lock(&path, std::time::Duration::ZERO).map(Some);
+    }
+    if mock_mode {
+        return Ok(None);
+    }
+    // /run, not the bpffs pin root, which rejects regular files.
+    acquire_instance_lock(
+        std::path::Path::new(INSTANCE_LOCK_PATH),
+        std::time::Duration::from_secs(240),
+    )
+    .map(Some)
 }
 
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
@@ -517,84 +632,14 @@ fn prepare_runtime_data_dir(
     prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
 }
 
-/// Log timestamps in the machine's local time zone with its UTC offset,
-/// e.g. `2026-09-12T02:30:15.123456+10:00`. The default timer prints UTC,
-/// which does not line up with a router's syslog or an operator's clock.
-/// chrono reads the zone itself, so this stays sound after threads exist.
-struct LocalTime;
-
-impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(
-            w,
-            "{}",
-            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
-        )
-    }
-}
-
-/// The console layer, with or without the local timestamp. The file layer
-/// always stamps: a file has no journal in front of it.
-fn console_log_layer<S, W>(
-    disable_timestamp: bool,
-    writer: W,
-    filter: tracing_subscriber::EnvFilter,
-) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
-{
-    use tracing_subscriber::Layer as _;
-    if disable_timestamp {
-        Box::new(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_writer(writer)
-                .with_filter(filter),
-        )
-    } else {
-        Box::new(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(writer)
-                .with_filter(filter),
-        )
-    }
-}
-
-fn resolved_log_file_path(
-    config: &Config,
-    cli_override: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    cli_override
-        .map(honk_config::paths::resolve_artifact_path)
-        .or_else(|| match config.global.log_file.trim() {
-            "" => None,
-            path => Some(honk_config::paths::resolve_artifact_path(path)),
-        })
-}
-
-fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            anyhow::anyhow!("create log directory {}: {error}", parent.display())
-        })?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "log destination is not a regular file: {}",
-        path.display()
-    );
-    Ok(file)
+/// A valid cached Clash mode, else `default_mode`, else `Rule`.
+#[cfg(feature = "clash-api")]
+fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &str) -> String {
+    mode_db
+        .and_then(|db| db.load_clash_mode())
+        .and_then(|mode| mode::ModeState::normalize(&mode))
+        .or_else(|| mode::ModeState::normalize(default_mode))
+        .unwrap_or_else(|| "Rule".to_owned())
 }
 
 fn load_operator_config(
@@ -608,6 +653,14 @@ fn load_operator_config(
         || DiagnosticSources::new(Some(path.into())).root(),
         |diagnostic| diagnostic.source.sources().root(),
     );
+    admit_operator_config(config, source, diagnostics)
+}
+
+fn admit_operator_config(
+    config: Config,
+    source: honk_config::diagnostic::SourceRef,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
     config.append_diagnostics(source.clone(), diagnostics);
     let result = config.validate_detailed().and_then(|()| {
         subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
@@ -627,6 +680,47 @@ fn load_operator_config(
     finish_attempt(result.map(|()| config), diagnostics)
 }
 
+#[cfg(feature = "native-api")]
+fn load_operator_config_captured(
+    path: &std::path::Path,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<(Config, Option<configuration::SourceUpdate>), DetailedConfigError> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dae"))
+    {
+        return load_operator_config(path.to_str().unwrap_or(""), diagnostics)
+            .map(|config| (config, None));
+    }
+    let start = diagnostics.len();
+    let loaded = match Config::from_dae_file_with_sources(
+        path,
+        &std::collections::HashMap::new(),
+        honk_config::parser::SourceLimits::default(),
+        diagnostics,
+    ) {
+        Ok(loaded) => loaded,
+        Err(captured_error) => {
+            diagnostics.truncate(start);
+            let config = load_operator_config(path.to_str().unwrap_or(""), diagnostics)?;
+            if config.experimental.native_api.config_write {
+                return Err(captured_error);
+            }
+            return Ok((config, None));
+        }
+    };
+    let source = loaded.sources[0].source.clone();
+    let config = admit_operator_config(loaded.config, source, diagnostics)?;
+    Ok((
+        config,
+        Some(configuration::SourceUpdate {
+            sources: loaded.sources,
+            dependencies: Vec::new(),
+            geo_sources: None,
+        }),
+    ))
+}
+
 fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
     for diagnostic in diagnostics.iter().filter(|diagnostic| !diagnostic.terminal) {
         eprintln!(
@@ -643,7 +737,7 @@ fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
 /// Render one runtime admission rejection at the process reporting boundary.
 pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
     let diagnostic = error.diagnostic.as_ref();
-    tracing::error!(
+    tracing::warn!(
         code = diagnostic.code,
         setting = %diagnostic.setting,
         value = %diagnostic.value,
@@ -653,15 +747,75 @@ pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    #[cfg(feature = "native-api")]
+    let started_at = std::time::SystemTime::now();
+    #[cfg(feature = "native-api")]
+    let started = std::time::Instant::now();
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
     let mut diagnostics = Vec::new();
+    #[cfg(feature = "native-api")]
+    let mut native_sources = None;
+    #[cfg(feature = "native-api")]
+    let mut database = None;
+    #[cfg(not(feature = "native-api"))]
+    anyhow::ensure!(
+        cli.store == ConfigStore::File,
+        "--store db needs the native-api feature"
+    );
+    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    // Everything else in `run` drops before it.
+    let _instance_lock = instance_lock(mock_mode)?;
     let startup = (|| -> anyhow::Result<_> {
+        #[cfg(feature = "native-api")]
+        let mut config = if cli.store == ConfigStore::Db {
+            std::fs::create_dir_all(&cli.data_dir)?;
+            // DbStore needs an absolute, lexically normal entry; a missing -c
+            // is fine once the db holds a revision.
+            let entry =
+                std::fs::canonicalize(&cli.config).or_else(|_| std::path::absolute(&cli.config))?;
+            let startup =
+                native_api::store::DatabaseStartup::open(&entry, &cli.data_dir, &mut diagnostics)?;
+            native_sources = Some(startup.sources.clone());
+            let config = startup.config.clone();
+            database = Some(startup);
+            config
+        } else {
+            let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
+            anyhow::ensure!(
+                sources.is_some() || !config.experimental.native_api.config_write,
+                "native configuration administration requires a dae source file"
+            );
+            native_sources = sources;
+            config
+        };
+        #[cfg(not(feature = "native-api"))]
         let mut config = load_operator_config(cli.config.to_str().unwrap(), &mut diagnostics)?;
+        #[cfg(not(feature = "native-api"))]
+        anyhow::ensure!(
+            !config.experimental.native_api.enabled,
+            "native-api feature is required"
+        );
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            cli.store == ConfigStore::File || runtime_data_dir == requested_data_dir,
+            "the configuration db needs its data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            !(config.experimental.native_api.enabled
+                && config.experimental.native_api.password_auth
+                && runtime_data_dir != requested_data_dir),
+            "native API password login needs its configured data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
         honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
             anyhow::anyhow!(
                 "runtime data directory is already {}; cannot switch to {}",
@@ -680,27 +834,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             other => other,
         };
         let default_level = if cli.debug { "debug" } else { config_level };
-        // quinn logs every endpoint-driver death at ERROR; probe/warm endpoints
-        // over retiring AnyTLS sessions die as a matter of course (the SYNACK
-        // watchdog kills them on purpose), so that target is silenced unless
-        // RUST_LOG says otherwise.
         let env_filter =
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(format!("{default_level},quinn::endpoint=off"))
+                tracing_subscriber::EnvFilter::new(format!("{default_level},{QUIET_LOG_TARGETS}"))
             });
 
         let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
-        let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-            let file = open_log_file(path)?;
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime)
-                    .with_ansi(false)
-                    .with_writer(std::sync::Mutex::new(file))
-                    .with_filter(env_filter.clone()),
+        let (log_file_layer, log_file_level) = if let Some(path) = log_file_path.as_ref() {
+            let file = RotatingLogFile::open(path, LOG_FILE_LIMIT)?;
+            let (filter, level) = tracing_subscriber::reload::Layer::new(env_filter.clone());
+            (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(LocalTime)
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file))
+                        .with_filter(filter),
+                ),
+                Some(level),
             )
         } else {
-            None
+            (None, None)
         };
         Ok((
             config,
@@ -708,6 +862,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             data_dir_creation_error,
             log_file_path,
             log_file_layer,
+            log_file_level,
             env_filter,
         ))
     })();
@@ -717,6 +872,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         data_dir_creation_error,
         log_file_path,
         log_file_layer,
+        log_file_level,
         env_filter,
     ) = match startup {
         Ok(startup) => startup,
@@ -730,18 +886,39 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // With no `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
     let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
+    #[cfg(feature = "native-api")]
+    let (native_log_layer, native_log_binding) = native_api::logs::tracing_layer();
 
     use tracing_subscriber::prelude::*;
+    let (console_filter, console_level) =
+        tracing_subscriber::reload::Layer::new(env_filter.clone());
     let registry = tracing_subscriber::registry()
         .with(console_log_layer(
             cli.disable_timestamp,
+            console_ansi(
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ),
             std::io::stdout,
-            env_filter,
+            console_filter,
         ))
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
+    #[cfg(feature = "native-api")]
+    let registry = registry.with(native_log_layer);
     registry.init();
+    #[cfg(feature = "native-api")]
+    let engine_level = {
+        let mut engine = native_api::logs::EngineLevel::default();
+        engine.push(console_level, env_filter.clone());
+        if let Some(level) = log_file_level {
+            engine.push(level, env_filter);
+        }
+        engine
+    };
+    #[cfg(not(feature = "native-api"))]
+    let _ = (console_level, log_file_level, env_filter);
 
     info!("honk-core {} starting", VERSION);
     info!("Config: {}", cli.config.display());
@@ -755,6 +932,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    let degradations = Arc::new(degradations::Degradations::default());
+    let (state_db, state_reset) =
+        open_state_db(&cli, &config, honk_config::paths::data_dir(), &degradations)?;
+    #[cfg(feature = "native-api")]
+    let state_db = database
+        .as_ref()
+        .map(|database| database.store.state())
+        .or(state_db);
+    let legacy_cache = {
+        let (path, cache_id) = config.experimental.cache_file.legacy_cache_file();
+        let config_dir = cli.config.parent();
+        #[cfg(feature = "native-api")]
+        let config_dir = database
+            .as_ref()
+            .map_or(config_dir, |database| database.store.entry().parent());
+        state::import::LegacyCache::locate(path, cache_id, config_dir)
+    };
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
     }
@@ -791,26 +985,29 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
+    #[cfg(feature = "native-api")]
+    if let Some(database) = database.as_mut() {
+        database.record()?;
+    }
+    let claimed = claim_state(
+        state_db,
+        state_reset,
+        &config,
+        honk_config::paths::data_dir(),
+        subscription::legacy_store_roots(),
+        &degradations,
+    );
+    let state_db = claimed.state_db;
+
     // A valid stored body makes network refresh non-blocking for startup.
     // Missing subscriptions still get the bounded first-fetch grace period;
     // every fetch continues in the background after the control plane starts.
-    let subscription_store = if config.global.store_subscribe {
-        match subscription::SubscriptionStore::in_data_dir() {
-            Ok(store) => {
-                info!(directory = %store.root().display(), "Subscription store ready");
-                Some(store)
-            }
-            Err(error) => {
-                warn!(%error, "Subscription store unavailable; continuing without persistence");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut subscription_supervisor =
-        subscription::SubscriptionSupervisor::prepare(&mut config, subscription_store, diagnostics)
-            .await?;
+    let mut subscription_supervisor = subscription::SubscriptionSupervisor::prepare(
+        &mut config,
+        claimed.subscriptions,
+        diagnostics,
+    )
+    .await?;
     let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
     // Resolve group filters into concrete node IDs. This must run for every
@@ -841,7 +1038,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
     #[cfg(feature = "ebpf")]
@@ -858,14 +1054,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "default route unavailable; auto interface binding is pending until a network route appears"
         );
     }
-
-    // Only the real datapath owns fixed dae0/daens/TC resources. Mock mode
-    // must remain usable without access to the process-global /run lock.
-    let _instance_lock = if mock_mode {
-        None
-    } else {
-        Some(acquire_instance_lock(&cli.bpf_pin_root)?)
-    };
 
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
@@ -1109,8 +1297,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
-    let router = routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources)?;
+    let mut shared = routing::SharedMatchers::default();
+    let router = routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
+    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1121,11 +1311,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_cache = std::sync::Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(
         config.dns.cache.max_size,
     )));
-    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_with_geo_sources(
+    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_sharing(
         &config.dns,
         &geo_sources,
+        &mut shared,
     )?);
-    drop(geo_sources);
+    drop((geo_sources, shared));
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
@@ -1163,6 +1354,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_cache,
             dns_router,
         )
+        .with_configured_upstreams(&config.dns)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),
@@ -1176,6 +1368,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     info!("DNS forwarder ready");
 
+    #[cfg(feature = "native-api")]
+    let native_enabled = config.experimental.native_api.enabled;
     let mut control_plane = control::ControlPlane::new_with_upstream_pool_and_budget(
         config,
         ebpf_backend,
@@ -1184,7 +1378,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_forwarder,
         dns_upstream_pool.clone(),
         resource_budget,
+        Arc::clone(&degradations),
     )?;
+    #[cfg(feature = "native-api")]
+    let native_observation = if native_enabled {
+        Some(native_api::observation::NativeObservation::attach(&mut control_plane).await)
+    } else {
+        None
+    };
     control_plane
         .install_startup_diagnostics(startup_diagnostics)
         .await;
@@ -1196,6 +1397,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.config_handle(),
             control_plane.command_sender(),
             attached_ifaces,
+            Arc::clone(&degradations),
         )
     } else {
         None
@@ -1207,11 +1409,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
     dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
     info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
+    // The initial runtime owns the pool now; keeping this handle would pin the
+    // startup traffic router snapshot after that runtime retires.
+    drop(dns_upstream_pool);
 
-    // Persistent cache (selector choices, clash mode): opens cache.db when
-    // `experimental.cache_file` is enabled, restores Selector choices, and
-    // wires change persistence into the group manager.
-    control_plane.init_cache_db(cli.config.parent()).await;
+    // Runtime state (selector choices, clash mode): with
+    // `experimental.cache_file` enabled, imports a legacy cache.db, restores
+    // Selector choices, and wires change persistence into the group manager.
+    control_plane
+        .init_cache_db(state_db.clone(), Some(legacy_cache))
+        .await;
 
     #[cfg(feature = "clash-api")]
     let clash_cfg = control_plane
@@ -1221,42 +1428,68 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .experimental
         .clash_api
         .clone();
-    let cache_db = control_plane.cache_db();
-    #[cfg(feature = "clash-api")]
-    let mode = cache_db
-        .as_ref()
-        .and_then(|db| db.load_clash_mode())
-        .and_then(|mode| mode::ModeState::normalize(&mode))
-        .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
-        .unwrap_or_else(|| "Rule".to_string());
-    #[cfg(not(feature = "clash-api"))]
-    let mode = "Rule".to_string();
-    let (default_selection, valid_global_selections) = {
-        let config = control_plane.config_handle();
-        let config = config.read().await;
-        let selections = config
-            .groups
-            .iter()
-            .map(|group| group.name.clone())
-            .chain(config.nodes.iter().map(|node| node.name.clone()))
-            .collect::<Vec<_>>();
-        let default = selections.first().cloned().unwrap_or_default();
-        (default, selections)
+    let native_mode = cfg!(feature = "native-api")
+        && control_plane
+            .config_handle()
+            .read()
+            .await
+            .experimental
+            .native_api
+            .enabled;
+    let mode_value = match native_mode {
+        #[cfg(feature = "native-api")]
+        true => mode::ModeState::native(),
+        #[cfg(not(feature = "native-api"))]
+        true => unreachable!("native mode needs the native-api feature"),
+        false => {
+            let mode_db = control_plane.mode_db();
+            #[cfg(feature = "clash-api")]
+            let mode = startup_clash_mode(mode_db.as_deref(), &clash_cfg.default_mode);
+            #[cfg(not(feature = "clash-api"))]
+            let mode = "Rule".to_owned();
+            let (default_selection, valid_global_selections) = {
+                let config = control_plane.config_handle();
+                let config = config.read().await;
+                let selections = config
+                    .groups
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .chain(config.nodes.iter().map(|node| node.name.clone()))
+                    .collect::<Vec<_>>();
+                (selections.first().cloned().unwrap_or_default(), selections)
+            };
+            let global_selection = mode_db
+                .as_ref()
+                .and_then(|db| db.load_clash_global())
+                .filter(|selection| {
+                    valid_global_selections
+                        .iter()
+                        .any(|valid| valid == selection)
+                })
+                .unwrap_or(default_selection);
+            mode::ModeState::new(&mode, global_selection)
+        }
     };
-    let global_selection = cache_db
-        .as_ref()
-        .and_then(|db| db.load_selector_choice("GLOBAL"))
-        .filter(|selection| {
-            valid_global_selections
-                .iter()
-                .any(|valid| valid == selection)
-        })
-        .unwrap_or(default_selection);
-    let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
-        mode::ModeState::new(&mode, global_selection),
-    ));
+    let mode_state: mode::SharedModeState =
+        std::sync::Arc::new(parking_lot::RwLock::new(mode_value));
     control_plane.set_mode_state(mode_state.clone());
     control_plane.start_datapath_flags_coordinator()?;
+
+    #[cfg(feature = "native-api")]
+    let mut native = match native_observation {
+        Some(observation) => Some(
+            native_api::NativeRuntime::start(
+                &mut control_plane,
+                observation,
+                started_at,
+                started,
+                engine_level,
+                &native_log_binding,
+            )
+            .await?,
+        ),
+        None => None,
+    };
 
     // Starts only when external_controller is configured; bind/parse
     // failures are logged and never abort startup.
@@ -1293,6 +1526,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     datapath_flags: control_plane
                         .datapath_flags_handle()
                         .expect("datapath flags writer started above"),
+                    control: Some(control_plane.control_client()),
+                    ui_download: control_plane.ui_download_handle(),
                     secret: clash_cfg.secret.clone(),
                     connection_pool: control_plane.connection_pool(),
                     external_ui,
@@ -1316,13 +1551,40 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
+    subscription_supervisor.route_through(download_route::SharedOutbounds {
+        router: control_plane.traffic_router(),
+        config: control_plane.config_handle(),
+        group_manager: control_plane.group_manager(),
+        proxy_registry: control_plane.proxy_registry(),
+        runtime_registry: control_plane.runtime_registry(),
+    });
     subscription_supervisor.start(cmd_tx.clone());
+    #[cfg(feature = "native-api")]
+    control_plane.attach_subscriptions(subscription_supervisor.handle());
     let reload_subscription_supervisor = subscription_supervisor.handle();
+    #[cfg(feature = "native-api")]
+    let native_configuration = match native.as_mut() {
+        Some(native) => Some(
+            native
+                .start_configuration(
+                    &mut control_plane,
+                    database.take(),
+                    native_sources,
+                    &cli.config,
+                    cmd_tx.clone(),
+                    reload_subscription_supervisor.clone(),
+                )
+                .await,
+        ),
+        None => None,
+    };
 
     // SIGHUP handler: reload configuration from disk and push it to the
     // control plane without interrupting established connections.
     let config_path = cli.config.clone();
     let reload_tx = cmd_tx.clone();
+    let mut activation =
+        configuration::Activation::new(reload_tx.clone(), reload_subscription_supervisor);
     let sighup_handle = tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -1337,6 +1599,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             sighup.recv().await;
             request_id = request_id.wrapping_add(1).max(1);
             info!("SIGHUP reload request {request_id} received");
+            #[cfg(feature = "native-api")]
+            if let Some(service) = &native_configuration {
+                if service.request_sighup().is_err() {
+                    warn!("SIGHUP reload coordinator is unavailable or busy");
+                }
+                continue;
+            }
             let mut diagnostics = Vec::new();
             let result = load_operator_config(
                 config_path.to_str().unwrap_or("/etc/honk/config.dae"),
@@ -1346,18 +1615,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             match result {
                 Ok(mut new_config) => {
                     new_config.ensure_builtin_nodes();
-                    if let Err(error) = request_runtime_reload(
-                        &reload_tx,
-                        &reload_subscription_supervisor,
-                        request_id,
-                        new_config,
-                        diagnostics,
-                    )
-                    .await
+                    match activation
+                        .activate(configuration::ActivationRequest {
+                            candidate: new_config,
+                            diagnostics,
+                            #[cfg(feature = "native-api")]
+                            sources: None,
+                            #[cfg(feature = "native-api")]
+                            expected_group_revision: None,
+                            #[cfg(feature = "native-api")]
+                            deferred_provider: None,
+                        })
+                        .await
                     {
-                        warn!("SIGHUP reload request {request_id} failed: {error}");
-                        let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
-                        break;
+                        Ok(_) | Err(configuration::ActivationFailure::Rejected) => {}
+                        Err(configuration::ActivationFailure::Degraded(generation)) => {
+                            warn!(generation, "SIGHUP reload committed with degraded datapath");
+                        }
+                        Err(configuration::ActivationFailure::Reconciliation(generation)) => {
+                            error!(generation, "SIGHUP reload worker reconciliation failed");
+                            break;
+                        }
+                        Err(failure) => {
+                            error!(?failure, "SIGHUP reload request {request_id} failed");
+                            let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -1367,6 +1650,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
+    let shutdown_intent = control_plane.shutdown_intent();
     let sig_handle = tokio::spawn(async move {
         // The shell may start us with SIGINT/SIGTERM ignored (e.g. background
         // job). Reset them to the default disposition so tokio can install its
@@ -1389,11 +1673,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
+        shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 
-    info!("honk-core is running. Press Ctrl+C to stop.");
+    // Under a service manager nobody is at a terminal to press it.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        info!("honk-core is running. Press Ctrl+C to stop.");
+    } else {
+        info!("honk-core is running.");
+    }
     let control_result = control_plane.run().await;
+    #[cfg(feature = "native-api")]
+    native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -1403,11 +1697,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     sighup_handle.abort();
     let _ = sig_handle.await;
     let _ = sighup_handle.await;
-    let remaining_subscription_tasks = subscription_supervisor.shutdown().await;
-    debug_assert_eq!(remaining_subscription_tasks, 0);
+    let subscription_result = subscription_supervisor.shutdown().await;
     info!("honk-core stopped");
 
-    control_result
+    control_result?;
+    anyhow::ensure!(
+        subscription_result? == 0,
+        "subscription tasks remained after shutdown"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "ebpf")]
@@ -1943,9 +2241,10 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
 /// Addressing for the dae0/dae0peer link pair between the host namespace and
 /// the isolated `daens` namespace.  These strings are the canonical values:
 /// the netns setup consumes them (ebpf feature only), while the control
-/// plane's internal-traffic filter (`control::is_honk_internal_addr`) uses
-/// the numeric forms `DAE0_IPV6_PREFIX_HI` / `DAE0_IPV4_NET` below in every
-/// build.  `control` tests assert both forms agree.
+/// plane's internal-traffic filter (`control::is_honk_internal_addr`) and the
+/// kernel datapath use the numeric forms `DAE0_IPV6_PREFIX_HI` /
+/// `DAE0_IPV4_NET` in `honk-ebpf-common` in every build.  `control` tests
+/// assert both forms agree.
 ///
 /// Link-local addresses (169.254.0.0/16) are used instead of a private
 /// subnet so that the kernel treats daens-originated traffic as local — no
@@ -1961,13 +2260,6 @@ pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
 pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
 #[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
-
-/// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the
-/// fd00:686f:6e6b::/64 ULA prefix — as a big-endian u64.
-pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
-/// `DAENS_HOST_IP`/`DAENS_PEER_IP` with the host bits masked off
-/// (169.254.0.0/16), as a big-endian u32.
-pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
 
 pub(crate) fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
@@ -2011,86 +2303,166 @@ fn is_mountpoint(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod local_time_tests {
-    use tracing_subscriber::fmt::time::FormatTime;
-
-    #[test]
-    fn test_log_timestamp_carries_the_local_utc_offset() {
-        let mut out = String::new();
-        super::LocalTime
-            .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut out))
-            .unwrap();
-        // 2026-09-12T02:30:15.123456+10:00 — date, time with microseconds, signed offset.
-        let (stamp, offset) = out.split_at(out.len() - 6);
-        assert_eq!(stamp.len(), 26, "{out}");
-        assert_eq!(&stamp[10..11], "T", "{out}");
-        assert!(offset.starts_with('+') || offset.starts_with('-'), "{out}");
-        assert_eq!(&offset[3..4], ":", "{out}");
-        let expected = chrono::Local::now().format("%:z").to_string();
-        assert_eq!(offset, expected, "{out}");
-    }
-
-    /// `--disable-timestamp` drops the stamp from the console line only.
-    #[test]
-    fn test_disable_timestamp_omits_the_console_stamp() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::prelude::*;
-
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let render = |disable_timestamp: bool| {
-            let sink = Sink::default();
-            let writer = sink.clone();
-            let layer = super::console_log_layer(
-                disable_timestamp,
-                move || writer.clone(),
-                tracing_subscriber::EnvFilter::new("info"),
-            );
-            let subscriber = tracing_subscriber::registry().with(layer);
-            tracing::subscriber::with_default(subscriber, || {
-                tracing::info!("stamp probe");
-            });
-            let bytes = sink.0.lock().unwrap().clone();
-            let text = String::from_utf8(bytes).unwrap();
-            // The console layer keeps its colours; strip the SGR sequences.
-            let mut plain = String::new();
-            let mut rest = text.as_str();
-            while let Some(start) = rest.find("\u{1b}[") {
-                plain.push_str(&rest[..start]);
-                let after = &rest[start + 2..];
-                rest = after.find('m').map_or("", |end| &after[end + 1..]);
-            }
-            plain.push_str(rest);
-            plain
-        };
-
-        let stamped = render(false);
-        assert!(stamped.starts_with("20"), "{stamped:?}");
-        assert!(stamped.contains(" INFO "), "{stamped:?}");
-        let bare = render(true);
-        assert!(bare.trim_start().starts_with("INFO "), "{bare:?}");
-        assert!(bare.contains("stamp probe"), "{bare:?}");
-    }
-}
-
-#[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, load_operator_config, open_log_file, prepare_nfqueue_startup,
-        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
-        running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, acquire_instance_lock, load_operator_config,
+        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
+        publish_instance_pid, running_instance_pid,
     };
+    use crate::logging::open_log_file;
     use clap::Parser;
+
+    #[test]
+    fn a_reset_that_cannot_run_leaves_honk_running_without_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(directory.path()).unwrap());
+        let held = crate::state::StateDb::open(directory.path()).unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        assert!(crate::state::startup::reset_non_strict(directory.path(), &degradations).is_none());
+        let issue = degradations
+            .get(crate::degradations::Component::Persistence)
+            .expect("the failed reset is reported");
+        // The reset's own failure is the cause, not the corruption.
+        assert_eq!(issue.reason, "in_use");
+        drop(held);
+    }
+
+    #[test]
+    fn a_failed_reopen_bounds_the_log_to_twice_the_limit() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        log.fail_reopen = true;
+        for _ in 0..20 {
+            log.write_all(format!("{}\n", "x".repeat(59)).as_bytes())
+                .unwrap();
+        }
+        let rotated = std::fs::metadata(directory.path().join("honk.log.1")).unwrap();
+        assert!(
+            rotated.len() <= 200,
+            "{} bytes after a failed reopen",
+            rotated.len()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn two_writers_sharing_the_log_rotate_it_once() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut first = RotatingLogFile::open(&path, 100).unwrap();
+        let mut second = RotatingLogFile::open(&path, 100).unwrap();
+        let line = |text: &str| format!("{}\n", text.repeat(59));
+        first.write_all(line("a").as_bytes()).unwrap();
+        second.write_all(line("b").as_bytes()).unwrap();
+        first.write_all(line("c").as_bytes()).unwrap();
+        second.write_all(line("d").as_bytes()).unwrap();
+        let rotated = std::fs::read_to_string(directory.path().join("honk.log.1")).unwrap();
+        assert_eq!(rotated, format!("{}\n{}\n", "a".repeat(59), "b".repeat(59)));
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(current, format!("{}\n{}\n", "c".repeat(59), "d".repeat(59)));
+    }
+
+    #[test]
+    fn the_log_file_rotates_into_one_private_copy() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let rotated = directory.path().join("honk.log.1");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        for line in ["a", "b", "c", "d"] {
+            log.write_all(line.repeat(59).as_bytes()).unwrap();
+            log.write_all(b"\n").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "d".repeat(59) + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "c".repeat(59) + "\n"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        for file in [&path, &rotated] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_strict_state_db_that_cannot_be_used_leaves_honk_running() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cli = Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.experimental.cache_file.enabled = Some(true);
+
+        let unsafe_dir = tempfile::tempdir().unwrap();
+        let state = unsafe_dir.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state).unwrap();
+        // Only a writable directory is still refused; readable ones are tightened.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let reason = |degradations: &crate::degradations::Degradations| {
+            degradations
+                .get(crate::degradations::Component::Persistence)
+                .map(|issue| issue.reason)
+        };
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &degradations).unwrap();
+        assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("unsafe"));
+        let entry = degradations.snapshot().pop().unwrap();
+        assert_eq!(entry.rule, Some("group_or_other_bits"));
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::open(locked_dir.path().join(crate::state::STATE_DIR)).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, locked_dir.path(), &degradations).unwrap();
+        assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("locked"));
+        drop(held);
+
+        // Password mode makes the db strict: the same unsafe directory refuses startup.
+        config.experimental.native_api.password_auth = true;
+        assert!(
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &Default::default()).is_err()
+        );
+
+        // A newer schema refuses startup either way.
+        config.experimental.native_api.password_auth = false;
+        let newer_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(newer_dir.path()).unwrap());
+        rusqlite::Connection::open(
+            newer_dir
+                .path()
+                .join(crate::state::STATE_DIR)
+                .join(crate::state::DB_FILE),
+        )
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA user_version = {}",
+            crate::state::SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        assert!(
+            super::open_state_db(&cli, &config, newer_dir.path(), &Default::default()).is_err()
+        );
+    }
 
     #[test]
     fn nfqueue_requested_with_mock_backend_falls_back_to_disabled() {
@@ -2255,6 +2627,21 @@ mod startup_lifecycle_tests {
         drop(lock);
         assert!(running_instance_pid(&path).is_err());
     }
+
+    #[test]
+    fn a_refused_instance_lock_names_the_holder_and_the_wait() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("honk-core.lock");
+        let wait = std::time::Duration::ZERO;
+        let _held = acquire_instance_lock(&path, wait).expect("take instance lock");
+        let error = acquire_instance_lock(&path, wait).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("PID {}", std::process::id())),
+            "{error}"
+        );
+        assert!(error.contains("within 0s"), "{error}");
+    }
+
     #[test]
     fn startup_load_reports_duplicate_node_identity() {
         let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();

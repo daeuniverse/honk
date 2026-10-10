@@ -416,6 +416,7 @@ replaces PKI.
 - `src/tls.rs` — **BoringSSL TLS client** with webpki/no-verify stores. Process-wide `set_tls_mode` (`tls_implementation = "utls"`) selects a Chrome-oriented ClientHello profile: GREASE, permuted extensions, hybrid then classic X25519 shares, Chrome-derived sigalgs/curves/ciphers, brotli certificate compression, ALPS-h2, and ECH GREASE. This is protocol emulation, not a claim of complete Chrome identity. Per-node **ECH** uses `ech_config` / `ech_config_path`; discovery uses DNS HTTPS records and remains best-effort/fail-open, while an explicit server ECH rejection fails closed.
   `build_reality_connector(chrome)` replaces PKI with post-handshake ed25519 authentication in `reality.rs`, permits TLS 1.3 only, and never offers REALITY resumption. REALITY necessarily adds ed25519 to the signature list, another reason not to describe it as a full browser fingerprint.
   Explicit structured TCP ALPN reaches `build_connector` in both tls/utls modes; empty lists retain existing profile defaults. Chrome ALPS follows exact `h2` membership. Registry publication and direct connector construction validate nonempty overrides; shared stream dispatch validates before choosing plaintext or REALITY, and direct QUIC configuration rejects TCP ALPN rather than ignoring it.
+  `build_connector` and `build_reality_connector` return shared BoringSSL contexts, one per (REALITY, verification, pin, ALPN override, Chrome mode) shape, kept in a process-wide cache that restarts empty at 128 shapes. Each context holds the process-wide webpki store instead of the OS CA bundle that `SslConnector::builder` parses by default, so a dial parses no certificates and a live connection pins no private CA copy.
 
 ### Process-wide TLS profile
 
@@ -723,9 +724,14 @@ combinations, but not H2 or UoT framing. Vision Direct in either direction
 removes only AEAD framing; the outer transport and random mode's per-record
 header XOR remain, following Xray `XorConn` including its skip rule for
 TLS-shaped headers. This is not a raw-socket cutover claim for encrypted Vision.
-Random-mode Direct acknowledges and copies at most 8 KiB per write, preserving
-the codec's existing bounded pending-write buffer. Header XOR state survives
-those short writes; native Direct adds no wire-copy buffer.
+Random-mode Direct acknowledges and copies at most 8 KiB per write. Header XOR
+state survives those short writes; native Direct adds no wire-copy buffer.
+While traffic flows the codec reuses one write buffer, shared with
+random-mode Direct, and rotates two read buffers, so steady frames allocate
+nothing. A write buffer above one maximum frame, such as a large 0-RTT
+prewrite, is dropped after use. A completed flush releases the write buffer,
+and a read that waits at a frame boundary releases the plaintext buffer, so
+an idle stream keeps only the five-byte header buffer.
 
 ## QUIC stack
 
@@ -797,11 +803,13 @@ cooldown, never shrinks automatically, and applies to the live connection and
 active/future streams without reconnecting. Zero-progress samples preserve a pending
 promotion only while the corresponding connection credit remains pressured.
 Native TUIC and Hysteria2 UDP
-endpoints use a per-send deadline of `clamp(4 × SRTT, 1 s, 5 s)`. Three
-consecutive send deadlines, or no newly acknowledged QUIC packet is observed for
-`max(8 × SRTT, 10 s)`, retires the endpoint and closes that connection so the
-next flow redials. A successful send resets the send streak; observed delivery
-progress resets both clocks. Attempted UDP packets are never replayed. TUIC
+endpoints use a per-send deadline of `clamp(4 × SRTT, 1 s, 5 s)`; a deadline
+alone never closes the connection, because Quinn parks a send while
+congestion control holds capacity. The path watchdog closes the connection, so the next flow
+redials, only when no newly acknowledged QUIC packet is observed for
+`max(8 × SRTT, 10 s)` while at least three ack-eliciting packets sent since
+the last acknowledgement are still unacknowledged. Observed delivery
+progress resets that clock. Attempted UDP packets are never replayed. TUIC
 also enables Quinn PING keepalive, including its UDP-over-stream fallback where
 protocol heartbeat datagrams are unavailable.
 
@@ -809,9 +817,9 @@ protocol heartbeat datagrams are unavailable.
 
 | Protocol | Authentication and TCP | UDP | Transport policy |
 | --- | --- | --- | --- |
-| TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, with node overrides |
-| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows |
-| Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
+| TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB, with node overrides |
+| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB |
+| Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows with the same connection auto-tuning |
 
 The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
 its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed
@@ -835,14 +843,18 @@ The server must DNAT the range to its listener. Receive metadata rewrites the
 reply source port to the nominal remote port so QUIC sees one stable peer.
 
 quinn's 1.25 MiB limits streams to ~12.5MB/s per 100ms RTT. The connection window
-also budgets memory; slow consumers buffer ~3× it. Reducing 32→8 MiB was
-throughput-neutral on a 75ms/15%-loss link. Overrides:
+also budgets memory; slow consumers buffer ~3× it. It starts at 8 MiB and honk's
+quinn fork grows it (`TransportConfig::receive_window_autotune`) like quic-go: when
+more than half the window was read in an epoch and reading that fraction took under
+`4 × fraction × RTT`, it doubles, up to the larger of 32 MiB and the configured
+window. Growth is driven by bytes the application read, so a slow consumer does not
+inflate it, and the window never shrinks. Overrides:
 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window`, hy2 `hy2_init_*`.
 
 ## AnyTLS session engine
 
 `src/proxy/anytls/mod.rs` implements sing-anytls multiplexing with stateless handlers. Each generation's `NodeRuntime::AnyTls` owns one
-`SessionPool<AnyTlsSession>` and lazily materialized BoringSSL connector.
+`SessionPool<AnyTlsSession>` and a BoringSSL connector built on the first dial; the connector is never idle-reaped because TLS contexts are shared per shape.
 Generation-free calls use a guarded ephemeral equivalent.
 
 ### Pool and session lifecycle
@@ -870,8 +882,11 @@ only its own SID; an unrelated acknowledgement never clears another stream's
 deadline, and local stream teardown cancels it. An open still pending
 three seconds after its SYN was written is reset at stream level when the
 session kept receiving frames during the window (the server was alive but
-never acknowledged that open). A fully silent window retires the physical
-session so the pool redials instead of reusing a dead carrier.
+never acknowledged that open). A fully silent window does not prove the carrier
+is dead: a loss burst silences every stream at once, and TCP delivers afterwards.
+In that case, only the pending open is reset and the session leaves rotation.
+The session and its streams retire only after another ten seconds of silence,
+so the pool redials instead of reusing a dead carrier.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor (`anytls_min_idle_session`) and `anytls_idle_session_timeout` feed one node-local janitor.
@@ -914,13 +929,14 @@ Each TCP child has a bounded delivery queue, demultiplexed by `sid`. When it fil
 parks frames in a per-SID ordered overflow instead of waiting, preserving
 sibling progress and exact frame/byte accounting.
 
-The first parked frame starts a watchdog ticking every 250 ms; it retires on
-overflow drain and is aborted on close. Only a stream with no successful overflow flush
-for a full 3 seconds is reset; queued bytes alone are not evidence of a stall.
-
-The emergency hard limit is 768 parked frames per session. Retained payload bytes
-are bounded separately by the pool-wide budgets below. If a stream is
-already past the 3-second grace, admission reaps that stream immediately.
+No separate timer resets a parked stream: a reader may pause for any
+length of time, and queued bytes alone are not evidence of a stall. The
+emergency hard limit is 768 parked data frames per session (at most two
+terminal events per SID); there a stream is reset only if it has had no
+successful overflow flush for a full 3 seconds. Retained payload bytes are
+bounded separately by the pool-wide budgets below. If a stream is already
+past the 3-second grace, admission at the hard limit reaps that stream
+immediately.
 Otherwise the demultiplexer waits in bounded 100 ms
 `OVERFLOW_EMERGENCY_WAIT` rounds, shortened to the nearest grace expiry, and
 re-evaluates after reader progress. This covers the measured 12–16 ms reader

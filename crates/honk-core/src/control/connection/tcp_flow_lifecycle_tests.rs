@@ -47,6 +47,10 @@ fn tracked_entry(id: &str) -> ConnectionEntry {
         source: "192.0.2.1:50000".to_string(),
         destination: "203.0.113.2:443".to_string(),
         proxy: "direct".to_string(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Fallback".to_string(),
         rule_payload: String::new(),
         chains: vec!["direct".to_string()],
@@ -215,12 +219,12 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
 
     let mut backend_guard = backend.write().await;
     let retire = tokio::spawn(flow.retire());
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !tracker.snapshot().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        tracker.snapshot().len(),
+        1,
+        "retirement retains its ID until backend cleanup completes"
+    );
     backend_guard.tcp_conn_state_store(
         &tuple,
         &ConnState {

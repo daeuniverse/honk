@@ -101,7 +101,7 @@ fn raw_fields<'d, 'a>(
                 diagnostics,
                 Severity::Warning,
                 "unknown-statement",
-                "unknown DNS statement ignored",
+                "unknown DNS statement ignored; expected key: value or an upstream, routing or fixed_domain_ttl block",
             );
             continue;
         };
@@ -122,7 +122,7 @@ fn raw_fields<'d, 'a>(
                 diagnostics,
                 Severity::Warning,
                 "unknown-key",
-                "unknown scalar key ignored",
+                "unknown DNS key ignored; expected bind, use_host, client_subnet, ipversion_prefer, optimistic_cache, optimistic_cache_ttl, optimistic_stale_reply_ttl or max_cache_size",
             );
             continue;
         }
@@ -162,7 +162,7 @@ pub(super) fn parse_section(
                 *bind,
                 "invalid-config-value",
                 "bind",
-                "invalid configuration value",
+                "expected IP:port or a udp://, tcp:// or tcp+udp:// host:port",
             )
         })?;
     }
@@ -275,7 +275,7 @@ pub(super) fn parse_section(
                     );
                 }
                 for block in blocks {
-                    parse_dns_routing(&block, &mut cfg.routing, diagnostics);
+                    parse_dns_routing(&block, &mut cfg.routing, diagnostics, &mut |_, _, _| {});
                 }
             }
             "fixed_domain_ttl" => {
@@ -513,10 +513,48 @@ fn legacy_comment_has_unquoted_slash(comment: Text<'_, '_>) -> bool {
     false
 }
 
+/// Parse `dns { routing { … } }` blocks in `parse_section` order and report the
+/// statement of each kept rule and fallback: whether it is a response rule, its
+/// index in that list or `None` for the fallback, and its text.
+pub(super) fn parse_routing_indexed(
+    section: &[Segment<'_, '_>],
+    diagnostics: &mut ParserDiagnostics<'_>,
+    mut location: impl FnMut(bool, Option<usize>, Text<'_, '_>),
+) {
+    let mut routing = crate::dns::DnsRouting::default();
+    for root in section {
+        let mut subs = Vec::new();
+        children(
+            root,
+            &["upstream", "routing", "fixed_domain_ttl"],
+            &mut Vec::new(),
+            &mut subs,
+            diagnostics,
+        );
+        for sub in subs
+            .iter()
+            .filter(|sub| read::block_header(sub).unwrap().raw() == "routing")
+        {
+            let mut blocks = Vec::new();
+            children(
+                sub,
+                &["request", "response"],
+                &mut Vec::new(),
+                &mut blocks,
+                diagnostics,
+            );
+            for block in blocks {
+                parse_dns_routing(&block, &mut routing, diagnostics, &mut location);
+            }
+        }
+    }
+}
+
 fn parse_dns_routing(
     section: &Segment<'_, '_>,
     routing: &mut crate::dns::DnsRouting,
     diagnostics: &mut ParserDiagnostics<'_>,
+    location: &mut impl FnMut(bool, Option<usize>, Text<'_, '_>),
 ) {
     let is_response = read::block_header(section).unwrap().raw() == "response";
     let kind = if is_response { "response" } else { "request" };
@@ -578,12 +616,14 @@ fn parse_dns_routing(
             } else if is_response {
                 routing.response.fallback =
                     crate::dns::DnsResponseAction::parse(target.unquote().raw());
+                location(true, None, line);
             } else {
                 routing.request.fallback =
                     crate::dns::DnsRequestAction::parse(target.unquote().raw());
                 if let crate::dns::DnsRequestAction::Upstream(name) = &routing.request.fallback {
                     routing.fallback = name.clone();
                 }
+                location(false, None, line);
             }
             continue;
         }
@@ -610,11 +650,13 @@ fn parse_dns_routing(
             continue;
         }
         if is_response {
+            location(true, Some(routing.response.rules.len()), line);
             routing.response.rules.push(crate::dns::DnsResponseRule {
                 conditions,
                 action: crate::dns::DnsResponseAction::parse(right.unquote().raw()),
             });
         } else {
+            location(false, Some(routing.request.rules.len()), line);
             routing.request.rules.push(crate::dns::DnsRequestRule {
                 conditions,
                 action: crate::dns::DnsRequestAction::parse(right.unquote().raw()),

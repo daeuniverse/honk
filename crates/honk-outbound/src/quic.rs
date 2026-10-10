@@ -59,6 +59,23 @@ pub fn congestion_factory(
     }
 }
 
+/// HKDF-Expand-Label (RFC 8446 §7.1) with the empty context QUIC uses
+/// (RFC 9001 §5.1); `label` excludes the `tls13 ` prefix. Labels over 249
+/// bytes and outputs over 65535 bytes do not fit the encoding.
+pub fn hkdf_expand_label<H: hkdf::HmacImpl>(
+    prk: &hkdf::GenericHkdf<H>,
+    label: &[u8],
+    out: &mut [u8],
+) -> Result<(), hkdf::InvalidLength> {
+    const PREFIX: &[u8] = b"tls13 ";
+    let length = u16::try_from(out.len()).map_err(|_| hkdf::InvalidLength)?;
+    let label_len = u8::try_from(PREFIX.len() + label.len()).map_err(|_| hkdf::InvalidLength)?;
+    prk.expand_multi_info(
+        &[&length.to_be_bytes(), &[label_len], PREFIX, label, &[0]],
+        out,
+    )
+}
+
 /// Fixed-rate "brutal" sender (hysteria2 parity): paces at a constant rate
 /// and ignores loss entirely. quinn's token-bucket pacer refills at
 /// window/RTT, so reporting a window of `rate × RTT` yields the target
@@ -162,9 +179,9 @@ impl congestion::Controller for Brutal {
 }
 
 const QUIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-/// Connection-wide QUIC delivery progress. Packet sends only read atomics;
-/// Quinn statistics are sampled at most once per second, plus on a send
-/// deadline and the watchdog's one-second tick.
+/// Connection-wide QUIC delivery progress. Quinn statistics are sampled at
+/// most once per second, shared by packet sends, completions and the
+/// watchdog's tick.
 #[derive(Debug)]
 pub(crate) struct QuicPathHealth {
     ack_state: AtomicU64,
@@ -175,18 +192,10 @@ pub(crate) struct QuicPathHealth {
     waiting_acked_baseline: AtomicU64,
     unacked_since_ms: AtomicU64,
     last_sample_ms: AtomicU64,
-    timeout_state: AtomicU64,
-    waiting_since_ms: AtomicU64,
     send_timeout_ms: AtomicU64,
     path_stall_timeout_ms: AtomicU64,
     path_stalled: AtomicBool,
     telemetry_enabled: AtomicBool,
-}
-
-enum SendCompletion {
-    Success,
-    Timeout,
-    Failure,
 }
 
 #[derive(Debug, Default)]
@@ -362,6 +371,9 @@ pub async fn client_config(
     }
     if let Some(w) = options.conn_receive_window {
         transport.receive_window(VarInt::from_u64(w)?);
+        transport.receive_window_autotune(Some(VarInt::from_u64(
+            w.max(flow_control::FLOW_CONTROL_MAX_WINDOW),
+        )?));
     }
     if let Some(mtu) = options.max_udp_payload_size {
         let mtu = clamp_quic_payload_size(mtu);
@@ -412,7 +424,7 @@ mod path_health_tests;
 struct TrackedConnection<C> {
     id: u64,
     connection: Connection,
-    _endpoint: Endpoint,
+    _endpoint: crate::runtime::RuntimeEndpoint,
     state: Weak<C>,
     monitor: Arc<QuicClientConnectionMonitor>,
 }
@@ -420,7 +432,7 @@ struct TrackedConnection<C> {
 struct State<C> {
     /// Lazily created endpoint, tagged with its address family. Recreated when
     /// the family of the resolved server address changes.
-    endpoint: Option<(bool, Endpoint)>,
+    endpoint: Option<(bool, crate::runtime::RuntimeEndpoint)>,
     conn: Option<(Connection, Arc<C>)>,
     connections: Vec<TrackedConnection<C>>,
     next_connection_id: u64,
@@ -458,6 +470,7 @@ pub struct QuicClient<C> {
     mtu: u16,
     flow_control_profiles: Arc<AdaptiveFlowProfiles>,
     state: Arc<Mutex<State<C>>>,
+    task_scope: crate::runtime::TaskScope,
 }
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -467,6 +480,20 @@ mod brutal_tests;
 
 #[cfg(test)]
 mod client_tests;
+
+#[cfg(test)]
+mod label_tests {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    #[test]
+    fn hkdf_expand_label_rejects_labels_beyond_the_encoding() {
+        let prk = Hkdf::<Sha256>::from_prk(&[7; 32]).unwrap();
+        let mut out = [0; 16];
+        assert!(super::hkdf_expand_label(&prk, &[b'a'; 249], &mut out).is_ok());
+        assert!(super::hkdf_expand_label(&prk, &[b'a'; 250], &mut out).is_err());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // QUIC over a proxied UDP tunnel

@@ -341,6 +341,12 @@ impl PartialEq<Vec<u8>> for InboundPayload {
         self.data.as_ref() == other.as_slice()
     }
 }
+
+/// Peer silence mid-frame after a budget wait. Independent of the overflow
+/// reap grace: that one is tuned for reader progress, this one for a peer
+/// that stops sending a frame body it announced.
+const FRAME_BODY_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn complete_frame_body<T>(
     budget_waited: bool,
     body: impl Future<Output = std::io::Result<T>>,
@@ -348,7 +354,7 @@ async fn complete_frame_body<T>(
     if !budget_waited {
         return body.await;
     }
-    tokio::time::timeout(OVERFLOW_STALL_GRACE, body)
+    tokio::time::timeout(FRAME_BODY_STALL_TIMEOUT, body)
         .await
         .map_err(|_| {
             std::io::Error::new(
@@ -539,6 +545,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
                 session.settle_syn_pending(sid);
+                session.observe_synack(sid, data.is_empty());
                 if !data.is_empty() {
                     let shown = &data[..data.len().min(MAX_STREAM_ERROR_SOURCE_BYTES)];
                     let suffix = if shown.len() == data.len() {
@@ -606,7 +613,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         "AnyTLS padding scheme updated"
                     );
                 } else {
-                    warn!(
+                    debug!(
                         session = session.seq,
                         "AnyTLS server sent an invalid padding scheme"
                     );

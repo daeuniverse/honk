@@ -2,6 +2,7 @@
 
 mod bootstrap;
 mod cache;
+pub(crate) mod client;
 mod connection;
 pub mod dns_control;
 mod dns_listener;
@@ -18,6 +19,7 @@ use nfqueue_runtime::{
 };
 #[cfg(feature = "ebpf")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
+mod lifecycle;
 pub mod packet_sniffer;
 mod preconnect;
 mod probers;
@@ -88,12 +90,18 @@ use tracing::{debug, error, info, trace, warn};
 
 mod commands;
 
-pub(crate) use commands::ControlCommand;
+pub use client::ControlClient;
+pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
+pub(crate) use reload::LogFiles;
+#[cfg(feature = "native-api")]
+pub(crate) use reload::restart_required_fields;
 use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
+#[cfg(all(test, feature = "native-api"))]
+pub(crate) use tests::reload_harness::ReloadBehavior;
 
 /// Re-send `NetworkChanged` with bounded backoff after a rejected refresh.
 /// Duplicate deliveries after the interface-dependent state converges are
@@ -113,14 +121,22 @@ fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task:
 #[cfg(test)]
 type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
 
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnginePhase {
+    Starting,
+    Running,
+    Draining,
+    Failed,
+}
+
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Arc<Config>>>,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     /// Reuse decisions must observe the generation they eventually replace.
     reload_lock: tokio::sync::Mutex<()>,
-    log_file_override: Option<PathBuf>,
-    effective_log_file: Option<PathBuf>,
+    log_files: LogFiles,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
@@ -144,27 +160,34 @@ pub struct ControlPlane {
     connection_pool: Arc<ConnectionPool>,
     connection_tracker: Arc<ConnectionTracker>,
     tcp_flow_pins: Arc<TcpFlowPins>,
-    /// Persistent cache (selector choices, clash mode); opened by `run()`
-    /// via `init_cache_db` when `experimental.cache_file` is enabled.
-    cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    /// Persistent cache (selector choices, delay samples); opened by `run()`
+    /// via `init_cache_db` unless `experimental.cache_file.enabled` is false.
+    cache_db: Option<Arc<crate::state::cache::CacheDb>>,
+    /// `cache_db` when `experimental.cache_file` also keeps the Clash mode.
+    mode_db: Option<Arc<crate::state::cache::CacheDb>>,
+    /// The state database handed to `init_cache_db`.
+    state_db: Option<Arc<crate::state::StateDb>>,
+    state_tick: cache::StateTick,
+    /// Features running reduced; shared with startup and the native API.
+    degradations: Arc<crate::degradations::Degradations>,
+    /// Built by `configure_health_loop`; a reload updates whether it is needed.
+    quic_score_target: Option<Arc<probers::QuicScoreProbeTarget>>,
     /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
+    tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
-    /// Background task handles (health check, janitor) for clean shutdown.
-    background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    /// The generation-owned UDP warm coordinator. It is deliberately kept
-    /// separate from generic background tasks so reload/shutdown can abort
-    /// and drain it in the required ownership order.
-    udp_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    health_task: Option<tokio::task::JoinHandle<()>>,
+    /// Generation-owned UDP warm coordinator, joined before transport retirement.
+    udp_warm_task: tokio::sync::Mutex<Option<reload::WarmTask>>,
     /// UDP warm NodeIds survive task replacement so a reload can release
     /// retention that disappeared from the replacement plan.
     udp_warm_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     /// Generation-owned task that pins every Selector's configured leaf.
-    selector_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    selector_warm_task: tokio::sync::Mutex<Option<reload::WarmTask>>,
     /// Choice changes wake reconciliation immediately; a short periodic pass
     /// repairs sessions lost independently of group changes.
     selector_warm_notify: Arc<tokio::sync::Notify>,
@@ -181,6 +204,18 @@ pub struct ControlPlane {
     #[cfg(feature = "ebpf")]
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "native-api")]
+    phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
+    #[cfg(feature = "native-api")]
+    configuration: Option<Arc<crate::configuration::AcceptedSources>>,
+    native: Option<Arc<crate::observe::Observation>>,
+    #[cfg(feature = "native-api")]
+    native_owner: Option<Arc<dyn crate::observe::Owner>>,
+    #[cfg(feature = "native-api")]
+    subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "clash-api")]
+    ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
@@ -195,6 +230,40 @@ pub struct ControlPlane {
 pub(crate) use udp_removal::spawn_udp_removal_worker;
 
 impl ControlPlane {
+    #[cfg(feature = "native-api")]
+    pub(crate) fn observe_phase(&mut self) -> tokio::sync::watch::Receiver<EnginePhase> {
+        self.phase
+            .get_or_insert_with(|| tokio::sync::watch::channel(EnginePhase::Starting).0)
+            .subscribe()
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn publish_phase(&self, phase: EnginePhase) {
+        if let Some(native) = &self.native
+            && phase == EnginePhase::Running
+        {
+            native.started(self.diagnostics.read().generation);
+        }
+        if let Some(sender) = &self.phase {
+            sender.send_replace(phase);
+        }
+        if let Some(native) = &self.native {
+            native
+                .events
+                .publish("runtime.updated", serde_json::json!({}), None);
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn degradations_handle(&self) -> Arc<crate::degradations::Degradations> {
+        Arc::clone(&self.degradations)
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn datapath_health_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.datapath_healthy)
+    }
+
     /// Install the startup mode snapshot before the flags writer starts.
     pub fn set_mode_state(&mut self, mode_state: crate::mode::SharedModeState) {
         assert!(
@@ -216,7 +285,7 @@ impl ControlPlane {
         self.datapath_flags = Some(crate::mode::DatapathFlagsHandle::new(
             Arc::clone(&self.ebpf),
             mode_state,
-            self.cache_db.clone(),
+            self.mode_db.clone(),
         ));
         Ok(())
     }
@@ -242,6 +311,10 @@ impl ControlPlane {
     }
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
+    }
+    #[cfg(feature = "native-api")]
+    pub(crate) fn log_files(&self) -> LogFiles {
+        self.log_files.clone()
     }
 
     pub(crate) async fn install_startup_diagnostics(
@@ -315,6 +388,29 @@ impl ControlPlane {
         self.command_tx.clone()
     }
 
+    pub fn control_client(&self) -> ControlClient {
+        ControlClient::new(self.command_sender())
+    }
+
+    #[cfg(feature = "clash-api")]
+    pub fn ui_download_handle(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>> {
+        Arc::clone(&self.ui_download)
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn attach_subscriptions(
+        &mut self,
+        subscriptions: crate::subscription::SubscriptionSupervisorHandle,
+    ) {
+        self.subscriptions = Some(subscriptions);
+    }
+
+    pub(crate) fn shutdown_intent(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.shutdown_requested)
+    }
+
     pub fn is_datapath_healthy(&self) -> bool {
         self.datapath_healthy
             .load(std::sync::atomic::Ordering::Acquire)
@@ -331,7 +427,7 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
-    fn compile_routing_plan(
+    pub(crate) fn compile_routing_plan(
         config: &Config,
         router: &Router,
     ) -> anyhow::Result<routing_matcher::RoutingPushPlan> {
@@ -353,7 +449,24 @@ impl ControlPlane {
             .dial_mode
             .parse::<DialMode>()
             .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
-        routing_matcher::RoutingPushPlan::compile(router, &outbound_name_to_id, dial_mode)
+        let mut plan =
+            routing_matcher::RoutingPushPlan::compile(router, &outbound_name_to_id, dial_mode)?;
+        plan.enable_trace(
+            cfg!(feature = "native-api")
+                && config.experimental.native_api.enabled
+                && config.experimental.native_api.record_flows,
+        );
+        // Witnesses of a policy without a dictionary could not be decoded.
+        #[cfg(feature = "native-api")]
+        if plan.trace_enabled()
+            && !crate::observe::flows::kernel::KernelTraceDictionary::fits(router, config, &plan)
+        {
+            tracing::warn!(
+                "routing policy too large for its kernel trace dictionary; kernel route tracing is off"
+            );
+            plan.enable_trace(false);
+        }
+        Ok(plan)
     }
 }
 

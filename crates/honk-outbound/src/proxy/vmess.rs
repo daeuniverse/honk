@@ -443,18 +443,19 @@ impl VmessHandler {
 
         let (client_half, server_half) = tokio::io::duplex(65536);
         let failure = RelayFailure::default();
-        let relay = tokio::spawn(vmess_relay_recorded(
-            stream,
-            server_half,
-            header_wire,
-            session,
-            failure.clone(),
-        ));
+        let relay_future =
+            vmess_relay_recorded(stream, server_half, header_wire, session, failure.clone());
+        let relay_future = crate::runtime::flow_observation::scope(
+            crate::runtime::flow_observation::current(),
+            relay_future,
+        );
+        let relay = crate::runtime::spawn_owned(relay_future)
+            .ok_or(crate::proxy::PacketRejection::Cancelled)?;
 
         Ok(ProxyStream {
             stream: Box::new(VmessStream {
                 inner: client_half,
-                relay: relay.abort_handle(),
+                relay,
                 failure,
             }),
             target_addr: target,
@@ -640,8 +641,7 @@ async fn vmess_relay(
     let (mut client_read, mut client_write) = tokio::io::split(client);
 
     let upload = async {
-        server_write.write_all(&header_wire).await?;
-        server_write.flush().await?;
+        super::transport::write_request(&mut server_write, &header_wire).await?;
 
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];

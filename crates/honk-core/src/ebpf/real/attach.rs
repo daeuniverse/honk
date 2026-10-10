@@ -126,6 +126,12 @@ impl RealEbpfBackend {
                 .override_global("TASK_MM_OFFSET", &offsets.task_mm, true)
                 .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
         }
+        #[cfg(feature = "native-api")]
+        let receive_trace_offsets = receive_trace::detect();
+        #[cfg(feature = "native-api")]
+        if let Some(offsets) = &receive_trace_offsets {
+            offsets.configure(&mut loader);
+        }
         let mut bpf = loader.load(obj)?;
         validate_routing_handoff_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
@@ -147,7 +153,7 @@ impl RealEbpfBackend {
             if let Err(error) = std::fs::remove_file(&pin_path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                warn!("remove stale pin '{}': {}", name, error);
+                debug!("remove stale pin '{}': {}", name, error);
             }
             if let Err(e) = map.pin(&pin_path) {
                 warn!("pin '{}': {}", name, e);
@@ -241,7 +247,7 @@ impl RealEbpfBackend {
             if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_lan_ifname) {
                 let msg = e.to_string();
                 if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                    warn!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
+                    debug!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
                 }
             }
         }
@@ -290,7 +296,7 @@ impl RealEbpfBackend {
             if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_wan_ifname) {
                 let msg = e.to_string();
                 if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                    warn!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
+                    debug!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
                 }
             }
 
@@ -351,7 +357,7 @@ impl RealEbpfBackend {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
                     let msg = e.to_string();
                     if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                        warn!(
+                        debug!(
                             "failed to add clsact qdisc to bridge slave {}: {}",
                             slave, e
                         );
@@ -406,7 +412,7 @@ impl RealEbpfBackend {
             let slave_dir = aya::programs::TcAttachType::Ingress;
             for slave in &lan_slaves {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
+                    debug!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
                 let slave_prog = Self::lan_program_pair(slave).0;
                 interface_links.push(
@@ -436,7 +442,7 @@ impl RealEbpfBackend {
             let slave_dir = aya::programs::TcAttachType::Egress;
             for slave in &wan_egress_slaves {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
+                    debug!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
                 // Bond slaves are ARPHRD_ETHER and see fully-framed skbs at
                 // their TC egress hook (the bond driver has already built
@@ -535,6 +541,7 @@ impl RealEbpfBackend {
             interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,
+            pname_mode,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
@@ -547,6 +554,15 @@ impl RealEbpfBackend {
             routing_slot: 0,
             routing_generation_counter: 0,
             routing_generation_sequence,
+            next_trace_policy: 0,
+            #[cfg(feature = "native-api")]
+            trace_dictionaries: Default::default(),
+            #[cfg(feature = "native-api")]
+            receive_trace: None,
+            #[cfg(feature = "native-api")]
+            receive_trace_available: receive_trace_offsets.is_some(),
+            #[cfg(feature = "native-api")]
+            receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
         })
     }
@@ -572,7 +588,7 @@ impl RealEbpfBackend {
         let id = p
             .attach(iface, dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
-        info!(
+        debug!(
             "attached '{}' to {} ({:?}) link_id={:?}",
             prog, iface, dir, id
         );
@@ -726,7 +742,7 @@ impl RealEbpfBackend {
         single_homed: bool,
     ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
         let ifname = Self::bridge_interface(ifname).unwrap_or_else(|| ifname.to_string());
-        info!("Attaching LAN programs to additional interface: {}", ifname);
+        debug!("Attaching LAN programs to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(&ifname);
         let ifindex = crate::netlink::ifindex_of(&ifname).unwrap_or(0);
         let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
@@ -747,7 +763,7 @@ impl RealEbpfBackend {
 
     /// Attach WAN egress to an additional interface.
     pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        info!("Attaching WAN egress to additional interface: {}", ifname);
+        debug!("Attaching WAN egress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
         if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), true) {
             return Ok(());
@@ -760,7 +776,7 @@ impl RealEbpfBackend {
     /// conntrack updates for replies arriving from the WAN).  L2/L3 is
     /// chosen by interface type, same as `attach_wan_egress`.
     pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        info!("Attaching WAN ingress to additional interface: {}", ifname);
+        debug!("Attaching WAN ingress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
         if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), false) {
             return Ok(());
@@ -778,7 +794,7 @@ impl RealEbpfBackend {
         ifname: &str,
         role: crate::ebpf::IfaceRole,
     ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
-        info!(
+        debug!(
             "Attaching slave programs to additional interface: {}",
             ifname
         );

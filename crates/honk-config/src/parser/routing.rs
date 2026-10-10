@@ -109,7 +109,7 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         self.parts().flat_map(Text::parentheses)
     }
 
-    fn display(self) -> String {
+    pub(super) fn display(self) -> String {
         let mut output = String::new();
         for part in self
             .parts()
@@ -171,6 +171,14 @@ pub(super) fn parse_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<RoutingConfig, super::ParseFailure> {
+    parse_section_indexed(section, diagnostics, |_, _| {})
+}
+
+pub(super) fn parse_section_indexed(
+    section: &[Segment<'_, '_>],
+    diagnostics: &mut ParserDiagnostics<'_>,
+    mut location: impl FnMut(Option<usize>, Expression<'_, '_, '_>),
+) -> Result<RoutingConfig, super::ParseFailure> {
     let mut config = RoutingConfig::default();
     let lines = read::statements(section, diagnostics, super::cursor::BodySyntax::Expressions);
     let mut start = 0;
@@ -215,12 +223,14 @@ pub(super) fn parse_section(
             config.default_outbound = outbound;
             config.default_must = must;
             config.default_mark = mark;
+            location(None, statement);
         } else {
             match parse_routing_rule(statement, config.rules.len(), ordinal, diagnostics) {
                 Ok(Some((rule, source))) => {
                     if let Some(source) = source {
                         config.record_complex_rule_source(rule.name.clone(), source);
                     }
+                    location(Some(config.rules.len()), statement);
                     config.rules.push(rule);
                 }
                 Ok(None) => statement.parts().next().unwrap().notice(

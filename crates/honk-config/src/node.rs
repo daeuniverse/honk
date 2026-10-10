@@ -362,6 +362,9 @@ pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
     pub name: String,
+    /// Configured client icon, passed through without fetching or normalization.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// Group selection policy.
     #[serde(default)]
     pub policy: GroupPolicy,
@@ -391,20 +394,23 @@ pub struct Group {
     /// URL for health checks (overrides global tcp_check_url).
     #[serde(default)]
     pub check_url: Option<String>,
-    /// Health check interval override in seconds.
+    /// Retained interval metadata; runtime checks use the global interval.
     #[serde(default)]
     pub check_interval: Option<u64>,
     /// Minimum latency difference (ms) before switching the URLTest selection.
-    /// Zero means switch on any improvement. Default: 50 (matches sing-box).
+    /// Default: 50; the runtime applies a minimum of one millisecond.
     #[serde(default = "default_tolerance")]
     pub tolerance: u64,
-    /// Stop health checks after this many seconds of inactivity.
-    /// `None` means never stop. Zero means never stop.
+    /// URLTest inactivity threshold in seconds; `None` uses 1800 seconds.
+    /// Zero makes the group immediately idle between selections.
     #[serde(default)]
     pub idle_timeout: Option<u64>,
-    /// Request tracking removal on selection changes; live relays are not cancelled.
+    /// Close owned connections when the selected member changes.
     #[serde(default)]
     pub interrupt_connections: bool,
+    /// Which defaulted options the group's own source sets.
+    #[serde(skip)]
+    pub own: OwnOptions,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -414,6 +420,7 @@ impl Default for Group {
         Self {
             id: uuid::Uuid::new_v4(),
             name: String::new(),
+            icon: None,
             policy: GroupPolicy::default(),
             nodes: Vec::new(),
             filters: Vec::new(),
@@ -425,7 +432,44 @@ impl Default for Group {
             tolerance: default_tolerance(),
             idle_timeout: None,
             interrupt_connections: false,
+            own: OwnOptions::default(),
             created_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// Group options whose effective value otherwise comes from a default or `global`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnOptions {
+    pub tolerance: bool,
+    pub interrupt_connections: bool,
+}
+
+impl Group {
+    pub(crate) const INVALID_ICON: &'static str =
+        "icon must be an absolute http(s) URL or data URI of at most 2048 characters";
+
+    pub fn valid_icon(value: &str) -> bool {
+        if value.chars().count() > 2048
+            || value.chars().any(char::is_whitespace)
+            || value.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Ok(url) = url::Url::parse(value) else {
+            return false;
+        };
+        match url.scheme() {
+            "http" | "https" => {
+                value
+                    .split_once(':')
+                    .is_some_and(|(_, rest)| rest.starts_with("//"))
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            }
+            "data" => url.path().contains(','),
+            _ => false,
         }
     }
 }
@@ -456,6 +500,19 @@ pub enum GroupPolicy {
     Fallback,
     /// Reliability-aware automatic selection trained by real connection outcomes.
     Score,
+}
+
+impl GroupPolicy {
+    /// Serde wire name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selector => "selector",
+            Self::URLTest => "urltest",
+            Self::LoadBalance => "loadbalance",
+            Self::Fallback => "fallback",
+            Self::Score => "score",
+        }
+    }
 }
 
 #[cfg(test)]

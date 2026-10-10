@@ -6,6 +6,7 @@ use super::{
     SCORE_SWITCH_FULL_EVIDENCE, ScoreSelectionContext, ScoreSnapshot, SelectionHistoryKey,
     SelectionReason, SelectionReasonKey, StateInner, Stats, comparison,
 };
+use crate::group::observation;
 use honk_config::node::Node;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -102,7 +103,18 @@ fn ordinary_decision<'a>(
         },
     );
     let membership = evaluation.membership(nodes);
+    let incumbent = inner
+        .selection_history
+        .peek(&SelectionHistoryKey::new(group, context))
+        .inspect(|history| observation::previous_node(history.current))
+        .and_then(|history| nodes.iter().position(|node| node.id == history.current))
+        .filter(|index| membership[*index]);
     if !membership.iter().any(|member| *member) {
+        if observation::active() {
+            for node in nodes {
+                observation::score_eligible(node.id, false);
+            }
+        }
         return None;
     }
     let baseline = performance_baseline(
@@ -111,11 +123,15 @@ fn ordinary_decision<'a>(
             .zip(&membership)
             .filter_map(|(score, member)| member.then_some(score)),
     );
-    let incumbent = inner
-        .selection_history
-        .peek(&SelectionHistoryKey::new(group, context))
-        .and_then(|history| nodes.iter().position(|node| node.id == history.current))
-        .filter(|index| membership[*index]);
+    if observation::active() {
+        for ((node, score), member) in nodes.iter().zip(&scores).zip(&membership) {
+            let eligible = *member && normal_eligible(score, baseline);
+            observation::score_eligible(node.id, eligible);
+            if eligible {
+                observation::score(node.id, utility(score, baseline));
+            }
+        }
+    }
     let reference = incumbent
         .unwrap_or_else(|| best_index(&scores, nodes, baseline, |index| membership[index]).index);
     let pairs = view.pairs((&scores, baseline), (&membership, reference));

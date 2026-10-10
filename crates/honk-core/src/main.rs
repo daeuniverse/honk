@@ -26,6 +26,23 @@ fn disable_transparent_huge_pages() -> std::io::Result<()> {
     }
 }
 
+/// mimalloc v3 delays returning freed pages to the OS by a full second, so the
+/// churn of probes, connections and DNS across every worker leaves most of the
+/// heap's recent peak resident. `libmimalloc-sys` exports no constant for the
+/// option; its index is the same in the v2 and v3 enums.
+#[cfg(feature = "mimalloc")]
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+#[cfg(feature = "mimalloc")]
+const PURGE_DELAY_MS: std::ffi::c_long = 100;
+
+/// A `MIMALLOC_PURGE_DELAY` the operator set wins: `mi_option_set_default`
+/// only replaces a value that did not come from the environment.
+#[cfg(feature = "mimalloc")]
+fn tune_allocator() {
+    // SAFETY: plain integer option, set before this process starts any thread.
+    unsafe { libmimalloc_sys::mi_option_set_default(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS) };
+}
+
 #[cfg(feature = "mimalloc")]
 fn mimalloc_collect_period(value: Option<&str>) -> Option<std::time::Duration> {
     let seconds = value.and_then(|value| value.parse().ok()).unwrap_or(60);
@@ -96,7 +113,7 @@ impl OwnerCollector {
             }
             let covered = self.sweep().await;
             if covered < self.worker_count {
-                tracing::warn!(
+                tracing::debug!(
                     covered,
                     expected = self.worker_count,
                     "mimalloc owner sweep could not reach every Tokio worker"
@@ -220,6 +237,8 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "mimalloc")]
+    tune_allocator();
     #[cfg(all(feature = "mimalloc", target_os = "linux"))]
     disable_transparent_huge_pages()?;
 
@@ -407,6 +426,44 @@ mod tests {
         assert!(!collector.workers_idle_for_sweep());
         parked_workers.store(3, std::sync::atomic::Ordering::Relaxed);
         assert!(collector.workers_idle_for_sweep());
+    }
+
+    #[cfg(feature = "mimalloc")]
+    #[test]
+    fn purge_delay_default_yields_to_the_operators_environment() {
+        const TEST: &str = "tests::purge_delay_default_yields_to_the_operators_environment";
+        if std::env::var_os("HONK_TEST_PURGE_CHILD").is_some() {
+            tune_allocator();
+            // SAFETY: reads one integer option.
+            let delay = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
+            println!("purge_delay={delay}");
+            return;
+        }
+        // mimalloc reads its environment when the process starts, so each case
+        // needs its own process.
+        let delay_with = |env: Option<&str>| {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env("HONK_TEST_PURGE_CHILD", "1")
+                .env_remove("MIMALLOC_PURGE_DELAY");
+            if let Some(value) = env {
+                child.env("MIMALLOC_PURGE_DELAY", value);
+            }
+            let output = String::from_utf8(child.output().unwrap().stdout).unwrap();
+            output
+                .lines()
+                .find_map(|line| {
+                    line.split_once("purge_delay=")
+                        .map(|(_, delay)| delay.trim())
+                })
+                .unwrap_or_else(|| panic!("child printed no delay: {output}"))
+                .to_owned()
+        };
+
+        assert_eq!(delay_with(None), PURGE_DELAY_MS.to_string());
+        assert_eq!(delay_with(Some("0")), "0");
+        assert_eq!(delay_with(Some("-1")), "-1");
     }
     #[test]
     fn top_level_future_runs_on_a_runtime_worker() {

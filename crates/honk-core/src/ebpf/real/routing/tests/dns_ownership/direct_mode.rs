@@ -90,3 +90,93 @@ fn direct_mode_normalizes_nonmust_proxy_in_lan_and_wan_tcp_udp() {
         }
     });
 }
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn rule_direct_prefix_offload_preserves_global_handoffs() {
+    isolated(|| {
+        let destination = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 80));
+        let rules = [
+            rule(
+                "early-direct",
+                RoutingCondition {
+                    ip: vec![destination.to_string()],
+                    ..Default::default()
+                },
+                "direct",
+                0,
+                false,
+            ),
+            rule(
+                "later-domain",
+                RoutingCondition {
+                    domain: vec!["late.test".into()],
+                    ..Default::default()
+                },
+                "proxy",
+                0,
+                false,
+            ),
+        ];
+        let (mut backend, _, _listeners) = publish(&rules);
+        let router = Router::new(&rules, "direct").unwrap();
+        let plan =
+            RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::DomainPlusPlus).unwrap();
+        backend.publish_routing_plan(&plan, &[]).unwrap();
+        for (flags, base_port) in [(0, 43000), (DATAPATH_FLAG_OFFLOAD_RULE_DIRECT, 43010)] {
+            backend.set_datapath_flags(flags).unwrap();
+            for (wan, side) in [(false, "lan_ingress_l2"), (true, "wan_egress_l2")] {
+                let source = IpAddr::V4(Ipv4Addr::new(10 + wan as u8, 0, 0, 2));
+                for protocol in [IPPROTO_TCP, IPPROTO_UDP] {
+                    let source_port = base_port + protocol as u16;
+                    let before_handoff = hash_count::<TuplesKey, RoutingHandoffEntry>(
+                        &backend,
+                        "ROUTING_HANDOFF_MAP",
+                    );
+                    for tcp_flags in if protocol == IPPROTO_TCP {
+                        [0x02, 0x10]
+                    } else {
+                        [0, 0]
+                    } {
+                        let packet = packet(
+                            source,
+                            destination,
+                            protocol,
+                            source_port,
+                            443,
+                            0,
+                            tcp_flags,
+                        );
+                        let result = run(&backend, side, &packet, SkbInput::default());
+                        let context =
+                            format!("{side} protocol={protocol} flags={flags} tcp={tcp_flags}");
+                        if flags == 0 {
+                            assert_eq!(result.verdict, TC_ACT_REDIRECT, "{context}");
+                            let key = tuple(source, destination, source_port, 443, protocol);
+                            assert_eq!(
+                                handoff(&backend, &key).result.outbound,
+                                OutboundIndex::ControlPlaneRouting as u8,
+                                "{context}"
+                            );
+                        } else {
+                            assert_eq!(result.verdict, TC_ACT_OK, "{context}");
+                            assert_eq!(
+                                result.mark,
+                                if wan { 0 } else { CLASSIFIED_MARK },
+                                "{context}"
+                            );
+                            assert_eq!(
+                                hash_count::<TuplesKey, RoutingHandoffEntry>(
+                                    &backend,
+                                    "ROUTING_HANDOFF_MAP"
+                                ),
+                                before_handoff,
+                                "{context}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}

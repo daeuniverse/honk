@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use honk_ebpf_common::DomainRouting;
+use honk_outbound::alive::IpVersion;
 
 use crate::ebpf::EbpfBackend;
 use crate::routing::Router;
@@ -108,14 +109,20 @@ impl RoutingProjectionSnapshot {
     }
 }
 
+/// A/AAAA results own only their address family; NXDOMAIN clears the name.
 #[derive(Debug)]
 pub(crate) enum ProjectionObservation<'a> {
     Positive {
         domain: &'a str,
+        family: IpVersion,
         ips: &'a [IpAddr],
         advertised_ttl: Duration,
     },
     Clear {
+        domain: &'a str,
+        family: IpVersion,
+    },
+    ClearName {
         domain: &'a str,
     },
     Retain,
@@ -345,6 +352,7 @@ impl ProjectionReplacementBenchmark {
         state.observe(
             ProjectionObservation::Positive {
                 domain: &domain,
+                family: state::family_of(ip),
                 ips: std::slice::from_ref(&ip),
                 advertised_ttl: Duration::from_secs(300),
             },
@@ -363,6 +371,7 @@ impl ProjectionReplacementBenchmark {
         self.state.observe(
             ProjectionObservation::Positive {
                 domain: &self.domain,
+                family: state::family_of(self.ip),
                 ips: std::slice::from_ref(&self.ip),
                 advertised_ttl: Duration::from_secs(300),
             },

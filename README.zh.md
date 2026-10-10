@@ -33,6 +33,12 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 - **UDP NFQUEUE 默认开启：**它在 conntrack/NAT 前保留仍有歧义的 LAN 转发首包。设置 `global.nfqueue_enable: false` 可关闭；修改后需要重启。Mock 模式、不带 `ebpf` 的构建或队列不可用时，会记录 warning 并在本进程禁用暂存。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；同一网络命名空间中的防火墙管理器不得修改它们。详见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)。
 - **VLESS 升级：**`vless_mode` 已删除，所有 VLESS 节点 ID 都会重新派生。升级前须迁移静态链接及缓存/provider 内容，离线升级尤其需要提前迁移。仍可用的按名称保存的 Selector 选择和持久化延迟样本应保留。UDP 权限、packet encoding 和多路复用是独立设置。详见[迁移指南](doc/zh/reference/nodes.md#从-vless_mode-迁移)和 [VLESS 设计](doc/zh/design/outbound.md#vless-wire-契约)。
 
+## 可选原生观测 API
+
+以 `--features native-api` 构建（release 构建已包含）并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立观测用户态连接与记录流、节点与组健康、出站计数、RSS/cgroup、历史、事件、结构化安全日志、DNS 与 provider 状态。支持有界探测、路由模拟、精确连接关闭与缓存失效、provider refresh、分网络 Selector 控制与临时设置。除显式启用的匿名 loopback 访问外，均要求 bearer secret 或密码登录。可托管可信目录，或以 `--features native-ui` 和 `ui: embedded` 使用固定版本的 doona，运行时不下载 UI。
+
+`.dae` 仍是唯一配置权威。启动时捕获的源支持元数据读取、离线校验、授权源 PUT 和受限组 PATCH。主文件节点/provider 的创建与删除在实际激活后才返回成功，geodata 更新 operation 激活已验证的内容。编辑已有条目继续使用源 PUT；`--store db` 将已接受的源记录为状态数据库中的 revision。凭据源只读，返回正文时遮蔽 listener secret 值。启用原生 API 时，与 Clash 共用非持久化模式；成功的显式激活（含 no-op）重置 Rule 与设置，provider/network refresh 保留它们。原生 runtime mode、暂停/恢复与完整内核 flow 观测仍未开放。详见[原生 API 参考](doc/zh/reference/api.md#原生-api)。
+
 ## 开发
 
 工作区包含配置、共享 eBPF 类型、NFQUEUE、出站、核心和工具 crate。`crates/honk-ebpf` 中的内核程序单独构建。构建依赖和命令见[启动指南](doc/zh/how-to-start.md#从源码构建)与 [Justfile](Justfile)。

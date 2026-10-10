@@ -15,22 +15,37 @@ use honk_config::types::SubscriptionType;
 
 mod clash;
 mod json;
+#[cfg(feature = "native-api")]
+mod network;
 mod records;
+mod route;
 mod store;
 mod supervisor;
 
+#[cfg(feature = "native-api")]
+pub(crate) use store::StoredBodies;
 pub use store::SubscriptionStore;
 pub(crate) use store::same_subscription_fetch_identity;
+pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies};
 
+pub(crate) use route::failure_code;
+pub(crate) use supervisor::SubscriptionMergeReply;
+#[cfg(feature = "native-api")]
+pub(crate) use supervisor::same_subscription_source_spec;
 pub(crate) use supervisor::{
     AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
     SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
 };
+#[cfg(feature = "native-api")]
+pub(crate) use supervisor::{ProviderLoad, RefreshRefusal, RefreshReport};
 
 /// Bounds what a hostile or broken origin can make honk buffer before parsing.
 const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 
 const MAX_SUBSCRIPTION_REDIRECTS: usize = 5;
+
+/// How long a whole subscription fetch, its redirects included, may take.
+const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One source entry retained only until the common admission pass consumes it.
 #[derive(Debug)]
@@ -299,109 +314,165 @@ fn subscription_redirect_error(
     }
 }
 
-const SUBSCRIPTION_STORE_DIR: &str = ".sub";
-const DEFAULT_SUBSCRIPTION_USER_AGENT: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));
+/// Carries the request headers over a followed redirect, on the direct and
+/// the routed fetch alike. Leaving the previous origin drops credentials and
+/// a configured Host; the previous URL becomes the Referer unless the hop
+/// goes from https to http.
+fn follow_subscription_redirect(
+    previous: &reqwest::Url,
+    next: &reqwest::Url,
+    headers: &mut http::HeaderMap,
+) {
+    use http::header;
 
-fn effective_subscription_user_agent(sub: &Subscription) -> &str {
+    if previous.host_str() != next.host_str()
+        || previous.port_or_known_default() != next.port_or_known_default()
+        || previous.scheme() != next.scheme()
+    {
+        for name in [
+            header::AUTHORIZATION,
+            header::COOKIE,
+            header::HeaderName::from_static("cookie2"),
+            header::WWW_AUTHENTICATE,
+            header::PROXY_AUTHORIZATION,
+            header::HOST,
+        ] {
+            headers.remove(name);
+        }
+    }
+    if previous.scheme() != "https" || next.scheme() == "https" {
+        let mut referer = previous.clone();
+        let _ = referer.set_username("");
+        let _ = referer.set_password(None);
+        referer.set_fragment(None);
+        if let Ok(value) = header::HeaderValue::from_str(referer.as_str()) {
+            headers.insert(header::REFERER, value);
+        }
+    }
+}
+
+const SUBSCRIPTION_STORE_DIR: &str = ".sub";
+pub(crate) const DEFAULT_SUBSCRIPTION_USER_AGENT: &str =
+    concat!("honk/", env!("CARGO_PKG_VERSION"));
+
+pub(crate) fn effective_subscription_user_agent(sub: &Subscription) -> &str {
     sub.user_agent
         .as_deref()
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT)
 }
 
-/// `Response::text` buffers the whole body before anything can check its size.
-async fn read_capped_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(reqwest::Error::without_url)?
-    {
-        if body.len() + chunk.len() > MAX_SUBSCRIPTION_BYTES {
-            anyhow::bail!("subscription body exceeds {MAX_SUBSCRIPTION_BYTES} bytes");
-        }
-        body.extend_from_slice(&chunk);
+fn subscription_client() -> anyhow::Result<crate::marked_http::Client> {
+    crate::marked_http::Client::new()
+}
+
+async fn fetch_body(
+    client: &crate::marked_http::Client,
+    sub: &Subscription,
+) -> anyhow::Result<Vec<u8>> {
+    fetch_following(sub, route::Hop::Direct(client)).await
+}
+
+/// The User-Agent and configured headers every subscription request sends.
+fn subscription_request_headers(sub: &Subscription) -> anyhow::Result<http::HeaderMap> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::USER_AGENT,
+        effective_subscription_user_agent(sub).parse()?,
+    );
+    for header in &sub.headers {
+        headers.append(
+            http::HeaderName::from_bytes(header.key.as_bytes())?,
+            header.value.parse()?,
+        );
     }
-    Ok(body)
+    Ok(headers)
+}
+
+/// Fetches the subscription over `hop`, direct or routed alike. Redirects
+/// are followed here, not by the client, so each hop is checked against the
+/// original origin and cross-origin hops drop credentials.
+async fn fetch_following(sub: &Subscription, hop: route::Hop<'_>) -> anyhow::Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + SUBSCRIPTION_TIMEOUT;
+    let mut url = reqwest::Url::parse(&sub.url)?;
+    let mut headers = subscription_request_headers(sub)?;
+    // Userinfo becomes Basic auth unless a configured Authorization wins.
+    crate::marked_http::normalize_url(&mut url, &mut headers)?;
+    let origin = url.clone();
+    for redirects in 0..=MAX_SUBSCRIPTION_REDIRECTS {
+        let reply = hop.get(sub, &url, &headers, deadline).await?;
+        if crate::marked_http::followed_redirect(reply.status)
+            && let Some(location) = reply.location
+        {
+            // The bound comes first, so a hop past it fails the same way
+            // whatever its Location holds.
+            anyhow::ensure!(
+                redirects < MAX_SUBSCRIPTION_REDIRECTS,
+                "subscription redirected too many times"
+            );
+            let mut next = url.join(location.to_str()?)?;
+            // Redirect userinfo must not restore credentials after an origin change.
+            let _ = next.set_username("");
+            let _ = next.set_password(None);
+            if let Some(reason) = subscription_redirect_error(&origin, &next) {
+                anyhow::bail!(reason);
+            }
+            follow_subscription_redirect(&url, &next, &mut headers);
+            url = next;
+            continue;
+        }
+        anyhow::ensure!(
+            !reply.status.is_client_error() && !reply.status.is_server_error(),
+            "subscription server answered HTTP {}",
+            reply.status
+        );
+        return Ok(reply.body.to_vec());
+    }
+    unreachable!("redirect bound checked before following");
+}
+
+enum SubscriptionHttp {
+    Shared(crate::marked_http::Client),
+    #[cfg(feature = "native-api")]
+    Owned(network::SubscriptionNetwork),
 }
 
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
-    client: crate::marked_http::Client,
+    http: SubscriptionHttp,
+    /// Set once routing is up; routed fetches fail until then.
+    routing: std::sync::OnceLock<route::Routing>,
 }
 
 impl SubscriptionManager {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            client: crate::marked_http::Client::new()?,
+            http: SubscriptionHttp::Shared(subscription_client()?),
+            routing: std::sync::OnceLock::new(),
         })
     }
 
-    /// Redirects are followed here, not by the client, so each hop is checked
-    /// against the original origin and cross-origin hops drop credentials.
-    async fn fetch_body(
-        &self,
-        mut url: reqwest::Url,
-        mut headers: http::HeaderMap,
-    ) -> anyhow::Result<Vec<u8>> {
-        use http::header;
+    #[cfg(feature = "native-api")]
+    async fn new_owned() -> anyhow::Result<Self> {
+        let network = network::SubscriptionNetwork::new()?;
+        network.ready().await?;
+        Ok(Self {
+            http: SubscriptionHttp::Owned(network),
+            routing: std::sync::OnceLock::new(),
+        })
+    }
 
-        crate::marked_http::normalize_url(&mut url, &mut headers)?;
-        let origin = url.clone();
-        for hop in 0..=MAX_SUBSCRIPTION_REDIRECTS {
-            let response = self
-                .client
-                .get(&url, &headers, std::time::Duration::from_secs(30))
-                .await?;
-            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
-                && let Some(location) = response.headers().get(header::LOCATION)
-            {
-                anyhow::ensure!(
-                    hop < MAX_SUBSCRIPTION_REDIRECTS,
-                    "subscription redirected too many times"
-                );
-                let mut next = url.join(location.to_str()?)?;
-                // Redirect userinfo must not restore credentials after an origin change.
-                let _ = next.set_username("");
-                let _ = next.set_password(None);
-                if let Some(reason) = subscription_redirect_error(&origin, &next) {
-                    anyhow::bail!(reason);
-                }
-                let previous = std::mem::replace(&mut url, next);
-                if previous.host_str() != url.host_str()
-                    || previous.port_or_known_default() != url.port_or_known_default()
-                    || previous.scheme() != url.scheme()
-                {
-                    for name in [
-                        header::AUTHORIZATION,
-                        header::COOKIE,
-                        header::HeaderName::from_static("cookie2"),
-                        header::WWW_AUTHENTICATE,
-                        header::PROXY_AUTHORIZATION,
-                        header::HOST,
-                    ] {
-                        headers.remove(name);
-                    }
-                }
-                if previous.scheme() != "https" || url.scheme() == "https" {
-                    let mut referer = previous;
-                    let _ = referer.set_username("");
-                    let _ = referer.set_password(None);
-                    referer.set_fragment(None);
-                    if let Ok(value) = header::HeaderValue::from_str(referer.as_str()) {
-                        headers.insert(header::REFERER, value);
-                    }
-                }
-                continue;
-            }
-            return read_capped_body(
-                response
-                    .error_for_status()
-                    .map_err(reqwest::Error::without_url)?,
-            )
-            .await;
+    /// Hands routed fetches the outbounds user traffic uses.
+    pub(crate) fn route_through(&self, routing: route::Routing) {
+        let _ = self.routing.set(routing);
+    }
+
+    async fn pause_network(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "native-api")]
+        if let SubscriptionHttp::Owned(network) = &self.http {
+            network.pause().await?;
         }
-        unreachable!("redirect bound checked before following");
+        Ok(())
     }
 
     /// Fetch a subscription URL and parse its contents into a list of nodes.
@@ -428,24 +499,29 @@ impl SubscriptionManager {
         store: Option<&SubscriptionStore>,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Vec<Node>> {
-        let url = reqwest::Url::parse(&sub.url)?;
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::USER_AGENT,
-            effective_subscription_user_agent(sub).parse()?,
-        );
-        for header in &sub.headers {
-            headers.append(
-                http::HeaderName::from_bytes(header.key.as_bytes())?,
-                header.value.parse()?,
-            );
-        }
-        let body = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.fetch_body(url, headers),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("subscription HTTP request timed out"))??;
+        let start = diagnostics.len();
+        let (nodes, content) = self.fetch_content(sub, diagnostics).await?;
+        Self::persist_content(sub, store, content, diagnostics, start).await;
+        Ok(nodes)
+    }
+
+    async fn fetch_content(
+        &self,
+        sub: &Subscription,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> anyhow::Result<(Vec<Node>, String)> {
+        let body = if route::direct(sub) {
+            match &self.http {
+                SubscriptionHttp::Shared(client) => fetch_body(client, sub).await?,
+                #[cfg(feature = "native-api")]
+                SubscriptionHttp::Owned(network) => network.fetch(sub).await?,
+            }
+        } else {
+            let routing = self.routing.get().ok_or_else(|| {
+                anyhow::anyhow!("subscription '{}': routing is not ready yet", sub.name)
+            })?;
+            fetch_following(sub, route::Hop::Routed(routing)).await?
+        };
         let content = finish_attempt(
             String::from_utf8(body).map_err(|_| {
                 subscription_error(
@@ -455,8 +531,17 @@ impl SubscriptionManager {
             }),
             diagnostics,
         )?;
-        let start = diagnostics.len();
         let nodes = parse_subscription_content_with_diagnostics(sub, &content, diagnostics)?;
+        Ok((nodes, content))
+    }
+
+    async fn persist_content(
+        sub: &Subscription,
+        store: Option<&SubscriptionStore>,
+        content: String,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        start: usize,
+    ) {
         if let Some(store) = store
             && store.store_content(sub, content).await.is_err()
         {
@@ -472,7 +557,6 @@ impl SubscriptionManager {
                 "subscription body accepted but could not be persisted",
             ));
         }
-        Ok(nodes)
     }
 }
 
@@ -770,7 +854,7 @@ fn decode_base64_flexible(input: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn yaml_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
-    mapping.get(serde_yaml::Value::String(key.to_string()))
+    mapping.get(key)
 }
 
 #[cfg(test)]

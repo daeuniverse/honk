@@ -99,6 +99,24 @@ mod empty_subgroups {
     };
 
     #[test]
+    fn structured_configs_keep_the_assets_block() {
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(config.assets.route, "proxy");
+        for restored in [
+            serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
+            serde_yaml::from_str::<Config>(&serde_yaml::to_string(&config).unwrap()).unwrap(),
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+        ] {
+            assert_eq!(restored.assets, config.assets);
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"assets": {"routes": "direct"}}"#).is_err());
+    }
+
+    #[test]
     fn explicit_empty_contributions_survive_roundtrip_and_refresh() {
         let mut diagnostics = Vec::new();
         let config = parse_dae_config_with_detailed_diagnostics("node {\n edge: 'socks5://127.0.0.1:1080'\n}\nsubscription {\n paid: 'https://example.test/sub'\n}\ngroup {\n empty { filter: group() }\n blank { filter: }\n nested { filter: group(empty) }\n late { filter: subtag(paid) }\n sibling {\n filter: group()\n filter: name(edge)\n final: direct\n }\n}", &mut diagnostics).unwrap();
@@ -234,6 +252,25 @@ mod check_targets {
         for input in ["", "https://", "http://[::1", "http://host:bad/"] {
             assert!(decode_health_http_target(input).is_err());
         }
+    }
+
+    #[test]
+    fn http_targets_reject_explicit_zero_ports() {
+        use honk_config::check::{decode_health_http_target, decode_http_check_target};
+        for input in [
+            "http://127.0.0.1:0/check",
+            "https://[::1]:0/",
+            "host:0/check",
+        ] {
+            assert!(decode_http_check_target(input, false).is_err(), "{input}");
+            assert!(decode_health_http_target(input).is_err(), "{input}");
+        }
+        assert_eq!(
+            decode_http_check_target("http://host:8080/", false)
+                .unwrap()
+                .port(),
+            8080
+        );
     }
 
     #[test]
@@ -609,6 +646,194 @@ mod share_link_security {
     }
 }
 
+mod native_api {
+    use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
+
+    #[test]
+    fn removed_destination_settings_warn_and_are_not_serialized() {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental {\n native_api {\n probe_allowed_cidrs: PRIVATE\n probe_allowed_ports: 0, 65536, invalid\n }\n}",
+            &mut diagnostics,
+        )
+        .unwrap();
+        config.validate_detailed().unwrap();
+        assert_eq!(config.experimental.native_api, Default::default());
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (notice, line, key) in [
+            (&diagnostics[0], 3, "probe_allowed_cidrs"),
+            (&diagnostics[1], 4, "probe_allowed_ports"),
+        ] {
+            assert_eq!(notice.code, "legacy-config-warning");
+            assert_eq!(
+                notice.setting.to_string(),
+                format!("experimental.native_api.{key}")
+            );
+            assert_eq!(notice.severity, honk_config::diagnostic::Severity::Warning);
+            assert_eq!(notice.line, Some(line));
+            assert!(
+                notice.message.contains("removed") && notice.message.contains("can be deleted")
+            );
+            assert!(!format!("{notice:?}").contains("PRIVATE"));
+            assert!(!serde_json::to_string(&config).unwrap().contains(key));
+        }
+    }
+
+    #[test]
+    fn native_api_security_syntax_never_falls_back() {
+        for input in [
+            "secrett: PRIVATE",
+            "enabled: maybe",
+            "allow_anonymous_loopback: maybe",
+            "record_flows: maybe",
+            "record_logs: maybe",
+            "record_dns_log: maybe",
+            "secret { value: PRIVATE }",
+            "unknown { secret: PRIVATE }",
+            "allowed_hosts: 'localhost', ''",
+            "allow_origins: 'http://localhost',",
+            "allow_origins: 'http://localhost,http://example.test'",
+            "allowed_hosts: ['localhost']",
+        ] {
+            let mut diagnostics = Vec::new();
+            let error = parse_dae_config_with_detailed_diagnostics(
+                &format!("experimental {{\n native_api {{\n {input}\n }}\n}}"),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+            assert_eq!(error.diagnostic.line, Some(3), "{input}");
+            assert!(
+                error
+                    .diagnostic
+                    .setting
+                    .to_string()
+                    .starts_with("experimental.native_api")
+            );
+            assert!(!format!("{error:?}{diagnostics:?}").contains("PRIVATE"));
+        }
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental {\n native_api {\n allow_origins: 'http://localhost:3000', 'https://panel.example'\n allowed_hosts: 'panel.example', '[::1]:9527'\n }\n}", &mut Vec::new()
+        ).unwrap();
+        assert_eq!(
+            config.experimental.native_api.allow_origins,
+            ["http://localhost:3000", "https://panel.example"]
+        );
+        assert!(
+            serde_json::from_value::<Config>(
+                serde_json::json!({"experimental":{"native_api":{"secrett":"PRIVATE"}}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_api_security_uses_every_admission_boundary() {
+        for native in [
+            serde_json::json!({"enabled":true}),
+            serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","allow_anonymous_loopback":true}),
+            serde_json::json!({"enabled":true,"listen":":9527","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"listen":"localhost:9527","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"listen":"127.0.0.1:0","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"secret":"PRIVATE phrase"}),
+            serde_json::json!({"enabled":true,"secret":"PRIVATE,token"}),
+            serde_json::json!({"enabled":true,"secret":"PRIVATE密钥"}),
+            serde_json::json!({"allowed_hosts":["panel.example:bad"]}),
+            serde_json::json!({"allowed_hosts":["*.example"]}),
+            serde_json::json!({"allowed_hosts":["https://panel.example"]}),
+            serde_json::json!({"allowed_hosts":["user@panel.example"]}),
+            serde_json::json!({"allowed_hosts":["::1"]}),
+            serde_json::json!({"allow_origins":["null"]}),
+            serde_json::json!({"allow_origins":["https://panel.example/"]}),
+            serde_json::json!({"allow_origins":["https://panel.example?secret=PRIVATE"]}),
+            serde_json::json!({"allow_origins":["https://user:PRIVATE@panel.example"]}),
+            serde_json::json!({"geosite_download_url":"https://user:PRIVATE@example.test/data"}),
+            serde_json::json!({"geoip_download_url":"file:///PRIVATE"}),
+            serde_json::json!({"geoip_download_url":"https://example.test/#PRIVATE"}),
+            serde_json::json!({"geosite_download_url":"https://@example.test/data"}),
+            serde_json::json!({"geosite_download_url":"https://example.test:0/data"}),
+            serde_json::json!({"geoip_download_url":format!("https://example.test/{}", "a".repeat(4076))}),
+        ] {
+            let config: Config =
+                serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
+                    .unwrap();
+            for error in [
+                config.validate_detailed().unwrap_err(),
+                config.validate_assembled().unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .diagnostic
+                        .setting
+                        .to_string()
+                        .starts_with("experimental.native_api")
+                );
+                assert!(!format!("{error:?}").contains("PRIVATE"));
+            }
+        }
+        for native in [
+            serde_json::json!({}),
+            serde_json::json!({"ui":"embedded"}),
+            serde_json::json!({"enabled":true,"allow_anonymous_loopback":true}),
+            serde_json::json!({"enabled":true,"listen":"[::1]:9527","allow_anonymous_loopback":true}),
+            serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE"}),
+            serde_json::json!({"geosite_download_url":"https://example.test/data?token=PRIVATE","geoip_download_url":"http://[::1]:8080/data"}),
+            serde_json::json!({"geoip_download_url":format!("https://example.test/{}", "a".repeat(4075))}),
+        ] {
+            let config: Config =
+                serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
+                    .unwrap();
+            config.validate_detailed().unwrap();
+            config.validate_assembled().unwrap();
+        }
+        for (detour, valid) in [
+            ("", true),
+            ("direct", true),
+            ("routing", true),
+            ("proxy", true),
+            ("missing", false),
+        ] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "groups": [{"name": "proxy"}],
+                "experimental": {"native_api": {"geodata_download_detour": detour}},
+            }))
+            .unwrap();
+            for result in [config.validate_detailed(), config.validate_assembled()] {
+                match result {
+                    Ok(()) => assert!(valid, "{detour}"),
+                    Err(error) => {
+                        assert!(!valid, "{detour}: {error:?}");
+                        assert_eq!(
+                            error.diagnostic.setting.to_string(),
+                            "experimental.native_api.geodata_download_detour"
+                        );
+                    }
+                }
+            }
+        }
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental { native_api {\n geosite_download_url: 'https://example.test/site?token=PRIVATE'\n geoip_download_url: 'http://[::1]:8080/ip'\n } }", &mut Vec::new(),
+        ).unwrap();
+        config.validate_detailed().unwrap();
+        assert_eq!(
+            config.experimental.native_api.geosite_download_url,
+            "https://example.test/site?token=PRIVATE"
+        );
+        assert_eq!(
+            config.experimental.native_api.geoip_download_url,
+            "http://[::1]:8080/ip"
+        );
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental { native_api {\n geodata_download_detour: 'routing'\n } }",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "routing"
+        );
+    }
+}
+
 mod routing_marks {
     use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
 
@@ -685,4 +910,68 @@ mod routing_marks {
             assert_eq!(config.global.effective_so_mark(), effective);
         }
     }
+}
+
+#[test]
+fn subscription_download_detour_names_direct_routing_or_a_group() {
+    use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
+    for (detour, valid) in [
+        ("", true),
+        ("direct", true),
+        ("routing", true),
+        ("proxy", true),
+        ("missing", false),
+    ] {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "groups": [{"name": "proxy"}],
+            "subscriptions": [{"name": "sub", "url": "https://example.test/sub", "download_detour": detour}],
+        }))
+        .unwrap();
+        for result in [config.validate_detailed(), config.validate_assembled()] {
+            match result {
+                Ok(()) => assert!(valid, "{detour}"),
+                Err(error) => {
+                    assert!(!valid, "{detour}: {error:?}");
+                    assert_eq!(
+                        error.diagnostic.setting.to_string(),
+                        "subscriptions[1].download_detour"
+                    );
+                }
+            }
+        }
+    }
+    let config = parse_dae_config_with_detailed_diagnostics(
+        "subscription {\n own: {\n url: 'https://example.test/sub'\n download_detour: direct\n }\n other: 'https://example.test/other'\n}",
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(config.subscriptions[0].download_detour, "direct");
+    assert_eq!(
+        config.subscriptions[1].download_detour, "",
+        "routing by default"
+    );
+}
+
+#[test]
+fn subscription_entry_route_is_validated_as_download_detour() {
+    use honk_config::parser::parse_dae_config_with_detailed_diagnostics;
+    let parse = |route: &str| {
+        parse_dae_config_with_detailed_diagnostics(
+            &format!(
+                "group {{\n proxy {{ policy: min_moving_avg }}\n}}\nsubscription {{\n own: 'https://example.test/sub' {{ route: {route} }}\n}}"
+            ),
+            &mut Vec::new(),
+        )
+        .unwrap()
+    };
+    for route in ["routing", "direct", "proxy"] {
+        let config = parse(route);
+        assert_eq!(config.subscriptions[0].download_detour, route);
+        config.validate_detailed().unwrap();
+    }
+    let error = parse("missing").validate_detailed().unwrap_err();
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "subscriptions[1].download_detour"
+    );
 }

@@ -103,7 +103,7 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "live".into(),
+        stats.outbound_tracker("live", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -188,7 +188,7 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
         Some("live".into()),
     );
     control.finish(ScoreOutcome::Cancelled);
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
 }
 
 #[tokio::test]
@@ -294,7 +294,7 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "live".into(),
+            stats.outbound_tracker("live", crate::stats::OutboundKind::Node),
         );
         tokio::time::timeout(Duration::from_secs(1), driver.wait_ready())
             .await
@@ -415,7 +415,7 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
             .iter()
             .all(|endpoint| !endpoint.dead.load(Ordering::Acquire))
     );
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
 }
 
 #[tokio::test]
@@ -478,7 +478,7 @@ async fn four_live_udp_drivers_establish_observed_usability_before_retirement() 
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "live".into(),
+            stats.outbound_tracker("live", crate::stats::OutboundKind::Node),
         );
         tokio::time::timeout(Duration::from_secs(1), driver.wait_ready())
             .await
@@ -549,7 +549,7 @@ async fn four_live_udp_drivers_establish_observed_usability_before_retirement() 
             .iter()
             .all(|endpoint| !endpoint.dead.load(Ordering::Acquire))
     );
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
 }
 
 #[tokio::test]
@@ -647,7 +647,7 @@ async fn quic_stall_terminal_invalidates_aggregate_without_changing_alive_conges
             client_addr: client,
             client_dst: target,
             alive_set: Arc::clone(&alive),
-            outbound_tracker: stats.outbound_tracker("stalled"),
+            outbound_tracker: stats.outbound_tracker("stalled", crate::stats::OutboundKind::Node),
             stats,
             health_family: honk_outbound::alive::IpVersion::V4,
         },

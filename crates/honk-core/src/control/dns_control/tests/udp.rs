@@ -1,5 +1,39 @@
 use super::*;
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_log_captures_transparent_udp_completion_with_full_source() {
+    let query = query_with_txid("example.com", 0x1111);
+    let (controller, _) = test_controller(a_response(&query, [192, 0, 2, 5]), Duration::ZERO);
+    let api = Arc::new(crate::native_api::dns::DnsApi::new(
+        "udp-log".into(),
+        true,
+        std::sync::Weak::new(),
+    ));
+    controller
+        .dns_service()
+        .attach_observer(Arc::downgrade(&api.recorder));
+    let source: SocketAddr = "[2001:db8::12]:53000".parse().unwrap();
+    let admission = controller.try_admit_query(true).unwrap();
+    controller
+        .handle_udp_dns_admitted(
+            &admission,
+            &query,
+            source,
+            "[::1]:53".parse().unwrap(),
+            crate::dns::query::validate_exact_dns_query(&query).unwrap(),
+        )
+        .await;
+    let response = api.log_for_test().page_for_test();
+    let bytes = axum::body::to_bytes(response.into_body(), 262144)
+        .await
+        .unwrap();
+    let log: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(log["total"], 1);
+    assert_eq!(log["records"][0]["src"], source.to_string());
+    assert_eq!(log["records"][0]["answers"][0]["data"], "192.0.2.5");
+}
+
 #[tokio::test]
 async fn admitted_transparent_udp_routes_by_client_source() {
     struct SourceRouteUpstream {
@@ -69,19 +103,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     });
     let cache = Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8)));
     let directory = tempfile::tempdir().expect("cache directory");
-    let database = Arc::new(
-        crate::cachedb::CacheDb::open(&honk_config::experimental::CacheFileConfig {
-            enabled: true,
-            path: directory
-                .path()
-                .join("cache.db")
-                .to_string_lossy()
-                .into_owned(),
-            store_dns: true,
-            ..Default::default()
-        })
-        .expect("cache database"),
-    );
+    let database = Arc::new(crate::state::cache::CacheDb::in_dir(directory.path()));
     let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
     cache.lock().await.set_persister(Some(persister.clone()));
     let forwarder = Arc::new(DnsForwarder::new(
@@ -95,13 +117,14 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         ),
     ));
     let (controller, _ebpf) = projection_controller(forwarder);
-    let runtime = controller.runtime_provider().acquire();
+    let runtime = controller.runtime_provider().try_acquire().unwrap();
     let snapshot = Arc::clone(runtime.runtime().routing_projection());
     let learned_ip = "192.0.2.10".parse().expect("learned IP");
     controller.routing_projection.submit(
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",
+            family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
             advertised_ttl: Duration::from_secs(30),
         },
@@ -111,13 +134,14 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
 
     let outcome = controller
         .dns_service()
-        .resolve_outcome_with_runtime(
+        .resolve_client_outcome_with_runtime(
             &runtime,
             &query,
             DnsRequestMeta::EMPTY,
             IngressProfile::Udp {
                 advertised_size: 1232,
             },
+            None,
         )
         .await
         .expect("truncated outcome");
@@ -133,7 +157,79 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     assert_eq!(projected_again[0].0, projected[0].0);
     assert_eq!(projected_again[0].1.bitmap, projected[0].1.bitmap);
     persister.shutdown().await.expect("persistence shutdown");
-    assert!(database.load_dns_v2().expect("persisted rows").is_empty());
+    assert!(database.load_dns().expect("persisted rows").is_empty());
+    controller.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn projection_follows_query_family_until_nxdomain() {
+    struct QtypeUpstream;
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for QtypeUpstream {
+        async fn query(&self, _name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let (_, qtype) = crate::dns::forwarder::parse_dns_question(raw).expect("question");
+            if qtype == 1 {
+                return Ok(a_response(raw, [192, 0, 2, 10]));
+            }
+            let mut reply = raw.to_vec();
+            reply[2] = 0x81;
+            reply[3] = if qtype == 16 { 0x83 } else { 0x80 };
+            Ok(reply)
+        }
+    }
+
+    let forwarder = Arc::new(DnsForwarder::new(
+        Arc::new(QtypeUpstream),
+        Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+        Arc::new(
+            crate::dns::routing::DnsRouter::new_from_dns_config(&Default::default())
+                .expect("DNS router"),
+        ),
+    ));
+    let (controller, _ebpf) = projection_controller(forwarder);
+    let snapshot = Arc::clone(
+        controller
+            .runtime_provider()
+            .try_acquire()
+            .unwrap()
+            .runtime()
+            .routing_projection(),
+    );
+    let v4 = std::net::IpAddr::from([192, 0, 2, 10]);
+    let v6 = std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
+    controller.routing_projection.submit(
+        Arc::clone(&snapshot),
+        crate::dns::projection::ProjectionObservation::Positive {
+            domain: "example.com",
+            family: honk_outbound::alive::IpVersion::V6,
+            ips: &[v6],
+            advertised_ttl: Duration::from_secs(30),
+        },
+    );
+    // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,
+    // then NXDOMAIN for an unrelated type.
+    for (qtype, rcode, expected) in [
+        (1, 0, &[v4, v6][..]),
+        (65, 0, &[v4, v6]),
+        (28, 0, &[v4]),
+        (16, 3, &[]),
+    ] {
+        let reply = controller
+            .answer_query_for_test(
+                &crate::dns::forwarder::build_dns_query("example.com", qtype),
+                DnsRequestMeta::EMPTY,
+                IngressProfile::Internal,
+            )
+            .await;
+        assert_eq!(reply[3] & 0x0f, rcode, "QTYPE {qtype} reply");
+        let projected = controller
+            .project_routes(&snapshot)
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .collect::<Vec<_>>();
+        assert_eq!(projected, expected, "after QTYPE {qtype}");
+    }
     controller.shutdown(Duration::from_secs(1)).await;
 }
 

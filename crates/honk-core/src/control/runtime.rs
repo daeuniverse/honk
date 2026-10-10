@@ -1,34 +1,23 @@
-use super::udp_ingress::{UdpLoopState, udp_listener_loop};
 use super::*;
-#[cfg(not(feature = "ebpf"))]
-#[allow(dead_code)]
-enum NfqueueRuntimeEvent {
-    Fatal(anyhow::Error),
-    TokenExhausted,
-}
 
-#[cfg(not(feature = "ebpf"))]
-async fn wait_nfqueue_event(
-    _runtime: &mut (),
-    _ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-) -> NfqueueRuntimeEvent {
-    std::future::pending::<NfqueueRuntimeEvent>().await
-}
-fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
-    !drain.should_reject()
-}
-
-/// Fires the fatal channel when a critical background task exits for any
-/// reason (return, panic, abort): otherwise the process stays alive but
-/// deaf. Shutdown aborts land after the run loop has left its select, so
-/// they never deliver.
+/// A normal return is fatal unless the owner acknowledged its requested stop.
 pub(super) struct CriticalTaskExit {
-    name: &'static str,
-    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+    pub(super) name: &'static str,
+    pub(super) fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+    pub(super) expected: bool,
+}
+
+impl CriticalTaskExit {
+    pub(super) fn expected_stop(&mut self) {
+        self.expected = true;
+    }
 }
 
 impl Drop for CriticalTaskExit {
     fn drop(&mut self) {
+        if self.expected && !std::thread::panicking() {
+            return;
+        }
         let _ = self.fatal_tx.send(anyhow::anyhow!(
             "critical background task '{}' exited",
             self.name
@@ -36,7 +25,7 @@ impl Drop for CriticalTaskExit {
     }
 }
 
-async fn accept_tcp_with_admission(
+pub(super) async fn accept_tcp_with_admission(
     tcp4_listener: &tokio::io::unix::AsyncFd<std::net::TcpListener>,
     tcp6_listener: Option<&tokio::io::unix::AsyncFd<std::net::TcpListener>>,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
@@ -131,18 +120,20 @@ fn resize_tcp_admission(
     );
 }
 
-async fn run_tcp_admission_scaler(
+pub(super) async fn run_tcp_admission_scaler(
     semaphore: Arc<tokio::sync::Semaphore>,
     budget: ResourceBudget,
     stats: Arc<StatsManager>,
+    target_cell: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let mut target = budget.active_tcp_flows;
+    let mut target = target_cell.load(std::sync::atomic::Ordering::Acquire);
     let mut interval = tokio::time::interval(TCP_ADMISSION_SCALE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         if let Some(open_fds) = open_fd_count() {
             resize_tcp_admission(&semaphore, &mut target, budget, &stats, open_fds);
+            target_cell.store(target, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -158,6 +149,33 @@ pub(super) struct OutboundHealthPublisher {
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
     alive_set: Arc<AliveDialerSet>,
+    /// Per-group bitmask of datapath slots last computed as not alive, so only
+    /// transitions are logged. Reloads republish connectivity without this
+    /// map, so it restarts with each config generation.
+    dead_slots: parking_lot::Mutex<(
+        std::sync::Weak<Config>,
+        std::collections::HashMap<String, u8>,
+    )>,
+}
+
+/// Record one group slot's computed liveness; returns whether it flipped.
+/// Unknown slots start alive.
+fn group_slot_flipped(
+    dead_slots: &mut std::collections::HashMap<String, u8>,
+    group: &str,
+    slot: u8,
+    alive: bool,
+) -> bool {
+    let bit = 1u8 << slot;
+    match dead_slots.get_mut(group) {
+        Some(mask) if (*mask & bit == 0) != alive => *mask ^= bit,
+        Some(_) => return false,
+        None if alive => return false,
+        None => {
+            dead_slots.insert(group.to_owned(), bit);
+        }
+    }
+    true
 }
 
 impl OutboundHealthPublisher {
@@ -172,6 +190,7 @@ impl OutboundHealthPublisher {
             config,
             group_manager,
             alive_set,
+            dead_slots: parking_lot::Mutex::default(),
         }
     }
 
@@ -191,6 +210,14 @@ impl OutboundHealthPublisher {
             IpVersion::V4
         };
         let group_manager = self.group_manager.read().clone();
+        let slot = probe_domain as u8 * 2 + ip_version as u8;
+        let mut slots = self.dead_slots.lock();
+        let (generation, dead_slots) = &mut *slots;
+        // The held Weak keeps the old allocation, so its address cannot be reused.
+        if !std::ptr::eq(generation.as_ptr(), Arc::as_ptr(&*config)) {
+            *generation = Arc::downgrade(&*config);
+            dead_slots.clear();
+        }
         for (index, group) in config.groups.iter().enumerate() {
             if !group_manager.group_reaches_node(&group.name, node_id) {
                 continue;
@@ -211,6 +238,23 @@ impl OutboundHealthPublisher {
                     ipver,
                     "failed to update outbound health in eBPF"
                 );
+            }
+            if group_slot_flipped(dead_slots, &group.name, slot, alive) {
+                if alive {
+                    info!(
+                        group = %group.name,
+                        ?probe_domain,
+                        ?ip_version,
+                        "outbound group is alive again"
+                    );
+                } else {
+                    warn!(
+                        group = %group.name,
+                        ?probe_domain,
+                        ?ip_version,
+                        "outbound group has no alive outbound"
+                    );
+                }
             }
         }
     }
@@ -269,32 +313,75 @@ impl ControlPlane {
         subscription_authorizations: &mut crate::subscription::SubscriptionAuthorizations,
     ) -> bool {
         match command {
+            #[cfg(all(feature = "native-api", feature = "clash-api"))]
+            ControlCommand::SetRuntimeMode { request, reply } => {
+                let _reload = self.reload_lock.lock().await;
+                let config = self.config.read().await;
+                let result =
+                    if let (Some(native), Some(flags)) = (&self.native, &self.datapath_flags) {
+                        crate::mode::apply_mode_request(
+                            &config,
+                            &native.catalog.snapshot().groups,
+                            flags,
+                            request,
+                        )
+                        .await
+                    } else {
+                        Err(super::client::ControlError::Unavailable)
+                    };
+                let _ = reply.send(result);
+            }
+            #[cfg(any(feature = "native-api", feature = "clash-api"))]
+            ControlCommand::SetSelector { request, reply } => {
+                let result = self.apply_selector_request(request).await;
+                let _ = reply.send(result);
+            }
             ControlCommand::ReloadConfig {
                 request_id,
                 config,
                 diagnostics,
+                #[cfg(feature = "native-api")]
+                sources,
+                #[cfg(feature = "native-api")]
+                expected_group_revision,
                 result,
             } => {
                 info!("SIGHUP reload request {request_id} started");
-                let applied = match self
-                    .apply_sighup_config(*config, diagnostics, drain, subscription_authorizations)
+                let outcome = match self
+                    .apply_sighup_config(
+                        *config,
+                        diagnostics,
+                        drain,
+                        subscription_authorizations,
+                        #[cfg(feature = "native-api")]
+                        sources.as_deref(),
+                        #[cfg(feature = "native-api")]
+                        expected_group_revision.as_deref(),
+                    )
                     .await
                 {
                     Ok(applied) => applied,
                     Err(error) => {
                         crate::report_runtime_admission_error(&error);
-                        false
+                        ReloadOutcome::Rejected
                     }
                 };
-                let committed = if applied {
-                    info!("SIGHUP reload request {request_id} applied");
+                let authorized = if outcome.accepted() {
+                    info!(?outcome, "SIGHUP reload request {request_id} applied");
                     let config = self.config.read().await;
-                    Some(subscription_authorizations.committed(&config.subscriptions))
+                    subscription_authorizations.committed(&config.subscriptions)
                 } else {
-                    warn!("SIGHUP reload request {request_id} rejected");
-                    None
+                    info!("SIGHUP reload request {request_id} rejected");
+                    Vec::new()
                 };
-                if result.send(committed).is_err() && applied {
+                if result
+                    .send(ReloadReply {
+                        outcome,
+                        authorized,
+                    })
+                    .is_err()
+                    && outcome.accepted()
+                {
                     error!("SIGHUP reload request {request_id} lost its supervisor handoff");
                     return false;
                 }
@@ -304,9 +391,13 @@ impl ControlPlane {
                 revision,
                 nodes,
                 diagnostics,
+                result,
             } => {
-                info!(nodes = nodes.len(), "Publishing accepted subscription body");
-                match self
+                debug!(
+                    nodes = nodes.len(),
+                    message = "Publishing accepted subscription body"
+                );
+                let (outcome, rejection) = match self
                     .merge_authorized_subscription_nodes_with_drain(
                         subscription_id,
                         revision,
@@ -317,10 +408,33 @@ impl ControlPlane {
                     )
                     .await
                 {
-                    Ok(true) => info!("Subscription runtime publication applied"),
-                    Ok(false) => warn!("Subscription runtime publication rejected"),
-                    Err(error) => crate::report_runtime_admission_error(&error),
-                }
+                    Ok(outcome) if outcome.accepted() => {
+                        debug!(
+                            ?outcome,
+                            message = "Subscription runtime publication applied"
+                        );
+                        (outcome, None)
+                    }
+                    Ok(outcome) => {
+                        debug!(message = "Subscription runtime publication rejected");
+                        (outcome, None)
+                    }
+                    Err(error) => {
+                        crate::report_runtime_admission_error(&error);
+                        (ReloadOutcome::Rejected, Some(error.diagnostic.code))
+                    }
+                };
+                let config = self.config.read().await;
+                let _ = result.send(crate::subscription::SubscriptionMergeReply {
+                    outcome,
+                    node_count: config
+                        .nodes
+                        .iter()
+                        .filter(|node| node.subscription_id == Some(subscription_id))
+                        .count(),
+                    authorized: subscription_authorizations.committed(&config.subscriptions),
+                    rejection,
+                });
             }
             ControlCommand::NetworkChanged => {
                 let _reload = self.reload_lock.lock().await;
@@ -346,10 +460,12 @@ impl ControlPlane {
                                 drain,
                                 crate::config_diagnostics::DiagnosticUpdate::Preserve,
                                 None,
+                                #[cfg(feature = "native-api")]
+                                None,
                             )
                             .await
                         {
-                            Ok(applied) => applied,
+                            Ok(outcome) => outcome.accepted(),
                             Err(error) => {
                                 crate::report_runtime_admission_error(&error);
                                 false
@@ -381,635 +497,13 @@ impl ControlPlane {
         true
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut rx = self.command_rx.take().expect("command_rx already taken");
-        let config = self.config.read().await;
-        let mut subscription_authorizations =
-            crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions)?;
-        let tproxy_port = config.global.tproxy_port;
-        let tproxy_mark = config.global.tproxy_mark;
-        #[cfg(feature = "ebpf")]
-        let mut udp_nfqueue_enabled = config.global.nfqueue_enable;
-        #[cfg(not(feature = "ebpf"))]
-        let udp_nfqueue_enabled = config.global.nfqueue_enable;
-        let dns_bind_endpoint = config
-            .dns
-            .bind_endpoint()
-            .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
-        drop(config);
-        #[cfg(feature = "ebpf")]
-        {
-            let _reload = self.reload_lock.lock().await;
-            self.warn_lan_self_protection().await;
-        }
-        let bound_dns_listener = dns_bind_endpoint
-            .as_ref()
-            .map(dns_listener::BoundDnsListener::bind)
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("bind dns.bind listener: {error}"))?;
-        let tcp4_addr = SocketAddr::new("0.0.0.0".parse()?, tproxy_port);
-        let tcp6_addr = SocketAddr::new("::".parse()?, tproxy_port);
-        let udp4_addr = tcp4_addr;
-        let udp6_addr = tcp6_addr;
-
-        let tcp4_listener =
-            tokio::io::unix::AsyncFd::new(bind_tproxy_tcp(tcp4_addr, tproxy_mark)?)?;
-        info!("Control plane listening for TPROXY TCPv4 on {}", tcp4_addr);
-
-        let tcp6_listener = match bind_tproxy_tcp(tcp6_addr, tproxy_mark).and_then(|listener| {
-            tokio::io::unix::AsyncFd::new(listener).map_err(anyhow::Error::from)
-        }) {
-            Ok(l) => {
-                info!("Control plane listening for TPROXY TCPv6 on {}", tcp6_addr);
-                Some(l)
-            }
-            Err(e) => {
-                // Same rule as the UDPv6 listeners: only a host without an
-                // IPv6 stack may continue with the slot empty (the published
-                // v4 fd fallback cannot accept v6 flows).
-                let no_ipv6 = e
-                    .downcast_ref::<io::Error>()
-                    .and_then(|error| error.raw_os_error())
-                    == Some(libc::EAFNOSUPPORT);
-                if no_ipv6 {
-                    warn!("TPROXY TCPv6 listener unavailable: {}", e);
-                    None
-                } else {
-                    return Err(e.context("bind TPROXY TCPv6 listener"));
-                }
-            }
-        };
-
-        // Parallel UDP listeners: the eBPF datapath hashes each flow's tuple
-        // into one of UDP_LISTENER_COUNT sockets per family (sk_lookup.rs);
-        // each socket gets its own receive loop task below, so flows drain
-        // in parallel across runtime workers.
-        const UDP_LISTENER_COUNT: usize = 4;
-        let udp4_sockets: Vec<Arc<UdpSocket>> =
-            bind_tproxy_udp_listeners(udp4_addr, UDP_LISTENER_COUNT)?
-                .into_iter()
-                .map(Arc::new)
-                .collect();
-        info!(
-            "Control plane listening for TPROXY UDPv4 x{} on {}",
-            udp4_sockets.len(),
-            udp4_addr
-        );
-
-        let udp6_sockets: Vec<Arc<UdpSocket>> =
-            match bind_tproxy_udp_listeners(udp6_addr, UDP_LISTENER_COUNT) {
-                Ok(sockets) => {
-                    let sockets: Vec<Arc<UdpSocket>> = sockets.into_iter().map(Arc::new).collect();
-                    info!(
-                        "Control plane listening for TPROXY UDPv6 x{} on {}",
-                        sockets.len(),
-                        udp6_addr
-                    );
-                    sockets
-                }
-                Err(e) => {
-                    // Only a host without an IPv6 stack may run with empty
-                    // sk_lookup slots; any other failure would black-hole
-                    // proxied IPv6 UDP until restart (slots are published
-                    // once), so fail startup and let the supervisor retry.
-                    let no_ipv6 = e
-                        .downcast_ref::<io::Error>()
-                        .and_then(|error| error.raw_os_error())
-                        == Some(libc::EAFNOSUPPORT);
-                    if no_ipv6 {
-                        warn!("TPROXY UDPv6 listener unavailable: {}", e);
-                        Vec::new()
-                    } else {
-                        return Err(e.context("bind TPROXY UDPv6 listener group"));
-                    }
-                }
-            };
-
-        // Publish listener socket FDs into the eBPF listen_socket_map so TC
-        // programs can bpf_sk_assign() proxy-bound packets directly to userspace.
-        {
-            use std::os::unix::io::AsRawFd;
-            let tcp4_fd = tcp4_listener.as_raw_fd();
-            let tcp6_fd = tcp6_listener.as_ref().map_or(tcp4_fd, |l| l.as_raw_fd());
-            let udp4_fds: Vec<_> = udp4_sockets.iter().map(|s| s.as_raw_fd()).collect();
-            let udp6_fds: Vec<_> = udp6_sockets.iter().map(|s| s.as_raw_fd()).collect();
-            let mut ebpf = self.ebpf.write().await;
-            // A partially published listener set means flows are assigned to
-            // sockets that don't exist — run nothing rather than that.
-            ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, &udp4_fds, &udp6_fds)
-                .map_err(|e| anyhow::anyhow!("publish listener sockets to eBPF: {}", e))?;
-        }
-
-        let mut dns_listener = match bound_dns_listener {
-            Some(bound) => {
-                let listener = bound
-                    .spawn(
-                        Arc::clone(&self.dns_controller),
-                        Arc::clone(&self.concurrency_limit),
-                        Arc::clone(&self.stats),
-                        Arc::clone(&self.drain_tracker),
-                    )
-                    .map_err(|error| anyhow::anyhow!("start dns.bind listener: {error}"))?;
-                info!(
-                    address = %listener.local_addr(),
-                    tcp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.tcp_enabled()),
-                    udp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.udp_enabled()),
-                    "Standalone DNS listener started"
-                );
-                Some(listener)
-            }
-            None => None,
-        };
-
-        // One receive loop per listener socket. The datapath hashes flows
-        // into the group (see the comment above), so loops are flow-disjoint.
-        let (critical_fatal_tx, mut critical_fatal_rx) = mpsc::unbounded_channel();
-        {
-            let state = UdpLoopState::new(self, daens_netns_exists());
-            let mut tasks = self.background_tasks.lock().await;
-            for (socket, family) in udp4_sockets
-                .iter()
-                .map(|socket| (socket, "v4"))
-                .chain(udp6_sockets.iter().map(|socket| (socket, "v6")))
-            {
-                let state = state.clone();
-                let socket = Arc::clone(socket);
-                let fatal_tx = critical_fatal_tx.clone();
-                let name = match family {
-                    "v4" => "udp_listener_loop/v4",
-                    _ => "udp_listener_loop/v6",
-                };
-                tasks.push(tokio::spawn(async move {
-                    let _exit = CriticalTaskExit { name, fatal_tx };
-                    udp_listener_loop(state, socket, family).await;
-                }));
-            }
-        }
-
-        let tcp6_listener = tcp6_listener;
-        // A persistent token allocator error is ambiguous; only service setup can degrade.
-        #[cfg(feature = "ebpf")]
-        let nfqueue_sequence_ready = if udp_nfqueue_enabled {
-            match self.rotate_udp_decision_generation().await {
-                Ok(ready) => ready,
-                Err(error) => {
-                    if let Some(listener) = dns_listener.as_mut() {
-                        listener.stop_accepting();
-                        listener.abort_and_join().await;
-                    }
-                    self.cleanup_pre_admission_failure().await;
-                    return Err(anyhow::anyhow!(
-                        "prepare UDP decision token allocator: {error:#}"
-                    ));
-                }
-            }
-        } else {
-            false
-        };
-        #[cfg(feature = "ebpf")]
-        let mut nfqueue_runtime = match self
-            .start_nfqueue_runtime(udp_nfqueue_enabled, nfqueue_sequence_ready)
-            .await
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.degrade_nfqueue_startup(&mut udp_nfqueue_enabled, error)
-                    .await;
-                None
-            }
-        };
-        #[cfg(not(feature = "ebpf"))]
-        let mut nfqueue_runtime = ();
-
-        let (mut udp_removal_task, mut udp_removal_fatal_rx) = {
-            let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
-            let mut tasks = self.background_tasks.lock().await;
-
-            let janitor = BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone());
-            tasks.push(janitor.spawn_supervised(CriticalTaskExit {
-                name: "bpf_janitor",
-                fatal_tx: critical_fatal_tx.clone(),
-            }));
-            info!("BPF map janitor started");
-
-            let removal_task = spawn_udp_removal_worker(
-                Arc::clone(&self.udp_pool),
-                self.ebpf.clone(),
-                self.connection_tracker.clone(),
-                fatal_tx,
-            );
-
-            tasks.push(self.udp_pool.spawn_janitor());
-
-            tasks.push(self.sniffer_pool.spawn_janitor());
-
-            tasks.push(crate::control::tcp_sniff::spawn_sniff_neg_cache_janitor(
-                self.tcp_sniff_neg_cache.clone(),
-            ));
-            (removal_task, fatal_rx)
-        };
-
-        {
-            let alive_set = self.alive_set.clone();
-            let interval_secs = {
-                let c = self.config.read().await;
-                c.global.check_interval_secs
-            };
-            let check_timeout = std::time::Duration::from_secs(5);
-
-            {
-                let c = self.config.read().await;
-                honk_outbound::tls::set_tls_mode(&c.global.tls_implementation);
-                honk_outbound::tls::set_utls_imitate(&c.global.utls_imitate);
-            }
-
-            // Configure HTTP-based health checks from config (Go: TcpCheckOption).
-            {
-                let c = self.config.read().await;
-                let check_url = c.global.tcp_check_url.first().cloned().unwrap_or_default();
-                let check_method = if c.global.tcp_check_http_method.is_empty() {
-                    "HEAD".to_string()
-                } else {
-                    c.global.tcp_check_http_method.clone()
-                };
-                if !check_url.is_empty() {
-                    let prober = Arc::new(ProxyHttpProber::new(
-                        self.config.clone(),
-                        self.proxy_registry.clone(),
-                        self.runtime_registry.clone(),
-                        check_method.clone(),
-                        self.group_manager.clone(),
-                    ));
-                    alive_set
-                        .set_http_probe(prober, check_url, check_method)
-                        .await;
-                } else {
-                    info!(
-                        "HTTP health check disabled (no tcp_check_url configured), using TCP connect"
-                    );
-                }
-            }
-
-            // Configure UDP health checks (Go: UdpCheckOption): each probe
-            // cycle sends one DNS query through the node's own UDP data
-            // path, so nodes with working TCP but broken UDP (e.g. an
-            // AnyTLS server without UoT) are marked dead for the UDP
-            // domains and excluded from UDP selection.
-            {
-                let dns_raw = {
-                    let c = self.config.read().await;
-                    c.global.udp_check_dns.clone()
-                };
-                let quic_url = {
-                    let c = self.config.read().await;
-                    if c.groups
-                        .iter()
-                        .any(|group| group.policy == honk_config::node::GroupPolicy::Score)
-                    {
-                        c.global.tcp_check_url.first().cloned().unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                };
-                let resolver: crate::outbound::ResolveHook = {
-                    let controller = self.dns_controller.clone();
-                    Arc::new(move |host: String, port: u16| {
-                        let controller = controller.clone();
-                        Box::pin(async move {
-                            controller.resolve_domain(&host).await.map(|addresses| {
-                                addresses
-                                    .into_iter()
-                                    .map(|ip| std::net::SocketAddr::new(ip, port))
-                                    .collect()
-                            })
-                        })
-                    })
-                };
-                let dns_probe = UdpDnsProbeTarget::new(dns_raw, Some(resolver.clone()));
-                match tokio::time::timeout(check_timeout, dns_probe.resolve()).await {
-                    Ok(Ok((target, _))) => info!("UDP health check enabled (dns={})", target),
-                    _ => info!(
-                        "UDP DNS health target initialization deferred to later health checks"
-                    ),
-                }
-                let quic_score_target = (!quic_url.is_empty())
-                    .then(|| QuicScoreProbeTarget::new(quic_url, Some(resolver)));
-                alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
-                    self.config.clone(),
-                    self.proxy_registry.clone(),
-                    self.runtime_registry.clone(),
-                    self.stats.clone(),
-                    dns_probe,
-                    quic_score_target,
-                    self.group_manager.clone(),
-                )));
-            }
-
-            info!(
-                "Starting health check loop (interval={}s, timeout={}s)",
-                interval_secs,
-                check_timeout.as_secs()
-            );
-            let health_publisher = Arc::new(OutboundHealthPublisher::new(
-                self.ebpf.clone(),
-                self.config.clone(),
-                self.group_manager.clone(),
-                alive_set.clone(),
-            ));
-            alive_set.set_ebpf_callback(Box::new(
-                move |node_id, _outbound_idx, domain, ipver, _alive| {
-                    let _handle =
-                        tokio::spawn(Arc::clone(&health_publisher).publish(node_id, domain, ipver));
-                },
-            ));
-            let period = std::time::Duration::from_secs(interval_secs);
-            let handle = alive_set.spawn_health_check_loop(period, check_timeout);
-            self.background_tasks.lock().await.push(handle);
-            info!(
-                "Outbound health check loop started (interval={}s)",
-                interval_secs
-            );
-        }
-
-        {
-            let pool_handle = self.connection_pool.spawn_janitor();
-            self.background_tasks.lock().await.push(pool_handle);
-            info!("Connection pool janitor started");
-        }
-
-        self.start_preconnect().await;
-
-        // Warm coordinators start only after group/runtime setup and retain
-        // this exact registry Arc for their complete lifetime.
-        let warm_generation = self.runtime_registry.read().clone();
-        self.start_udp_warm_coordinator(Arc::clone(&warm_generation))
-            .await;
-        self.start_selector_warm_coordinator(warm_generation).await;
-
-        {
-            let runtime_registry = self.runtime_registry.clone();
-            let dns_runtime = self.dns_controller.runtime_provider();
-            let handle = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
-                interval.tick().await;
-                loop {
-                    interval.tick().await;
-                    let generation = runtime_registry.read().clone();
-                    let now = std::time::Instant::now();
-                    let evicted = generation.reap_idle_resources(now)
-                        + dns_runtime.acquire().runtime().reap_idle_resources(now);
-                    if evicted > 0 {
-                        debug!(evicted, "released idle outbound resources");
-                    }
-                }
-            });
-            self.background_tasks.lock().await.push(handle);
-        }
-
-        #[cfg(feature = "ebpf")]
-        {
-            let nfqueue_startup_health_error = match nfqueue_runtime.as_mut() {
-                Some(runtime) => runtime.check_startup_health().await.err(),
-                None => None,
-            };
-            if let Some(error) = nfqueue_startup_health_error {
-                self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
-                    .await;
-                nfqueue_runtime = None;
-                self.degrade_nfqueue_startup(&mut udp_nfqueue_enabled, error.into())
-                    .await;
-            }
-        }
-        #[cfg(feature = "ebpf")]
-        let nfqueue_ready = nfqueue_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.sequence_ready);
-        #[cfg(not(feature = "ebpf"))]
-        let nfqueue_ready = false;
-        if let Err(error) = self
-            .initialize_datapath_flags(udp_nfqueue_enabled, nfqueue_ready)
-            .await
-        {
-            #[cfg(feature = "ebpf")]
-            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
-                .await;
-            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
-                .await;
-            return Err(anyhow::anyhow!("initialize datapath flags: {error:#}"));
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(runtime) = nfqueue_runtime.as_ref()
-            && runtime.sequence_ready
-        {
-            runtime.pending.open_admission();
-        }
-        let datapath_open = {
-            let mut backend = self.ebpf.write().await;
-            backend.set_datapath_ready(true)
-        };
-        if let Err(error) = datapath_open {
-            if let Some(flags) = self.datapath_flags.as_ref() {
-                let _ = flags.fence_nfqueue().await;
-            }
-            #[cfg(feature = "ebpf")]
-            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
-                .await;
-            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
-                .await;
-            return Err(anyhow::anyhow!("open eBPF datapath admission: {error}"));
-        }
-        info!("eBPF datapath admission opened after listener publication");
-        let tcp_scaler = tokio::spawn(run_tcp_admission_scaler(
-            Arc::clone(&self.concurrency_limit),
-            self.resource_budget,
-            Arc::clone(&self.stats),
-        ));
-        self.background_tasks.lock().await.push(tcp_scaler);
-        #[cfg(target_os = "linux")]
-        if let Err(error) =
-            libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
-        {
-            warn!(%error, "sd_notify readiness failed");
-        }
-
-        let tcp_concurrency_limit = Arc::clone(&self.concurrency_limit);
-        let tcp_stats = Arc::clone(&self.stats);
-        let drain = self.drain_tracker.clone();
-        let fatal_ebpf = Arc::clone(&self.ebpf);
-        let mut fatal_error = None;
-
-        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut loop_count = 0u64;
-        loop {
-            loop_count += 1;
-            tokio::select! {
-                error = udp_removal_fatal_rx.recv() => {
-                    fatal_error = Some(error.unwrap_or_else(|| {
-                        anyhow::anyhow!("UDP removal fatal channel closed unexpectedly")
-                    }));
-                    break;
-                }
-                error = critical_fatal_rx.recv() => {
-                    fatal_error = Some(error.unwrap_or_else(|| {
-                        anyhow::anyhow!("critical task fatal channel closed unexpectedly")
-                    }));
-                    break;
-                }
-                event = wait_nfqueue_event(&mut nfqueue_runtime, &fatal_ebpf) => {
-                    match event {
-                        NfqueueRuntimeEvent::Fatal(error) => {
-                            fatal_error = Some(error);
-                            break;
-                        }
-                        NfqueueRuntimeEvent::TokenExhausted => {
-                            #[cfg(feature = "ebpf")]
-                            if let Some(runtime) = nfqueue_runtime.as_mut()
-                                && let Err(error) = self
-                                    .recover_nfqueue_token_exhaustion(runtime)
-                                    .await
-                            {
-                                fatal_error = Some(anyhow::anyhow!(
-                                    "recover exhausted UDP decision token generation: {error:#}"
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    let manager = self.group_manager.read().clone();
-                    manager.observe_transport_quality();
-                    trace!(
-                        "control plane heartbeat (iteration {}, active_connections={})",
-                        loop_count,
-                        drain.active_count()
-                    );
-                    continue;
-                }
-                accept_result = accept_tcp_with_admission(
-                    &tcp4_listener,
-                    tcp6_listener.as_ref(),
-                    Arc::clone(&tcp_concurrency_limit),
-                    Arc::clone(&tcp_stats),
-                ), if accepts_transparent_connection(&drain) => {
-                    match accept_result {
-                        Ok((stream, addr, family, permit)) => {
-                            debug!("Accepted TPROXY TCP{} connection from {}", family, addr);
-                            if let Err(e) = set_so_mark_zero(&stream) {
-                                warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
-                            }
-                            if !accepts_transparent_connection(&drain) {
-                                debug!("Rejecting new connection from {} (draining)", addr);
-                                continue;
-                            }
-                            let tcp_flow = tcp_stats.track_tcp_flow();
-                            let guard = ConnectionGuard::new(Arc::clone(&drain));
-                            let handle = self.spawn_handle();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let _tcp_flow = tcp_flow;
-                                let _guard = guard;
-                                if let Err(e) = handle.serve_connection(stream, addr).await {
-                                    warn!("Error handling TCP{} from {}: {}", family, addr, e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("TPROXY TCP accept error: {}", e);
-                            if e.raw_os_error() == Some(libc::EMFILE) {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
-                        }
-                    }
-                }
-
-                cmd = rx.recv() => {
-                    let Some(command) = cmd else {
-                        break;
-                    };
-                    if !self
-                        .dispatch_control_command(
-                            command,
-                            &drain,
-                            &mut subscription_authorizations,
-                        )
-                        .await
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(flags) = self.datapath_flags.as_ref()
-            && let Err(error) = flags.fence_nfqueue().await
-        {
-            fatal_error.get_or_insert_with(|| {
-                anyhow::anyhow!("failed to fence NFQUEUE during shutdown: {error:#}")
-            });
-        }
-        let datapath_closed = {
-            let mut backend = self.ebpf.write().await;
-            backend.set_datapath_ready(false)
-        };
-        if let Err(error) = datapath_closed {
-            fatal_error.get_or_insert_with(|| {
-                anyhow::anyhow!("failed to close eBPF datapath admission: {error:#}")
-            });
-        }
-        drain.start_rejecting();
-        #[cfg(feature = "ebpf")]
-        if let Some(runtime) = nfqueue_runtime.as_mut() {
-            runtime.begin_pending_drain().await;
-            if let Err(error) = runtime.check_startup_health().await {
-                fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
-            }
-        }
-
-        if let Err(error) = self
-            .shutdown_datapath(&drain, &mut udp_removal_task, dns_listener.as_mut())
-            .await
-        {
-            fatal_error.get_or_insert(error);
-        }
-
-        #[cfg(feature = "ebpf")]
-        if let Some(runtime) = nfqueue_runtime.as_mut() {
-            if let Err(error) = runtime.shutdown_service().await {
-                fatal_error.get_or_insert(error);
-            }
-            if let Some(error) = runtime.take_shutdown_fatal() {
-                fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
-            }
-            if let Err(error) = runtime.finish_pending_drain().await {
-                fatal_error.get_or_insert(error);
-            }
-            self.pending_udp_verdicts = None;
-        }
-
-        if let Some(flags) = self.datapath_flags.as_ref()
-            && let Err(error) = flags.disable().await
-        {
-            fatal_error.get_or_insert_with(|| {
-                anyhow::anyhow!("failed to disable datapath flags: {error:#}")
-            });
-        }
-
-        if let Err(error) = self.finalize_shutdown().await {
-            fatal_error.get_or_insert(error);
-        }
-        if let Some(error) = fatal_error {
-            Err(error)
-        } else {
-            Ok(())
-        }
-    }
     pub(super) fn spawn_handle(&self) -> ControlPlaneHandle {
         #[cfg(test)]
         self.connection_tracker.enable();
         ControlPlaneHandle {
             config: self.config.clone(),
+            diagnostics: self.diagnostics.clone(),
+            native: self.native.clone(),
             router: self.router.clone(),
             proxy_registry: self.proxy_registry.clone(),
             runtime_registry: self.runtime_registry.clone(),
@@ -1118,10 +612,10 @@ mod tests {
             let _guard = CriticalTaskExit {
                 name: "probe_task",
                 fatal_tx,
+                expected: false,
             };
         }
-        let error = fatal_rx.recv().await.expect("guard drop must notify");
-        assert!(error.to_string().contains("probe_task"));
+        assert!(fatal_rx.recv().await.is_some());
     }
 
     #[tokio::test]
@@ -1130,9 +624,43 @@ mod tests {
         let _guard = CriticalTaskExit {
             name: "probe_task",
             fatal_tx,
+            expected: false,
         };
         fatal_rx
             .try_recv()
             .expect_err("a live guard must not notify");
+    }
+
+    #[test]
+    fn expected_stop_preserves_previously_reported_failure() {
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        drop(CriticalTaskExit {
+            name: "failed",
+            fatal_tx: fatal_tx.clone(),
+            expected: false,
+        });
+        let mut stopped = CriticalTaskExit {
+            name: "stopped",
+            fatal_tx,
+            expected: false,
+        };
+        stopped.expected_stop();
+        drop(stopped);
+        assert!(fatal_rx.try_recv().is_ok());
+        assert!(fatal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn group_slot_logs_only_transitions() {
+        let mut dead = std::collections::HashMap::new();
+        assert!(!group_slot_flipped(&mut dead, "g", 0, true));
+        assert!(group_slot_flipped(&mut dead, "g", 0, false));
+        assert!(!group_slot_flipped(&mut dead, "g", 0, false));
+        assert!(group_slot_flipped(&mut dead, "g", 5, false));
+        assert!(!group_slot_flipped(&mut dead, "other", 0, true));
+        assert!(group_slot_flipped(&mut dead, "g", 0, true));
+        assert!(!group_slot_flipped(&mut dead, "g", 0, true));
+        assert!(!group_slot_flipped(&mut dead, "g", 5, false));
+        assert!(group_slot_flipped(&mut dead, "g", 0, false));
     }
 }

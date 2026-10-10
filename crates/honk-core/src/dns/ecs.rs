@@ -10,7 +10,7 @@ use nix::sys::socket::{
     ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, setsockopt, sockopt,
 };
 use tokio::io::Interest;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::wire::skip_dns_name;
 
@@ -26,7 +26,8 @@ const HOP_TIMEOUT: Duration = Duration::from_millis(150);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn resolve_client_subnet(config: &mut DnsConfig) {
-    config.resolved_client_subnet = None;
+    // Callers re-resolve on every rebuild; only a changed subnet is news.
+    let previous = config.resolved_client_subnet.take();
     let mode = match config.client_subnet_mode() {
         Ok(mode) => mode,
         Err(error) => {
@@ -38,7 +39,11 @@ pub(crate) async fn resolve_client_subnet(config: &mut DnsConfig) {
         None => {}
         Some(DnsClientSubnet::Preset(network)) => {
             config.resolved_client_subnet = Some(network);
-            info!(client_subnet = %network, "DNS client subnet preset enabled");
+            if previous == Some(network) {
+                debug!(client_subnet = %network, "DNS client subnet preset enabled");
+            } else {
+                info!(client_subnet = %network, "DNS client subnet preset enabled");
+            }
         }
         Some(DnsClientSubnet::Auto { target }) => {
             match tokio::time::timeout(PROBE_TIMEOUT, first_public_hop(target)).await {
@@ -47,7 +52,11 @@ pub(crate) async fn resolve_client_subnet(config: &mut DnsConfig) {
                         .expect("IPv4 /24 is valid")
                         .trunc();
                     config.resolved_client_subnet = Some(network);
-                    info!(%target, client_subnet = %network, "inferred DNS client subnet");
+                    if previous == Some(network) {
+                        debug!(%target, client_subnet = %network, "inferred DNS client subnet");
+                    } else {
+                        info!(%target, client_subnet = %network, "inferred DNS client subnet");
+                    }
                 }
                 Ok(Ok(None)) => {
                     warn!(%target, "DNS client subnet inference found no public hop; ECS disabled");

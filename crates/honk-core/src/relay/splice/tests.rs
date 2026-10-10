@@ -18,6 +18,8 @@ fn observed_progress() -> (crate::relay::RelayProgress, Arc<(AtomicU64, AtomicU6
     let progress = crate::relay::RelayProgress {
         upload: Arc::new(AtomicU64::new(0)),
         download: Arc::new(AtomicU64::new(0)),
+        outbound_upload: None,
+        outbound_download: None,
         first_response: None,
         on_transfer: Some(Arc::new(move |up, down| {
             assert!(up == 0 || down == 0);
@@ -280,53 +282,69 @@ async fn test_relay_splice_stats_match_copy_semantics() {
     assert!(splice_available());
 }
 
-/// Live progress counters are incremented as data flows and end up equal
-/// to the final RelayStats (splice path).
+/// Prefixed counters stay live and relay stats stay incremental, including fallback.
 #[tokio::test]
 async fn test_relay_splice_live_progress_matches_stats() {
     let _lock = TEST_LOCK.lock().await;
-    let _state = StateGuard::new();
-    assert!(splice_available());
-
-    let echo = spawn_echo().await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let front = listener.local_addr().unwrap();
-    let (progress, accepted) = observed_progress();
-    let (up, down) = (progress.upload.clone(), progress.download.clone());
-    let relay = tokio::spawn(async move {
-        let (mut client, client_addr) = listener.accept().await.unwrap();
-        let upstream = TcpStream::connect(echo).await.unwrap();
-        relay_splice(&mut client, upstream, client_addr, echo, Some(progress)).await
-    });
-
-    let mut client = TcpStream::connect(front).await.unwrap();
-    let payload = pattern(512 * 1024);
-    client.write_all(&payload).await.unwrap();
-    let mut received = vec![0u8; payload.len()];
-    client.read_exact(&mut received).await.unwrap();
-    assert_eq!(received, payload);
-    assert_eq!(accepted.0.load(Ordering::Relaxed), payload.len() as u64);
-    assert_eq!(accepted.1.load(Ordering::Relaxed), payload.len() as u64);
-    assert!(!relay.is_finished());
-    client.shutdown().await.unwrap();
-
-    let stats = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-        .await
-        .expect("relay task hung")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        up.load(Ordering::Relaxed),
-        stats.client_to_proxy,
-        "live upload counter must match final stats"
-    );
-    assert_eq!(
-        down.load(Ordering::Relaxed),
-        stats.proxy_to_client,
-        "live download counter must match final stats"
-    );
-    assert_eq!(accepted.0.load(Ordering::Relaxed), stats.client_to_proxy);
-    assert_eq!(accepted.1.load(Ordering::Relaxed), stats.proxy_to_client);
+    for unsupported in [false, true] {
+        let _state = StateGuard::new();
+        if unsupported {
+            test_hook::set_forced_errno(libc::EINVAL, -1);
+        }
+        let echo = spawn_echo().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = listener.local_addr().unwrap();
+        let (mut progress, accepted) = observed_progress();
+        let (up, down) = (progress.upload.clone(), progress.download.clone());
+        up.store(11, Ordering::Relaxed);
+        down.store(13, Ordering::Relaxed);
+        let aggregate_up = Arc::new(AtomicU64::new(101));
+        let aggregate_down = Arc::new(AtomicU64::new(103));
+        progress.outbound_upload = Some(aggregate_up.clone());
+        progress.outbound_download = Some(aggregate_down.clone());
+        let relay = tokio::spawn(async move {
+            let (mut client, client_addr) = listener.accept().await.unwrap();
+            let upstream = TcpStream::connect(echo).await.unwrap();
+            relay_splice(&mut client, upstream, client_addr, echo, Some(progress)).await
+        });
+        let mut client = TcpStream::connect(front).await.unwrap();
+        let payload = pattern(512 * 1024);
+        client.write_all(&payload).await.unwrap();
+        let mut received = vec![0u8; payload.len()];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+        assert!(!relay.is_finished());
+        assert_eq!(
+            aggregate_up.load(Ordering::Relaxed),
+            101 + payload.len() as u64
+        );
+        assert_eq!(
+            aggregate_down.load(Ordering::Relaxed),
+            103 + payload.len() as u64
+        );
+        assert_eq!(accepted.0.load(Ordering::Relaxed), payload.len() as u64);
+        assert_eq!(accepted.1.load(Ordering::Relaxed), payload.len() as u64);
+        client.shutdown().await.unwrap();
+        let stats = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.client_to_proxy, payload.len() as u64);
+        assert_eq!(stats.proxy_to_client, payload.len() as u64);
+        assert_eq!(up.load(Ordering::Relaxed), 11 + stats.client_to_proxy);
+        assert_eq!(down.load(Ordering::Relaxed), 13 + stats.proxy_to_client);
+        assert_eq!(
+            aggregate_up.load(Ordering::Relaxed),
+            101 + stats.client_to_proxy
+        );
+        assert_eq!(
+            aggregate_down.load(Ordering::Relaxed),
+            103 + stats.proxy_to_client
+        );
+        assert_eq!(accepted.0.load(Ordering::Relaxed), stats.client_to_proxy);
+        assert_eq!(accepted.1.load(Ordering::Relaxed), stats.proxy_to_client);
+    }
 }
 
 /// Live progress counters work the same through the copy relay

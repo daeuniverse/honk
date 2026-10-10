@@ -14,7 +14,7 @@ log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/$lane"
 mkdir -p "$kernel_dir" "$log_dir"
 
 {
-  cargo test -p honk-core --features ebpf --lib --test ebpf_datapath_test --no-run --message-format=json
+  cargo test -p honk-core --features ebpf,native-api --lib --test ebpf_datapath_test --no-run --message-format=json
   cargo test -p honk-nfqueue --lib --no-run --message-format=json
   cargo test -p honk-outbound --lib --no-run --message-format=json
 } | jq -sr '

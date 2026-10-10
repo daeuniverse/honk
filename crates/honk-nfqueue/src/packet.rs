@@ -10,6 +10,7 @@ const NFQA_MARK: u16 = 3;
 const NFQA_PAYLOAD: u16 = 10;
 const NFQA_CAP_LEN: u16 = 13;
 const NFQA_SKB_INFO: u16 = 14;
+const NFQA_PRIORITY: u16 = 21;
 const NFQA_SKB_CSUMNOTREADY: u32 = 1;
 const IPPROTO_HOPOPTS: u8 = 0;
 const IPPROTO_UDP: u8 = 17;
@@ -29,6 +30,7 @@ pub struct QueuedPacket {
     pub tuple: UdpTuple,
     pub payload: Bytes,
     pub mark: u32,
+    pub priority: Option<u32>,
     pub received_at: Instant,
 }
 
@@ -123,6 +125,8 @@ pub(crate) fn parse_packet_message(
     let mut payload = None;
     let mut capture_length = None;
     let mut skb_info = None;
+    let mut priority = None;
+    let mut priority_seen = false;
     for attribute in netlink::attributes(body.slice(netlink::NFGENMSG_LEN..)) {
         let attribute =
             attribute.map_err(|error| PacketError::MalformedAttributes(error.to_string()))?;
@@ -154,6 +158,14 @@ pub(crate) fn parse_packet_message(
             NFQA_SKB_INFO => {
                 set_once(&mut skb_info, attribute.kind)?;
                 skb_info = Some(be32_attribute(&attribute)?);
+            }
+            NFQA_PRIORITY => {
+                priority = if priority_seen {
+                    None
+                } else {
+                    be32_attribute(&attribute).ok()
+                };
+                priority_seen = true;
             }
             _ => {}
         }
@@ -199,6 +211,7 @@ pub(crate) fn parse_packet_message(
             tuple: parsed.tuple,
             payload: layer_three.slice(range),
             mark,
+            priority,
             received_at,
         }),
         Err(error) => PacketEvent::Rejected {
@@ -506,6 +519,38 @@ mod tests {
         assert_eq!(packet.tuple.client, "10.0.0.2:53000".parse().unwrap());
         assert_eq!(packet.tuple.destination, "203.0.113.7:443".parse().unwrap());
         assert_eq!(packet.payload.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn optional_priority_never_changes_packet_or_mark_ownership() {
+        let mark = 0x8123_4567;
+        let received_at = Instant::now();
+        let packet = ipv4_udp(b"dns");
+        let base = nfqa_body(libc::AF_INET as u8, mark, &packet, None);
+        for (attributes, expected) in [
+            (vec![], None),
+            (vec![123u32.to_be_bytes().to_vec()], Some(123)),
+            (vec![vec![0, 1, 2]], None),
+            (
+                vec![123u32.to_be_bytes().to_vec(), 124u32.to_be_bytes().to_vec()],
+                None,
+            ),
+            (vec![vec![], 123u32.to_be_bytes().to_vec()], None),
+        ] {
+            let mut body = base.to_vec();
+            for payload in attributes {
+                netlink::put_attribute(&mut body, NFQA_PRIORITY, &payload);
+            }
+            let parsed = parse_packet_message(body.into(), received_at).unwrap();
+            assert_eq!(parsed.packet_id, 9);
+            let PacketEvent::Datagram(packet) = parsed.event else {
+                panic!("optional trace metadata must not reject a datagram");
+            };
+            assert_eq!(packet.priority, expected);
+            assert_eq!(packet.payload.as_ref(), b"dns");
+            assert_eq!(packet.mark, mark);
+            assert_eq!(packet.received_at, received_at);
+        }
     }
 
     #[test]

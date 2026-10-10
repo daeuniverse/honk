@@ -1,11 +1,15 @@
 mod http2;
+#[cfg(feature = "flow-observation")]
+mod native;
 mod score;
 
+use super::exchange::MAX_HTTP_RESPONSE_HEAD;
 use super::*;
 use crate::proxy::ProxyStream;
 use honk_config::types::NodeProtocol;
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::SystemTime;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Mock handler: dials the requested target with a plain TcpStream
 /// (no proxy protocol, no SO_MARK). Nodes named "bad" always fail.
@@ -205,6 +209,7 @@ async fn assert_cold_reusable_transport_warms_before_measurement(node: Node) {
         &format!("http://{addr}/"),
         Duration::from_secs(1),
         None,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -266,6 +271,7 @@ async fn cold_quic_warm_time_is_not_reported() {
             &format!("http://{addr}/"),
             Duration::from_secs(1),
             None,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -299,6 +305,7 @@ async fn cold_vless_mux_warm_failure_skips_measurement() {
         "http://localhost/",
         Duration::from_millis(50),
         None,
+        Default::default(),
     )
     .await
     .unwrap_err();
@@ -398,7 +405,7 @@ async fn urltest_distinguishes_domain_and_address_targets() {
             .unwrap();
     });
     let request = http_probe_request("http://localhost/", "").unwrap();
-    exchange_http1(&mut client, &request, &None, Duration::from_secs(5))
+    exchange_http1(&mut client, &request, &None, Duration::from_secs(5), false)
         .await
         .unwrap();
     server.await.unwrap();
@@ -493,7 +500,7 @@ async fn http1_uses_configured_method_target_and_authority() {
         "GET",
     )
     .unwrap();
-    exchange_http1(&mut client, &request, &None, Duration::from_secs(1))
+    exchange_http1(&mut client, &request, &None, Duration::from_secs(1), false)
         .await
         .unwrap();
     peer.await.unwrap();
@@ -516,7 +523,14 @@ async fn partial_measured_response_timeout_is_not_a_fallback_success() {
         std::future::pending::<()>().await;
     });
     let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-    let result = exchange_http1(&mut client, &request, &None, Duration::from_millis(50)).await;
+    let result = exchange_http1(
+        &mut client,
+        &request,
+        &None,
+        Duration::from_millis(50),
+        false,
+    )
+    .await;
     peer.abort();
     let _ = peer.await;
     assert!(
@@ -548,7 +562,7 @@ async fn malformed_truncated_or_oversized_response_is_not_a_fallback_success() {
         });
         let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
         assert!(
-            exchange_http1(&mut client, &request, &None, Duration::from_secs(1))
+            exchange_http1(&mut client, &request, &None, Duration::from_secs(1), false)
                 .await
                 .is_err()
         );
@@ -657,7 +671,7 @@ async fn test_exchange_http1_falls_back_when_server_closes() {
     let request = http_probe_request("http://localhost/", "").unwrap();
     let addr = spawn_close_after_response_server().await;
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+    exchange_http1(&mut stream, &request, &None, Duration::from_secs(5), false)
         .await
         .expect("single-response server must fall back to the warm sample");
 }
@@ -685,11 +699,11 @@ async fn test_exchange_http1_reports_warm_round_trip() {
     });
     let request = http_probe_request("http://localhost/", "").unwrap();
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let measured = exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+    let measured = exchange_http1(&mut stream, &request, &None, Duration::from_secs(5), false)
         .await
         .unwrap();
     assert!(
-        measured < Duration::from_millis(100),
+        measured.latency < Duration::from_millis(100),
         "warm round trip must exclude the stalled first response: {measured:?}"
     );
 }
@@ -717,11 +731,11 @@ async fn test_exchange_http1_reports_the_second_round_trip() {
     });
     let request = http_probe_request("http://localhost/", "").unwrap();
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let measured = exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+    let measured = exchange_http1(&mut stream, &request, &None, Duration::from_secs(5), false)
         .await
         .unwrap();
     assert!(
-        measured >= Duration::from_millis(150),
+        measured.latency >= Duration::from_millis(150),
         "the sample is the second request: {measured:?}"
     );
 }
@@ -750,7 +764,7 @@ async fn test_exchange_http1_bad_status_on_second_request_fails() {
     let request = http_probe_request("http://localhost/", "").unwrap();
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     assert!(
-        exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+        exchange_http1(&mut stream, &request, &None, Duration::from_secs(5), false)
             .await
             .is_err()
     );
@@ -779,12 +793,24 @@ async fn test_exchange_http1_slow_second_request_falls_back() {
     });
     let request = http_probe_request("http://localhost/", "").unwrap();
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let measured = exchange_http1(&mut stream, &request, &None, Duration::from_millis(100))
-        .await
-        .unwrap();
+    let measured = exchange_http1(
+        &mut stream,
+        &request,
+        &None,
+        Duration::from_millis(100),
+        false,
+    )
+    .await
+    .unwrap();
     assert!(
-        measured < Duration::from_millis(100),
+        measured.latency < Duration::from_millis(100),
         "timed-out measured request falls back to the warm sample: {measured:?}"
+    );
+    assert!(
+        SystemTime::now()
+            .duration_since(measured.observed_at)
+            .unwrap()
+            >= Duration::from_millis(90)
     );
 }
 
@@ -874,6 +900,7 @@ async fn test_urltest_group_does_not_penalize_resolver_rejection() {
             "https://rejected.invalid/",
             Duration::from_millis(50),
             None,
+            Default::default(),
         )
         .await;
         assert!(crate::proxy::is_packet_rejection(
@@ -918,9 +945,12 @@ async fn urltest_group_failures_do_not_advance_real_dial_streaks() {
             &url,
             Duration::from_secs(5),
             None,
+            Default::default(),
         )
         .await;
         assert_eq!(results.len(), members.len());
+        assert_eq!(results[0].0, "good");
+        assert_eq!(results[1].0, "bad");
         assert!(results.iter().all(|(_, result)| result.is_err()));
     }
     for member in &members {

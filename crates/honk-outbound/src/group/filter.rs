@@ -63,12 +63,36 @@ impl GroupManager {
             // tag's state instead of leaking the old leaf's.
             return candidates
                 .into_iter()
-                .filter(|c| alive.is_alive_for_url(c.tag(), url))
+                .filter(|c| {
+                    let eligible = alive.is_alive_for_url(c.tag(), url);
+                    observation::candidate(
+                        c,
+                        eligible,
+                        if eligible {
+                            "eligible"
+                        } else {
+                            "custom_url_unavailable"
+                        },
+                    );
+                    eligible
+                })
                 .collect();
         }
         candidates
             .into_iter()
-            .filter(|c| self.is_node_selectable_for_domain(c.node.id, domain, ipver))
+            .filter(|c| {
+                let eligible = self.is_node_selectable_for_domain(c.node.id, domain, ipver);
+                observation::candidate(
+                    c,
+                    eligible,
+                    if eligible {
+                        "eligible"
+                    } else {
+                        "capability_or_health_unavailable"
+                    },
+                );
+                eligible
+            })
             .collect()
     }
 }

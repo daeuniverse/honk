@@ -5,9 +5,8 @@ use std::time::{Duration, Instant};
 use quinn::{Connection, VarInt};
 
 use super::metrics::{record_quic_path_stall, record_quic_session_rx_drop};
-use super::{QUIC_SAMPLE_INTERVAL, QuicPathHealth, SendCompletion};
+use super::{QUIC_SAMPLE_INTERVAL, QuicPathHealth};
 
-pub(super) const PATH_TIMEOUT_STREAK: u8 = 3;
 pub(super) const PATH_MIN_UNACKED_SENDS: u64 = 3;
 const PATH_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 static PATH_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -22,9 +21,7 @@ pub(super) fn path_now_millis() -> u64 {
 
 const PATH_EPOCH_MASK: u64 = (1_u64 << 62) - 1;
 pub(super) const PATH_WAITING: u64 = 1_u64 << 62;
-const PATH_MUTATING: u64 = 1_u64 << 63;
-const PATH_TIMEOUT_BITS: u32 = 2;
-const PATH_TIMEOUT_MASK: u64 = (1_u64 << PATH_TIMEOUT_BITS) - 1;
+pub(super) const PATH_MUTATING: u64 = 1_u64 << 63;
 
 fn path_epoch(state: u64) -> u64 {
     state & PATH_EPOCH_MASK
@@ -32,18 +29,6 @@ fn path_epoch(state: u64) -> u64 {
 
 pub(super) fn path_state(epoch: u64, waiting: bool) -> u64 {
     (epoch & PATH_EPOCH_MASK) | if waiting { PATH_WAITING } else { 0 }
-}
-
-pub(super) fn timeout_state(epoch: u64, streak: u8) -> u64 {
-    (epoch << PATH_TIMEOUT_BITS) | u64::from(streak.min(PATH_TIMEOUT_STREAK))
-}
-
-fn timeout_state_epoch(state: u64) -> u64 {
-    state >> PATH_TIMEOUT_BITS
-}
-
-pub(super) fn timeout_state_streak(state: u64) -> u8 {
-    (state & PATH_TIMEOUT_MASK) as u8
 }
 
 impl QuicPathHealth {
@@ -62,8 +47,6 @@ impl QuicPathHealth {
             waiting_acked_baseline: AtomicU64::new(stats.path.acked_ack_eliciting_packets),
             unacked_since_ms: AtomicU64::new(0),
             last_sample_ms: AtomicU64::new(now),
-            timeout_state: AtomicU64::new(timeout_state(0, 0)),
-            waiting_since_ms: AtomicU64::new(0),
             send_timeout_ms: AtomicU64::new(duration_millis(bounded_quic_send_timeout(rtt))),
             path_stall_timeout_ms: AtomicU64::new(duration_millis(
                 quic_path_stall_timeout_from_rtt(rtt),
@@ -113,18 +96,37 @@ impl QuicPathHealth {
         sent.saturating_sub(acked)
     }
 
-    fn refresh_unacked_since(&self, now: u64) {
-        let state = self.ack_state.load(Ordering::Acquire);
-        if state & (PATH_WAITING | PATH_MUTATING) != PATH_WAITING {
-            self.unacked_since_ms.store(0, Ordering::Release);
+    /// Only the mutation-bit holder writes the no-ACK clock, so a sampler
+    /// that read an older state cannot erase or backdate a newer wait.
+    pub(super) fn refresh_unacked_since(&self) {
+        self.refresh_unacked_since_from(self.ack_state.load(Ordering::Acquire));
+    }
+
+    pub(super) fn refresh_unacked_since_from(&self, state: u64) {
+        if state & (PATH_WAITING | PATH_MUTATING) != PATH_WAITING
+            || self
+                .ack_state
+                .compare_exchange(
+                    state,
+                    state | PATH_MUTATING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
             return;
         }
-        if self.unacked_sends_since_wait() != 0 {
-            let _ =
-                self.unacked_since_ms
-                    .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
-        } else {
+        self.update_unacked_since();
+        self.ack_state.store(state, Ordering::Release);
+    }
+
+    /// Caller holds `PATH_MUTATING` for a waiting state.
+    fn update_unacked_since(&self) {
+        if self.unacked_sends_since_wait() == 0 {
             self.unacked_since_ms.store(0, Ordering::Release);
+        } else if self.unacked_since_ms.load(Ordering::Acquire) == 0 {
+            self.unacked_since_ms
+                .store(path_now_millis(), Ordering::Release);
         }
     }
 
@@ -171,9 +173,6 @@ impl QuicPathHealth {
             );
             self.waiting_acked_baseline
                 .store(current, Ordering::Release);
-            self.timeout_state
-                .store(timeout_state(epoch, 0), Ordering::Release);
-            self.waiting_since_ms.store(0, Ordering::Release);
             self.unacked_since_ms.store(0, Ordering::Release);
             self.ack_state
                 .store(path_state(epoch, false), Ordering::Release);
@@ -195,7 +194,7 @@ impl QuicPathHealth {
             .fetch_max(stats.path.sent_ack_eliciting_packets, Ordering::Release);
         let current = self.sampled_acked_packets.load(Ordering::Acquire);
         self.note_ack_progress(current);
-        self.refresh_unacked_since(now);
+        self.refresh_unacked_since();
         current
     }
     /// Refresh Quinn statistics at most once per second on packet send paths.
@@ -236,24 +235,21 @@ impl QuicPathHealth {
                     path_epoch(state),
                     ack_baseline,
                     sent_baseline,
-                    path_now_millis(),
                 );
             }
         }
     }
+    /// A deadline expiry still completes the attempt: the send was admitted
+    /// and its packet accounting counts.
     pub(super) fn complete_send(
         &self,
         token: crate::proxy::QuicSendToken,
-        completion: SendCompletion,
         observed_acks: u64,
     ) -> bool {
         if !token.is_active() {
             return false;
         }
         self.note_ack_progress(observed_acks);
-        if matches!(completion, SendCompletion::Failure) {
-            return false;
-        }
         loop {
             if self.path_stalled.load(Ordering::Acquire) {
                 return false;
@@ -288,38 +284,21 @@ impl QuicPathHealth {
                 return false;
             }
             let epoch = path_epoch(state);
-            let timeout = self.timeout_state.load(Ordering::Acquire);
-            let previous_streak = if timeout_state_epoch(timeout) == epoch {
-                timeout_state_streak(timeout)
-            } else {
-                0
-            };
-            let streak = if matches!(completion, SendCompletion::Timeout) {
-                previous_streak.saturating_add(1).min(PATH_TIMEOUT_STREAK)
-            } else {
-                0
-            };
-            self.timeout_state
-                .store(timeout_state(epoch, streak), Ordering::Release);
             if state & PATH_WAITING == 0 {
                 self.waiting_sent_baseline
                     .store(token.sent_baseline, Ordering::Release);
                 self.waiting_acked_baseline
                     .store(token.ack_baseline, Ordering::Release);
-                self.waiting_since_ms
-                    .store(token.started_at, Ordering::Release);
                 self.unacked_since_ms.store(0, Ordering::Release);
             } else {
                 // Concurrent sends can complete out of order. Keep the
                 // earliest accepted packet in the watchdog's accounting.
                 self.waiting_sent_baseline
                     .fetch_min(token.sent_baseline, Ordering::AcqRel);
-                self.waiting_since_ms
-                    .fetch_min(token.started_at, Ordering::AcqRel);
             }
+            self.update_unacked_since();
             self.ack_state
                 .store(path_state(epoch, true), Ordering::Release);
-            self.refresh_unacked_since(path_now_millis());
             return true;
         }
     }
@@ -330,7 +309,7 @@ impl QuicPathHealth {
         conn: &Connection,
     ) {
         let observed = self.refresh_sample(conn);
-        self.complete_send(token, SendCompletion::Success, observed);
+        self.complete_send(token, observed);
     }
 
     pub(crate) fn record_send_timeout(
@@ -339,15 +318,15 @@ impl QuicPathHealth {
         conn: &Connection,
     ) -> bool {
         let observed = self.refresh_sample(conn);
-        self.complete_send(token, SendCompletion::Timeout, observed) && self.telemetry_enabled()
+        self.complete_send(token, observed) && self.telemetry_enabled()
     }
 
+    /// A failed or cancelled send yields no path evidence beyond ACKs the
+    /// sampler already published.
     pub(crate) fn record_send_failure(&self, token: crate::proxy::QuicSendToken) {
-        self.complete_send(
-            token,
-            SendCompletion::Failure,
-            self.sampled_acked_packets.load(Ordering::Acquire),
-        );
+        if token.is_active() {
+            self.note_ack_progress(self.sampled_acked_packets.load(Ordering::Acquire));
+        }
     }
 
     fn check_stalled(&self, conn: &Connection) -> bool {
@@ -363,28 +342,11 @@ impl QuicPathHealth {
         if state & PATH_WAITING == 0 || state & PATH_MUTATING != 0 {
             return false;
         }
-        let epoch = path_epoch(state);
         let unacked_sends = self.unacked_sends_since_wait();
-        let timeout = self.timeout_state.load(Ordering::Acquire);
-        let streak = if timeout_state_epoch(timeout) == epoch {
-            timeout_state_streak(timeout)
-        } else {
-            0
-        };
         let now = path_now_millis();
-        let timeout_elapsed = Duration::from_millis(
-            now.saturating_sub(self.waiting_since_ms.load(Ordering::Acquire)),
-        );
         let no_ack_elapsed =
             elapsed_since_millis(now, self.unacked_since_ms.load(Ordering::Acquire));
-        if !should_retire_path(
-            timeout_elapsed,
-            no_ack_elapsed,
-            streak,
-            unacked_sends,
-            self.send_timeout(),
-            self.path_stall_timeout(),
-        ) {
+        if !should_retire_path(no_ack_elapsed, unacked_sends, self.path_stall_timeout()) {
             return false;
         }
         if self
@@ -423,9 +385,6 @@ impl QuicPathHealth {
                 .store(latest.path.acked_ack_eliciting_packets, Ordering::Release);
             self.unacked_since_ms.store(0, Ordering::Release);
             let next_epoch = path_epoch(state).wrapping_add(1) & PATH_EPOCH_MASK;
-            self.timeout_state
-                .store(timeout_state(next_epoch, 0), Ordering::Release);
-            self.waiting_since_ms.store(0, Ordering::Release);
             self.ack_state
                 .store(path_state(next_epoch, false), Ordering::Release);
             return false;
@@ -462,15 +421,11 @@ pub(super) fn bounded_quic_send_timeout(rtt: Duration) -> Duration {
 }
 
 pub(super) fn should_retire_path(
-    timeout_elapsed: Duration,
     no_ack_elapsed: Duration,
-    timeout_streak: u8,
     unacked_sends: u64,
-    send_timeout: Duration,
     no_ack_timeout: Duration,
 ) -> bool {
-    (no_ack_elapsed >= no_ack_timeout && unacked_sends >= PATH_MIN_UNACKED_SENDS)
-        || (timeout_streak >= PATH_TIMEOUT_STREAK && timeout_elapsed >= send_timeout)
+    no_ack_elapsed >= no_ack_timeout && unacked_sends >= PATH_MIN_UNACKED_SENDS
 }
 
 fn quic_path_stall_timeout_from_rtt(rtt: Duration) -> Duration {
@@ -479,10 +434,13 @@ fn quic_path_stall_timeout_from_rtt(rtt: Duration) -> Duration {
         .max(Duration::from_secs(10))
 }
 
-/// Close a shared QUIC path only after repeated send deadlines or a full
-/// no-ACK grace period. Any new packet acknowledgement clears both clocks.
+/// Close a shared QUIC path only after a full no-ACK grace period with at
+/// least [`PATH_MIN_UNACKED_SENDS`] unacknowledged ack-eliciting sends. A
+/// local send deadline is congestion queueing, not path evidence: Quinn
+/// parks the send until congestion control frees capacity. Any new packet
+/// acknowledgement clears the clock.
 pub(crate) fn spawn_quic_path_watchdog(conn: Connection, health: Arc<QuicPathHealth>) {
-    tokio::spawn(async move {
+    let _ = crate::runtime::spawn_owned(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + PATH_WATCH_INTERVAL,
             PATH_WATCH_INTERVAL,

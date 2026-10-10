@@ -123,7 +123,7 @@ async fn admitted_query_keeps_old_generation_quota_after_publication() {
     .await
     .expect("new query must complete while the predecessor remains blocked");
     assert_eq!(
-        crate::dns::forwarder::extract_answer_ips(&new_response),
+        crate::dns::forwarder::extract_answer_ips(new_response.wire()),
         ["198.51.100.9".parse::<std::net::IpAddr>().unwrap()]
     );
     assert!(!running.is_finished());
@@ -131,7 +131,7 @@ async fn admitted_query_keeps_old_generation_quota_after_publication() {
     release.notify_waiters();
     let old_response = running.await.expect("old-generation query task");
     assert_eq!(
-        crate::dns::forwarder::extract_answer_ips(&old_response),
+        crate::dns::forwarder::extract_answer_ips(old_response.wire()),
         ["192.0.2.9".parse::<std::net::IpAddr>().expect("old IP")]
     );
 }
@@ -142,7 +142,7 @@ async fn retirement_cancels_stalled_reply_but_allows_ready_servfail() {
     let admission = controller.try_admit_query(true).unwrap();
     let ready_admission = controller.try_admit_query(true).unwrap();
     let (entered, started) = tokio::sync::oneshot::channel();
-    let stalled = tokio::spawn(async move {
+    let mut stalled = tokio::spawn(async move {
         admission
             .run_reply(async {
                 entered.send(()).unwrap();
@@ -151,14 +151,18 @@ async fn retirement_cancels_stalled_reply_but_allows_ready_servfail() {
             .await
     });
     started.await.unwrap();
-    controller.shutdown(Duration::from_secs(1)).await;
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), stalled)
-            .await
-            .expect("retirement must cancel stalled reply I/O")
-            .unwrap()
-            .is_err()
-    );
+    let shutdown = controller.shutdown(Duration::from_secs(1));
+    tokio::pin!(shutdown);
+    let cancelled = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("shutdown acknowledged a retained DNS reply lease"),
+            result = &mut stalled => result.unwrap(),
+        }
+    })
+    .await
+    .expect("retirement must cancel stalled reply I/O");
+    assert!(cancelled.is_err());
 
     let (reply, received) = tokio::sync::oneshot::channel();
     ready_admission
@@ -171,6 +175,10 @@ async fn retirement_cancels_stalled_reply_but_allows_ready_servfail() {
         .expect("ready terminal reply must win over retirement")
         .unwrap();
     assert_eq!(received.await.unwrap()[3] & 0x0f, 2);
+    drop(ready_admission);
+    tokio::time::timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("released replies must allow shutdown to join");
 }
 
 #[tokio::test]

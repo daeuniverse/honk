@@ -9,7 +9,7 @@ use super::*;
 #[tokio::test]
 async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let active_policy = policy(600);
     let (key, response, _) = fixture(
         IngressProfile::Internal,
@@ -52,42 +52,26 @@ async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
 }
 
 #[tokio::test]
-async fn legacy_rows_are_not_restored_or_removed_on_startup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
-    db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, unix_now() + 300);
-    db.set("selector:proxy", "node-a");
-    let cache = DnsCache::new(8);
-    let persister = DnsCachePersister::spawn(Arc::clone(&db));
-    assert_eq!(
-        persister
-            .restore(cache.service(), Some(policy(600)))
-            .await
-            .expect("restore"),
-        0
-    );
-    assert_eq!(db.load_dns_answers(unix_now()).len(), 1);
-    assert_eq!(db.get("selector:proxy").as_deref(), Some("node-a"));
-    persister.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
 async fn mismatched_policy_and_corrupt_or_unknown_entries_are_counted_and_skipped() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let (key, response, _) = fixture(
         IngressProfile::Internal,
         Some(policy(600)),
         upstream("default"),
     );
     let encoded = codec::encode(&key, &response, unix_now() + 300);
-    db.write_dns_v2(&[(encoded.suffix.clone(), encoded.bytes.clone())])
-        .expect("write policy row");
+    db.write_dns(vec![(
+        encoded.suffix.clone(),
+        unix_now() + 300,
+        encoded.bytes.clone(),
+    )])
+    .expect("write policy row");
     let mut unknown = encoded.bytes;
     unknown[4] = 99;
-    db.write_dns_v2(&[
-        ("unknown".to_string(), unknown),
-        ("collision".to_string(), vec![1, 2, 3]),
+    db.write_dns(vec![
+        ("unknown".to_string(), unix_now() + 300, unknown),
+        ("collision".to_string(), unix_now() + 300, vec![1, 2, 3]),
     ])
     .expect("write invalid rows");
 
@@ -109,7 +93,7 @@ async fn mismatched_policy_and_corrupt_or_unknown_entries_are_counted_and_skippe
 #[tokio::test]
 async fn exact_restore_does_not_hit_profile_scope_wire_or_policy_variants() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let active_policy = policy(600);
     let (key, response, _) = fixture(
         IngressProfile::Internal,
@@ -117,7 +101,7 @@ async fn exact_restore_does_not_hit_profile_scope_wire_or_policy_variants() {
         upstream("default"),
     );
     let encoded = codec::encode(&key, &response, unix_now() + 300);
-    db.write_dns_v2(&[(encoded.suffix, encoded.bytes)])
+    db.write_dns(vec![(encoded.suffix, unix_now() + 300, encoded.bytes)])
         .expect("write");
     let cache = DnsCache::new(16);
     let service = cache.service();
@@ -160,10 +144,10 @@ async fn exact_restore_does_not_hit_profile_scope_wire_or_policy_variants() {
 #[tokio::test]
 async fn expired_entry_is_skipped_and_counted_once() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let (key, response, _) = fixture(IngressProfile::Internal, None, upstream("default"));
     let encoded = codec::encode(&key, &response, unix_now().saturating_sub(1));
-    db.write_dns_v2(&[(encoded.suffix, encoded.bytes)])
+    db.write_dns(vec![(encoded.suffix, unix_now() + 300, encoded.bytes)])
         .expect("write stale row");
     let persister = DnsCachePersister::spawn(db);
 

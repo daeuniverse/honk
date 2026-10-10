@@ -51,6 +51,18 @@ impl In6Addr {
         }
     }
 
+    /// Whether the address lies in the dae0/dae0peer link subnets, which carry
+    /// honk's own traffic rather than a client's.
+    pub fn is_dae0_link(&self) -> bool {
+        unsafe {
+            if self.is_v4_mapped() {
+                u32::from_be(self.u6_addr32[3]) & 0xFFFF_0000 == crate::DAE0_IPV4_NET
+            } else {
+                u64::from_be(self.u6_addr64[0]) == crate::DAE0_IPV6_PREFIX_HI
+            }
+        }
+    }
+
     /// Get a reference to the 16-byte array without requiring `unsafe` on the caller's side.
     pub fn as_bytes(&self) -> &[__u8; 16] {
         // Valid: all union variants cover the same memory, and [u8; 16] is the
@@ -134,5 +146,26 @@ impl core::fmt::Debug for In6Addr {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dae0_link_matches_exactly_the_honk_subnets() {
+        for ip in ["fd00:686f:6e6b::2", "fd00:686f:6e6b::beef"] {
+            let addr = In6Addr::from_ipv6_addr(ip.parse().unwrap());
+            assert!(addr.is_dae0_link(), "{ip}");
+        }
+        for ip in ["fd00:686f:6e6c::1", "fd00:dae:d000::1", "2001:db8::1"] {
+            let addr = In6Addr::from_ipv6_addr(ip.parse().unwrap());
+            assert!(!addr.is_dae0_link(), "{ip}");
+        }
+        assert!(In6Addr::from_ipv4_bytes([169, 254, 0, 11]).is_dae0_link());
+        assert!(In6Addr::from_ipv4_bytes([169, 254, 200, 1]).is_dae0_link());
+        assert!(!In6Addr::from_ipv4_bytes([169, 255, 0, 1]).is_dae0_link());
+        assert!(!In6Addr::from_ipv4_bytes([192, 168, 0, 1]).is_dae0_link());
     }
 }

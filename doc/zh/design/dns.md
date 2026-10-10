@@ -196,7 +196,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 | 机制 | 不变量 |
 | --- | --- |
-| 容量 | 最多 16 个 LRU 分片精确划分 `max_cache_size`。每个分片同时受条目数与保留的 key/response wire 字节限制。字节目标为每个配置条目 4 KiB，每分片至少 65,535 字节，全局上限 64 MiB。 |
+| 容量 | 最多 16 个 LRU 分片精确划分 `max_cache_size`。每个分片只受条目数限制；`max_cache_size` 钳制为不超过 100,000。 |
 | 正缓存 TTL | `fixed_domain_ttl` 优先级最高；零表示该域名不缓存。否则，非零 `optimistic_cache_ttl` 覆盖应答最小 TTL。两者均未覆盖时，NOERROR 正应答取所有已遍历非 OPT 记录的最小 TTL，包括零；最小值为零时移除精确缓存槽，不保留新应答。选定的非零 TTL 也会写入缓存中的记录。失败响应码仍使用原有的 TTL 提取规则。 |
 | 负缓存 TTL | NXDOMAIN 使用 `min(SOA TTL, SOA MINIMUM, 300)` 秒；缺少 SOA 或生命周期为零时移除精确缓存槽，不保留应答。SERVFAIL 仍缺省为 60 秒，并将 SOA 得出的生命周期限制在 `1..=300` 秒。`fixed_domain_ttl: 0` 禁止缓存所有响应码的应答，但不移除已有条目。 |
 | NODATA TTL | `ANCOUNT=0` 的 NOERROR 应答以完整报文保留在正缓存槽中。非零 `fixed_domain_ttl` 优先于 SOA 和上限；否则生命周期为 `min(SOA TTL, SOA MINIMUM, 300)`，缺少 SOA 或生命周期为零时移除精确缓存槽，不保留新应答。`optimistic_cache_ttl` 不适用。NODATA 仍可作为过期应答返回；过期改写只改变 SOA TTL，不改变 MINIMUM。 |
@@ -211,9 +211,9 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 此保证仅适用于内存；缓存槽版本号仅在进程内有效，不改变持久化格式或严格模式的应答准入。移除正缓存不会使已保存的 SQLite 行失效。若在该行过期前重启，该正缓存可能恢复为仅兼容模式可用：严格模式不会复用它，兼容模式则可能在持久化过期时间之后的一小时内继续提供过期应答。因为刷新触发条件对剩余秒数向下取整，所以刷新开始时原应答可能仍有至多 `max(min_ttl / 10, 1) + 1` 秒的实际有效期。
 
-`store_dns` 启用持久化后，一个有界 actor 会将仍被保留的正缓存插入镜像到 SQLite。若条目因分片 wire 字节预算而立即被驱逐，则不会进入持久化队列。actor 将命令队列与 pending set 都限制为 4,096 项，批量写入并按 epoch 隔离；flush 会在接纳当前状态前丢弃更旧的排队 epoch。
+`store_dns` 启用持久化后，一个有界 actor 会将仍保留的正缓存插入同步到 SQLite。actor 将命令队列与 pending set 都限制为 1,024 项，批量写入并按 epoch 隔离；flush 会在接纳当前状态前丢弃更旧的排队 epoch。
 
-`HDNS` version 2 行位于 `dns:v2:` 下，编码 canonical wire、入口 profile、scope、policy、operation、expiry 与已校验的 response wire。恢复时跳过已过期、损坏、version 不匹配、collision 不匹配及 policy 不匹配的行。v2 namespace 不消费也不改写旧 `dns:` 行。v2 之前的二进制会忽略 `dns:v2:` 行，因此将其留在 `cache.db` 中可安全回滚。
+`HDNS` version 2 条目保存在状态数据库的 `dns_answer` 表中，编码 canonical wire、入口 profile、scope、policy、operation、expiry 与已校验的 response wire。恢复时跳过已过期、损坏、version 不匹配、collision 不匹配及 policy 不匹配的行。编码后超过 4 KiB 的条目在进入批量写入前被丢弃并计入 `oversize`，因为表的长度 `CHECK` 会让整个批量事务失败。
 
 ## 上游 transport
 
@@ -226,7 +226,9 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 支持经所选叶节点的 `PacketTransport`。 |
 | DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | QUIC 会话可使用所选叶节点的 `PacketTransport`。 |
 
-代理 DoQ 与 DoH3 会把 generation 固定的叶节点 `PacketTransport` 适配为 quinn `AsyncUdpSocket`。每个池化 QUIC connection 或 HTTP/3 session 持有一个有界 adapter 与 client endpoint，直到 retry 或 shutdown 将其关闭；datagram 边界和 peer 元数据保持不变，内层 QUIC payload 上限为 1252 bytes。缺少代理 registry 或 packet capability 时会 fail closed，不会绕过为直连。直连 QUIC 仍复用带 bypass mark 的原生 endpoint。
+代理 DoQ 与 DoH3 将固定 generation 的叶节点 `PacketTransport` 适配为 quinn `AsyncUdpSocket`。每个池化 QUIC connection 或 HTTP/3 session 持有一个有界 adapter 与 client endpoint，直到 retry 或 shutdown 将其关闭。datagram 边界和 peer 元数据保持不变，内层 QUIC payload 上限为 1252 bytes。adapter 的接收 worker 每读取 32 次 transport 就让出一次调度，使 endpoint driver 能在从不挂起的 transport 的两批读取之间得到调度。队列仍满时丢弃该 datagram 并计入 `transportRxDrops`，不会对 transport 施加背压。缺少代理 registry 或 packet capability 时会 fail closed，不会绕过为直连。直连 QUIC 仍复用带 bypass mark 的原生 endpoint。
+
+DNS client task owner 与捕获的 runtime owner 保留同一份 packet-adapter worker join，涵盖 session 发布前握手失败或被取消的路径。关闭和暂停等待这些 join；worker panic 在回收后仍保留，并使暂停失败。零 timeout 的 endpoint close 仅请求关闭，不确认 joined cleanup；健康探测共用同一 endpoint 关闭协议。
 
 `-> node-or-group` 强制选择一个由 generation 固定的拨号叶子。没有显式目标时，上游 endpoint 经过固定的流量 Router 与组快照。UDP+代理有意使用 TCP-DNS；此策略独立于普通代理 UDP 流量使用的 SOCKS5 RFC 1928 UDP transport。
 
@@ -271,13 +273,16 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 | 结果 | 投影 observation |
 | --- | --- |
-| 已接受的 positive | 可缓存时，用 outcome 的有效 TTL 替换该域名的 IP 集合与 expiry；不可缓存的正应答改用已有 wire TTL 规则：非 OPT 记录中的最小正 TTL，不存在正 TTL 时回退为 60 秒。拒绝缓存不应抹去已接受地址的路由寿命。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
-| 已接受的 NODATA 或 NXDOMAIN | 清除该域名 owner。 |
-| 已接受的 SERVFAIL 或被策略拒绝 | 保留当前状态。 |
+| 已接受的 A 或 AAAA positive | 可缓存时，用 outcome 的有效 TTL 替换该名称在所查询地址族下的 IP 集合与 expiry；不可缓存的正应答改用已有 wire TTL 规则：非 OPT 记录中的最小正 TTL，不存在正 TTL 时回退为 60 秒。拒绝缓存不应抹去已接受地址的路由寿命。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
+| 已接受的 A 或 AAAA NODATA | 只清除该名称在所查询地址族下的 owner。 |
+| 已接受的 NXDOMAIN | 清除该名称两个地址族的 owner。 |
+| 其他 QTYPE（如 HTTPS）、已接受的 SERVFAIL 或被策略拒绝 | 保留当前状态。 |
+
+同一名称的 A 与 AAAA owner 相互独立，各自使用自己的 TTL。因此，已学到 IPv4 地址的名称收到空的 AAAA 或 HTTPS 应答时，IPv4 事实仍然保留。
 
 每个 policy generation 内的域名关联仍为全局且与来源无关。带来源的请求路由隔离 DNS 交换 scope 与应答；它不划分 eBPF domain observation 或普通流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
-投影最多保留 10,000 个域名 owner，并向容量为 65,536 的 domain map 准入最多 49,152 个唯一 IP key。选入 desired/reload 集合的零 bitmap 另有 32,768 个 key 的上限，为后续命中规则的 DNS 事实留出空间；等待成功删除的过时零值 key 可暂时突破该子上限，但仍受 applied 总上限约束。剩余 16,384 个 map 槽位不供 DNS 投影使用，留给 sniff 写入。IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰地址最大的 IP。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 IP。容量压力会产生警告。
+投影最多保留 10,000 个 owner（同一名称的 A 与 AAAA owner 分别计数），并向容量为 65,536 的 domain map 准入最多 49,152 个唯一 IP key。选入 desired/reload 集合的零 bitmap 另有 32,768 个 key 的上限，为后续命中规则的 DNS 事实留出空间；等待成功删除的过时零值 key 可暂时突破该子上限，但仍受 applied 总上限约束。剩余 16,384 个 map 槽位不供 DNS 投影使用，留给 sniff 写入。IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰地址最大的 IP。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 IP。容量压力会产生警告。
 
 被省略的 key 按普通的缺失域名事实处理，而不是伪造零 bitmap。现有 dial-mode 和终态 `must`/`block` 语义仍然有效：符合条件的未确定 direct 结果进入 control-plane routing，但该容量策略不会把所有未知事实都强制送入慢路径，也不改变 `ip` 模式。Sniff 写入共享物理 map，仍可能耗尽其预留空间；backend 写入失败继续可观测，并在适用路径中重试。
 
@@ -291,11 +296,11 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、routing/group snapshot、transport manager、路由投影、捕获的 bootstrap resolver 及代内 query/UDP admission。每个新 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于该代。每个 DNS pool 持有新的 outbound runtime fork，不复用 traffic session 或旧 DNS 代 session。fork 与来源配置代共享 dial semaphore、进程 physical-dial ceiling 和进程 VLESS-carrier gate，但不共享 retirement state 或 protocol pool。
 
-现有 TLS 维护任务也会回收当前 DNS registry 的空闲 connector。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
+现有维护任务也会回收当前 DNS registry 已结束的任务与空闲 VLESS carrier。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
 
 发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程等待后台工作任务结束并关闭 DNS transport；只有这些 transport 排空后，才关闭它们的私有 outbound runtime fork，再退役捕获的普通流量 registry 中未转移的可复用状态。
 
-30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全兜底，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。Forwarding 返回后的 bootstrap fallback 不在该取消范围内。最多保留四个已退役 runtime；超过上限与 provider 关闭会触发相同的强制取消。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。
+30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全限制，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。应用解析的 bootstrap fallback 仍在原查询 lease 内执行，drain 会等待它，强制 shutdown 也会取消它。最多保留四个已退役代；超过上限与 provider 关闭会触发相同的强制取消。某代完成退役且 lease 排空后即释放其 runtime，只保留 outbound registry 供上述强制关闭使用。已就绪的终态 `SERVFAIL` 应答仍会尝试发送，但停滞的已准入应答 I/O 会被取消；TCP 写入被取消时关闭连接。
 
 `DnsServiceProvider` 持有、回收全部退役与强制关闭 supervisor，并在关闭时等待它们结束。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
@@ -311,7 +316,15 @@ DNS 诊断使用相互独立、单调递增的 atomic counter。类别覆盖缓�
 
 结构化 DNS 失败事件将错误压缩为有界 `error_kind` 类别：forwarder（`engine`、`exchange`、`response`、`internal`、`rejected_plan`、`overloaded`）、持久化（`worker_closed`、`ack_dropped`、`worker_failed`、`database`）、投影（`map_full`、`backend_write`）及 transport（`exchange_failed`，另带有界 transport label）。这些事件字段不包含 query name、upstream 地址或自由格式 error payload。
 
-该快照仅供内部使用。honk 不公开 DNS metrics endpoint、配置开关或 DNS telemetry API。
+上述 atomic counter 快照仅供内部使用，不公开 DNS metrics endpoint。原生 API 另从真实 DNS owner 提供有界 query/cache/log 资源；这些观测接口不构成同一原子快照。
+
+### 原生诊断、精确失效与客户端历史
+
+`/api/v1/dns/query` 把 cache access 与可选强制配置 upstream 作为同一个请求局部 options 贯穿 planning、preferred-family sibling 和 exchange；一次请求固定同一 DNS generation。强制 upstream 替换普通请求路由，但保留 hosts/strategy 与响应侧 requery，hosts 命中不虚构 upstream exchange。`bypass` 不读正/负/stale 答案、不写缓存、不加入普通 singleflight/refresh，也不启动后台 refresher；普通生产请求不带 override 时语义不变。最多 8 个不同 type，共享 10 秒请求期限、262144 字节完整 JSON 预算与每分钟 30 次 principal/global 限额。
+
+Cache list 的 opaque ID 对应 exact-key incarnation，检查不触发 LRU promotion 或 hit 统计；`persistent:false` 明确只覆盖运行时记录。分页固定 filters/instance，最多 8 个 snapshot、30 秒和合计 8 MiB，底层淘汰不释放仍由 snapshot 持有的预算。按 ID 删除只影响该 incarnation，按完整 name/type 删除可覆盖不同 exact 变体。原生与 Clash 失效共用 DNS/cache owner 的 publication→shard 屏障，等待持久化删除及此前 queued put 的确认；旧 foreground/refresh 不能复活已经确认失效的记录。Flush 仅清答案缓存，不清域名路由投影，持久化失败不能假报成功。
+
+`record_dns_log` 默认为 `true`，允许在独立 DNS 日志需求有效或显式运行时设置 `record_dns_log: "on"` 时记录；实际记录停止时释放历史并使游标失效。进程级环形缓冲区在客户端请求实际完成时捕获普通 DNS 查询结果和来源已知的客户端解析结果；排除原生/Clash 诊断调用及后台刷新产生的重复记录。保留实际 `SocketAddr`、问题、最终状态、缓存/上游/路由与时间，最多 512 条/8 MiB，原始报文与元数据一起计入预算；不截断 RRset，超限淘汰整条旧记录。列表最新优先，支持 `name`、`type`、`src` 过滤、最多 500 条一页及与过滤器绑定的游标，淘汰会使旧游标失效。查询、缓存和日志的响应投影无法完整装入 262144 字节时返回 503 与 `Retry-After`，不返回截断后仍标为完整的答案。缓存和日志分页在会超限的记录之前结束并返回 `next_cursor`；单条记录本身超限时独占一页完整返回，因为原始报文最多 65535 字节，展开后的大小有界，分页遍历不会因此中断。配置禁用记录器需重启；运行时 `"off"` 可强制关闭配置已允许的记录器。运行时设置由同一所有者原子发布；临时缩容在显式配置激活时重置，provider 刷新或网络刷新时保留。
 
 ## 相关文档
 

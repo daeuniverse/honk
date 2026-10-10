@@ -236,6 +236,9 @@ impl JuicityHandler {
             .await
             .context("Juicity: send request header")
             .map_err(super::quic_carrier_error)?;
+        if let Some(observer) = crate::runtime::flow_observation::current() {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+        }
         Ok((send, recv))
     }
     async fn client_for_runtime(
@@ -290,8 +293,11 @@ impl JuicityHandler {
         for _ in 0..2 {
             let (conn, state) = client.connection(connect_timeout).await?;
             state.touch();
+            let observation = crate::session::ObservedSessionOpen::start();
             match Self::open_stream(&conn, NETWORK_UDP, &stream_addr).await {
                 Ok((send, recv)) => {
+                    observation
+                        .finish(crate::runtime::flow_observation::SessionEvent::OpenSucceeded);
                     state.open.fetch_add(1, Ordering::Relaxed);
                     let open = Arc::clone(&state.open);
                     let stream_state = Arc::clone(&state);
@@ -311,6 +317,7 @@ impl JuicityHandler {
                     }));
                 }
                 Err(error) => {
+                    observation.finish(crate::runtime::flow_observation::SessionEvent::OpenFailed);
                     client.quic.invalidate(&conn).await;
                     last_error = Some(error);
                 }
@@ -328,9 +335,13 @@ impl WarmableOutbound for JuicityHandler {
         connect_timeout: Duration,
         _requirement: super::WarmRequirement,
     ) -> anyhow::Result<()> {
-        let client = self.client_for_runtime(&runtime).await?;
-        client.connection(connect_timeout).await?;
-        Ok(())
+        let warm = async {
+            let client = self.client_for_runtime(&runtime).await?;
+            client.connection(connect_timeout).await?;
+            Ok(())
+        };
+        let warm = crate::runtime::flow_observation::without(warm);
+        warm.await
     }
 }
 

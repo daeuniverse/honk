@@ -388,6 +388,7 @@ async fn correlator_flow_slots_fail_closed_at_the_hard_cap() {
         },
         payload: bytes::Bytes::from_static(b"over capacity"),
         mark: honk_ebpf_common::pack_nfqueue_mark(token).unwrap(),
+        priority: None,
         received_at,
     };
 
@@ -759,6 +760,7 @@ async fn backend_write_lock_cannot_extend_packet_hold_deadline() {
         },
         payload: bytes::Bytes::from_static(b"held"),
         mark: honk_ebpf_common::pack_nfqueue_mark(token).unwrap(),
+        priority: None,
         received_at,
     };
     let writer = backend.write().await;
@@ -805,6 +807,7 @@ async fn active_direct_follower_does_not_wait_for_backend() {
         },
         payload: bytes::Bytes::from_static(b"direct follower"),
         mark: honk_ebpf_common::pack_nfqueue_mark(fixture.identity.decision_token).unwrap(),
+        priority: None,
         received_at,
     };
     let _writer = fixture.backend.write().await;

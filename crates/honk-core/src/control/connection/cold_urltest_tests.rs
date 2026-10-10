@@ -53,14 +53,15 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
         ..Default::default()
     };
     let control = crate::control::tests::support::control_plane(config);
-    let handle = control.spawn_handle();
+    let mut handle = control.spawn_handle();
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
-            &nodes, 1, 4, 0, None,
+            &nodes, 1, 4, 0, false, None,
         )
         .unwrap()
         .0,
     );
+    let mut completed_refusal = None;
     for _ in 0..2 {
         let result = handle
             .race_candidates(
@@ -68,6 +69,7 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
                 "192.0.2.1:443".parse().unwrap(),
                 None,
                 "proxy",
+                crate::stats::OutboundKind::Group,
                 None,
                 Duration::from_millis(50),
                 tokio::time::Instant::now() + Duration::from_secs(1),
@@ -75,6 +77,10 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
                 IpVersion::V4,
                 &HashMap::new(),
                 true,
+                #[cfg(feature = "native-api")]
+                &HashMap::new(),
+                #[cfg(feature = "native-api")]
+                &ConnectionObservation::default(),
             )
             .await;
         assert!(
@@ -89,15 +95,43 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
             honk_outbound::proxy::packet_rejection(&error),
             Some(honk_outbound::proxy::PacketRejection::Capacity),
         );
+        completed_refusal = Some(error);
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(100), listener.accept())
             .await
             .is_err()
     );
+    // The real pool factory needs scheduling; an uncompleted refusal may lose.
+    // Return its completed error synchronously to exercise the winner veto.
+    struct CompletedRefusal(parking_lot::Mutex<Option<anyhow::Error>>);
+
+    #[async_trait::async_trait]
+    impl honk_outbound::proxy::TcpOutbound for CompletedRefusal {
+        async fn dial(
+            &self,
+            _node: &Node,
+            _target: SocketAddr,
+            _target_domain: Option<&str>,
+            _connect_timeout: Duration,
+        ) -> anyhow::Result<crate::proxy::ProxyStream> {
+            Err(self.0.lock().take().expect("one completed refusal"))
+        }
+    }
+
+    let mut registry = ProxyRegistry::new();
+    registry.register(honk_outbound::proxy::ProtocolEntry::new(
+        blocked.protocol(),
+        Arc::new(CompletedRefusal(parking_lot::Mutex::new(completed_refusal))),
+    ));
+    registry.register(honk_outbound::proxy::ProtocolEntry::new(
+        alternate.protocol(),
+        Arc::new(honk_outbound::proxy::socks5::Socks5Handler::new()),
+    ));
+    handle.proxy_registry = Arc::new(registry);
     let target = "192.0.2.1:443".parse().unwrap();
     let tcp = tokio::net::TcpStream::connect(server).await.unwrap();
-    let (_peer, _) = listener.accept().await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
     let key = ConnectionPool::ready_key(generation.generation(), alternate.id, target, None);
     handle
         .connection_pool
@@ -117,6 +151,7 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
             target,
             None,
             "proxy",
+            crate::stats::OutboundKind::Group,
             None,
             Duration::from_millis(50),
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -124,6 +159,10 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
             IpVersion::V4,
             &HashMap::new(),
             false,
+            #[cfg(feature = "native-api")]
+            &HashMap::new(),
+            #[cfg(feature = "native-api")]
+            &ConnectionObservation::default(),
         )
         .await;
     let Err(error) = result else {
@@ -132,6 +171,22 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
     assert_eq!(
         honk_outbound::proxy::packet_rejection(&error),
         Some(honk_outbound::proxy::PacketRejection::Capacity),
+    );
+    assert!(
+        handle
+            .alive_set
+            .is_alive_for(blocked.id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    assert!(handle.connection_pool.acquire_ready(&key).await.is_none());
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut peer, &mut [0; 1]),
+        )
+        .await
+        .expect("vetoed provisional stream must close")
+        .unwrap(),
+        0,
     );
     generation.shutdown().await;
 }

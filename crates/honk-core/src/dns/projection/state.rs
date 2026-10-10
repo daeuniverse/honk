@@ -1,4 +1,5 @@
 use honk_ebpf_common::DomainRouting;
+use honk_outbound::alive::IpVersion;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::net::IpAddr;
@@ -7,6 +8,18 @@ use tokio::time::Instant;
 
 use super::{ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
 type OwnerKey = Arc<str>;
+/// A name's owner within one address-family slot. A mapped-IPv6 AAAA answer
+/// shares its IPv4 key, so one IP may belong to both families of a name.
+type FamilyOwner = (OwnerKey, usize);
+
+#[cfg(any(test, feature = "dns-bench"))]
+pub(super) fn family_of(ip: IpAddr) -> IpVersion {
+    if ip.is_ipv4() {
+        IpVersion::V4
+    } else {
+        IpVersion::V6
+    }
+}
 
 // Leave a quarter of the map for sniff writes and another quarter unavailable
 // to present-zero facts, so DNS misses cannot crowd out later matching facts.
@@ -15,10 +28,15 @@ pub(super) const ZERO_IP_CAPACITY: usize = crate::ebpf::maps::DOMAIN_MAP_CAPACIT
 
 fn aggregate_domains(
     snapshot: &RoutingProjectionSnapshot,
-    domains: &BTreeSet<OwnerKey>,
+    owners: &BTreeSet<FamilyOwner>,
 ) -> Option<DomainRouting> {
     let mut aggregate = None;
-    for domain in domains {
+    let mut previous = None;
+    // Both family owners of one name may share a canonical IP; the bitmap is per name.
+    for (domain, _) in owners {
+        if previous.replace(domain) == Some(domain) {
+            continue;
+        }
         if let Some(bitmap) = snapshot.bitmap_for(domain) {
             or_bitmap(aggregate.get_or_insert_default(), &bitmap);
         }
@@ -83,6 +101,7 @@ pub(super) struct PendingSet {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct DeadlineEntry {
     pub(super) at: Instant,
+    pub(super) family: usize,
     pub(super) domain: OwnerKey,
     pub(super) sequence: u64,
 }
@@ -91,8 +110,9 @@ pub(super) struct DesiredState {
     pub(super) capacity: usize,
     pub(super) sequence: u64,
     pub(super) snapshot: Arc<RoutingProjectionSnapshot>,
-    pub(super) owners: BTreeMap<OwnerKey, DomainOwner>,
-    pub(super) reverse: BTreeMap<IpAddr, BTreeSet<OwnerKey>>,
+    /// Indexed by `IpVersion`; one owner per name and family.
+    pub(super) owners: [BTreeMap<OwnerKey, DomainOwner>; 2],
+    pub(super) reverse: BTreeMap<IpAddr, BTreeSet<FamilyOwner>>,
     pub(super) desired: BTreeMap<IpAddr, DomainRouting>,
     zero_ips: BTreeSet<IpAddr>,
     capacity_warning_emitted: bool,
@@ -100,7 +120,7 @@ pub(super) struct DesiredState {
     pub(super) dirty_ips: BTreeSet<IpAddr>,
     pub(super) retries: BTreeMap<IpAddr, RetryMetadata>,
     pub(super) expiry_deadlines: BinaryHeap<Reverse<DeadlineEntry>>,
-    pub(super) eviction_order: BinaryHeap<Reverse<(u64, OwnerKey)>>,
+    pub(super) eviction_order: BinaryHeap<Reverse<(u64, usize, OwnerKey)>>,
 }
 
 impl DesiredState {
@@ -109,7 +129,7 @@ impl DesiredState {
             capacity,
             sequence: 0,
             snapshot,
-            owners: BTreeMap::new(),
+            owners: [BTreeMap::new(), BTreeMap::new()],
             reverse: BTreeMap::new(),
             desired: BTreeMap::new(),
             zero_ips: BTreeSet::new(),
@@ -136,59 +156,73 @@ impl DesiredState {
         match observation {
             ProjectionObservation::Positive {
                 domain,
+                family,
                 ips,
                 advertised_ttl,
-            } => self.replace(domain, ips, now + advertised_ttl),
-            ProjectionObservation::Clear { domain } => {
-                self.remove_owner(domain);
+            } => self.replace(family as usize, domain, ips, now + advertised_ttl),
+            ProjectionObservation::Clear { domain, family } => {
+                self.remove_owner(family as usize, domain);
+                0
+            }
+            ProjectionObservation::ClearName { domain } => {
+                self.remove_owner(IpVersion::V4 as usize, domain);
+                self.remove_owner(IpVersion::V6 as usize, domain);
                 0
             }
             ProjectionObservation::Retain => 0,
         }
     }
 
-    fn replace(&mut self, domain: &str, ips: &[IpAddr], expires_at: Instant) -> u64 {
+    fn owner_count(&self) -> usize {
+        self.owners.iter().map(BTreeMap::len).sum()
+    }
+
+    fn replace(&mut self, family: usize, domain: &str, ips: &[IpAddr], expires_at: Instant) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
         let ips = ips
             .iter()
             .map(|ip| ip.to_canonical())
             .collect::<BTreeSet<_>>();
-        let existing = self.owners.get_key_value(domain).map(|(key, owner)| {
-            let removed = owner.ips.difference(&ips).copied().collect::<Vec<_>>();
-            let added = ips
-                .iter()
-                .filter(|ip| !owner.ips.contains(ip) || !self.desired.contains_key(ip))
-                .copied()
-                .collect::<Vec<_>>();
-            (Arc::clone(key), removed, added)
-        });
+        let existing = self.owners[family]
+            .get_key_value(domain)
+            .map(|(key, owner)| {
+                let removed = owner.ips.difference(&ips).copied().collect::<Vec<_>>();
+                let added = ips
+                    .iter()
+                    .filter(|ip| !owner.ips.contains(ip) || !self.desired.contains_key(ip))
+                    .copied()
+                    .collect::<Vec<_>>();
+                (Arc::clone(key), removed, added)
+            });
 
         let owner_key = existing
             .as_ref()
             .map(|(key, _, _)| Arc::clone(key))
+            .or_else(|| {
+                self.owners[1 - family]
+                    .get_key_value(domain)
+                    .map(|(key, _)| Arc::clone(key))
+            })
             .unwrap_or_else(|| Arc::<str>::from(domain));
+        let member: FamilyOwner = (Arc::clone(&owner_key), family);
         let mut affected = Vec::new();
         if let Some((_, removed, added)) = &existing {
             affected.reserve(removed.len() + added.len());
             for ip in removed {
-                if let Some(domains) = self.reverse.get_mut(ip) {
-                    domains.remove(&owner_key);
-                    if domains.is_empty() {
+                if let Some(owners) = self.reverse.get_mut(ip) {
+                    owners.remove(&member);
+                    if owners.is_empty() {
                         self.reverse.remove(ip);
                     }
                 }
                 affected.push(*ip);
             }
             for ip in added {
-                self.reverse
-                    .entry(*ip)
-                    .or_default()
-                    .insert(Arc::clone(&owner_key));
+                self.reverse.entry(*ip).or_default().insert(member.clone());
                 affected.push(*ip);
             }
-            let owner = self
-                .owners
+            let owner = self.owners[family]
                 .get_mut(&owner_key)
                 .expect("existing projection owner disappeared");
             owner.ips = ips;
@@ -197,13 +231,10 @@ impl DesiredState {
         } else {
             affected.reserve(ips.len());
             for ip in &ips {
-                self.reverse
-                    .entry(*ip)
-                    .or_default()
-                    .insert(Arc::clone(&owner_key));
+                self.reverse.entry(*ip).or_default().insert(member.clone());
                 affected.push(*ip);
             }
-            self.owners.insert(
+            self.owners[family].insert(
                 Arc::clone(&owner_key),
                 DomainOwner {
                     ips,
@@ -215,45 +246,48 @@ impl DesiredState {
 
         self.expiry_deadlines.push(Reverse(DeadlineEntry {
             at: expires_at,
+            family,
             domain: Arc::clone(&owner_key),
             sequence,
         }));
         self.eviction_order
-            .push(Reverse((sequence, Arc::clone(&owner_key))));
+            .push(Reverse((sequence, family, Arc::clone(&owner_key))));
         self.recompute_ips(affected);
         self.compact_owner_heaps_if_needed();
-        if self.owners.len() <= self.capacity {
+        if self.owner_count() <= self.capacity {
             return 0;
         }
 
         let evicted = loop {
-            let Some(Reverse((candidate_sequence, candidate))) = self.eviction_order.pop() else {
+            let Some(Reverse((candidate_sequence, candidate_family, candidate))) =
+                self.eviction_order.pop()
+            else {
                 break None;
             };
-            if self
-                .owners
+            if self.owners[candidate_family]
                 .get(&candidate)
                 .is_some_and(|owner| owner.sequence == candidate_sequence)
             {
-                break Some(candidate);
+                break Some((candidate_family, candidate));
             }
         };
-        if let Some(evicted) = evicted {
-            self.remove_owner(&evicted);
+        if let Some((evicted_family, evicted)) = evicted {
+            self.remove_owner(evicted_family, &evicted);
             1
         } else {
             0
         }
     }
 
-    fn remove_owner(&mut self, domain: &str) {
-        let Some((owner_key, owner)) = self.owners.remove_entry(domain) else {
+    fn remove_owner(&mut self, family: usize, domain: &str) {
+        let Some((owner_key, owner)) = self.owners[family].remove_entry(domain) else {
             return;
         };
+        let member: FamilyOwner = (owner_key, family);
         for ip in &owner.ips {
-            if let Some(domains) = self.reverse.get_mut(ip) {
-                domains.remove(&owner_key);
-                if domains.is_empty() {
+            if let Some(owners) = self.reverse.get_mut(ip) {
+                owners.remove(&member);
+                if owners.is_empty() {
                     self.reverse.remove(ip);
                 }
             }
@@ -327,9 +361,11 @@ impl DesiredState {
     fn prune_stale_expiry_heads(&mut self) {
         while self.expiry_deadlines.peek().is_some_and(|entry| {
             let deadline = &entry.0;
-            !self.owners.get(&deadline.domain).is_some_and(|owner| {
-                owner.sequence == deadline.sequence && owner.expires_at == deadline.at
-            })
+            !self.owners[deadline.family]
+                .get(&deadline.domain)
+                .is_some_and(|owner| {
+                    owner.sequence == deadline.sequence && owner.expires_at == deadline.at
+                })
         }) {
             self.expiry_deadlines.pop();
         }
@@ -337,7 +373,7 @@ impl DesiredState {
 
     pub(super) fn compact_owner_heaps_if_needed(&mut self) {
         self.prune_stale_expiry_heads();
-        let live = self.owners.len();
+        let live = self.owner_count();
         let stale_limit = live.max(64);
         let expiry_stale = self.expiry_deadlines.len().saturating_sub(live);
         let eviction_stale = self.eviction_order.len().saturating_sub(live);
@@ -346,13 +382,16 @@ impl DesiredState {
         }
         let mut expiry_deadlines = BinaryHeap::with_capacity(live);
         let mut eviction_order = BinaryHeap::with_capacity(live);
-        for (domain, owner) in &self.owners {
-            expiry_deadlines.push(Reverse(DeadlineEntry {
-                at: owner.expires_at,
-                domain: Arc::clone(domain),
-                sequence: owner.sequence,
-            }));
-            eviction_order.push(Reverse((owner.sequence, Arc::clone(domain))));
+        for (family, owners) in self.owners.iter().enumerate() {
+            for (domain, owner) in owners {
+                expiry_deadlines.push(Reverse(DeadlineEntry {
+                    at: owner.expires_at,
+                    family,
+                    domain: Arc::clone(domain),
+                    sequence: owner.sequence,
+                }));
+                eviction_order.push(Reverse((owner.sequence, family, Arc::clone(domain))));
+            }
         }
         self.expiry_deadlines = expiry_deadlines;
         self.eviction_order = eviction_order;
@@ -382,12 +421,11 @@ impl DesiredState {
                 .pop()
                 .expect("expiry heap entry disappeared")
                 .0;
-            if self
-                .owners
+            if self.owners[deadline.family]
                 .get(&deadline.domain)
                 .is_some_and(|owner| owner.sequence == deadline.sequence && owner.expires_at <= now)
             {
-                self.remove_owner(&deadline.domain);
+                self.remove_owner(deadline.family, &deadline.domain);
             }
             self.prune_stale_expiry_heads();
         }
@@ -396,6 +434,10 @@ impl DesiredState {
 
     #[cfg(test)]
     pub(super) fn owner_domains(&self) -> Vec<String> {
-        self.owners.keys().map(ToString::to_string).collect()
+        self.owners
+            .iter()
+            .flat_map(BTreeMap::keys)
+            .map(ToString::to_string)
+            .collect()
     }
 }
