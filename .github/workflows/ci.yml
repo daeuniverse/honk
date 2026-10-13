@@ -141,7 +141,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload lane selection
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-selection
           path: target/ci-report/selection.json
@@ -243,7 +243,7 @@ jobs:
             if (failure) core.setFailed(failure.summary);
       - name: Upload parser CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-parser
           path: target/ci-report/parser.json
@@ -325,7 +325,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload lint CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-lint
           path: target/ci-report/lint.json
@@ -404,7 +404,7 @@ jobs:
       - run: cargo nextest run --workspace --profile ci
       - name: Upload workspace JUnit
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: workspace-junit
           path: target/nextest/ci/junit.xml
@@ -502,7 +502,7 @@ jobs:
           PY
       - name: Upload test CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-test
           path: target/ci-report/test.json
@@ -635,7 +635,7 @@ jobs:
           PY
       - name: Upload smoke CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-smoke
           path: target/ci-report/smoke.json
@@ -776,7 +776,7 @@ jobs:
         run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
       - name: Upload eBPF unit-test JUnit
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ebpf-unit-junit
           path: target/nextest/ci/junit.xml
@@ -790,7 +790,7 @@ jobs:
         run: .github/ci/run-vm-gate.sh floor
       - name: Upload guest output
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vm-tests-floor
           path: target/vm-tests/floor
@@ -837,7 +837,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload floor-VM CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-ebpf
           path: target/ci-report/ebpf.json
@@ -936,7 +936,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload eBPF compile-guard CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-ebpf-check
           path: target/ci-report/ebpf-check.json
@@ -1092,7 +1092,7 @@ jobs:
         run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
       - name: Upload eBPF unit-test JUnit
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ebpf-recent-unit-junit
           path: target/nextest/ci/junit.xml
@@ -1106,7 +1106,7 @@ jobs:
         run: .github/ci/run-vm-gate.sh recent
       - name: Upload guest output
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vm-tests-recent
           path: target/vm-tests/recent
@@ -1153,7 +1153,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload recent-VM CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-ebpf-recent
           path: target/ci-report/ebpf-recent.json
@@ -1223,7 +1223,7 @@ jobs:
       - run: cargo nextest run --workspace --profile ci
       - name: Upload workspace JUnit
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aarch64-junit
           path: target/nextest/ci/junit.xml
@@ -1259,7 +1259,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload aarch64 CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-aarch64
           path: target/ci-report/aarch64.json
@@ -1383,7 +1383,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload feature-set CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-features
           path: target/ci-report/features.json
@@ -1510,7 +1510,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload musl CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-cross-musl
           path: target/ci-report/cross-musl.json
@@ -1628,7 +1628,7 @@ jobs:
             }, null, 2) + "\n");
       - name: Upload review CI report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-report-review
           path: target/ci-report/review.json

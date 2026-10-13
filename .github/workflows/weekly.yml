@@ -87,7 +87,7 @@ jobs:
       - run: cargo +stable nextest run --workspace --profile ci
       - name: Upload preview JUnit
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: toolchain-preview-junit
           path: target/nextest/ci/junit.xml
@@ -186,7 +186,7 @@ jobs:
             --run-ignored only -E "test(=$vision_test)" --no-tests fail
       - name: Upload public loopback JUnit
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: public-vless-loopback-junit
           path: target/nextest/ci/junit.xml
@@ -292,7 +292,7 @@ jobs:
           exit "$failed"
       - name: Upload fuzz findings and corpus
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-inputs
           path: |
