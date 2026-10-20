@@ -14,7 +14,7 @@
 
 ## `native_api`
 
-Requires the opt-in `native-api` Cargo feature (build with `--features native-api` or `native-ui`; release builds include it). It does not require `clash-api`, and the listener is disabled by default. Enabling it without that feature fails startup. All effective fields require restart: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
+Requires the opt-in `native-api` Cargo feature (build with `--features native-api` or `native-ui`; the full and `-native-api` release artifacts include it). It does not require `clash-api`, and the listener is disabled by default. Enabling it without that feature fails startup. All effective fields require restart: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -61,7 +61,7 @@ Lists use individually quoted comma-separated entries, such as `allow_origins: '
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api).
 
-For a single binary, use a release build or `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`, and set `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. Asset/source identities, corresponding-source distribution and the management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
+For a single binary, use a full release build or `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`, and set `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. Asset/source identities, corresponding-source distribution and the management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
 
 File-configured geodata sources are administrator-controlled, restart-required and cannot be changed through source writes. With a state db, downloads can also use authenticated URL overrides or built-in sources. Userinfo, fragments, redirects and content encoding are rejected. Direct hostname sources require `global.bootstrap_resolver`; no system-DNS fallback is used. `assets.geodata.route` or the stored route can send downloads through the routing rules or a group instead, and a route that cannot carry a request never falls back to direct. Updates use the applicable configured, stored or built-in sources. The [management contract](./api.md#managed-entries-and-geodata) distinguishes network limits, verified-byte activation and partial durable replacement from rollback.
 

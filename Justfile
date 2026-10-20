@@ -17,11 +17,10 @@ build:
 build-core:
     cargo build --release -p honk-core --features "ebpf"
 
-# Build honk-core with eBPF only
-build-core-ebpf:
-    cargo build --release -p honk-core --features ebpf
-
 # Build honk-core for VyOS/Debian (static musl, portable)
+# The features argument adds to the crate defaults (clash-api,mimalloc,rprx),
+# so `just build-musl ebpf` is the clash-api-only shape; use build-musl-native
+# for the exact native-api-only feature set.
 # Uses zig cc/c++ as the musl toolchain (ci/zigcc, ci/zigcxx): boring-sys
 # (BoringSSL, C++) needs a clang-compatible compiler — under cross, CMake
 # injects clang-style --target flags into the ASM rules that real GCC rejects
@@ -46,6 +45,18 @@ build-musl-embedded-ui:
     set -euo pipefail
     doona="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}"
     HONK_DOONA_DIR="$doona" {{just_executable()}} build-musl "ebpf,native-ui"
+
+# Native-api-only musl build (no clash-api), matching the release asset.
+# Unlike build-musl, this passes --no-default-features for an exact set.
+build-musl-native:
+    ZIGCC_TARGET=x86_64-linux-musl \
+    CC_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcc \
+    CXX_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcxx \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER={{justfile_directory()}}/ci/zigcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
+    BINDGEN_EXTRA_CLANG_ARGS="$({{justfile_directory()}}/ci/zig-bindgen-env x86_64-linux-musl)" \
+    cargo build --release -p honk-core --no-default-features --features "ebpf,native-api,rprx,mimalloc" --target x86_64-unknown-linux-musl
+    @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
 
 # Build eBPF object standalone (optional; honk-core build.rs auto-builds it)
 # NOTE: an environment RUSTFLAGS overrides crates/honk-ebpf/.cargo/config.toml

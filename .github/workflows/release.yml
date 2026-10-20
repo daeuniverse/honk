@@ -73,33 +73,36 @@ jobs:
       - run: cargo test --workspace --no-fail-fast
 
   build:
-    name: build ${{ matrix.target }}${{ matrix.suffix }}
+    name: build ${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      ARTIFACT_NAME: honk-core-${{ startsWith(github.ref, 'refs/tags/debug.') && 'debug' || github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}
+      ARTIFACT_NAME: honk-core-${{ startsWith(github.ref, 'refs/tags/debug.') && 'debug' || github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Both arches ship two binaries: mimalloc (default, faster QUIC)
-          # and stock malloc (lower RSS high-water on small gateways).
-          - target: x86_64-unknown-linux-gnu
-            suffix: ""
-          - target: x86_64-unknown-linux-gnu
-            suffix: "-stock"
-          - target: x86_64-unknown-linux-musl
-            suffix: ""
-          - target: x86_64-unknown-linux-musl
-            suffix: "-stock"
-          - target: aarch64-unknown-linux-gnu
-            suffix: ""
-          - target: aarch64-unknown-linux-gnu
-            suffix: "-stock"
-          - target: aarch64-unknown-linux-musl
-            suffix: ""
-          - target: aarch64-unknown-linux-musl
-            suffix: "-stock"
+          # Full: Clash API + native API + embedded doona UI. Both arches ship
+          # two binaries: mimalloc (default, faster QUIC) and stock malloc
+          # (lower RSS high-water on small gateways).
+          - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: ""}
+          - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: ""}
+          - {target: x86_64-unknown-linux-musl, suffix: "", variant: full, name_suffix: ""}
+          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: ""}
+          - {target: aarch64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: ""}
+          - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: ""}
+          - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: ""}
+          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: ""}
+          # Lean variants apply to the static gateway builds only; the gnu
+          # artifacts stay full. The unsuffixed names remain the full build.
+          - {target: x86_64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: aarch64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: x86_64-unknown-linux-musl, suffix: "", variant: native-api, name_suffix: "-native-api"}
+          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: native-api, name_suffix: "-native-api"}
+          - {target: aarch64-unknown-linux-musl, suffix: "", variant: native-api, name_suffix: "-native-api"}
+          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: native-api, name_suffix: "-native-api"}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,7 +128,7 @@ jobs:
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target }}${{ matrix.suffix }}
+          key: ${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           workspaces: |
@@ -173,17 +176,26 @@ jobs:
           version: 0.14.1
 
       - name: Fetch doona for the embedded UI
+        if: matrix.variant == 'full'
         run: |
           set -euo pipefail
           dir=$(ci/fetch-doona.sh)
           echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
 
-      # Allocator variants must expose the same protocol and API capabilities.
+      # The release builds from an exact feature set: `--no-default-features`
+      # below means the native-api-only variant really drops the default-on
+      # clash-api. Allocator variants keep the same protocol and API features.
       - name: Resolve feature set
         shell: bash
         run: |
           set -euo pipefail
-          features=clash-api,ebpf,rprx,native-ui
+          case "${{ matrix.variant }}" in
+            full) features=clash-api,native-ui ;;
+            clash-api) features=clash-api ;;
+            native-api) features=native-api ;;
+            *) printf 'unknown variant: %s\n' "${{ matrix.variant }}" >&2; exit 1 ;;
+          esac
+          features="ebpf,rprx,$features"
           if [[ "${{ matrix.suffix }}" != "-stock" ]]; then
             features+=,mimalloc
           fi
@@ -227,9 +239,12 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
-          # The embedded doona UI keeps its own license and notices.
-          mkdir "dist/$name/doona"
-          cp -r "$HONK_DOONA_DIR"/{LICENSE,LICENSES,NOTICE,THIRD-PARTY-NOTICES.txt} "dist/$name/doona/"
+          # The embedded doona UI keeps its own license and notices; lean
+          # variants do not embed it and carry no doona directory.
+          if [[ "${{ matrix.variant }}" == full ]]; then
+            mkdir "dist/$name/doona"
+            cp -r "$HONK_DOONA_DIR"/{LICENSE,LICENSES,NOTICE,THIRD-PARTY-NOTICES.txt} "dist/$name/doona/"
+          fi
           tar -czf "$name.tar.gz" -C dist "$name"
 
       - name: Start the packaged x86_64 artifact
@@ -244,7 +259,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: honk-core-${{ matrix.target }}${{ matrix.suffix }}
+          name: honk-core-${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
           path: ${{ env.ARTIFACT_NAME }}.tar.gz
           retention-days: 1
 

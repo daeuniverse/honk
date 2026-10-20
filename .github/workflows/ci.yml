@@ -917,6 +917,8 @@ jobs:
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
       - run: cargo check -p honk-core --features ebpf,native-api --tests
+      # The release native-api-only artifact drops the default-on clash-api.
+      - run: cargo check -p honk-core --no-default-features --features ebpf,native-api,rprx,mimalloc
       - name: Write eBPF compile-guard CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

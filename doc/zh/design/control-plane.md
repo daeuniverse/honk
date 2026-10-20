@@ -302,7 +302,7 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 ## 原生观测 API
 
-独立且需显式编译的 `native-api` feature（以 `--features native-api` 或 `native-ui` 构建；发布产物包含）提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
+独立且需显式编译的 `native-api` feature（以 `--features native-api` 或 `native-ui` 构建；full 与 `-native-api` 发布产物包含）提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
 `native_api/server.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，30 秒读空闲期限仅在该连接没有进行中请求时生效（请求自 body 结束至响应完成视为进行中），停滞写入另有独立 30 秒期限，健康 SSE 与慢 handler 可持续超过 30 秒；accept 错误记录日志后重试，EMFILE/ENFILE/ENOBUFS/ENOMEM 退避 100 ms；连接任务失败只记录日志，不终止 server；HTTP 关闭共享五秒 grace，随后等待已准入的真实阻塞凭据任务结束。`crate::observe`（`observe.rs` 的 `Observation`、flows、rules、catalog 身份、`DnsRecorder`）拥有进程身份与引擎侧有界存储，独立于客户端；`native_api` 只负责 HTTP 投影。未启用 `native-api` 时观测 hook 编译为零开销 inert 替身。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 与 `/logs` 续传均为 ready → replay → live。
 

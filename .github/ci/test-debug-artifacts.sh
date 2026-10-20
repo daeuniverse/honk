@@ -12,6 +12,12 @@ for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown
     printf 'artifact\n' > "dist/honk-core-debug-$target$suffix.tar.gz"
   done
 done
+for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+  for suffix in '' -stock; do
+    printf 'artifact\n' > "dist/honk-core-debug-$target$suffix-clash-api.tar.gz"
+    printf 'artifact\n' > "dist/honk-core-debug-$target$suffix-native-api.tar.gz"
+  done
+done
 bash "$ci_dir/check-debug-artifacts.sh"
 
 expect_rejection() {
@@ -24,7 +30,13 @@ expect_rejection() {
   fi
 }
 
-artifact=dist/honk-core-debug-aarch64-unknown-linux-musl-stock.tar.gz
+artifact=dist/honk-core-debug-aarch64-unknown-linux-musl-stock-native-api.tar.gz
+mv "$artifact" saved.tar.gz
+expect_rejection
+mv saved.tar.gz "$artifact"
+bash "$ci_dir/check-debug-artifacts.sh"
+
+artifact=dist/honk-core-debug-x86_64-unknown-linux-gnu.tar.gz
 mv "$artifact" saved.tar.gz
 expect_rejection
 mv saved.tar.gz "$artifact"

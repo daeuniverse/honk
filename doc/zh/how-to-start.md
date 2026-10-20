@@ -88,16 +88,22 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 ### 预编译二进制
 
-从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包：
+从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。无后缀名为 full 构建：
 
-- `x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl`
+| 变体 | 包后缀 | 内容 |
+|---|---|---|
+| full | 无 | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
+| clash-api | `-clash-api` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
+| native-api | `-native-api` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
 
 musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备。
 
+精简变体按 fail-closed 处理：在 `-clash-api` 上启用 `experimental.native_api`，或没有 `native-ui` 却设置 `ui: embedded`，都会启动失败。`--store db` 与原生配置管理需要 `native-api`。
+
 ```shell
-tar -xzf honk-core-<version>-<target>.tar.gz
-sudo install -m 0755 honk-core-<version>-<target>/honk-core /usr/local/bin/honk-core
+pkg=honk-core-<version>-<target>   # 按下载的包追加 -stock、-clash-api 或 -native-api
+tar -xzf "$pkg.tar.gz"
+sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
 ```
 

@@ -88,16 +88,22 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 ### Prebuilt binaries
 
-Download the package matching the device architecture from [GitHub Releases](https://github.com/daeuniverse/honk/releases):
+Download the package matching the device architecture from [GitHub Releases](https://github.com/daeuniverse/honk/releases). The unsuffixed name is the full build:
 
-- `x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl`
+| Variant | Package suffix | Contents |
+|---|---|---|
+| full | none | Clash API, native API and the embedded doona UI (`x86_64`/`aarch64`, gnu and musl) |
+| clash-api | `-clash-api` | Clash API only; no native API and no embedded UI (musl only) |
+| native-api | `-native-api` | Native API only; no Clash API and no embedded UI (musl only) |
 
 The musl packages are static binaries intended for gateways. Packages without the `-stock` suffix use mimalloc for throughput; `-stock` packages use the system allocator and suit small devices where the RSS high-water mark matters more.
 
+The lean variants fail closed: enabling `experimental.native_api` on `-clash-api`, or `ui: embedded` without `native-ui`, fails startup. `--store db` and native configuration administration require `native-api`.
+
 ```shell
-tar -xzf honk-core-<version>-<target>.tar.gz
-sudo install -m 0755 honk-core-<version>-<target>/honk-core /usr/local/bin/honk-core
+pkg=honk-core-<version>-<target>   # append -stock, -clash-api or -native-api as downloaded
+tar -xzf "$pkg.tar.gz"
+sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
 ```
 

@@ -35,7 +35,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 ## 可选原生观测 API
 
-以 `--features native-api` 构建（release 构建已包含）并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立观测用户态连接与记录流、节点与组健康、出站计数、RSS/cgroup、历史、事件、结构化安全日志、DNS 与 provider 状态。支持有界探测、路由模拟、精确连接关闭与缓存失效、provider refresh、分网络 Selector 控制与临时设置。除显式启用的匿名 loopback 访问外，均要求 bearer secret 或密码登录。可托管可信目录，或以 `--features native-ui` 和 `ui: embedded` 使用固定版本的 doona，运行时不下载 UI。
+以 `--features native-api` 构建（full 与 `-native-api` 发布产物已包含）并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立观测用户态连接与记录流、节点与组健康、出站计数、RSS/cgroup、历史、事件、结构化安全日志、DNS 与 provider 状态。支持有界探测、路由模拟、精确连接关闭与缓存失效、provider refresh、分网络 Selector 控制与临时设置。除显式启用的匿名 loopback 访问外，均要求 bearer secret 或密码登录。可托管可信目录，或以 `--features native-ui` 和 `ui: embedded` 使用固定版本的 doona，运行时不下载 UI。
 
 `.dae` 仍是唯一配置权威。启动时捕获的源支持元数据读取、离线校验、授权源 PUT 和受限组 PATCH。主文件节点/provider 的创建与删除在实际激活后才返回成功，geodata 更新 operation 激活已验证的内容。编辑已有条目继续使用源 PUT；`--store db` 将已接受的源记录为状态数据库中的 revision。凭据源只读，返回正文时遮蔽 listener secret 值。启用原生 API 时，与 Clash 共用非持久化模式；成功的显式激活（含 no-op）重置 Rule 与设置，provider/network refresh 保留它们。原生 runtime mode、暂停/恢复与完整内核 flow 观测仍未开放。详见[原生 API 参考](doc/zh/reference/api.md#原生-api)。
 
@@ -49,7 +49,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 维护者推送 `debug.*` tag 会更新滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)，而不是 Latest。这些是 release profile 二进制，并非 Cargo debug profile 构建。滚动 tag 和附件会被替换；源 tag 保留，release 说明记录源 commit 和 workflow run。等待中的中间运行可能被后续运行取代。
 
-发布要求八个预期归档齐全且非空。若 artifact 已过期或被删除，使用 **Re-run all jobs**。发布不是原子操作；更新失败可能使 tag、说明和附件暂时不一致，需恢复后才能重新一致。
+发布要求十六个预期归档齐全且非空。若 artifact 已过期或被删除，使用 **Re-run all jobs**。发布不是原子操作；更新失败可能使 tag、说明和附件暂时不一致，需恢复后才能重新一致。
 
 ## Review 状态
 

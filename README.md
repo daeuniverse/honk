@@ -35,7 +35,7 @@ The [documentation index](doc/README.md) links all bilingual guides, references,
 
 ## Opt-in native observation API
 
-Build with `--features native-api` (release builds include it) and configure `experimental.native_api` for independent observations and controls on `127.0.0.1:9527`: bounded flows/logs/DNS history, probes, provider status/refresh, per-network Selector control and exact connection closure. Captured `.dae` sources remain authoritative, with opt-in source/Group PATCH transactions, synchronous main-file node/provider creation and removal, and verified-geodata operations; existing entries are edited through source PUT. `--store db` records accepted sources as revisions in a state database instead. A bearer secret or password login is required unless anonymous loopback is explicitly enabled. Serve a trusted directory, or build `--features native-ui` and set `ui: embedded` for the pinned doona build without runtime downloads. Native runtime_mode and full kernel transparency remain unavailable. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api).
+Build with `--features native-api` (the full and `-native-api` release artifacts include it) and configure `experimental.native_api` for independent observations and controls on `127.0.0.1:9527`: bounded flows/logs/DNS history, probes, provider status/refresh, per-network Selector control and exact connection closure. Captured `.dae` sources remain authoritative, with opt-in source/Group PATCH transactions, synchronous main-file node/provider creation and removal, and verified-geodata operations; existing entries are edited through source PUT. `--store db` records accepted sources as revisions in a state database instead. A bearer secret or password login is required unless anonymous loopback is explicitly enabled. Serve a trusted directory, or build `--features native-ui` and set `ui: embedded` for the pinned doona build without runtime downloads. Native runtime_mode and full kernel transparency remain unavailable. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api).
 
 ## Development
 
@@ -47,7 +47,7 @@ For unprivileged userspace development, use [mock mode](doc/en/how-to-start.md#u
 
 Maintainer `debug.*` tags update the rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug), not Latest. These are release-profile binaries, not Cargo debug-profile builds. The rolling tag and assets are replaced; source tags remain, and release notes record the source commit and workflow run. Pending intermediate runs may be superseded.
 
-Publication requires all eight expected archives to be present and nonempty. If artifacts have expired or been deleted, use **Re-run all jobs**. Publication is not transactional; a failed update may leave the tag, notes, and assets inconsistent until recovery.
+Publication requires all sixteen expected archives to be present and nonempty. If artifacts have expired or been deleted, use **Re-run all jobs**. Publication is not transactional; a failed update may leave the tag, notes, and assets inconsistent until recovery.
 
 ## Review status
 
