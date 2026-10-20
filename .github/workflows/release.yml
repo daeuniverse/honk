@@ -76,8 +76,6 @@ jobs:
     name: build ${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      ARTIFACT_NAME: honk-core-${{ startsWith(github.ref, 'refs/tags/debug.') && 'debug' || github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +105,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      # Manual runs can select a branch whose name contains '/', which cannot
+      # appear in an asset path. Tags keep the existing debug/v* spelling.
+      - name: Resolve artifact name
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/debug.* ]]; then
+            prefix=debug
+          else
+            prefix=${GITHUB_REF_NAME//\//-}
+          fi
+          echo "ARTIFACT_NAME=honk-core-$prefix-${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}" >> "$GITHUB_ENV"
 
       - name: Read Rust toolchains
         id: toolchain
