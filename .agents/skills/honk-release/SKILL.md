@@ -12,12 +12,14 @@ Publication belongs to the maintainer. Contributors can prepare the notes withou
 1. Confirm the intended `main` tip has been pushed.
 2. Confirm its branch CI from `.github/workflows/ci.yml` is green in GitHub Actions, through the web UI or API.
 3. The maintainer creates and pushes the next tag at that tip. Tag naming: `.agents/rules/release.md`, "Release process (standing convention)".
-4. The tag runs `.github/workflows/release.yml`. Wait for its test, build and release jobs to finish and create the GitHub Release.
-5. The maintainer edits the Release notes. Notes format and author attribution: `.agents/rules/release.md`, "Release process (standing convention)". For author lookup and note editing, use the `gh` commands there or the GitHub commit pages and Release editor in the web UI; the GitHub commits and releases APIs are another option.
+4. The tag runs `.github/workflows/release.yml`. Wait for its test, build and release jobs to finish and create the draft GitHub Release.
+5. The maintainer edits the draft's notes. Notes format and author attribution: `.agents/rules/release.md`, "Release process (standing convention)". For author lookup and note editing, use the `gh` commands there or the GitHub commit pages and Release editor in the web UI; the GitHub commits and releases APIs are another option.
+6. The maintainer checks the assets against the build and publishes the draft: `gh release edit <tag> --repo daeuniverse/honk --draft=false`, or **Publish release** in the web UI.
 
 ## Checklist
 
 - [ ] The intended `main` tip is pushed and its branch CI is green.
 - [ ] The maintainer created and pushed the next tag under the release rule.
-- [ ] The tag workflow finished and created the Release.
+- [ ] The tag workflow finished and created the draft Release.
 - [ ] The maintainer edited the notes using the release rule's format and author attribution.
+- [ ] The maintainer checked the assets and published the draft.

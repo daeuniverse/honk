@@ -41,7 +41,7 @@ Before upload, every x86_64 matrix entry extracts its packaged tarball into a cl
 ### Release process (standing convention)
 
 - **Tag naming:** `v0.0.1.beta.N` (strictly incrementing; check `git tag -l | sort -V | tail`). Tag the current `main` tip after it is pushed and its branch CI is green.
-- **Trigger:** tag push runs the full workflow above and creates the GitHub Release with `generate_release_notes: true` as a base.
+- **Trigger:** tag push runs the full workflow above and creates a draft GitHub Release with `generate_release_notes: true` as a base. Nobody outside the repository sees it until the maintainer publishes it.
 - **Release notes (agent-curated, dae `v2.0.0` style):** replace auto notes with this format after Release creation:
 
     ```markdown
@@ -72,7 +72,7 @@ Before upload, every x86_64 matrix entry extracts its packaged tarball into a cl
 
     - Attribute commits to GitHub-resolved authors (`gh api repos/daeuniverse/honk/commits/<sha> --jq .author.login`), never raw git `Author:` names: the daeuniverse-org Release must show org-visible identity.
     - Group commits by their `type(scope)` prefix (`feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation, `refactor`/`test` → fold into the nearest section or omit).
-    - Apply `gh release edit <tag> --repo daeuniverse/honk --notes-file <file>` only after the build and workflow `release` job finish; the Release page does not exist earlier.
+    - Apply `gh release edit <tag> --repo daeuniverse/honk --notes-file <file>` only after the build and workflow `release` job finish; the draft does not exist earlier. Check the assets against the build, then publish with `gh release edit <tag> --repo daeuniverse/honk --draft=false`.
 
 - **Deployment:** after tagging, use the canonical musl mimalloc gateway tarball. Note development/manual `scp` deployments in the PR/issue of record when they differ from release artifacts.
 
