@@ -43,7 +43,7 @@ Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all p
 
 ### Release process (standing convention)
 
-- **Versions:** SemVer, `vMAJOR.MINOR.PATCH` with an optional `-alpha.N`, `-beta.N` or `-rc.N` suffix. `[workspace.package] version` in `Cargo.toml` is the only source: bump it (and `Cargo.lock`) in a pull request, then tag `v<that version>` on the merged `main` tip once its branch CI is green. The test job runs `.github/ci/check-release-version.sh` and fails a tag that is not SemVer or differs from the manifest. A tag with a suffix publishes as a prerelease. Tags from before this scheme (`v0.0.1.beta.N`) stay as they are; never move or delete a published tag.
+- **Versions:** SemVer, `vMAJOR.MINOR.PATCH` with an optional `-alpha.N`, `-beta.N` or `-rc.N` suffix. `[workspace.package] version` in `Cargo.toml` is the only source: bump it (and `Cargo.lock` and `crates/honk-ebpf/Cargo.lock`) in a pull request, then tag `v<that version>` on the merged `main` tip once its branch CI is green. The test job runs `.github/ci/check-release-version.sh` and fails a tag that is not SemVer or differs from the manifest. A tag with a suffix publishes as a prerelease. Tags from before this scheme (`v0.0.1.beta.N`) stay as they are; never move or delete a published tag.
 - **Draft:** the tag creates a draft Release. Nobody outside the repository sees it until the maintainer publishes it.
 - **Notes:** `.github/ci/release-notes.sh` writes the draft body from the commits since the previous `v*` tag, followed by the `## Downloads` section from `.github/ci/release-assets.sh`:
 
