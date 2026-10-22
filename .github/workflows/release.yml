@@ -30,8 +30,8 @@ jobs:
         run: |
           bash .github/ci/test-release-version.sh
           bash .github/ci/test-release-notes.sh
-      # A formal tag must be SemVer and equal the workspace version; this fails
-      # before the sixteen builds start.
+      # A formal tag must be SemVer and equal the workspace version. The builds run
+      # in parallel; the release job needs this one, so a mismatched tag publishes nothing.
       - name: Check the tag against the workspace version
         if: startsWith(github.ref, 'refs/tags/v')
         run: bash .github/ci/check-release-version.sh "$GITHUB_REF_NAME"
