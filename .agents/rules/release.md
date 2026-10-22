@@ -73,6 +73,7 @@ Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all p
     ```
 
     - Attribute commits to GitHub-resolved authors (`gh api repos/daeuniverse/honk/commits/<sha> --jq .author.login`), never raw git `Author:` names: the daeuniverse-org Release must show org-visible identity.
+    - Keep the workflow's `## Downloads` section, the archive table written by `.github/ci/release-assets.sh`, below the curated notes.
     - Group commits by their `type(scope)` prefix (`feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation, `refactor`/`test` → fold into the nearest section or omit).
     - Apply `gh release edit <tag> --repo daeuniverse/honk --notes-file <file>` only after the build and workflow `release` job finish; the Release page does not exist earlier.
 

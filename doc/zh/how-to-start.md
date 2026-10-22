@@ -92,13 +92,13 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。无后缀名为 full 构建：
 
-| 变体 | 包后缀 | 内容 |
-|---|---|---|
-| full | 无 | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
-| clash-api | `-clash-api` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
-| native-api | `-native-api` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
+| 变体 | 包后缀 | Release 标签 | 内容 |
+|---|---|---|---|
+| full | 无 | `fullapi` | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
+| clash-api | `-clash-api` | `clashapi` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
+| native-api | `-native-api` | `nativeapi` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
 
-musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备。
+musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐（标签 `mimalloc`）；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备（标签 `stockalloc`）。每个 release 的 Downloads 一节按 `{allocator}-{API}-{arch}-{libc}` 标签列出全部归档。
 
 精简变体按 fail-closed 处理：在 `-clash-api` 上启用 `experimental.native_api`，或没有 `native-ui` 却设置 `ui: embedded`，都会启动失败。`--store db` 与原生配置管理需要 `native-api`。
 

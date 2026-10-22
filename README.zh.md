@@ -23,7 +23,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 真实透明代理需要 **root、Linux 6.12+、所需内核选项和 bpffs**。首次部署会修改网络 hook、命名空间和 sysctl；须保留带外管理通道。
 
 1. 按[启动指南](doc/zh/how-to-start.md)检查内核、安装程序、准备 direct-only 配置并验证连通性。
-2. 从 [Releases](https://github.com/daeuniverse/honk/releases) 下载匹配的二进制，或按指南准备源码构建依赖。发布二进制内嵌 eBPF 对象；源码构建需要启用 `ebpf` feature。仅运行 `cargo build --release` **不会**启用真实数据面。
+2. 从 [Releases](https://github.com/daeuniverse/honk/releases) 下载匹配的二进制，每个 release 的 Downloads 一节说明各个归档，可用 `SHA256SUMS` 校验；或按指南准备源码构建依赖。发布二进制内嵌 eBPF 对象；源码构建需要启用 `ebpf` feature。仅运行 `cargo build --release` **不会**启用真实数据面。
 3. 按[配置指南](doc/zh/configuration.md)添加节点、组、路由和 DNS。仓库提供[完整示例](config.dae)和[最小开发示例](config.min.dae)；使用前须调整接口和节点地址。
 
 [文档索引](doc/README.md)汇总双语指南、参考和子系统设计。实现细节可从[架构概览](doc/zh/design/overview.md)、[节点参考](doc/zh/reference/nodes.md)或 [API 参考](doc/zh/reference/api.md)开始。
@@ -47,7 +47,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 ### Debug 构建
 
-维护者推送 `debug.*` tag 会更新滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)，而不是 Latest。这些是 release profile 二进制，并非 Cargo debug profile 构建。滚动 tag 和附件会被替换；源 tag 保留，release 说明记录源 commit 和 workflow run。等待中的中间运行可能被后续运行取代。
+维护者推送 `debug.*` tag 会更新滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)，而不是 Latest。这些是 release profile 二进制，并非 Cargo debug profile 构建。滚动 tag 和附件会被替换；源 tag 保留，release 说明记录源 commit 和 workflow run，并列出每个归档。与正式版一样，每个 Debug release 都附带 `SHA256SUMS` 与构建来源证明。等待中的中间运行可能被后续运行取代。
 
 发布要求十六个预期归档齐全且非空。若 artifact 已过期或被删除，使用 **Re-run all jobs**。发布不是原子操作；更新失败可能使 tag、说明和附件暂时不一致，需恢复后才能重新一致。
 

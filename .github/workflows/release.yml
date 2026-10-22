@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test Debug artifact preflight
         run: bash .github/ci/test-debug-artifacts.sh
+      - name: Test release asset table
+        run: bash .github/ci/test-release-assets.sh
       - name: Read Rust toolchain
         id: toolchain
         run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
@@ -307,6 +309,16 @@ jobs:
         working-directory: dist
         run: sha256sum -- *.tar.gz > SHA256SUMS
 
+      # Every release body explains each archive as {allocator}-{API}-{arch}-{libc}.
+      - name: Write release notes
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          bash release-source/.github/ci/release-assets.sh dist > assets.md
+          source_lines=$(printf "Source tag: \`%s\`\n\nCommit: \`%s\`\n\nBuild: %s" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUN_URL")
+          printf "Debug build of \`%s\`.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
+          printf 'Rolling debug build: the newest published debug tag. Each tag also keeps its own release.\n\n%s\n\n' "$source_lines" | cat - assets.md > notes-rolling.md
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -321,6 +333,7 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          body_path: assets.md
           generate_release_notes: true
 
       - name: Check complete Debug artifacts
@@ -341,12 +354,7 @@ jobs:
             dist/SHA256SUMS
           overwrite_files: true
           fail_on_unmatched_files: true
-          body: |
-            Debug build of `${{ github.ref_name }}`.
-
-            Source tag: `${{ github.ref_name }}`
-            Commit: `${{ github.sha }}`
-            Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          body_path: notes-debug.md
 
       # The rolling Debug release keeps one stable page and download URL on the newest published build; the tag release
       # above stays as the immutable copy that downstream pins name.
@@ -382,9 +390,4 @@ jobs:
             dist/SHA256SUMS
           overwrite_files: true
           fail_on_unmatched_files: true
-          body: |
-            Rolling debug build: the newest published debug tag. Each tag also keeps its own release.
-
-            Source tag: `${{ github.ref_name }}`
-            Commit: `${{ github.sha }}`
-            Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          body_path: notes-rolling.md

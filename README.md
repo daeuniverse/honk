@@ -23,7 +23,7 @@ Implemented does not mean fully reviewed; see [review status](#review-status). T
 Real transparent proxying requires **root, Linux 6.12+, the required kernel options, and bpffs**. Initial deployment changes network hooks, namespaces, and sysctls; keep an out-of-band management path available.
 
 1. Follow the [startup guide](doc/en/how-to-start.md) for kernel checks, installation, a direct-only configuration, and connectivity verification.
-2. Download a matching binary from [Releases](https://github.com/daeuniverse/honk/releases), or follow the guide's source-build prerequisites. Release binaries embed the eBPF object; source builds require the `ebpf` feature. Plain `cargo build --release` does **not** enable the real datapath.
+2. Download a matching binary from [Releases](https://github.com/daeuniverse/honk/releases); each release's Downloads section explains every archive, and `SHA256SUMS` verifies it. Or follow the guide's source-build prerequisites. Release binaries embed the eBPF object; source builds require the `ebpf` feature. Plain `cargo build --release` does **not** enable the real datapath.
 3. Add nodes, groups, routing, and DNS using the [configuration guide](doc/en/configuration.md). The repository provides [full](config.dae) and [minimal development](config.min.dae) examples; adapt interfaces and node addresses before use.
 
 The [documentation index](doc/README.md) links all bilingual guides, references, and subsystem designs. Start with the [architecture overview](doc/en/design/overview.md), [node reference](doc/en/reference/nodes.md), or [API reference](doc/en/reference/api.md) for details.
@@ -45,7 +45,7 @@ For unprivileged userspace development, use [mock mode](doc/en/how-to-start.md#u
 
 ### Debug builds
 
-Maintainer `debug.*` tags update the rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug), not Latest. These are release-profile binaries, not Cargo debug-profile builds. The rolling tag and assets are replaced; source tags remain, and release notes record the source commit and workflow run. Pending intermediate runs may be superseded.
+Maintainer `debug.*` tags update the rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug), not Latest. These are release-profile binaries, not Cargo debug-profile builds. The rolling tag and assets are replaced; source tags remain, and release notes record the source commit and workflow run and list each archive. Every Debug release carries `SHA256SUMS` and build provenance, like formal releases. Pending intermediate runs may be superseded.
 
 Publication requires all sixteen expected archives to be present and nonempty. If artifacts have expired or been deleted, use **Re-run all jobs**. Publication is not transactional; a failed update may leave the tag, notes, and assets inconsistent until recovery.
 

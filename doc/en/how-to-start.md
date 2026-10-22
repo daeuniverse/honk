@@ -92,13 +92,13 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 Download the package matching the device architecture from [GitHub Releases](https://github.com/daeuniverse/honk/releases). The unsuffixed name is the full build:
 
-| Variant | Package suffix | Contents |
-|---|---|---|
-| full | none | Clash API, native API and the embedded doona UI (`x86_64`/`aarch64`, gnu and musl) |
-| clash-api | `-clash-api` | Clash API only; no native API and no embedded UI (musl only) |
-| native-api | `-native-api` | Native API only; no Clash API and no embedded UI (musl only) |
+| Variant | Package suffix | Release label | Contents |
+|---|---|---|---|
+| full | none | `fullapi` | Clash API, native API and the embedded doona UI (`x86_64`/`aarch64`, gnu and musl) |
+| clash-api | `-clash-api` | `clashapi` | Clash API only; no native API and no embedded UI (musl only) |
+| native-api | `-native-api` | `nativeapi` | Native API only; no Clash API and no embedded UI (musl only) |
 
-The musl packages are static binaries intended for gateways. Packages without the `-stock` suffix use mimalloc for throughput; `-stock` packages use the system allocator and suit small devices where the RSS high-water mark matters more.
+The musl packages are static binaries intended for gateways. Packages without the `-stock` suffix use mimalloc for throughput (label `mimalloc`); `-stock` packages use the system allocator and suit small devices where the RSS high-water mark matters more (label `stockalloc`). The Downloads section of each release lists every archive with its `{allocator}-{API}-{arch}-{libc}` label.
 
 The lean variants fail closed: enabling `experimental.native_api` on `-clash-api`, or `ui: embedded` without `native-ui`, fails startup. `--store db` and native configuration administration require `native-api`.
 
