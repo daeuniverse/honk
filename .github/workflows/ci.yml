@@ -1670,3 +1670,43 @@ jobs:
           path: target/ci-report/review.json
           retention-days: 30
           if-no-files-found: error
+
+  ci-ok:
+    name: ci-ok
+    needs:
+      - changes
+      - parser
+      - docs
+      - lint
+      - test
+      - smoke
+      - ebpf
+      - ebpf-check
+      - ebpf-recent
+      - aarch64
+      - features
+      - cross-musl
+      - review-bot
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every selected lane to pass
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "- `\(.key)`: \(.value.result)"' <<<"${NEEDS}" >> "${GITHUB_STEP_SUMMARY}"
+          # A skipped lane was not selected; failure, cancellation or failed change detection is not a pass.
+          bad="$(jq -r '
+            to_entries
+            | map(select(.value.result == "failure" or .value.result == "cancelled"
+                or (.key == "changes" and .value.result != "success")))
+            | map(.key + "=" + .value.result)
+            | join(", ")' <<<"${NEEDS}")"
+          if [ -n "${bad}" ]; then
+            echo "ci-ok: ${bad}" | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          echo "ci-ok: all selected lanes passed" | tee -a "${GITHUB_STEP_SUMMARY}"
