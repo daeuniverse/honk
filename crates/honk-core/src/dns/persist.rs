@@ -156,7 +156,7 @@ impl ReservedInvalidation<'_> {
         let epoch = self
             .persister
             .epoch
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
                 epoch.checked_add(1)
             })
             .expect("DNS persistence epoch exhausted")

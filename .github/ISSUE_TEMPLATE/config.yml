@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and usage help / 使用问题
+    url: https://github.com/daeuniverse/honk/discussions
+    about: Ask how to configure or deploy honk in Discussions. / 配置与部署问题请到 Discussions 提问。

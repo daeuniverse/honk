@@ -331,7 +331,7 @@ pub(super) async fn connect(inner: Box<dyn AsyncReadWrite>) -> anyhow::Result<Ar
             // An explicit pool close wins over a concurrent successful driver end.
             let _ = session
                 .state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                     matches!(
                         TerminalState::from_raw(state),
                         TerminalState::Active | TerminalState::Draining

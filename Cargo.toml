@@ -56,7 +56,7 @@ reqwest = { version = "0.13", features = [
 ], default-features = false }
 h2 = "0.4"
 http = "1"
-hyper = { version = "1.11", features = ["client", "server", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = [
     "tokio",
     "service",
@@ -88,7 +88,7 @@ rustls-pemfile = "2.2"
 webpki-roots = "1"
 aes-gcm = "0.11"
 aes = "0.9"
-chacha20 = "0"
+chacha20 = "0.10"
 chacha20poly1305 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -125,9 +125,9 @@ glob = "0.3"
 base64 = "0.23"
 bytes = "1"
 rand = "0.10"
-lru = "0.18"
+lru = "0.19"
 libc = "0.2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 dashmap = "6"
 libsystemd = "0.7"
 nix = { version = "0.31", features = [
@@ -140,7 +140,7 @@ nix = { version = "0.31", features = [
     "zerocopy",
 ] }
 pin-project-lite = "0.2"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 flate2 = "1.1"
 
 # Dev/test utilities
@@ -182,5 +182,5 @@ strip = true
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b65ecaa69b7eefe3c2fecd074b97facd2" }
 # honk fork (branch `honk-0.11` = upstream 0.11.x + patches, auto-merged): bound receive fragmentation, expose delivery and flow-control state,
 # allow runtime flow-control window tuning, and auto-tune the connection receive window.
-quinn = { git = "https://github.com/Glassyiris/quinn", rev = "b29ded20" }
-quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "b29ded20" }
+quinn = { git = "https://github.com/Glassyiris/quinn", rev = "8669cdb8f8a1740a1583ebe44ec1b623cdb11e61" }
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "8669cdb8f8a1740a1583ebe44ec1b623cdb11e61" }

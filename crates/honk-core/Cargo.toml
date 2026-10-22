@@ -156,7 +156,7 @@ brotli.workspace = true
 criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 futures-util = "0.3"
 stats_alloc = "0.1.10"
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.59", default-features = false }
 
 [[bench]]
 name = "dns"

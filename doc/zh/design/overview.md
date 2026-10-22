@@ -1,6 +1,6 @@
 # 架构概览
 
-`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎；本页说明其架构及关键运行时规则。项目当前为实验性 alpha `v0.0.1-alpha`，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
+`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎；本页说明其架构及关键运行时规则。项目当前为实验性 alpha，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
 
 其配置语法和 TC 数据路径源自 dae，并在文档声明的范围内保持 dae 兼容；出站 Handler、组与 Clash API 则采用 sing-box 风格的设计。`honk` 是独立实现，现已与两者显著分化。
 

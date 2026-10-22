@@ -215,11 +215,13 @@ impl RealEbpfBackend {
             .ok_or_else(|| anyhow::anyhow!("required EVENT_RINGBUF map not found"))?;
         let event_ring = aya::maps::RingBuf::try_from(event_map)
             .map_err(|error| anyhow::anyhow!("required EVENT_RINGBUF open: {error}"))?;
-        let event_fd =
-            tokio::io::unix::AsyncFd::with_interest(event_ring, tokio::io::Interest::READABLE)
-                .map_err(|error| {
-                    anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}")
-                })?;
+        let event_fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                event_ring,
+                tokio::io::Interest::READABLE,
+            )
+        }
+        .map_err(|error| anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}"))?;
         match pname_mode {
             process_name::PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")
@@ -503,8 +505,12 @@ impl RealEbpfBackend {
         let log_flush_handle = match aya_log::EbpfLogger::init(&mut bpf) {
             Ok(logger) => {
                 debug!("eBPF logger initialized");
-                match tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)
-                {
+                match unsafe {
+                    tokio::io::unix::AsyncFd::register_with_interest(
+                        logger,
+                        tokio::io::Interest::READABLE,
+                    )
+                } {
                     Ok(async_logger) => Some(tokio::spawn(async move {
                         let mut async_logger = async_logger;
                         loop {

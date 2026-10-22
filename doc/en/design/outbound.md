@@ -355,10 +355,7 @@ error/excluding GOAWAY are stream errors rather than clean EOF. Already buffered
 payload precedes terminal read errors, which remain errors on later reads;
 successful receive completion remains EOF even if the write direction later
 fails. An admitted stream can finish after graceful GOAWAY; no application
-bytes are retried. The locked `h2` 0.4.19 still normalizes a missing `:status` to
-200. [Upstream fix #959](https://github.com/hyperium/h2/pull/959) is merged but not
-included in this locked release; rejection of that malformed response still
-requires upgrading to a published release containing the fix.
+bytes are retried.
 
 VMess records errors returned by its relay before closing the duplex half, so
 response-header and body-decoding failures reach the stream owner instead of EOF.

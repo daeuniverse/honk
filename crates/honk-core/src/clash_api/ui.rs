@@ -609,7 +609,10 @@ fn extract_ui_zip_bounded(
         );
     }
     let mut remaining = limits.bytes;
-    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let names = archive
+        .file_names()
+        .map(|name| name.map(std::borrow::Cow::into_owned))
+        .collect::<Result<Vec<String>, _>>()?;
     let trim_top = single_top_directory(&names);
 
     std::fs::create_dir_all(output)?;
@@ -618,7 +621,8 @@ fn extract_ui_zip_bounded(
         if file.is_dir() {
             continue;
         }
-        let mut components: Vec<&str> = file.name().split('/').collect();
+        let name = file.name()?;
+        let mut components: Vec<&str> = name.split('/').collect();
         if trim_top {
             components.remove(0);
         }

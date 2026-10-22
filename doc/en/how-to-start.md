@@ -4,7 +4,7 @@ honk is an experimental eBPF transparent proxy engine for Linux. Follow this gui
 
 > **Warning**
 >
-> honk is still `v0.0.1-alpha`. Real mode loads eBPF programs, attaches TC and cgroup hooks, creates `dae0`/`daens`, changes sysctls, and uses NFQUEUE 320 by default. Keep an out-of-band management path available during the first deployment.
+> honk is still alpha. Real mode loads eBPF programs, attaches TC and cgroup hooks, creates `dae0`/`daens`, changes sysctls, and uses NFQUEUE 320 by default. Keep an out-of-band management path available during the first deployment.
 
 ## Linux kernel requirements
 

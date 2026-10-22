@@ -1,0 +1,79 @@
+name: Bug report / 问题报告
+description: honk behaves differently from its documentation. / honk 的行为与文档不符。
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Write in English or Chinese. Remove passwords, UUIDs, subscription URLs and API tokens from everything you paste.
+        中英文均可。粘贴的内容请先删除密码、UUID、订阅地址与 API token。
+  - type: textarea
+    id: version
+    attributes:
+      label: Version / 版本
+      description: Output of `honk-core --version`. / `honk-core --version` 的输出。
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: package
+    attributes:
+      label: Package or build / 安装包或构建方式
+      description: The release asset name, the OpenWrt package, or the source commit and features you built with. / Release 附件名、OpenWrt 软件包，或源码构建的 commit 与 feature。
+      placeholder: honk-core-<version>-aarch64-unknown-linux-musl-stock.tar.gz
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System / 系统
+      description: Distribution or OpenWrt release, CPU architecture, and the output of `uname -r`. / 发行版或 OpenWrt 版本、CPU 架构，以及 `uname -r` 的输出。
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened / 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour / 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 重现步骤
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration / 配置
+      description: The smallest part of the configuration that reproduces the problem, with secrets removed. / 能重现问题的最小配置片段，已删除敏感信息。
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / 日志
+      description: honk-core output around the problem, at a higher log level if you can. / 问题前后的 honk-core 输出，最好调高日志级别。
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks / 确认
+      options:
+        - label: I searched existing issues and found no report of this. / 我已搜索现有 issue，没有相同的报告。
+          required: true
+        - label: The problem also happens on the newest release or Debug build. / 最新的 release 或 Debug 构建上同样存在此问题。

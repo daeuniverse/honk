@@ -6,7 +6,7 @@ English | [中文](./README.zh.md)
 
 honk is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapath and configuration syntax are inspired by [dae](https://github.com/daeuniverse/dae); its outbound groups, multi-protocol dialers, and Clash-compatible API follow [sing-box](https://github.com/SagerNet/sing-box) designs. It is an independent implementation, not a line-for-line port.
 
-> **Early alpha (`v0.0.1-alpha`), not recommended for production.** Expect breaking changes, incomplete features, and limited real-world validation.
+> **Early alpha, not recommended for production.** Expect breaking changes, incomplete features, and limited real-world validation.
 
 ## Capabilities
 
