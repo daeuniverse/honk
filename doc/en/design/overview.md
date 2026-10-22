@@ -1,6 +1,6 @@
 # Architecture overview
 
-`honk` is a Linux eBPF transparent-proxy engine for gateway and host traffic. This page describes its architecture and runtime invariants. The project is experimental alpha `v0.0.1-alpha`, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
+`honk` is a Linux eBPF transparent-proxy engine for gateway and host traffic. This page describes its architecture and runtime invariants. The project is experimental alpha, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
 
 Its configuration syntax and TC datapath derive from dae and remain dae-compatible where documented. Its outbound handlers, groups, and Clash API follow sing-box designs. `honk` is an independent implementation and has diverged substantially from both.
 

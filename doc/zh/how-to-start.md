@@ -4,7 +4,7 @@ honk 是 Linux 上的实验性 eBPF 透明代理引擎。本文说明普通用�
 
 > **注意**
 >
-> honk 当前仍是 `v0.0.1-alpha`。真实模式会加载 eBPF、挂接 TC/cgroup hook、创建 `dae0`/`daens`、调整 sysctl，并在默认配置下占用 NFQUEUE 320。首次部署请保留带外管理通道。
+> honk 当前仍处于 alpha 阶段。真实模式会加载 eBPF、挂接 TC/cgroup hook、创建 `dae0`/`daens`、调整 sysctl，并在默认配置下占用 NFQUEUE 320。首次部署请保留带外管理通道。
 
 ## Linux 内核要求
 
