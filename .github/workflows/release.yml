@@ -409,3 +409,17 @@ jobs:
           overwrite_files: true
           fail_on_unmatched_files: true
           body_path: notes-rolling.md
+
+      # Downstream pins name a per-tag Debug release, so the newest ten stay; older
+      # ones are removed from the Releases page while their source tags remain.
+      - name: Prune old Debug releases
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: 10
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | startswith(\"debug.\"))] | sort_by(.createdAt) | reverse | .[$KEEP:] | .[].tagName" |
+            while read -r tag; do
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            done
