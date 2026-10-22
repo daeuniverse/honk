@@ -14,7 +14,7 @@ Publication belongs to the maintainer. Contributors can prepare the notes withou
 3. The `Cargo.toml` workspace version on that tip is the release version (bumped in a merged pull request). The maintainer creates and pushes `v<version>` at that tip. Versions: `.agents/rules/release.md`, "Release process (standing convention)".
 4. The tag runs `.github/workflows/release.yml`. Wait for its test, build and release jobs to finish and create the draft GitHub Release with generated notes.
 5. The maintainer writes the draft's Highlights and adjusts the generated entries. Notes format and author attribution: `.agents/rules/release.md`, "Release process (standing convention)". For author lookup and note editing, use the `gh` commands there or the GitHub commit pages and Release editor in the web UI; the GitHub commits and releases APIs are another option.
-6. The maintainer checks the assets against the build and publishes the draft: `gh release edit <tag> --repo daeuniverse/honk --draft=false`, or **Publish release** in the web UI.
+6. The maintainer checks the assets against the build and publishes the draft. Publish commands: `.agents/rules/release.md`, "Release process (standing convention)".
 
 ## Checklist
 
