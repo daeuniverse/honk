@@ -10,7 +10,7 @@ repo=${GITHUB_REPOSITORY:-daeuniverse/honk}
 prev=$(git describe --tags --abbrev=0 --match 'v*' "$tag^" 2>/dev/null || true)
 range=${prev:+$prev..}$tag
 
-declare -A sections=([feat]="" [fix]="" [perf]="" [docs]="")
+declare -A title=([feat]='New Features' [fix]='Bug Fixes' [perf]='Performance' [docs]='Documentation') sections=()
 other=0
 
 login() {
@@ -25,7 +25,7 @@ while IFS=$'\t' read -r sha subject; do
   fi
   type=${BASH_REMATCH[1]}
   [[ $type == bench ]] && type=docs
-  if [[ -z ${sections[$type]+set} ]]; then
+  if [[ -z ${title[$type]+set} ]]; then
     other=$((other + 1))
     continue
   fi
@@ -35,14 +35,8 @@ done < <(git log --no-merges --reverse --format='%H%x09%s' "$range")
 
 printf '## Highlights\n\n<!-- Maintainer: two to five bullets on what this release means to a gateway operator. -->\n\n## What'"'"'s Changed\n'
 for type in feat fix perf docs; do
-  [[ -z ${sections[$type]} ]] && continue
-  case $type in
-    feat) title='New Features' ;;
-    fix) title='Bug Fixes' ;;
-    perf) title='Performance' ;;
-    docs) title='Documentation' ;;
-  esac
-  printf '\n### %s\n\n%s' "$title" "${sections[$type]}"
+  [[ -z ${sections[$type]-} ]] && continue
+  printf '\n### %s\n\n%s' "${title[$type]}" "${sections[$type]}"
 done
 if (( other > 0 )); then
   printf '\n%d refactoring, test and maintenance commits are not listed.\n' "$other"
