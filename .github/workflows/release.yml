@@ -323,17 +323,20 @@ jobs:
       # Every release body explains each archive as {allocator}-{API}-{arch}-{libc}.
       - name: Write release notes
         env:
-          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           bash release-source/.github/ci/release-assets.sh dist > assets.md
           source_lines=$(printf "Source tag: \`%s\`\n\nCommit: \`%s\`\n\nBuild: %s" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUN_URL")
           printf "Debug build of \`%s\`.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
           printf 'Rolling debug build: the newest published debug tag. Each tag also keeps its own release.\n\n%s\n\n' "$source_lines" | cat - assets.md > notes-rolling.md
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            (cd release-source && bash .github/ci/release-notes.sh "$GITHUB_REF_NAME") > notes-formal.md
-            printf '\n' | cat - assets.md >> notes-formal.md
-          fi
+
+      - name: Write formal release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release-source && bash .github/ci/release-notes.sh "$GITHUB_REF_NAME") > notes-formal.md
+          printf '\n' | cat - assets.md >> notes-formal.md
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
