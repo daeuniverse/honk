@@ -104,10 +104,13 @@ The lean variants fail closed: enabling `experimental.native_api` on `-clash-api
 
 ```shell
 pkg=honk-core-<version>-<target>   # append -stock, -clash-api or -native-api as downloaded
+sha256sum -c --ignore-missing SHA256SUMS   # SHA256SUMS comes from the same release
 tar -xzf "$pkg.tar.gz"
 sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
 ```
+
+With the GitHub CLI installed, `gh attestation verify "$pkg.tar.gz" -R daeuniverse/honk` also confirms that the package was built by this repository's release workflow.
 
 Release binaries embed the eBPF object, so `honk-ebpf` does not need to be installed separately. At runtime, the engine does not invoke `ip`, `nft`, `iptables`, or `nsenter` subprocesses.
 

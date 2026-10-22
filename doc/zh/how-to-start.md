@@ -104,10 +104,13 @@ musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使�
 
 ```shell
 pkg=honk-core-<version>-<target>   # 按下载的包追加 -stock、-clash-api 或 -native-api
+sha256sum -c --ignore-missing SHA256SUMS   # SHA256SUMS 从同一个 release 下载
 tar -xzf "$pkg.tar.gz"
 sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
 ```
+
+装有 GitHub CLI 时，还可以用 `gh attestation verify "$pkg.tar.gz" -R daeuniverse/honk` 确认该包由本仓库的发布 workflow 构建。
 
 release binary 已内嵌 eBPF object，不需要单独安装 `honk-ebpf`。运行时也不会调用 `ip`、`nft`、`iptables` 或 `nsenter` 子进程。
 

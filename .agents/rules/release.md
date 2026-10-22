@@ -29,6 +29,8 @@ The independent weekly `fuzz` job uses the nightly channel from `crates/honk-ebp
 
 Before upload, every x86_64 matrix entry extracts its packaged tarball into a clean temporary directory and runs the nested `honk-core --version`. This covers the loader and early startup for gnu/musl and both allocators, not configuration or datapath behavior. aarch64 artifacts are not executed. Manual release runs keep the same build checks; publication remains restricted to `v*` and `debug.*` tag refs, never branches.
 
+Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all published archives and records a build-provenance attestation for each archive, checked with `gh attestation verify <archive> -R daeuniverse/honk`. The publication job alone holds `id-token: write` and `attestations: write` for that, next to `contents: write`.
+
 ### Debug releases
 
 - Push a source tag such as `debug.2026.9.19.score.1`; the trigger accepts `debug.*` without prescribing a date or component format. It runs the same tests and sixteen release-profile builds as formal tags.
