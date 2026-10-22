@@ -37,6 +37,14 @@ The [documentation index](doc/README.md) links all bilingual guides, references,
 
 Build with `--features native-api` (the full and `-native-api` release artifacts include it) and configure `experimental.native_api` for independent observations and controls on `127.0.0.1:9527`: bounded flows/logs/DNS history, probes, provider status/refresh, per-network Selector control and exact connection closure. Captured `.dae` sources remain authoritative, with opt-in source/Group PATCH transactions, synchronous main-file node/provider creation and removal, and verified-geodata operations; existing entries are edited through source PUT. `--store db` records accepted sources as revisions in a state database instead. A bearer secret or password login is required unless anonymous loopback is explicitly enabled. Serve a trusted directory, or build `--features native-ui` and set `ui: embedded` for the pinned doona build without runtime downloads. Native runtime_mode and full kernel transparency remain unavailable. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api).
 
+## Versions and compatibility
+
+- Releases follow [SemVer](https://semver.org/) from `v0.1.0`; tags with `-alpha.N`, `-beta.N` or `-rc.N` are prereleases. Before `1.0`, a minor release may change configuration or behaviour, and its notes list what needs action before upgrading.
+- Requirements: root and Linux 6.12+ with the kernel options in the [startup guide](doc/en/how-to-start.md), on `x86_64` or `aarch64` with gnu or musl.
+- Configuration uses dae syntax, documented in the [configuration guide](doc/en/configuration.md).
+- The native API is served under the fixed `/api/v1` base and stays opt-in through `experimental.native_api`; before `1.0` it may change in a minor release. `GET /api/v1/version` reports the contract identity.
+- Each release lists its archives in a Downloads section and carries `SHA256SUMS` and build provenance. Security reports go through the [security policy](.github/SECURITY.md).
+
 ## Development
 
 The workspace contains configuration, shared eBPF types, NFQUEUE, outbound, core, and tooling crates. The kernel program in `crates/honk-ebpf` is built separately. Build prerequisites and commands are in the [startup guide](doc/en/how-to-start.md#build-from-source) and [Justfile](Justfile).
@@ -45,9 +53,7 @@ For unprivileged userspace development, use [mock mode](doc/en/how-to-start.md#u
 
 ### Debug builds
 
-Maintainer `debug.*` tags update the rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug), not Latest. These are release-profile binaries, not Cargo debug-profile builds. The rolling tag and assets are replaced; source tags remain, and release notes record the source commit and workflow run and list each archive. Every Debug release carries `SHA256SUMS` and build provenance, like formal releases. Pending intermediate runs may be superseded.
-
-Publication requires all sixteen expected archives to be present and nonempty. If artifacts have expired or been deleted, use **Re-run all jobs**. Publication is not transactional; a failed update may leave the tag, notes, and assets inconsistent until recovery.
+Between releases, maintainers publish `debug.*` builds from `main`: release-profile binaries for testing, not Cargo debug-profile builds. The rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug) always holds the newest one and is never marked Latest; each debug tag also keeps its own release while it is among the newest ten. Like formal releases, they carry `SHA256SUMS`, build provenance and a Downloads section. Publication details are in [the release rules](.agents/rules/release.md).
 
 ## Review status
 
