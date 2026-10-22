@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Print the draft notes for a formal release: commits since the previous v* tag,
 # grouped by their type(scope) prefix and credited to GitHub logins.
-# Usage: release-notes.sh <tag>   (run inside a full clone; GH_TOKEN and
-# GITHUB_REPOSITORY resolve logins; RELEASE_NOTES_OFFLINE=1 skips the lookup)
+# Usage: release-notes.sh <tag>   (run inside a full clone; gh resolves logins
+# through GH_TOKEN and GITHUB_REPOSITORY, and a failed lookup omits the login)
 set -euo pipefail
 
 tag=${1:?usage: release-notes.sh <tag>}
@@ -12,11 +12,6 @@ range=${prev:+$prev..}$tag
 
 declare -A title=([feat]='New Features' [fix]='Bug Fixes' [perf]='Performance' [docs]='Documentation') sections=()
 other=0
-
-login() {
-  [[ ${RELEASE_NOTES_OFFLINE:-} == 1 ]] && return 0
-  gh api "repos/$repo/commits/$1" --jq '.author.login // empty' 2>/dev/null || true
-}
 
 while IFS=$'\t' read -r sha subject; do
   if [[ ! $subject =~ ^([a-z]+)(\([^\)]*\))?!?:\ (.+)$ ]]; then
@@ -29,7 +24,7 @@ while IFS=$'\t' read -r sha subject; do
     other=$((other + 1))
     continue
   fi
-  user=$(login "$sha")
+  user=$(gh api "repos/$repo/commits/$sha" --jq '.author.login // empty' 2>/dev/null || true)
   sections[$type]+="- $subject${user:+ by @$user} in ${sha:0:9}"$'\n'
 done < <(git log --no-merges --reverse --format='%H%x09%s' "$range")
 
