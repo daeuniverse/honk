@@ -1,0 +1,47 @@
+name: Feature request / 功能请求
+description: Propose a capability honk does not have. / 提议 honk 目前没有的功能。
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 要解决的问题
+      description: What you are trying to do and why the current behaviour does not cover it. / 想做什么，以及现有行为为何无法满足。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal / 提议
+      description: The behaviour or configuration you would like. / 希望的行为或配置写法。
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / 范围
+      options:
+        - Routing / 路由
+        - DNS
+        - Outbound and protocols / 出站与协议
+        - eBPF datapath / eBPF 数据面
+        - Native API
+        - Clash API
+        - Configuration / 配置
+        - Documentation / 文档
+        - Other / 其他
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / 替代方案
+      description: Workarounds you use today, or how dae or other tools handle this. / 目前的变通做法，或 dae 等其他工具的处理方式。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks / 确认
+      options:
+        - label: I searched existing issues and discussions and found no request for this. / 我已搜索现有 issue 与 discussion，没有相同的请求。
+          required: true

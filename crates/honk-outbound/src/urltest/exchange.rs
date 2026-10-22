@@ -71,7 +71,6 @@ async fn h2_round(
         reporter_first_response(reporter);
     }
     reporter_rx(reporter, 1);
-    // ponytail: locked h2 0.4.19 defaults missing :status; await a release containing hyperium/h2#959.
     Ok((
         ProbeMeasurement {
             latency: start.elapsed(),

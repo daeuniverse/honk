@@ -246,8 +246,6 @@ HTTP/2 探测连接在首个本地检测到的协议错误时终止，避免后�
 报告值为第二轮热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮传输失败可返回已验证的第一轮样本；HTTP/1 要求没有部分响应，HTTP/2 接受正常 GOAWAY 或远端 `REFUSED_STREAM`，畸形或部分响应仍失败。冷可复用探测关闭 guarded runtime，HTTP/2 driver 在完成或取消后停止。准备、拨号、TLS、HTTP/2 启动和每轮请求分别有阶段预算，core 保留连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。`alive` 负责健康调度，只有真实流量增加拨号失败 strike；组 delay 并发上限仍为 10。
 API 返回的首轮预热回退值不会作为配置方法的 Score 证据发布；只有成功测得的第二轮才更新该方法的质量 cohort。
 
-当前锁定依赖的已知限制：[`h2` 0.4.19 会把缺少响应 `:status` 的情况默认解码为 200](https://github.com/hyperium/h2/issues/958)。探测器只能检查解码后的状态，无法恢复被遗漏的伪头，因此这种畸形 HTTP/2 响应仍可能被判为健康。[上游修复 #959](https://github.com/hyperium/h2/pull/959) 已于 2026-09-14 合并，但当前锁定版本尚未包含；等待包含修复的正式版本后更新依赖，不引入本地 fork 或 vendor 补丁。
-
 ## UDP 候选资格
 
 `filter_alive_candidates` 按节点和地址族决定 UDP 选择：

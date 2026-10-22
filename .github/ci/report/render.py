@@ -66,6 +66,9 @@ REPORT_JOBS = {
     "reload": "compare-main",
 }
 
+# The aggregate gate in ci.yml fails only when another job failed, so it never has a report of its own.
+AGGREGATE_JOB = "ci-ok"
+
 POLICY_GROUPS = (
     ({"lint", "test", "smoke", "ebpf-check"}, "code lanes not run: `ci:full`"),
     ({"ebpf"}, "eBPF VM not run: `ci:ebpf`"),
@@ -611,7 +614,8 @@ def failure_lines(reports: dict[str, Any], jobs: dict[str, Any]) -> tuple[list[s
     require(isinstance(raw_jobs, list), "jobs.jobs must be an array")
     failed_names = {
         item.get("name") for item in raw_jobs
-        if isinstance(item, dict) and item.get("conclusion") not in (None, "success", "skipped", "neutral")
+        if isinstance(item, dict) and item.get("name") != AGGREGATE_JOB
+        and item.get("conclusion") not in (None, "success", "skipped", "neutral")
     }
     for report in sorted(reports.values(), key=lambda item: item["lane"]):
         failure = report["failure"]

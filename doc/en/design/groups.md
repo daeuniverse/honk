@@ -248,8 +248,6 @@ The last real TCP delay sample per node is written to the state db every 60 seco
   Every protocol reports the second request's warm-path RTT, excluding proxy dial, target TLS and session preparation. A second-round transport failure may return the validated first sample; HTTP/1 requires no partial response, and HTTP/2 accepts graceful GOAWAY or remote `REFUSED_STREAM`. Invalid/partial heads still fail. Cold reusable probes close their guarded runtime, and HTTP/2 drivers stop on completion/cancellation. Preparation, dial, TLS, HTTP/2 startup and each request have separate phase budgets; core retains its connection timeout. Empty delay URLs use `https://www.gstatic.com/generate_204`. `alive` owns health scheduling; only actual traffic feeds dial-failure strikes. Group delay concurrency remains capped at 10.
   The API's warm-up fallback is not published as Score evidence for the configured method: only a successfully measured second round updates that method's quality cohort.
 
-Known limitation of the locked dependency: [`h2` 0.4.19 defaults a missing response `:status` to 200](https://github.com/hyperium/h2/issues/958). The probe validates the decoded status and cannot recover the omitted pseudo-header, so that malformed HTTP/2 response can appear healthy. [Upstream fix #959](https://github.com/hyperium/h2/pull/959) was merged on 2026-09-14, but is not included in the locked release; adoption awaits a published release containing it, without a local fork or vendor patch.
-
 ## UDP candidate eligibility
 
 `filter_alive_candidates` decides UDP selection per node and address family:

@@ -1,6 +1,8 @@
 //! Deterministic sequential interleaving of lookup -> production publication -> locked snapshot.
 //! This is not a claim about live parallel-reader coverage.
 
+use core::num::NonZeroU64;
+
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::__sk_buff,
@@ -48,13 +50,14 @@ unsafe fn same_payload<T>(left: *const T, right: *const T) -> bool {
 
 // The fixture supplies a canonical key and an ordinary L2 IPv4/IPv6 SYN without
 // extension headers. Read only the packet fields needed by the real publisher.
+// `Option<u64>` returns in R0/R2, but the verifier keeps only R0 across a BPF-to-BPF call.
 #[inline(never)]
 fn publish_syn(
     ctx: *mut __sk_buff,
     key: &TuplesKey,
     direction: u32,
     scratch: &mut UdpDecisionScratch,
-) -> Option<u64> {
+) -> Option<NonZeroU64> {
     let tc = TcContext::new(ctx);
     let prefix = tc.load::<[u8; 2]>(ETH_HLEN as usize).ok()?;
     let (tcp_offset, dscp) = if prefix[0] >> 4 == 4 && key.src_ip.is_v4_mapped() {
@@ -122,7 +125,7 @@ fn publish_syn(
     }
     unsafe { (&raw mut (*ctx).cb[4]).write_volatile(7) };
     drop(publisher);
-    Some(incarnation)
+    NonZeroU64::new(incarnation)
 }
 
 // Input cb[0]: 0 LAN framing, 1 WAN framing. The fixture seeds A with real TC
@@ -192,14 +195,14 @@ pub fn stable_flow_element_identity_test(ctx: *mut __sk_buff) -> c_long {
     let Some(redirect_ptr) = REDIRECT_TRACK.get_ptr_mut(&redirect_key) else {
         return TC_ACT_SHOT;
     };
-    let Some(current) = publish_syn(ctx, key, direction, scratch) else {
+    let Some(current) = publish_syn(ctx, key, direction, scratch).map(NonZeroU64::get) else {
         return TC_ACT_SHOT;
     };
     unsafe {
         (&raw mut (*ctx).cb[1]).write_volatile(current as u32);
         (&raw mut (*ctx).cb[2]).write_volatile((current >> 32) as u32);
     }
-    if current == 0 || current == previous {
+    if current == previous {
         return TC_ACT_OK;
     }
     unsafe {

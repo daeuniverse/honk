@@ -539,7 +539,7 @@ impl EbpfBackend for MockEbpfBackend {
         #[cfg(test)]
         if self
             .adopt_proof_pending
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |remaining| remaining.checked_sub(1),

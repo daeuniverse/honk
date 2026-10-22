@@ -20,7 +20,7 @@ const REPORTERS: usize = 4;
 
 pub(super) fn next_reporter_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |id| {
+    NEXT.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |id| {
         id.checked_add(1)
     })
     .unwrap_or(0)

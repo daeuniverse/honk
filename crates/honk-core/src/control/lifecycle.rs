@@ -131,12 +131,13 @@ impl ControlPlane {
         let udp4_addr = tcp4_addr;
         let udp6_addr = tcp6_addr;
 
-        let tcp4_listener =
-            tokio::io::unix::AsyncFd::new(bind_tproxy_tcp(tcp4_addr, tproxy_mark)?)?;
+        let tcp4_listener = unsafe {
+            tokio::io::unix::AsyncFd::register(bind_tproxy_tcp(tcp4_addr, tproxy_mark)?)
+        }?;
         info!("Control plane listening for TPROXY TCPv4 on {}", tcp4_addr);
 
         let tcp6_listener = match bind_tproxy_tcp(tcp6_addr, tproxy_mark).and_then(|listener| {
-            tokio::io::unix::AsyncFd::new(listener).map_err(anyhow::Error::from)
+            unsafe { tokio::io::unix::AsyncFd::register(listener) }.map_err(anyhow::Error::from)
         }) {
             Ok(l) => {
                 info!("Control plane listening for TPROXY TCPv6 on {}", tcp6_addr);
