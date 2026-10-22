@@ -1,6 +1,6 @@
 [package]
 name = "honk-tool"
-version = "0.0.1-alpha"
+version.workspace = true
 edition = "2024"
 description = "honk CLI toolbox: subscription checks, datapath diagnostics"
 

@@ -26,6 +26,15 @@ jobs:
         run: bash .github/ci/test-debug-artifacts.sh
       - name: Test release asset table
         run: bash .github/ci/test-release-assets.sh
+      - name: Test release version and notes scripts
+        run: |
+          bash .github/ci/test-release-version.sh
+          bash .github/ci/test-release-notes.sh
+      # A formal tag must be SemVer and equal the workspace version; this fails
+      # before the sixteen builds start.
+      - name: Check the tag against the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash .github/ci/check-release-version.sh "$GITHUB_REF_NAME"
       - name: Read Rust toolchain
         id: toolchain
         run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
@@ -297,6 +306,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: release-source
+          # The formal notes list the commits since the previous v* tag.
+          fetch-depth: 0
 
       # GPL-3.0 section 6: the binaries embed doona, so its corresponding
       # source is published next to them.
@@ -312,18 +323,25 @@ jobs:
       # Every release body explains each archive as {allocator}-{API}-{arch}-{libc}.
       - name: Write release notes
         env:
+          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           bash release-source/.github/ci/release-assets.sh dist > assets.md
           source_lines=$(printf "Source tag: \`%s\`\n\nCommit: \`%s\`\n\nBuild: %s" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUN_URL")
           printf "Debug build of \`%s\`.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
           printf 'Rolling debug build: the newest published debug tag. Each tag also keeps its own release.\n\n%s\n\n' "$source_lines" | cat - assets.md > notes-rolling.md
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            (cd release-source && bash .github/ci/release-notes.sh "$GITHUB_REF_NAME") > notes-formal.md
+            printf '\n' | cat - assets.md >> notes-formal.md
+          fi
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
 
+      # A formal release starts as a draft: the maintainer writes the Highlights,
+      # checks the assets, then publishes it. Debug releases stay immediate.
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
@@ -332,9 +350,9 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           fail_on_unmatched_files: true
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          body_path: assets.md
-          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          draft: true
+          body_path: notes-formal.md
 
       - name: Check complete Debug artifacts
         if: startsWith(github.ref, 'refs/tags/debug.')

@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "honk-ebpf-common"
-version = "0.0.1-alpha"
+version = "0.1.0-beta.1"
 dependencies = [
  "aya",
  "aya-ebpf-bindings",
