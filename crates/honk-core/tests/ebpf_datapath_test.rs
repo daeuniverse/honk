@@ -408,6 +408,37 @@ fn ndp_redirect_l2_contract() {
         ingress_ifindex: 1,
         ..Default::default()
     };
+    // Single-homed gateways attach only wan_egress on the shared link, so the
+    // same suppression invariant must hold there.
+    assert_eq!(
+        fixture
+            .run(
+                "wan_egress_l2",
+                &icmp6(src6, dst6, 137),
+                SkbInput::default()
+            )
+            .return_value,
+        TC_ACT_SHOT,
+        "local ICMPv6 Redirect is dropped on WAN egress"
+    );
+    assert_eq!(
+        fixture
+            .run("wan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
+            .return_value,
+        TC_ACT_UNSPEC,
+        "forwarded ICMPv6 Redirect passes on WAN egress"
+    );
+    assert_eq!(
+        fixture
+            .run(
+                "wan_egress_l2",
+                &icmp6(src6, dst6, 128),
+                SkbInput::default()
+            )
+            .return_value,
+        TC_ACT_UNSPEC,
+        "other ICMPv6 remains untouched on WAN egress"
+    );
     assert_eq!(
         fixture
             .run("lan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
@@ -932,6 +963,40 @@ fn ndp_redirect_l3_on_real_tun() {
         assert!(
             received(&mut outgoing, destination, 137),
             "local Redirect passes without the TC hook"
+        );
+
+        // A single-homed gateway shares one L3 link, where wan_egress is the
+        // only egress hook that can suppress the kernel's Redirect.
+        let program: &mut SchedClassifier = fixture
+            .bpf
+            .program_mut("wan_egress_l3")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let link = program
+            .attach("honk-out", aya::programs::TcAttachType::Egress)
+            .unwrap();
+        message[0] = 137;
+        match socket.send_to(&message, &SocketAddr::new(destination.into(), 0).into()) {
+            Ok(sent) => assert_eq!(sent, message.len()),
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS)),
+        }
+        assert!(
+            !received(&mut outgoing, destination, 137),
+            "local Redirect is dropped on WAN egress"
+        );
+        incoming.write_all(&forwarded[14..]).unwrap();
+        assert!(
+            received(&mut outgoing, destination, 137),
+            "forwarded Redirect passes on WAN egress"
+        );
+        program.detach(link).unwrap();
+        socket
+            .send_to(&message, &SocketAddr::new(destination.into(), 0).into())
+            .unwrap();
+        assert!(
+            received(&mut outgoing, destination, 137),
+            "local Redirect passes without the WAN hook"
         );
     })
     .join()

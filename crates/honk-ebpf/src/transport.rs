@@ -89,7 +89,7 @@ pub const ERR_UNKNOWN_PROTO: c_long = -3;
 /// Unsupported packet type (not IP); pass through.
 pub const PASS_UNSUPPORTED: c_long = 1;
 
-/// Parsed ICMPv6 Redirect; only locally originated LAN egress suppresses it.
+/// Parsed ICMPv6 Redirect; egress suppresses it when locally originated.
 pub const PASS_NDP_REDIRECT: c_long = 3;
 
 /// Destinations that must never enter routing/conntrack: L2
