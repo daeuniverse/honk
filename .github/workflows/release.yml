@@ -420,10 +420,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/debug.')
         env:
           GH_TOKEN: ${{ github.token }}
-          KEEP: 10
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,publishedAt \
-            --jq "[.[] | select(.tagName | startswith(\"debug.\"))] | sort_by(.publishedAt) | reverse | .[$KEEP:] | .[].tagName" |
+            --jq '[.[] | select(.tagName | startswith("debug."))] | sort_by(.publishedAt) | reverse | .[10:] | .[].tagName' |
             while read -r tag; do
               gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
             done
