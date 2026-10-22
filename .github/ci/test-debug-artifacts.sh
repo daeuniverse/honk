@@ -9,7 +9,7 @@ mkdir dist
 
 for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl; do
   for suffix in '' -stock; do
-    printf 'artifact\n' > "dist/honk-core-debug-$target$suffix.tar.gz"
+    printf 'artifact\n' > "dist/honk-core-debug-$target$suffix-full.tar.gz"
   done
 done
 for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
@@ -36,7 +36,7 @@ expect_rejection
 mv saved.tar.gz "$artifact"
 bash "$ci_dir/check-debug-artifacts.sh"
 
-artifact=dist/honk-core-debug-x86_64-unknown-linux-gnu.tar.gz
+artifact=dist/honk-core-debug-x86_64-unknown-linux-gnu-full.tar.gz
 mv "$artifact" saved.tar.gz
 expect_rejection
 mv saved.tar.gz "$artifact"

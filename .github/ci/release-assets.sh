@@ -15,7 +15,7 @@ for path in "$dist"/*.tar.gz; do
     *) printf '::error::Unknown release archive: %s\n' "$file" >&2; exit 1 ;;
   esac
 
-  if [[ ! $file =~ -(x86_64|aarch64)-unknown-linux-(gnu|musl)(-stock)?(-clash-api|-native-api)?\.tar\.gz$ ]]; then
+  if [[ ! $file =~ -(x86_64|aarch64)-unknown-linux-(gnu|musl)(-stock)?-(full|clash-api|native-api)\.tar\.gz$ ]]; then
     printf '::error::Unrecognised honk-core archive name: %s\n' "$file" >&2
     exit 1
   fi
@@ -24,9 +24,9 @@ for path in "$dist"/*.tar.gz; do
   alloc=mimalloc alloc_rank=1
   [[ -n ${BASH_REMATCH[3]} ]] && alloc=stockalloc alloc_rank=2
   case ${BASH_REMATCH[4]} in
-    -clash-api) api=clashapi api_rank=2 ;;
-    -native-api) api=nativeapi api_rank=3 ;;
-    *) api=fullapi api_rank=1 ;;
+    full) api=fullapi api_rank=1 ;;
+    clash-api) api=clashapi api_rank=2 ;;
+    native-api) api=nativeapi api_rank=3 ;;
   esac
   # Sort key first (arch, libc, API, allocator), stripped before printing.
   rows+=("$arch $libc $api_rank $alloc_rank"$'\t'"| \`$file\` | \`$alloc-$api-$arch-$libc\` |")

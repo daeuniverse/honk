@@ -90,11 +90,11 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 ### 预编译二进制
 
-从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。无后缀名为 full 构建：
+从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。每个包名都以变体结尾（旧版本的 full 构建不带后缀）：
 
 | 变体 | 包后缀 | Release 标签 | 内容 |
 |---|---|---|---|
-| full | 无 | `fullapi` | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
+| full | `-full` | `fullapi` | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
 | clash-api | `-clash-api` | `clashapi` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
 | native-api | `-native-api` | `nativeapi` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
 
@@ -103,7 +103,7 @@ musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使�
 精简变体按 fail-closed 处理：在 `-clash-api` 上启用 `experimental.native_api`，或没有 `native-ui` 却设置 `ui: embedded`，都会启动失败。`--store db` 与原生配置管理需要 `native-api`。
 
 ```shell
-pkg=honk-core-<version>-<target>   # 按下载的包追加 -stock、-clash-api 或 -native-api
+pkg=honk-core-<version>-<target>-full   # 或按下载的包改为 -stock-full、-clash-api、-stock-native-api 等
 sha256sum -c --ignore-missing SHA256SUMS   # SHA256SUMS 从同一个 release 下载
 tar -xzf "$pkg.tar.gz"
 sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core

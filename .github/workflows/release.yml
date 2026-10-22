@@ -85,16 +85,16 @@ jobs:
           # Full: Clash API + native API + embedded doona UI. Both arches ship
           # two binaries: mimalloc (default, faster QUIC) and stock malloc
           # (lower RSS high-water on small gateways).
-          - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: ""}
-          - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: ""}
-          - {target: x86_64-unknown-linux-musl, suffix: "", variant: full, name_suffix: ""}
-          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: ""}
+          - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
           # Lean variants apply to the static gateway builds only; the gnu
-          # artifacts stay full. The unsuffixed names remain the full build.
+          # artifacts stay full. Every name carries its variant suffix.
           - {target: x86_64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
           - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
           - {target: aarch64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
