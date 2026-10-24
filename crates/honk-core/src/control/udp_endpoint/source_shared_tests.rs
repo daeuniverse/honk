@@ -603,15 +603,11 @@ async fn shared_source_forgets_the_oldest_retired_peer() {
     use super::source::SourceEndpoint;
 
     let f = Fixture::new(false, 16).await;
-    let (client, oldest, recent) = (f.client(), f.target(1), f.target(2));
+    let (client, bound, oldest, recent) = (f.client(), f.target(0), f.target(1), f.target(2));
     let endpoint = f.flow(0, b"bound").await;
     let transport = f.transport();
-    let reply_socket = Arc::new(f.pool.create_reply_socket(f.target(0)).unwrap());
-    // 65 later retirements push `oldest` out of the 64-peer fence.
-    let retired = std::iter::once(oldest)
-        .chain((0..64).map(|index| SocketAddr::from(([192, 0, 2, 1], 10000 + index))))
-        .chain([recent]);
-    for target in retired {
+    let reply_socket = Arc::new(f.pool.create_reply_socket(bound).unwrap());
+    let retire = async |target| {
         let view = SourceEndpoint::new(
             f.attach(client, target, None).await,
             target,
@@ -621,11 +617,21 @@ async fn shared_source_forgets_the_oldest_retired_peer() {
                 .outbound_tracker(&f.node.name, crate::stats::OutboundKind::Node),
         );
         view.retire(&AtomicBool::new(false));
+    };
+    // `oldest` and 63 later retirements fill the 64-peer fence.
+    retire(oldest).await;
+    for index in 0..63 {
+        retire(SocketAddr::from(([192, 0, 2, 1], 10000 + index))).await;
     }
+    transport.reply(oldest, b"fenced");
+    no_reply(&f.client).await;
+    retire(recent).await;
     transport.reply(recent, b"late");
     no_reply(&f.client).await;
     transport.reply(oldest, b"foreign");
     assert_eq!(received(&f.client).await, (b"foreign".to_vec(), oldest));
+    transport.reply(bound, b"still-bound");
+    assert_eq!(received(&f.client).await, (b"still-bound".to_vec(), bound));
     drop((endpoint, transport, reply_socket));
     f.shutdown().await;
 }
