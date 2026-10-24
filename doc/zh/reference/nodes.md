@@ -164,7 +164,7 @@ SOCKS5 UDP ASSOCIATE 为每个客户端 source 保持一条控制 TCP 连接和�
 - 各端口所选路径不同的 VLESS source（例如 Xray UDP 池加 UDP/443 `skip`，443 走协议回退而不是池）即使在同一节点上，也按所选路径各有一条 association。
 - Trojan、Juicity 与 AnyTLS 把一个 source 的全部目的地放在一条可靠流上，某个目的地停滞会拖慢同流的其他目的地，写失败会终止所有目的地。datagram 载体（Hysteria2、TUIC、Shadowsocks、SOCKS5）没有这个问题。
 - 53 端口的流不在数据路径中发布客户端回复 framing，因此对 53 端口流的主动回复依赖宿主机转发。
-- 每个客户端 source 同时最多服务七个外来回复源。当第 65 个不同的 peer 即将退役、而仍在跟踪 64 个已退役 peer 时，该 source 不再接纳主动回复；重新被绑定的 peer 会从该列表移除。此后在该 source 的剩余生命周期中，所有未绑定回复都会被禁用，包括此前已接纳的 peer；仍绑定的 flow 不受影响。进入该状态时记录一条包含 client、outbound、protocol 与已退役 peer 数的 WARN，而不逐条记录被丢弃的回复。
+- 每个客户端 source 同时最多保持七个外来回复 socket；新外来 peer 的回复会替换最久未用的那个。来自该 source 最近 64 个已退役 peer 的回复会被丢弃，而不作为外来回复投递；重新被绑定的 peer 会从该列表移除，第 65 次退役会忘掉最早的那个。仍绑定的 flow 不受影响。
 - VMess 没有 UDP 后端。
 
 对于支持 `network` 的协议，扁平结构化输入接受逗号分隔的 `tcp`/`udp`，忽略各项首尾空白和 ASCII 大小写。`tcp` 关闭 UDP；`udp` 与 `tcp,udp` 都允许 UDP。空文本或纯空白规范化为未指定，保留协议的默认能力。`quic` 等未知值，或非空列表中的空项，会使节点被拒绝。该字段只控制 UDP 准入；`udp` 不会额外禁止 TCP。

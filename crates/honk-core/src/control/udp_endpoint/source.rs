@@ -88,8 +88,7 @@ struct SourceState {
     bindings: usize,
     active_sender: u64,
     intentional_sender: u64,
-    retired_reply_peers: HashSet<SocketAddr>,
-    foreign_replies_disabled: bool,
+    retired_reply_peers: std::collections::VecDeque<SocketAddr>,
     active_foreign_reply: Option<SocketAddr>,
     /// The last view's endpoint slot, kept until the receiver and transport drop so
     /// retiring sources cannot overlap new endpoints beyond the descriptor partition.
@@ -101,6 +100,16 @@ impl SourceState {
         if self.active_sender == view {
             self.intentional_sender = view;
         }
+    }
+
+    /// Keeps late replies of the most recently retired flows from foreign delivery.
+    // ponytail: heavy churn shortens each peer's fence; add deadlines if that matters.
+    fn note_retired_peer(&mut self, peer: SocketAddr) {
+        self.retired_reply_peers.retain(|retired| *retired != peer);
+        if self.retired_reply_peers.len() >= MAX_RETIRED_REPLY_PEERS {
+            self.retired_reply_peers.pop_front();
+        }
+        self.retired_reply_peers.push_back(peer);
     }
 }
 
@@ -159,8 +168,7 @@ impl SourceOwner {
                 bindings: 0,
                 active_sender: 0,
                 intentional_sender: 0,
-                retired_reply_peers: HashSet::new(),
-                foreign_replies_disabled: false,
+                retired_reply_peers: std::collections::VecDeque::new(),
                 active_foreign_reply: None,
                 retained_endpoint_permit: None,
             }),
@@ -215,7 +223,7 @@ impl SourceOwner {
             .bindings
             .checked_add(1)
             .expect("source binding count overflow");
-        state.retired_reply_peers.remove(&target);
+        state.retired_reply_peers.retain(|peer| *peer != target);
         state.retained_endpoint_permit = None;
         true
     }
@@ -512,22 +520,7 @@ impl SourceEndpoint {
         {
             let mut state = self.owner.state.lock();
             if matches!(self.owner.scope.reply, ReplyProjection::ActualPeer) {
-                let peer = normalize_socket_addr(self.target);
-                if state.retired_reply_peers.len() < MAX_RETIRED_REPLY_PEERS {
-                    state.retired_reply_peers.insert(peer);
-                } else if !state.foreign_replies_disabled
-                    && !state.retired_reply_peers.contains(&peer)
-                {
-                    // ponytail: after 64 retired peers, disable only unbound foreign replies for this source lifetime.
-                    state.foreign_replies_disabled = true;
-                    tracing::warn!(
-                        client = %self.owner.scope.client,
-                        outbound = %self.owner._runtime.node.name,
-                        protocol = ?self.owner._runtime.node.protocol(),
-                        retired_peers = state.retired_reply_peers.len(),
-                        "UDP source retired-peer limit reached; unbound replies are disabled for this source's lifetime"
-                    );
-                }
+                state.note_retired_peer(normalize_socket_addr(self.target));
             }
             if binding.endpoint_permit.is_some() {
                 state.mark_intentional_sender(self.view);
@@ -709,7 +702,8 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
         pool: Arc::clone(&pool),
         owner: Arc::clone(&owner),
     };
-    let mut buf = [0u8; 65536];
+    // Heap, not inline: an inline array adds 64 KiB to every source task.
+    let mut buf = vec![0u8; 65536];
     let mut alternate_reply_sockets = Vec::new();
 
     loop {

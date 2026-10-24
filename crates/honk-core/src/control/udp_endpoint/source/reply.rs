@@ -35,10 +35,9 @@ impl UdpEndpointPool {
             return match owner.scope.reply {
                 ReplyProjection::ActualPeer => {
                     let state = owner.state.lock();
-                    if state.foreign_replies_disabled
-                        || state
-                            .retired_reply_peers
-                            .contains(&normalize_socket_addr(peer))
+                    if state
+                        .retired_reply_peers
+                        .contains(&normalize_socket_addr(peer))
                     {
                         SourceReplyTarget::Drop
                     } else {
@@ -90,7 +89,6 @@ impl UdpEndpointPool {
         let peer = normalize_socket_addr(peer);
         if !matches!(owner.scope.reply, ReplyProjection::ActualPeer)
             || state.retirement.is_some()
-            || state.foreign_replies_disabled
             || state.retired_reply_peers.contains(&peer)
             || state.active_foreign_reply.is_some()
         {
@@ -163,28 +161,12 @@ pub(super) async fn deliver_source_reply(
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 return SourceReplyDisposition::Drop;
             }
-            let index = match alternate_reply_sockets
-                .iter()
-                .position(|(cached_source, _)| *cached_source == source)
-            {
-                Some(index) => index,
-                None if alternate_reply_sockets.len() < MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 => {
-                    let socket = match pool.create_reply_socket(source) {
-                        Ok(socket) => socket,
-                        Err(error) => {
-                            debug!("UDP foreign reply socket creation failed: {}", error);
-                            return SourceReplyDisposition::Observed;
-                        }
-                    };
-                    alternate_reply_sockets.push((source, socket));
-                    alternate_reply_sockets.len() - 1
-                }
-                None => {
-                    crate::logging::warn_throttled!(
-                        node = %owner.node_id,
-                        limit = MAX_REPLY_SOCKETS_PER_ENDPOINT - 1,
-                        "UDP source reached its foreign reply socket limit; replies from further unbound peers are not delivered for this source's lifetime"
-                    );
+            let socket = match alternate_reply_socket(alternate_reply_sockets, source, || {
+                pool.create_reply_socket(source)
+            }) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    debug!("UDP foreign reply socket creation failed: {}", error);
                     return SourceReplyDisposition::Observed;
                 }
             };
@@ -199,7 +181,7 @@ pub(super) async fn deliver_source_reply(
                     hook.release.notified().await;
                 }
             }
-            if !send_reply(&alternate_reply_sockets[index].1, data, owner.scope.client).await {
+            if !send_reply(socket, data, owner.scope.client).await {
                 debug!("UDP foreign reply delivery failed");
                 SourceReplyDisposition::Observed
             } else {

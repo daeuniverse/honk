@@ -9,6 +9,9 @@ const MAX_ACTIVE_TCP_FLOWS: usize = 16_384;
 const MAX_TRANSIENT_DIALS: usize = 1_024;
 const MAX_UDP_SLOW_PATH: usize = 256;
 const MAX_DNS_SLOW_PATH: usize = 256;
+const MAX_VLESS_CARRIERS: usize = 8_192;
+// About twice a measured Shadowsocks shared source (~35 KiB).
+const UDP_ENDPOINT_MEMORY_BYTES: u64 = 64 * 1024;
 const TCP_FLOW_DESCRIPTOR_COST: usize = 6;
 // One upstream socket, a possible SOCKS5 control connection, and every reply socket.
 const UDP_ENDPOINT_DESCRIPTOR_COST: usize = 2 + MAX_REPLY_SOCKETS_PER_ENDPOINT;
@@ -56,7 +59,7 @@ impl ResourceBudget {
         };
         let after_dials = after_tcp_pool.saturating_sub(transient_dials);
         let vless_carriers = if cfg!(feature = "rprx") {
-            (after_dials / 8).min(MAX_ENDPOINTS)
+            (after_dials / 8).min(MAX_VLESS_CARRIERS)
         } else {
             0
         };
@@ -75,6 +78,16 @@ impl ResourceBudget {
             udp_slow_path: udp_endpoints.min(MAX_UDP_SLOW_PATH),
             dns_slow_path: transient_dials.min(MAX_DNS_SLOW_PATH),
         }
+    }
+
+    /// Caps UDP endpoints so their worst case stays within a quarter of RAM.
+    pub(crate) fn with_memory(mut self, total_bytes: u64) -> Self {
+        let cap = total_bytes / 4 / UDP_ENDPOINT_MEMORY_BYTES;
+        self.udp_endpoints = self
+            .udp_endpoints
+            .min(usize::try_from(cap).unwrap_or(usize::MAX));
+        self.udp_slow_path = self.udp_endpoints.min(MAX_UDP_SLOW_PATH);
+        self
     }
 
     pub(crate) fn clamp_dials(self, requested: usize) -> usize {
@@ -146,11 +159,28 @@ mod tests {
             assert!(budget.active_tcp_flows <= MAX_ACTIVE_TCP_FLOWS);
             assert!(budget.tcp_pool_entries <= MAX_TOTAL_ENTRIES);
             assert!(budget.transient_dials <= MAX_TRANSIENT_DIALS);
-            assert!(budget.vless_carriers <= MAX_ENDPOINTS);
+            assert!(budget.vless_carriers <= MAX_VLESS_CARRIERS);
             assert!(budget.udp_endpoints <= MAX_ENDPOINTS);
             assert!(budget.udp_slow_path <= budget.udp_endpoints);
             assert!(budget.dns_slow_path <= budget.transient_dials);
         }
+    }
+
+    #[test]
+    fn udp_endpoints_stay_within_a_quarter_of_memory() {
+        const GIB: u64 = 1 << 30;
+        let unbounded = ResourceBudget::for_nofile(MAX_EFFECTIVE_NOFILE);
+        for (memory, endpoints) in [
+            (GIB / 2, 2_048),
+            (2 * GIB, 8_192),
+            (16 * GIB, MAX_ENDPOINTS),
+        ] {
+            let budget = unbounded.with_memory(memory);
+            assert_eq!(budget.udp_endpoints, endpoints);
+            assert_eq!(budget.udp_slow_path, endpoints.min(MAX_UDP_SLOW_PATH));
+        }
+        let fd_bound = ResourceBudget::for_nofile(4_096);
+        assert_eq!(fd_bound.with_memory(16 * GIB), fd_bound);
     }
 
     #[cfg(not(feature = "rprx"))]

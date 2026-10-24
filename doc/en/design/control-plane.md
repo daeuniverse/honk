@@ -156,7 +156,7 @@ Each transparent socket consumes at most eight datagrams per readiness turn with
 
 SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the source association's lifetime and treats control EOF or unexpected control data as association failure. Its connected UDP socket sends to the physical server `BND.ADDR` relay, resolving a domain reply and replacing an unspecified address with the control peer IP. Each request header names its destination and each reply returns the real source from its header, with a domain source projected only to the captured name and port. `PacketTransport::relay_addr()` is the first destination, so the relay itself is never mistaken for the remote peer.
 
-Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket. Ordinary flows cache accepted alternate full-cone sources per endpoint; shared sources retain one receiver-owned cache of at most seven alternate sockets across all bound views. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid. A reply from an alternate source has no exact `REDIRECT_TRACK` entry; `dae0_ingress` returns it to the client through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, so a restrictive forward policy does not drop it. Receiving such a reply never authorizes the client's own next packet to that source: `lan_egress` does not learn a reverse direction from packets arriving from `dae0`, and that packet takes the normal routing path.
+Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket. Ordinary flows cache accepted alternate full-cone sources per endpoint, and shared sources retain one receiver-owned cache across all bound views; each cache holds at most seven alternate sockets, and a new source replaces the least recently used one. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid. A reply from an alternate source has no exact `REDIRECT_TRACK` entry; `dae0_ingress` returns it to the client through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, so a restrictive forward policy does not drop it. Receiving such a reply never authorizes the client's own next packet to that source: `lan_egress` does not learn a reverse direction from packets arriving from `dae0`, and that packet takes the normal routing path.
 
 Reload advances a cancellation epoch before waiting. Initializers capture that epoch and an incarnation generation; a cancellation that linearizes before `commit_ready` prevents publication. Reload drains `Initializing` leases and their retained resources. A successful compiled traffic-plan change retires direct `Ready` endpoints only when the old or new policy includes direct marks, so later traffic cannot reuse their old socket marks. No-op/unrelated reloads and routing changes with no direct marks in either policy preserve them. Every retirement, including its `Retiring` tombstone and acknowledgement, names the token and generation, so delayed work cannot remove a replacement mapping. Explicitly userspace-owned WAN UDP decisions, including marked `direct(must)`, retire their token-zero conn state, handoff and redirect track together under the tuple/reader fence; native LAN direct/offloaded decisions and newer nonzero tokens survive.
 
@@ -181,13 +181,19 @@ is:
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
 | VLESS physical carriers | 8192 | 1 each = 8192 |
-| UDP endpoints | 8192 | 10 each = 81,920 |
-| **Total** |  | **191,744** |
+| UDP endpoints | 32,768 | 10 each = 327,680 |
+| **Total** |  | **437,504** |
 
 One UDP endpoint budgets a relay socket, a possible SOCKS5 control stream, and
 all eight possible anyfrom reply sockets. One TCP flow budgets the accepted and
 outbound sockets plus two two-FD splice pipes. Smaller limits use the same
 saturating partition; a zero VLESS-carrier result stays zero.
+
+Startup also caps UDP endpoints at a quarter of `MemTotal`, budgeting 64 KiB per
+endpoint: 8,192 at 2 GiB and the 32,768 hard cap from 8 GiB. A Shadowsocks shared
+source measured about 35 KiB and each further destination about 11 KiB, so the
+budget leaves room for transports with more per-flow state. A cgroup memory
+limit is not consulted.
 
 The process VLESS-carrier semaphore is shared by traffic generations and DNS
 runtime forks. A carrier holds its permit during actual I/O through provisional,

@@ -526,6 +526,29 @@ async fn reply_socket_credits_cover_retained_teardown_sockets() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn alternate_reply_sockets_replace_the_least_recent_within_their_permits() {
+    let full = MAX_REPLY_SOCKETS_PER_ENDPOINT - 1;
+    let sockets: Vec<_> = (0..=full)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let sources: Vec<_> = sockets.iter().map(|s| s.local_addr().unwrap()).collect();
+    // Injected sockets are single-use and permits cover only a full cache, so a
+    // hit must reuse its socket and a replacement must close the evicted one first.
+    let factory = InjectedReplySocketFactory::new(sockets);
+    let slots = Arc::new(Semaphore::new(full));
+    let mut cache = Vec::new();
+    for &source in sources[..full].iter().chain([&sources[0], &sources[full]]) {
+        alternate_reply_socket(&mut cache, source, || {
+            ReplySocket::create(&factory, &slots, source)
+        })
+        .unwrap();
+    }
+    let mut expected = sources[2..full].to_vec();
+    expected.extend([sources[0], sources[full]]);
+    assert_eq!(cache.iter().map(|(s, _)| *s).collect::<Vec<_>>(), expected);
+}
+
 fn commit_ready(
     pool: &Arc<UdpEndpointPool>,
     client: SocketAddr,

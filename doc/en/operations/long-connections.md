@@ -10,7 +10,7 @@ Each ordinary no-reply expiry counts as a `DataUdp` health failure. After a node
 
 Kernel state has independent [UDP idle-renewal rules](../design/datapath.md#udp-lifetime-renewal); a fresh kernel entry does not prevent userspace reply-idle expiry. Userspace does not keep silent kernel entries fresh; kernel-state reclamation also retires the owning endpoint, so the next packet needs a new one. Transport keepalives do not configure external NAT/conntrack.
 
-New mappings drop at the process-wide **8192-endpoint hard cap** (both families combined), or the lower startup descriptor budget; existing mappings are not evicted and rejected datagrams are not queued. NFQUEUE originals drop too. Check `udp.capacity.rejected` in authenticated Clash `GET /stats`; raising the service `RLIMIT_NOFILE` can help only below the hard cap. [Slow-path/queue budgets](../design/control-plane.md#queue-and-descriptor-budgets) can reject work earlier.
+New mappings drop at the process-wide **32,768-endpoint hard cap** (both families combined), or the lower startup descriptor or memory budget (a quarter of `MemTotal` at 64 KiB per endpoint, 8,192 at 2 GiB); existing mappings are not evicted and rejected datagrams are not queued. NFQUEUE originals drop too. Check `udp.capacity.rejected` in authenticated Clash `GET /stats`; raising the service `RLIMIT_NOFILE` helps only while descriptors are the smaller limit. [Slow-path/queue budgets](../design/control-plane.md#queue-and-descriptor-budgets) can reject work earlier.
 
 ## TCP: idle is not a relay deadline
 

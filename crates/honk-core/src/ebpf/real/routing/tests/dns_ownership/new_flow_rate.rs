@@ -5,7 +5,7 @@ use nix::unistd::Pid;
 
 /// The documented per-CPU budget (doc/en/design/datapath.md), deliberately not
 /// imported from production so a drifting value fails these tests.
-const NEW_FLOW_LIMIT_PER_CPU_SECOND: u16 = 256;
+const NEW_FLOW_LIMIT_PER_CPU_SECOND: u16 = 1024;
 
 fn monotonic_ns() -> u64 {
     let mut time: libc::timespec = unsafe { mem::zeroed() };

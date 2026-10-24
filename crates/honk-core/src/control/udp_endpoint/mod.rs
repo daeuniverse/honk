@@ -53,7 +53,6 @@ pub(in crate::control) enum UdpTerminal {
     PacketRejected,
     QuicSniffIncomplete,
     ReplyFamilyMismatch,
-    ReplySocketCapacity,
     ReplySocketFailed,
     SetupFailed,
     SpecialAddressSkipped,
@@ -93,7 +92,6 @@ impl UdpTerminal {
             Self::PacketRejected => (Failed, "packet_rejected"),
             Self::QuicSniffIncomplete => (Failed, "quic_sniff_incomplete"),
             Self::ReplyFamilyMismatch => (Failed, "reply_family_mismatch"),
-            Self::ReplySocketCapacity => (Failed, "reply_socket_capacity"),
             Self::ReplySocketFailed => (Failed, "reply_socket_failed"),
             Self::SetupFailed => (Failed, "setup_failed"),
             Self::SpecialAddressSkipped => (Failed, "special_address_skipped"),
@@ -144,7 +142,7 @@ const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 /// to grow the pool (and with it sockets, reply tasks and memory) without
 /// bound — at the cap new mappings are refused and the datagram is dropped,
 /// which UDP tolerates by design.
-pub(crate) const MAX_ENDPOINTS: usize = 8192;
+pub(crate) const MAX_ENDPOINTS: usize = 32_768;
 /// Total reply sockets retained by one endpoint, including the eagerly-created primary.
 pub(in crate::control) const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 enum EndpointTransport {
@@ -673,6 +671,27 @@ impl ReplySocket {
             _permit: None,
         }
     }
+}
+
+/// Finds or creates the reply socket for a non-primary peer, replacing the least
+/// recently used one once `MAX_REPLY_SOCKETS_PER_ENDPOINT - 1` are open.
+// ponytail: more interleaved unbound peers than slots recreate a socket per reply.
+fn alternate_reply_socket(
+    sockets: &mut Vec<(SocketAddr, ReplySocket)>,
+    source: SocketAddr,
+    create: impl FnOnce() -> io::Result<ReplySocket>,
+) -> io::Result<&ReplySocket> {
+    match sockets.iter().position(|(cached, _)| *cached == source) {
+        Some(index) => sockets[index..].rotate_left(1),
+        None => {
+            if sockets.len() >= MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 {
+                // Drop first so the replacement can take its slot permit.
+                sockets.remove(0);
+            }
+            sockets.push((source, create()?));
+        }
+    }
+    Ok(&sockets.last().expect("reply socket cached above").1)
 }
 
 #[derive(Debug)]

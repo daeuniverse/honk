@@ -151,7 +151,7 @@ impl BpfStatsKey {
 
 /// New flows (pure SYN, first non-DNS UDP packet, every UDP/53 packet) one LAN
 /// source may start per second on each CPU before further attempts are dropped.
-pub const NEW_FLOW_LIMIT_PER_CPU_SECOND: u32 = 256;
+pub const NEW_FLOW_LIMIT_PER_CPU_SECOND: u32 = 1024;
 
 /// How long a redirected or blocked first fragment condemns the rest of its datagram.
 pub const FRAGMENT_VERDICT_TTL_NS: u64 = 30_000_000_000;

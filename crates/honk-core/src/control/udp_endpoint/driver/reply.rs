@@ -33,7 +33,8 @@ pub(super) async fn receive_loop(
     // The normal fixed-target path keeps using the pre-created socket without
     // allocating. Full-cone sources populate this small endpoint-local cache.
     let mut alternate_reply_sockets = Vec::new();
-    let mut buf = [0u8; 65536];
+    // Heap, not inline: an inline array adds 64 KiB to every endpoint task.
+    let mut buf = vec![0u8; 65536];
     let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
     tokio::pin!(reply_idle_timeout);
     loop {
@@ -86,48 +87,25 @@ pub(super) async fn receive_loop(
         let reply_socket = if source == client_dst {
             reply_socket.as_ref()
         } else {
-            let index = match alternate_reply_sockets
-                .iter()
-                .position(|(cached_source, _)| *cached_source == source)
-            {
-                Some(index) => index,
-                None => {
-                    if alternate_reply_sockets.len() >= MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 {
-                        endpoint
-                            .native
-                            .dropped("reply_socket_capacity", Some("capacity"));
-                        endpoint.native.finish(UdpTerminal::ReplySocketCapacity);
-                        return Err(local_reply_error(io::Error::new(
-                            io::ErrorKind::AddrNotAvailable,
-                            "UDP endpoint reply-source socket cache is full",
-                        )));
-                    }
-                    let socket = match ReplySocket::create(
-                        reply_socket_factory.as_ref(),
-                        &reply_socket_slots,
-                        source,
-                    ) {
-                        Ok(socket) => socket,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            debug!("UDP reply socket capacity exhausted for {}", source);
-                            endpoint
-                                .native
-                                .dropped("reply_socket_capacity", Some("capacity"));
-                            continue;
-                        }
-                        Err(error) => {
-                            endpoint
-                                .native
-                                .dropped("reply_socket_failed", Some("reply_socket_failed"));
-                            endpoint.native.finish(UdpTerminal::ReplySocketFailed);
-                            return Err(local_reply_error(error));
-                        }
-                    };
-                    alternate_reply_sockets.push((source, socket));
-                    alternate_reply_sockets.len() - 1
+            match alternate_reply_socket(&mut alternate_reply_sockets, source, || {
+                ReplySocket::create(reply_socket_factory.as_ref(), &reply_socket_slots, source)
+            }) {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    debug!("UDP reply socket capacity exhausted for {}", source);
+                    endpoint
+                        .native
+                        .dropped("reply_socket_capacity", Some("capacity"));
+                    continue;
                 }
-            };
-            &alternate_reply_sockets[index].1
+                Err(error) => {
+                    endpoint
+                        .native
+                        .dropped("reply_socket_failed", Some("reply_socket_failed"));
+                    endpoint.native.finish(UdpTerminal::ReplySocketFailed);
+                    return Err(local_reply_error(error));
+                }
+            }
         };
         let delivered = reply_socket.send_to(&buf[..n], client_addr).await;
         if delivered.is_err() {

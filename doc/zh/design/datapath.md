@@ -198,9 +198,9 @@ UDP53 不创建普通 UDP conn-state 或 decision token。LAN 查询分片需要
 
 ### 单源新流限制
 
-每个 LAN 源地址有始终开启、不可配置的 **256 次新流尝试/秒/CPU** 预算，使用固定一秒窗口：纯 TCP SYN（含重传）、未缓存流的首个普通 UDP 包，以及任一端口为 53 的每个被路由 UDP 包。direct 与代理流共用预算；同一个 NAT 路由器/接入点源地址后的所有客户端也共用预算；每个 IPv6 地址都是独立的源。超额尝试在状态分配前丢弃，增加 `honk-tool bpf stats` 中的 `new_flow_rate_limited`，计数增长时 janitor 记录 WARN。本地服务回复学习共用预算，但不丢弃请求（见[反向学习](#反向-udp-学习与-conn-压力)）。LRU 淘汰会忘记近期计数；限制不覆盖主机发起的 WAN 流量、已缓存流的辅助项重建，以及大量伪造或轮换的源地址。
+每个 LAN 源地址有始终开启、不可配置的 **1024 次新流尝试/秒/CPU** 预算，使用固定一秒窗口：纯 TCP SYN（含重传）、未缓存流的首个普通 UDP 包，以及任一端口为 53 的每个被路由 UDP 包。direct 与代理流共用预算；同一个 NAT 路由器/接入点源地址后的所有客户端也共用预算；每个 IPv6 地址都是独立的源。超额尝试在状态分配前丢弃，增加 `honk-tool bpf stats` 中的 `new_flow_rate_limited`，计数增长时 janitor 记录 WARN。本地服务回复学习共用预算，但不丢弃请求（见[反向学习](#反向-udp-学习与-conn-压力)）。LRU 淘汰会忘记近期计数；限制不覆盖主机发起的 WAN 流量、已缓存流的辅助项重建，以及大量伪造或轮换的源地址。
 
-由于窗口按 CPU 计，有效上限是 CPU 数 × 256/s。该预算只减缓、并不限制单个源对共享辅助 map 的占用：若其流量分散到所有 CPU，3 个及以上 CPU 时单个主机即可用 UDP 流占满 `REDIRECT_TRACK`（65,536 项，空闲 120 秒过期）；9 个及以上 CPU 时可用任一协议的新流占满 `ROUTING_HANDOFF`（65,536 项，30 秒过期）。janitor 的压力节奏与回收是兜底，map 写满由 `redirect_track_insert_failure` / `routing_handoff_insert_failure` 计数。
+由于窗口按 CPU 计，有效上限是 CPU 数 × 1024/s。该预算只减缓、并不限制单个源对共享辅助 map 的占用：单个 CPU 的预算就足以让一个主机用 UDP 流占满 `REDIRECT_TRACK`（65,536 项，空闲 120 秒过期）；流量分散到 3 个及以上 CPU 时，可用任一协议的新流占满 `ROUTING_HANDOFF`（65,536 项，30 秒过期）。janitor 的压力节奏与回收是兜底，map 写满由 `redirect_track_insert_failure` / `routing_handoff_insert_failure` 计数。
 
 ### 重定向数据报的分片
 

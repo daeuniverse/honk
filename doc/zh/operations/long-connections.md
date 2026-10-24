@@ -10,7 +10,7 @@ Endpoint 在 **120 s 没有回复**后退役；成功发送与 carrier keepalive
 
 内核状态有独立的 [UDP 空闲续期规则](../design/datapath.md#udp-生存期续期)；内核条目新鲜不阻止用户态回复空闲到期。用户态不会为静默内核条目保鲜；内核状态回收也会退役所属 endpoint，之后的数据包需要新建。传输 keepalive 不配置外部 NAT/conntrack。
 
-达到进程级 **8192 个 endpoint 硬上限**（两个地址族合计），或更低的启动描述符预算时，新映射丢弃；不淘汰已有映射，也不排队保留被拒数据报。NFQUEUE 原包同样丢弃。检查经过鉴权的 Clash `GET /stats` 中的 `udp.capacity.rejected`；提高服务 `RLIMIT_NOFILE` 只对硬上限以下的预算有效。[慢路径/队列预算](../design/control-plane.md#queue-与描述符预算)可能更早拒绝工作。
+达到进程级 **32,768 个 endpoint 硬上限**（两个地址族合计），或更低的启动描述符或内存预算（`MemTotal` 的四分之一，每个 endpoint 按 64 KiB 计，2 GiB 为 8,192）时，新映射丢弃；不淘汰已有映射，也不排队保留被拒数据报。NFQUEUE 原包同样丢弃。检查经过鉴权的 Clash `GET /stats` 中的 `udp.capacity.rejected`；只有描述符是较小限制时，提高服务 `RLIMIT_NOFILE` 才有效。[慢路径/队列预算](../design/control-plane.md#queue-与描述符预算)可能更早拒绝工作。
 
 ## TCP：空闲不是中继期限
 

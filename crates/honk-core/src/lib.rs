@@ -103,6 +103,20 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
         .min(control::MAX_EFFECTIVE_NOFILE))
 }
 
+// ponytail: MemTotal ignores cgroup memory.max; read it if limited containers appear.
+fn total_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
 #[cfg(feature = "ebpf")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredInterfaces {
@@ -976,7 +990,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             1_024
         }
     };
-    let resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
+    let mut resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
+    match total_memory_bytes() {
+        Some(memory) => resource_budget = resource_budget.with_memory(memory),
+        None => warn!("Failed to read MemTotal; UDP endpoints are sized by descriptors only"),
+    }
     let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
     if tcp_flow_max < 256 {
         warn!(
