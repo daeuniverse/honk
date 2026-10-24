@@ -1933,8 +1933,8 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
 async fn udp_endpoint_serves_more_foreign_peers_than_it_caches_sockets_for() {
     let primary_socket = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
     let primary = primary_socket.local_addr().unwrap();
-    // One more foreign peer than the alternate cache holds, all sharing the
-    // pool's eight reply-socket permits with the primary.
+    // One more foreign peer than the shared pool holds for one endpoint of
+    // capacity; the primary shares the same eight reply-socket permits.
     let foreign_sockets: Vec<_> = (0..MAX_REPLY_SOCKETS_PER_ENDPOINT)
         .map(|_| std::net::UdpSocket::bind("127.0.0.3:0").unwrap())
         .collect();
