@@ -685,6 +685,10 @@ fn alternate_reply_socket(
         Some(index) => sockets[index..].rotate_left(1),
         None => {
             if sockets.len() >= MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 {
+                crate::logging::warn_throttled!(
+                    limit = MAX_REPLY_SOCKETS_PER_ENDPOINT - 1,
+                    "UDP reply-source socket cache is full; recycling the least recently used socket for a new peer"
+                );
                 // Drop first so the replacement can take its slot permit.
                 sockets.remove(0);
             }
