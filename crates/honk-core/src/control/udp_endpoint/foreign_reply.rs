@@ -34,11 +34,17 @@ impl ForeignReplySockets {
 
     /// The eager reply socket of one endpoint, bound to its original destination.
     pub(super) fn create_primary(&self, source: SocketAddr) -> io::Result<ReplySocket> {
-        match ReplySocket::create(self.factory.as_ref(), &self.slots, source) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock && self.evict_one() => {
-                ReplySocket::create(self.factory.as_ref(), &self.slots, source)
+        self.create_with_reclaim(source)
+    }
+
+    /// Evicts until creation succeeds or nothing cached remains. An evicted
+    /// socket still sending holds its permit, so reclamation must not stop at it.
+    fn create_with_reclaim(&self, source: SocketAddr) -> io::Result<ReplySocket> {
+        loop {
+            match ReplySocket::create(self.factory.as_ref(), &self.slots, source) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && self.evict_one() => {}
+                created => return created,
             }
-            created => created,
         }
     }
 
@@ -50,16 +56,7 @@ impl ForeignReplySockets {
             *used = now;
             return Ok(Arc::clone(socket));
         }
-        let created = match ReplySocket::create(self.factory.as_ref(), &self.slots, source) {
-            Ok(created) => created,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !self.evict_one() {
-                    return Err(error);
-                }
-                ReplySocket::create(self.factory.as_ref(), &self.slots, source)?
-            }
-            Err(error) => return Err(error),
-        };
+        let created = self.create_with_reclaim(source)?;
         let (socket, overflow) = {
             let mut cache = self.cache.lock();
             let socket = Arc::clone(&cache.get_or_insert(source, || (Arc::new(created), now)).0);

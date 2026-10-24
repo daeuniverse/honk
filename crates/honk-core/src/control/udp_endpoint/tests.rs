@@ -570,6 +570,33 @@ async fn foreign_reply_sockets_share_reuse_and_yield_to_primaries() {
     assert_eq!(foreign.available_slots(), full);
 }
 
+#[tokio::test]
+async fn foreign_reply_sockets_reclaim_past_a_pinned_victim() {
+    let full = MAX_REPLY_SOCKETS_PER_ENDPOINT;
+    let sockets: Vec<_> = (0..=full)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let sources: Vec<_> = sockets.iter().map(|s| s.local_addr().unwrap()).collect();
+    let pool = UdpEndpointPool::with_reply_socket_factory(
+        1,
+        Arc::new(InjectedReplySocketFactory::new(sockets)),
+    );
+    let primary = pool.create_reply_socket(sources[0]).unwrap();
+    let foreign = &pool.foreign_replies;
+    // Holding this Arc keeps the least recently used socket's permit occupied
+    // even after the cache evicts it, so one eviction cannot admit a primary.
+    let pinned = foreign.get(sources[1]).unwrap();
+    for source in &sources[2..full] {
+        foreign.get(*source).unwrap();
+    }
+    assert_eq!(foreign.available_slots(), 0);
+    let second_primary = pool.create_reply_socket(sources[full]).unwrap();
+    assert_eq!(foreign.cached(), sources[3..full].to_vec());
+    drop((primary, second_primary, pinned));
+    foreign.clear();
+    assert_eq!(foreign.available_slots(), full);
+}
+
 #[tokio::test(start_paused = true)]
 async fn foreign_reply_sockets_expire_when_a_peer_stops_replying() {
     let sockets: Vec<_> = (0..3)
