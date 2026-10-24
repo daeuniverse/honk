@@ -1857,6 +1857,93 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
 }
 
 #[tokio::test]
+async fn udp_endpoint_serves_more_foreign_peers_than_it_caches_sockets_for() {
+    let primary_socket = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+    let primary = primary_socket.local_addr().unwrap();
+    // One more foreign peer than the alternate cache holds, all sharing the
+    // pool's eight reply-socket permits with the primary.
+    let foreign_sockets: Vec<_> = (0..MAX_REPLY_SOCKETS_PER_ENDPOINT)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.3:0").unwrap())
+        .collect();
+    let foreign: Vec<_> = foreign_sockets
+        .iter()
+        .map(|socket| socket.local_addr().unwrap())
+        .collect();
+    let factory = Arc::new(InjectedReplySocketFactory::new(
+        std::iter::once(primary_socket).chain(foreign_sockets),
+    ));
+    let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+        1,
+        factory.clone(),
+    ));
+    let stats = Arc::new(StatsManager::new());
+    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = client_socket.local_addr().unwrap();
+    let replies: Vec<_> = foreign
+        .iter()
+        .chain([&primary])
+        .enumerate()
+        .map(|(index, &source)| (format!("reply-{index}").into_bytes(), source))
+        .collect();
+    let transport = Arc::new(
+        ScriptedPacketTransport::with_receive_actions(
+            primary,
+            [DriverSendAction::Ok],
+            replies
+                .iter()
+                .map(|(data, source)| DriverReceiveAction::Packet {
+                    data: data.clone(),
+                    source: *source,
+                })
+                .chain([DriverReceiveAction::Pending]),
+        )
+        .allowing_full_cone_replies(),
+    );
+    let endpoint = driver_test_endpoint(transport, primary);
+    endpoint.record_pending_reply_peer(primary);
+    let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let mut lease = match pool.reserve_or_enqueue(client, primary, b"request", slow_permit, &stats)
+    {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("reply-source fixture must initialize"),
+    };
+    let queue_rx = lease.take_queue_receiver().unwrap();
+    let reply_socket = Arc::new(pool.create_reply_socket(primary).unwrap());
+    let mut driver = pool.spawn_driver(
+        client,
+        primary,
+        lease.generation(),
+        lease.decision_token(),
+        Arc::clone(&endpoint),
+        queue_rx,
+        reply_socket,
+        Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+        Arc::clone(&stats),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
+    );
+    driver.wait_ready().await.unwrap();
+    assert!(lease.commit_ready(endpoint));
+    driver.start(lease.take_first().unwrap()).unwrap();
+    drop(lease);
+    driver.wait_first_ack().await.unwrap();
+
+    let mut buf = [0u8; 32];
+    for (expected, expected_source) in &replies {
+        let (n, source) =
+            tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("reply from {expected_source} timed out"))
+                .unwrap();
+        assert_eq!((&buf[..n], source), (expected.as_slice(), *expected_source));
+    }
+    let mut created = vec![primary];
+    created.extend(&foreign);
+    assert_eq!(factory.created(), created);
+    driver.abort();
+    assert!(pool.shutdown().await.joined);
+}
+
+#[tokio::test]
 async fn udp_endpoint_worker_sends_first_then_fifo_followers() {
     let pool = Arc::new(UdpEndpointPool::new());
     let stats = Arc::new(StatsManager::new());

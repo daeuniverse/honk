@@ -16,7 +16,7 @@ use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 use std::collections::HashMap;
 use std::sync::Weak;
 
-const TARGETS: usize = 8;
+const TARGETS: usize = MAX_REPLY_SOCKETS_PER_ENDPOINT + 1;
 
 type Reply = io::Result<(Vec<u8>, SocketAddr)>;
 
@@ -579,6 +579,22 @@ async fn shared_source_foreign_reply_requires_vacant_live_owner() {
     assert_eq!(received(&f.client).await, (b"sibling-lives".to_vec(), b));
     assert!(eb.has_reply());
     drop((eb, other, transport));
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_source_serves_more_foreign_peers_than_it_caches_sockets_for() {
+    let f = Fixture::new(false, 16).await;
+    let endpoint = f.flow(0, b"bound").await;
+    let transport = f.transport();
+    // One more foreign peer than the receiver caches sockets for, then the
+    // evicted first peer again.
+    for index in (1..=MAX_REPLY_SOCKETS_PER_ENDPOINT).chain([1]) {
+        let peer = f.target(index);
+        transport.reply(peer, b"foreign");
+        assert_eq!(received(&f.client).await, (b"foreign".to_vec(), peer));
+    }
+    drop((endpoint, transport));
     f.shutdown().await;
 }
 
