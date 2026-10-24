@@ -279,12 +279,12 @@ impl EndpointEntry {
         self.generation() == generation && self.owner().token == token
     }
 
-    pub(super) fn retire(&self) -> Option<String> {
+    pub(super) fn retire(&self, fence_peer: bool) -> Option<String> {
         match self {
             Self::Initializing(_) => None,
             Self::Ready(entry) => {
                 entry.alive.store(false, Ordering::Release);
-                entry.endpoint.kill();
+                entry.endpoint.kill(fence_peer);
                 entry.endpoint.take_tracker_id()
             }
             Self::Retiring { .. } => None,
@@ -617,7 +617,7 @@ impl UdpInitLease {
             native_terminal: self.initializer.native_terminal.get().cloned(),
         });
         drop(occupied);
-        let conn_id = entry.retire();
+        let conn_id = entry.retire(false);
         drop(entry);
         drop(self.first.take());
         drop(self.connection_guard.take());

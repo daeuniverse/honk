@@ -373,7 +373,7 @@ async fn unaccepted_source_send_cannot_reconcile_delivered_reply() {
                 if disposition == "failed" {
                     owner.fail(ScoreOutcome::NodeFailure);
                 } else {
-                    endpoint.kill();
+                    endpoint.kill(true);
                 }
                 if disposition == "cancelled" {
                     drop(driver);

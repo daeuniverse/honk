@@ -420,7 +420,7 @@ impl UdpEndpoint {
         self.ref_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn kill(&self) {
+    pub fn kill(&self, fence_peer: bool) {
         // A retirement ordered before `begin_send_attempt` must prevent the
         // transport call; an attempt already admitted remains ambiguous.
         let _send_gate = self.send_gate.lock();
@@ -429,7 +429,7 @@ impl UdpEndpoint {
         }
         match &self.transport {
             EndpointTransport::Flow(_) => self.dead.store(true, Ordering::Release),
-            EndpointTransport::Source(source) => source.retire(&self.dead),
+            EndpointTransport::Source(source) => source.retire(&self.dead, fence_peer),
         }
     }
 

@@ -154,7 +154,7 @@ impl UdpEndpointPool {
         generation: u64,
     ) -> bool {
         let key = EndpointKey::new(client, dst);
-        self.retire_if_same(key, token, generation)
+        self.close_if_same(key, token, generation)
             || self.endpoints.get(&key).is_some_and(|entry| {
                 matches!(entry.value(), EndpointEntry::Retiring { generation: found, owner, .. }
                     if *found == generation && owner.token == token)
@@ -266,7 +266,7 @@ impl UdpEndpointPool {
                 .then(|| (entry.value().owner().token, entry.value().generation()))
         });
         if let Some((token, generation)) = identity {
-            self.retire_if_same(key, token, generation);
+            self.close_if_same(key, token, generation);
         }
     }
 
@@ -310,6 +310,22 @@ impl UdpEndpointPool {
 
     /// Replace only the exact live incarnation with its removal tombstone.
     pub(super) fn retire_if_same(&self, key: EndpointKey, token: u32, generation: u64) -> bool {
+        self.retire_exact(key, token, generation, false)
+    }
+
+    /// Like `retire_if_same`, but a shared source then drops the closed
+    /// destination's late replies instead of delivering them as foreign.
+    fn close_if_same(&self, key: EndpointKey, token: u32, generation: u64) -> bool {
+        self.retire_exact(key, token, generation, true)
+    }
+
+    fn retire_exact(
+        &self,
+        key: EndpointKey,
+        token: u32,
+        generation: u64,
+        fence_peer: bool,
+    ) -> bool {
         let entry = match self.endpoints.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied)
                 if occupied.get().matches_identity(generation, token)
@@ -344,7 +360,7 @@ impl UdpEndpointPool {
         };
         let owner = entry.owner();
         let stateless = owner.is_stateless(key.client_port, key.dst_port);
-        let conn_id = entry.retire();
+        let conn_id = entry.retire(fence_peer);
         drop(entry);
         self.notify_removed(EndpointRemoval {
             client: SocketAddr::new(key.client_ip(), key.client_port),
@@ -428,7 +444,7 @@ impl UdpEndpointPool {
             .collect();
         let removed = stale
             .into_iter()
-            .filter(|(key, token, generation)| self.retire_if_same(*key, *token, *generation))
+            .filter(|(key, token, generation)| self.close_if_same(*key, *token, *generation))
             .count();
         if removed != 0 {
             debug!(

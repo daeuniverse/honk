@@ -863,7 +863,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
     for endpoint in &endpoints[..2] {
         endpoint.send_packet(b"bound", true).await.unwrap();
     }
-    endpoints[2].kill();
+    endpoints[2].kill(true);
     let mut replies = HashMap::new();
     let first = next_data_frame(&mut events, &mut replies).await;
     let second = next_data_frame(&mut events, &mut replies).await;

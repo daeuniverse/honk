@@ -583,6 +583,28 @@ async fn shared_source_foreign_reply_requires_vacant_live_owner() {
 }
 
 #[tokio::test]
+async fn shared_source_delivers_replies_of_a_view_whose_driver_ended() {
+    let f = Fixture::new(false, 16).await;
+    let (client, b) = (f.client(), f.target(1));
+    let bound = f.flow(0, b"bound").await;
+    let lease = f.reserve(client, b, b"ending");
+    let attachment = f.attach(client, b, None).await;
+    let (ending, mut driver) = f.install(lease, attachment, client, b, b).await;
+    driver.wait_first_ack().await.unwrap();
+    let transport = f.transport();
+    // Idle expiry and transport errors leave through this same driver exit.
+    driver.abort();
+    f.wait_until("ended view to leave the pool", || {
+        !f.pool.endpoints.contains_key(&EndpointKey::new(client, b))
+    })
+    .await;
+    transport.reply(b, b"after-end");
+    assert_eq!(received(&f.client).await, (b"after-end".to_vec(), b));
+    drop((bound, ending, transport));
+    f.shutdown().await;
+}
+
+#[tokio::test]
 async fn shared_source_serves_more_foreign_peers_than_it_caches_sockets_for() {
     let f = Fixture::new(false, 16).await;
     let endpoint = f.flow(0, b"bound").await;
@@ -616,7 +638,7 @@ async fn shared_source_forgets_the_oldest_retired_peer() {
             f.stats
                 .outbound_tracker(&f.node.name, crate::stats::OutboundKind::Node),
         );
-        view.retire(&AtomicBool::new(false));
+        view.retire(&AtomicBool::new(false), true);
     };
     // `oldest` and 63 later retirements fill the 64-peer fence.
     retire(oldest).await;

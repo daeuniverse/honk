@@ -102,7 +102,7 @@ impl SourceState {
         }
     }
 
-    /// Keeps late replies of the most recently retired flows from foreign delivery.
+    /// Keeps late replies of the most recently closed flows from foreign delivery.
     // ponytail: heavy churn shortens each peer's fence; add deadlines if that matters.
     fn note_retired_peer(&mut self, peer: SocketAddr) {
         self.retired_reply_peers.retain(|retired| *retired != peer);
@@ -514,12 +514,14 @@ impl SourceEndpoint {
         true
     }
 
-    pub(super) fn retire(&self, dead: &AtomicBool) {
+    /// `fence_peer` drops the target's later replies instead of delivering them
+    /// as foreign: set for an explicit close, not for idle expiry or failure.
+    pub(super) fn retire(&self, dead: &AtomicBool, fence_peer: bool) {
         let mut binding = self.binding.lock();
         binding.attachment.take();
         {
             let mut state = self.owner.state.lock();
-            if matches!(self.owner.scope.reply, ReplyProjection::ActualPeer) {
+            if fence_peer && matches!(self.owner.scope.reply, ReplyProjection::ActualPeer) {
                 state.note_retired_peer(normalize_socket_addr(self.target));
             }
             if binding.endpoint_permit.is_some() {

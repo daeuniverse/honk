@@ -90,7 +90,7 @@ async fn different_sources_share_only_aggregated_carriers() {
             assert_eq!((frames[0].session_id, frames[1].session_id), (0, 0));
         }
         if aggregated {
-            endpoints[0].kill();
+            endpoints[0].kill(true);
         }
         endpoints[1].send_packet(b"survivor", false).await.unwrap();
         let keep = next_data_frame(&mut events, &mut replies).await;

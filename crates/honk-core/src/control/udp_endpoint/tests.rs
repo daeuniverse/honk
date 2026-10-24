@@ -36,7 +36,7 @@ async fn explicit_retirement_is_neutral_until_a_reply_makes_it_useful() {
     let relay = "127.0.0.1:53".parse().unwrap();
     let endpoint = UdpEndpoint::new(transport(socket, relay), relay, uuid::Uuid::new_v4());
     let result = Err(io::Error::new(io::ErrorKind::BrokenPipe, "retired"));
-    endpoint.kill();
+    endpoint.kill(true);
 
     assert_eq!(
         score_driver_outcome(&endpoint, &result),
@@ -142,7 +142,7 @@ fn quic_stall_is_node_failure_without_overriding_neutral_boundaries() {
         ),
         ScoreOutcome::Rejected,
     );
-    endpoint.kill();
+    endpoint.kill(true);
     assert_eq!(
         score_driver_outcome(&endpoint, &idle),
         ScoreOutcome::Success
@@ -2297,7 +2297,7 @@ async fn udp_endpoint_node_death_stops_after_blocked_first_send() {
         first_ack_tx,
     ));
     transport.wait_for_send_count(1).await;
-    endpoint.kill();
+    endpoint.kill(true);
     release.notify_waiters();
     assert_eq!(
         first_ack_rx.await.unwrap().unwrap_err().kind(),
@@ -2352,7 +2352,7 @@ async fn udp_endpoint_node_death_stops_after_blocked_steady_send() {
     ));
     first_ack_rx.await.unwrap().unwrap();
     transport.wait_for_send_count(2).await;
-    endpoint.kill();
+    endpoint.kill(true);
     release.notify_waiters();
     assert_eq!(
         worker.await.unwrap().unwrap_err().kind(),
