@@ -124,7 +124,6 @@ pub(super) async fn deliver_source_reply(
     owner: &SourceOwner,
     peer: SocketAddr,
     data: &[u8],
-    alternate_reply_sockets: &mut Vec<(SocketAddr, ReplySocket)>,
 ) -> SourceReplyDisposition {
     match pool.classify_source_reply(owner, peer) {
         SourceReplyTarget::Flow { endpoint, source } => {
@@ -161,9 +160,7 @@ pub(super) async fn deliver_source_reply(
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 return SourceReplyDisposition::Drop;
             }
-            let socket = match alternate_reply_socket(alternate_reply_sockets, source, || {
-                pool.create_reply_socket(source)
-            }) {
+            let socket = match pool.foreign_replies.get(source) {
                 Ok(socket) => socket,
                 Err(error) => {
                     debug!("UDP foreign reply socket creation failed: {}", error);
@@ -181,7 +178,7 @@ pub(super) async fn deliver_source_reply(
                     hook.release.notified().await;
                 }
             }
-            if !send_reply(socket, data, owner.scope.client).await {
+            if !send_reply(&socket, data, owner.scope.client).await {
                 debug!("UDP foreign reply delivery failed");
                 SourceReplyDisposition::Observed
             } else {

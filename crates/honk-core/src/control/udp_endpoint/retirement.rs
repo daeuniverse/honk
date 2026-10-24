@@ -477,6 +477,13 @@ impl UdpEndpointPool {
         if removed > 0 {
             debug!("UDP endpoint janitor removed {} expired endpoints", removed);
         }
+        let closed = self.foreign_replies.prune(DEFAULT_NAT_TIMEOUT);
+        if closed > 0 {
+            debug!(
+                "UDP endpoint janitor closed {} idle foreign reply sockets",
+                closed
+            );
+        }
         removed
     }
 
@@ -582,6 +589,7 @@ impl UdpEndpointPool {
         self.drain_removal_dirty().await;
         let retirements_clean = self.wait_for_retirements().await;
         self.remove_sink.lock().take();
+        self.foreign_replies.clear();
         let joined = initializers_clean && drivers.joined && sources.joined && retirements_clean;
         UdpShutdown {
             joined,

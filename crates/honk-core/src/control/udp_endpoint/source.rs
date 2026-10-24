@@ -706,7 +706,6 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
     };
     // Heap, not inline: an inline array adds 64 KiB to every source task.
     let mut buf = vec![0u8; 65536];
-    let mut alternate_reply_sockets = Vec::new();
 
     loop {
         let retired = owner.retire_notify.notified();
@@ -748,13 +747,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
                         return;
                     }
                 };
-                match deliver_source_reply(
-                    &pool,
-                    &owner,
-                    peer,
-                    &buf[..len],
-                    &mut alternate_reply_sockets,
-                ).await {
+                match deliver_source_reply(&pool, &owner, peer, &buf[..len]).await {
                     SourceReplyDisposition::Delivered if owner.is_ready() => {
                         owner.report_available();
                         reply_idle_timeout

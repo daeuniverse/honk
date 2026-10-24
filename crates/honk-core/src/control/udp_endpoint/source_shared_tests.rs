@@ -606,11 +606,11 @@ async fn shared_source_delivers_replies_of_a_view_whose_driver_ended() {
 
 #[tokio::test]
 async fn shared_source_serves_more_foreign_peers_than_it_caches_sockets_for() {
-    let f = Fixture::new(false, 16).await;
+    // One endpoint of capacity leaves seven foreign sockets, so the eighth peer
+    // evicts the first, which then needs a fresh socket.
+    let f = Fixture::new(false, 1).await;
     let endpoint = f.flow(0, b"bound").await;
     let transport = f.transport();
-    // One more foreign peer than the receiver caches sockets for, then the
-    // evicted first peer again.
     for index in (1..=MAX_REPLY_SOCKETS_PER_ENDPOINT).chain([1]) {
         let peer = f.target(index);
         transport.reply(peer, b"foreign");

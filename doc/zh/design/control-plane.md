@@ -149,7 +149,7 @@ source gate 准入后开始，并由 driver 保留到最终 I/O 结果分类完�
 
 SOCKS5 UDP 在 source association 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 association 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。每个请求头写入自己的目的地，每个应答返回其头部中的真实来源，域名来源仅投影为捕获的名称和端口。`PacketTransport::relay_addr()` 是第一个目的地，因此 SOCKS relay 本身不会被误认为远端 peer。
 
-回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket。普通 flow 按 endpoint 缓存已接受的其他 full-cone 来源，共享 source 则由 receiver 为全部绑定 view 共用一个缓存；每个缓存最多七个其他来源 socket，新来源替换最久未用的那个。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
+回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket。普通 flow 与共享 source 的 receiver 共用一个进程级 full-cone 回复 socket 缓存，按 peer 地址索引，上限为每个 endpoint 容量七个，空闲超过一个 NAT 超时即被清理。超出上限的新 peer 会关闭最久未用的 socket；主回复 socket 在描述符预算耗尽时也这样处理，因此外来回复让位于新流。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
 
 Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 取消并排空 `Initializing` lease 及其保留资源，`Ready` endpoint 仍遵循既有生命周期。已有原始 UDP `Ready` 会话在语义分组名相同且符合该生命周期时可以保留，但 `Initializing` 不能跨 reload 存活。编译策略发布后，过期的排队路由元数据仍会被准入检查拒绝。每次 retirement（包括其 `Retiring` tombstone）和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
 编译后的流量计划成功变更，且旧策略或新策略包含直连 mark 时，才会退役直连 `Ready` endpoint，避免后续流量复用旧 socket mark；无变化、不相关重载，以及新旧策略均无直连 mark 的路由变更，都会保留这些端点。显式标记为用户态所有的 WAN UDP 决策（包括带 mark 的 `direct(must)`）会在 tuple/reader fence 下同时清理 token 为零的 conn state、handoff 与 redirect track；原生 LAN direct/offloaded 决策及更新的非零 token 保持不变。
@@ -174,10 +174,10 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 | UDP endpoint | 32,768 | 每个 10 = 327,680 |
 | **合计** |  | **437,504** |
 
-一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流和全部八个
-anyfrom reply socket 记账。一个 TCP 流为 accepted/outbound socket 和两组
-各含两个 FD 的 splice pipe 记账。更小限制使用相同的饱和分区；VLESS carrier
-结果为零时保持零。
+一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流，以及它自己的
+anyfrom reply socket 加进程级外来池的一份记账；每个 endpoint 容量共八个回复
+socket。一个 TCP 流为 accepted/outbound socket 和两组各含两个 FD 的 splice pipe
+记账。更小限制使用相同的饱和分区；VLESS carrier 结果为零时保持零。
 
 启动时还把 UDP endpoint 限制在 `MemTotal` 的四分之一以内，每个 endpoint 按
 64 KiB 计：2 GiB 为 8,192，8 GiB 起达到 32,768 硬上限。实测一个 Shadowsocks
