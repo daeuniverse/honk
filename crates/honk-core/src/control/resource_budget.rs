@@ -80,7 +80,7 @@ impl ResourceBudget {
         }
     }
 
-    /// Caps UDP endpoints so their worst case stays within a quarter of RAM.
+    /// Caps UDP endpoints at a quarter of RAM, budgeting `UDP_ENDPOINT_MEMORY_BYTES` each.
     pub(crate) fn with_memory(mut self, total_bytes: u64) -> Self {
         let cap = total_bytes / 4 / UDP_ENDPOINT_MEMORY_BYTES;
         self.udp_endpoints = self
