@@ -50,3 +50,10 @@ path = "fuzz_targets/netstack_schedule.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "netstack_transparent"
+path = "fuzz_targets/netstack_transparent.rs"
+test = false
+doc = false
+bench = false

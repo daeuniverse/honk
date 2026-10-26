@@ -267,7 +267,7 @@ jobs:
           failed=0
           # New inputs go to a scratch directory (libFuzzer writes to the first
           # corpus argument); the committed seeds under fuzz/corpus stay seeds.
-          for target in document share_link lexer netstack_packet netstack_schedule; do
+          for target in document share_link lexer netstack_packet netstack_schedule netstack_transparent; do
             mkdir -p "$RUNNER_TEMP/fuzz-grown/$target"
             if cargo +"$FUZZ_NIGHTLY" fuzz run "$target" \
               "$RUNNER_TEMP/fuzz-grown/$target" "corpus/$target" -- \

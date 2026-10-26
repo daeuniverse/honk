@@ -4,6 +4,7 @@ use crate::wire::tcp::{ACK, FIN, Header, RST, SYN};
 use crate::{Ready, StreamError};
 
 use super::cc::CcAck;
+use super::passive::Gate;
 use super::recovery;
 use super::ring::Pool;
 use super::sack::Insert;
@@ -20,6 +21,10 @@ impl Tcb {
         pool: &mut Pool,
     ) -> Option<(u32, u32, u8)> {
         if self.state == TcpState::Closed {
+            return None;
+        }
+        if self.gate != Gate::Open {
+            // Before the application decides nothing is answered: retransmitted SYNs are absorbed.
             return None;
         }
         if self.state == TcpState::SynSent {
@@ -106,6 +111,7 @@ impl Tcb {
             }
             return None;
         }
+        self.ka_activity(now);
         if h.flags & RST != 0 {
             if h.seq == self.rcv_nxt {
                 self.fail(StreamError::Reset);
@@ -253,6 +259,8 @@ impl Tcb {
 
     fn established(&mut self, now: Instant) {
         self.state = TcpState::Established;
+        self.ka_activity(now);
+        self.arm_keepalive(now);
         // SYN retransmission backoff belongs to the handshake, not to the first data timeout.
         self.rtt.backoff = 0;
         self.rto_deadline = None;

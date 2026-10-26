@@ -12,7 +12,7 @@ const AH: u8 = 51;
 const NO_NEXT: u8 = 59;
 const DEST_OPTS: u8 = 60;
 
-pub(super) fn addrs(pkt: &[u8]) -> (Ipv6Addr, Ipv6Addr) {
+pub(crate) fn addrs(pkt: &[u8]) -> (Ipv6Addr, Ipv6Addr) {
     let a = |o: usize| {
         let mut b = [0u8; 16];
         b.copy_from_slice(&pkt[o..o + 16]);
@@ -49,11 +49,35 @@ pub fn parse(pkt: &[u8]) -> Result<IpPacket, ParseError> {
 /// the upper layer and its protocol number.
 pub(super) fn skip_ext_headers(
     pkt: &[u8],
+    off: usize,
+    end: usize,
+    next: u8,
+) -> Result<(usize, u8), ParseError> {
+    match walk_ext_headers(pkt, off, end, next)? {
+        Walk {
+            proto: FRAGMENT, ..
+        } => Err(ParseError::Fragment),
+        Walk { off, proto, .. } => Ok((off, proto)),
+    }
+}
+
+/// Where [`walk_ext_headers`] stopped: `off` is the first byte of the header (or upper layer)
+/// of protocol `proto`, and `nh_off` the offset of the "next header" byte that announced it.
+pub(crate) struct Walk {
+    pub off: usize,
+    pub proto: u8,
+    pub nh_off: usize,
+}
+
+/// Like [`skip_ext_headers`] but stops at a fragment header (`proto == 44`) instead of failing.
+pub(crate) fn walk_ext_headers(
+    pkt: &[u8],
     mut off: usize,
     end: usize,
     mut next: u8,
-) -> Result<(usize, u8), ParseError> {
+) -> Result<Walk, ParseError> {
     let mut seen = 0;
+    let mut nh_off = 6;
     loop {
         match next {
             HOP_BY_HOP | ROUTING | DEST_OPTS => {
@@ -70,13 +94,32 @@ pub(super) fn skip_ext_headers(
                     return Err(ParseError::Unsupported);
                 }
                 next = pkt[off];
+                nh_off = off;
                 off += len;
             }
-            FRAGMENT => return Err(ParseError::Fragment),
             ESP | AH | NO_NEXT => return Err(ParseError::Unsupported),
-            proto => return Ok((off, proto)),
+            proto => return Ok(Walk { off, proto, nh_off }),
         }
     }
+}
+
+pub(crate) const FRAGMENT_HEADER_LEN: usize = 8;
+
+/// Writes an 8-byte fragment header: `offset` in bytes (a multiple of 8).
+pub(crate) fn emit_fragment_header(
+    buf: &mut [u8],
+    next: u8,
+    offset: usize,
+    more: bool,
+    id: u32,
+) -> Option<usize> {
+    let h = buf.get_mut(..FRAGMENT_HEADER_LEN)?;
+    let field = u16::try_from(offset).ok()? & 0xFFF8 | u16::from(more);
+    h[0] = next;
+    h[1] = 0;
+    h[2..4].copy_from_slice(&field.to_be_bytes());
+    h[4..8].copy_from_slice(&id.to_be_bytes());
+    Some(FRAGMENT_HEADER_LEN)
 }
 
 pub fn emit(

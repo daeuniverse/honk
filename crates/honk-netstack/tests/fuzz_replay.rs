@@ -27,9 +27,10 @@ type Check = (&'static str, fn(&[u8]));
 #[test]
 fn saved_inputs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz");
-    let checks: [Check; 2] = [
+    let checks: [Check; 3] = [
         ("netstack_packet", fuzz_checks::packet),
         ("netstack_schedule", fuzz_checks::schedule),
+        ("netstack_transparent", fuzz_checks::transparent),
     ];
     let mut count = 0;
     for (target, check) in checks {

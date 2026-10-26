@@ -7,10 +7,12 @@
 
 mod packet;
 mod schedule;
+mod transparent;
 mod world;
 
 pub use packet::check as packet;
 pub use schedule::check as schedule;
+pub use transparent::check as transparent;
 
 /// Seed inputs for each target, as `(target, bytes)`; the corpus generator writes them out.
 pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
@@ -18,5 +20,8 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     let schedules = schedule::seeds()
         .into_iter()
         .map(|s| ("netstack_schedule", s));
-    packets.chain(schedules).collect()
+    let transparent = transparent::seeds()
+        .into_iter()
+        .map(|s| ("netstack_transparent", s));
+    packets.chain(schedules).chain(transparent).collect()
 }

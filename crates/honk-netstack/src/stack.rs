@@ -1,13 +1,17 @@
 //! Public sans-I/O API and the single-owner scheduler.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::{BitOr, BitOrAssign, Range};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::MemoryBudget;
+use crate::accept::Refuse;
 use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
+use crate::fragment::{FragmentLimits, Push};
+use crate::icmp_out::IcmpLimits;
+use crate::mode::{Mode, is_unicast};
 use crate::tcp::output::Output;
 use crate::tcp::ring::{FLOOR, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
@@ -24,9 +28,20 @@ pub struct Config {
     pub max_flows: u32,
     pub tcp_rcv_buf_max: usize,
     pub tcp_snd_buf_max: usize,
+    /// Whom the stack answers for; the default, [`Mode::Endpoint`], answers for `local_v4`/`local_v6`.
+    pub mode: Mode,
+    /// Transparent mode: half-open (SYN received, handshake unfinished) flows in total; further
+    /// SYNs are dropped and counted, never answered.
+    pub half_open_max: u32,
+    /// Transparent mode: half-open flows per client address.
+    pub half_open_per_source: u32,
     /// Process-wide limit on top of `memory_limit`: floors and shared commitments are charged to
     /// both. Stacks sharing one budget cannot exceed it together; a dropped stack returns its share.
     pub shared_budget: Option<Arc<MemoryBudget>>,
+    /// Transparent mode: ICMP error generation limits.
+    pub icmp_limits: IcmpLimits,
+    /// Transparent mode: IP fragment reassembly limits.
+    pub fragment_limits: FragmentLimits,
 }
 
 impl Config {
@@ -41,6 +56,11 @@ impl Config {
             tcp_rcv_buf_max: 8 * 1024 * 1024,
             tcp_snd_buf_max: 6 * 1024 * 1024,
             shared_budget: None,
+            icmp_limits: IcmpLimits::default(),
+            fragment_limits: FragmentLimits::default(),
+            mode: Mode::Endpoint,
+            half_open_max: 1024,
+            half_open_per_source: 128,
         }
     }
 }
@@ -87,6 +107,19 @@ pub enum Rx {
         src: SocketAddr,
         payload: Range<usize>,
     },
+    /// Transparent-mode UDP: stateless, no flow; `payload` indexes the input packet.
+    Transparent {
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Range<usize>,
+    },
+    /// A transparent datagram that was reassembled from fragments; `payload` indexes `packet`.
+    TransparentOwned {
+        src: SocketAddr,
+        dst: SocketAddr,
+        packet: Vec<u8>,
+        payload: Range<usize>,
+    },
     Dropped(DropReason),
 }
 
@@ -100,6 +133,10 @@ pub enum DropReason {
     NoFlow,
     Unsupported,
     Stale,
+    /// Transparent mode: a SYN beyond the half-open caps.
+    HalfOpen,
+    /// Transparent mode: a SYN the flow table or memory floors could not admit.
+    Capacity,
 }
 
 impl From<ParseError> for DropReason {
@@ -158,15 +195,21 @@ pub enum UdpError {
     Stale,
     #[error("datagram exceeds the path MTU")]
     TooLarge,
+    #[error("pending fragment queue is full")]
+    Busy,
+    #[error("source and destination address families differ")]
+    FamilyMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackStats {
     /// Indexed by the discriminant of [`DropReason`].
-    pub drops: [u64; 8],
+    pub drops: [u64; 16],
     pub memory_committed: usize,
     pub memory_allocated: usize,
     pub flows: u32,
+    /// Transparent mode: flows between SYN and the end of the handshake.
+    pub half_open: u32,
     pub timewait_entries: usize,
     pub control_dropped: u64,
     pub rx_packets: u64,
@@ -174,11 +217,13 @@ pub struct StackStats {
 }
 
 #[derive(Clone, Copy)]
-struct Control {
-    tuple: FourTuple,
-    seq: u32,
-    ack: u32,
-    flags: u8,
+pub(crate) struct Control {
+    pub(crate) tuple: FourTuple,
+    pub(crate) seq: u32,
+    pub(crate) ack: u32,
+    pub(crate) flags: u8,
+    /// An ICMP error for a refused SYN instead of a TCP segment.
+    pub(crate) icmp: Option<Refuse>,
 }
 const CONTROL_LIMIT: usize = 128;
 
@@ -188,8 +233,8 @@ pub struct Stack {
     pub(crate) epoch: Instant,
     pub(crate) table: Table,
     ports: Ports,
-    pool: Pool,
-    floor_cap: u32,
+    pub(crate) pool: Pool,
+    pub(crate) floor_cap: u32,
     timers: Timers,
     /// Queue elements `purge_stale` has visited; lets tests assert teardown stays amortized O(1).
     #[cfg(test)]
@@ -198,16 +243,28 @@ pub struct Stack {
     ready: VecDeque<FlowId>,
     writers: VecDeque<FlowId>,
     timewait_ready: VecDeque<FlowId>,
-    controls: VecDeque<Control>,
-    tx_wakeup: bool,
+    pub(crate) controls: VecDeque<Control>,
+    pub(crate) tx_wakeup: bool,
     class: u8,
     cache: Option<(FourTuple, FlowId)>,
+    /// Passive flows whose SYN `poll_accept` has not yet reported.
+    pub(crate) accept_q: VecDeque<FlowId>,
+    pub(crate) half_open: u32,
+    pub(crate) half_open_by_source: HashMap<IpAddr, u32>,
+    pub(crate) udp_tx: crate::udp_t::UdpTx,
+    pub(crate) icmp_out: crate::icmp_out::IcmpOut,
     pub(crate) counters: StackStats,
+    pub(crate) reasm: crate::fragment::Reassembler,
 }
 
 impl Stack {
     pub fn new(mut cfg: Config, now: Instant) -> Stack {
-        cfg.mtu = cfg.mtu.max(if cfg.local_v6.is_some() { 1280 } else { 68 });
+        let transparent = matches!(cfg.mode, Mode::Transparent { .. });
+        cfg.mtu = cfg.mtu.max(if cfg.local_v6.is_some() || transparent {
+            1280
+        } else {
+            68
+        });
         let floor_cap = cfg
             .max_flows
             .min((cfg.memory_limit / FLOOR).min(u32::MAX as usize) as u32);
@@ -216,6 +273,9 @@ impl Stack {
             .with_budget(cfg.shared_budget.clone());
         let ports = Ports::new(&cfg.secret);
         Stack {
+            udp_tx: crate::udp_t::UdpTx::new(&cfg.secret),
+            icmp_out: crate::icmp_out::IcmpOut::new(cfg.icmp_limits),
+            reasm: crate::fragment::Reassembler::new(cfg.fragment_limits),
             cfg,
             now,
             epoch: now,
@@ -234,6 +294,9 @@ impl Stack {
             tx_wakeup: false,
             class: 0,
             cache: None,
+            accept_q: VecDeque::new(),
+            half_open: 0,
+            half_open_by_source: HashMap::new(),
             counters: StackStats::default(),
         }
     }
@@ -241,15 +304,33 @@ impl Stack {
     pub fn receive(&mut self, now: Instant, packet: &[u8]) -> Rx {
         self.now = now;
         self.counters.rx_packets += 1;
+        self.receive_packet(now, packet)
+    }
+
+    fn receive_packet(&mut self, now: Instant, packet: &[u8]) -> Rx {
         let ip = match wire::parse_ip(packet) {
             Ok(ip) => ip,
+            Err(ParseError::Fragment) if self.transparent() => {
+                return match self.reasm.push(now, packet) {
+                    Push::Pending => Rx::Consumed,
+                    Push::Dropped(reason) => self.drop_packet(reason),
+                    // The whole datagram goes through the normal checks, destination included.
+                    Push::Complete(r) => {
+                        let rx = self.receive_packet(now, &r.packet);
+                        r.wrap(rx)
+                    }
+                };
+            }
             Err(e) => return self.drop_packet(e.into()),
         };
-        if !self.is_local(ip.dst) {
-            return self.drop_packet(DropReason::NotForUs);
+        if let Some(reason) = self.refuses(ip.dst) {
+            return self.drop_packet(reason);
         }
         match ip.proto {
             wire::PROTO_TCP => self.receive_tcp(now, &ip, packet),
+            wire::PROTO_UDP if self.transparent() => {
+                crate::udp_t::receive_transparent(self, &ip, packet, true)
+            }
             wire::PROTO_UDP => self.receive_udp(&ip, packet),
             wire::PROTO_ICMP | wire::PROTO_ICMPV6 => self.receive_icmp(now, &ip, packet),
             _ => self.drop_packet(DropReason::Unsupported),
@@ -296,7 +377,10 @@ impl Stack {
             self.sync(index, now);
             return Rx::Consumed;
         }
-        if let Some(&index) = self.table.timewait.get(&tuple) {
+        let reopen = self.timewait_reopen(tuple, &h);
+        if reopen.is_none()
+            && let Some(&index) = self.table.timewait.get(&tuple)
+        {
             let slot = &mut self.table.slots[index as usize];
             if let Some(Flow::TimeWait(t)) = slot.flow.as_mut()
                 && crate::tcp::valid_timewait_fin(
@@ -323,6 +407,11 @@ impl Stack {
             self.timers.refresh(&mut self.table, index);
             return Rx::Consumed;
         }
+        if self.transparent()
+            && let Some(rx) = self.passive_open(now, tuple, &h, reopen)
+        {
+            return rx;
+        }
         if h.flags & wire::tcp::RST == 0 {
             if h.flags & wire::tcp::ACK != 0 {
                 self.control(tuple, h.ack, 0, wire::tcp::RST);
@@ -340,17 +429,22 @@ impl Stack {
 
     pub fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
         self.now = now;
-        for step in 0..3 {
-            let class = (self.class + step) % 3;
+        for step in 0..5 {
+            let class = (self.class + step) % 5;
             let result = match class {
-                0 => self.emit_control(out),
+                0 => self.emit_control(now, out),
                 1 => self.emit_timewait(now, out),
-                _ => self.emit_flow(now, out),
+                2 => self.emit_flow(now, out),
+                3 => self.poll_udp_frag(out),
+                _ => self.reasm.poll_icmp(now, &mut self.icmp_out, out),
             };
             match result {
                 Output::Sent(n) => {
-                    self.class = (class + 1) % 3;
-                    self.counters.tx_packets += 1;
+                    self.class = (class + 1) % 5;
+                    if class != 3 {
+                        // `poll_udp_frag` counts its own packets.
+                        self.counters.tx_packets += 1;
+                    }
                     return Some(n);
                 }
                 Output::Blocked => return None,
@@ -360,27 +454,39 @@ impl Stack {
         None
     }
 
-    fn emit_control(&mut self, out: &mut [u8]) -> Output {
-        let Some(c) = self.controls.front() else {
-            return Output::None;
-        };
-        let h = wire::tcp::Header {
-            src_port: c.tuple.local.port(),
-            dst_port: c.tuple.remote.port(),
-            seq: c.seq,
-            ack: c.ack,
-            flags: c.flags,
-            window: 0,
-            urgent: 0,
-            options: wire::tcp::Options::default(),
-        };
-        match wire::tcp::emit_packet(out, c.tuple.local.ip(), c.tuple.remote.ip(), &h, [&[], &[]]) {
-            Some(n) => {
-                self.controls.pop_front();
-                Output::Sent(n)
+    fn emit_control(&mut self, now: Instant, out: &mut [u8]) -> Output {
+        while let Some(c) = self.controls.front().copied() {
+            if let Some(how) = c.icmp {
+                match self.emit_refusal(now, &c, how, out) {
+                    Output::None => continue,
+                    result => return result,
+                }
             }
-            None => Output::Blocked,
+            let h = wire::tcp::Header {
+                src_port: c.tuple.local.port(),
+                dst_port: c.tuple.remote.port(),
+                seq: c.seq,
+                ack: c.ack,
+                flags: c.flags,
+                window: 0,
+                urgent: 0,
+                options: wire::tcp::Options::default(),
+            };
+            return match wire::tcp::emit_packet(
+                out,
+                c.tuple.local.ip(),
+                c.tuple.remote.ip(),
+                &h,
+                [&[], &[]],
+            ) {
+                Some(n) => {
+                    self.controls.pop_front();
+                    Output::Sent(n)
+                }
+                None => Output::Blocked,
+            };
         }
+        Output::None
     }
 
     fn emit_timewait(&mut self, now: Instant, out: &mut [u8]) -> Output {
@@ -474,11 +580,15 @@ impl Stack {
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.timers.next()
+        [self.timers.next(), self.reasm.poll_timeout()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
         self.now = now;
+        self.reasm.expire(now);
         while let Some((deadline, index, generation)) = self.timers.pop_due(now) {
             let slot = &mut self.table.slots[index as usize];
             if slot.generation != generation || slot.scheduled != Some(deadline) {
@@ -657,6 +767,7 @@ impl Stack {
             memory_committed: self.table.tcp_active as usize * FLOOR + self.pool.shared_bytes(),
             memory_allocated: self.pool.allocated_bytes(),
             flows: self.table.active,
+            half_open: self.half_open,
             timewait_entries: self.table.timewait.len(),
             ..self.counters
         }
@@ -677,8 +788,13 @@ impl Stack {
         };
         let mut remove = false;
         let mut compact = None;
+        let mut left_half_open = None;
         if let Some(Flow::Tcp(t)) = slot.flow.as_mut() {
             t.check();
+            if t.half_open && t.state != TcpState::SynReceived {
+                t.half_open = false;
+                left_half_open = Some(t.tuple.remote.ip());
+            }
             if !t.app_open {
                 if t.state == TcpState::Closed && !t.rst_pending {
                     remove = true;
@@ -700,6 +816,9 @@ impl Stack {
                     self.ready.push_back(id);
                 }
             }
+        }
+        if let Some(source) = left_half_open {
+            self.leave_half_open(source);
         }
         let retired = remove || compact.is_some();
         if remove {
@@ -756,7 +875,7 @@ impl Stack {
     /// Drops queue nodes of removed flows. Every pop already skips them by generation, so this only
     /// bounds growth: a queue is swept once it holds twice what the live slots could, which costs
     /// O(1) amortized per removal where sweeping on each removal made mass teardown quadratic.
-    fn purge_stale(&mut self) {
+    pub(crate) fn purge_stale(&mut self) {
         let limit = 2 * self.table.slots.len().max(16);
         let slots = &self.table.slots;
         for queue in [
@@ -764,6 +883,7 @@ impl Stack {
             &mut self.ready,
             &mut self.writers,
             &mut self.timewait_ready,
+            &mut self.accept_q,
         ] {
             if queue.len() > limit {
                 #[cfg(test)]
@@ -781,6 +901,18 @@ impl Stack {
     pub(crate) fn check(&self) {
         self.table.check();
         self.pool.check_held(self.table.tcp_active as usize);
+        let (mut half_open, mut by_source) = (0u32, HashMap::<IpAddr, u32>::new());
+        for slot in &self.table.slots {
+            if let Some(Flow::Tcp(t)) = &slot.flow
+                && t.half_open
+            {
+                half_open += 1;
+                *by_source.entry(t.tuple.remote.ip()).or_default() += 1;
+            }
+        }
+        assert_eq!(half_open, self.half_open);
+        assert_eq!(by_source, self.half_open_by_source);
+        assert!(self.half_open <= self.cfg.half_open_max);
         for slot in &self.table.slots {
             let deadline = match &slot.flow {
                 Some(Flow::Tcp(t)) => {
@@ -803,6 +935,7 @@ impl Stack {
             &self.ready,
             &self.writers,
             &self.timewait_ready,
+            &self.accept_q,
         ] {
             assert!(
                 queue.len() <= bound,
@@ -814,6 +947,8 @@ impl Stack {
             "the timer heap outgrew its rebuild bound"
         );
         assert!(self.controls.len() <= CONTROL_LIMIT);
+        self.reasm.check();
+        self.udp_tx.check();
         assert!(self.stats().memory_committed <= self.cfg.memory_limit);
     }
 
@@ -823,6 +958,14 @@ impl Stack {
         self.check();
         assert_eq!(self.table.active, 0);
         assert_eq!(self.table.timewait.len(), 0);
+        self.reasm.assert_idle();
+        assert_eq!(self.half_open, 0);
+        assert!(self.half_open_by_source.is_empty());
+        assert!(
+            self.accept_q
+                .iter()
+                .all(|id| { self.table.slots[id.idx as usize].generation != id.generation })
+        );
         assert_eq!(self.stats().memory_committed, 0);
         self.pool.assert_idle();
         if let Some(budget) = &self.cfg.shared_budget {
@@ -830,17 +973,22 @@ impl Stack {
         }
     }
 
-    fn control(&mut self, tuple: FourTuple, seq: u32, ack: u32, flags: u8) {
-        if self.controls.len() == CONTROL_LIMIT {
-            self.counters.control_dropped += 1;
-            return;
-        }
-        self.controls.push_back(Control {
+    pub(crate) fn control(&mut self, tuple: FourTuple, seq: u32, ack: u32, flags: u8) {
+        self.queue_control(Control {
             tuple,
             seq,
             ack,
             flags,
+            icmp: None,
         });
+    }
+
+    pub(crate) fn queue_control(&mut self, c: Control) {
+        if self.controls.len() == CONTROL_LIMIT {
+            self.counters.control_dropped += 1;
+            return;
+        }
+        self.controls.push_back(c);
     }
 
     pub(crate) fn local_for(&self, remote: IpAddr) -> Option<IpAddr> {
@@ -849,8 +997,41 @@ impl Stack {
             IpAddr::V6(_) => self.cfg.local_v6.map(IpAddr::V6),
         }
     }
-    fn is_local(&self, addr: IpAddr) -> bool {
-        self.local_for(addr) == Some(addr)
+
+    pub(crate) fn transparent(&self) -> bool {
+        matches!(self.cfg.mode, Mode::Transparent { .. })
+    }
+
+    /// Why a packet to `dst` is not ours, if it is not. A transparent stack answers for every
+    /// unicast address except the excluded ones; multicast, broadcast and unspecified (the
+    /// tun's own RS, MLD and DAD) are `Unsupported`, silently.
+    fn refuses(&self, dst: IpAddr) -> Option<DropReason> {
+        match &self.cfg.mode {
+            Mode::Endpoint => (self.local_for(dst) != Some(dst)).then_some(DropReason::NotForUs),
+            Mode::Transparent { exclude } => {
+                if !is_unicast(dst) {
+                    Some(DropReason::Unsupported)
+                } else {
+                    exclude.contains(dst).then_some(DropReason::NotForUs)
+                }
+            }
+        }
+    }
+
+    /// A TIME_WAIT entry that `h`, a plain SYN, may replace: its index and `snd_nxt`.
+    fn timewait_reopen(&self, tuple: FourTuple, h: &wire::tcp::Header) -> Option<(u32, u32)> {
+        if !self.transparent()
+            || h.flags & (wire::tcp::SYN | wire::tcp::ACK | wire::tcp::RST | wire::tcp::FIN)
+                != wire::tcp::SYN
+        {
+            return None;
+        }
+        let &index = self.table.timewait.get(&tuple)?;
+        let Some(Flow::TimeWait(tw)) = &self.table.slots[index as usize].flow else {
+            return None;
+        };
+        tw.syn_reopens(h.seq, h.options.timestamps.map(|v| v.0))
+            .then_some((index, tw.snd_nxt))
     }
     pub(crate) fn drop_packet(&mut self, reason: DropReason) -> Rx {
         self.counters.drops[reason as usize] += 1;
@@ -904,7 +1085,8 @@ mod tests {
         assert_eq!(stack.tcp_write(first, b"stale"), Err(StreamError::Stale));
         assert!(
             std::mem::size_of::<Tcb>() <= 1024,
-            "idle state excludes rings' separately allocated storage"
+            "idle state excludes rings' separately allocated storage ({} bytes)",
+            std::mem::size_of::<Tcb>()
         );
     }
 

@@ -4,6 +4,7 @@
 pub mod app;
 pub mod engine;
 pub mod honk;
+pub mod honk_server;
 pub mod link;
 pub mod rng;
 pub mod smol;
@@ -12,6 +13,7 @@ pub mod wire;
 use app::{Driver, Metrics, Plan, Role};
 use engine::{Host, Outcome, Sim, SimConfig, epoch};
 use honk::HonkHost;
+use honk_server::HonkServerHost;
 use smol::{SmolConfig, SmolHost};
 use std::fmt::Debug;
 use std::time::Duration;
@@ -32,6 +34,13 @@ impl AppHost for SmolHost {
 impl AppHost for HonkHost {
     type Id = honk_netstack::FlowId;
     fn app(&self) -> &Driver<honk_netstack::FlowId> {
+        &self.app
+    }
+}
+
+impl AppHost for HonkServerHost {
+    type Id = usize;
+    fn app(&self) -> &Driver<usize> {
         &self.app
     }
 }
@@ -97,4 +106,34 @@ pub fn path(seed: u64, rate_bps: u64, rtt: Duration, loss: f64) -> SimConfig {
         b_to_a,
         mtu: 1420,
     }
+}
+
+/// honk client against a honk transparent terminator (`defer` holds each SYN-ACK that long).
+pub fn honk_to_transparent(
+    cfg: &SimConfig,
+    family: smol::Family,
+    buffer: usize,
+    plan: &Plan,
+    defer: Option<Duration>,
+) -> Sim<HonkHost, HonkServerHost> {
+    Sim::new(
+        cfg,
+        HonkHost::new(family, buffer, plan.clone()),
+        HonkServerHost::new(family, buffer, plan.clone(), defer),
+    )
+}
+
+/// smoltcp client against a honk transparent terminator.
+pub fn smol_to_transparent(
+    cfg: &SimConfig,
+    sockets: &SmolConfig,
+    buffer: usize,
+    plan: &Plan,
+    defer: Option<Duration>,
+) -> Sim<SmolHost, HonkServerHost> {
+    Sim::new(
+        cfg,
+        SmolHost::new(sockets, plan.clone(), Role::Client),
+        HonkServerHost::new(sockets.family, buffer, plan.clone(), defer),
+    )
 }

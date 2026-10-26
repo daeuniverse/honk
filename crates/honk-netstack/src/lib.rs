@@ -8,7 +8,8 @@
 //! TCP supports active open (including simultaneous open), SACK/DSACK, timestamps,
 //! scaled/autotuned receive windows, CUBIC with HyStart++, RACK-TLP loss detection, PRR,
 //! spurious-loss undo (DSACK, Eifel, F-RTO), pacing, delayed ACKs, RTO and zero-window
-//! probes. There is no listen API, IP reassembly, ECN, urgent-data API or ICMP emission.
+//! probes. In [`Mode::Endpoint`] (the default) there is no listen API, IP reassembly or ICMP
+//! emission; ECN and urgent data are never supported. See "Transparent termination" below.
 //! Unknown TCP options are ignored; malformed lengths stop option parsing. Incoming IP
 //! and transport checksums are always verified before changing a flow.
 //!
@@ -28,6 +29,40 @@
 //! and an open application handle; once both are gone and the final ACK is sent, its
 //! compact entry holds no chunk reservations and expires after 60 seconds.
 //!
+//! # Transparent termination
+//!
+//! `Config::mode = Mode::Transparent { exclude }` makes the stack answer for every unicast
+//! destination except the excluded ones (a backstop; the classifier in front of the driver is
+//! what keeps such traffic out). A flow's local end is the packet's original destination, so
+//! replies are sourced from it. Multicast, broadcast and unspecified destinations (the tun's own
+//! RS/MLD/DAD) are dropped silently as [`DropReason::Unsupported`].
+//!
+//! A SYN creates a pending flow and sends nothing. [`Stack::poll_accept`] reports it once as a
+//! [`SynInfo`]; the application then calls [`Stack::tcp_accept`] (`Now` queues the SYN-ACK,
+//! `Deferred` holds it until [`Stack::tcp_complete`] after an upstream dial) or
+//! [`Stack::tcp_refuse`] (RST, silent drop, ICMP host unreachable or administratively
+//! prohibited). Retransmitted SYNs are absorbed without a second flow or report. A SYN nobody
+//! decides on, or a deferred one nobody completes, dies silently 25 s after it arrived
+//! ([`MAX_DEFERRED`]); a reported flow then surfaces `ERROR` and must still be closed.
+//! `AcceptOpts::max_mss` clamps the connection's MSS in both directions (the client's real egress
+//! MTU), `AcceptOpts::keepalive` arms per-flow [`Keepalive`] probing (off by default; a flow whose
+//! probes all go unanswered fails with `TimedOut`). Half-open flows are capped in total and per
+//! client address ([`Config::half_open_max`], [`Config::half_open_per_source`]); SYNs beyond a
+//! cap, or beyond the flow or memory limits, are dropped and counted
+//! ([`DropReason::HalfOpen`], [`DropReason::Capacity`]), never answered and never cookied.
+//!
+//! The side that closes first keeps TIME_WAIT (RFC 9293 MUST-13), including simultaneous close,
+//! with the RFC 6191 reopen check for a new SYN on the same tuple; the side that closes second
+//! goes LAST_ACK to CLOSED. A server-side TIME_WAIT is therefore never skipped. The compact
+//! TIME_WAIT entry lives inside the stack for 60 s after the last FIN exchange: a driver must keep
+//! delivering packets for that tuple to [`Stack::receive`] for that long (the delivery state in
+//! front of the stack, such as an eBPF redirect entry, must outlive the flow), or a client's
+//! retransmitted FIN reaches the real server instead of the tombstone and is answered with RST.
+//!
+//! UDP is stateless: [`Rx::Transparent`] carries both addresses, [`Stack::udp_send_from`]
+//! answers from any source and fragments oversized replies. Fragmented packets are reassembled
+//! within bounded limits ([`FragmentLimits`]) and ICMP errors are rate limited ([`IcmpLimits`]).
+//!
 //! # Memory and datagrams
 //!
 //! Chunk storage is 16 KiB. Admission reserves one TX and one RX chunk plus a minimum
@@ -43,7 +78,8 @@
 //!
 //! UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and
 //! [`Stack::udp_send`] writes straight into the caller's output buffer. Datagram payloads
-//! exceeding the configured MTU return [`UdpError::TooLarge`]; fragments are dropped.
+//! exceeding the configured MTU return [`UdpError::TooLarge`]; in endpoint mode fragments are
+//! dropped.
 //! ICMP packet-too-big and unreachable feedback requires a matching outstanding quoted
 //! TCP sequence. Each stack's secret must be supplied by its caller and kept private.
 
@@ -51,20 +87,30 @@
 
 pub mod wire;
 
+mod accept;
 mod budget;
 mod flow;
+mod fragment;
 mod icmp;
+mod icmp_out;
+mod mode;
 mod stack;
 mod tcp;
 mod timer;
 mod udp;
+mod udp_t;
 
+pub use accept::{AcceptOpts, AcceptWhen, Keepalive, MAX_DEFERRED, Refuse, SynInfo};
 pub use budget::MemoryBudget;
+pub use fragment::FragmentLimits;
+pub use icmp_out::IcmpLimits;
+pub use mode::{ExcludeSet, Mode};
 pub use stack::{
     BindError, Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StackStats, StreamError,
     UdpError,
 };
 pub use tcp::{TcpState, TcpStats};
+pub use udp_t::UdpRefuse;
 
 /// Property checks behind the `fuzz/` targets and `tests/fuzz_replay.rs`; not part of the API.
 #[cfg(feature = "fuzz-checks")]
