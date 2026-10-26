@@ -204,7 +204,7 @@ impl Reassembler {
     /// Feeds one decoded fragment after the stack applies its destination filter.
     pub(crate) fn push(&mut self, now: Instant, f: Fragment<'_>) -> Push {
         let end = f.offset + f.data.len();
-        if f.data.is_empty() || (f.more && f.data.len() % 8 != 0) || end > f.max_total() {
+        if f.data.is_empty() || (f.more && !f.data.len().is_multiple_of(8)) || end > f.max_total() {
             self.stats.invalid += 1;
             return Push::Dropped(DropReason::Malformed);
         }
@@ -641,7 +641,10 @@ mod tests {
             assert_eq!(r.bytes(), ENTRY_OVERHEAD);
             // Later fragments, even valid ones, never complete it.
             for p in &f[2..] {
-                assert!(matches!(push(&mut r, t, p), Push::Dropped(DropReason::Fragment)));
+                assert!(matches!(
+                    push(&mut r, t, p),
+                    Push::Dropped(DropReason::Fragment)
+                ));
             }
             r.check();
             // The tombstone expires with no ICMP.
@@ -758,7 +761,10 @@ mod tests {
             ..FragmentLimits::default()
         });
         let f = split(&datagram(src, dst, 64_000, 4), 1, 1400);
-        assert!(matches!(push(&mut tiny, t, f.last().unwrap()), Push::Dropped(_)));
+        assert!(matches!(
+            push(&mut tiny, t, f.last().unwrap()),
+            Push::Dropped(_)
+        ));
         tiny.check();
     }
 
@@ -808,7 +814,10 @@ mod tests {
         }
         assert_eq!((r.len(), r.stats.evicted), (2, 1));
         let f = split(&datagram(src, dst, 64_000, 3), 9, 1400);
-        assert!(matches!(push(&mut r, t, f.last().unwrap()), Push::Dropped(_)));
+        assert!(matches!(
+            push(&mut r, t, f.last().unwrap()),
+            Push::Dropped(_)
+        ));
         assert!(budget.used() <= budget.limit());
         r.check();
         drop(r);

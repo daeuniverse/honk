@@ -513,11 +513,15 @@ mod tests {
             "fd00::7".parse().unwrap(),
             44,
             24,
-        ).unwrap();
+        )
+        .unwrap();
         ipv6::emit_fragment_header(&mut packet[40..], 60, 0, true, 1).unwrap();
         packet[48] = wire::PROTO_ICMPV6;
         packet[56] = 1;
-        assert_suppressed(&packet, "ICMPv6 error behind Fragment and Destination Options");
+        assert_suppressed(
+            &packet,
+            "ICMPv6 error behind Fragment and Destination Options",
+        );
         for end in 48..=56 {
             assert_suppressed(&packet[..end], "truncated extension or absent ICMPv6 type");
         }
@@ -528,7 +532,10 @@ mod tests {
             Reject::Unreachable,
             &packet,
         );
-        assert!(matches!(result, IcmpEmit::Sent(_)), "an inspectable echo is answerable");
+        assert!(
+            matches!(result, IcmpEmit::Sent(_)),
+            "an inspectable echo is answerable"
+        );
         packet[48] = 44;
         assert_suppressed(&packet, "nested Fragment header");
     }

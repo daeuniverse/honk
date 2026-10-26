@@ -55,14 +55,21 @@ fn refusal_window_tracks_actual_passive_syn_ack_output() {
                 let peer = Peer::new(CLIENT, DST, 1000);
                 peer.syn(&mut stack, t0, 1460);
                 let info = info_of(&mut stack);
-                stack.tcp_accept(info.id, AcceptOpts {
-                    when: if deferred {
-                        AcceptWhen::Deferred { deadline: Duration::from_secs(5) }
-                    } else {
-                        AcceptWhen::Now
-                    },
-                    ..AcceptOpts::default()
-                }).unwrap();
+                stack
+                    .tcp_accept(
+                        info.id,
+                        AcceptOpts {
+                            when: if deferred {
+                                AcceptWhen::Deferred {
+                                    deadline: Duration::from_secs(5),
+                                }
+                            } else {
+                                AcceptWhen::Now
+                            },
+                            ..AcceptOpts::default()
+                        },
+                    )
+                    .unwrap();
                 if deferred {
                     stack.tcp_complete(info.id).unwrap();
                 }
@@ -72,7 +79,10 @@ fn refusal_window_tracks_actual_passive_syn_ack_output() {
                 stack.tcp_refuse(info.id, how);
                 assert_eq!((stack.stats().flows, stack.stats().half_open), (0, 0));
                 assert_eq!(budget.used(), 0);
-                assert_eq!(stack.tcp_read(info.id, &mut [0; 1]), Err(StreamError::Stale));
+                assert_eq!(
+                    stack.tcp_read(info.id, &mut [0; 1]),
+                    Err(StreamError::Stale)
+                );
                 let packets = drain_raw(&mut stack, t0);
                 if how == Refuse::Drop {
                     assert!(packets.is_empty());
@@ -84,7 +94,17 @@ fn refusal_window_tracks_actual_passive_syn_ack_output() {
                         let ip = honk_netstack::wire::parse_ip(&packets[0]).unwrap();
                         assert_eq!(ip.proto, honk_netstack::wire::PROTO_ICMP);
                         let icmp = &packets[0][ip.payload];
-                        assert_eq!((icmp[0], icmp[1]), (3, if how == Refuse::IcmpUnreachable { 1 } else { 13 }));
+                        assert_eq!(
+                            (icmp[0], icmp[1]),
+                            (
+                                3,
+                                if how == Refuse::IcmpUnreachable {
+                                    1
+                                } else {
+                                    13
+                                }
+                            )
+                        );
                     }
                 }
             }

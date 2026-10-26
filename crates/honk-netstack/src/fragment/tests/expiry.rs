@@ -23,7 +23,10 @@ fn large_expiry_quotes_are_truncated_and_stay_within_the_shared_budget() {
     let frag = 40 + 8 * 2048;
     for id in 0..20 {
         ipv6::emit_fragment_header(&mut packet[frag..], wire::PROTO_UDP, 0, true, id).unwrap();
-        assert!(matches!(push(&mut r, now, &packet), Push::Pending | Push::Dropped(_)));
+        assert!(matches!(
+            push(&mut r, now, &packet),
+            Push::Pending | Push::Dropped(_)
+        ));
         now += Duration::from_secs(30);
         r.expire(now);
         assert!(!r.expired.is_empty());
@@ -38,8 +41,14 @@ fn large_expiry_quotes_are_truncated_and_stay_within_the_shared_budget() {
     }
     assert!(budget.used() > 0);
     let mut icmp = IcmpOut::default();
-    assert!(matches!(r.poll_icmp(now, &mut icmp, &mut [0; 1500]), Output::None));
-    assert!(icmp.suppressed > 0, "the truncated extension chain is uninspectable");
+    assert!(matches!(
+        r.poll_icmp(now, &mut icmp, &mut [0; 1500]),
+        Output::None
+    ));
+    assert!(
+        icmp.suppressed > 0,
+        "the truncated extension chain is uninspectable"
+    );
     r.assert_idle();
     assert_eq!(budget.used(), 0);
 }
@@ -65,13 +74,19 @@ fn expiry_quotes_remain_funded_through_blocked_sent_and_rate_limited_output() {
                 burst,
                 ..crate::IcmpLimits::default()
             });
-            assert!(matches!(r.poll_icmp(late, &mut icmp, &mut [0; 1]), Output::Blocked));
+            assert!(matches!(
+                r.poll_icmp(late, &mut icmp, &mut [0; 1]),
+                Output::Blocked
+            ));
             assert_eq!(budget.used(), retained);
             let result = r.poll_icmp(late, &mut icmp, &mut [0; 1500]);
             if burst == 1 {
                 assert!(matches!(result, Output::Sent(_)));
                 assert!(budget.used() < retained && budget.used() > 0);
-                assert!(matches!(r.poll_icmp(late, &mut icmp, &mut [0; 1500]), Output::None));
+                assert!(matches!(
+                    r.poll_icmp(late, &mut icmp, &mut [0; 1500]),
+                    Output::None
+                ));
             } else {
                 assert!(matches!(result, Output::None));
             }
@@ -100,7 +115,8 @@ fn expiry_never_answers_icmpv6_behind_fragment_and_destination_options() {
         "fd00::7".parse().unwrap(),
         44,
         24,
-    ).unwrap();
+    )
+    .unwrap();
     ipv6::emit_fragment_header(&mut packet[40..], 60, 0, true, 1).unwrap();
     packet[48] = wire::PROTO_ICMPV6;
     packet[56] = 1;
@@ -109,7 +125,10 @@ fn expiry_never_answers_icmpv6_behind_fragment_and_destination_options() {
     r.expire(late);
     assert!(r.pending_icmp());
     let mut icmp = IcmpOut::default();
-    assert!(matches!(r.poll_icmp(late, &mut icmp, &mut [0; 1500]), Output::None));
+    assert!(matches!(
+        r.poll_icmp(late, &mut icmp, &mut [0; 1500]),
+        Output::None
+    ));
     assert_eq!(icmp.suppressed, 1);
     assert_eq!(budget.used(), 0);
     r.assert_idle();

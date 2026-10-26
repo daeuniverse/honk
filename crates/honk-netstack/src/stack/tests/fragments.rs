@@ -53,7 +53,10 @@ fn nested_ipv6_fragment_headers_are_dropped_even_behind_extensions() {
             let mut stack = terminator(now);
             if atomic_outer {
                 let packet = fragment(next, &data, 0, false, 2);
-                assert_eq!(stack.receive(now, &packet), Rx::Dropped(DropReason::Fragment));
+                assert_eq!(
+                    stack.receive(now, &packet),
+                    Rx::Dropped(DropReason::Fragment)
+                );
             } else {
                 let first = fragment(next, &data[..16], 0, true, 2);
                 let last = fragment(next, &data[16..], 16, false, 2);
@@ -85,7 +88,10 @@ fn excluded_fragments_never_acquire_reassembly_state_or_emit_time_exceeded() {
         let mut tx = terminator(now);
         let mut out = [0; 1500];
         let n = tx.udp_send_from(src, dst, &[7; 4000], &mut out).unwrap();
-        assert_eq!(rx.receive(now, &out[..n]), Rx::Dropped(DropReason::NotForUs));
+        assert_eq!(
+            rx.receive(now, &out[..n]),
+            Rx::Dropped(DropReason::NotForUs)
+        );
         assert_eq!(rx.reasm.len(), 0);
         assert_eq!(budget.used(), 0);
         assert!(rx.poll_timeout().is_none());

@@ -392,13 +392,7 @@ impl Stack {
         self.receive_ip(now, ip, packet, meta)
     }
 
-    fn receive_ip(
-        &mut self,
-        now: Instant,
-        ip: wire::IpPacket,
-        packet: &[u8],
-        meta: RxMeta,
-    ) -> Rx {
+    fn receive_ip(&mut self, now: Instant, ip: wire::IpPacket, packet: &[u8], meta: RxMeta) -> Rx {
         if let Some(reason) = self.refuses(ip.dst) {
             return self.drop_packet(reason);
         }

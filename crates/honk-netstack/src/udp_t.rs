@@ -731,7 +731,9 @@ mod tests {
             let budget = MemoryBudget::new(3008);
             let funded = || {
                 let mut cfg = Config::new([9; 32]);
-                cfg.mode = crate::Mode::Transparent { exclude: crate::ExcludeSet::default() };
+                cfg.mode = crate::Mode::Transparent {
+                    exclude: crate::ExcludeSet::default(),
+                };
                 cfg.mtu = 1280;
                 cfg.shared_budget = Some(budget.clone());
                 Stack::new(cfg, Instant::now())
@@ -742,7 +744,10 @@ mod tests {
             let payload = [7; 3000];
             let mut out = [0; 1500];
             let ident = a.udp_tx.ident;
-            assert_eq!(a.udp_send_from(src, dst, &payload, &mut [0; 1]), Err(UdpError::BufferTooSmall));
+            assert_eq!(
+                a.udp_send_from(src, dst, &payload, &mut [0; 1]),
+                Err(UdpError::BufferTooSmall)
+            );
             assert_eq!(a.udp_tx.ident, ident);
             assert_eq!(budget.used(), 0);
             a.udp_send_from(src, dst, &payload, &mut out).unwrap();
@@ -752,7 +757,10 @@ mod tests {
             assert!(matches!(a.poll_udp_frag(&mut [0; 1]), Output::Blocked));
             assert_eq!(budget.used(), retained);
             out.fill(0xA5);
-            assert_eq!(b.udp_send_from(src, dst, &payload, &mut out), Err(UdpError::Busy));
+            assert_eq!(
+                b.udp_send_from(src, dst, &payload, &mut out),
+                Err(UdpError::Busy)
+            );
             assert!(out.iter().all(|&byte| byte == 0xA5));
             assert_eq!(budget.used(), retained);
             assert!(!b.udp_tx.pending());
