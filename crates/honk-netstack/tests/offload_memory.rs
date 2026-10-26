@@ -163,7 +163,18 @@ fn idle_flows_hold_no_chunks() {
         let mut s = Stack::new(with_chunk(chunk, 256 << 20), Instant::now());
         let now = Instant::now();
         for i in 0..50 {
-            established(&mut s, client_n(i), 1000, now);
+            let (id, snd, echo) = established(&mut s, client_n(i), 1000, now);
+            let options = honk_netstack::wire::tcp::Options {
+                timestamps: Some((5002, echo)),
+                ..Default::default()
+            };
+            let packet = build(client_n(i), addr(DST), 1001, snd, ACK, options, &[9; 100]);
+            assert_eq!(s.receive(now + ms(2), &packet), Rx::Consumed);
+            let mut out = [0; 100];
+            assert_eq!(s.tcp_read(id, &mut out), Ok(100));
+            assert_eq!(out, [9; 100]);
+            let mut packet = [0; 2000];
+            while s.poll_transmit(now + ms(2), &mut packet).is_some() {}
         }
         let st = s.stats();
         assert_eq!(st.flows, 50);
@@ -214,12 +225,8 @@ fn the_floor_alone_keeps_both_directions_moving() {
                 break;
             }
         }
-        let n = loop {
-            match s.tcp_read(id, &mut buf) {
-                Ok(n) if n > 0 => break n,
-                _ => panic!("no progress in round {round}"),
-            }
-        };
+        let n = s.tcp_read(id, &mut buf).expect("the floor makes progress");
+        assert!(n > 0, "no progress in round {round}");
         received.extend_from_slice(&buf[..n]);
         assert!(n <= 4096, "never more than the floor's chunk: {n}");
         let st = s.tcp_stats(id).unwrap();

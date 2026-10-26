@@ -11,7 +11,8 @@
 //! probes. In [`Mode::Endpoint`] (the default) there is no listen API, IP reassembly or ICMP
 //! emission; ECN and urgent data are never supported. See "Transparent termination" below.
 //! Unknown TCP options are ignored; malformed lengths stop option parsing. Incoming IP
-//! and transport checksums are always verified before changing a flow.
+//! and transport checksums are verified before changing a flow, except where a transparent
+//! driver vouches for them (see "Offload").
 //!
 //! # Driving the stack
 //!
@@ -63,10 +64,39 @@
 //! answers from any source and fragments oversized replies. Fragmented packets are reassembled
 //! within bounded limits ([`FragmentLimits`]) and ICMP errors are rate limited ([`IcmpLimits`]).
 //!
+//! # Offload
+//!
+//! A transparent driver reading a TUN device with `virtio_net_hdr` hands the stack what the
+//! kernel knows, through [`Stack::receive_with`] and [`RxMeta`]. [`Csum::Verify`] (flags 0) is the
+//! only provenance [`Stack::receive`] and an endpoint stack know. [`Csum::Valid`]
+//! (`DATA_VALID`) says the checksum was verified already; [`Csum::Partial`] (`NEEDS_CSUM`,
+//! `CHECKSUM_PARTIAL`) says the field holds only the pseudo-header sum, common for locally
+//! generated packets and GRO super-packets, so there is no complete checksum to verify. Both are
+//! accepted only in [`Mode::Transparent`]; an endpoint stack (the WireGuard driver) drops any
+//! packet that carries offload metadata as [`DropReason::Unsupported`]. The IP header, ICMP and
+//! datagrams reassembled from fragments are always verified, and a `Partial` that does not
+//! point at the L4 checksum field is [`DropReason::Malformed`]. A TCP super-packet
+//! ([`GsoRx`]) is ingested as one contiguous segment; `ceil(len / size)` counts only the
+//! full frames of the delayed-ACK cadence (two or more are acknowledged at once, with one ACK),
+//! while dupACK, SACK, RACK, PAWS and timestamps see it as the single segment it is. A UDP
+//! super-packet is [`Rx::TransparentSplit`]: chunks of `size` bytes are the datagrams.
+//!
+//! [`Stack::poll_transmit_with`] and [`TxCaps`] let a TCP flow emit one TSO packet of up to 64
+//! KiB: one header, MSS-sized segments, the checksum field holding the pseudo-header sum
+//! ([`TxCsum::Partial`], the field is not complemented). The packet is as long as the congestion
+//! and receive windows, the pacer (a burst is at most two milliseconds of traffic) and about a
+//! millisecond of the pacing rate allow, and as the output buffer holds. Each segment keeps its
+//! own send descriptor, so SACK and RACK are unchanged, and a run of lost segments is
+//! retransmitted as one TSO packet too. [`Stack::udp_send_gso_from`] sends up to 64 equal
+//! datagrams as one USO packet (the last may be shorter); without the family's capability, or in
+//! endpoint mode, a multi-datagram send returns [`UdpError::Offload`]. `poll_transmit_with` with no
+//! capabilities, and every `poll_transmit` call, keep the ordinary single-packet behavior.
+//!
 //! # Memory and datagrams
 //!
-//! Chunk storage is 16 KiB. Admission reserves one TX and one RX chunk plus a minimum
-//! send-descriptor capacity per TCP flow; excess chunks and descriptor capacity share
+//! Chunk storage is 16 KiB in [`Mode::Endpoint`] and 4 KiB in [`Mode::Transparent`]
+//! ([`Config::tcp_chunk`] overrides it, 4 to 64 KiB). Admission reserves one TX and one RX chunk
+//! plus a minimum send-descriptor capacity per TCP flow; excess chunks and descriptor capacity share
 //! the configured budget. Receive windows are committed before advertising space,
 //! although physical chunks are allocated lazily. A ring that empties (everything read or
 //! acknowledged) returns all its chunks, and descriptor storage is released when nothing is

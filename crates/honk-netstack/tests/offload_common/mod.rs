@@ -254,6 +254,14 @@ impl Conn {
     }
 
     pub fn with_addrs(cfg: Config, client: &str, dst: &str) -> Conn {
+        Self::with_addrs_opts(cfg, client, dst, AcceptOpts::default())
+    }
+
+    pub fn with_opts(cfg: Config, opts: AcceptOpts) -> Conn {
+        Self::with_addrs_opts(cfg, CLIENT, DST, opts)
+    }
+
+    fn with_addrs_opts(cfg: Config, client: &str, dst: &str, opts: AcceptOpts) -> Conn {
         let t0 = Instant::now();
         let mut stack = Stack::new(cfg, t0);
         let (client, dst) = (addr(client), addr(dst));
@@ -261,7 +269,7 @@ impl Conn {
         let syn = build(client, dst, 1000, 0, SYN, opts_syn(mss), &[]);
         assert_eq!(stack.receive(t0, &syn), Rx::Consumed);
         let info = stack.poll_accept().expect("SynInfo");
-        stack.tcp_accept(info.id, AcceptOpts::default()).unwrap();
+        stack.tcp_accept(info.id, opts).unwrap();
         let out = drain(&mut stack, t0, TxCaps::NONE);
         assert_eq!(out.len(), 1);
         let synack = &out[0].1;

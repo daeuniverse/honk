@@ -15,8 +15,8 @@ pub enum Csum {
     Verify,
     /// `DATA_VALID`: the device already verified the checksum; the field is not checked.
     Valid,
-    /// `NEEDS_CSUM` (`CHECKSUM_PARTIAL`): the field holds only the pseudo-header sum, as in every
-    /// packet the local kernel generates and in every GRO super-packet, so there is nothing to
+    /// `NEEDS_CSUM` (`CHECKSUM_PARTIAL`): the field holds only the pseudo-header sum, common for
+    /// locally generated packets and GRO super-packets, so there is no complete checksum to
     /// verify. `start` is the L4 header offset and `offset` the checksum field within it; both must
     /// match the packet, or it is dropped as malformed.
     Partial { start: u16, offset: u16 },

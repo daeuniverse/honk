@@ -144,7 +144,9 @@ impl Tcb {
                 {
                     let (mut data, mut fin, mut segs) = (data, fin, 1);
                     if tso_max >= 2 && data == cap && unsent > data && rwnd > data {
-                        let n = self.tso_segs(cap, tso_max, budget);
+                        let n = self
+                            .tso_segs(cap, tso_max, budget)
+                            .min(unsent.min(rwnd).div_ceil(cap));
                         if n > 1 && self.sent.ensure_room(pool, n + 1) {
                             data = unsent.min(rwnd).min(n * cap);
                             segs = data.div_ceil(cap);

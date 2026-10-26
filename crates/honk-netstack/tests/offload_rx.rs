@@ -3,14 +3,11 @@
 
 mod offload_common;
 
-use std::net::SocketAddr;
 use std::time::Instant;
 
+use honk_netstack::wire;
 use honk_netstack::wire::tcp::{self, ACK, PSH};
-use honk_netstack::wire::{self, PROTO_UDP};
-use honk_netstack::{
-    Config, Csum, DropReason, GsoKind, GsoRx, Rx, RxMeta, Stack, StreamError, TxCaps,
-};
+use honk_netstack::{Config, Csum, DropReason, GsoKind, GsoRx, Rx, RxMeta, Stack, StreamError};
 use offload_common::*;
 
 const MSS: usize = 1368;
@@ -585,6 +582,4 @@ fn contradictory_gso_metadata_is_malformed() {
         malformed
     );
     assert_eq!(c.stack.stats().drops[DropReason::Malformed as usize], 7);
-    let _ = (PROTO_UDP, TxCaps::NONE);
-    let _: Option<SocketAddr> = None;
 }

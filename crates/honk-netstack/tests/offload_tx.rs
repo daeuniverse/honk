@@ -306,8 +306,8 @@ fn the_receive_window_cuts_a_tso_packet_at_the_byte() {
 
 #[test]
 fn the_pacing_burst_is_two_milliseconds_at_the_pacing_rate() {
-    // A slow, long path: 100 ms RTT. Two milliseconds at the pacing rate is a fraction of a
-    // segment, so no packet may carry more than a bucket of one segment.
+    // A slow, long path: the two-millisecond bucket limits the burst to far fewer segments than
+    // on the fast path, even as its congestion window grows. `pump` checks the bound per packet.
     let mut c = Conn::new(transparent());
     all(&mut c);
     let slow = pump(&mut c, 600_000, ms(100));
@@ -339,9 +339,15 @@ fn partial_acks_and_sack_see_one_descriptor_per_segment() {
     assert_eq!(total, 8 * cap + 500);
     let s = c.stack.tcp_stats(c.id).unwrap();
     assert_eq!(s.outstanding_bytes, total);
-    // Segments 3 and 4 arrive; 0..3 are missing: SACK covers exactly two descriptors.
     c.snd = start;
     c.now += ms(1);
+    // Only part of descriptor 3 arrived: conservatively none is SACKed.
+    c.client_ack(&[(start + 3 * cap + 100, start + 4 * cap - 100)]);
+    assert_eq!(c.stack.tcp_stats(c.id).unwrap().sacked_bytes, 0);
+    // A range spanning three descriptors covers only the middle one completely.
+    c.client_ack(&[(start + 3 * cap + 100, start + 6 * cap - 100)]);
+    assert_eq!(c.stack.tcp_stats(c.id).unwrap().sacked_bytes, cap);
+    // Segments 3 and 4 arrive: exactly two descriptors in total are now SACKed.
     c.client_ack(&[(start + 3 * cap, start + 5 * cap)]);
     let s = c.stack.tcp_stats(c.id).unwrap();
     assert_eq!(s.sacked_bytes, 2 * cap);
@@ -619,4 +625,29 @@ fn uso_errors_consume_nothing_and_respect_the_limits() {
         e.udp_send_gso_from((src, dst), &big, 1000, TxCaps::ALL, &mut out),
         Err(UdpError::Offload)
     );
+}
+
+#[test]
+fn max_mss_caps_each_segment_not_the_super_packet() {
+    let opts = honk_netstack::AcceptOpts {
+        max_mss: Some(600),
+        ..Default::default()
+    };
+    let mut c = Conn::with_opts(transparent(), opts);
+    all(&mut c);
+    c.stack.tcp_write(c.id, &pattern(6000, 3)).unwrap();
+    let out = c.drain();
+    assert_eq!(out.len(), 1);
+    let (tx, packet) = &out[0];
+    let gso = tx
+        .gso
+        .expect("multiple path-sized segments behind one header");
+    assert_eq!(gso.size, 588, "MSS minus timestamp options");
+    assert!(packet.payload.len() > 600);
+    check_packet(tx, packet);
+    for segment in tso_segments(tx, packet) {
+        let segment = decode(&segment);
+        assert!(segment.payload.len() <= 588);
+        assert!(segment.raw.len() <= 600 + 20 + 20);
+    }
 }

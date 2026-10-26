@@ -137,6 +137,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fold_is_the_uncomplemented_seed_of_a_partial_checksum() {
+        let mut rng = Rng::new(0xF01D);
+        for len in [0usize, 1, 2, 7, 64, 1001] {
+            let data = rng.bytes(len);
+            let mut c = Checksum::new();
+            c.add(&data);
+            assert_eq!(!c.fold(), c.finish());
+            // Seeding a sum with `fold` and adding the rest equals summing everything.
+            let (a, b) = data.split_at(len / 2 & !1);
+            let mut seed = Checksum::new();
+            seed.add(a);
+            let mut rest = Checksum::new();
+            rest.add_u16(seed.fold());
+            rest.add(b);
+            assert_eq!(rest.finish(), checksum(&data));
+        }
+    }
+
+    #[test]
     fn rfc1071_example() {
         // RFC 1071 §3: words 0001 f203 f4f5 f6f7 sum to ddf2 (one's complement), checksum 220d.
         assert_eq!(

@@ -6,7 +6,7 @@ mod offload_common;
 
 use std::time::{Duration, Instant};
 
-use honk_netstack::{AcceptOpts, Config, FlowId, Rx, Stack, StreamError, TcpState, TxCaps, TxCsum};
+use honk_netstack::{AcceptOpts, FlowId, Rx, Stack, StreamError, TcpState, TxCaps, TxCsum};
 use offload_common::*;
 
 struct Pair {
@@ -234,13 +234,12 @@ fn a_long_burst_of_loss_recovers_too() {
     p.transfer(8 << 20, 800_000);
     let t = p.server.tcp_stats(p.sid).unwrap();
     assert!(t.retrans_segments >= 100, "{t:?}");
-    let _ = Config::new([0; 32]);
 }
 
 #[test]
 fn throughput_paths_work_at_every_chunk_size() {
     // A TSO packet spans 16 chunks of 4 KiB, one of 64 KiB; the stream must not care.
-    for chunk in [4096, 8192, 16384, 65536] {
+    for chunk in [4096, 8192, 8193, 16384, 65536] {
         let mut p = pair_chunk(TxCaps::ALL, |n| n % 500 == 123, Some(chunk));
         p.transfer(3 << 20, 400_000);
         assert!(p.tso_packets > 0 && p.super_packets > 0, "chunk {chunk}");
