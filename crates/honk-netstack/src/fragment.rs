@@ -22,7 +22,7 @@ use crate::tcp::output::Output;
 use crate::wire::frag::{self, Fragment};
 use crate::{DropReason, MemoryBudget, Rx};
 
-/// Bookkeeping charged per datagram next to its buffer (entry, ranges, key).
+/// Fixed bookkeeping charged per datagram next to its data, header and range storage.
 const ENTRY_OVERHEAD: usize = 256;
 /// Time Exceeded quotes waiting for `poll_icmp`; further ones are dropped.
 const MAX_PENDING_ICMP: usize = 16;
@@ -108,7 +108,10 @@ struct Live {
 
 impl Live {
     fn charge(&self) -> usize {
-        ENTRY_OVERHEAD + self.data.len() + self.head.len()
+        ENTRY_OVERHEAD
+            + self.data.capacity()
+            + self.head.capacity()
+            + self.ranges.capacity() * std::mem::size_of::<(usize, usize)>()
     }
 
     fn holes(&self) -> usize {
@@ -173,7 +176,15 @@ impl Reassembler {
 
     /// Charges `n` bytes to the shared budget and this table; `false` leaves both unchanged.
     fn grow(&mut self, n: usize) -> bool {
-        if self.budget.as_ref().is_some_and(|b| !b.try_charge(n)) {
+        if n == 0 {
+            return true;
+        }
+        if self
+            .bytes
+            .checked_add(n)
+            .is_none_or(|v| v > self.limits.max_bytes)
+            || self.budget.as_ref().is_some_and(|b| !b.try_charge(n))
+        {
             return false;
         }
         self.bytes += n;
@@ -181,6 +192,9 @@ impl Reassembler {
     }
 
     fn shrink(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
         self.bytes -= n;
         if let Some(b) = &self.budget {
             b.refund(n);
@@ -211,6 +225,9 @@ impl Reassembler {
         let idx = match self.entries.iter().position(|e| e.key == key) {
             Some(i) => i,
             None => {
+                if self.limits.max_entries == 0 {
+                    return Push::Dropped(DropReason::Capacity);
+                }
                 if self.entries.len() >= self.limits.max_entries {
                     self.evict_oldest(None);
                 }
@@ -278,11 +295,20 @@ impl Reassembler {
             self.kill(idx);
             return Err(());
         }
-        let growth =
-            end.saturating_sub(live.data.len()) + if f.offset == 0 { f.head.len() } else { 0 };
+        let head = if f.offset == 0 {
+            f.head.len()
+        } else {
+            live.head.capacity()
+        };
+        let charge = ENTRY_OVERHEAD
+            + live.data.capacity().max(end)
+            + head
+            + holes.ranges.capacity() * std::mem::size_of::<(usize, usize)>();
+        let old_charge = self.entries[idx].charged;
+        let growth = charge.saturating_sub(old_charge);
         let mut idx = idx;
         // `grow` charges the shared budget too: a refusal evicts like the local limit does.
-        while self.bytes + growth > self.limits.max_bytes || !self.grow(growth) {
+        while !self.grow(growth) {
             let key = self.entries[idx].key;
             if self.entries.len() == 1 {
                 self.stats.invalid += 1;
@@ -299,7 +325,15 @@ impl Reassembler {
         let entry = &mut self.entries[idx];
         let live = entry.live.as_mut().expect("live entry");
         if live.data.len() < end {
+            // Reassembly is charged by buffered extent: do not let Vec's geometric growth
+            // retain a second uncharged extent between the received fragments.
+            live.data.reserve_exact(end - live.data.len());
             live.data.resize(end, 0);
+            if live.data.capacity() != end {
+                // `reserve_exact` permits allocator slack. A boxed slice has exactly the
+                // funded extent; normal global allocators never need this conversion.
+                live.data = std::mem::take(&mut live.data).into_boxed_slice().into_vec();
+            }
         }
         live.data[f.offset..end].copy_from_slice(f.data);
         live.ranges = holes.ranges;
@@ -307,13 +341,15 @@ impl Reassembler {
         if f.offset == 0 {
             live.head = f.head.to_vec();
         }
-        let charge = live.charge();
-        debug_assert_eq!(charge, entry.charged + growth);
+        debug_assert_eq!(charge, live.charge());
         entry.charged = charge;
-        if live.total == Some(live.data.len())
+        let complete = live.total == Some(live.data.len())
             && live.ranges.len() == 1
-            && live.ranges[0] == (0, live.data.len())
-        {
+            && live.ranges[0] == (0, live.data.len());
+        if charge < old_charge {
+            self.shrink(old_charge - charge);
+        }
+        if complete {
             let entry = self.entries.remove(idx);
             self.shrink(entry.charged);
             let live = entry.live.expect("live entry");
@@ -731,6 +767,17 @@ mod tests {
         assert!(held(&r, 0) > 3000 - 1000);
         pending(r.push(t, &f[0]));
         pending(r.push(t, &f[2]));
+        let live = r.entries[0].live.as_ref().unwrap();
+        assert_eq!(
+            live.data.capacity(),
+            live.data.len(),
+            "no uncharged geometric capacity"
+        );
+        assert_eq!(
+            budget.used(),
+            ENTRY_OVERHEAD + 3000 + 20 + std::mem::size_of::<(usize, usize)>(),
+            "the coalesced range also holds memory"
+        );
         complete(r.push(t, &f[3]));
         assert_eq!(held(&r, 0), 0);
         // A killed datagram keeps only its tombstone, which expiry then refunds.
@@ -759,6 +806,26 @@ mod tests {
             100_000,
             "dropping the table refunds its bytes"
         );
+        budget.refund(100_000);
+        assert_eq!(budget.used(), 0);
+        for limits in [
+            FragmentLimits {
+                max_entries: 0,
+                ..FragmentLimits::default()
+            },
+            FragmentLimits {
+                max_bytes: ENTRY_OVERHEAD - 1,
+                ..FragmentLimits::default()
+            },
+        ] {
+            let mut r = Reassembler::new(limits).with_budget(Some(budget.clone()));
+            assert!(matches!(
+                r.push(t, &f[0]),
+                Push::Dropped(DropReason::Capacity)
+            ));
+            r.assert_idle();
+            assert_eq!(budget.used(), 0, "no charge for a refused entry");
+        }
     }
 
     #[test]

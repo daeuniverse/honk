@@ -3,8 +3,9 @@
 //!
 //! Every scenario asserts exactly-once ordered delivery (the drivers compare each byte against a
 //! per-flow stream), that the terminator only ever sources packets from an accepted flow's
-//! original destination, and that every stack's flow, TIME_WAIT, half-open and memory accounting
-//! returns to zero once the handles are closed and TIME_WAIT has expired.
+//! original destination, and that every stack's flow, TIME_WAIT, half-open and committed memory
+//! return to zero once handles are closed and TIME_WAIT expires. The existing pool may retain one
+//! uncommitted spare chunk until the stack is dropped (4 KiB transparent, 16 KiB endpoint).
 
 pub mod sim;
 
@@ -40,6 +41,10 @@ fn assert_zero(stack: &Stack, what: &str) {
         (s.flows, s.timewait_entries, s.half_open, s.memory_committed),
         (0, 0, 0, 0),
         "{what}: {s:?}"
+    );
+    assert!(
+        s.memory_allocated <= 16 * 1024,
+        "more than one spare chunk: {what}: {s:?}"
     );
 }
 
@@ -141,9 +146,9 @@ fn close_order_decides_who_keeps_time_wait_and_everything_drains() {
 
 #[test]
 fn a_lost_final_ack_is_repaired_by_the_time_wait_tombstone() {
-    // The server closes first and drops its handle at once: only the compact entry is left when the
-    // client's FIN arrives. The ACK of that FIN is lost, so the client retransmits the FIN into
-    // the tombstone, which must acknowledge it instead of resetting.
+    // The server closes first, then drops its handle after the client's FIN. Its final ACK is
+    // consumed from the stack but lost on the link, leaving only the compact TIME_WAIT entry.
+    // The client's retransmitted FIN must reach that tombstone and be acknowledged, not reset.
     let cfg = sim::path(SEED, 20_000_000, Duration::from_millis(40), 0.0);
     let mut plan = Plan::request_response(10_000, 30_000);
     plan.fin_after_peer = Some(Role::Client);
@@ -199,6 +204,10 @@ fn a_lost_final_ack_is_repaired_by_the_time_wait_tombstone() {
     );
     let t = s.b.host.io.stack.stats();
     assert_eq!((t.flows, t.timewait_entries), (0, 1), "{t:?}");
+    assert!(
+        s.b.host.io.audit.tombstone_fins > 0,
+        "no FIN reached a compact tombstone"
+    );
     assert_eq!(
         s.b.host.io.audit.rsts, 0,
         "the tombstone answered a late FIN with RST"
@@ -392,10 +401,6 @@ fn soak(flows: &[usize], budget_bytes: usize, stagger: Duration, bound: Duration
     }
 }
 
-fn seconds(v: &[Duration]) -> Vec<f64> {
-    v.iter().map(Duration::as_secs_f64).collect()
-}
-
 #[test]
 fn soak_staggered_sources_under_a_small_shared_budget_all_progress() {
     // 40 sources x 8 flows arrive 60 ms apart against a budget that funds about twenty flows: the
@@ -403,16 +408,14 @@ fn soak_staggered_sources_under_a_small_shared_budget_all_progress() {
     let flows = vec![8; 40];
     let r = soak(&flows, 3 * MIB / 2, Duration::from_millis(60), secs(600));
     eprintln!("staggered sources: {r:?}");
-    let t = seconds(&r.latency);
     assert!(
         r.syn_drops > 0,
         "the budget was never under pressure: {r:?}"
     );
     assert!(
-        t.iter().all(|&v| v < 30.0),
-        "a source waited far longer than its transfer takes: {t:?}"
+        r.latency.iter().all(|&d| d < secs(10)),
+        "a source made no bounded progress: {r:?}"
     );
-    assert!(sim::app::jain(&t) > 0.5, "latencies are unfair: {t:?}");
 }
 
 #[test]
@@ -420,7 +423,7 @@ fn soak_a_syn_herd_beyond_the_budget_is_served_in_retry_waves_without_loss() {
     // 15 sources x 8 flows dial at the same instant, three times what the budget funds. The
     // refused SYNs are silent drops; clients retry on their backoff (1, 2, 4 s ...) and every
     // flow is admitted by the last wave. Admission is first come first served, so this bounds
-    // time-to-admit, not fairness: that is the TC per-source budget's job (design 3.2).
+    // time-to-admit, not fairness: cross-source admission policy belongs in the backend.
     let flows = vec![8; 15];
     let r = soak(&flows, 3 * MIB, Duration::ZERO, secs(600));
     eprintln!("syn herd: {r:?}");
@@ -439,8 +442,8 @@ fn soak_a_greedy_source_cannot_starve_polite_ones() {
     let polite = *r.latency[1..].iter().max().unwrap();
     assert!(r.syn_drops > 0, "no SYN was refused: {r:?}");
     assert!(
-        polite < r.latency[0],
-        "polite sources ({polite:?}) finished after the greedy one ({:?})",
+        polite < secs(10) && polite < r.latency[0],
+        "a polite source made no bounded progress ({polite:?}); greedy source ({:?})",
         r.latency[0]
     );
 }

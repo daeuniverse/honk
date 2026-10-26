@@ -12,7 +12,7 @@ use honk_netstack::{
     TcpState,
 };
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// The address of client source `k` in a multi-source run.
@@ -41,6 +41,8 @@ pub struct Audit {
     pub rsts: u64,
     /// Packets whose source was not the original destination of an accepted flow.
     pub foreign: u64,
+    /// FINs delivered when every full flow is gone and only compact TIME_WAIT entries remain.
+    pub tombstone_fins: u64,
 }
 
 pub struct HonkServerIo {
@@ -54,7 +56,7 @@ pub struct HonkServerIo {
     defer: Option<Duration>,
     per_source: Option<usize>,
     close_when_done: bool,
-    dsts: HashSet<(IpAddr, u16)>,
+    tuples: HashSet<(SocketAddr, SocketAddr)>,
     pub audit: Audit,
 }
 
@@ -161,7 +163,7 @@ impl HonkServerHost {
             defer,
             per_source: opts.per_source,
             close_when_done: opts.close_when_done,
-            dsts: HashSet::new(),
+            tuples: HashSet::new(),
             audit: Audit::default(),
         };
         HonkServerHost {
@@ -173,6 +175,16 @@ impl HonkServerHost {
 
 impl Host for HonkServerHost {
     fn receive(&mut self, now: Instant, packet: &[u8]) {
+        let s = self.io.stack.stats();
+        if s.flows == 0
+            && s.timewait_entries > 0
+            && let Ok(ip) = wire::parse_ip(packet)
+            && ip.proto == wire::PROTO_TCP
+            && let Ok((h, _)) = tcp::parse(&packet[ip.payload])
+            && h.flags & tcp::FIN != 0
+        {
+            self.io.audit.tombstone_fins += 1;
+        }
         self.io.stack.receive(now, packet);
     }
 
@@ -184,7 +196,10 @@ impl Host for HonkServerHost {
             let audit = &mut self.io.audit;
             audit.tcp_packets += 1;
             audit.rsts += u64::from(h.flags & tcp::RST != 0);
-            audit.foreign += u64::from(!self.io.dsts.contains(&(ip.src, h.src_port)));
+            audit.foreign += u64::from(!self.io.tuples.contains(&(
+                SocketAddr::new(ip.src, h.src_port),
+                SocketAddr::new(ip.dst, h.dst_port),
+            )));
         }
         Some(n)
     }
@@ -208,8 +223,7 @@ impl Host for HonkServerHost {
             assert!(io.ids[i].is_none(), "flow {i} reported twice");
             io.ids[i] = Some(info.id);
             io.admitted[i] = Some(now);
-            io.dsts
-                .insert((info.original_dst.ip(), info.original_dst.port()));
+            io.tuples.insert((info.original_dst, info.client));
             let when = match io.defer {
                 Some(d) => {
                     io.held.push((info.id, now + d));

@@ -263,8 +263,8 @@ fn reassembly_is_charged_to_the_shared_budget_and_bounded_by_it() {
         }
     };
 
-    // The table's own cap (256 KiB) is below the budget: the budget sees exactly the buffered
-    // bytes, a sibling stack still completes a datagram and still admits a flow.
+    // The table's own cap (256 KiB) is below the budget: the budget sees the buffered
+    // bytes, and a sibling stack still admits a TCP flow and progresses in both directions.
     let budget = MemoryBudget::new(1024 * 1024);
     let mut a = terminator(&budget, 256 * 1024);
     flood(&mut a, 40);
@@ -274,7 +274,8 @@ fn reassembly_is_charged_to_the_shared_budget_and_bounded_by_it() {
         "uncharged reassembly leaves the budget at {held}"
     );
     let mut b = Side::new(Some(&budget));
-    assert!(b.connect().is_ok(), "the sibling keeps its floor");
+    let mut c = b.connect().expect("the sibling keeps its floor");
+    b.assert_progress(&mut c);
     // Timeout and drop refund it.
     a.handle_timeout(now + Duration::from_secs(31));
     assert!(budget.used() < held);
@@ -295,6 +296,23 @@ fn reassembly_is_charged_to_the_shared_budget_and_bounded_by_it() {
     let mut b = terminator(&budget, 4 * 1024 * 1024);
     flood(&mut b, 40);
     assert!(budget.used() <= budget.limit(), "{}", budget.used());
+    drop((a, b));
+    assert_eq!(budget.used(), 0);
+
+    // A live sibling has already funded its floor. A 2.4 MiB reassembly flood against the
+    // remaining share may be refused, but cannot make that flow lose progress in either direction.
+    let budget = MemoryBudget::new(128 * 1024);
+    let mut b = Side::new(Some(&budget));
+    let mut c = b.connect().unwrap();
+    let before = budget.used();
+    let mut a = terminator(&budget, 4 * 1024 * 1024);
+    flood(&mut a, 40);
+    assert!(
+        budget.used() > before,
+        "reassembly bypassed the sibling's shared budget"
+    );
+    assert!(budget.used() <= budget.limit());
+    b.assert_progress(&mut c);
     drop((a, b));
     assert_eq!(budget.used(), 0);
 }

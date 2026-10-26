@@ -3,9 +3,8 @@
 //! (`transparent_tcp`), plus transparent UDP and passive open. Every case reports
 //! `Throughput::Elements` so Criterion prints time per packet.
 //!
-//! Offload comparison: the two seams are `deliver` (how a batch of in-order segments enters the
-//! stack) and `Flow::send` (how a batch of full segments leaves it). Re-pointing them at
-//! super-packet receive/transmit re-runs every case with GSO; nothing else changes.
+//! `OFFLOAD` is the one-line switch for transparent TCP GRO/TSO; element throughput still counts
+//! wire segments, not super-packets. Endpoint/WireGuard and IP-fragmented UDP stay plain.
 
 use std::hint::black_box;
 use std::net::{IpAddr, SocketAddr};
@@ -13,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use honk_netstack::wire::{self, tcp};
-use honk_netstack::{AcceptOpts, Config, ExcludeSet, FlowId, Mode, Rx, Stack, TcpState};
+use honk_netstack::{
+    AcceptOpts, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Mode, Rx, RxMeta, Stack,
+    TcpState, TxCaps,
+};
 
 /// Config MTU 1420 minus IPv4 and TCP headers; no timestamps are negotiated.
 const MSS: usize = 1380;
@@ -21,6 +23,9 @@ const MS: Duration = Duration::from_millis(1);
 /// Packets prepared (outside the timed region) per timed batch.
 const BATCH: u64 = 256;
 const OUTSTANDING: u32 = 1000;
+/// Toggle only this line for the transparent TCP GSO comparison.
+const OFFLOAD: bool = false;
+const GRO_SEGMENTS: usize = 32;
 
 fn remote() -> SocketAddr {
     "198.51.100.2:443".parse().unwrap()
@@ -56,6 +61,7 @@ struct Flow {
     local: SocketAddr,
     /// The other end: `remote()` for an active open, the client for an accepted flow.
     peer: SocketAddr,
+    transparent: bool,
     now: Instant,
     /// Next sequence number the stack will send.
     snd_nxt: u32,
@@ -82,6 +88,7 @@ impl Flow {
             id,
             local: SocketAddr::new(local_ip, syn.src_port),
             peer: remote(),
+            transparent: false,
             now,
             snd_nxt: syn.seq.wrapping_add(1),
             peer_next: 0x1020_3041,
@@ -124,7 +131,7 @@ impl Flow {
         assert_eq!(stack.receive(now, &packet), Rx::Consumed);
         let info = stack.poll_accept().expect("the SYN is reported");
         stack.tcp_accept(info.id, AcceptOpts::default()).unwrap();
-        let mut out = vec![0u8; 2048];
+        let mut out = vec![0u8; 65535];
         let n = stack.poll_transmit(now, &mut out).expect("SYN-ACK");
         let ip = wire::parse_ip(&out[..n]).unwrap();
         let (synack, _) = tcp::parse(&out[ip.payload.clone()]).unwrap();
@@ -133,6 +140,7 @@ impl Flow {
             id: info.id,
             local: original_dst(),
             peer: client(),
+            transparent: true,
             now,
             snd_nxt: synack.seq.wrapping_add(1),
             peer_next: syn.seq.wrapping_add(1),
@@ -183,9 +191,17 @@ impl Flow {
     fn send(&mut self, segments: usize) {
         let mut sent = 0;
         while sent < segments {
-            if let Some(n) = self.stack.poll_transmit(self.now, &mut self.out) {
-                assert_eq!(n, 40 + MSS, "a full segment");
-                sent += 1;
+            let caps = if OFFLOAD && self.transparent {
+                TxCaps::ALL
+            } else {
+                TxCaps::NONE
+            };
+            if let Some(tx) = self.stack.poll_transmit_with(self.now, &mut self.out, caps) {
+                let n = (tx.len - 40) / MSS;
+                assert!(n > 0 && sent + n <= segments);
+                assert_eq!(tx.len, 40 + n * MSS, "whole full-sized wire segments");
+                assert_eq!(tx.gso.is_some(), n > 1);
+                sent += n;
                 continue;
             }
             match self.stack.poll_timeout() {
@@ -223,12 +239,33 @@ impl Flow {
 
 /// The flavours every TCP case runs for: an active-open client and a transparent terminator.
 type Make = fn() -> Flow;
-const FLAVOURS: [(&str, Make); 2] = [("tcp", Flow::connect), ("transparent_tcp", Flow::accept)];
+const FLAVOURS: [(&str, Make); 2] = [
+    ("tcp", Flow::connect),
+    (
+        if OFFLOAD {
+            "transparent_tcp_gso"
+        } else {
+            "transparent_tcp"
+        },
+        Flow::accept,
+    ),
+];
 
 /// Feeds in-order segments to the stack, reading and answering each (the offload seam for RX).
 fn deliver(f: &mut Flow, packets: &[Vec<u8>], read: &mut [u8]) {
     for p in packets {
-        assert_eq!(f.stack.receive(f.now, p), Rx::Consumed);
+        let meta = if OFFLOAD && f.transparent {
+            RxMeta {
+                csum: Csum::Verify,
+                gso: Some(GsoRx {
+                    kind: GsoKind::Tcp,
+                    size: MSS as u16,
+                }),
+            }
+        } else {
+            RxMeta::VERIFY
+        };
+        assert_eq!(f.stack.receive_with(f.now, p, meta), Rx::Consumed);
         black_box(f.stack.tcp_read(f.id, read).unwrap());
         while f.stack.poll_transmit(f.now, &mut f.out).is_some() {}
     }
@@ -241,13 +278,24 @@ fn receive_and_ack(c: &mut Criterion) {
         g.bench_function("receive_in_order_and_ack", |b| {
             b.iter_custom(|iters| {
                 let mut f = make();
-                let payload = vec![0x5au8; MSS];
+                let gro = if OFFLOAD && f.transparent {
+                    GRO_SEGMENTS
+                } else {
+                    1
+                };
+                let payload = vec![0x5au8; gro * MSS];
                 let mut read = vec![0u8; 64 * 1024];
                 let mut elapsed = Duration::ZERO;
                 let mut left = iters;
                 while left > 0 {
                     let n = left.min(BATCH);
-                    let packets: Vec<Vec<u8>> = (0..n).map(|_| f.data_packet(&payload)).collect();
+                    let packets: Vec<Vec<u8>> = (0..n as usize)
+                        .step_by(gro)
+                        .map(|i| {
+                            let count = gro.min(n as usize - i);
+                            f.data_packet(&payload[..count * MSS])
+                        })
+                        .collect();
                     let t = Instant::now();
                     deliver(&mut f, &packets, &mut read);
                     elapsed += t.elapsed();
@@ -355,6 +403,7 @@ fn datagram_packets(len: usize) -> Vec<Vec<u8>> {
 fn transparent_udp(c: &mut Criterion) {
     let mut g = c.benchmark_group("transparent_udp");
     let now = Instant::now();
+    let endpoints = (original_dst(), client());
     for (name, len) in [("1200_byte", 1200usize), ("4000_byte_fragmented", 4000)] {
         let packets = datagram_packets(len);
         let count = packets.len() as u64;
@@ -363,8 +412,23 @@ fn transparent_udp(c: &mut Criterion) {
         g.bench_function(format!("receive_{name}"), |b| {
             let mut rx = Stack::new(transparent(), now);
             b.iter(|| {
-                for p in &packets {
-                    black_box(rx.receive(now, p));
+                for (i, p) in packets.iter().enumerate() {
+                    let result = rx.receive(now, p);
+                    if i + 1 < packets.len() {
+                        assert_eq!(result, Rx::Consumed);
+                    } else {
+                        match result {
+                            Rx::Transparent { src, dst, payload }
+                            | Rx::TransparentOwned {
+                                src, dst, payload, ..
+                            } => {
+                                assert_eq!((src, dst), endpoints);
+                                assert_eq!(payload.len(), len);
+                                black_box(payload);
+                            }
+                            other => panic!("datagram was not delivered: {other:?}"),
+                        }
+                    }
                 }
             })
         });
@@ -374,12 +438,15 @@ fn transparent_udp(c: &mut Criterion) {
             let mut out = vec![0u8; 2048];
             b.iter(|| {
                 black_box(
-                    tx.udp_send_from(original_dst(), client(), &payload, &mut out)
+                    tx.udp_send_from(endpoints.0, endpoints.1, &payload, &mut out)
                         .unwrap(),
                 );
+                let mut emitted = 1;
                 while let Some(n) = tx.poll_transmit(now, &mut out) {
                     black_box(n);
+                    emitted += 1;
                 }
+                assert_eq!(emitted, count, "every fragment must be emitted");
             })
         });
     }
