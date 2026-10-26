@@ -10,13 +10,14 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::icmp_out::Reject;
 use crate::offload::{GsoKind, GsoTx, MAX_USO_RX, MAX_USO_TX, RxMeta, Transmit, TxCaps, TxCsum};
 use crate::tcp::output::Output;
 use crate::wire::{self, IpPacket, ipv4, ipv6};
-use crate::{DropReason, Rx, Stack, UdpError};
+use crate::{DropReason, MemoryBudget, Rx, Stack, UdpError};
 
 /// Why a transparent UDP datagram is refused (ICMP mapping of the design, §3.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +30,7 @@ pub enum UdpRefuse {
     AdminProhibited,
 }
 
-/// Bytes of datagrams waiting for their later fragments. One datagram is always accepted.
+/// Capacity of datagrams waiting for later fragments, also subject to the shared budget.
 pub(crate) const MAX_PENDING_BYTES: usize = 512 * 1024;
 const UDP_HEADER: usize = 8;
 
@@ -90,17 +91,29 @@ impl Pending {
 pub(crate) struct UdpTx {
     queue: VecDeque<Pending>,
     bytes: usize,
+    budget: Option<Arc<MemoryBudget>>,
     /// Next IP identification; sequential from a keyed start, so ids never repeat within 2^16
     /// datagrams (IPv4) while still not starting at a guessable value.
     ident: u32,
 }
 
+impl Drop for UdpTx {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget
+            && self.bytes != 0
+        {
+            budget.refund(self.bytes);
+        }
+    }
+}
+
 impl UdpTx {
-    pub(crate) fn new(secret: &[u8; 32]) -> UdpTx {
+    pub(crate) fn new(secret: &[u8; 32], budget: Option<Arc<MemoryBudget>>) -> UdpTx {
         let h = blake3::keyed_hash(secret, b"honk-netstack udp ident");
         UdpTx {
             queue: VecDeque::new(),
             bytes: 0,
+            budget,
             ident: u32::from_le_bytes([
                 h.as_bytes()[0],
                 h.as_bytes()[1],
@@ -151,8 +164,15 @@ impl UdpTx {
         if !self.queue.is_empty() && self.bytes + udp_len > MAX_PENDING_BYTES {
             return Err(UdpError::Busy);
         }
-        let mut datagram = vec![0u8; udp_len];
-        wire::udp::emit_datagram(&mut datagram, src, dst, payload).ok_or(UdpError::TooLarge)?;
+        if out.len() < ip_len + frag_extra + chunk.min(udp_len) {
+            return Err(UdpError::BufferTooSmall);
+        }
+        if self.budget.as_ref().is_some_and(|b| !b.try_charge(udp_len)) {
+            return Err(UdpError::Busy);
+        }
+        let mut datagram = vec![0u8; udp_len].into_boxed_slice().into_vec();
+        wire::udp::emit_datagram(&mut datagram, src, dst, payload)
+            .expect("validated UDP length and buffer");
         let mut p = Pending {
             src: src.ip(),
             dst: dst.ip(),
@@ -161,7 +181,7 @@ impl UdpTx {
             next: 0,
             chunk,
         };
-        let n = p.emit(out).ok_or(UdpError::BufferTooSmall)?;
+        let n = p.emit(out).expect("validated first fragment buffer");
         self.ident = self.ident.wrapping_add(1);
         self.bytes += udp_len;
         self.queue.push_back(p);
@@ -258,14 +278,18 @@ impl UdpTx {
         };
         if p.done() {
             let p = self.queue.pop_front().expect("front");
-            self.bytes -= p.datagram.len();
+            let freed = p.datagram.capacity();
+            self.bytes -= freed;
+            if let Some(budget) = &self.budget {
+                budget.refund(freed);
+            }
         }
         Output::Sent(n)
     }
 
     #[cfg(any(test, feature = "fuzz-checks"))]
     pub(crate) fn check(&self) {
-        let sum: usize = self.queue.iter().map(|p| p.datagram.len()).sum();
+        let sum: usize = self.queue.iter().map(|p| p.datagram.capacity()).sum();
         assert_eq!(sum, self.bytes);
         assert!(self.queue.iter().all(|p| !p.done()));
         assert!(self.queue.len() <= 1 || self.bytes <= MAX_PENDING_BYTES);
@@ -700,6 +724,51 @@ mod tests {
         assert_eq!(reassemble(&packets).len(), 20 + 8 + 5000);
         assert!(matches!(s.poll_udp_frag(&mut out), Output::None));
     }
+
+    #[test]
+    fn queued_udp_fragments_share_budget_until_fully_sent_or_dropped() {
+        for v6 in [false, true] {
+            let budget = MemoryBudget::new(3008);
+            let funded = || {
+                let mut cfg = Config::new([9; 32]);
+                cfg.mode = crate::Mode::Transparent { exclude: crate::ExcludeSet::default() };
+                cfg.mtu = 1280;
+                cfg.shared_budget = Some(budget.clone());
+                Stack::new(cfg, Instant::now())
+            };
+            let mut a = funded();
+            let mut b = funded();
+            let (src, dst) = addrs(v6);
+            let payload = [7; 3000];
+            let mut out = [0; 1500];
+            let ident = a.udp_tx.ident;
+            assert_eq!(a.udp_send_from(src, dst, &payload, &mut [0; 1]), Err(UdpError::BufferTooSmall));
+            assert_eq!(a.udp_tx.ident, ident);
+            assert_eq!(budget.used(), 0);
+            a.udp_send_from(src, dst, &payload, &mut out).unwrap();
+            let retained = a.udp_tx.queue.front().unwrap().datagram.capacity();
+            assert_eq!(retained, 3008);
+            assert_eq!(budget.used(), retained);
+            assert!(matches!(a.poll_udp_frag(&mut [0; 1]), Output::Blocked));
+            assert_eq!(budget.used(), retained);
+            out.fill(0xA5);
+            assert_eq!(b.udp_send_from(src, dst, &payload, &mut out), Err(UdpError::Busy));
+            assert!(out.iter().all(|&byte| byte == 0xA5));
+            assert_eq!(budget.used(), retained);
+            assert!(!b.udp_tx.pending());
+            b.udp_send_from(src, dst, b"small", &mut out).unwrap();
+            while let Output::Sent(_) = a.poll_udp_frag(&mut out) {
+                assert_eq!(budget.used(), if a.udp_tx.pending() { retained } else { 0 });
+                a.udp_tx.check();
+            }
+            assert_eq!(budget.used(), 0);
+            b.udp_send_from(src, dst, &payload, &mut out).unwrap();
+            assert_eq!(budget.used(), retained);
+            drop(b);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
     #[test]
     fn refusals_answer_for_the_original_destination() {
         let now = Instant::now();

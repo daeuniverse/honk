@@ -219,7 +219,7 @@ pub enum UdpError {
     Stale,
     #[error("datagram exceeds the path MTU")]
     TooLarge,
-    #[error("pending fragment queue is full")]
+    #[error("pending fragment queue or memory budget is full")]
     Busy,
     #[error("source and destination address families differ")]
     FamilyMismatch,
@@ -301,7 +301,7 @@ impl Stack {
             .with_budget(cfg.shared_budget.clone());
         let ports = Ports::new(&cfg.secret);
         Stack {
-            udp_tx: crate::udp_t::UdpTx::new(&cfg.secret),
+            udp_tx: crate::udp_t::UdpTx::new(&cfg.secret, cfg.shared_budget.clone()),
             icmp_out: crate::icmp_out::IcmpOut::new(cfg.icmp_limits),
             reasm: crate::fragment::Reassembler::new(cfg.fragment_limits)
                 .with_budget(cfg.shared_budget.clone()),

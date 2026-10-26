@@ -110,11 +110,11 @@
 //! the pool's cached free chunks (up to 64 while any chunk is in use, one otherwise).
 //! [`Config::shared_budget`] lets stacks of one process share an additional limit, charged
 //! for floors and commitments and refunded as flows retire and when a stack is dropped.
-//! Reassembly storage and queued Time Exceeded quote capacities share that budget too;
-//! expiry quotes stay charged until sent, discarded or dropped, including across blocked output.
+//! Reassembly storage, queued Time Exceeded quotes and pending UDP fragment datagram capacities
+//! share that budget too. Queued storage stays charged across blocked output until sent or dropped.
 //! Per-flow buffer maxima are bounded to the modular-sequence safe range and at least one chunk.
 //!
-//! UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and
+//! Endpoint UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and
 //! [`Stack::udp_send`] writes straight into the caller's output buffer. Datagram payloads
 //! exceeding the configured MTU return [`UdpError::TooLarge`]; in endpoint mode fragments are
 //! dropped.
