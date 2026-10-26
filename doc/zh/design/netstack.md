@@ -1,6 +1,6 @@
 # 用户态网络栈与 WireGuard 隧道
 
-`honk-netstack` 是 sans-I/O 的 IPv4/IPv6 TCP/UDP 栈，唯一的使用者是 WireGuard 出站：它充当用户态隧道的内层网络，honk 是隧道内的 TCP/UDP 客户端，因此栈只实现主动打开和数据报 socket。本页描述已实现的内容。与其他用户态子系统一样，它主要由 AI 编写，仅经过维护者的部分审查，见[已知限制](#已知限制与缺口)。
+`honk-netstack` 是 sans-I/O 的 IPv4/IPv6 TCP/UDP 栈，由 `Config::mode` 选择两种模式。`Mode::Endpoint`（默认）下，它是 WireGuard 出站所用用户态隧道的内层网络：honk 是隧道内的 TCP/UDP 客户端，因此栈只实现主动打开和数据报 socket。`Mode::Transparent` 下，它为客户端拨出的任意目的地址终结 TCP 和 UDP（被动打开、无状态 UDP、IP 重组、ICMP 生成）；该模式已实现并经过测试，但**目前没有任何 driver 选用它**，见[透明终结](#透明终结)和[尚未实现](#尚未实现)。除非另有说明，本页其余部分描述 Endpoint 模式，其行为不变。本页描述已实现的内容。与其他用户态子系统一样，它主要由 AI 编写，仅经过维护者的部分审查，见[已知限制](#已知限制与缺口)。
 
 出站侧的行为（注册表、流、失败归因）在下文从栈的角度概述，规范见[出站设计](./outbound.md#wireguard-隧道)。节点字段和分享链接见[节点参考](../reference/nodes.md)。
 
@@ -14,7 +14,7 @@ flowchart LR
 ```
 
 - `honk-netstack` 只依赖 `blake3` 和 `thiserror`，`publish = false`，并禁止 `unsafe`。依赖方向是 `honk-outbound` → 它；它对节点、tokio、socket 一无所知。`smoltcp` 是 dev-dependency，只用于测试基线。
-- 它从不读取时钟、环境变量或配置文件。调用方提供 `Instant`、接口地址和 MTU、32 字节私有 secret 以及内存上限（`Config`）。默认值：MTU 1420、4096 个流、256 MiB 内存、每流 8 MiB 接收缓冲和 6 MiB 发送缓冲。
+- 它从不读取时钟、环境变量或配置文件。调用方提供 `Instant`、接口地址和 MTU、32 字节私有 secret 以及内存上限（`Config`）。默认值：MTU 1420、4096 个流、256 MiB 内存、每流 8 MiB 接收缓冲和 6 MiB 发送缓冲、`Mode::Endpoint`；透明模式的字段见[配置与计数器](#配置与计数器)。
 - `wire` 模块是公开的（IPv4/IPv6/TCP/UDP/ICMP 编解码和校验和），因为集成测试用它构造报文；其余均为私有。
 
 ## 编程模型
@@ -23,22 +23,24 @@ flowchart LR
 
 | 调用 | 约定 |
 | --- | --- |
-| `receive(now, packet) -> Rx` | 借用一个完整 IP 包。需要保留的字节会复制进栈自有的环，因此返回后 buffer 可立即复用。不需要输出容量：回复变为状态。UDP 通过 `Rx::Datagram` 返回输入包中的范围；`Rx::Dropped(reason)` 会被计数。 |
+| `receive(now, packet) -> Rx` | 借用一个完整 IP 包。需要保留的字节会复制进栈自有的环，因此返回后 buffer 可立即复用。不需要输出容量：回复变为状态。UDP 通过 `Rx::Datagram`（Endpoint）和 `Rx::Transparent`（透明模式）返回输入包中的范围：**该范围只在调用方复用或回收输入 buffer 之前有效**（`Rx::TransparentOwned` 自带字节）。`Rx::Dropped(reason)` 会被计数。 |
 | `poll_transmit(now, out) -> Option<usize>` | 把一个完整 IP 包写入 `out[..n]`。`out` 过小时返回 `None` 且不丢包。`None` 也表示 cwnd、rwnd 或 pacing 当前不允许发送。 |
 | `poll_timeout()` / `handle_timeout(now)` | 所有流中最早的 deadline；条目可能已过期，因此提前唤醒是合法的。 |
 | `poll_event()` | 合并后的 `Ready` 位（`CONNECTED`、`READABLE`、`WRITABLE`、`READ_CLOSED`、`ERROR`）；每个流在事件链表上最多出现一次。 |
-| `take_tx_wakeup()` | 由 `tcp_write`、`tcp_shutdown`、`tcp_close`、`tcp_abort`、`tcp_connect` 以及产生 ACK 义务的 `tcp_read` 置位。返回 true 时调用方必须唤醒 owner。 |
+| `take_tx_wakeup()` | 由 `tcp_write`、`tcp_shutdown`、`tcp_close`、`tcp_abort`、`tcp_connect`、`tcp_accept`、`tcp_complete`、`tcp_refuse`、产生 ACK 义务的 `tcp_read`，以及留下待发分片的 `udp_send_from` 置位。返回 true 时调用方必须唤醒 owner。 |
 | `tcp_*`、`udp_*` | 语义同 `write(2)`：用 `WouldBlock` 代替阻塞，`tcp_read` 返回 `Ok(0)` 为 EOF，终止错误具有粘性，并在缓冲数据读完之后才返回。`FlowId` 带 generation，过期 id 返回 `Stale`，绝不会命中新占用者。 |
 
 同一个接收批次（最多 64 个包）内的所有 `receive` 必须传入同一个入口时间戳，避免 RTT、RACK 和自动调优把处理延迟当作网络延迟。
 
 ### 输出调度
 
-`poll_transmit` 按三个类别轮转服务，并跨调用记住轮转位置，因此没有哪一类会饿死其他类：
+`poll_transmit` 按五个类别轮转服务，并跨调用记住轮转位置，因此没有哪一类会饿死其他类：
 
-1. **控制回复**：对未知流的包回复 RST。队列容量 128，满了就丢弃并计数（`control_dropped`），语义上等同链路丢包。
+1. **控制回复**：对未知流的包回复 RST。队列容量 128，满了就丢弃并计数（`control_dropped`），语义上等同链路丢包。透明模式下，被拒绝 SYN 的 ICMP 错误也走这个队列。
 2. **TIME_WAIT 回复**（对重传 FIN 的 ACK），按位合并在条目上，不会丢失。
 3. **就绪的 TCP 流**，按 deficit round robin 调度，quantum 为一个 MTU。同一个流内 ACK 和重传先于新数据。
+4. **排队的 UDP 分片**：`udp_send_from` 发送超长数据报时剩余的分片（透明模式），按 FIFO 输出。
+5. **ICMP Time Exceeded**：重组超时产生（透明模式）。
 
 流的回复义务是位（`DATA`、`OOO`、`WINDOW_UPDATE`、`PROBE_RESPONSE`、`CHALLENGE`、`FIN_ACK`），而不是通过“`rcv_nxt` 是否前移”推断，因为窗口更新、零窗口探测响应和 challenge ACK 都不推进 `rcv_nxt`。所以调用方停止拉取不会丢失任何义务，这本身就是背压。
 
@@ -48,19 +50,19 @@ flowchart LR
 
 ## 报文处理
 
-- 解析带选项的 IPv4 头；IPv6 扩展头（hop-by-hop、routing、destination options，最多八个）会被跳过，带剩余段的 routing 头为 `Unsupported`。巨型载荷、ESP/AH 和未知协议为 `Unsupported`。IPv4 和 IPv6 分片在头校验和之后被丢弃（`Fragment`）：**没有重组，也没有分片**。IP 长度之外的链路层填充被忽略。
+- 解析带选项的 IPv4 头；IPv6 扩展头（hop-by-hop、routing、destination options，最多八个）会被跳过，带剩余段的 routing 头为 `Unsupported`。巨型载荷、ESP/AH 和未知协议为 `Unsupported`。Endpoint 模式下，IPv4 和 IPv6 分片在头校验和之后被丢弃（`Fragment`）：**没有重组，也没有分片**；透明模式会重组分片并对超长 UDP 回复做分片（见[重组](#重组)）。IP 长度之外的链路层填充被忽略。
 - 发送的 IPv4 包设置 DF，TTL/hop limit 为 64，没有选项和扩展头。
-- 目的地址不是本族已配置本地地址的包为 `NotForUs`。没有本地地址的地址族完全不可用（`NoLocalAddress`）。
-- `StackStats` 按原因计数丢包：`Malformed`、`Checksum`、`Fragment`、`NotForUs`、`NoFlow`、`Unsupported`。（`Stale` 已定义但从未产生。）
-- **校验和总是验证**（IPv4 头、TCP、UDP、ICMP），且发生在任何流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 无效。没有“trusted”模式：WireGuard 只认证隧道对端，并不认证发送方的 inner 校验和。验证是对报文的单独一遍读取，随后才复制载荷；发送校验和在复制载荷的同一遍中计算。
-- **ICMP 只消费，从不发送。** packet-too-big（RFC 1191/8201）或 destination-unreachable 仅在报文地址族与流一致、且被引用的 TCP 序号落在未确认窗口内时才生效：PTB 降低该流的路径 MTU（只减不增），并让所有变得过大的段重新可发，包括已按旧尺寸重传过的段；`SYN_SENT` 流收到 unreachable 时 connect 以 `Unreachable` 失败。不带 MTU 的旧式 PTB 使用 RFC 1191 plateau 表。ICMP echo 和其他 ICMP 一律忽略。
-- **UDP** 没有接收队列，也没有发送队列。发往未绑定端口的数据报为 `NoFlow`（不发 ICMP 错误）。`udp_send` 直接把一个 IP 包序列化进调用方的 buffer；超过 MTU 的数据报返回 `TooLarge`。
+- Endpoint 模式下，目的地址不是本族已配置本地地址的包为 `NotForUs`。没有本地地址的地址族完全不可用（`NoLocalAddress`）。透明模式改为接受任意单播目的地址（见[范围与寻址](#范围与寻址)）。
+- `StackStats` 按原因计数丢包：`Malformed`、`Checksum`、`Fragment`、`NotForUs`、`NoFlow`、`Unsupported`，透明模式下还有 `HalfOpen` 和 `Capacity`。（`Stale` 已定义但从未产生。）
+- **两种模式下校验和都总是验证**（IPv4 头、TCP、UDP、ICMP），且发生在任何流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 无效。目前没有“trusted”模式，`receive` 的签名也无法请求跳过验证；未来 offload 工作的规则见[校验和信任](#校验和信任)。WireGuard 只认证隧道对端，并不认证发送方的 inner 校验和。验证是对报文的单独一遍读取，随后才复制载荷；发送校验和在复制载荷的同一遍中计算。
+- **ICMP 在两种模式下都会被消费，只有透明模式才发送。** packet-too-big（RFC 1191/8201）或 destination-unreachable 仅在报文地址族与流一致、且被引用的 TCP 序号落在未确认窗口内时才生效：PTB 降低该流的路径 MTU（只减不增），并让所有变得过大的段重新可发，包括已按旧尺寸重传过的段；`SYN_SENT` 流收到 unreachable 时 connect 以 `Unreachable` 失败。不带 MTU 的旧式 PTB 使用 RFC 1191 plateau 表。ICMP echo 和其他 ICMP 一律忽略。Endpoint 模式下栈从不生成 ICMP；生成见 [ICMP 生成](#icmp-生成)。
+- **Endpoint 模式的 UDP** 没有接收队列，也没有发送队列。发往未绑定端口的数据报为 `NoFlow`（不发 ICMP 错误）。`udp_send` 直接把一个 IP 包序列化进调用方的 buffer；超过 MTU 的数据报返回 `TooLarge`。透明 UDP 是无状态的，见[透明 UDP](#透明-udp)。
 
 ## TCP
 
 ### 连接模型
 
-只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选择源端口（对本地/远端地址和远端端口做 keyed hash，再加每个 bucket 的计数器，范围 32768..65535），ISN 取 keyed hash（RFC 6528）加 4 µs 时钟，并为每个地址对使用稳定的时间戳偏移（RFC 6191）。secret 来自 `Config::secret`（blake3 keyed hash）。**没有 listen API**；未知四元组的 SYN 会得到 RST；同时打开（simultaneous open）已处理。
+Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选择源端口（对本地/远端地址和远端端口做 keyed hash，再加每个 bucket 的计数器，范围 32768..65535），ISN 取 keyed hash（RFC 6528）加 4 µs 时钟，并为每个地址对使用稳定的时间戳偏移（RFC 6191）。secret 来自 `Config::secret`（blake3 keyed hash）。Endpoint 模式**没有 listen API**；未知四元组的 SYN 会得到 RST；同时打开（simultaneous open）已处理。被动打开只存在于透明模式（[TCP 接纳](#tcp-接纳)）。
 
 每个 SYN 都提供 MSS（MTU − 40/60）、窗口缩放（shift 根据 `tcp_rcv_buf_max` 一次选定，最大 14）、SACK-permitted 和时间戳；只有对端回显的选项才会启用。缺失对端 MSS 时默认 536（IPv4）或 1220（IPv6），并至少提升到 48（Linux `tcp_min_snd_mss`），恶意服务器无法换取逐字节发包。数据段的载荷不超过 `min(对端 MSS, PMTU − IP 头 − 该段的 TCP 头)`，按包计算，因为时间戳加 SACK block 会让 TCP 头增长到 60 字节。
 
@@ -69,8 +71,8 @@ flowchart LR
 ### 关闭与生命周期
 
 - `tcp_shutdown` 只关闭写半边。`tcp_close` 立即释放应用句柄，由协议继续完成（排队数据之后发 FIN）；**带未读数据关闭，或处于 `SYN_RECEIVED` 时关闭，会发 RST**，与 Linux 一致。处于 `FIN_WAIT_2` 的孤儿流有 60 秒超时。
-- TIME_WAIT 与应用句柄分离。流保留 slab 槽（环、就绪位），直到应用读完所有数据并关闭句柄、最后一个 ACK 已发出；之后才压缩为不占 chunk 的小表项 `{tuple, snd_nxt, rcv_nxt, ts_recent, expiry, ack_due}`，持续 60 秒。收到合法的重传 FIN 时回 ACK 并重启计时。到同一四元组的新连接只有在 RFC 6191 的时间戳与序号比较证明对端能区分两个化身时才可复用该表项，否则继续搜索端口（最多 32768 个候选，之后 `AddrInUse`）。
-- 终止错误：`Reset`、`TimedOut`（6 次 SYN 重传、15 次连续 RTO 退避、连续 15 次无 ACK 应答的零窗口探测，或孤儿超时）和 `Unreachable`。没有 TCP keepalive。
+- TIME_WAIT 与应用句柄分离。流保留 slab 槽（环、就绪位），直到应用读完所有数据并关闭句柄、最后一个 ACK 已发出；之后才压缩为不占 chunk 的小表项 `{tuple, snd_nxt, rcv_nxt, ts_recent, expiry, ack_due}`，持续 60 秒。收到合法的重传 FIN 时回 ACK 并重启计时。到同一四元组的新连接只有在 RFC 6191 的时间戳与序号比较证明对端能区分两个化身时才可复用该表项，否则继续搜索端口（最多 32768 个候选，之后 `AddrInUse`）。哪一方保留 TIME_WAIT，以及透明模式的 SYN 如何重开四元组，见[关闭语义](#关闭语义)。
+- 终止错误：`Reset`、`TimedOut`（6 次 SYN 重传、15 次连续 RTO 退避、连续 15 次无 ACK 应答的零窗口探测、孤儿超时，或对启用了 keepalive 的透明模式已接受流，keepalive 探测无应答）和 `Unreachable`。TCP keepalive 默认关闭，只有 `AcceptOpts::keepalive` 设置后才启用（[Keepalive](#keepalive)）。
 
 ### 接收侧
 
@@ -101,6 +103,112 @@ flowchart LR
 - **进程共享预算。** `Config::shared_budget`（`Option<Arc<MemoryBudget>>`，`MemoryBudget::new(limit_bytes)`、`limit()`、`used()`）让多个栈在各自 `memory_limit` 之外共用一个上限。保底在接纳时计入（预算无法支付时 `tcp_connect` 返回 `Memory`），每次共享 chunk 或描述符承诺也在栈内池计费的同一路径上计入；流结束退还其保底，丢弃 `Stack` 退还其仍持有的全部份额。在预算下被接纳的流保有自己的保底，因此预算耗尽时仍能前进。预算无锁（每次 chunk 粒度的计费一次原子更新），不做 I/O。
 - 每流缓冲上限被限制在一个 chunk 到 1 GiB 之间，使序号运算保持模运算安全。
 
+## 透明终结
+
+`Config::mode = Mode::Transparent { exclude }` 让栈成为客户端所拨任意目的地址的 TCP/UDP 端点。它由报文脚本、模拟器和 fuzz 覆盖，但树内没有任何代码选用它：WireGuard driver 构造默认 `Config`，仍处于 `Mode::Endpoint`。上文的内存、拥塞控制、丢包恢复、编程模型和单 owner 规则对透明流同样适用，不变。**本模式没有声称任何性能门槛或数字**；模拟器和基准的数字是逐包、虚拟时间的证据，不是实验室证据。
+
+### 范围与寻址
+
+- 流的本地端是报文的原始目的地址，因此所有回复（SYN-ACK、数据、RST、ICMP 错误、UDP）都以它为源。入站包不与 `local_v4`/`local_v6` 比对，栈会把 MTU 至少提升到 1280。
+- `ExcludeSet`（`insert(addr, prefix_len)`）列出栈以 `NotForUs` 拒绝的目的前缀。它只是兜底：driver 前面的 TC classifier 才是真正的闸门，在这里被丢弃的包对该客户端是黑洞。
+- 组播、受限广播和未指定目的地址（tun 设备自身的路由器请求、MLD 和 DAD）以 `Unsupported` 静默丢弃。
+- 源地址不是单播、源与目的地址相同，或端口为 0 的 SYN 不会开流，像其他游离段一样回 RST。
+
+### TCP 接纳
+
+未知四元组的普通 SYN 会创建一个处于 `SYN_RECEIVED` 的待定流，且不发送任何内容；流在未决定或被延迟期间忽略所有输入，所以重传的 SYN 被吸收，不会产生第二个流或第二次上报。待定流已持有内存保底，但尚未承诺接收窗口；窗口由 `tcp_accept` 承诺。
+
+| 调用 | 约定 |
+| --- | --- |
+| `poll_accept() -> Option<SynInfo>` | 每个新流上报一次：`id`、`client`、`original_dst`、客户端的 `mss`（缺失时 536 或 1220，至少 48）、`wscale`、`sack`、`timestamps`。 |
+| `tcp_accept(id, AcceptOpts)` | `when: AcceptWhen::Now` 排队发送 SYN-ACK；`AcceptWhen::Deferred { deadline }` 持有 SYN-ACK 直到 `tcp_complete`（上游拨号之后）；若 `deadline` 先到，流以 `TimedOut` 失败且不发送任何内容。`max_mss` 在两个方向上限制 MSS（下限 48）；应使用客户端真实的出口 MTU，tun 的 MTU 不能说明它。`keepalive` 启用 [Keepalive](#keepalive)。默认值（`AcceptOpts::default()`）：`Now`、不限制、无 keepalive。流已死亡时返回该流的错误（例如 `TimedOut`），已决定过则返回 `Closed`，旧句柄返回 `Stale`。 |
+| `tcp_complete(id)` | 放行被延迟流的 SYN-ACK。流不在被持有状态时返回 `Closed`。 |
+| `tcp_refuse(id, Refuse)` | 只在 SYN-ACK 发出之前有效（之后被忽略，改用 `tcp_abort`）。遗忘该流并释放句柄。`Refuse::Rst` 回 RST\|ACK，`Drop` 什么也不回，`IcmpUnreachable` 回 host unreachable，`IcmpAdminProhibited` 回 administratively prohibited（见 [ICMP 生成](#icmp-生成)）。RST 和 ICMP 回复经过容量 128 的控制队列。 |
+
+`MAX_DEFERRED` 为 25 秒，使栈先于边缘 classifier 自己 30 秒的交接过期放弃。`poll_accept` 从未上报的 SYN 在到达 25 秒后被静默遗忘（客户端会重试）；已上报或被延迟、但到截止时间（不晚于 SYN 之后 25 秒）仍未被接受或完成的流，以 `TimedOut` 失败且不发送任何内容，并产生 `ERROR`，应用仍须关闭自己的句柄。
+
+接纳限制：
+
+- **半开上限。** 流从 SYN 起到握手完成或流死亡为止是半开的。`Config::half_open_max`（默认 1024）限制总数，`Config::half_open_per_source`（默认 128）限制每个客户端地址。超出上限的 SYN 被丢弃并计数（`DropReason::HalfOpen`）：从不回 RST 或 ICMP，也没有 SYN cookie。由于每个待定流已持有保底，这些上限同时也限制了 SYN 洪泛能钉住的内存。
+- **流与内存限制。** 流表（`max_flows`）、保底上限，或内存保底与共享预算无法接纳的 SYN 被丢弃并计数（`DropReason::Capacity`），不予应答，客户端会重试。
+
+### 关闭语义
+
+- 先关闭的一方（主动关闭，含同时关闭）经 `FIN_WAIT_1`/`FIN_WAIT_2`/`CLOSING` 进入 TIME_WAIT，保留 60 秒的紧凑墓碑表项（RFC 9293）。后关闭的一方走 `LAST_ACK` 到 `CLOSED`，不保留任何东西。由于先关闭者总会保留 TIME_WAIT，服务端的 TIME_WAIT 绝不会被跳过。
+- 墓碑对合法的重传 FIN 回 ACK 并重启 60 秒计时；其他段被忽略。同一四元组的新 SYN 只有在 RFC 6191 检查通过时才会取代墓碑：其时间戳比最后一次见到的更新，或在没有可用时间戳时，其序号超出旧的 `rcv_nxt`；时间戳更旧的 SYN 被视为游离的重复包并被忽略。新流的 ISS 被强制置于旧 `snd_nxt` 之后。
+- **Driver 约定。** 该表项在最后一次 FIN 交换之后至少在栈内存活 60 秒。这段时间内 driver 必须继续把该四元组的包送给 `receive`：栈前面的任何投递状态（eBPF redirect 表项、流表）都必须比流活得更久，否则客户端重传的 FIN 会到达真实服务器而不是墓碑，并被回以 RST。`StackStats::timewait_entries` 统计存活的墓碑。
+
+### 透明 UDP
+
+- `receive` 对数据报返回 `Rx::Transparent { src, dst, payload }`：没有流、没有 bind，两端地址都在其中。`payload` 是输入包中的范围。
+- `Rx::TransparentOwned { src, dst, packet, payload }` 对应由分片重组出的数据报：`packet` 归栈所有，`payload` 索引它。
+- **借用载荷的生命周期。** `Rx::Datagram` 和 `Rx::Transparent` 的范围只在调用方回收或复用输入 buffer 之前有效。输入 buffer 是 TUN 读缓冲（或将来归还给 fill ring 的 AF_XDP UMEM 帧）的 driver，必须在释放 buffer 之前消费或复制该载荷。`TransparentOwned` 没有这个限制。
+- `udp_send_from(src, dst, payload, out)` 无状态，可使用任意源地址（回复以数据报的原始目的地址为源）。不超过 MTU 的数据报作为一个包写入 `out`（无 DF，设置 identification）。更大的数据报，UDP 长度至多 65535 字节（IPv4 总长度同理，超出返回 `TooLarge`），会被分片：第一个分片写入 `out`，其余是栈内状态（已算好校验和的数据报，只复制一次），通过 `poll_transmit` 每次调用输出一个分片，按 FIFO；存在待发分片时 `take_tx_wakeup()` 置位。待发字节上限 512 KiB（总会接受一个数据报）；会超出的发送在消耗任何东西之前返回 `Busy`，`out` 过小返回 `BufferTooSmall` 且不消耗任何东西。地址族不一致为 `FamilyMismatch`。
+- `udp_refuse(now, UdpRefuse, original, out)` 用 ICMP 回应被拒绝的数据报（`PortUnreachable`、`HostUnreachable`、`AdminProhibited`）；`original` 是该数据报的 IP 包。`Ok(None)` 表示错误被抑制或被限速。
+
+### 重组
+
+透明模式重组任意协议的 IPv4 和 IPv6 分片；Endpoint 模式仍然丢弃分片。重组完成的数据报重新进入常规接收路径，因此目的地址过滤和校验和对它同样生效。
+
+- `FragmentLimits`（`Config::fragment_limits`）默认值：`max_entries` 64，`max_bytes` 4 MiB（载荷、分片 0 保存的头部，以及每个数据报 256 B 的簿记开销），`max_holes` 32，`timeout` 30 秒，从数据报的第一个分片起算。
+- 重叠分片（包括完全相同的重复分片）会终结该数据报（RFC 5722、RFC 8200 第 4.5 节）：buffer 立即释放，一个无 buffer 的墓碑吸收其余分片（`Fragment`）直到超时。空洞多于 `max_holes`，或长度不一致，同样终结数据报。空分片、长度不是 8 的倍数的非末尾分片，以及超过 64 KiB 的数据报为 `Malformed`。原子分片作为完整数据报交付（RFC 6946）。
+- 表或 `max_bytes` 耗尽时，最旧的数据报被静默驱逐，因此洪泛的首分片无法饿死能够完成的突发。
+- 超时仅当分片 0 已到达时才回 ICMP Time Exceeded（IPv4 type 11 code 1，IPv6 type 3 code 1）；引用内容是保存的头部加至多 8 字节。最多 16 个这样的错误等待 `poll_transmit`；`poll_timeout` 和 `handle_timeout` 覆盖重组 deadline。
+- **共享预算。** 重组字节计入 `Config::shared_budget`（不计入栈自己的 `memory_limit`；没有预算时只受 `FragmentLimits` 限制）。计费被拒绝时驱逐最旧的数据报并重试；没有可驱逐的数据报时丢弃该分片：若它会开启新数据报，丢弃为 `DropReason::Capacity`；若是唯一剩下的现有数据报无法增长，则终结该数据报（`Fragment`）。完成、驱逐、超时、终结以及栈被丢弃时退还。因此，分片洪泛最多可占用共享预算中的 `FragmentLimits::max_bytes`，而新流也是按同一个预算接纳的：请为此留出余量，否则洪泛期间 SYN 会以 `Capacity` 被丢弃。
+
+### ICMP 生成
+
+只有透明模式的路径会生成错误：`Refuse::IcmpUnreachable`/`IcmpAdminProhibited`、`udp_refuse`、`packet_too_big(now, mtu, original, out)` 以及重组超时。Endpoint 模式下栈自己从不生成 ICMP。（`udp_refuse` 和 `packet_too_big` 不检查模式，它们是为透明 driver 准备的。）错误以原始目的地址为源，发往原始源地址。
+
+| 拒绝类型 | IPv4（type/code） | IPv6（type/code） |
+| --- | --- | --- |
+| `UdpRefuse::PortUnreachable` | 3/3 | 1/4 |
+| host unreachable（`Refuse::IcmpUnreachable`、`UdpRefuse::HostUnreachable`） | 3/1 | 1/3 |
+| administratively prohibited（`Refuse::IcmpAdminProhibited`、`UdpRefuse::AdminProhibited`） | 3/13 | 1/1（RFC 4443 第 3.1 节） |
+| 重组超时 | 11/1 | 3/1 |
+| `packet_too_big` | 3/4（MTU 在低 16 位，上限 65535） | 2/0 |
+
+- **抑制**（不发错误，也不消耗限速额度）：原始包是非首分片、源或目的地址为未指定/组播/广播、本身就是 ICMP 错误（IPv4 type 3、4、5、11、12 以及大于 18；IPv6 type 小于 128）或不带 type 字节的 ICMP 包，或引用内容无法解析。
+- **大小。** 整个错误包不超过 576 字节（IPv4）或 1280 字节（IPv6）；对原始包的引用被截断以适应。
+- **限速**（`IcmpLimits`，Linux 风格）：全局桶每秒 `per_sec` 1000 条、`burst` 50；按目标（原始源地址）的桶每 `target_interval`（1 秒）一条，突发 `target_burst` 6 个间隔，记住 `max_targets` 128 个目标（替换最久未用者）。两者都同意才扣费。Packet-too-big 豁免，与 Linux 一致。
+- 输出 buffer 过小时所有限速器保持不变，调用可以重试。
+
+### Keepalive
+
+`Keepalive { idle, interval, probes }` 通过 `AcceptOpts::keepalive` 按流设置，默认关闭；主动打开的流没有相应 API。它在握手完成时启动。对端每一个被接受的段都会重启空闲计时和探测计数。静默 `idle` 之后，栈每隔 `interval` 发送一个序号为 `snd_una - 1` 的空 ACK；连续 `probes`（至少 1）个探测无应答、并再过一个 `interval` 之后，流以 `TimedOut` 失败。它在 `SYN_RECEIVED`、`TIME_WAIT`、`CLOSED` 状态下不启用，失败或 abort 后停止。
+
+### 校验和信任
+
+目前栈在所有模式下都验证每个收到的校验和（IPv4 头、TCP、UDP、ICMP），包括重组后的数据报，公开 API 中没有任何手段可以关闭它；内部的透明 UDP 接收路径有一个 `verify_csum` 参数，所有调用方都传 true。offload 工作（`Csum::Valid`/`Partial` 元数据，尚未合并）的设计规则：受信任的校验和只可能在 `Mode::Transparent` 下、来自拥有本地设备的 driver 时被接受，而 WireGuard driver 绝不能有办法选择它，因为它的内层包来自网络。
+
+### 内存与 chunk 大小
+
+各模式下载荷 chunk 都是 16 KiB（`tcp/ring.rs` 中的 `CHUNK`）；一个 TX chunk、一个 RX chunk 加 16 个描述符槽的保底、通告窗口的承诺、从不后退的右沿以及空闲释放，对透明流的作用方式与[内存模型](#内存模型)所述相同。透明模式使用更小的 chunk（设计建议默认 4 KiB，保底约 9 KiB）是**计划中，尚未实现**：`Config` 没有 chunk 大小字段。
+
+### 配置与计数器
+
+| `Config` 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `mode` | `Mode::Endpoint` | 栈为谁应答。 |
+| `half_open_max` | 1024 | 透明：半开流总数。 |
+| `half_open_per_source` | 128 | 透明：每个客户端地址的半开流数。 |
+| `icmp_limits` | `IcmpLimits::default()` | 透明：ICMP 生成限制。 |
+| `fragment_limits` | `FragmentLimits::default()` | 透明：重组限制。 |
+| `shared_budget` | `None` | 所有模式；透明模式的重组也计入其中。 |
+
+`StackStats` 包含 `drops`（按 `DropReason`，现含 `HalfOpen` 和 `Capacity`）、`half_open`（SYN 到握手结束之间的流数）、`timewait_entries`、`control_dropped`、`rx_packets`、`tx_packets`、`flows`、`memory_committed` 和 `memory_allocated`。重组和 ICMP 的计数器是内部的，不导出。
+
+## 尚未实现
+
+以下内容目前不在 `crates/honk-netstack/src` 中，或不在仓库中；这份清单就是本页论断的边界。
+
+- Driver：TUN driver（`honk-tun`）和 AF_XDP driver（`honk-xsk`）。不存在这些名字的 crate。
+- eBPF/TC 一侧：classifier 的投递位、把流导向栈的 steering、必须比 TIME_WAIT 活得更久的投递状态（[关闭语义](#关闭语义)），以及在 TC 层代理非首分片。
+- Offload：GRO、GSO/TSO 和 USO，`RxMeta`/`Csum` 接收元数据，因而也没有受信任的校验和（[校验和信任](#校验和信任)）。
+- 可配置的 chunk 大小及更小的透明默认值（[内存与 chunk 大小](#内存与-chunk-大小)）。
+- ICMP 代理：在客户端与真实上游之间转发 echo 或错误。栈只会针对未确认的 TCP 序号消费 ICMP，并生成上文列出的错误。
+- 透明模式的任何性能门槛或实测数字。
+
 ## Driver 约定（WireGuard）
 
 driver 位于 `honk-outbound/src/proxy/wireguard/`；规范在[出站设计](./outbound.md#wireguard-隧道)，此处只写对栈有约束的部分。
@@ -120,19 +228,21 @@ driver 位于 `honk-outbound/src/proxy/wireguard/`；规范在[出站设计](./o
 
 - 单元测试位于 `honk-netstack/src/` 各模块旁。`tests/tcp_receive.rs`、`tcp_send.rs`、`tcp_recovery.rs` 是确定性报文脚本：只通过公开 API 驱动脚本化对端，并精确比对输出段。
 - `tests/sim/` 是确定性链路模拟器（种子化的延迟、iid 与 Gilbert-Elliott 丢包、乱序、重复、限速和 drop-tail 队列），连接 honk↔honk 或 honk↔固定版本 smoltcp 0.14.0。`sim_honk.rs` 检查 1% 丢包、IPv6 与多流下字节恰好一次按序交付并完成，每次只拉 1 个包与不限量拉取交付相同的流，撤销由链路乱序引起的伪恢复，以及修复既无 SACK 也无重组的对端；`sim_baseline.rs` 刻画 smoltcp，并测试模拟器本身（包括拉取预算恢复）。debug 构建下计分板在每次修改后重算（计数、描述符顺序、游标和被记住的 SACK 区间），且每次调用后 `Tcb::check` 会把它与 `snd_una`/`snd_nxt` 对账。两个 `#[ignore]` 网格会打印对比表（`cargo test -p honk-netstack --test sim_honk -- --ignored --nocapture`）。
+- 透明模式：`tests/transparent_tcp.rs` 是报文脚本套件（接纳、延迟接纳及其 25 秒过期、重传 SYN、拒绝及其 ICMP code、半开与容量丢弃、MSS 限制、keepalive、主动对被动关闭、墓碑处的迟到 FIN、RFC 6191 重开、范围与排除、UDP 与分片）。`tests/sim_transparent.rs` 在虚拟时间里让 honk 和 smoltcp 客户端对接 honk 终结器（`tests/sim/honk_server.rs`），覆盖丢包、IPv6、多流以及延迟接纳期间的 SYN 重传。`tests/sim_termination.rs` 增加 honk 对 honk 的端到端用例：关闭顺序矩阵、墓碑处的迟到 FIN，以及在较小共享预算下的多流与 soak；透明模拟器测试断言所有流、墓碑、半开计数与内存计费最终归零。`benches/stack.rs` 的透明用例在 endpoint 用例旁报告逐包开销。
 - `honk-outbound/src/proxy/wireguard/tests/` 对独立的进程内 peer 运行 driver（回环 UDP 上的 boringtun `Tunn`，后面是 smoltcp 接口）。
-- `fuzz/` 有两个 libFuzzer 目标：`netstack_packet`（任意字节，可选修复长度和校验和，送入有七种状态流的栈的 `receive`）和 `netstack_schedule`（按字节解码的操作序列：构造的对端段、应用调用、时间推进、拉取预算 0/1/N 和 ICMP）。两者来自 `honk-netstack` 的 `fuzz-checks` feature，也作为 `tests/fuzz_replay.rs` 在 stable 上回放已提交的种子和已保存的崩溃产物。断言：不 panic、输出有界且格式正确、每次操作后整栈重算（`Stack::check`）、定时器不会遗留已过期 deadline、全部关闭后归还所有池占用且所有流结束。`cargo bench -p honk-netstack --bench stack` 报告接收+ACK、批量发送和 SACK 处理的每包纳秒数。
+- `fuzz/` 有三个 libFuzzer 目标：`netstack_packet`（任意字节，可选修复长度和校验和，送入有七种状态流的栈的 `receive`）、`netstack_schedule`（按字节解码的操作序列：构造的对端段、应用调用、时间推进、拉取预算 0/1/N 和 ICMP）和 `netstack_transparent`（透明栈上的 SYN 与重传 SYN、立即与延迟接纳、拒绝、握手 ACK、数据、FIN/RST、keepalive、时间推进以及原始/UDP 包）。三者都来自 `honk-netstack` 的 `fuzz-checks` feature，也作为 `tests/fuzz_replay.rs` 在 stable 上回放已提交的种子和已保存的崩溃产物。断言：不 panic、输出有界且格式正确、每次操作后整栈重算（`Stack::check`）、定时器不会遗留已过期 deadline、全部关闭后归还所有池占用且所有流结束。`cargo bench -p honk-netstack --bench stack` 报告接收+ACK、批量发送、SACK 处理和透明用例的每包纳秒数。
 - 真实网络的实验室工具和结果只放在 `bench` 分支。截至目前 `main` 上没有 honk 臂的结果记录，所以本页没有任何吞吐、丢包恢复或 CPU 结论属于实测。
 
 ## 已知限制与缺口
 
 | 范围 | 限制 |
 | --- | --- |
-| IP | 无分片与重组（分片被丢弃，超长 UDP 为 `TooLarge`）；不生成 ICMP；无 ECN；发送不带 IPv4 选项。 |
-| TCP | 无 listen/accept；无 keepalive；无 urgent 数据 API；无 TCP Fast Open；无 PLPMTUD（只响应路径上的 PTB）；仅 CUBIC（BBRv3 推迟）；IW10，无按路由调优。未知 TCP 选项被忽略，选项长度格式错误会终止选项解析。 |
+| IP | Endpoint 模式：无分片与重组（分片被丢弃，超长 UDP 为 `TooLarge`），不生成 ICMP。透明模式在 `FragmentLimits` 内重组，并对 UDP 回复分片，至多 64 KiB。无 ECN；发送不带 IPv4 选项。 |
+| TCP | listen/accept 仅在透明模式（尚无 driver）；keepalive 仅作为已接受透明流的可选项；无 urgent 数据 API；无 TCP Fast Open；无 PLPMTUD（只响应路径上的 PTB）；仅 CUBIC（BBRv3 推迟）；IW10，无按路由调优。未知 TCP 选项被忽略，选项长度格式错误会终止选项解析。 |
 | 接收 | 每流最多 32 个乱序区间；ACK 拉伸受 64 包接收批次限制。 |
 | 规模 | 空闲的已建立流约占 1.4 KiB 堆（无 chunk）；每条隧道 4096 个流，每条被接纳的流从进程预算预留约 33 KiB 的 floor；预算即份额（默认 256 MiB，honk 取内存的 1/8，限制在 64 MiB..4 GiB），所有隧道的栈共同使用，64 MiB / 256 MiB / 1 GiB 下仅 floor 约可容纳 2,000 / 8,000 / 32,000 条流；活动隧道数由其固定开销限制，`share / 4 MiB`，夹在 1..128；`max_flows` 统计 UDP 关联；每条隧道一把锁、一个 owner 任务，因此单条隧道受限于一个核。 |
 | WireGuard | 每条隧道恰好一个 peer；无入站连接；IPv4 与 IPv6 各自需要配置隧道地址；endpoint 域名只在握手尝试超时之后的下一次获取时重新解析，已有会话时端点集合不变；每个 control plane 每个（密钥对，端点）只有一条隧道（不带 runtime 的拨号共用一个单独的进程级 registry），每个 registry 的活动隧道最多 `share / 4 MiB` 条（1..128，见规模）；共享密钥对与端点的节点必须所有隧道设置一致，否则互相替换，主机名与 IP 字面量写法的同一端点是不同的隧道；内层 MTU 至多 65472，使外层数据报装得进一个 UDP 载荷。 |
+| 透明 | 未接入任何 driver；[尚未实现](#尚未实现)下列出的内容均不存在。chunk 仍为 16 KiB。分片洪泛最多可占用共享预算中的 `FragmentLimits::max_bytes`。覆盖仅限报文脚本、模拟器和 fuzz：没有真实网络、TUN、AF_XDP 或 eBPF 运行，也没有性能数字。 |
 | 验证 | 没有对非 Linux TCP 实现的互通测试，没有 ARM 实测，也没有跑 `test-routing`/`test-netns` 虚拟机门槛。设计阈值在一台 x86-64 4-vCPU 虚拟机上以内核 WireGuard + 内核 TCP 为对照实测（不是设计里的同一外层引擎 + TUN 对照臂，且 honk 一侧多一跳本地中继）：G1–G4 通过，G5 下行公平性按中位数通过，G5 空闲内存（含驱动与中继状态约每流 4 KiB）未达到 1 KiB 目标；证据在 `bench` 分支的 `bench/netstack/results/` 下。 |
 
 ## 相关文档
