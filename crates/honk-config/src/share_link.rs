@@ -1,7 +1,7 @@
 //! Share-link parsing: build a [`Node`] from a proxy share URI.
 //!
 //! Supports the common `scheme://` share-link formats (socks5, ss,
-//! trojan, anytls, vmess, vless, hysteria2/hy2, tuic, juicity).
+//! trojan, anytls, vmess, vless, hysteria2/hy2, tuic, juicity, wireguard/wg).
 //! Shadowsocks links follow SIP002: the userinfo is either
 //! `base64(method:password)` or plain `method:password` (the method itself
 //! may still be base64-encoded), the whole `method:password@host:port`
@@ -27,6 +27,7 @@ use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
 use crate::options::vocab::{optional_text, vmess_cipher, xhttp_stream_transport};
 
 mod options;
+mod wireguard;
 mod xhttp;
 
 impl Node {
@@ -91,6 +92,7 @@ impl Node {
             );
             emit(diagnostic);
         })?;
+        node.normalize_wireguard();
         node.normalize_stream_transport().map_err(|message| {
             DetailedConfigError::new(
                 ErrorCategory::Validation,
@@ -144,6 +146,9 @@ impl Node {
         let first = decoded.as_deref().unwrap_or(first);
         let (first, embedded_hop_ports) = extract_hy2_hop_ports(first).map_err(legacy)?;
         let url = url::Url::parse(first.as_ref()).map_err(|_| invalid_link(source))?;
+        if matches!(url.scheme(), "wireguard" | "wg") {
+            return wireguard::parse(&url, source, emit);
+        }
         let mut node = node_from_url(&url, source)?;
         if let Some(config) = ss_config {
             node.outbound = OutboundConfig::Shadowsocks(config);
@@ -197,7 +202,7 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 "unknown-protocol",
                 source.clone(),
                 SettingPath::new("config").field("protocol"),
-                "unknown node protocol; expected socks5, socks4, socks4a, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
+                "unknown node protocol; expected socks5, socks4, socks4a, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic, juicity, wireguard or wg",
             ));
         }
     };
@@ -255,6 +260,7 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 config.uuid = single()?;
                 config.encryption = Some("auto".into());
             }
+            OutboundConfig::WireGuard(_) => unreachable!("WireGuard has a dedicated URI adapter"),
             OutboundConfig::Shadowsocks(_) | OutboundConfig::Direct | OutboundConfig::Block => {}
         }
     }

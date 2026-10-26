@@ -6,6 +6,7 @@ mod protocol;
 mod validation;
 mod vless;
 mod wire;
+mod wireguard;
 mod xhttp;
 
 pub use protocol::*;
@@ -13,6 +14,10 @@ pub use validation::validate_node_collection;
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
+pub use wireguard::{
+    WireGuardConfig, WireGuardKey, parse_wireguard_addresses, parse_wireguard_allowed_ips,
+    parse_wireguard_reserved,
+};
 pub use xhttp::{
     DefaultXmux, XhttpDownload, XhttpMode, XhttpOptions, XhttpRange, XhttpResolvedMode,
     XrayDownload,
@@ -107,6 +112,18 @@ impl Node {
     pub fn is_xhttp(&self) -> bool {
         self.transport()
             .is_some_and(StreamTransportOptions::is_xhttp)
+    }
+
+    /// Canonicalize the numeric endpoint, DNS case and tunnel settings at adapter boundaries.
+    pub fn normalize_wireguard(&mut self) {
+        if let Some(config) = self.wireguard_mut() {
+            config.normalize();
+            if self.host.is_empty() && self.address.matches(':').count() > 1 {
+                return;
+            }
+            self.host = normalized_wireguard_host(self.host()).into_owned();
+            self.address = format!("{}:{}", self.host, self.port);
+        }
     }
 
     /// Canonicalize XHTTP at every adapter boundary before deriving identity.
@@ -287,6 +304,20 @@ impl Node {
         }
     }
 
+    pub fn wireguard(&self) -> Option<&WireGuardConfig> {
+        match &self.outbound {
+            OutboundConfig::WireGuard(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn wireguard_mut(&mut self) -> Option<&mut WireGuardConfig> {
+        match &mut self.outbound {
+            OutboundConfig::WireGuard(config) => Some(config),
+            _ => None,
+        }
+    }
+
     pub fn tls(&self) -> Option<&TlsOptions> {
         self.outbound.tls()
     }
@@ -308,10 +339,15 @@ impl Node {
     }
 
     pub(crate) fn identity_material(&self) -> String {
+        let host = if self.wireguard().is_some() {
+            normalized_wireguard_host(self.host())
+        } else {
+            Cow::Borrowed(self.host())
+        };
         format!(
             "{}|{}|{}|{}|{}",
             self.protocol().as_str(),
-            identity_field(self.host()),
+            identity_field(&host),
             self.port,
             self.outbound.credential_fingerprint(),
             self.outbound.dial_shape_fingerprint()
@@ -331,6 +367,20 @@ impl Node {
         } else {
             legacy_id
         }
+    }
+}
+
+fn normalized_wireguard_host(host: &str) -> Cow<'_, str> {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+        Cow::Owned(ip.to_string())
+    } else if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
     }
 }
 

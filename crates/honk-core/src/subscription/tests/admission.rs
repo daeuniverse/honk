@@ -672,3 +672,214 @@ fn ignored_xhttp_options_are_type_checked_alike_in_both_spellings() {
         assert!(!uri_accepts(bad), "{uri}");
     }
 }
+
+fn wireguard_key(byte: u8) -> String {
+    base64::engine::general_purpose::STANDARD.encode([byte; 32])
+}
+
+#[test]
+fn wireguard_clash_and_both_sing_box_forms_match_uri_identity() {
+    use serde_json::json;
+    let private = wireguard_key(1);
+    let public = wireguard_key(2);
+    let psk = wireguard_key(3);
+    let canonical = Node::from_share_link(&format!(
+        "wireguard://{private}@peer.example:51820?publickey={public}&presharedkey={psk}&address=10.20.30.4/24,fd00::2/64&reserved=1,2,255&allowedips=10.4.5.99/24,2001:db8::42/64&mtu=1400&keepalive=25&udp=0#tunnel"
+    )).unwrap();
+    let bodies = [
+        json!({"proxies":[{"type":"wireguard", "name":"tunnel", "server":"peer.example", "port":"51820", "private-key":private, "public-key":public, "pre-shared-key":psk, "ip":"10.20.30.4/24", "ipv6":"fd00::2/64", "reserved":[1,2,255], "allowed-ips":["2001:db8::42/64","10.4.5.99/24"], "mtu":1400, "persistent-keepalive":25, "udp":false}]}),
+        json!({"proxies":[{"type":"wireguard", "name":"tunnel", "private-key":private, "ip":"10.20.30.4/32", "ipv6":"fd00::2/128", "mtu":1400, "udp":false, "peers":[{"server":"peer.example", "port":51820, "public-key":public, "pre-shared-key":psk, "reserved":"AQL/", "allowed-ips":["10.4.5.0/24","2001:db8::/64"], "persistent-keepalive":"25s"}]}]}),
+        json!({"outbounds":[{"type":"wireguard", "tag":"tunnel", "server":"peer.example", "server_port":51820, "private_key":private, "peer_public_key":public, "pre_shared_key":psk, "local_address":["10.20.30.4/24","fd00::2/64"], "reserved":[1,2,255], "allowed_ips":["10.4.5.0/24","2001:db8::/64"], "mtu":1400, "persistent_keepalive_interval":25, "network":"tcp", "system_interface":false}]}),
+        json!({"endpoints":[{"type":"wireguard", "tag":"tunnel", "private_key":private, "address":["10.20.30.4/24","fd00::2/64"], "mtu":1400, "network":"tcp", "system":false, "peers":[{"address":"peer.example", "port":51820, "public_key":public, "pre_shared_key":psk, "reserved":[1,2,255], "allowed_ips":["10.4.5.0/24","2001:db8::/64"], "persistent_keepalive_interval":25}]}]}),
+    ];
+    for body in bodies {
+        let mut diagnostics = Vec::new();
+        let nodes = parse_subscription_content_with_diagnostics(
+            &Subscription::default(),
+            &body.to_string(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].outbound, canonical.outbound);
+        assert_eq!(nodes[0].id, canonical.id);
+    }
+    let yaml = format!(
+        "proxies:\n  - type: wireguard\n    name: yaml\n    server: peer.example\n    port: 51820\n    private-key: {private}\n    public-key: {public}\n    ip: 10.0.0.2/24\n"
+    );
+    let nodes = parse_subscription_content(
+        &Subscription {
+            sub_type: SubscriptionType::Clash,
+            ..Subscription::default()
+        },
+        &yaml,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes[0].wireguard().unwrap().local_v4.unwrap().to_string(),
+        "10.0.0.2"
+    );
+    assert_eq!(nodes[0].wireguard().unwrap().allowed_ips.len(), 2);
+    assert_eq!(nodes[0].wireguard().unwrap().mtu, 1420);
+    assert_eq!(nodes[0].network(), None);
+}
+
+#[test]
+fn wireguard_multiple_peers_reject_only_their_entries_in_mixed_sing_box_profiles() {
+    use serde_json::json;
+    let peer = json!({"address":"peer.example", "port":51820, "public_key":wireguard_key(2), "allowed_ips":["0.0.0.0/0","::/0"]});
+    let endpoint = json!({"type":"wireguard", "tag":"endpoint", "private_key":wireguard_key(1), "address":["10.0.0.2/32"], "peers":[peer]});
+    let mut multi = endpoint.clone();
+    multi["tag"] = json!("PRIVATE_NAME");
+    multi["peers"] = json!([peer, peer]);
+    let body = json!({
+        "outbounds":[
+            {"type":"socks", "tag":"neighbor", "server":"127.0.0.1", "server_port":1080},
+            multi,
+        ],
+        "endpoints":[multi, endpoint]
+    });
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        &body.to_string(),
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["neighbor", "endpoint"]
+    );
+    assert_eq!(diagnostics.len(), 2);
+    for (diagnostic, path) in diagnostics.iter().zip(["outbounds[2]", "endpoints[1]"]) {
+        assert_eq!(diagnostic.code, "malformed-subscription-entry");
+        assert_eq!(diagnostic.setting.to_string(), path);
+        assert!(diagnostic.message.contains("exactly one peer"));
+        assert!(!diagnostic.terminal);
+        let rendered = format!("{diagnostic:?}");
+        assert!(!rendered.contains("PRIVATE_NAME"));
+        assert!(!rendered.contains(&wireguard_key(1)));
+        assert!(!rendered.contains("peer.example"));
+    }
+}
+
+#[test]
+fn wireguard_invalid_foreign_fields_and_conflicting_peer_claims_salvage_neighbors() {
+    use serde_json::json;
+    let valid = json!({"type":"wireguard", "name":"tunnel", "server":"peer.example", "port":51820, "private-key":wireguard_key(1), "public-key":wireguard_key(2), "ip":"10.0.0.2/24"});
+    let mut invalid = Vec::new();
+    for (field, value) in [
+        ("private-key", json!("PRIVATE_SECRET")),
+        ("public-key", json!("AA==")),
+        ("ip", json!("10.0.0.2/33")),
+        ("ipv6", json!("10.0.0.3/32")),
+        ("mtu", json!(575)),
+        ("mtu", json!(65536)),
+        ("reserved", json!([1, 2, 256])),
+        ("reserved", json!("AQI=")),
+        ("allowed-ips", json!([])),
+        ("persistent-keepalive", json!(-1)),
+        ("persistent-keepalive", json!(65536)),
+        ("peers", json!([])),
+        (
+            "peers",
+            json!([{"server":"peer.example", "port":51820}, {"server":"peer.example", "port":51821}]),
+        ),
+        (
+            "peers",
+            json!([{"server":"different.example", "port":51820, "public-key":wireguard_key(2)}]),
+        ),
+        (
+            "peers",
+            json!([{"server":"peer.example", "port":51820, "public-key":wireguard_key(3)}]),
+        ),
+        ("network", json!("tcp,quic")),
+        ("amnezia-wg-option", json!({"jc":4})),
+    ] {
+        let mut record = valid.clone();
+        record[field] = value;
+        invalid.push(record);
+    }
+    let count = invalid.len();
+    invalid.push(valid);
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        &json!({"proxies":invalid}).to_string(),
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].name, "tunnel");
+    assert_eq!(diagnostics.len(), count);
+    assert!(
+        diagnostics
+            .iter()
+            .enumerate()
+            .all(
+                |(index, diagnostic)| diagnostic.entry_index == Some(index + 1)
+                    && !diagnostic.terminal
+            )
+    );
+}
+
+#[test]
+fn wireguard_uri_subscriptions_preserve_valid_siblings_and_udp_restrictions() {
+    let body = format!(
+        "wireguard://{}@peer.example:51820?publickey={}&address=10.0.0.2/32&udp=0\nwg://bad.example:51820?pk=PRIVATE_SECRET&peer_pk={}&local_address=10.0.0.3\nsocks5://127.0.0.1:1080#neighbor",
+        wireguard_key(1),
+        wireguard_key(2),
+        wireguard_key(2)
+    );
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        &body,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].protocol(), NodeProtocol::WireGuard);
+    assert_eq!(nodes[0].network(), Some("tcp"));
+    assert_eq!(nodes[1].name, "neighbor");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].setting.to_string(),
+        "entries[2].wg_private_key"
+    );
+    assert!(!format!("{:?}", diagnostics[0]).contains("PRIVATE_SECRET"));
+}
+
+#[test]
+fn wireguard_sing_box_peer_port_aliases_compare_numeric_claims() {
+    use serde_json::{Value, json};
+    for (port, server_port, accepted) in [
+        (json!(51820), json!("51820"), true),
+        (json!("51820"), json!(51820), true),
+        (Value::Null, json!(51820), true),
+        (json!(51820), Value::Null, true),
+        (json!(51820), json!(51821), false),
+        (json!("bad"), json!(51820), false),
+        (Value::Null, Value::Null, false),
+    ] {
+        let body = json!({"outbounds":[{"type":"socks", "tag":"neighbor", "server":"127.0.0.1", "server_port":1080}],
+            "endpoints":[{"type":"wireguard", "tag":"tunnel", "private_key":wireguard_key(1), "address":["10.0.0.2/32"],
+                "peers":[{"address":"peer.example", "port":port, "server_port":server_port, "public_key":wireguard_key(2)}]}]});
+        let mut diagnostics = Vec::new();
+        let nodes = parse_subscription_content_with_diagnostics(
+            &Subscription::default(),
+            &body.to_string(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1 + usize::from(accepted));
+        assert_eq!(diagnostics.len(), usize::from(!accepted));
+        if accepted {
+            assert_eq!(nodes[1].port, 51820);
+        }
+    }
+}

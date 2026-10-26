@@ -13,7 +13,8 @@ use crate::types::NodeProtocol;
 use super::{
     AnyTlsConfig, Hysteria2Config, JuicityConfig, Node, OutboundConfig, QuicOptions,
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
-    VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig,
+    VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig, WireGuardConfig, WireGuardKey,
+    parse_wireguard_addresses,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +69,11 @@ impl<'de> Deserialize<'de> for RawVlessMode {
 
         deserializer.deserialize_any(Visitor)
     }
+}
+
+fn raw_presence<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -176,6 +182,29 @@ struct FlatNode {
     anytls_idle_session_check_interval: Option<u64>,
     #[serde(default)]
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(default)]
+    wg_private_key: Option<WireGuardKey>,
+    #[serde(default)]
+    wg_public_key: Option<WireGuardKey>,
+    #[serde(default)]
+    wg_preshared_key: Option<WireGuardKey>,
+    #[serde(default)]
+    wg_addresses: Vec<String>,
+    #[serde(default)]
+    wg_mtu: Option<u16>,
+    #[serde(default)]
+    wg_keepalive: Option<u16>,
+    #[serde(default)]
+    wg_reserved: Option<[u8; 3]>,
+    #[serde(default)]
+    wg_allowed_ips: Option<Vec<ipnet::IpNet>>,
+    #[serde(
+        default,
+        rename = "peers",
+        alias = "wg_peers",
+        deserialize_with = "raw_presence"
+    )]
+    wg_peers: bool,
     #[serde(default)]
     mark: Option<u32>,
     #[serde(default)]
@@ -321,7 +350,10 @@ impl FlatNode {
         );
         strip!(
             self.password.is_some()
-                && matches!(self.protocol, NodeProtocol::Direct | NodeProtocol::Block),
+                && matches!(
+                    self.protocol,
+                    NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::WireGuard
+                ),
             password
         );
         strip!(
@@ -389,6 +421,7 @@ impl FlatNode {
                         | NodeProtocol::VMess
                         | NodeProtocol::VLess
                         | NodeProtocol::AnyTLS
+                        | NodeProtocol::WireGuard
                 ),
             network
         );
@@ -458,6 +491,18 @@ impl FlatNode {
             self.anytls_idle_session_timeout.is_some() && !anytls,
             anytls_idle_session_timeout
         );
+        let wireguard = self.protocol == NodeProtocol::WireGuard;
+        strip!(self.wg_private_key.is_some() && !wireguard, wg_private_key);
+        strip!(self.wg_public_key.is_some() && !wireguard, wg_public_key);
+        strip!(
+            self.wg_preshared_key.is_some() && !wireguard,
+            wg_preshared_key
+        );
+        strip!(!self.wg_addresses.is_empty() && !wireguard, wg_addresses);
+        strip!(self.wg_mtu.is_some() && !wireguard, wg_mtu);
+        strip!(self.wg_keepalive.is_some() && !wireguard, wg_keepalive);
+        strip!(self.wg_reserved.is_some() && !wireguard, wg_reserved);
+        strip!(self.wg_allowed_ips.is_some() && !wireguard, wg_allowed_ips);
 
         if !dropped.is_empty() {
             diagnostics.push(DetailedDiagnostic::warning(
@@ -510,6 +555,15 @@ impl FlatNode {
     ) -> Result<Node, crate::error::DetailedConfigError> {
         self.resolve_credential_aliases()
             .map_err(|error| error.into_detailed(source.clone(), setting.clone()))?;
+        if self.protocol == NodeProtocol::WireGuard && self.wg_peers {
+            return Err(crate::error::DetailedConfigError::new(
+                crate::error::ErrorCategory::Validation,
+                "unsupported-wireguard-peers",
+                source.clone(),
+                setting.clone().field("peers"),
+                "flat WireGuard nodes describe exactly one peer through wg_public_key and endpoint fields, not a peers collection",
+            ));
+        }
         if self.protocol == NodeProtocol::VLess && self.vless_mode != RawVlessMode::Missing {
             return Err(crate::error::DetailedConfigError::new(
                 crate::error::ErrorCategory::Validation,
@@ -673,6 +727,30 @@ impl FlatNode {
                     tls,
                 })
             }
+            NodeProtocol::WireGuard => {
+                let (local_v4, local_v6) =
+                    parse_wireguard_addresses(flat.wg_addresses.iter().map(String::as_str))
+                        .map_err(|message| {
+                            semantic_error(source, setting.clone().field("wg_addresses"), message)
+                        })?;
+                let mut config = WireGuardConfig {
+                    private_key: flat.wg_private_key.take(),
+                    public_key: flat.wg_public_key.take(),
+                    preshared_key: flat.wg_preshared_key.take(),
+                    local_v4,
+                    local_v6,
+                    mtu: flat.wg_mtu.unwrap_or(1420),
+                    persistent_keepalive: flat.wg_keepalive,
+                    reserved: flat.wg_reserved,
+                    network: flat.network.take(),
+                    ..WireGuardConfig::default()
+                };
+                if let Some(allowed_ips) = flat.wg_allowed_ips.take() {
+                    config.allowed_ips = allowed_ips;
+                }
+                config.normalize();
+                OutboundConfig::WireGuard(config)
+            }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
         };
@@ -697,6 +775,7 @@ impl FlatNode {
             created_at: flat.created_at,
             updated_at: flat.updated_at,
         };
+        node.normalize_wireguard();
         node.normalize_stream_transport()
             .map_err(|message| semantic_error(source, setting.clone().field("xhttp"), message))?;
         node.validate_detailed_at(source, setting)?;
@@ -769,6 +848,22 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_private_key: Option<&'a WireGuardKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_public_key: Option<&'a WireGuardKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_preshared_key: Option<&'a WireGuardKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_addresses: Option<Vec<std::net::IpAddr>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_mtu: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_keepalive: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_reserved: Option<[u8; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_allowed_ips: Option<&'a [ipnet::IpNet]>,
     mark: Option<u32>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
@@ -898,6 +993,24 @@ impl<'a> WireOptions<'a> {
                 wire.anytls_idle_session_check_interval = config.idle_session_check_interval;
                 wire.anytls_idle_session_timeout = config.idle_session_timeout;
                 wire.set_tls(&config.tls);
+            }
+            OutboundConfig::WireGuard(config) => {
+                wire.wg_private_key = config.private_key.as_ref();
+                wire.wg_public_key = config.public_key.as_ref();
+                wire.wg_preshared_key = config.preshared_key.as_ref();
+                wire.wg_addresses = Some(
+                    config
+                        .local_v4
+                        .map(std::net::IpAddr::V4)
+                        .into_iter()
+                        .chain(config.local_v6.map(std::net::IpAddr::V6))
+                        .collect(),
+                );
+                wire.wg_mtu = Some(config.mtu);
+                wire.wg_keepalive = config.persistent_keepalive;
+                wire.wg_reserved = config.reserved;
+                wire.wg_allowed_ips = Some(&config.allowed_ips);
+                wire.network = config.network.as_deref();
             }
             OutboundConfig::Direct | OutboundConfig::Block => {}
         }

@@ -35,7 +35,7 @@ chrono.workspace = true
 uuid.workspace = true
 base64.workspace = true
 # getifaddrs for interface address enumeration (replaces `ip addr show`)
-ipnet.workspace = true
+ipnet = { workspace = true, features = ["serde"] }
 libc.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true

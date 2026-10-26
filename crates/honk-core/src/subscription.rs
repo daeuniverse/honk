@@ -712,6 +712,7 @@ fn parse_sip008_subscription(
         serde_yaml::Value::Mapping(root)
             if yaml_value(root, "servers").is_some()
                 && yaml_value(root, "outbounds").is_none()
+                && yaml_value(root, "endpoints").is_none()
                 && yaml_value(root, "proxies").is_none() =>
         {
             json::emit_json_subscription(value, subscription_id, emit)
@@ -776,7 +777,7 @@ fn parse_structured_subscription(
             });
         if first.starts_with('{')
             || (first.starts_with('[') && !ini_header)
-            || ["proxies:", "outbounds:", "servers:"]
+            || ["proxies:", "outbounds:", "endpoints:", "servers:"]
                 .iter()
                 .any(|key| first.starts_with(key))
         {

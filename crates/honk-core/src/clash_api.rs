@@ -416,6 +416,7 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
         NodeProtocol::Tuic => "Tuic",
         NodeProtocol::Juicity => "Juicity",
         NodeProtocol::AnyTLS => "AnyTLS",
+        NodeProtocol::WireGuard => "WireGuard",
         NodeProtocol::Direct => "Direct",
         NodeProtocol::Block => "Reject",
     }

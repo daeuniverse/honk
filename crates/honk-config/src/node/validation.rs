@@ -201,6 +201,11 @@ impl Node {
         if let Some(config) = self.vless() {
             config.validate_fields()?;
         }
+        if let Some(config) = self.wireguard() {
+            config
+                .check()
+                .map_err(|(field, message)| ValidationFailure::new(Some(field), message))?;
+        }
         let Some(tls) = self.tls() else { return Ok(()) };
         tls.validate_alpn()?;
         let reality = tls

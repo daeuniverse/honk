@@ -25,6 +25,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         "tuic" => NodeProtocol::Tuic,
         "juicity" => NodeProtocol::Juicity,
         "anytls" => NodeProtocol::AnyTLS,
+        "wireguard" => NodeProtocol::WireGuard,
         "selector" | "urltest" | "direct" | "block" | "dns" => {
             return Ok(NormalizedEntry::Profile(
                 "sing-box non-proxy profile outbound",
@@ -76,9 +77,112 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         NodeProtocol::Tuic => normalize_tuic(source, proxy),
         NodeProtocol::Juicity => normalize_juicity(source, proxy),
         NodeProtocol::AnyTLS => normalize_anytls(source, proxy),
+        NodeProtocol::WireGuard => normalize_wireguard(source, proxy),
         NodeProtocol::Direct | NodeProtocol::Block => unreachable!(),
     }
     .map(NormalizedEntry::Node)
+}
+
+fn normalize_wireguard(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
+    for key in [
+        "system",
+        "system_interface",
+        "listen_port",
+        "tls",
+        "transport",
+        "multiplex",
+        "udp_over_tcp",
+        "amnezia",
+    ] {
+        reject_active_key(
+            &mut source,
+            key,
+            "sing-box WireGuard system interfaces, listening and wire extensions are unsupported",
+        )?;
+    }
+    for (source_key, target_key) in [
+        ("private_key", "private-key"),
+        ("peer_public_key", "public-key"),
+        ("public_key", "public_key"),
+        ("pre_shared_key", "pre-shared-key"),
+        ("local_address", "local-address"),
+        ("address", "address"),
+        ("mtu", "mtu"),
+        ("reserved", "reserved"),
+        ("allowed_ips", "allowed-ips"),
+        ("persistent_keepalive_interval", "persistent-keepalive"),
+    ] {
+        if let Some(value) = source.remove(source_key) {
+            put(&mut proxy, target_key, value);
+        }
+    }
+    normalize_packet_network(&mut source, &mut proxy)?;
+    if let Some(peers) = source.remove("peers") {
+        let peers = match peers {
+            Value::Sequence(peers) => peers,
+            Value::Null => return Err("sing-box WireGuard peers must be a single-peer array"),
+            _ => return Err("sing-box WireGuard peers must be an array"),
+        };
+        if peers.len() != 1 {
+            return Err(
+                "WireGuard supports exactly one peer; multi-peer configurations are unsupported",
+            );
+        }
+        let mut normalized = Vec::with_capacity(1);
+        for peer in peers {
+            let Value::Mapping(mut peer) = peer else {
+                return Err("sing-box WireGuard peer must be an object");
+            };
+            let mut target = Mapping::new();
+            let server = honk_config::options::vocab::coalesce_equal(
+                [
+                    take_optional_string(&mut peer, "address"),
+                    take_optional_string(&mut peer, "server"),
+                ],
+                "sing-box WireGuard endpoint aliases must agree",
+            )?;
+            if let Some(server) = server {
+                put(&mut target, "server", Value::String(server));
+            }
+            let port = honk_config::options::vocab::coalesce_equal(
+                ["port", "server_port"].into_iter().map(|key| {
+                    let number = match peer.remove(key) {
+                        None | Some(Value::Null) => return Ok(None),
+                        Some(Value::Number(number)) => number.as_u64(),
+                        Some(Value::String(number)) => number.trim().parse::<u64>().ok(),
+                        _ => None,
+                    };
+                    number
+                        .and_then(|port| u16::try_from(port).ok())
+                        .filter(|port| *port != 0)
+                        .map(Some)
+                        .ok_or("sing-box WireGuard peer port must be a nonzero 16-bit integer")
+                }),
+                "sing-box WireGuard endpoint port aliases must agree",
+            )?;
+            if let Some(port) = port {
+                put(&mut target, "port", Value::Number(port.into()));
+            }
+            for (source_key, target_key) in [
+                ("public_key", "public-key"),
+                ("pre_shared_key", "pre-shared-key"),
+                ("allowed_ips", "allowed-ips"),
+                ("reserved", "reserved"),
+                ("persistent_keepalive_interval", "persistent-keepalive"),
+            ] {
+                if let Some(value) = peer.remove(source_key) {
+                    put(&mut target, target_key, value);
+                }
+            }
+            reject_active_remainder(
+                &peer,
+                "sing-box WireGuard peer wire extensions are unsupported",
+            )?;
+            normalized.push(Value::Mapping(target));
+        }
+        put(&mut proxy, "peers", Value::Sequence(normalized));
+    }
+    Ok(proxy)
 }
 
 fn normalize_shadowsocks(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {

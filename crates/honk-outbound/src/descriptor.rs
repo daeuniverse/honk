@@ -189,6 +189,15 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::AnyTls,
         share_link_schemes: &["anytls"],
     },
+    ProtocolDescriptor {
+        protocol: NodeProtocol::WireGuard,
+        supports_udp: network_allows_udp,
+        pool_ready_streams: never,
+        pool_bare_tcp: never,
+        supports_warm: no_warm,
+        generation_runtime: GenerationRuntime::None,
+        share_link_schemes: &["wireguard", "wg"],
+    },
     // Each direct flow owns a socket carrying its own rule or global mark; a
     // pooled socket would hand one flow another flow's mark.
     ProtocolDescriptor {
@@ -240,6 +249,7 @@ mod tests {
             NodeProtocol::Tuic,
             NodeProtocol::Juicity,
             NodeProtocol::AnyTLS,
+            NodeProtocol::WireGuard,
             NodeProtocol::Direct,
             NodeProtocol::Block,
         ] {
@@ -366,6 +376,29 @@ mod tests {
         let ss = descriptor(NodeProtocol::SS).supports_udp;
         let node = Node::default();
         assert!(ss(&node), "SS UDP is not network-gated");
+    }
+
+    #[test]
+    fn wireguard_declares_udp_permission_without_registering_a_handler() {
+        let descriptor = descriptor(NodeProtocol::WireGuard);
+        let mut node = Node {
+            outbound: honk_config::node::OutboundConfig::WireGuard(Default::default()),
+            ..Node::default()
+        };
+        assert!((descriptor.supports_udp)(&node));
+        node.wireguard_mut().unwrap().network = Some("tcp".into());
+        assert!(!(descriptor.supports_udp)(&node));
+        node.wireguard_mut().unwrap().network = Some("TCP, UDP".into());
+        assert!((descriptor.supports_udp)(&node));
+        assert!(!(descriptor.pool_ready_streams)(&node));
+        assert!(!(descriptor.pool_bare_tcp)(&node));
+        assert!(!descriptor.supports_warm(&node, WarmRequirement::Udp));
+        assert!(
+            crate::proxy::ProxyRegistry::default_resolver()
+                .unwrap()
+                .find(NodeProtocol::WireGuard)
+                .is_none()
+        );
     }
 
     #[test]
