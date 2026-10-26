@@ -272,10 +272,9 @@ impl Reassembler {
         let charge = live.charge();
         self.bytes = self.bytes - entry.charged + charge;
         entry.charged = charge;
-        if live.total == Some(end.max(live.data.len()))
+        if live.total == Some(live.data.len())
             && live.ranges.len() == 1
             && live.ranges[0] == (0, live.data.len())
-            && !live.head.is_empty()
         {
             let entry = self.entries.remove(idx);
             self.bytes -= entry.charged;
@@ -362,21 +361,17 @@ impl Reassembler {
         Output::None
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_icmp(&self) -> bool {
         !self.expired.is_empty()
     }
 
-    /// Returns every buffer.
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-        self.expired.clear();
-        self.bytes = 0;
-    }
-
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -601,6 +596,7 @@ mod tests {
             r.expire(late - Duration::from_millis(1));
             assert_eq!(r.len(), 1, "not yet");
             r.expire(late);
+            assert!(!r.pending_icmp(), "no fragment 0, no Time Exceeded");
             assert!(matches!(
                 r.poll_icmp(late, &mut icmp, &mut out),
                 Output::None
@@ -811,15 +807,22 @@ mod tests {
     }
 
     #[test]
-    fn clear_returns_everything() {
+    fn a_datagram_without_fragment_zero_never_completes_and_expiry_returns_state() {
         let t = Instant::now();
-        let (src, dst) = families()[0];
-        let mut r = Reassembler::default();
-        for id in 0..10u32 {
-            pending(r.push(t, &split(&datagram(src, dst, 3000, 1), id, 1000)[1]));
+        for (src, dst) in families() {
+            let mut r = Reassembler::default();
+            for id in 0..10u32 {
+                let f = split(&datagram(src, dst, 3000, 1), id, 1000);
+                // Every byte but the head has arrived, the end included.
+                for p in f[1..].iter().rev() {
+                    pending(r.push(t, p));
+                }
+            }
+            assert_eq!(r.len(), 10);
+            assert!(r.bytes() > 0);
+            r.expire(t + Duration::from_secs(30));
+            assert!(!r.pending_icmp());
+            r.assert_idle();
         }
-        assert!(r.bytes() > 0);
-        r.clear();
-        r.assert_idle();
     }
 }
