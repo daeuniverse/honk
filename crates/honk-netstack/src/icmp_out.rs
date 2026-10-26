@@ -15,9 +15,8 @@ const MAX_ERROR_V4: usize = 576;
 const MAX_ERROR_V6: usize = 1280;
 /// Fixed ICMP header (type, code, checksum, 4-byte rest).
 const ICMP_HEADER: usize = 8;
-/// RFC 4443 §3.1 code 5 ("source address failed ingress/egress policy"); the design's
-/// "admin-prohibited (v6 policy)". Code 1 is the RFC-natural alternative.
-const V6_POLICY: u8 = 5;
+/// RFC 4443 §3.1 code 1: "communication with destination administratively prohibited".
+const V6_ADMIN_PROHIBITED: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reject {
@@ -25,7 +24,7 @@ pub(crate) enum Reject {
     Unreachable,
     /// No route / host unreachable: v4 3/1, v6 1/3.
     HostUnreachable,
-    /// Administratively prohibited: v4 3/13, v6 1/5.
+    /// Administratively prohibited: v4 3/13, v6 1/1.
     AdminProhibited,
     /// Fragment reassembly timeout: v4 11/1, v6 3/1.
     TimeExceeded,
@@ -140,7 +139,7 @@ impl IcmpOut {
             (Reject::HostUnreachable, false) => ((3, 1), [0; 4]),
             (Reject::HostUnreachable, true) => ((1, 3), [0; 4]),
             (Reject::AdminProhibited, false) => ((3, 13), [0; 4]),
-            (Reject::AdminProhibited, true) => ((1, V6_POLICY), [0; 4]),
+            (Reject::AdminProhibited, true) => ((1, V6_ADMIN_PROHIBITED), [0; 4]),
             (Reject::TimeExceeded, false) => ((11, 1), [0; 4]),
             (Reject::TimeExceeded, true) => ((3, 1), [0; 4]),
             (Reject::PacketTooBig { mtu }, false) => {
@@ -359,7 +358,7 @@ mod tests {
         let table = [
             (Reject::Unreachable, [(3, 3), (1, 4)]),
             (Reject::HostUnreachable, [(3, 1), (1, 3)]),
-            (Reject::AdminProhibited, [(3, 13), (1, 5)]),
+            (Reject::AdminProhibited, [(3, 13), (1, 1)]),
             (Reject::TimeExceeded, [(11, 1), (3, 1)]),
         ];
         for (i, (src, dst)) in family().into_iter().enumerate() {
