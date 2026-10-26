@@ -152,7 +152,7 @@ Admission limits:
 
 ### Reassembly
 
-Transparent mode reassembles IPv4 and IPv6 fragments of any protocol; Endpoint mode still drops them. The completed datagram re-enters the normal receive path, so the destination filter and checksums apply to it.
+Transparent mode reassembles IPv4 and IPv6 fragments of any protocol; Endpoint mode still drops them. The completed datagram re-enters the normal receive path, so the destination filter and checksums apply to it. A completed IPv6 datagram that still contains a Fragment header, including behind other extension headers, is dropped as `Fragment`, never reassembled again.
 
 - `FragmentLimits` (`Config::fragment_limits`) defaults: `max_entries` 64, `max_bytes` 4 MiB (retained capacities of payload storage, fragment 0's saved headers and the range table, plus 256 B of fixed bookkeeping per datagram), `max_holes` 32, `timeout` 30 s counted from a datagram's first fragment.
 - An overlapping fragment (an exact duplicate too) kills the datagram (RFC 5722, RFC 8200 section 4.5): the buffer is freed at once and a bufferless tombstone absorbs the remaining fragments (`Fragment`) until the timeout. More than `max_holes` gaps, or inconsistent lengths, kill it as well. Empty fragments, a non-final fragment whose length is not a multiple of 8 and a datagram beyond 64 KiB are `Malformed`. An atomic fragment is delivered as a whole datagram (RFC 6946).

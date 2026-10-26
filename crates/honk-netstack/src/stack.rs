@@ -372,13 +372,26 @@ impl Stack {
                     // The whole datagram goes through the normal checks, destination included,
                     // and its checksum is verified: no fragment's metadata vouches for the rest.
                     Push::Complete(r) => {
-                        let rx = self.receive_packet(now, &r.packet, RxMeta::VERIFY);
+                        let rx = match wire::parse_ip(&r.packet) {
+                            Ok(ip) => self.receive_ip(now, ip, &r.packet, RxMeta::VERIFY),
+                            Err(e) => self.drop_packet(e.into()),
+                        };
                         r.wrap(rx)
                     }
                 };
             }
             Err(e) => return self.drop_packet(e.into()),
         };
+        self.receive_ip(now, ip, packet, meta)
+    }
+
+    fn receive_ip(
+        &mut self,
+        now: Instant,
+        ip: wire::IpPacket,
+        packet: &[u8],
+        meta: RxMeta,
+    ) -> Rx {
         if let Some(reason) = self.refuses(ip.dst) {
             return self.drop_packet(reason);
         }
@@ -1170,6 +1183,8 @@ impl Stack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod fragments;
 
     #[test]
     fn abandoned_opens_do_not_accumulate_stale_ready_nodes() {
