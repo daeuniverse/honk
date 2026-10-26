@@ -6,3 +6,5 @@
 //! stack-owned rings, so a driver may recycle any buffer as soon as a call returns.
 
 #![forbid(unsafe_code)]
+
+pub mod wire;
