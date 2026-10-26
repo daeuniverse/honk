@@ -3,15 +3,38 @@
 
 pub mod app;
 pub mod engine;
+pub mod honk;
 pub mod link;
 pub mod rng;
 pub mod smol;
 pub mod wire;
 
-use app::{Metrics, Plan, Role};
-use engine::{Outcome, Sim, SimConfig, epoch};
+use app::{Driver, Metrics, Plan, Role};
+use engine::{Host, Outcome, Sim, SimConfig, epoch};
+use honk::HonkHost;
 use smol::{SmolConfig, SmolHost};
+use std::fmt::Debug;
 use std::time::Duration;
+
+/// A host whose application driver the completion check and metrics can inspect.
+pub trait AppHost: Host {
+    type Id: Copy + Debug;
+    fn app(&self) -> &Driver<Self::Id>;
+}
+
+impl AppHost for SmolHost {
+    type Id = usize;
+    fn app(&self) -> &Driver<usize> {
+        &self.app
+    }
+}
+
+impl AppHost for HonkHost {
+    type Id = honk_netstack::FlowId;
+    fn app(&self) -> &Driver<honk_netstack::FlowId> {
+        &self.app
+    }
+}
 
 pub fn smoltcp_pair(cfg: &SimConfig, sockets: &SmolConfig, plan: &Plan) -> Sim<SmolHost, SmolHost> {
     Sim::new(
@@ -21,25 +44,39 @@ pub fn smoltcp_pair(cfg: &SimConfig, sockets: &SmolConfig, plan: &Plan) -> Sim<S
     )
 }
 
+/// honk client against a smoltcp listener; `honk_buffer` caps honk's per-flow rings.
+pub fn honk_pair(
+    cfg: &SimConfig,
+    server: &SmolConfig,
+    honk_buffer: usize,
+    plan: &Plan,
+) -> Sim<HonkHost, SmolHost> {
+    Sim::new(
+        cfg,
+        HonkHost::new(server.family, honk_buffer, plan.clone()),
+        SmolHost::new(server, plan.clone(), Role::Server),
+    )
+}
+
 /// Fails with the seed, per-flow progress and link statistics if a transfer stalls.
-pub fn finish(sim: &mut Sim<SmolHost, SmolHost>, seed: u64, bound: Duration) -> Metrics {
+pub fn finish<A: AppHost, B: AppHost>(sim: &mut Sim<A, B>, seed: u64, bound: Duration) -> Metrics {
     let outcome = sim.run(epoch() + bound, |s| {
-        s.a.app.finished() && s.b.app.finished()
+        s.a.app().finished() && s.b.app().finished()
     });
     assert_eq!(
         outcome,
         Outcome::Stopped,
         "seed={seed}; client={:?}; server={:?}; forward={:?}; reverse={:?}",
-        sim.a.app.flows,
-        sim.b.app.flows,
+        sim.a.app().flows,
+        sim.b.app().flows,
         sim.a_to_b.stats(),
         sim.b_to_a.stats()
     );
     let a = sim.a_to_b.stats();
     let b = sim.b_to_a.stats();
     Metrics::new(
-        &sim.a.app,
-        &sim.b.app,
+        sim.a.app(),
+        sim.b.app(),
         sim.elapsed(),
         a.wire.tcp_retrans_bytes + b.wire.tcp_retrans_bytes,
         a.max_queue_bytes.max(b.max_queue_bytes),

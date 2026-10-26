@@ -224,11 +224,21 @@ pub fn emit_packet(
     hdr: &Header,
     payload: [&[u8]; 2],
 ) -> Option<usize> {
+    emit_packet_parts(out, src, dst, hdr, &payload)
+}
+
+pub(crate) fn emit_packet_parts(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
+    hdr: &Header,
+    payload: &[&[u8]],
+) -> Option<usize> {
     let syn = hdr.flags & SYN != 0;
     let hlen = header_len(&hdr.options, syn);
-    let seg_len = hlen
-        .checked_add(payload[0].len())?
-        .checked_add(payload[1].len())?;
+    let seg_len = payload
+        .iter()
+        .try_fold(hlen, |len, part| len.checked_add(part.len()))?;
     let iplen = emit_ip_header(out, src, dst, PROTO_TCP, seg_len)?;
     let total = iplen + seg_len;
     let seg = out.get_mut(iplen..total)?;
@@ -249,9 +259,11 @@ pub fn emit_packet(
     let mut ck = Checksum::pseudo(src, dst, PROTO_TCP, seg_len);
     let (head, body) = seg.split_at_mut(hlen);
     ck.add(head);
-    let (b0, b1) = body.split_at_mut(payload[0].len());
-    ck.copy_add(b0, payload[0]);
-    ck.copy_add(b1, payload[1]);
+    let mut offset = 0;
+    for part in payload {
+        ck.copy_add(&mut body[offset..offset + part.len()], part);
+        offset += part.len();
+    }
     head[16..18].copy_from_slice(&ck.finish().to_be_bytes());
     Some(total)
 }
