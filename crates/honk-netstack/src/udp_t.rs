@@ -8,7 +8,6 @@
 //! FIFO order. Nothing is lost when the driver is slow: the queue is bounded, and a send that
 //! would exceed it fails with [`UdpError::Busy`] before consuming anything.
 
-
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;

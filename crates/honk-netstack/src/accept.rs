@@ -5,11 +5,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::flow::{self, Flow, FourTuple};
-use crate::stack::Control;
-use crate::tcp::passive::Gate;
-use crate::tcp::Tcb;
 use crate::icmp_out::{IcmpEmit, Reject};
+use crate::stack::Control;
+use crate::tcp::Tcb;
 use crate::tcp::output::Output;
+use crate::tcp::passive::Gate;
 use crate::wire;
 use crate::{DropReason, FlowId, Rx, Stack, StreamError};
 

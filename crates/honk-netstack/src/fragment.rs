@@ -11,7 +11,6 @@
 //! Sans-I/O like the rest of the stack: the caller supplies `now`, polls
 //! [`Reassembler::poll_timeout`] and drains [`Reassembler::poll_icmp`].
 
-
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::ops::Range;

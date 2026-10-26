@@ -4,7 +4,6 @@
 //! The caller owns the pending refusal: [`IcmpOut::emit`] either writes the packet or reports
 //! why not, and a refused `TooSmall` leaves every limiter untouched so the call can be retried.
 
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 

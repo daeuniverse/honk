@@ -973,8 +973,20 @@ fn icmp_refusals_are_sourced_from_the_original_destination_and_rate_limited() {
     for (client, dst, how, v4_code, v6_code) in [
         (CLIENT, DST, Refuse::IcmpUnreachable, 1u8, 3u8),
         (CLIENT, DST, Refuse::IcmpAdminProhibited, 13, 5),
-        ("[2001:db8::2]:40000", "[2001:db8:1::9]:443", Refuse::IcmpUnreachable, 1, 3),
-        ("[2001:db8::2]:40000", "[2001:db8:1::9]:443", Refuse::IcmpAdminProhibited, 13, 5),
+        (
+            "[2001:db8::2]:40000",
+            "[2001:db8:1::9]:443",
+            Refuse::IcmpUnreachable,
+            1,
+            3,
+        ),
+        (
+            "[2001:db8::2]:40000",
+            "[2001:db8:1::9]:443",
+            Refuse::IcmpAdminProhibited,
+            13,
+            5,
+        ),
     ] {
         let mut stack = Stack::new(transparent(), t0);
         let peer = Peer::new(client, dst, 1000);
@@ -1007,7 +1019,11 @@ fn icmp_refusals_are_sourced_from_the_original_destination_and_rate_limited() {
     let mut stack = Stack::new(cfg, t0);
     let mut sent = 0;
     for i in 0..10u16 {
-        let peer = Peer::new(&format!("10.0.1.{}:5000", i + 1), &format!("203.0.113.{}:80", i + 1), 7);
+        let peer = Peer::new(
+            &format!("10.0.1.{}:5000", i + 1),
+            &format!("203.0.113.{}:80", i + 1),
+            7,
+        );
         peer.syn(&mut stack, t0, 1400);
         let info = info_of(&mut stack);
         stack.tcp_refuse(info.id, Refuse::IcmpUnreachable);
@@ -1025,7 +1041,9 @@ fn transparent_udp_and_fragments_reach_the_driver_with_both_addresses() {
     let (server, client) = (addr(DST), addr(CLIENT));
     // Small datagram: no flow, no bind.
     let mut out = [0u8; 2000];
-    let n = tx.udp_send_from(server, client, b"hello", &mut out).unwrap();
+    let n = tx
+        .udp_send_from(server, client, b"hello", &mut out)
+        .unwrap();
     match rx.receive(t0, &out[..n]) {
         Rx::Transparent { src, dst, payload } => {
             assert_eq!((src, dst), (server, client));
@@ -1045,7 +1063,12 @@ fn transparent_udp_and_fragments_reach_the_driver_with_both_addresses() {
     for p in &packets {
         match rx.receive(t0, p) {
             Rx::Consumed => {}
-            Rx::TransparentOwned { src, dst, packet, payload } => {
+            Rx::TransparentOwned {
+                src,
+                dst,
+                packet,
+                payload,
+            } => {
                 delivered = Some((src, dst, packet[payload].to_vec()));
             }
             other => panic!("{other:?}"),
@@ -1067,7 +1090,10 @@ fn transparent_udp_and_fragments_reach_the_driver_with_both_addresses() {
     let mut cfg = Config::new([1; 32]);
     cfg.local_v4 = Some(client.ip().to_string().parse().unwrap());
     let mut endpoint = Stack::new(cfg, t0);
-    assert_eq!(endpoint.receive(t0, &packets[0]), Rx::Dropped(DropReason::Fragment));
+    assert_eq!(
+        endpoint.receive(t0, &packets[0]),
+        Rx::Dropped(DropReason::Fragment)
+    );
     // An unfinished reassembly times out and is forgotten.
     let mut timed = Stack::new(transparent(), t0);
     assert_eq!(timed.receive(t0, &packets[1]), Rx::Consumed);
@@ -1099,8 +1125,10 @@ fn a_reopened_tuple_gets_an_iss_beyond_the_old_incarnation() {
         .unwrap()
         .h;
     let our_end = fin.seq.wrapping_add(1);
-    c.peer.seg(&mut c.stack, c.t0 + ms(9), our_end, ACK, tsval, &[]);
-    c.peer.seg(&mut c.stack, c.t0 + ms(10), our_end, ACK | FIN, tsval, &[]);
+    c.peer
+        .seg(&mut c.stack, c.t0 + ms(9), our_end, ACK, tsval, &[]);
+    c.peer
+        .seg(&mut c.stack, c.t0 + ms(10), our_end, ACK | FIN, tsval, &[]);
     drain(&mut c.stack, c.t0 + ms(10));
     assert_eq!(c.stack.stats().timewait_entries, 1);
     let syn = build(
