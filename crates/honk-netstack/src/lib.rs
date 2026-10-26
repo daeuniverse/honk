@@ -55,15 +55,19 @@ mod accept;
 mod budget;
 mod flow;
 mod mode;
+mod fragment;
 mod icmp;
 mod icmp_out;
 mod stack;
 mod tcp;
 mod timer;
 mod udp;
+mod udp_t;
 
 pub use accept::{AcceptOpts, AcceptWhen, Keepalive, MAX_DEFERRED, Refuse, SynInfo};
 pub use budget::MemoryBudget;
+pub use fragment::FragmentLimits;
+pub use icmp_out::IcmpLimits;
 pub use mode::{ExcludeSet, Mode};
 pub use stack::{
     BindError, Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StackStats, StreamError,

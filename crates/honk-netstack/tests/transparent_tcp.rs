@@ -435,7 +435,7 @@ fn refusing_after_the_syn_ack_is_ignored() {
     let mut c = established(transparent(), AcceptOpts::default());
     c.stack.tcp_refuse(c.id, Refuse::Rst);
     assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
-    assert!(drain(&mut c.stack, c.at(10)).is_empty());
+    assert!(drain(&mut c.stack, c.t0 + ms(10)).is_empty());
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn max_mss_clamps_both_directions() {
             Err(_) => break,
         }
     }
-    let out = drain(&mut c.stack, c.at(10));
+    let out = drain(&mut c.stack, c.t0 + ms(10));
     assert!(!out.is_empty());
     let longest = out.iter().map(|p| p.payload.len()).max().unwrap();
     assert!(longest <= 1000 - 12, "segment of {longest} bytes exceeds MSS 1000 minus timestamps");
@@ -555,14 +555,14 @@ fn keepalive_probes_an_idle_peer_and_fails_the_flow_when_unanswered() {
     let (id, _) = c.stack.poll_event().unwrap();
     assert_eq!(id, c.id);
     let deadline = c.stack.poll_timeout().expect("keepalive armed");
-    assert!(deadline <= c.at(5) + ka.idle);
+    assert!(deadline <= c.t0 + ms(5) + ka.idle);
     // Nothing before the idle time.
-    c.stack.handle_timeout(c.at(9_000));
-    assert!(drain(&mut c.stack, c.at(9_000)).is_empty());
+    c.stack.handle_timeout(c.t0 + ms(9_000));
+    assert!(drain(&mut c.stack, c.t0 + ms(9_000)).is_empty());
     let mut probes = Vec::new();
     for at in [10_005u64, 12_005, 14_005] {
-        c.stack.handle_timeout(c.at(at));
-        let out = drain(&mut c.stack, c.at(at));
+        c.stack.handle_timeout(c.t0 + ms(at));
+        let out = drain(&mut c.stack, c.t0 + ms(at));
         assert_eq!(out.len(), 1, "one probe at {at} ms");
         probes.push(out.into_iter().next().unwrap());
     }
@@ -573,8 +573,8 @@ fn keepalive_probes_an_idle_peer_and_fails_the_flow_when_unanswered() {
         assert_eq!(p.src, addr(DST));
     }
     assert!(c.stack.poll_event().is_none());
-    c.stack.handle_timeout(c.at(16_005));
-    assert!(drain(&mut c.stack, c.at(16_005)).is_empty());
+    c.stack.handle_timeout(c.t0 + ms(16_005));
+    assert!(drain(&mut c.stack, c.t0 + ms(16_005)).is_empty());
     let (id, ready) = c.stack.poll_event().expect("failure surfaces");
     assert_eq!(id, c.id);
     assert!(ready.contains(Ready::ERROR));
@@ -596,19 +596,20 @@ fn an_answered_probe_restarts_the_idle_period() {
             ..AcceptOpts::default()
         },
     );
-    c.stack.handle_timeout(c.at(10_005));
-    assert_eq!(drain(&mut c.stack, c.at(10_005)).len(), 1);
+    c.stack.handle_timeout(c.t0 + ms(10_005));
+    assert_eq!(drain(&mut c.stack, c.t0 + ms(10_005)).len(), 1);
+    let _ = c.stack.poll_event();
     // The peer answers with a plain ACK.
-    c.client_seg(c.at(10_100), ACK, &[]);
+    c.client_seg(c.t0 + ms(10_100), ACK, &[]);
     // Far past what the unanswered schedule would allow: still alive and quiet.
-    for ms in [12_005u64, 14_005, 16_005, 20_000] {
-        c.stack.handle_timeout(c.at(ms));
-        assert!(drain(&mut c.stack, c.at(ms)).is_empty(), "{ms}");
+    for t in [12_005u64, 14_005, 16_005, 20_000] {
+        c.stack.handle_timeout(c.t0 + ms(t));
+        assert!(drain(&mut c.stack, c.t0 + ms(t)).is_empty(), "{t}");
     }
     assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
     // Idle again: the next probe is one full idle period after the answer.
-    c.stack.handle_timeout(c.at(20_200));
-    assert_eq!(drain(&mut c.stack, c.at(20_200)).len(), 1);
+    c.stack.handle_timeout(c.t0 + ms(20_200));
+    assert_eq!(drain(&mut c.stack, c.t0 + ms(20_200)).len(), 1);
     assert!(c.stack.poll_event().is_none());
 }
 
@@ -616,8 +617,11 @@ fn an_answered_probe_restarts_the_idle_period() {
 fn keepalive_is_off_unless_configured() {
     let mut c = established(transparent(), AcceptOpts::default());
     let _ = c.stack.poll_event();
+    let _ = c.stack.poll_event();
+    // Only the stale handshake entry of the lazy heap may remain; once popped, nothing is armed.
+    c.stack.handle_timeout(c.t0 + ms(30_000));
     assert_eq!(c.stack.poll_timeout(), None, "an idle flow holds no timer");
-    let far = c.at(3 * 3600 * 1000);
+    let far = c.t0 + ms(3 * 3600 * 1000);
     c.stack.handle_timeout(far);
     assert!(drain(&mut c.stack, far).is_empty());
     assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
@@ -627,15 +631,15 @@ fn keepalive_is_off_unless_configured() {
 fn passive_close_goes_last_ack_to_closed_without_time_wait() {
     let mut c = established(transparent(), AcceptOpts::default());
     let _ = c.stack.poll_event();
-    c.client_seg(c.at(10), ACK | FIN, &[]);
-    let out = drain(&mut c.stack, c.at(10));
+    c.client_seg(c.t0 + ms(10), ACK | FIN, &[]);
+    let out = drain(&mut c.stack, c.t0 + ms(10));
     assert!(out.iter().any(|p| p.h.flags & ACK != 0));
     assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::CloseWait));
     c.stack.tcp_close(c.id);
-    let out = drain(&mut c.stack, c.at(11));
+    let out = drain(&mut c.stack, c.t0 + ms(11));
     let fin = out.iter().find(|p| p.h.flags & FIN != 0).expect("our FIN");
     assert_eq!(c.stack.stats().flows, 1);
-    c.client_seg(c.at(12), ACK, &[]);
+    c.client_seg(c.t0 + ms(12), ACK, &[]);
     // (the client's ACK acknowledges our FIN: ack = fin.seq + 1)
     let _ = fin;
 }
@@ -645,16 +649,16 @@ fn active_close_keeps_time_wait_and_a_late_fin_reaches_the_tombstone() {
     let mut c = established(transparent(), AcceptOpts::default());
     let _ = c.stack.poll_event();
     c.stack.tcp_close(c.id);
-    let out = drain(&mut c.stack, c.at(10));
+    let out = drain(&mut c.stack, c.t0 + ms(10));
     let fin = out.iter().find(|p| p.h.flags & FIN != 0).expect("our FIN").h;
     let our_end = fin.seq.wrapping_add(1);
     // Client ACKs our FIN, then sends its own.
     let mut peer = Peer::new(CLIENT, DST, c.peer.seq);
     let tsval = fin.options.timestamps.unwrap().0;
     peer.ts = c.peer.ts;
-    peer.seg(&mut c.stack, c.at(20), our_end, ACK, tsval, &[]);
-    peer.seg(&mut c.stack, c.at(30), our_end, ACK | FIN, tsval, &[]);
-    let out = drain(&mut c.stack, c.at(30));
+    peer.seg(&mut c.stack, c.t0 + ms(20), our_end, ACK, tsval, &[]);
+    peer.seg(&mut c.stack, c.t0 + ms(30), our_end, ACK | FIN, tsval, &[]);
+    let out = drain(&mut c.stack, c.t0 + ms(30));
     assert!(out.iter().any(|p| p.h.flags == ACK && p.h.ack == peer.seq));
     // The flow compacts into a TIME_WAIT tombstone that holds no memory.
     let stats = c.stack.stats();
@@ -674,12 +678,12 @@ fn active_close_keeps_time_wait_and_a_late_fin_reaches_the_tombstone() {
         },
         &[],
     );
-    assert_eq!(c.stack.receive(c.at(2_000), &late), Rx::Consumed);
-    let out = drain(&mut c.stack, c.at(2_000));
+    assert_eq!(c.stack.receive(c.t0 + ms(2_000), &late), Rx::Consumed);
+    let out = drain(&mut c.stack, c.t0 + ms(2_000));
     assert_eq!(out.len(), 1);
     assert_eq!((out[0].h.flags, out[0].h.ack), (ACK, peer.seq));
     // After 60 s the tombstone is gone.
-    c.stack.handle_timeout(c.at(2_000 + 60_001));
+    c.stack.handle_timeout(c.t0 + ms(2_000 + 60_001));
     assert_eq!(c.stack.stats().timewait_entries, 0);
 }
 
@@ -688,15 +692,15 @@ fn a_syn_reopens_time_wait_only_when_it_is_safe() {
     let mut c = established(transparent(), AcceptOpts::default());
     let _ = c.stack.poll_event();
     c.stack.tcp_close(c.id);
-    let out = drain(&mut c.stack, c.at(10));
+    let out = drain(&mut c.stack, c.t0 + ms(10));
     let fin = out.iter().find(|p| p.h.flags & FIN != 0).unwrap().h;
     let our_end = fin.seq.wrapping_add(1);
     let tsval = fin.options.timestamps.unwrap().0;
     let mut peer = Peer::new(CLIENT, DST, c.peer.seq);
     peer.ts = c.peer.ts;
-    peer.seg(&mut c.stack, c.at(20), our_end, ACK, tsval, &[]);
-    peer.seg(&mut c.stack, c.at(30), our_end, ACK | FIN, tsval, &[]);
-    drain(&mut c.stack, c.at(30));
+    peer.seg(&mut c.stack, c.t0 + ms(20), our_end, ACK, tsval, &[]);
+    peer.seg(&mut c.stack, c.t0 + ms(30), our_end, ACK | FIN, tsval, &[]);
+    drain(&mut c.stack, c.t0 + ms(30));
     assert_eq!(c.stack.stats().timewait_entries, 1);
     let rcv_nxt = peer.seq; // beyond the client's FIN
     let syn = |seq: u32, ts: u32| {
@@ -714,16 +718,16 @@ fn a_syn_reopens_time_wait_only_when_it_is_safe() {
         )
     };
     // An old duplicate SYN (sequence below rcv_nxt, older timestamp) must not kill the tombstone.
-    assert_eq!(c.stack.receive(c.at(100), &syn(500, peer.ts - 5)), Rx::Consumed);
+    assert_eq!(c.stack.receive(c.t0 + ms(100), &syn(500, peer.ts - 5)), Rx::Consumed);
     assert!(c.stack.poll_accept().is_none());
     assert_eq!(c.stack.stats().timewait_entries, 1);
     // A new incarnation (newer timestamp) replaces it and is reported.
-    assert_eq!(c.stack.receive(c.at(200), &syn(500, peer.ts + 1000)), Rx::Consumed);
+    assert_eq!(c.stack.receive(c.t0 + ms(200), &syn(500, peer.ts + 1000)), Rx::Consumed);
     let info = c.stack.poll_accept().expect("reopened");
     assert_eq!(info.client, addr(CLIENT));
     assert_eq!(c.stack.stats().timewait_entries, 0);
     c.stack.tcp_accept(info.id, AcceptOpts::default()).unwrap();
-    let out = drain(&mut c.stack, c.at(200));
+    let out = drain(&mut c.stack, c.t0 + ms(200));
     assert_eq!(out.len(), 1);
     assert!(
         (out[0].h.seq.wrapping_sub(our_end) as i32) > 0,
@@ -733,19 +737,19 @@ fn a_syn_reopens_time_wait_only_when_it_is_safe() {
     let mut c = established(transparent(), AcceptOpts::default());
     let _ = c.stack.poll_event();
     c.stack.tcp_close(c.id);
-    let out = drain(&mut c.stack, c.at(10));
+    let out = drain(&mut c.stack, c.t0 + ms(10));
     let fin = out.iter().find(|p| p.h.flags & FIN != 0).unwrap().h;
     let mut peer = Peer::new(CLIENT, DST, c.peer.seq);
     peer.ts = c.peer.ts;
     let tsval = fin.options.timestamps.unwrap().0;
     let our_end = fin.seq.wrapping_add(1);
-    peer.seg(&mut c.stack, c.at(20), our_end, ACK, tsval, &[]);
-    peer.seg(&mut c.stack, c.at(30), our_end, ACK | FIN, tsval, &[]);
-    drain(&mut c.stack, c.at(30));
+    peer.seg(&mut c.stack, c.t0 + ms(20), our_end, ACK, tsval, &[]);
+    peer.seg(&mut c.stack, c.t0 + ms(30), our_end, ACK | FIN, tsval, &[]);
+    drain(&mut c.stack, c.t0 + ms(30));
     let no_ts = |seq: u32| build(addr(CLIENT), addr(DST), seq, 0, SYN, Options { mss: Some(1460), ..Options::default() }, &[]);
-    c.stack.receive(c.at(100), &no_ts(rcv_nxt.wrapping_sub(10)));
+    c.stack.receive(c.t0 + ms(100), &no_ts(rcv_nxt.wrapping_sub(10)));
     assert!(c.stack.poll_accept().is_none());
-    c.stack.receive(c.at(200), &no_ts(rcv_nxt.wrapping_add(10)));
+    c.stack.receive(c.t0 + ms(200), &no_ts(rcv_nxt.wrapping_add(10)));
     assert!(c.stack.poll_accept().is_some());
 }
 
@@ -804,4 +808,8 @@ fn endpoint_mode_has_no_passive_open() {
     assert_eq!((out.len(), out[0].h.flags), (1, RST | ACK));
     let elsewhere = build(addr(CLIENT), addr(DST), 1, 0, SYN, opts_syn(1460), &[]);
     assert_eq!(stack.receive(t0, &elsewhere), Rx::Dropped(DropReason::NotForUs));
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
 }

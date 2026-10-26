@@ -111,8 +111,7 @@ impl Tcb {
             }
             return None;
         }
-        self.ka_rx = now;
-        self.ka_probes = 0;
+        self.ka_activity(now);
         if h.flags & RST != 0 {
             if h.seq == self.rcv_nxt {
                 self.fail(StreamError::Reset);
@@ -260,8 +259,7 @@ impl Tcb {
 
     fn established(&mut self, now: Instant) {
         self.state = TcpState::Established;
-        self.ka_rx = now;
-        self.ka_probes = 0;
+        self.ka_activity(now);
         self.arm_keepalive(now);
         // SYN retransmission backoff belongs to the handshake, not to the first data timeout.
         self.rtt.backoff = 0;

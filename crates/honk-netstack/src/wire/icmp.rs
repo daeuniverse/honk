@@ -132,6 +132,20 @@ pub fn emit_packet_too_big(
         mtu.to_be_bytes()
     };
     let quote = &original[..original.len().min(MAX_QUOTE_LEN)];
+    let kind = if src.is_ipv4() { (3, 4) } else { (2, 0) };
+    emit_error(out, src, dst, kind, mtu_bytes, quote)
+}
+
+/// Writes an ICMP/ICMPv6 error of `ty`/`code` (`rest` is the 4-byte field after the checksum)
+/// quoting `quote` verbatim; the caller bounds the quote.
+pub(crate) fn emit_error(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
+    (ty, code): (u8, u8),
+    rest: [u8; 4],
+    quote: &[u8],
+) -> Option<usize> {
     let len = HEADER_LEN + quote.len();
     let proto = if src.is_ipv4() {
         PROTO_ICMP
@@ -141,12 +155,8 @@ pub fn emit_packet_too_big(
     let iplen = emit_ip_header(out, src, dst, proto, len)?;
     let total = iplen + len;
     let msg = out.get_mut(iplen..total)?;
-    msg[0..4].copy_from_slice(if src.is_ipv4() {
-        &[3, 4, 0, 0]
-    } else {
-        &[2, 0, 0, 0]
-    });
-    msg[4..8].copy_from_slice(&mtu_bytes);
+    msg[0..4].copy_from_slice(&[ty, code, 0, 0]);
+    msg[4..8].copy_from_slice(&rest);
     let mut c = if src.is_ipv4() {
         Checksum::new()
     } else {

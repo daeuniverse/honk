@@ -19,7 +19,6 @@ pub(crate) mod seq;
 use std::time::{Duration, Instant};
 
 use crate::flow::FourTuple;
-use crate::accept::Keepalive;
 use crate::{Config, Ready, StreamError};
 use cc::Cc;
 use pacing::Pacer;
@@ -186,11 +185,8 @@ pub struct Tcb {
     pub(crate) gate: passive::Gate,
     /// Counted against the stack's half-open caps until the handshake completes or the flow dies.
     pub(crate) half_open: bool,
-    pub(crate) keepalive: Option<Keepalive>,
-    ka_deadline: Option<Instant>,
-    /// Last accepted segment from the peer; keepalive idleness is measured from here.
-    ka_rx: Instant,
-    ka_probes: u8,
+    /// Per-flow keepalive state; boxed so flows without one stay small.
+    pub(crate) ka: Option<Box<passive::Ka>>,
 }
 
 impl Tcb {
@@ -297,10 +293,7 @@ impl Tcb {
             stats: Counters::default(),
             gate: passive::Gate::Open,
             half_open: false,
-            keepalive: None,
-            ka_deadline: None,
-            ka_rx: now,
-            ka_probes: 0,
+            ka: None,
         }
     }
 
@@ -317,7 +310,7 @@ impl Tcb {
             self.tlp_deadline,
             self.recovery.reo_deadline(),
             self.pacing_deadline,
-            self.ka_deadline,
+            self.ka_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -482,7 +475,7 @@ impl Tcb {
         self.delack_deadline = None;
         self.close_deadline = None;
         self.ack_due = 0;
-        self.ka_deadline = None;
+        self.ka_stop();
     }
 
     pub fn fail(&mut self, error: StreamError) {
@@ -492,7 +485,7 @@ impl Tcb {
         self.delack_deadline = None;
         self.close_deadline = None;
         self.ack_due = 0;
-        self.ka_deadline = None;
+        self.ka_stop();
         self.ready |= Ready::ERROR | Ready::READABLE | Ready::WRITABLE | Ready::READ_CLOSED;
     }
 
@@ -500,7 +493,7 @@ impl Tcb {
         self.state = TcpState::TimeWait;
         self.close_deadline = Some(now + TIME_WAIT);
         self.rto_deadline = None;
-        self.ka_deadline = None;
+        self.ka_stop();
         self.ready |= Ready::READ_CLOSED;
     }
 
@@ -754,7 +747,7 @@ impl Tcb {
             "a gated flow has answered or is due to answer"
         );
         assert!(!self.half_open || self.state == TcpState::SynReceived);
-        assert!(self.keepalive.is_some() || self.ka_deadline.is_none());
+        assert!(self.ka.is_some() || self.ka_deadline().is_none());
         assert!(self.pmtu >= 68);
         if self.state == TcpState::SynSent {
             return;

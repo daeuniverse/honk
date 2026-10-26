@@ -5,7 +5,7 @@ use std::time::Instant;
 use super::cc::Cc;
 use super::ring::Pool;
 use super::{Tcb, TcpState};
-use crate::accept::{AcceptOpts, AcceptWhen, MAX_DEFERRED};
+use crate::accept::{AcceptOpts, AcceptWhen, Keepalive, MAX_DEFERRED};
 use crate::flow::FourTuple;
 use crate::wire::tcp::Header;
 use crate::{Config, StreamError};
@@ -83,7 +83,14 @@ impl Tcb {
             self.cc = Cc::new(self.send_mss());
             self.rcv_mss = self.send_mss().min(536) as usize;
         }
-        self.keepalive = opts.keepalive;
+        self.ka = opts.keepalive.map(|cfg| {
+            Box::new(Ka {
+                cfg,
+                rx: now,
+                probes: 0,
+                deadline: None,
+            })
+        });
         self.init_window(pool);
         match opts.when {
             AcceptWhen::Now => self.open_gate(),
@@ -103,38 +110,65 @@ impl Tcb {
         self.close_deadline = None;
     }
 
+    /// A segment from the peer was accepted: the idle period starts over.
+    pub(super) fn ka_activity(&mut self, now: Instant) {
+        if let Some(ka) = self.ka.as_mut() {
+            ka.rx = now;
+            ka.probes = 0;
+        }
+    }
+
     pub fn arm_keepalive(&mut self, now: Instant) {
-        self.ka_deadline = self.keepalive.map(|k| now + k.idle);
+        if let Some(ka) = self.ka.as_mut() {
+            ka.deadline = Some(now + ka.cfg.idle);
+        }
     }
 
     /// Probes an idle peer with an empty segment at `snd_una - 1` and fails the flow when
-    /// `probes` of them in a row go unanswered. Activity only moves `ka_rx`; an early wakeup
+    /// `probes` of them in a row go unanswered. Activity only moves `ka.rx`; an early wakeup
     /// finds the flow busy and re-arms, so the hot path never touches the timer.
     pub(super) fn keepalive_timer(&mut self, now: Instant) {
-        if self.ka_deadline.is_none_or(|t| t > now) {
+        let Some(ka) = self.ka.as_mut() else { return };
+        if ka.deadline.is_none_or(|t| t > now) {
             return;
         }
-        let Some(k) = self.keepalive else {
-            self.ka_deadline = None;
-            return;
-        };
         if matches!(
             self.state,
             TcpState::SynSent | TcpState::SynReceived | TcpState::TimeWait | TcpState::Closed
         ) {
-            self.ka_deadline = None;
+            ka.deadline = None;
             return;
         }
         // With probes outstanding the deadline is ours and any activity would have reset them.
-        let due = self.ka_rx + k.idle;
-        if self.ka_probes == 0 && due > now {
-            self.ka_deadline = Some(due);
-        } else if self.ka_probes >= k.probes.max(1) {
+        let due = ka.rx + ka.cfg.idle;
+        if ka.probes == 0 && due > now {
+            ka.deadline = Some(due);
+        } else if ka.probes >= ka.cfg.probes.max(1) {
             self.fail(StreamError::TimedOut);
         } else {
-            self.ka_probes += 1;
+            ka.probes += 1;
+            ka.deadline = Some(now + ka.cfg.interval);
             self.probe_due = true;
-            self.ka_deadline = Some(now + k.interval);
         }
     }
+
+    pub(super) fn ka_deadline(&self) -> Option<Instant> {
+        self.ka.as_ref().and_then(|ka| ka.deadline)
+    }
+
+    /// Failure and teardown end keepalive probing.
+    pub(super) fn ka_stop(&mut self) {
+        if let Some(ka) = self.ka.as_mut() {
+            ka.deadline = None;
+        }
+    }
+}
+
+/// Keepalive configuration and progress of one flow.
+pub struct Ka {
+    cfg: Keepalive,
+    /// Last accepted segment from the peer.
+    rx: Instant,
+    probes: u8,
+    pub(super) deadline: Option<Instant>,
 }

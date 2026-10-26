@@ -6,6 +6,7 @@ use super::{IpPacket, ParseError};
 pub const HEADER_LEN: usize = 20;
 const FRAGMENT_BITS: u16 = 0x3FFF;
 const DF: u16 = 0x4000;
+const MF: u16 = 0x2000;
 
 pub fn parse(pkt: &[u8]) -> Result<IpPacket, ParseError> {
     if pkt.len() < HEADER_LEN || pkt[0] >> 4 != 4 {
@@ -38,13 +39,40 @@ pub fn emit(
     proto: u8,
     payload_len: usize,
 ) -> Option<usize> {
+    emit_raw(buf, src, dst, proto, payload_len, 0, DF)
+}
+
+/// Like [`emit`] without DF, for datagrams the sender may fragment: `offset` is in bytes (a
+/// multiple of 8) and `more` sets MF. `id` must be unique per (src, dst, proto) while in flight.
+pub(crate) fn emit_fragment(
+    buf: &mut [u8],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    proto: u8,
+    payload_len: usize,
+    (id, offset, more): (u16, usize, bool),
+) -> Option<usize> {
+    let field =
+        u16::try_from(offset / 8).ok().filter(|f| *f <= 0x1FFF)? | if more { MF } else { 0 };
+    emit_raw(buf, src, dst, proto, payload_len, id, field)
+}
+
+fn emit_raw(
+    buf: &mut [u8],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    proto: u8,
+    payload_len: usize,
+    id: u16,
+    frag_field: u16,
+) -> Option<usize> {
     let total = u16::try_from(HEADER_LEN.checked_add(payload_len)?).ok()?;
     let h = buf.get_mut(..HEADER_LEN)?;
     h[0] = 0x45;
     h[1] = 0;
     h[2..4].copy_from_slice(&total.to_be_bytes());
-    h[4..6].copy_from_slice(&[0, 0]);
-    h[6..8].copy_from_slice(&DF.to_be_bytes());
+    h[4..6].copy_from_slice(&id.to_be_bytes());
+    h[6..8].copy_from_slice(&frag_field.to_be_bytes());
     h[8] = 64;
     h[9] = proto;
     h[10..12].copy_from_slice(&[0, 0]);

@@ -43,10 +43,21 @@ pub fn emit_packet(
     payload: &[u8],
 ) -> Option<usize> {
     let len = HEADER_LEN.checked_add(payload.len())?;
-    let wire_len = u16::try_from(len).ok()?;
     let iplen = emit_ip_header(out, src.ip(), dst.ip(), PROTO_UDP, len)?;
-    let total = iplen + len;
-    let dgram = out.get_mut(iplen..total)?;
+    emit_datagram(out.get_mut(iplen..)?, src, dst, payload)?;
+    Some(iplen + len)
+}
+
+/// Writes the UDP header, payload and checksum (no IP header); returns the datagram length.
+pub(crate) fn emit_datagram(
+    out: &mut [u8],
+    src: SocketAddr,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> Option<usize> {
+    let len = HEADER_LEN.checked_add(payload.len())?;
+    let wire_len = u16::try_from(len).ok()?;
+    let dgram = out.get_mut(..len)?;
     dgram[..2].copy_from_slice(&src.port().to_be_bytes());
     dgram[2..4].copy_from_slice(&dst.port().to_be_bytes());
     dgram[4..6].copy_from_slice(&wire_len.to_be_bytes());
@@ -60,7 +71,7 @@ pub fn emit_packet(
         sum => sum,
     };
     header[6..8].copy_from_slice(&sum.to_be_bytes());
-    Some(total)
+    Some(len)
 }
 
 #[cfg(test)]

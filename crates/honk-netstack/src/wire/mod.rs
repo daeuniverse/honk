@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::ops::Range;
 
 pub mod checksum;
+pub(crate) mod frag;
 pub mod icmp;
 pub mod ipv4;
 pub mod ipv6;

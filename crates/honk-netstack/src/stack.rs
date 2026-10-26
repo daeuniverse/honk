@@ -8,6 +8,8 @@ use std::time::Instant;
 
 use crate::MemoryBudget;
 use crate::accept::Refuse;
+use crate::fragment::{FragmentLimits, Push};
+use crate::icmp_out::IcmpLimits;
 use crate::mode::{Mode, is_unicast};
 use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::tcp::output::Output;
@@ -37,6 +39,10 @@ pub struct Config {
     /// Process-wide limit on top of `memory_limit`: floors and shared commitments are charged to
     /// both. Stacks sharing one budget cannot exceed it together; a dropped stack returns its share.
     pub shared_budget: Option<Arc<MemoryBudget>>,
+    /// Transparent mode: ICMP error generation limits.
+    pub icmp_limits: IcmpLimits,
+    /// Transparent mode: IP fragment reassembly limits.
+    pub fragment_limits: FragmentLimits,
 }
 
 impl Config {
@@ -51,6 +57,8 @@ impl Config {
             tcp_rcv_buf_max: 8 * 1024 * 1024,
             tcp_snd_buf_max: 6 * 1024 * 1024,
             shared_budget: None,
+            icmp_limits: IcmpLimits::default(),
+            fragment_limits: FragmentLimits::default(),
             mode: Mode::Endpoint,
             half_open_max: 1024,
             half_open_per_source: 128,
@@ -100,14 +108,13 @@ pub enum Rx {
         src: SocketAddr,
         payload: Range<usize>,
     },
-    /// Transparent mode: a datagram to any destination; there is no flow and no bind.
-    /// `payload` indexes the input packet, which the caller must copy before recycling it.
+    /// Transparent-mode UDP: stateless, no flow; `payload` indexes the input packet.
     Transparent {
         src: SocketAddr,
         dst: SocketAddr,
         payload: Range<usize>,
     },
-    /// Transparent mode: a datagram reassembled from fragments; `payload` indexes `packet`.
+    /// A transparent datagram that was reassembled from fragments; `payload` indexes `packet`.
     TransparentOwned {
         src: SocketAddr,
         dst: SocketAddr,
@@ -189,7 +196,7 @@ pub enum UdpError {
     Stale,
     #[error("datagram exceeds the path MTU")]
     TooLarge,
-    #[error("fragment queue is full")]
+    #[error("pending fragment queue is full")]
     Busy,
     #[error("source and destination address families differ")]
     FamilyMismatch,
@@ -244,9 +251,11 @@ pub struct Stack {
     /// Passive flows whose SYN `poll_accept` has not yet reported.
     pub(crate) accept_q: VecDeque<FlowId>,
     pub(crate) half_open: u32,
-    pub(crate) icmp_out: crate::icmp_out::IcmpOut,
     pub(crate) half_open_by_source: HashMap<IpAddr, u32>,
+    pub(crate) udp_tx: crate::udp_t::UdpTx,
+    pub(crate) icmp_out: crate::icmp_out::IcmpOut,
     pub(crate) counters: StackStats,
+    pub(crate) reasm: crate::fragment::Reassembler,
 }
 
 impl Stack {
@@ -265,6 +274,9 @@ impl Stack {
             .with_budget(cfg.shared_budget.clone());
         let ports = Ports::new(&cfg.secret);
         Stack {
+            udp_tx: crate::udp_t::UdpTx::new(&cfg.secret),
+            icmp_out: crate::icmp_out::IcmpOut::new(cfg.icmp_limits),
+            reasm: crate::fragment::Reassembler::new(cfg.fragment_limits),
             cfg,
             now,
             epoch: now,
@@ -285,7 +297,6 @@ impl Stack {
             cache: None,
             accept_q: VecDeque::new(),
             half_open: 0,
-            icmp_out: Default::default(),
             half_open_by_source: HashMap::new(),
             counters: StackStats::default(),
         }
@@ -300,6 +311,17 @@ impl Stack {
     fn receive_packet(&mut self, now: Instant, packet: &[u8]) -> Rx {
         let ip = match wire::parse_ip(packet) {
             Ok(ip) => ip,
+            Err(ParseError::Fragment) if self.transparent() => {
+                return match self.reasm.push(now, packet) {
+                    Push::Pending => Rx::Consumed,
+                    Push::Dropped(reason) => self.drop_packet(reason),
+                    // The whole datagram goes through the normal checks, destination included.
+                    Push::Complete(r) => {
+                        let rx = self.receive_packet(now, &r.packet);
+                        r.wrap(rx)
+                    }
+                };
+            }
             Err(e) => return self.drop_packet(e.into()),
         };
         if let Some(reason) = self.refuses(ip.dst) {
@@ -307,7 +329,9 @@ impl Stack {
         }
         match ip.proto {
             wire::PROTO_TCP => self.receive_tcp(now, &ip, packet),
-            wire::PROTO_UDP if self.transparent() => self.drop_packet(DropReason::Unsupported),
+            wire::PROTO_UDP if self.transparent() => {
+                crate::udp_t::receive_transparent(self, &ip, packet, true)
+            }
             wire::PROTO_UDP => self.receive_udp(&ip, packet),
             wire::PROTO_ICMP | wire::PROTO_ICMPV6 => self.receive_icmp(now, &ip, packet),
             _ => self.drop_packet(DropReason::Unsupported),
@@ -406,17 +430,22 @@ impl Stack {
 
     pub fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
         self.now = now;
-        for step in 0..3 {
-            let class = (self.class + step) % 3;
+        for step in 0..5 {
+            let class = (self.class + step) % 5;
             let result = match class {
                 0 => self.emit_control(now, out),
                 1 => self.emit_timewait(now, out),
-                _ => self.emit_flow(now, out),
+                2 => self.emit_flow(now, out),
+                3 => self.poll_udp_frag(out),
+                _ => self.reasm.poll_icmp(now, &mut self.icmp_out, out),
             };
             match result {
                 Output::Sent(n) => {
-                    self.class = (class + 1) % 3;
-                    self.counters.tx_packets += 1;
+                    self.class = (class + 1) % 5;
+                    if class != 3 {
+                        // `poll_udp_frag` counts its own packets.
+                        self.counters.tx_packets += 1;
+                    }
                     return Some(n);
                 }
                 Output::Blocked => return None,
@@ -552,11 +581,15 @@ impl Stack {
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.timers.next()
+        [self.timers.next(), self.reasm.poll_timeout()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
         self.now = now;
+        self.reasm.expire(now);
         while let Some((deadline, index, generation)) = self.timers.pop_due(now) {
             let slot = &mut self.table.slots[index as usize];
             if slot.generation != generation || slot.scheduled != Some(deadline) {
@@ -915,6 +948,8 @@ impl Stack {
             "the timer heap outgrew its rebuild bound"
         );
         assert!(self.controls.len() <= CONTROL_LIMIT);
+        self.reasm.check();
+        self.udp_tx.check();
         assert!(self.stats().memory_committed <= self.cfg.memory_limit);
     }
 
@@ -1048,7 +1083,8 @@ mod tests {
         assert_eq!(stack.tcp_write(first, b"stale"), Err(StreamError::Stale));
         assert!(
             std::mem::size_of::<Tcb>() <= 1024,
-            "idle state excludes rings' separately allocated storage"
+            "idle state excludes rings' separately allocated storage ({} bytes)",
+            std::mem::size_of::<Tcb>()
         );
     }
 
