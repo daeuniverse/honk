@@ -145,7 +145,7 @@ mod tests {
             c.add(&data);
             assert_eq!(!c.fold(), c.finish());
             // Seeding a sum with `fold` and adding the rest equals summing everything.
-            let (a, b) = data.split_at(len / 2 & !1);
+            let (a, b) = data.split_at((len / 2) & !1);
             let mut seed = Checksum::new();
             seed.add(a);
             let mut rest = Checksum::new();
