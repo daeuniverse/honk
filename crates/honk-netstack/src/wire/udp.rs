@@ -74,6 +74,26 @@ pub(crate) fn emit_datagram(
     Some(len)
 }
 
+/// Like [`emit_datagram`] for a USO packet: the payload is copied without being summed and the
+/// checksum field holds the uncomplemented pseudo-header sum over the whole UDP length
+/// (`CHECKSUM_PARTIAL`, field at UDP offset 6).
+pub(crate) fn emit_datagram_partial(
+    out: &mut [u8],
+    src: SocketAddr,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> Option<usize> {
+    let len = HEADER_LEN.checked_add(payload.len())?;
+    let wire_len = u16::try_from(len).ok()?;
+    let dgram = out.get_mut(..len)?;
+    dgram[..2].copy_from_slice(&src.port().to_be_bytes());
+    dgram[2..4].copy_from_slice(&dst.port().to_be_bytes());
+    dgram[4..6].copy_from_slice(&wire_len.to_be_bytes());
+    let seed = Checksum::pseudo(src.ip(), dst.ip(), PROTO_UDP, len).fold();
+    dgram[6..8].copy_from_slice(&seed.to_be_bytes());
+    dgram[HEADER_LEN..].copy_from_slice(payload);
+    Some(len)
+}
 #[cfg(test)]
 mod tests {
     use super::super::testutil::*;

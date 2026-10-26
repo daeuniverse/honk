@@ -18,6 +18,7 @@ impl Tcb {
         now: Instant,
         h: &Header,
         data: &[u8],
+        gso: u16,
         pool: &mut Pool,
     ) -> Option<(u32, u32, u8)> {
         if self.state == TcpState::Closed {
@@ -62,7 +63,7 @@ impl Tcb {
                 let mut established = *h;
                 established.seq = established.seq.wrapping_add(1);
                 established.flags &= !SYN;
-                self.receive_data(now, &established, data, pool);
+                self.receive_data(now, &established, data, gso, pool);
             }
             self.rearm(now);
             return None;
@@ -163,7 +164,7 @@ impl Tcb {
                     self.abort();
                     return None;
                 }
-                self.receive_data(now, h, data, pool);
+                self.receive_data(now, h, data, gso, pool);
             } else {
                 self.ack_due |= FIN_ACK;
             }
@@ -248,7 +249,7 @@ impl Tcb {
                 let mut h = *h;
                 h.seq = h.seq.wrapping_add(1);
                 h.flags &= !SYN;
-                self.receive_data(now, &h, data, pool);
+                self.receive_data(now, &h, data, 0, pool);
             }
         } else {
             self.state = TcpState::SynReceived;
@@ -499,7 +500,10 @@ impl Tcb {
         }
     }
 
-    fn receive_data(&mut self, now: Instant, h: &Header, data: &[u8], pool: &mut Pool) {
+    /// `gso` is the segment size of a received super-packet (`0`: an ordinary segment). The data
+    /// is ingested as one contiguous segment either way; the size only tells the delayed-ACK
+    /// cadence how many full frames it stands for.
+    fn receive_data(&mut self, now: Instant, h: &Header, data: &[u8], gso: u16, pool: &mut Pool) {
         if now.saturating_duration_since(self.last_rx) > self.rtt.rto() {
             self.quickack = 16;
             self.rcv_mss = self.send_mss().min(536) as usize;
@@ -545,11 +549,17 @@ impl Tcb {
                 self.ready |= Ready::READABLE;
                 // Variable SACK option bytes must not stretch ACKs for full frames.
                 let options = crate::wire::tcp::header_len(&h.options, false) - 20;
-                let size =
-                    bytes.len() + options.saturating_sub(if self.timestamps { 12 } else { 0 });
+                // A super-packet stands for `frames` full frames of `gso` bytes (the kernel's
+                // `tcp_measure_rcv_mss` also reads `gso_size`); nothing else in the stack sees them.
+                let (frame, frames) = match usize::from(gso) {
+                    g if g != 0 && bytes.len() > g => (g, bytes.len().div_ceil(g)),
+                    _ => (bytes.len(), 1),
+                };
+                let frames = u8::try_from(frames).unwrap_or(u8::MAX);
+                let size = frame + options.saturating_sub(if self.timestamps { 12 } else { 0 });
                 if size >= self.rcv_mss {
                     self.rcv_mss = size;
-                } else if size >= 48 && size == self.rcv_last_size {
+                } else if size >= 48 && (size == self.rcv_last_size || frames >= 2) {
                     // Two equal frames detect smaller paths without mistaking tiny app writes for MSS.
                     self.rcv_mss = size;
                     if self.rcv_nxt.wrapping_sub(self.last_ack_sent) as usize >= 2 * size {
@@ -558,10 +568,10 @@ impl Tcb {
                 }
                 self.rcv_last_size = size;
                 if size >= self.rcv_mss {
-                    self.full_segments = self.full_segments.saturating_add(1);
+                    self.full_segments = self.full_segments.saturating_add(frames);
                 }
                 if self.quickack != 0 {
-                    self.quickack -= 1;
+                    self.quickack = self.quickack.saturating_sub(frames);
                     self.ack_due |= DATA;
                 }
                 if self.full_segments >= 2 || had_ooo {

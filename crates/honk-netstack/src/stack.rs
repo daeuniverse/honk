@@ -12,6 +12,7 @@ use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::fragment::{FragmentLimits, Push};
 use crate::icmp_out::IcmpLimits;
 use crate::mode::{Mode, is_unicast};
+use crate::offload::{RxMeta, Transmit, TxCaps};
 use crate::tcp::output::Output;
 use crate::tcp::ring::{self, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
@@ -133,6 +134,16 @@ pub enum Rx {
         packet: Vec<u8>,
         payload: Range<usize>,
     },
+    /// A transparent USO super-packet ([`Stack::receive_with`]): `payload` indexes the input
+    /// packet and holds consecutive datagrams of `size` bytes each, the last possibly shorter;
+    /// every `size`-byte chunk is one datagram (boundaries preserved, at most 128 of them). Like
+    /// [`Rx::Transparent`] it borrows the input packet.
+    TransparentSplit {
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Range<usize>,
+        size: u16,
+    },
     Dropped(DropReason),
 }
 
@@ -212,6 +223,8 @@ pub enum UdpError {
     Busy,
     #[error("source and destination address families differ")]
     FamilyMismatch,
+    #[error("UDP segmentation offload is not available")]
+    Offload,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -316,22 +329,49 @@ impl Stack {
         }
     }
 
+    /// Receives one IP packet whose checksum the stack verifies. Same as
+    /// [`Stack::receive_with`] with [`RxMeta::VERIFY`].
     pub fn receive(&mut self, now: Instant, packet: &[u8]) -> Rx {
         self.now = now;
         self.counters.rx_packets += 1;
-        self.receive_packet(now, packet)
+        self.receive_packet(now, packet, RxMeta::VERIFY)
     }
 
-    fn receive_packet(&mut self, now: Instant, packet: &[u8]) -> Rx {
+    /// Receives one IP packet with what the driver knows about it: a trusted L4 checksum
+    /// ([`Csum::Valid`], [`Csum::Partial`]) and/or a GRO or USO super-packet. Offload metadata is
+    /// accepted only in [`Mode::Transparent`]; an endpoint stack drops any packet that carries it
+    /// as [`DropReason::Unsupported`], so a WireGuard driver can never skip verification. A claim
+    /// the packet contradicts (a `Partial` that does not point at the L4 checksum field, a segment
+    /// size of 0, a TCP size on a UDP packet, super-packet metadata on a fragment or ICMP) is
+    /// [`DropReason::Malformed`]. The IP header checksum and every ICMP checksum are always
+    /// verified, and so is a datagram reassembled from fragments.
+    ///
+    /// A TCP super-packet enters the receive ring as one contiguous segment; only the delayed-ACK
+    /// cadence counts `ceil(len / size)` full frames (see `Tcb::receive_data`). A UDP super-packet
+    /// surfaces as one [`Rx::TransparentSplit`].
+    pub fn receive_with(&mut self, now: Instant, packet: &[u8], meta: RxMeta) -> Rx {
+        self.now = now;
+        self.counters.rx_packets += 1;
+        if meta != RxMeta::VERIFY && !self.transparent() {
+            return self.drop_packet(DropReason::Unsupported);
+        }
+        self.receive_packet(now, packet, meta)
+    }
+
+    fn receive_packet(&mut self, now: Instant, packet: &[u8], meta: RxMeta) -> Rx {
         let ip = match wire::parse_ip(packet) {
             Ok(ip) => ip,
             Err(ParseError::Fragment) if self.transparent() => {
+                if meta.gso.is_some() {
+                    return self.drop_packet(DropReason::Malformed);
+                }
                 return match self.reasm.push(now, packet) {
                     Push::Pending => Rx::Consumed,
                     Push::Dropped(reason) => self.drop_packet(reason),
-                    // The whole datagram goes through the normal checks, destination included.
+                    // The whole datagram goes through the normal checks, destination included,
+                    // and its checksum is verified: no fragment's metadata vouches for the rest.
                     Push::Complete(r) => {
-                        let rx = self.receive_packet(now, &r.packet);
+                        let rx = self.receive_packet(now, &r.packet, RxMeta::VERIFY);
                         r.wrap(rx)
                     }
                 };
@@ -342,23 +382,36 @@ impl Stack {
             return self.drop_packet(reason);
         }
         match ip.proto {
-            wire::PROTO_TCP => self.receive_tcp(now, &ip, packet),
+            wire::PROTO_TCP => self.receive_tcp(now, &ip, packet, meta),
             wire::PROTO_UDP if self.transparent() => {
-                crate::udp_t::receive_transparent(self, &ip, packet, true)
+                crate::udp_t::receive_transparent(self, &ip, packet, meta)
             }
             wire::PROTO_UDP => self.receive_udp(&ip, packet),
+            wire::PROTO_ICMP | wire::PROTO_ICMPV6 if meta.gso.is_some() => {
+                self.drop_packet(DropReason::Malformed)
+            }
             wire::PROTO_ICMP | wire::PROTO_ICMPV6 => self.receive_icmp(now, &ip, packet),
             _ => self.drop_packet(DropReason::Unsupported),
         }
     }
 
-    fn receive_tcp(&mut self, now: Instant, ip: &wire::IpPacket, packet: &[u8]) -> Rx {
+    fn receive_tcp(
+        &mut self,
+        now: Instant,
+        ip: &wire::IpPacket,
+        packet: &[u8],
+        meta: RxMeta,
+    ) -> Rx {
         let seg = &packet[ip.payload.clone()];
         let (h, off) = match wire::tcp::parse(seg) {
             Ok(v) => v,
             Err(e) => return self.drop_packet(e.into()),
         };
-        if !wire::tcp::verify_checksum(ip.src, ip.dst, seg) {
+        let (verify, gso) = match meta.l4(wire::PROTO_TCP, ip.payload.start, 16) {
+            Ok(v) => v,
+            Err(reason) => return self.drop_packet(reason),
+        };
+        if verify && !wire::tcp::verify_checksum(ip.src, ip.dst, seg) {
             return self.drop_packet(DropReason::Checksum);
         }
         let tuple = FourTuple {
@@ -385,7 +438,7 @@ impl Stack {
                 },
             ));
             if let Some(Flow::Tcp(t)) = slot.flow.as_mut()
-                && let Some((seq, ack, flags)) = t.input(now, &h, &seg[off..], &mut self.pool)
+                && let Some((seq, ack, flags)) = t.input(now, &h, &seg[off..], gso, &mut self.pool)
             {
                 self.control(tuple, seq, ack, flags);
             }
@@ -443,13 +496,40 @@ impl Stack {
     }
 
     pub fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
+        self.poll_transmit_with(now, out, TxCaps::NONE)
+            .map(|t| t.len)
+    }
+
+    /// [`Stack::poll_transmit`] for a driver that can take segmentation offload. With `caps.tso4`
+    /// / `tso6` a TCP flow may emit one packet of up to 64 KiB of payload: one header, several
+    /// MSS-sized segments ([`Transmit::gso`]), the checksum field holding only the pseudo-header
+    /// sum ([`TxCsum::Partial`]). Packets of every other class, and every packet from an
+    /// endpoint-mode stack (which ignores `caps`), are ordinary, complete ones.
+    ///
+    /// How much a packet carries follows the congestion and receive windows, the pacer (a burst is
+    /// at most two milliseconds of traffic) and about a millisecond of the pacing rate, as TSO
+    /// autosizing; the output buffer bounds it too, so any buffer that holds one MTU-sized packet
+    /// works. Every segment keeps its own send descriptor, and a run of lost segments is
+    /// retransmitted in one TSO packet too.
+    pub fn poll_transmit_with(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        caps: TxCaps,
+    ) -> Option<Transmit> {
         self.now = now;
+        let caps = if self.transparent() {
+            caps
+        } else {
+            TxCaps::NONE
+        };
+        let mut tx = Transmit::plain(0);
         for step in 0..5 {
             let class = (self.class + step) % 5;
             let result = match class {
                 0 => self.emit_control(now, out),
                 1 => self.emit_timewait(now, out),
-                2 => self.emit_flow(now, out),
+                2 => self.emit_flow(now, out, caps, &mut tx),
                 3 => self.poll_udp_frag(out),
                 _ => self.reasm.poll_icmp(now, &mut self.icmp_out, out),
             };
@@ -460,7 +540,8 @@ impl Stack {
                         // `poll_udp_frag` counts its own packets.
                         self.counters.tx_packets += 1;
                     }
-                    return Some(n);
+                    tx.len = n;
+                    return Some(tx);
                 }
                 Output::Blocked => return None,
                 Output::None => {}
@@ -554,7 +635,13 @@ impl Stack {
         Output::None
     }
 
-    fn emit_flow(&mut self, now: Instant, out: &mut [u8]) -> Output {
+    fn emit_flow(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        caps: TxCaps,
+        tx: &mut Transmit,
+    ) -> Output {
         while let Some(id) = self.ready.pop_front() {
             let slot = &mut self.table.slots[id.idx as usize];
             if slot.generation != id.generation || !slot.on_tx {
@@ -568,7 +655,12 @@ impl Stack {
             if slot.deficit < quantum {
                 slot.deficit += quantum;
             }
-            let result = t.output(now, out, &mut self.pool);
+            let tso = if caps.tso(t.tuple.local.is_ipv6()) {
+                usize::from(u16::MAX)
+            } else {
+                0
+            };
+            let result = t.output_with(now, out, &mut self.pool, tso, tx);
             match result {
                 Output::Sent(n) => {
                     slot.deficit = slot.deficit.saturating_sub(n);

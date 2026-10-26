@@ -87,6 +87,12 @@ impl Checksum {
 
     /// Folded and complemented; a packet that carries its own checksum finishes as 0.
     pub fn finish(self) -> u16 {
+        !self.fold()
+    }
+
+    /// Folded, not complemented: the seed a `CHECKSUM_PARTIAL` packet carries in its checksum
+    /// field (the consumer sums the rest into it and complements).
+    pub fn fold(self) -> u16 {
         let mut c = self;
         if let Some(hi) = c.odd.take() {
             c.accumulate(u64::from(hi) << 8);
@@ -95,7 +101,7 @@ impl Checksum {
         while a >> 16 != 0 {
             a = (a & 0xFFFF) + (a >> 16);
         }
-        !(a as u16)
+        a as u16
     }
 
     /// Callers must pass addresses of one family; a mismatch is a bug, not input.

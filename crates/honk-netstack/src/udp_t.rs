@@ -13,6 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use crate::icmp_out::Reject;
+use crate::offload::{GsoKind, GsoTx, MAX_USO_RX, MAX_USO_TX, RxMeta, Transmit, TxCaps, TxCsum};
 use crate::tcp::output::Output;
 use crate::wire::{self, IpPacket, ipv4, ipv6};
 use crate::{DropReason, Rx, Stack, UdpError};
@@ -190,6 +191,61 @@ impl UdpTx {
         Ok(packet)
     }
 
+    /// One USO packet: a single IP header and UDP header over `payload` cut into `size`-byte
+    /// datagrams by the driver. The checksum field holds the pseudo-header sum
+    /// (`CHECKSUM_PARTIAL`). Errors consume nothing.
+    fn send_gso(
+        &mut self,
+        mtu: usize,
+        (src, dst): (SocketAddr, SocketAddr),
+        payload: &[u8],
+        size: usize,
+        out: &mut [u8],
+    ) -> Result<Transmit, UdpError> {
+        let v6 = dst.is_ipv6();
+        let ip_len = wire::ip_header_len(v6);
+        let udp_len = UDP_HEADER + payload.len();
+        // Every segment is a whole datagram on the wire and must fit the MTU by itself.
+        if payload.len().div_ceil(size) > MAX_USO_TX
+            || ip_len + UDP_HEADER + size > mtu
+            || udp_len > usize::from(u16::MAX)
+            || (!v6 && ip_len + udp_len > usize::from(u16::MAX))
+        {
+            return Err(UdpError::TooLarge);
+        }
+        let packet = ip_len + udp_len;
+        if out.len() < packet {
+            return Err(UdpError::BufferTooSmall);
+        }
+        match (src.ip(), dst.ip()) {
+            (IpAddr::V4(s), IpAddr::V4(d)) => ipv4::emit_fragment(
+                out,
+                s,
+                d,
+                wire::PROTO_UDP,
+                udp_len,
+                (self.ident as u16, 0, false),
+            ),
+            _ => wire::emit_ip_header(out, src.ip(), dst.ip(), wire::PROTO_UDP, udp_len),
+        }
+        .ok_or(UdpError::BufferTooSmall)?;
+        wire::udp::emit_datagram_partial(&mut out[ip_len..], src, dst, payload)
+            .ok_or(UdpError::TooLarge)?;
+        self.ident = self.ident.wrapping_add(1);
+        Ok(Transmit {
+            len: packet,
+            gso: Some(GsoTx {
+                kind: GsoKind::UdpL4,
+                size: size as u16,
+                hdr_len: (ip_len + UDP_HEADER) as u16,
+            }),
+            csum: TxCsum::Partial {
+                start: ip_len as u16,
+                offset: 6,
+            },
+        })
+    }
+
     /// Next queued fragment. `Blocked` keeps it queued for a larger buffer.
     pub(crate) fn poll(&mut self, out: &mut [u8]) -> Output {
         let Some(p) = self.queue.front_mut() else {
@@ -236,6 +292,44 @@ impl Stack {
         Ok(n)
     }
 
+    /// [`Stack::udp_send_from`] for a driver with UDP segmentation offload (`caps.uso4` / `uso6`,
+    /// transparent mode): `payload` is the concatenation of datagrams of `size` bytes, the last
+    /// possibly shorter, sent as one packet that the driver cuts back into those datagrams
+    /// ([`Transmit::gso`], [`TxCsum::Partial`]); boundaries are preserved. At most 64 datagrams,
+    /// each fitting the MTU together with its headers, else [`UdpError::TooLarge`]. A payload of
+    /// at most one datagram is an ordinary send (fragmenting if over the MTU, like
+    /// `udp_send_from`). Without the capability, [`UdpError::Offload`]; nothing is consumed on
+    /// error.
+    pub fn udp_send_gso_from(
+        &mut self,
+        (src, dst): (SocketAddr, SocketAddr),
+        payload: &[u8],
+        size: u16,
+        caps: TxCaps,
+        out: &mut [u8],
+    ) -> Result<Transmit, UdpError> {
+        let size = usize::from(size);
+        if size == 0 {
+            return Err(UdpError::TooLarge);
+        }
+        if payload.len() <= size {
+            return self
+                .udp_send_from(src, dst, payload, out)
+                .map(Transmit::plain);
+        }
+        if src.is_ipv4() != dst.is_ipv4() {
+            return Err(UdpError::FamilyMismatch);
+        }
+        if !self.transparent() || !caps.uso(dst.is_ipv6()) {
+            return Err(UdpError::Offload);
+        }
+        let tx = self
+            .udp_tx
+            .send_gso(usize::from(self.cfg.mtu), (src, dst), payload, size, out)?;
+        self.counters.tx_packets += 1;
+        Ok(tx)
+    }
+
     /// Answers a refused transparent datagram with the matching ICMP error, written to `out`.
     /// `original` is the datagram's IP packet (headers plus at least eight bytes). `Ok(None)`:
     /// suppressed or rate limited (see `icmp_out`); `Err(BufferTooSmall)` consumes nothing.
@@ -264,26 +358,40 @@ impl Stack {
     }
 }
 
-/// Receives one UDP datagram for any destination. `verify_csum` is false only when the driver
-/// vouches for the checksum (`Csum::Valid`/`Partial`, transparent mode only).
+/// Receives one UDP datagram for any destination. `meta` is the driver's (transparent mode only,
+/// see `Stack::receive_with`): a trusted checksum skips verification, a USO super-packet becomes
+/// [`Rx::TransparentSplit`].
 pub(crate) fn receive_transparent(
     stack: &mut Stack,
     ip: &IpPacket,
     packet: &[u8],
-    verify_csum: bool,
+    meta: RxMeta,
 ) -> Rx {
     let dgram = &packet[ip.payload.clone()];
     let (src, dst, payload) = match wire::udp::parse(dgram) {
         Ok(v) => v,
         Err(e) => return stack.drop_packet(e.into()),
     };
-    if verify_csum && !wire::udp::verify_checksum(ip.src, ip.dst, dgram) {
+    let (verify, size) = match meta.l4(wire::PROTO_UDP, ip.payload.start, 6) {
+        Ok(v) => v,
+        Err(reason) => return stack.drop_packet(reason),
+    };
+    if verify && !wire::udp::verify_checksum(ip.src, ip.dst, dgram) {
         return stack.drop_packet(DropReason::Checksum);
     }
-    Rx::Transparent {
-        src: SocketAddr::new(ip.src, src),
-        dst: SocketAddr::new(ip.dst, dst),
-        payload: ip.payload.start + payload.start..ip.payload.start + payload.end,
+    let (src, dst) = (SocketAddr::new(ip.src, src), SocketAddr::new(ip.dst, dst));
+    let payload = ip.payload.start + payload.start..ip.payload.start + payload.end;
+    if size == 0 || payload.len() <= usize::from(size) {
+        return Rx::Transparent { src, dst, payload };
+    }
+    if payload.len().div_ceil(usize::from(size)) > MAX_USO_RX {
+        return stack.drop_packet(DropReason::Malformed);
+    }
+    Rx::TransparentSplit {
+        src,
+        dst,
+        payload,
+        size,
     }
 }
 
@@ -353,7 +461,7 @@ mod tests {
             let mut query = vec![0u8; 200];
             let n = udp::emit_packet(&mut query, client, orig_dst, b"query").unwrap();
             let ip = parse_ip(&query[..n]).unwrap();
-            let rx = receive_transparent(&mut s, &ip, &query[..n], true);
+            let rx = receive_transparent(&mut s, &ip, &query[..n], RxMeta::VERIFY);
             let Rx::Transparent { src, dst, payload } = rx else {
                 panic!("{rx:?}")
             };
@@ -365,7 +473,7 @@ mod tests {
             let n = s.udp_send_from(dst, src, b"answer", &mut out).unwrap();
             let ip = parse_ip(&out[..n]).unwrap();
             assert_eq!((ip.src, ip.dst), (orig_dst.ip(), client.ip()));
-            let rx = receive_transparent(&mut s, &ip, &out[..n], true);
+            let rx = receive_transparent(&mut s, &ip, &out[..n], RxMeta::VERIFY);
             let Rx::Transparent { src, dst, payload } = rx else {
                 panic!("{rx:?}")
             };
@@ -391,18 +499,26 @@ mod tests {
             let ip = parse_ip(&p[..n]).unwrap();
             p[ip.payload.start + 8] ^= 0xFF;
             assert_eq!(
-                receive_transparent(&mut s, &ip, &p[..n], true),
+                receive_transparent(&mut s, &ip, &p[..n], RxMeta::VERIFY),
                 Rx::Dropped(DropReason::Checksum)
             );
             assert!(matches!(
-                receive_transparent(&mut s, &ip, &p[..n], false),
+                receive_transparent(
+                    &mut s,
+                    &ip,
+                    &p[..n],
+                    RxMeta {
+                        csum: crate::Csum::Valid,
+                        gso: None
+                    }
+                ),
                 Rx::Transparent { .. }
             ));
             // A UDP length beyond the IP payload.
             let at = ip.payload.start + 4;
             p[at..at + 2].copy_from_slice(&500u16.to_be_bytes());
             assert_eq!(
-                receive_transparent(&mut s, &ip, &p[..n], true),
+                receive_transparent(&mut s, &ip, &p[..n], RxMeta::VERIFY),
                 Rx::Dropped(DropReason::Malformed)
             );
         }
@@ -469,7 +585,7 @@ mod tests {
                     packets[0].clone()
                 };
                 let ip = parse_ip(&whole).unwrap();
-                let rx = receive_transparent(&mut s, &ip, &whole, true);
+                let rx = receive_transparent(&mut s, &ip, &whole, RxMeta::VERIFY);
                 let Rx::Transparent {
                     src: a,
                     dst: b,

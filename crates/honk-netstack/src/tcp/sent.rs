@@ -470,6 +470,29 @@ impl Sent {
         None
     }
 
+    /// Extends the whole `cap`-byte lost descriptor `i` over its successors that one TSO packet
+    /// can resend with it: each still LOST (neither SACKed nor retransmitted), without FIN, at most
+    /// `cap` bytes, and only the last one shorter. Returns the descriptor count (at most `max`) and
+    /// the end sequence of the run.
+    pub fn lost_run(&self, i: usize, cap: u32, max: usize) -> (usize, u32) {
+        let mut n = 1;
+        let mut end = self.queue[i].end_seq;
+        while n < max
+            && let Some(d) = self.queue.get(i + n)
+        {
+            let len = d.end_seq.wrapping_sub(end);
+            if d.flags & (SACKED | LOST | RETRANS | FIN) != LOST || len == 0 || len > cap {
+                break;
+            }
+            n += 1;
+            end = d.end_seq;
+            if len < cap {
+                break;
+            }
+        }
+        (n, end)
+    }
+
     /// The newest segment that is neither SACKed nor already retransmitted: the probe a tail loss
     /// probe resends.
     pub fn last_unsacked(&self) -> Option<(usize, u32, u32, bool)> {

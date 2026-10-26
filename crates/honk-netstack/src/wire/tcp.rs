@@ -234,6 +234,30 @@ pub(crate) fn emit_packet_parts(
     hdr: &Header,
     payload: &[&[u8]],
 ) -> Option<usize> {
+    emit_parts(out, src, dst, hdr, payload, false)
+}
+
+/// Like [`emit_packet_parts`] for a TSO packet: the payload is copied without being summed, and
+/// the checksum field holds the uncomplemented pseudo-header sum over the whole TCP length
+/// (`CHECKSUM_PARTIAL`, checksum field at `ip header length + 16`).
+pub(crate) fn emit_partial_parts(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
+    hdr: &Header,
+    payload: &[&[u8]],
+) -> Option<usize> {
+    emit_parts(out, src, dst, hdr, payload, true)
+}
+
+fn emit_parts(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
+    hdr: &Header,
+    payload: &[&[u8]],
+    partial: bool,
+) -> Option<usize> {
     let syn = hdr.flags & SYN != 0;
     let hlen = header_len(&hdr.options, syn);
     let seg_len = payload
@@ -258,13 +282,21 @@ pub(crate) fn emit_packet_parts(
 
     let mut ck = Checksum::pseudo(src, dst, PROTO_TCP, seg_len);
     let (head, body) = seg.split_at_mut(hlen);
-    ck.add(head);
     let mut offset = 0;
-    for part in payload {
-        ck.copy_add(&mut body[offset..offset + part.len()], part);
-        offset += part.len();
+    if partial {
+        for part in payload {
+            body[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        head[16..18].copy_from_slice(&ck.fold().to_be_bytes());
+    } else {
+        ck.add(head);
+        for part in payload {
+            ck.copy_add(&mut body[offset..offset + part.len()], part);
+            offset += part.len();
+        }
+        head[16..18].copy_from_slice(&ck.finish().to_be_bytes());
     }
-    head[16..18].copy_from_slice(&ck.finish().to_be_bytes());
     Some(total)
 }
 

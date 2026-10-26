@@ -94,6 +94,7 @@ mod fragment;
 mod icmp;
 mod icmp_out;
 mod mode;
+mod offload;
 mod stack;
 mod tcp;
 mod timer;
@@ -105,6 +106,7 @@ pub use budget::MemoryBudget;
 pub use fragment::FragmentLimits;
 pub use icmp_out::IcmpLimits;
 pub use mode::{ExcludeSet, Mode};
+pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, Transmit, TxCaps, TxCsum};
 pub use stack::{
     BindError, Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StackStats, StreamError,
     UdpError,

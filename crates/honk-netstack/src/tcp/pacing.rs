@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-const BURST_SEGMENTS: u64 = 10;
+pub const BURST_SEGMENTS: u64 = 10;
 const BURST_TIME: Duration = Duration::from_millis(2);
 
 pub struct Pacer {
@@ -30,16 +30,28 @@ impl Pacer {
         Some(bytes_per_s.clamp(1, u128::from(u64::MAX)) as u64)
     }
 
-    fn capacity(rate: u64, mss: u32) -> u64 {
+    fn capacity(rate: u64, mss: u32, burst: u64) -> u64 {
         let by_time = (u128::from(rate) * BURST_TIME.as_nanos() / 1_000_000_000) as u64;
-        (BURST_SEGMENTS * u64::from(mss))
-            .min(by_time)
-            .max(u64::from(mss))
+        (burst * u64::from(mss)).min(by_time).max(u64::from(mss))
     }
 
-    /// `None` if `bytes` may leave now; otherwise when enough tokens will have accumulated.
-    pub fn check(&mut self, now: Instant, bytes: u32, rate: u64, mss: u32) -> Option<Instant> {
-        let capacity = Self::capacity(rate, mss);
+    /// Tokens in the bucket as of the last `check`.
+    pub fn tokens(&self) -> u64 {
+        self.tokens
+    }
+
+    /// `None` if `bytes` may leave now; otherwise when enough tokens will have accumulated. The
+    /// bucket holds `burst` segments (TSO raises it from [`BURST_SEGMENTS`]), never more than 2 ms
+    /// of traffic.
+    pub fn check(
+        &mut self,
+        now: Instant,
+        bytes: u32,
+        rate: u64,
+        mss: u32,
+        burst: u64,
+    ) -> Option<Instant> {
+        let capacity = Self::capacity(rate, mss, burst);
         // A fresh or idle bucket starts full; a shrunk window never holds more than its capacity.
         self.tokens = self.tokens.min(capacity);
         let elapsed = now.saturating_duration_since(self.last).as_nanos();
@@ -83,7 +95,7 @@ mod tests {
         // 100 MB/s: 2 ms = 200 kB, so the 10-segment target applies.
         let mut p = Pacer::new(t);
         let mut sent = 0;
-        while p.check(t, MSS, 100_000_000, MSS).is_none() {
+        while p.check(t, MSS, 100_000_000, MSS, BURST_SEGMENTS).is_none() {
             p.sent(MSS);
             sent += 1;
             assert!(sent < 100);
@@ -92,16 +104,16 @@ mod tests {
         // 2.5 MB/s: 2 ms = 5 kB, the time cap wins.
         let mut p = Pacer::new(t);
         let mut sent = 0;
-        while p.check(t, MSS, 2_500_000, MSS).is_none() {
+        while p.check(t, MSS, 2_500_000, MSS, BURST_SEGMENTS).is_none() {
             p.sent(MSS);
             sent += 1;
         }
         assert_eq!(sent, 5);
         // A very slow rate still admits one segment per full bucket.
         let mut p = Pacer::new(t);
-        assert!(p.check(t, MSS, 1000, MSS).is_none());
+        assert!(p.check(t, MSS, 1000, MSS, BURST_SEGMENTS).is_none());
         p.sent(MSS);
-        assert!(p.check(t, MSS, 1000, MSS).is_some());
+        assert!(p.check(t, MSS, 1000, MSS, BURST_SEGMENTS).is_some());
     }
 
     #[test]
@@ -109,17 +121,17 @@ mod tests {
         let t = Instant::now();
         let mut p = Pacer::new(t);
         let rate = 1_000_000;
-        while p.check(t, MSS, rate, MSS).is_none() {
+        while p.check(t, MSS, rate, MSS, BURST_SEGMENTS).is_none() {
             p.sent(MSS);
         }
-        let at = p.check(t, MSS, rate, MSS).unwrap();
+        let at = p.check(t, MSS, rate, MSS, BURST_SEGMENTS).unwrap();
         assert!(at > t);
         assert!(
-            p.check(at, MSS, rate, MSS).is_none(),
+            p.check(at, MSS, rate, MSS, BURST_SEGMENTS).is_none(),
             "the promised deadline is sufficient"
         );
         p.sent(MSS);
-        let next = p.check(at, MSS, rate, MSS).unwrap();
+        let next = p.check(at, MSS, rate, MSS, BURST_SEGMENTS).unwrap();
         assert_eq!(
             next.duration_since(at),
             Duration::from_millis(1),
@@ -131,12 +143,15 @@ mod tests {
     fn idle_time_refills_only_one_burst() {
         let t = Instant::now();
         let mut p = Pacer::new(t);
-        while p.check(t, MSS, 100_000_000, MSS).is_none() {
+        while p.check(t, MSS, 100_000_000, MSS, BURST_SEGMENTS).is_none() {
             p.sent(MSS);
         }
         let later = t + Duration::from_secs(60);
         let mut n = 0;
-        while p.check(later, MSS, 100_000_000, MSS).is_none() {
+        while p
+            .check(later, MSS, 100_000_000, MSS, BURST_SEGMENTS)
+            .is_none()
+        {
             p.sent(MSS);
             n += 1;
         }
