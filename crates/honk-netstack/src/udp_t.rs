@@ -12,10 +12,23 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
 
+use crate::icmp_out::Reject;
 use crate::tcp::output::Output;
 use crate::wire::{self, IpPacket, ipv4, ipv6};
 use crate::{DropReason, Rx, Stack, UdpError};
+
+/// Why a transparent UDP datagram is refused (ICMP mapping of the design, §3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpRefuse {
+    /// Nothing listens: port unreachable.
+    PortUnreachable,
+    /// No route to the destination: host unreachable.
+    HostUnreachable,
+    /// Policy refusal: administratively prohibited.
+    AdminProhibited,
+}
 
 /// Bytes of datagrams waiting for their later fragments. One datagram is always accepted.
 pub(crate) const MAX_PENDING_BYTES: usize = 512 * 1024;
@@ -102,11 +115,6 @@ impl UdpTx {
         !self.queue.is_empty()
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.queue.clear();
-        self.bytes = 0;
-    }
-
     /// Writes the datagram (or its first fragment) to `out`. Errors consume nothing.
     pub(crate) fn send_from(
         &mut self,
@@ -140,9 +148,6 @@ impl UdpTx {
         let chunk = (mtu.saturating_sub(ip_len + frag_extra)) & !7;
         if chunk == 0 {
             return Err(UdpError::TooLarge);
-        }
-        if out.len() < ip_len + frag_extra + chunk {
-            return Err(UdpError::BufferTooSmall);
         }
         if !self.queue.is_empty() && self.bytes + udp_len > MAX_PENDING_BYTES {
             return Err(UdpError::Busy);
@@ -231,6 +236,24 @@ impl Stack {
             self.tx_wakeup = true;
         }
         Ok(n)
+    }
+
+    /// Answers a refused transparent datagram with the matching ICMP error, written to `out`.
+    /// `original` is the datagram's IP packet (headers plus at least eight bytes). `Ok(None)`:
+    /// suppressed or rate limited (see `icmp_out`); `Err(BufferTooSmall)` consumes nothing.
+    pub fn udp_refuse(
+        &mut self,
+        now: Instant,
+        how: UdpRefuse,
+        original: &[u8],
+        out: &mut [u8],
+    ) -> Result<Option<usize>, UdpError> {
+        let kind = match how {
+            UdpRefuse::PortUnreachable => Reject::Unreachable,
+            UdpRefuse::HostUnreachable => Reject::HostUnreachable,
+            UdpRefuse::AdminProhibited => Reject::AdminProhibited,
+        };
+        self.send_icmp(now, kind, original, out)
     }
 
     /// Pulls the next fragment of an earlier oversized `udp_send_from`.
@@ -560,5 +583,55 @@ mod tests {
         let packets = drain(&mut s, out[..n].to_vec());
         assert_eq!(reassemble(&packets).len(), 20 + 8 + 5000);
         assert!(matches!(s.poll_udp_frag(&mut out), Output::None));
+    }
+    #[test]
+    fn refusals_answer_for_the_original_destination() {
+        let now = Instant::now();
+        for v6 in [false, true] {
+            let (orig_dst, client) = addrs(v6);
+            let mut s = stack(1400);
+            let mut query = vec![0u8; 200];
+            let n = udp::emit_packet(&mut query, client, orig_dst, b"query").unwrap();
+            let query = &query[..n];
+            let mut out = vec![0u8; 1500];
+            let n = s
+                .udp_refuse(now, UdpRefuse::PortUnreachable, query, &mut out)
+                .unwrap()
+                .unwrap();
+            let ip = parse_ip(&out[..n]).unwrap();
+            assert_eq!((ip.src, ip.dst), (orig_dst.ip(), client.ip()));
+            let msg = &out[ip.payload];
+            assert_eq!((msg[0], msg[1]), if v6 { (1, 4) } else { (3, 3) });
+            assert_eq!(&msg[8..], query);
+            assert_eq!(s.stats().tx_packets, 1);
+            // Too small keeps the limiter intact: the same refusal still goes out afterwards.
+            assert_eq!(
+                s.udp_refuse(now, UdpRefuse::HostUnreachable, query, &mut out[..20]),
+                Err(UdpError::BufferTooSmall)
+            );
+            // A multicast destination is never answered.
+            let group = SocketAddr::new(
+                if v6 {
+                    "ff02::fb".parse().unwrap()
+                } else {
+                    v4(224, 0, 0, 251)
+                },
+                5353,
+            );
+            let mut mc = vec![0u8; 200];
+            let n = udp::emit_packet(&mut mc, client, group, b"x").unwrap();
+            assert_eq!(
+                s.udp_refuse(now, UdpRefuse::AdminProhibited, &mc[..n], &mut out),
+                Ok(None)
+            );
+            // Packet Too Big carries the MTU and ignores the limiter.
+            for _ in 0..200 {
+                assert!(
+                    s.packet_too_big(now, 1280, query, &mut out)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 }

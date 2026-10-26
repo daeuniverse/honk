@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, icmp::emit_error, ipv6};
+use crate::{Stack, UdpError};
 
 /// Quote ceiling: the whole error packet stays within the minimum MTU (RFC 1812 / RFC 4443).
 const MAX_ERROR_V4: usize = 576;
@@ -214,6 +215,40 @@ impl IcmpOut {
 }
 
 const MSG: u64 = 1_000_000;
+
+impl Stack {
+    /// Writes the ICMP error `kind` for `original` (the offending IP packet, at least its headers
+    /// plus eight bytes) into `out`. `Ok(None)` means it was suppressed or rate limited by design.
+    pub(crate) fn send_icmp(
+        &mut self,
+        now: Instant,
+        kind: Reject,
+        original: &[u8],
+        out: &mut [u8],
+    ) -> Result<Option<usize>, UdpError> {
+        self.now = now;
+        match self.icmp_out.emit(now, kind, original, out) {
+            IcmpEmit::Sent(n) => {
+                self.counters.tx_packets += 1;
+                Ok(Some(n))
+            }
+            IcmpEmit::Suppressed | IcmpEmit::RateLimited => Ok(None),
+            IcmpEmit::TooSmall => Err(UdpError::BufferTooSmall),
+        }
+    }
+
+    /// Tells the sender of `original` that it exceeds `mtu` (IPv4 fragmentation needed, IPv6
+    /// Packet Too Big). Exempt from the ICMP rate limits, as on Linux and gVisor.
+    pub fn packet_too_big(
+        &mut self,
+        now: Instant,
+        mtu: u32,
+        original: &[u8],
+        out: &mut [u8],
+    ) -> Result<Option<usize>, UdpError> {
+        self.send_icmp(now, Reject::PacketTooBig { mtu }, original, out)
+    }
+}
 
 struct Original<'a> {
     src: IpAddr,
