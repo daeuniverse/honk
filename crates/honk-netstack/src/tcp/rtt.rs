@@ -5,21 +5,23 @@ use std::time::Duration;
 pub const MIN_RTO: Duration = Duration::from_millis(200);
 pub const MAX_RTO: Duration = Duration::from_secs(120);
 
+/// Microseconds in 32 bits (71 minutes of range), 0 meaning "no sample yet": a flow carries this
+/// for its whole life, so it is kept small.
 pub struct Rtt {
-    pub srtt_us: Option<u64>,
-    pub rttvar_us: u64,
-    pub min_rtt: Option<Duration>,
-    rto: Duration,
+    srtt_us: u32,
+    rttvar_us: u32,
+    min_rtt_us: u32,
+    rto_us: u32,
     pub backoff: u8,
 }
 
 impl Default for Rtt {
     fn default() -> Self {
         Self {
-            srtt_us: None,
+            srtt_us: 0,
             rttvar_us: 0,
-            min_rtt: None,
-            rto: Duration::from_secs(1),
+            min_rtt_us: 0,
+            rto_us: 1_000_000,
             backoff: 0,
         }
     }
@@ -27,27 +29,28 @@ impl Default for Rtt {
 
 impl Rtt {
     pub fn sample(&mut self, sample: Duration) {
-        let us = sample.as_micros().min(u64::MAX as u128) as u64;
-        let us = us.max(1);
-        self.min_rtt = Some(self.min_rtt.map_or(sample, |v| v.min(sample)));
-        match self.srtt_us {
-            None => {
-                self.srtt_us = Some(us);
-                self.rttvar_us = us / 2;
-            }
-            Some(srtt) => {
-                self.rttvar_us = (3 * self.rttvar_us + srtt.abs_diff(us)) / 4;
-                self.srtt_us = Some((7 * srtt + us) / 8);
-            }
+        let us = sample.as_micros().clamp(1, u128::from(u32::MAX)) as u32;
+        self.min_rtt_us = if self.min_rtt_us == 0 {
+            us
+        } else {
+            self.min_rtt_us.min(us)
+        };
+        if self.srtt_us == 0 {
+            self.srtt_us = us;
+            self.rttvar_us = us / 2;
+        } else {
+            let srtt = u64::from(self.srtt_us);
+            self.rttvar_us =
+                ((3 * u64::from(self.rttvar_us) + srtt.abs_diff(u64::from(us))) / 4) as u32;
+            self.srtt_us = ((7 * srtt + u64::from(us)) / 8) as u32;
         }
-        let srtt = self.srtt_us.unwrap_or(us);
-        self.rto = Duration::from_micros(srtt.saturating_add((4 * self.rttvar_us).max(1000)))
-            .clamp(MIN_RTO, MAX_RTO);
+        let rto = u64::from(self.srtt_us) + (4 * u64::from(self.rttvar_us)).max(1000);
+        self.rto_us = rto.clamp(MIN_RTO.as_micros() as u64, MAX_RTO.as_micros() as u64) as u32;
         self.backoff = 0;
     }
 
     pub fn rto(&self) -> Duration {
-        self.rto
+        Duration::from_micros(u64::from(self.rto_us))
             .saturating_mul(1u32 << self.backoff.min(16))
             .min(MAX_RTO)
     }
@@ -57,7 +60,11 @@ impl Rtt {
     }
 
     pub fn srtt(&self) -> Option<Duration> {
-        self.srtt_us.map(Duration::from_micros)
+        (self.srtt_us != 0).then(|| Duration::from_micros(u64::from(self.srtt_us)))
+    }
+
+    pub fn min_rtt(&self) -> Option<Duration> {
+        (self.min_rtt_us != 0).then(|| Duration::from_micros(u64::from(self.min_rtt_us)))
     }
 }
 

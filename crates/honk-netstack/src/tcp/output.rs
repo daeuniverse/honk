@@ -5,7 +5,8 @@ use crate::wire::{
     tcp::{self as wire_tcp, ACK, FIN, Header, Options, PSH, RST, SYN},
 };
 
-use super::sent::{Descriptor, FIN as SENT_FIN};
+use super::pacing::Pacer;
+use super::sent::{APP_LIMITED, Descriptor, FIN as SENT_FIN, Stamp};
 use super::{Tcb, TcpState};
 
 pub enum Output {
@@ -43,15 +44,42 @@ impl Tcb {
         } else {
             None
         };
+        let mut probe = false;
+        let mut pipe = 0;
+        let mut unsent_left = 0;
         if kind.is_none() && !syn && self.state != TcpState::Closed {
             let cap = self.payload_cap(&options);
-            let pipe = self.recovery.pipe(&self.sent, self.sack);
-            if let Some((i, start, len, fin)) = self.sent.next_retransmit() {
+            let mss = self.send_mss();
+            pipe = self.recovery.pipe(&self.sent, self.sack);
+            let budget = self.recovery.budget(pipe, self.cc.cwnd()) as usize;
+            let can_send_new = matches!(
+                self.state,
+                TcpState::Established
+                    | TcpState::CloseWait
+                    | TcpState::FinWait1
+                    | TcpState::LastAck
+            );
+            let sent_offset = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
+            let unsent = self.tx.len().saturating_sub(sent_offset);
+            let rwnd = self
+                .snd_wnd
+                .saturating_sub(self.snd_nxt.wrapping_sub(self.snd_una))
+                as usize;
+            if self.tlp_due {
+                self.tlp_due = false;
+                kind = self.tlp_kind(pool, cap, unsent, rwnd, can_send_new);
+                probe = kind.is_some();
+            }
+            if kind.is_none()
+                && !self.recovery.hold_retransmits()
+                && let Some((i, start, len, fin)) = self.sent.next_retransmit()
+            {
                 let data = (len as usize - usize::from(fin)).min(cap);
                 let fin = fin && data as u32 + 1 == len;
-                if self.recovery.can_retransmit(pipe, self.cc.cwnd())
+                if budget > 0
                     && (data != 0 || fin)
                     && (data as u32 + u32::from(fin) == len || self.sent.ensure_room(pool, 1))
+                    && self.pace_ok(now, data as u32, mss)
                 {
                     kind = Some(Kind::Retransmit {
                         index: i,
@@ -61,33 +89,25 @@ impl Tcb {
                     });
                 }
             }
-            if kind.is_none()
-                && matches!(
-                    self.state,
-                    TcpState::Established
-                        | TcpState::CloseWait
-                        | TcpState::FinWait1
-                        | TcpState::LastAck
-                )
-            {
-                let sent_offset = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
-                let unsent = self.tx.len().saturating_sub(sent_offset);
-                let rwnd = self
-                    .snd_wnd
-                    .saturating_sub(self.snd_nxt.wrapping_sub(self.snd_una))
-                    as usize;
-                let cwnd = self.cc.cwnd().saturating_sub(pipe) as usize;
-                let data = unsent.min(cap).min(rwnd).min(cwnd);
+            if kind.is_none() && can_send_new {
+                let data = unsent.min(cap).min(rwnd);
                 let fin = self.fin_requested
                     && self.fin_seq.is_none()
                     && data == unsent
                     && rwnd > data
-                    && cwnd > data;
-                if (data != 0 || fin) && self.sent.ensure_room(pool, 2) {
-                    kind = Some(Kind::New { data, fin });
-                }
-                if unsent > data && cwnd < cap {
+                    && budget > 0;
+                if unsent == 0 {
+                    self.cwnd_limited = false;
+                } else if data != 0 && budget == 0 {
                     self.cwnd_limited = true;
+                }
+                if budget > 0
+                    && (data != 0 || fin)
+                    && self.sent.ensure_room(pool, 2)
+                    && self.pace_ok(now, data as u32, mss)
+                {
+                    unsent_left = unsent - data;
+                    kind = Some(Kind::New { data, fin });
                 }
             }
             if kind.is_none() && self.ack_due != 0 {
@@ -185,26 +205,57 @@ impl Tcb {
             Kind::Probe => self.probe_due = false,
             Kind::New { data, fin } => {
                 if self.sent.outstanding == 0 {
-                    if now.saturating_duration_since(self.last_tx) >= self.rtt.rto() {
+                    if now.saturating_duration_since(self.last_data_tx) >= self.rtt.rto() {
                         self.cc.restart_idle(self.send_mss());
                     }
+                    // Nothing in flight: a new delivery-rate interval starts here, and a probe
+                    // from an earlier burst can no longer be judged by this one's ACKs.
                     self.first_tx_ts = now;
+                    self.delivered_ts = now;
+                    self.recovery.rack.tlp = None;
                 }
                 if fin {
                     self.fin_seq = Some(self.snd_nxt.wrapping_add(data as u32));
                 }
                 self.snd_nxt = self.snd_nxt.wrapping_add(data as u32 + u32::from(fin));
+                // Less than a segment left to send and room in the window: the sender, not the
+                // path, limits this sample (draft-cheng-iccrg-delivery-rate-estimation §3.4).
+                let mss = self.send_mss();
+                let flight = self.recovery.pipe(&self.sent, self.sack) + data as u32;
+                if !probe
+                    && !fin
+                    && unsent_left < mss as usize
+                    && flight + mss <= self.cc.cwnd()
+                    && self.sent.lost == 0
+                {
+                    self.app_limited_until = (self.delivered + u64::from(flight)).max(1);
+                }
                 self.sent.push(Descriptor {
                     end_seq: self.snd_nxt,
                     xmit_ts: now,
-                    flags: if fin { SENT_FIN } else { 0 },
+                    flags: if fin { SENT_FIN } else { 0 }
+                        | if self.app_limited_until != 0 {
+                            APP_LIMITED
+                        } else {
+                            0
+                        },
                     delivered: self.delivered,
                     delivered_ts: self.delivered_ts,
                     first_tx_ts: self.first_tx_ts,
                 });
-                if self.sent.pipe().saturating_add(self.send_mss()) >= self.cc.cwnd() {
-                    self.cwnd_limited = true;
+                self.pacer.sent(data as u32);
+                let ts = self.timestamp(now);
+                self.recovery.sent_bytes(data as u32, false, ts);
+                if !probe {
+                    let pipe = self.recovery.pipe(&self.sent, self.sack);
+                    if pipe + self.send_mss() > self.cc.cwnd() {
+                        self.cwnd_limited = true;
+                    }
+                    self.rearm_pto(now);
+                } else {
+                    self.recovery.rack.start_tlp(self.snd_nxt, false);
                 }
+                self.last_data_tx = now;
             }
             Kind::Retransmit {
                 index,
@@ -212,13 +263,39 @@ impl Tcb {
                 data,
                 fin,
             } => {
-                self.recovery.retransmitted();
+                if pipe == 0 {
+                    self.first_tx_ts = now;
+                    self.delivered_ts = now;
+                }
                 let end = start.wrapping_add(data as u32 + u32::from(fin));
                 self.sent.split(index, end);
-                self.sent.retransmitted(index, start, now);
+                let stamp = Stamp {
+                    delivered: self.delivered,
+                    delivered_ts: self.delivered_ts,
+                    first_tx_ts: self.first_tx_ts,
+                    app_limited: self.app_limited_until != 0,
+                };
+                self.sent.retransmitted(index, now, &stamp);
+                if self.sack {
+                    self.recovery.rack.on_retransmit(end, now);
+                }
+                self.pacer.sent(data as u32);
+                let ts = self.timestamp(now);
+                self.recovery
+                    .sent_bytes(data as u32 + u32::from(fin), true, ts);
                 self.stats.retrans_bytes += data as u64;
                 self.stats.retrans_segments += 1;
+                if probe {
+                    self.recovery.rack.start_tlp(self.snd_nxt, true);
+                } else {
+                    self.rearm_pto(now);
+                }
+                self.last_data_tx = now;
             }
+        }
+        if probe {
+            self.recovery.counters.tlp_probes += 1;
+            self.rto_deadline = Some(now + self.rtt.rto());
         }
         if flags & ACK != 0 && !matches!(kind, Kind::Probe | Kind::Reset) {
             self.ack_due = 0;
@@ -234,9 +311,71 @@ impl Tcb {
                 }
             }
         }
-        self.last_tx = now;
         self.rearm(now);
         Output::Sent(n)
+    }
+
+    /// The segment a tail loss probe sends: new data if there is any and the peer allows it,
+    /// otherwise the newest unacknowledged one (RFC 8985 §7.3).
+    fn tlp_kind(
+        &mut self,
+        pool: &mut super::ring::Pool,
+        cap: usize,
+        unsent: usize,
+        rwnd: usize,
+        can_send_new: bool,
+    ) -> Option<Kind> {
+        if can_send_new && unsent != 0 && rwnd != 0 && self.sent.ensure_room(pool, 2) {
+            let data = unsent.min(cap).min(rwnd);
+            return Some(Kind::New { data, fin: false });
+        }
+        let (index, start, len, fin) = self.sent.last_unsacked()?;
+        let data = (len as usize - usize::from(fin)).min(cap);
+        let fin = fin && data as u32 + 1 == len;
+        ((data != 0 || fin)
+            && (data as u32 + u32::from(fin) == len || self.sent.ensure_room(pool, 1)))
+        .then_some(Kind::Retransmit {
+            index,
+            start,
+            data,
+            fin,
+        })
+    }
+
+    /// F-RTO step 2b holds retransmissions only while new data can go out in their place. When the
+    /// ACK just processed leaves none (nothing unsent, or no window for it) the sender falls back to
+    /// conventional recovery instead of idling until the next timeout (RFC 5682 §3, Linux
+    /// `tcp_process_loss`). A full congestion window just waits.
+    pub(super) fn frto_gate(&mut self) {
+        if !self.recovery.hold_retransmits() {
+            return;
+        }
+        let flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
+        let can_send_new = matches!(
+            self.state,
+            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::LastAck
+        );
+        if !(can_send_new && self.tx.len() > flight && self.snd_wnd as usize > flight) {
+            self.recovery.end_frto();
+        }
+    }
+
+    /// Pacing gate; records when the next segment may leave if it may not leave now.
+    fn pace_ok(&mut self, now: Instant, bytes: u32, mss: u32) -> bool {
+        let Some(rate) = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain()) else {
+            self.pacing_deadline = None;
+            return true;
+        };
+        match self.pacer.check(now, bytes.min(mss), rate, mss) {
+            None => {
+                self.pacing_deadline = None;
+                true
+            }
+            Some(at) => {
+                self.pacing_deadline = Some(at);
+                false
+            }
+        }
     }
 
     fn options(&self, now: Instant, syn: bool) -> Options {

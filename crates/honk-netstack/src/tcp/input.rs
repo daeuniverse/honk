@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 use crate::wire::tcp::{ACK, FIN, Header, RST, SYN};
 use crate::{Ready, StreamError};
 
+use super::cc::CcAck;
+use super::recovery;
 use super::ring::Pool;
 use super::sack::Insert;
+use super::sent::Acked;
 use super::{DATA, DELAY_ACK, FIN_ACK, OOO, PROBE_RESPONSE, Tcb, TcpState, seq};
 
 impl Tcb {
@@ -207,7 +210,8 @@ impl Tcb {
             } else {
                 536
             })
-            .max(1);
+            // Linux's `tcp_min_snd_mss`: a hostile server must not buy one packet per byte.
+            .max(48);
         self.snd_shift = h.options.wscale.unwrap_or(0);
         self.wscale = h.options.wscale.is_some();
         if !self.wscale {
@@ -249,6 +253,8 @@ impl Tcb {
 
     fn established(&mut self, now: Instant) {
         self.state = TcpState::Established;
+        // SYN retransmission backoff belongs to the handshake, not to the first data timeout.
+        self.rtt.backoff = 0;
         self.rto_deadline = None;
         self.rcv_rtt_seq = self.max_adv_right;
         self.rcv_rtt_time = now;
@@ -261,12 +267,12 @@ impl Tcb {
         if wnd == 0 {
             return len == 0 && seq_no == self.rcv_nxt;
         }
-        let in_window = |s| seq::ge(s, self.rcv_nxt) && seq::lt(s, self.max_adv_right);
         if len == 0 {
-            in_window(seq_no)
-        } else {
-            in_window(seq_no) || in_window(seq_no.wrapping_add(len - 1))
+            return seq::ge(seq_no, self.rcv_nxt) && seq::lt(seq_no, self.max_adv_right);
         }
+        // Any overlap with the window, as on Linux: `receive_data` trims both ends, so a
+        // retransmission straddling `rcv_nxt` is not lost to a window narrower than the segment.
+        seq::gt(seq_no.wrapping_add(len), self.rcv_nxt) && seq::lt(seq_no, self.max_adv_right)
     }
 
     fn paws(&mut self, now: Instant, h: &Header) -> bool {
@@ -294,6 +300,7 @@ impl Tcb {
             self.snd_wl2 = h.ack;
             if self.snd_wnd != 0 {
                 self.persist_probes = 0;
+                self.persist_backoff = 0;
                 if self.persist {
                     self.rto_deadline = None;
                     self.persist = false;
@@ -315,21 +322,26 @@ impl Tcb {
         let acked = h.ack.wrapping_sub(self.snd_una);
         let flight_before = self.sent.outstanding;
         let was_recovery = self.recovery.in_recovery();
+        let mut info = Acked::new(now, self.rtt.min_rtt().unwrap_or_default());
         if acked != 0 {
             let data_acked = (acked as usize).min(self.tx.len());
             self.tx.consume(pool, data_acked);
-            let result = self.sent.ack(h.ack, now);
+            self.sent.ack(h.ack, &mut info);
             self.sent.shrink_idle(pool);
-            self.delivered += u64::from(result.delivered);
-            if let Some(interval) = result.interval {
-                self.stats.delivery_rate = self
-                    .delivered
-                    .saturating_sub(result.prior_delivered)
-                    .saturating_mul(1_000_000)
-                    / (interval.as_micros().max(1).min(u64::MAX as u128) as u64);
-            }
+            self.snd_una = h.ack;
+        }
+        let dsack = if self.sack {
+            self.apply_sack(h, &mut info)
+        } else {
+            0
+        };
+        self.delivered += u64::from(info.delivered);
+        if info.delivered != 0 {
+            self.sample_rate(now, &info);
             self.delivered_ts = now;
-            if let Some(sample) = result.rtt {
+        }
+        if acked != 0 {
+            if let Some(sample) = info.rtt {
                 self.rtt.sample(sample);
             } else if self.timestamps
                 && let Some((_, echo)) = h.options.timestamps
@@ -340,43 +352,67 @@ impl Tcb {
                         .sample(Duration::from_millis(u64::from(delta.max(1))));
                 }
             }
-            self.snd_una = h.ack;
-            self.rto_deadline = if self.sent.outstanding != 0 {
-                Some(now + self.rtt.rto())
-            } else {
-                None
-            };
             if self.write_blocked && self.can_write(pool) {
                 self.write_blocked = false;
                 self.ready |= Ready::WRITABLE;
             }
         }
-        if self.sack {
-            for &(left, right) in h.options.sack.as_slice() {
-                let delivered = self.sent.sack(left, right, self.snd_nxt);
-                self.delivered += u64::from(delivered);
-                if delivered != 0 {
-                    self.delivered_ts = now;
-                }
-            }
-        }
         let mss = self.send_mss();
+        // Eifel (RFC 3522): an ACK echoing a timestamp older than the first retransmission
+        // acknowledges the original transmission.
+        let eifel = acked != 0
+            && self.timestamps
+            && h.options.timestamps.is_some_and(|(_, echo)| {
+                echo != 0
+                    && self
+                        .recovery
+                        .retrans_stamp()
+                        .is_some_and(|st| seq::lt(echo, st))
+            });
+        let srtt = self.rtt.srtt().unwrap_or_default();
         self.recovery.ack(
             &mut self.sent,
             &mut self.cc,
-            acked,
-            acked == 0 && duplicate_candidate,
-            self.sack,
-            self.snd_nxt,
-            mss,
-            flight_before,
+            &recovery::AckCtx {
+                now,
+                ack: h.ack,
+                acked,
+                dup: acked == 0 && duplicate_candidate,
+                info: &info,
+                dsack,
+                eifel,
+                snd_nxt: self.snd_nxt,
+                mss,
+                flight_before,
+                sack: self.sack,
+                srtt,
+                min_rtt: self.rtt.min_rtt().unwrap_or(srtt),
+            },
         );
-        self.cc.ack(
-            acked,
+        if acked != 0 || info.delivered != 0 {
+            // New data left the network: the timer measures the next one. After a NewReno partial
+            // ACK it keeps running (RFC 6582 "impatient"), see `Recovery::keep_rto`.
+            if self.sent.outstanding == 0 {
+                self.rto_deadline = None;
+            } else if !self.recovery.keep_rto() || self.rto_deadline.is_none() {
+                self.rto_deadline = Some(now + self.rtt.rto());
+            }
+            self.rearm_pto(now);
+        }
+        self.frto_gate();
+        let limited =
+            self.cwnd_limited || (self.cc.in_slow_start() && 2 * flight_before >= self.cc.cwnd());
+        self.cc.on_ack(&CcAck {
+            now,
+            bytes: acked,
             mss,
-            self.cwnd_limited,
-            was_recovery || self.recovery.in_recovery(),
-        );
+            cwnd_limited: limited,
+            in_recovery: was_recovery || self.recovery.in_recovery(),
+            rtt: info.rtt,
+            srtt,
+            snd_una: self.snd_una,
+            snd_nxt: self.snd_nxt,
+        });
         if let Some(fin) = self.fin_seq
             && seq::gt(h.ack, fin)
         {
@@ -394,6 +430,64 @@ impl Tcb {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Applies the SACK blocks in ascending order and returns the length of a DSACK block.
+    fn apply_sack(&mut self, h: &Header, info: &mut Acked) -> u32 {
+        let blocks = h.options.sack.as_slice();
+        let mut dsack = 0;
+        let mut ordered = [(0u32, 0u32); 4];
+        let mut n = 0;
+        for (i, &(left, right)) in blocks.iter().enumerate() {
+            // RFC 2883: below the cumulative ACK, or inside the second block.
+            let duplicate = i == 0
+                && (seq::le(right, h.ack)
+                    || blocks
+                        .get(1)
+                        .is_some_and(|&(l, r)| seq::ge(left, l) && seq::le(right, r)));
+            if duplicate {
+                // A DSACK describes one duplicated segment; a reversed, oversized or unsent block
+                // would otherwise inflate the count to ~2^32 and force an undo.
+                if seq::lt(left, right)
+                    && seq::le(right, self.snd_nxt)
+                    && right.wrapping_sub(left) <= u32::from(u16::MAX)
+                {
+                    dsack = right.wrapping_sub(left);
+                }
+            } else if n < ordered.len() {
+                ordered[n] = (left, right);
+                n += 1;
+            }
+        }
+        ordered[..n].sort_unstable_by_key(|&(left, _)| left.wrapping_sub(h.ack));
+        for &(left, right) in &ordered[..n] {
+            self.sent.sack(left, right, self.snd_nxt, info);
+        }
+        dsack
+    }
+
+    /// Delivery-rate sample (draft-cheng-iccrg-delivery-rate-estimation §3.3).
+    fn sample_rate(&mut self, now: Instant, info: &Acked) {
+        let Some(src) = info.sample else { return };
+        self.first_tx_ts = src.xmit_ts;
+        let interval = now
+            .saturating_duration_since(src.delivered_ts)
+            .max(src.xmit_ts.saturating_duration_since(src.first_tx_ts));
+        // Shorter than the path RTT means ACK compression, not a measurement.
+        if !interval.is_zero() && interval >= self.rtt.min_rtt().unwrap_or_default() {
+            let rate = self
+                .delivered
+                .saturating_sub(src.prior_delivered)
+                .saturating_mul(1_000_000)
+                / (interval.as_micros().min(u128::from(u64::MAX)) as u64).max(1);
+            // An app-limited sample can only raise the estimate.
+            if !src.app_limited || rate > self.stats.delivery_rate {
+                self.stats.delivery_rate = rate;
+            }
+        }
+        if self.app_limited_until != 0 && self.delivered > self.app_limited_until {
+            self.app_limited_until = 0;
         }
     }
 
@@ -422,6 +516,15 @@ impl Tcb {
                 .min(self.max_adv_right.wrapping_sub(start) as usize)];
         } else {
             bytes = &[];
+        }
+        if let Some(fin) = self.peer_fin {
+            // Nothing follows the peer's FIN; accepting it would carry `rcv_nxt` past the FIN.
+            let room = if seq::lt(start, fin) {
+                fin.wrapping_sub(start) as usize
+            } else {
+                0
+            };
+            bytes = &bytes[..bytes.len().min(room)];
         }
         let had_ooo = !self.ooo.is_empty();
         let mut advanced = false;
@@ -481,7 +584,7 @@ impl Tcb {
             && seq::ge(original_end, self.rcv_nxt)
             && seq::lt(original_end, self.max_adv_right)
         {
-            self.peer_fin = Some(original_end);
+            self.peer_fin.get_or_insert(original_end);
         }
         if self.peer_fin == Some(self.rcv_nxt) && !self.peer_fin_seen {
             self.peer_fin_seen = true;

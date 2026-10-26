@@ -109,6 +109,40 @@ fn pull(stack: &mut Stack, now: Instant) -> Option<Packet> {
         .map(|n| Packet::decode(out[..n].to_vec()))
 }
 
+fn pull_paced(stack: &mut Stack, now: &mut Instant) -> Option<Packet> {
+    let mut out = vec![0u8; usize::from(u16::MAX)];
+    loop {
+        if let Some(n) = stack.poll_transmit(*now, &mut out) {
+            return Some(Packet::decode(out[..n].to_vec()));
+        }
+        match stack.poll_timeout() {
+            Some(at) if at > *now && at - *now <= Duration::from_millis(100) => {
+                *now = at;
+                stack.handle_timeout(at);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Like `drain`, but lets time pass for pacing gaps (sub-millisecond here), not for probe timers.
+fn drain_paced(stack: &mut Stack, now: &mut Instant) -> Vec<Packet> {
+    let mut packets = Vec::new();
+    loop {
+        while let Some(packet) = pull(stack, *now) {
+            assert!(packets.len() < 256, "transmit never quiesced");
+            packets.push(packet);
+        }
+        match stack.poll_timeout() {
+            Some(at) if at > *now && at - *now <= Duration::from_millis(5) => {
+                *now = at;
+                stack.handle_timeout(at);
+            }
+            _ => return packets,
+        }
+    }
+}
+
 fn drain(stack: &mut Stack, now: Instant) -> Vec<Packet> {
     let mut packets = Vec::new();
     while let Some(packet) = pull(stack, now) {
@@ -337,7 +371,7 @@ fn newreno_third_duplicate_ack_retransmits_first_loss() {
     let peer = open(&mut stack, &mut now, remote(false), false, false);
     let bytes = pattern(10 * usize::from(MSS));
     assert_eq!(stack.tcp_write(peer.id, &bytes), Ok(bytes.len()));
-    let packets = drain(&mut stack, now);
+    let packets = drain_paced(&mut stack, &mut now);
     assert_eq!(packets.len(), 10);
     now += Duration::from_millis(10);
     for _ in 0..3 {
@@ -351,7 +385,7 @@ fn newreno_third_duplicate_ack_retransmits_first_loss() {
     );
     let stats = stack.tcp_stats(peer.id).unwrap();
     assert_eq!(stats.retrans_segments, 1);
-    assert_eq!(stats.ssthresh, 5000);
+    assert_eq!(stats.ssthresh, 7000, "CUBIC reduces to 0.7 of the window");
 }
 
 #[test]
@@ -361,7 +395,7 @@ fn newreno_partial_ack_retransmits_next_hole_and_full_ack_exits_once() {
     let peer = open(&mut stack, &mut now, remote(false), false, false);
     let bytes = pattern(5000);
     assert_eq!(stack.tcp_write(peer.id, &bytes), Ok(bytes.len()));
-    let initial = drain(&mut stack, now);
+    let initial = drain_paced(&mut stack, &mut now);
     assert_eq!(initial.len(), 5);
     now += Duration::from_millis(10);
     for _ in 0..3 {
@@ -408,7 +442,7 @@ fn newreno_partial_ack_retransmits_next_hole_and_full_ack_exits_once() {
     }
     assert_eq!(
         stack.tcp_stats(peer.id).unwrap().ssthresh,
-        2 * u32::from(MSS),
+        threshold / 10 * 7,
         "a later loss episode must be able to enter recovery again"
     );
     let retrans = pull(&mut stack, now).expect("new episode after full-ACK recovery exit");
@@ -425,7 +459,7 @@ fn sack_skips_delivered_segments_but_never_releases_send_bytes() {
     let bytes = pattern(2 * CHUNK);
     assert_eq!(stack.tcp_write(peer.id, &bytes), Ok(bytes.len()));
     assert_eq!(stack.tcp_write(peer.id, b"x"), Err(StreamError::WouldBlock));
-    let initial = drain(&mut stack, now);
+    let initial = drain_paced(&mut stack, &mut now);
     assert_eq!(initial.len(), 10);
     let allocated = stack.stats().memory_allocated;
     let mut h = peer.header(now, peer.start);
@@ -1264,10 +1298,8 @@ fn jumbo_mtu_serializes_unaligned_payload_spanning_five_ring_chunks() {
         assert_eq!(first.data(), prefix);
         let payload = pattern(65000);
         assert_eq!(stack.tcp_write(id, &payload), Ok(payload.len()));
-        let mut out = vec![0; usize::from(u16::MAX)];
-        let n = stack.poll_transmit(now, &mut out).unwrap();
-        out.truncate(n);
-        let packet = Packet::decode(out);
+        // The bucket holds one segment: the pacer releases the jumbo one only after a gap.
+        let packet = pull_paced(&mut stack, &mut now).unwrap();
         assert_eq!(packet.h.seq, first.end());
         assert_eq!(packet.h.ack, peer.next);
         assert_eq!(packet.data(), payload);
@@ -1276,7 +1308,7 @@ fn jumbo_mtu_serializes_unaligned_payload_spanning_five_ring_chunks() {
         peer.ack(&mut stack, now, packet.end());
         assert_eq!(stack.tcp_stats(id).unwrap().outstanding_bytes, 0);
         assert_eq!(stack.tcp_write(id, b"tail"), Ok(4));
-        assert_eq!(pull(&mut stack, now).unwrap().data(), b"tail");
+        assert_eq!(pull_paced(&mut stack, &mut now).unwrap().data(), b"tail");
     }
 }
 
@@ -1306,4 +1338,67 @@ fn legacy_ipv4_ptb_uses_the_quoted_datagram_length_for_its_next_plateau() {
     assert_eq!(first.bytes.len(), 508);
     let tail = pull(&mut stack, now).unwrap();
     assert_eq!((tail.h.seq, tail.data()), (first.end(), &bytes[468..]));
+}
+
+#[test]
+fn a_tiny_peer_mss_cannot_force_one_packet_per_byte() {
+    let mut now = Instant::now();
+    let mut stack = Stack::new(config(), now);
+    let peer = open_mss(&mut stack, &mut now, remote(false), false, false, 1);
+    assert_eq!(stack.tcp_write(peer.id, &pattern(500)), Ok(500));
+    let packets = drain(&mut stack, now);
+    assert_eq!(packets[0].data().len(), 48, "Linux's tcp_min_snd_mss");
+    assert!(packets.len() <= 11, "{} packets", packets.len());
+}
+
+#[test]
+fn an_icmp_error_of_the_other_family_cannot_lower_a_flows_path_mtu() {
+    for v6 in [false, true] {
+        let mut now = Instant::now();
+        let mut stack = Stack::new(config(), now);
+        let peer = open(&mut stack, &mut now, remote(v6), true, true);
+        assert_eq!(stack.tcp_write(peer.id, &pattern(900)), Ok(900));
+        let original = pull(&mut stack, now).unwrap();
+        let (outer_src, outer_dst) = if v6 {
+            (remote(false).ip(), config().local_v4.unwrap().into())
+        } else {
+            (remote(true).ip(), config().local_v6.unwrap().into())
+        };
+        let mut icmp = [0; 2048];
+        let n =
+            wire::icmp::emit_packet_too_big(&mut icmp, outer_src, outer_dst, 1300, &original.bytes)
+                .unwrap();
+        assert_eq!(stack.receive(now, &icmp[..n]), Rx::Consumed);
+        assert_eq!(
+            stack.tcp_stats(peer.id).unwrap().pmtu,
+            1420,
+            "v6 flow: {v6}"
+        );
+    }
+}
+
+#[test]
+fn ptb_after_a_timeout_retransmission_splits_the_oversize_segment_at_once() {
+    let mut now = Instant::now();
+    let mut stack = Stack::new(config(), now);
+    let peer = open_mss(&mut stack, &mut now, remote(false), false, false, 1460);
+    let bytes = pattern(1380);
+    assert_eq!(stack.tcp_write(peer.id, &bytes), Ok(bytes.len()));
+    let original = pull(&mut stack, now).unwrap();
+    now += Duration::from_secs(1);
+    stack.handle_timeout(now);
+    let resent = pull(&mut stack, now).expect("timeout retransmission at the old size");
+    assert_eq!(resent.data().len(), 1380);
+    assert!(pull(&mut stack, now).is_none());
+    assert_eq!(
+        stack.receive(now, &ptb(&peer, &original.bytes, 1280)),
+        Rx::Consumed
+    );
+    let split = drain_paced(&mut stack, &mut now);
+    assert!(split.iter().all(|p| p.bytes.len() <= 1280));
+    assert_eq!(
+        split.iter().map(|p| p.data().len()).sum::<usize>(),
+        bytes.len(),
+        "the dropped retransmission is sent again at the new size without waiting"
+    );
 }

@@ -1454,3 +1454,40 @@ fn variable_sack_option_sizes_do_not_stretch_two_full_segment_acks() {
     s.ack(now, s.rcv_nxt, s.peer_ts, &[]);
     s.quiet(now);
 }
+
+#[test]
+fn a_retransmission_overlapping_rcv_nxt_is_accepted_when_it_also_passes_the_window_edge() {
+    let mut cfg = config(false);
+    cfg.tcp_rcv_buf_max = 16 * 1024;
+    let mut s = Script::new(cfg, 3000, peer_options(false, true));
+    let start = s.rcv_nxt;
+    let data: Vec<u8> = (0..16 * 1024).map(|n| (n * 13) as u8).collect();
+    let now = s.at(20);
+    for (i, part) in data[..15_000].chunks(1000).enumerate() {
+        s.input(now, start.wrapping_add((i * 1000) as u32), ACK, part);
+    }
+    // 100 bytes already held, then the rest of the window and 200 bytes beyond its right edge.
+    let mut resent = data[14_900..].to_vec();
+    resent.extend_from_slice(&[0xAA; 200]);
+    s.input(now, start.wrapping_add(14_900), ACK, &resent);
+    let mut out = vec![0; 16 * 1024];
+    assert_eq!(s.stack.tcp_read(s.id, &mut out), Ok(16 * 1024));
+    assert_eq!(out, data);
+}
+
+#[test]
+fn data_beyond_a_recorded_fin_is_not_accepted() {
+    let mut s = Script::new(config(false), 4000, peer_options(false, true));
+    let start = s.rcv_nxt;
+    let now = s.at(20);
+    s.input(now, start.wrapping_add(100), FIN | ACK, &[]);
+    s.input(now, start, ACK, &[5; 300]);
+    let mut out = [0; 400];
+    assert_eq!(s.stack.tcp_read(s.id, &mut out), Ok(100));
+    assert_eq!(
+        s.stack.tcp_read(s.id, &mut out),
+        Ok(0),
+        "the FIN is consumed after 100 bytes"
+    );
+    assert_eq!(s.stack.tcp_state(s.id), Some(TcpState::CloseWait));
+}

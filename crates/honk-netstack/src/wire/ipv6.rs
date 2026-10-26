@@ -65,6 +65,10 @@ pub(super) fn skip_ext_headers(
                 if off + len > end {
                     return Err(ParseError::Malformed);
                 }
+                // RFC 8200 §4.4: a host must discard a routing header with segments left.
+                if next == ROUTING && pkt[off + 3] != 0 {
+                    return Err(ParseError::Unsupported);
+                }
                 next = pkt[off];
                 off += len;
             }
@@ -199,6 +203,18 @@ mod tests {
         assert_eq!(parse(&ok).unwrap().payload.start, 40 + 64);
         let too_many = packet(&[(60, 8); 9], 6, b"x");
         assert_eq!(parse(&too_many), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn routing_header_with_segments_left_is_discarded() {
+        let mut b = packet(&[(43, 8)], 6, b"tcp!");
+        assert_eq!(
+            &b[parse(&b).unwrap().payload],
+            b"tcp!",
+            "segments left 0 is final delivery"
+        );
+        b[43] = 2;
+        assert_eq!(parse(&b), Err(ParseError::Unsupported));
     }
 
     #[test]

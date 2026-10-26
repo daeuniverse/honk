@@ -185,6 +185,9 @@ pub struct Stack {
     pool: Pool,
     floor_cap: u32,
     timers: Timers,
+    /// Queue elements `purge_stale` has visited; lets tests assert teardown stays amortized O(1).
+    #[cfg(test)]
+    purge_visits: usize,
     events: VecDeque<FlowId>,
     ready: VecDeque<FlowId>,
     writers: VecDeque<FlowId>,
@@ -215,6 +218,8 @@ impl Stack {
             pool,
             floor_cap,
             timers: Timers::new(),
+            #[cfg(test)]
+            purge_visits: 0,
             events: VecDeque::new(),
             ready: VecDeque::new(),
             writers: VecDeque::new(),
@@ -478,7 +483,7 @@ impl Stack {
                 Some(Flow::Tcp(t)) => t.timer(now),
                 Some(Flow::TimeWait(t)) if t.expiry <= now && !t.ack_due => {
                     self.table.remove(index);
-                    self.retire_queues(index);
+                    self.purge_stale();
                     continue;
                 }
                 Some(Flow::TimeWait(t)) if t.expiry <= now => {
@@ -544,7 +549,7 @@ impl Stack {
                     let can_reuse = matches!(&self.table.slots[index as usize].flow, Some(Flow::TimeWait(tw)) if tw.reusable(iss, stamp));
                     if can_reuse {
                         self.table.remove(index);
-                        self.retire_queues(index);
+                        self.purge_stale();
                         choice = Some((tuple, iss));
                         break;
                     }
@@ -666,6 +671,7 @@ impl Stack {
         let mut remove = false;
         let mut compact = None;
         if let Some(Flow::Tcp(t)) = slot.flow.as_mut() {
+            t.check();
             if !t.app_open {
                 if t.state == TcpState::Closed && !t.rst_pending {
                     remove = true;
@@ -688,9 +694,7 @@ impl Stack {
                 }
             }
         }
-        if remove || compact.is_some() {
-            self.retire_queues(index);
-        }
+        let retired = remove || compact.is_some();
         if remove {
             if let Some(Flow::Tcp(mut t)) = self.table.remove(index) {
                 t.release(&mut self.pool);
@@ -700,6 +704,9 @@ impl Stack {
                 t.release(&mut self.pool);
             }
             self.table.compact(index, tw);
+        }
+        if retired {
+            self.purge_stale();
         }
         self.timers.refresh(&mut self.table, index);
         self.wake_writers();
@@ -737,11 +744,26 @@ impl Stack {
         }
     }
 
-    fn retire_queues(&mut self, index: u32) {
-        self.events.retain(|id| id.idx != index);
-        self.ready.retain(|id| id.idx != index);
-        self.timewait_ready.retain(|id| id.idx != index);
-        self.writers.retain(|id| id.idx != index);
+    /// Drops queue nodes of removed flows. Every pop already skips them by generation, so this only
+    /// bounds growth: a queue is swept once it holds twice what the live slots could, which costs
+    /// O(1) amortized per removal where sweeping on each removal made mass teardown quadratic.
+    fn purge_stale(&mut self) {
+        let limit = 2 * self.table.slots.len().max(16);
+        let slots = &self.table.slots;
+        for queue in [
+            &mut self.events,
+            &mut self.ready,
+            &mut self.writers,
+            &mut self.timewait_ready,
+        ] {
+            if queue.len() > limit {
+                #[cfg(test)]
+                {
+                    self.purge_visits += queue.len();
+                }
+                queue.retain(|id| slots[id.idx as usize].generation == id.generation);
+            }
+        }
     }
 
     fn control(&mut self, tuple: FourTuple, seq: u32, ack: u32, flags: u8) {
@@ -809,15 +831,38 @@ mod tests {
             let id = stack.tcp_connect(now, remote).unwrap();
             assert_ne!(id, first);
             stack.tcp_close(id);
-            assert!(stack.ready.is_empty());
-            assert!(stack.events.is_empty());
-            assert!(stack.writers.is_empty());
+            // Stale nodes are swept lazily, but never beyond twice the (here one-slot) floor.
+            assert!(stack.ready.len() <= 33, "{}", stack.ready.len());
+            assert!(stack.events.len() <= 33);
+            assert!(stack.writers.len() <= 33);
         }
         assert_eq!(stack.table.slots.len(), 1);
         assert_eq!(stack.tcp_write(first, b"stale"), Err(StreamError::Stale));
         assert!(
             std::mem::size_of::<Tcb>() <= 1024,
             "idle state excludes rings' separately allocated storage"
+        );
+    }
+
+    #[test]
+    fn mass_teardown_does_not_rescan_the_queues_per_flow() {
+        let now = Instant::now();
+        let mut cfg = Config::new([3; 32]);
+        cfg.local_v4 = Some(Ipv4Addr::new(192, 0, 2, 1));
+        let mut stack = Stack::new(cfg, now);
+        let remote = "198.51.100.1:443".parse().unwrap();
+        let ids: Vec<_> = (0..3000)
+            .map(|_| stack.tcp_connect(now, remote).unwrap())
+            .collect();
+        assert_eq!(stack.ready.len(), 3000);
+        for id in ids {
+            stack.tcp_abort(id);
+        }
+        assert_eq!(stack.stats().flows, 0);
+        assert!(
+            stack.purge_visits <= 2 * 3000,
+            "{} queue visits for 3000 removals",
+            stack.purge_visits
         );
     }
 }

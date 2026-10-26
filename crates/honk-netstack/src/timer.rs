@@ -8,12 +8,17 @@ use crate::flow::{Flow, Table};
 
 pub struct Timers {
     heap: BinaryHeap<Reverse<(Instant, u32, u32)>>,
+    /// Full rebuilds so far; lets tests assert that a burst of flows leaves them rare.
+    #[cfg(test)]
+    rebuilds: usize,
 }
 
 impl Timers {
     pub fn new() -> Timers {
         Timers {
             heap: BinaryHeap::new(),
+            #[cfg(test)]
+            rebuilds: 0,
         }
     }
 
@@ -30,8 +35,9 @@ impl Timers {
             slot.scheduled = Some(next);
             self.heap.push(Reverse((next, index, slot.generation)));
         }
-        let live = table.active as usize + table.timewait.len();
-        if self.heap.len() > 2 * live.max(1) {
+        // A rebuild walks every slab slot, so it must be paid for by as many pushes as the slab has
+        // slots: sizing the bound by live flows made each rebuild after a connection burst O(burst).
+        if self.heap.len() > 2 * table.slots.len().max(16) {
             self.rebuild(table);
         }
     }
@@ -49,6 +55,10 @@ impl Timers {
     }
 
     fn rebuild(&mut self, table: &mut Table) {
+        #[cfg(test)]
+        {
+            self.rebuilds += 1;
+        }
         self.heap.clear();
         for (index, slot) in table.slots.iter_mut().enumerate() {
             let next = match slot.flow.as_ref() {
@@ -123,8 +133,38 @@ mod tests {
                 t.expiry = now + Duration::from_secs(seconds);
             }
             timers.refresh(&mut table, id.idx);
-            assert!(timers.heap.len() <= 2, "stale > live must rebuild");
+            assert!(
+                timers.heap.len() <= 32,
+                "stale beyond the slab bound must rebuild"
+            );
             assert_eq!(timers.next(), Some(now + Duration::from_secs(seconds)));
         }
+    }
+
+    #[test]
+    fn a_connection_burst_does_not_make_rebuilds_frequent() {
+        let now = Instant::now();
+        let mut table = Table::new();
+        let mut timers = Timers::new();
+        let ids: Vec<_> = (0..2000)
+            .map(|_| table.insert(entry(now + Duration::from_secs(1000))))
+            .collect();
+        for id in &ids {
+            timers.refresh(&mut table, id.idx);
+        }
+        for id in &ids[1..] {
+            table.remove(id.idx);
+        }
+        // One survivor keeps pulling its deadline earlier; each rebuild walks all 2000 slots.
+        for seconds in (1..100).rev() {
+            if let Some(Flow::TimeWait(t)) = &mut table.slots[ids[0].idx as usize].flow {
+                t.expiry = now + Duration::from_secs(seconds);
+            }
+            timers.refresh(&mut table, ids[0].idx);
+        }
+        assert_eq!(
+            timers.rebuilds, 0,
+            "pushes are paid for by the slab size, not the live count"
+        );
     }
 }

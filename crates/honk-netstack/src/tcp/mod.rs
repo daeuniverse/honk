@@ -1,9 +1,13 @@
 //! TCP protocol state. The stack owns scheduling; each TCB owns its reply obligations.
 
 pub(crate) mod cc;
+mod cubic;
 mod input;
 pub(crate) use input::valid_timewait_fin;
 pub(crate) mod output;
+mod pacing;
+mod prr;
+mod rack;
 pub(crate) mod recovery;
 pub(crate) mod ring;
 pub(crate) mod rtt;
@@ -16,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::flow::FourTuple;
 use crate::{Config, Ready, StreamError};
 use cc::Cc;
+use pacing::Pacer;
 use recovery::Recovery;
 use ring::{CHUNK, Pool, RecvRing, SendRing};
 use sack::OooTable;
@@ -66,6 +71,26 @@ pub struct TcpStats {
     pub send_window: u32,
     pub receive_window: u32,
     pub receive_committed: usize,
+    /// Congestion events (fast recoveries and tail-loss-probe discoveries).
+    pub loss_events: u64,
+    /// Loss episodes later proven spurious (DSACK, timestamp echo or F-RTO).
+    pub spurious_recoveries: u64,
+    /// Congestion windows restored after a spurious episode.
+    pub undo_count: u64,
+    pub tlp_probes: u64,
+    /// Current RACK reordering window.
+    pub reo_wnd: Duration,
+}
+
+/// The counters `TcpStats` reports that no other state derives.
+#[derive(Default)]
+struct Counters {
+    delivery_rate: u64,
+    retrans_bytes: u64,
+    retrans_segments: u32,
+    rto_count: u32,
+    challenge_acks: u32,
+    ooo_drops: u32,
 }
 
 pub struct Tcb {
@@ -123,10 +148,19 @@ pub struct Tcb {
     pub probe_due: bool,
     pub persist: bool,
     pub persist_probes: u8,
+    /// Exponent of the probe interval; unlike the retry count, only an opened window resets it.
+    persist_backoff: u8,
     pub rtt: rtt::Rtt,
     pub cc: Cc,
     pub recovery: Recovery,
     pub cwnd_limited: bool,
+    pacer: Pacer,
+    pacing_deadline: Option<Instant>,
+    tlp_deadline: Option<Instant>,
+    tlp_due: bool,
+    /// `delivered` at the time the sender ran out of data with window to spare; rate samples whose
+    /// data was sent before it do not measure the path (draft-cheng-iccrg-delivery-rate-estimation).
+    app_limited_until: u64,
     pub write_blocked: bool,
     pub write_wait_queued: bool,
     snd_max: usize,
@@ -142,8 +176,10 @@ pub struct Tcb {
     pub delivered: u64,
     pub delivered_ts: Instant,
     pub first_tx_ts: Instant,
-    last_tx: Instant,
-    stats: TcpStats,
+    /// Last data (new or retransmitted) segment sent; ACKs and probes do not count as activity
+    /// for the idle restart (RFC 5681 §4.1).
+    last_data_tx: Instant,
+    stats: Counters,
 }
 
 impl Tcb {
@@ -221,10 +257,16 @@ impl Tcb {
             probe_due: false,
             persist: false,
             persist_probes: 0,
+            persist_backoff: 0,
             rtt: rtt::Rtt::default(),
             cc: Cc::new(u32::from(local_mss)),
             recovery: Recovery::new(iss.wrapping_add(1)),
             cwnd_limited: false,
+            pacer: Pacer::new(now),
+            pacing_deadline: None,
+            tlp_deadline: None,
+            tlp_due: false,
+            app_limited_until: 0,
             write_blocked: false,
             write_wait_queued: false,
             snd_max: cfg.tcp_snd_buf_max.clamp(CHUNK, 1 << 30),
@@ -240,8 +282,8 @@ impl Tcb {
             delivered: 0,
             delivered_ts: now,
             first_tx_ts: now,
-            last_tx: now,
-            stats: TcpStats::default(),
+            last_data_tx: now,
+            stats: Counters::default(),
         }
     }
 
@@ -251,10 +293,17 @@ impl Tcb {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.rto_deadline, self.delack_deadline, self.close_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.rto_deadline,
+            self.delack_deadline,
+            self.close_deadline,
+            self.tlp_deadline,
+            self.recovery.reo_deadline(),
+            self.pacing_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn available(&self) -> usize {
@@ -484,9 +533,29 @@ impl Tcb {
                 self.fail(StreamError::TimedOut);
             }
         }
-        if self.rto_deadline.is_none_or(|t| t > now) {
-            return;
+        if self.pacing_deadline.is_some_and(|t| t <= now) {
+            self.pacing_deadline = None;
         }
+        if self.recovery.reo_deadline().is_some_and(|t| t <= now) {
+            let mss = self.send_mss();
+            self.recovery.reo_timeout(
+                &mut self.sent,
+                &mut self.cc,
+                now,
+                self.snd_nxt,
+                mss,
+                &self.rtt,
+            );
+        }
+        if self.rto_deadline.is_some_and(|t| t <= now) {
+            self.rto_expired(now);
+        } else if self.tlp_deadline.is_some_and(|t| t <= now) {
+            self.tlp_deadline = None;
+            self.tlp_due = true;
+        }
+    }
+
+    fn rto_expired(&mut self, now: Instant) {
         self.rto_deadline = None;
         if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
             if self.syn_retries >= 6 {
@@ -502,12 +571,13 @@ impl Tcb {
                 return;
             }
             self.persist_probes += 1;
+            self.persist_backoff = (self.persist_backoff + 1).min(10);
             self.probe_due = true;
             self.rto_deadline = Some(
                 now + self
                     .rtt
                     .rto()
-                    .saturating_mul(1 << self.persist_probes.min(10))
+                    .saturating_mul(1 << self.persist_backoff)
                     .min(rtt::MAX_RTO),
             );
         } else if self.sent.outstanding != 0 {
@@ -520,7 +590,37 @@ impl Tcb {
             self.recovery
                 .rto(&mut self.sent, &mut self.cc, self.snd_nxt, mss);
             self.rtt.timeout();
+            self.tlp_deadline = None;
+            self.tlp_due = false;
         }
+    }
+
+    /// Arms the tail loss probe (RFC 8985 §7.2): `2 * SRTT`, plus the peer's ACK delay when a lone
+    /// segment is in flight, never later than the retransmission timer.
+    pub fn rearm_pto(&mut self, now: Instant) {
+        self.tlp_deadline = None;
+        if !self.sack
+            || self.persist
+            || self.recovery.state() != recovery::State::Open
+            || self.sent.outstanding == 0
+            || self.recovery.rack.tlp.is_some()
+            || !matches!(
+                self.state,
+                TcpState::Established
+                    | TcpState::CloseWait
+                    | TcpState::FinWait1
+                    | TcpState::LastAck
+            )
+        {
+            return;
+        }
+        let Some(srtt) = self.rtt.srtt() else { return };
+        let mut pto = 2 * srtt;
+        if self.sent.queue.len() <= 1 {
+            pto += rack::MAX_ACK_DELAY;
+        }
+        let rto = self.rto_deadline.unwrap_or(now + self.rtt.rto());
+        self.tlp_deadline = Some((now + pto).min(rto));
     }
 
     pub fn rearm(&mut self, now: Instant) {
@@ -530,7 +630,10 @@ impl Tcb {
         ) {
             return;
         }
+        // A probe replaces the retransmission timer only when nothing is outstanding: with data in
+        // flight a zero window must still retransmit the head, or a lost hole stalls forever.
         if self.snd_wnd == 0
+            && self.sent.outstanding == 0
             && (self.tx.len() != 0 || (self.fin_requested && self.fin_seq.is_none()))
         {
             self.persist = true;
@@ -586,11 +689,32 @@ impl Tcb {
             sacked_bytes: self.sent.sacked,
             lost_bytes: self.sent.lost,
             retrans_in_flight: self.sent.retrans,
+            loss_events: u64::from(self.recovery.counters.loss_events),
+            spurious_recoveries: u64::from(self.recovery.counters.spurious_recoveries),
+            undo_count: u64::from(self.recovery.counters.undo_count),
+            tlp_probes: u64::from(self.recovery.counters.tlp_probes),
+            reo_wnd: self
+                .recovery
+                .reo_wnd_now(&self.sent, &self.rtt, self.send_mss()),
             pmtu: self.pmtu,
             send_window: self.snd_wnd,
             receive_window: self.receive_window(),
             receive_committed: (self.rx.charged() + 1) * CHUNK,
-            ..self.stats
+            delivery_rate: self.stats.delivery_rate,
+            retrans_bytes: self.stats.retrans_bytes,
+            retrans_segments: u64::from(self.stats.retrans_segments),
+            rto_count: u64::from(self.stats.rto_count),
+            challenge_acks: u64::from(self.stats.challenge_acks),
+            ooo_drops: u64::from(self.stats.ooo_drops),
+        }
+    }
+
+    /// Debug-build invariants tying the scoreboard to the sequence variables; `Stack` runs it
+    /// after every call that can change this flow.
+    pub fn check(&self) {
+        // Before the SYN is acknowledged the scoreboard (which starts after it) has no `snd_una`.
+        if self.snd_una != self.iss {
+            self.sent.check_bounds(self.snd_una, self.snd_nxt);
         }
     }
 
@@ -634,5 +758,33 @@ mod tests {
         t.peer_fin_seen = true;
         t.rcv_nxt = 2;
         assert_eq!(t.read(&mut pool, &mut [], now), Ok(0));
+    }
+
+    #[test]
+    fn non_sack_retransmissions_leave_no_rack_bookkeeping() {
+        let now = Instant::now();
+        let tuple = FourTuple {
+            local: "192.0.2.1:40000".parse().unwrap(),
+            remote: "198.51.100.1:443".parse().unwrap(),
+        };
+        let mut t = Tcb::new(tuple, &Config::new([1; 32]), now, now, 100, 200);
+        let mut pool = Pool::new(8);
+        t.state = TcpState::Established;
+        t.snd_una = 101;
+        t.snd_nxt = 101;
+        assert_eq!(t.write(&mut pool, &[9; 2000]), Ok(2000));
+        let mut out = [0u8; 1500];
+        while let output::Output::Sent(_) = t.output(now, &mut out, &mut pool) {}
+        t.sent.mark_first_lost();
+        assert!(matches!(
+            t.output(now, &mut out, &mut pool),
+            output::Output::Sent(_)
+        ));
+        assert_eq!(t.stats().retrans_segments, 1);
+        assert_eq!(
+            t.recovery.rack.pending_retransmits(),
+            0,
+            "only SACK flows trim this queue, so it must not grow here"
+        );
     }
 }

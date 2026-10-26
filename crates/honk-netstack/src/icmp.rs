@@ -20,7 +20,8 @@ impl Stack {
         let Some(quote) = wire::icmp::parse_quoted(quoted_packet) else {
             return Rx::Consumed;
         };
-        if quote.proto != wire::PROTO_TCP {
+        // A v6 error cannot speak for a v4 flow (or the reverse): the quote must match the outer family.
+        if quote.proto != wire::PROTO_TCP || quote.src.is_ipv4() != ip.src.is_ipv4() {
             return Rx::Consumed;
         }
         let Some(quoted_seq) = quote.seq else {

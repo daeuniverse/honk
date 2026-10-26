@@ -6,7 +6,8 @@
 //! stack-owned rings, so a driver may recycle any buffer as soon as a call returns.
 //!
 //! TCP supports active open (including simultaneous open), SACK/DSACK, timestamps,
-//! scaled/autotuned receive windows, Reno/NewReno, delayed ACKs, RTO and zero-window
+//! scaled/autotuned receive windows, CUBIC with HyStart++, RACK-TLP loss detection, PRR,
+//! spurious-loss undo (DSACK, Eifel, F-RTO), pacing, delayed ACKs, RTO and zero-window
 //! probes. There is no listen API, IP reassembly, ECN, urgent-data API or ICMP emission.
 //! Unknown TCP options are ignored; malformed lengths stop option parsing. Incoming IP
 //! and transport checksums are always verified before changing a flow.
