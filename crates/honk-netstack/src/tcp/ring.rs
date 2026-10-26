@@ -8,9 +8,28 @@ use std::sync::Arc;
 
 use crate::budget::MemoryBudget;
 
+/// Endpoint-mode chunk size and the default of a [`Pool`] built without [`Pool::with_chunk`].
 pub const CHUNK: usize = 16 * 1024;
+/// Transparent-mode default: with many small client flows a 4 KiB chunk keeps the per-flow floor
+/// (accounting only, an idle flow holds no chunk) near 9 KiB.
+pub const TRANSPARENT_CHUNK: usize = 4 * 1024;
+/// Smallest and largest configurable chunk.
+pub const MIN_CHUNK: usize = 4 * 1024;
+pub const MAX_CHUNK: usize = 64 * 1024;
+/// Payload slices a maximum-size (64 KiB) IP packet can span at the smallest chunk, including an
+/// unaligned first chunk.
+pub const MAX_PARTS: usize = 65536 / MIN_CHUNK + 2;
+
 /// What admission reserves for one TCP flow: a TX and an RX chunk and the descriptor floor.
-pub const FLOOR: usize = 2 * CHUNK + super::sent::FLOOR_BYTES;
+pub const fn floor(chunk: usize) -> usize {
+    2 * chunk + super::sent::FLOOR_BYTES
+}
+
+/// A configured chunk size, clamped to `[MIN_CHUNK, MAX_CHUNK]`.
+pub fn clamp_chunk(chunk: usize) -> usize {
+    chunk.clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
 /// Free chunks kept for reuse at most, so a bulk flow does not return a chunk to the allocator and
 /// take one back for every 16 KiB. An idle pool keeps one (see `free`).
 const FREE_CACHE: usize = 64;
@@ -24,10 +43,11 @@ fn trim<T>(chunks: &mut VecDeque<T>) {
     }
 }
 
-/// A thin pointer: the chunk lists of idle rings stay half the size of fat `Box<[u8]>` ones.
-pub type Chunk = Box<[u8; CHUNK]>;
+/// `Box<[u8]>` of the pool's chunk size.
+pub type Chunk = Box<[u8]>;
 
 pub struct Pool {
+    chunk: usize,
     free: Vec<Chunk>,
     shared_limit: usize,
     shared_used: usize,
@@ -48,6 +68,7 @@ impl Pool {
 
     pub fn with_limits(shared_limit_bytes: usize, total_limit: usize) -> Pool {
         Pool {
+            chunk: CHUNK,
             free: Vec::new(),
             shared_limit: shared_limit_bytes,
             shared_used: 0,
@@ -64,14 +85,28 @@ impl Pool {
         self
     }
 
+    /// Chunk size for every chunk this pool hands out; call before the first allocation.
+    pub fn with_chunk(mut self, chunk: usize) -> Pool {
+        self.chunk = chunk;
+        self
+    }
+
+    pub fn chunk(&self) -> usize {
+        self.chunk
+    }
+
+    pub fn floor(&self) -> usize {
+        floor(self.chunk)
+    }
+
     /// Charges one flow's floor to the process budget (the pool's own floors are carved out of
     /// its limit up front). Pair with `release_floor` when the flow retires.
     pub fn admit_floor(&mut self) -> bool {
-        self.charge(FLOOR)
+        self.charge(self.floor())
     }
 
     pub fn release_floor(&mut self) {
-        self.refund(FLOOR);
+        self.refund(self.floor());
     }
 
     fn charge(&mut self, bytes: usize) -> bool {
@@ -93,7 +128,7 @@ impl Pool {
     }
 
     pub fn reserve(&mut self, chunks: usize) -> bool {
-        self.reserve_bytes(chunks * CHUNK)
+        self.reserve_bytes(chunks * self.chunk)
     }
 
     pub fn reserve_bytes(&mut self, bytes: usize) -> bool {
@@ -105,7 +140,7 @@ impl Pool {
     }
 
     pub fn release(&mut self, chunks: usize) {
-        self.release_bytes(chunks * CHUNK);
+        self.release_bytes(chunks * self.chunk);
     }
 
     pub fn release_bytes(&mut self, bytes: usize) {
@@ -117,12 +152,12 @@ impl Pool {
 
     pub fn shared_free(&self) -> usize {
         let own = self.shared_limit - self.shared_used;
-        self.budget.as_ref().map_or(own, |b| own.min(b.available())) / CHUNK
+        self.budget.as_ref().map_or(own, |b| own.min(b.available())) / self.chunk
     }
 
     #[cfg(test)]
     pub fn shared_used(&self) -> usize {
-        self.shared_used / CHUNK
+        self.shared_used / self.chunk
     }
 
     pub fn shared_bytes(&self) -> usize {
@@ -152,12 +187,12 @@ impl Pool {
     #[cfg(feature = "fuzz-checks")]
     pub fn check_held(&self, floors: usize) {
         if self.budget.is_some() {
-            assert_eq!(self.held, floors * FLOOR + self.shared_used);
+            assert_eq!(self.held, floors * self.floor() + self.shared_used);
         }
     }
 
     pub fn allocated_bytes(&self) -> usize {
-        (self.live + self.free.len()) * CHUNK + self.metadata
+        (self.live + self.free.len()) * self.chunk + self.metadata
     }
 
     pub fn metadata_grow(&mut self, bytes: usize) {
@@ -174,12 +209,9 @@ impl Pool {
 
     pub fn alloc(&mut self) -> Chunk {
         self.live += 1;
-        self.free.pop().unwrap_or_else(|| {
-            vec![0u8; CHUNK]
-                .into_boxed_slice()
-                .try_into()
-                .expect("exactly one chunk")
-        })
+        self.free
+            .pop()
+            .unwrap_or_else(|| vec![0u8; self.chunk].into_boxed_slice())
     }
 
     pub fn free(&mut self, chunk: Chunk) {
@@ -214,19 +246,21 @@ impl SendRing {
         self.len
     }
 
-    pub fn tail_room(&self) -> usize {
+    pub fn tail_room(&self, pool: &Pool) -> usize {
+        let chunk = pool.chunk();
         if self.chunks.is_empty() {
-            CHUNK
+            chunk
         } else {
-            self.chunks.len() * CHUNK - self.head - self.len
+            self.chunks.len() * chunk - self.head - self.len
         }
     }
 
     pub fn write(&mut self, pool: &mut Pool, data: &[u8]) -> usize {
+        let chunk = pool.chunk();
         let mut done = 0;
         while done < data.len() {
             let end = self.head + self.len;
-            let (ci, co) = (end / CHUNK, end % CHUNK);
+            let (ci, co) = (end / chunk, end % chunk);
             if ci == self.chunks.len() {
                 // The first chunk is the free floor; later ones are shared.
                 if !self.chunks.is_empty() && !pool.reserve(1) {
@@ -234,7 +268,7 @@ impl SendRing {
                 }
                 self.chunks.push_back(pool.alloc());
             }
-            let n = (CHUNK - co).min(data.len() - done);
+            let n = (chunk - co).min(data.len() - done);
             self.chunks[ci][co..co + n].copy_from_slice(&data[done..done + n]);
             done += n;
             self.len += n;
@@ -242,16 +276,17 @@ impl SendRing {
         done
     }
 
-    /// A maximum-size IP packet spans at most five 16 KiB chunks, including an
-    /// unaligned first chunk. The unused array slots never reach the checksum loop.
-    pub fn slices(&self, off: usize, len: usize) -> ([&[u8]; 5], usize) {
+    /// A maximum-size IP packet spans at most [`MAX_PARTS`] chunks, including an unaligned first
+    /// chunk. The unused array slots never reach the checksum loop.
+    pub fn slices(&self, off: usize, len: usize) -> ([&[u8]; MAX_PARTS], usize) {
         debug_assert!(off + len <= self.len && len <= usize::from(u16::MAX));
-        let mut parts: [&[u8]; 5] = [&[]; 5];
+        let mut parts: [&[u8]; MAX_PARTS] = [&[]; MAX_PARTS];
         let mut pos = self.head + off;
         let (mut left, mut count) = (len, 0);
+        let chunk = self.chunks.front().map_or(1, |c| c.len());
         while left != 0 {
-            let (ci, co) = (pos / CHUNK, pos % CHUNK);
-            let n = left.min(CHUNK - co);
+            let (ci, co) = (pos / chunk, pos % chunk);
+            let n = left.min(chunk - co);
             parts[count] = &self.chunks[ci][co..co + n];
             count += 1;
             pos += n;
@@ -268,9 +303,10 @@ impl SendRing {
             self.clear(pool);
             return;
         }
-        while self.head >= CHUNK {
+        let chunk = pool.chunk();
+        while self.head >= chunk {
             self.pop_front(pool);
-            self.head -= CHUNK;
+            self.head -= chunk;
         }
     }
 
@@ -317,13 +353,13 @@ impl RecvRing {
         }
     }
 
-    fn want_charge(&self, right: u32) -> usize {
+    fn want_charge(&self, chunk: usize, right: u32) -> usize {
         let span = self.head + right.wrapping_sub(self.rd_seq) as usize;
-        span.div_ceil(CHUNK).saturating_sub(1)
+        span.div_ceil(chunk).saturating_sub(1)
     }
 
     pub fn limit_right(&self, pool: &Pool, want: u32) -> u32 {
-        let capacity = (self.charged + 1 + pool.shared_free()) * CHUNK - self.head;
+        let capacity = (self.charged + 1 + pool.shared_free()) * pool.chunk() - self.head;
         self.rd_seq.wrapping_add(
             want.wrapping_sub(self.rd_seq)
                 .min(capacity.min(u32::MAX as usize) as u32),
@@ -332,7 +368,7 @@ impl RecvRing {
 
     /// Reserve shared chunks so the window may extend to `right`.
     pub fn grow(&mut self, pool: &mut Pool, right: u32) -> bool {
-        let want = self.want_charge(right);
+        let want = self.want_charge(pool.chunk(), right);
         if want > self.charged {
             if !pool.reserve(want - self.charged) {
                 return false;
@@ -343,7 +379,7 @@ impl RecvRing {
     }
 
     pub fn shrink(&mut self, pool: &mut Pool, right: u32) {
-        let want = self.want_charge(right);
+        let want = self.want_charge(pool.chunk(), right);
         if want < self.charged {
             pool.release(self.charged - want);
             self.charged = want;
@@ -352,15 +388,16 @@ impl RecvRing {
 
     /// `seq` must be inside the committed window.
     pub fn write_at(&mut self, pool: &mut Pool, seq: u32, data: &[u8]) {
+        let chunk_len = pool.chunk();
         let mut pos = self.head + seq.wrapping_sub(self.rd_seq) as usize;
         let mut rest = data;
         while !rest.is_empty() {
-            let (ci, co) = (pos / CHUNK, pos % CHUNK);
+            let (ci, co) = (pos / chunk_len, pos % chunk_len);
             while self.chunks.len() <= ci {
                 self.chunks.push_back(None);
             }
             let chunk = self.chunks[ci].get_or_insert_with(|| pool.alloc());
-            let n = (CHUNK - co).min(rest.len());
+            let n = (chunk_len - co).min(rest.len());
             chunk[co..co + n].copy_from_slice(&rest[..n]);
             rest = &rest[n..];
             pos += n;
@@ -375,11 +412,11 @@ impl RecvRing {
             let Some(Some(chunk)) = self.chunks.front() else {
                 break;
             };
-            let n = (CHUNK - self.head).min(want - done);
+            let n = (chunk.len() - self.head).min(want - done);
             out[done..done + n].copy_from_slice(&chunk[self.head..self.head + n]);
             done += n;
             self.head += n;
-            if self.head == CHUNK {
+            if self.head == chunk.len() {
                 if let Some(Some(c)) = self.chunks.pop_front() {
                     pool.free(c);
                 }
@@ -464,7 +501,7 @@ mod tests {
             ring.consume(&mut pool, data.len());
             assert_eq!((pool.shared_used(), pool.live_chunks()), (0, 0));
         }
-        assert_eq!(ring.tail_room(), CHUNK);
+        assert_eq!(ring.tail_room(&pool), CHUNK);
     }
 
     #[test]

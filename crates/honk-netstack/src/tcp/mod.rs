@@ -23,7 +23,7 @@ use crate::{Config, Ready, StreamError};
 use cc::Cc;
 use pacing::Pacer;
 use recovery::Recovery;
-use ring::{CHUNK, Pool, RecvRing, SendRing};
+use ring::{Pool, RecvRing, SendRing};
 use sack::OooTable;
 use sent::Sent;
 
@@ -204,7 +204,8 @@ impl Tcb {
             .saturating_sub(if tuple.local.is_ipv6() { 60 } else { 40 })
             .max(1);
         let peer_mss = if tuple.local.is_ipv6() { 1220 } else { 536 };
-        let rcv_max = cfg.tcp_rcv_buf_max.clamp(CHUNK, 1 << 30);
+        let chunk = cfg.chunk();
+        let rcv_max = cfg.tcp_rcv_buf_max.clamp(chunk, 1 << 30);
         let mut rcv_shift = 0;
         while rcv_shift < 14 && (u16::MAX as usize) << rcv_shift < rcv_max {
             rcv_shift += 1;
@@ -276,7 +277,7 @@ impl Tcb {
             app_limited_until: 0,
             write_blocked: false,
             write_wait_queued: false,
-            snd_max: cfg.tcp_snd_buf_max.clamp(CHUNK, 1 << 30),
+            snd_max: cfg.tcp_snd_buf_max.clamp(chunk, 1 << 30),
             rcv_max,
             rcv_target: usize::from(u16::MAX).min(rcv_max),
             rcv_mss: usize::from(local_mss.min(536)),
@@ -357,7 +358,7 @@ impl Tcb {
             self.write_blocked = true;
             return Err(StreamError::WouldBlock);
         }
-        let limit = self.send_limit();
+        let limit = self.send_limit(pool.chunk());
         let n = self.tx.write(
             pool,
             &data[..data.len().min(limit.saturating_sub(self.tx.len()))],
@@ -369,20 +370,22 @@ impl Tcb {
         Ok(n)
     }
 
-    fn send_limit(&self) -> usize {
+    fn send_limit(&self, chunk: usize) -> usize {
         (2 * self.cc.cwnd() as usize)
-            .max(4 * CHUNK)
+            .max(4 * chunk)
             .min(self.snd_max)
     }
 
     pub fn can_write(&self, pool: &Pool) -> bool {
-        let threshold = CHUNK.min(self.send_limit() / 2);
+        let chunk = pool.chunk();
+        let limit = self.send_limit(chunk);
+        let threshold = chunk.min(limit / 2);
         self.app_open
             && self.error.is_none()
             && !self.fin_requested
             && matches!(self.state, TcpState::Established | TcpState::CloseWait)
-            && self.send_limit().saturating_sub(self.tx.len()) >= threshold
-            && (pool.shared_free() != 0 || self.tx.tail_room() >= threshold)
+            && limit.saturating_sub(self.tx.len()) >= threshold
+            && (pool.shared_free() != 0 || self.tx.tail_room(pool) >= threshold)
     }
 
     pub fn read(
@@ -690,7 +693,7 @@ impl Tcb {
         self.sent.pmtu_changed(cap);
     }
 
-    pub fn stats(&self) -> TcpStats {
+    pub fn stats(&self, chunk: usize) -> TcpStats {
         TcpStats {
             srtt: self.rtt.srtt(),
             rto: self.rtt.rto(),
@@ -711,7 +714,7 @@ impl Tcb {
             pmtu: self.pmtu,
             send_window: self.snd_wnd,
             receive_window: self.receive_window(),
-            receive_committed: (self.rx.charged() + 1) * CHUNK,
+            receive_committed: (self.rx.charged() + 1) * chunk,
             delivery_rate: self.stats.delivery_rate,
             retrans_bytes: self.stats.retrans_bytes,
             retrans_segments: u64::from(self.stats.retrans_segments),
@@ -776,6 +779,7 @@ impl Tcb {
 
 #[cfg(test)]
 mod tests {
+    use super::ring::CHUNK;
     use super::*;
 
     #[test]
@@ -829,7 +833,7 @@ mod tests {
             t.output(now, &mut out, &mut pool),
             output::Output::Sent(_)
         ));
-        assert_eq!(t.stats().retrans_segments, 1);
+        assert_eq!(t.stats(CHUNK).retrans_segments, 1);
         assert_eq!(
             t.recovery.rack.pending_retransmits(),
             0,

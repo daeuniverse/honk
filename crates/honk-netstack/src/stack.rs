@@ -13,7 +13,7 @@ use crate::fragment::{FragmentLimits, Push};
 use crate::icmp_out::IcmpLimits;
 use crate::mode::{Mode, is_unicast};
 use crate::tcp::output::Output;
-use crate::tcp::ring::{FLOOR, Pool};
+use crate::tcp::ring::{self, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
 use crate::timer::Timers;
 use crate::wire::{self, ParseError};
@@ -42,6 +42,11 @@ pub struct Config {
     pub icmp_limits: IcmpLimits,
     /// Transparent mode: IP fragment reassembly limits.
     pub fragment_limits: FragmentLimits,
+    /// TCP buffer chunk size in bytes (clamped to 4..=64 KiB). `None`: 16 KiB in
+    /// [`Mode::Endpoint`], 4 KiB in [`Mode::Transparent`], so a transparent flow's funded floor
+    /// (two chunks plus the descriptor floor, about 9 KiB) stays small; the floor is accounting
+    /// only, an idle flow holds no chunk.
+    pub tcp_chunk: Option<usize>,
 }
 
 impl Config {
@@ -58,10 +63,18 @@ impl Config {
             shared_budget: None,
             icmp_limits: IcmpLimits::default(),
             fragment_limits: FragmentLimits::default(),
+            tcp_chunk: None,
             mode: Mode::Endpoint,
             half_open_max: 1024,
             half_open_per_source: 128,
         }
+    }
+    /// The effective chunk size.
+    pub fn chunk(&self) -> usize {
+        ring::clamp_chunk(self.tcp_chunk.unwrap_or(match self.mode {
+            Mode::Endpoint => ring::CHUNK,
+            Mode::Transparent { .. } => ring::TRANSPARENT_CHUNK,
+        }))
     }
 }
 
@@ -265,11 +278,13 @@ impl Stack {
         } else {
             68
         });
+        let floor = ring::floor(cfg.chunk());
         let floor_cap = cfg
             .max_flows
-            .min((cfg.memory_limit / FLOOR).min(u32::MAX as usize) as u32);
-        let reserved = floor_cap as usize * FLOOR;
+            .min((cfg.memory_limit / floor).min(u32::MAX as usize) as u32);
+        let reserved = floor_cap as usize * floor;
         let pool = Pool::with_limits(cfg.memory_limit.saturating_sub(reserved), cfg.memory_limit)
+            .with_chunk(cfg.chunk())
             .with_budget(cfg.shared_budget.clone());
         let ports = Ports::new(&cfg.secret);
         Stack {
@@ -696,7 +711,7 @@ impl Stack {
         if result == Err(StreamError::WouldBlock)
             && !t.write_wait_queued
             && self.pool.shared_free() == 0
-            && t.tx.tail_room() == 0
+            && t.tx.tail_room(&self.pool) == 0
         {
             t.write_wait_queued = true;
             self.writers.push_back(id);
@@ -757,14 +772,15 @@ impl Stack {
     }
     pub fn tcp_stats(&self, id: FlowId) -> Option<TcpStats> {
         match self.table.get(id)? {
-            Flow::Tcp(t) => Some(t.stats()),
+            Flow::Tcp(t) => Some(t.stats(self.pool.chunk())),
             _ => None,
         }
     }
 
     pub fn stats(&self) -> StackStats {
         StackStats {
-            memory_committed: self.table.tcp_active as usize * FLOOR + self.pool.shared_bytes(),
+            memory_committed: self.table.tcp_active as usize * self.pool.floor()
+                + self.pool.shared_bytes(),
             memory_allocated: self.pool.allocated_bytes(),
             flows: self.table.active,
             half_open: self.half_open,
