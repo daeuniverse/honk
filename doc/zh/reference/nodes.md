@@ -41,6 +41,8 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括 headers、padding 和 POST 间隔。输入别名、header 名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
 
+WireGuard 身份包含规范化的端点 host/port、解码后的私钥/公钥/预共享密钥、本地隧道主机地址、reserved 字节、已掩码/排序/去重的 allowed IPs，以及有效 UDP 权限。数字端点表示和 DNS ASCII 大小写会规范化；接口前缀不改变身份。全零 PSK 或 reserved 等同于省略。MTU 和 persistent keepalive 仅调优同一个认证 peer，不选择另一条拨号路径，因此不参与身份；显示名称、tags、mark 和来源元数据同样不参与。其他协议已有的身份规则不变。
+
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
 **破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及 session 状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
@@ -53,7 +55,7 @@ XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的
 
 ## 节点字段
 
-Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、fragment 和 query 填充面向操作者的字段；明确标为元数据的行由结构化 loader、导入或运行时管理。它们都不是 dae `node {}` 中的独立键。下表默认值是模型默认值；URL 形分享链接省略端口时使用 `443`，而 v2rayN VMess payload 必须包含有效端口。
+Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、fragment 和 query 填充面向操作者的字段；明确标为元数据的行由结构化 loader、导入或运行时管理。它们都不是 dae `node {}` 中的独立键。下表默认值是模型默认值；URL 形分享链接省略端口时使用 `443`，但 WireGuard 必须显式提供非零端口。v2rayN VMess payload 也必须包含有效端口。
 
 | 字段 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
@@ -62,7 +64,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `protocol` | enum | `ss` | 从分享链接 scheme 派生 |
 | `address` | string | `""` | 解析后的链接存储 `host:port` |
 | `host` | string | `""` | 显式服务端主机；否则 `Node::host()` 从 `address` 派生 |
-| `port` | u16 | `0` | 服务端端口；URL 形链接省略时使用 `443` |
+| `port` | u16 | `0` | 服务端端口；URL 形链接省略时使用 `443`，但 WireGuard 必须显式提供端口 |
 | `username` / `password` | string? | null | 来自 userinfo 的认证、UUID 或密钥 |
 | `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串；Shadowsocks 省略时拨号阶段回退到 `aes-128-gcm` |
 | `packet_encoding` | `VlessUdpEncoding` | VLESS 使用 `auto` | 结构化 VLESS 回退 encoding：`auto`、`native`、`xudp` 或 `uot-v2`；规范 URI 的 `packetEncoding=none` 映射为 `native` |
@@ -99,6 +101,13 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `anytls_min_idle_session` | usize? | null | 来自 `min_idle_session` 的空闲 session 目标下限；有效默认值 0，受八条 session 的池上限约束 |
 | `anytls_idle_session_check_interval` | u64? | null | 解析后的 `idle_session_check_interval` 秒数；当前运行时 janitor 周期仍固定为 30 秒 |
 | `anytls_idle_session_timeout` | u64? | null | 来自 `idle_session_timeout` 的空闲驱逐；有效默认值 30 秒 |
+| `wg_private_key` / `wg_public_key` | base64 string | WireGuard 必填 | 本地私钥和唯一 peer 的公钥；各自必须解码为恰好 32 字节 |
+| `wg_preshared_key` | base64 string? | null | 可选的 32 字节 peer PSK；全零等同于省略 |
+| `wg_addresses` | string[] | WireGuard 必填 | 至少一个隧道地址，至多一个 IPv4 和一个 IPv6；接受有效前缀后缀，去除前缀但不掩码主机地址 |
+| `wg_mtu` | u16 | `1420` | 内层 IP MTU；配置 IPv6 地址时范围 `1280..=65472`，仅 IPv4 时 `576..=65472`（65472 是补齐并加密后的数据报仍能装进一个 IPv4 UDP 载荷的最大值）；零和越界值会拒绝 |
+| `wg_keepalive` | u16? | null | Persistent keepalive 秒数；`0` 表示关闭 |
+| `wg_reserved` | byte[3]? | null | WARP 客户端标识；driver 将其保留在报文头第 1–3 字节；全零等同于省略 |
+| `wg_allowed_ips` | CIDR string[] | `["0.0.0.0/0", "::/0"]` | 唯一 peer 的目的/来源前缀；派生身份前掩码主机位、排序并去重；显式空列表会拒绝 |
 | `mark` | u32? | null | 结构化模型中的出站 `SO_MARK`；不是 dae 分享链接 query |
 | `tags` | string[] | `[]` | 分类元数据；不是 dae 分享链接 query |
 | `subscription_id` / `group_id` | UUID? | null | 导入/运行时归属元数据 |
@@ -149,10 +158,15 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `tuic` | — | 是 | 是 | QUIC 上的 TUIC v5 |
 | `juicity` | — | 是 | 是 | QUIC 上的 Juicity |
 | `anytls` | — | 是 | 是* | 多路复用 TLS session 与 UoT v2 |
+| `wireguard` | `wg` | 是 | 是* | 单 peer IPv4/IPv6 用户态隧道；目标按地址拨号，且必须落在 peer 的 allowed IPs 内 |
 | `direct` | — | 是 | 是 | 保留的内置直连出站；没有分享链接 scheme |
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接 scheme |
 
 `network` 可独立于流 transport 关闭 Trojan、AnyTLS 和 VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。AnyTLS UDP 使用 non-connect UoT v2：每个 datagram 都携带目的地和服务端的真实源地址，因此一条 stream 服务一个客户端 source 的全部目的地，主动到达的回包也保留真实源地址。Trojan UDP 为每个客户端 source 使用一条 associate 流承载所有目的地，并返回每个回复的真实来源，配合服务端可获得 EIM/EIF 行为；各目的地共享该流的队头阻塞与失败命运。VMess UDP 尚未实现。
+
+WireGuard 使用相同的 `network` 数据包权限：省略、`udp` 或 `tcp,udp` 允许 UDP，`tcp` 关闭 UDP；这不会禁止 TCP。隧道内是三层网络：TCP/UDP 目标按数字地址连接（目标域名只是元数据，不会在远端解析），并且必须落在 `wg_allowed_ips` 内，否则该流被拒绝，且不发送任何报文——TCP 视为目标失败，UDP 视为 policy 拒绝。目标所属 IP 族若没有配置隧道地址，TCP 拨号与 UDP 关联打开同样在握手开始前被拒绝，视为目标失败。peer 从 `wg_allowed_ips` 之外发来的数据报会被丢弃。隧道内的 RST 或 ICMP 不可达是目标的拒绝；握手未完成，或会话过期、隧道在流使用期间丢失，则是节点失败。认证失败的数据报被静默丢弃，不计入节点。隧道由密钥对加上按原样书写的端点主机与端口标识：隧道设置（包括 MTU 与 keepalive）完全相同的所有 runtime 共享同一条活动隧道，因为到同一 peer 的相同密钥对的两个会话会使彼此的握手失效。密钥对与端点相同但设置不同的节点会替换活动隧道，并以 runtime 已关闭错误关闭其上的流（这不是节点失败）；因此共享密钥对与端点的节点必须在所有隧道设置上一致，否则会不断互相替换。同一密钥对用于不同端点（WARP 式列表）则是相互独立的隧道。端点按书写形式比较：主机名与其解析出的 IP 地址，或同一服务器的 IPv4 与 IPv6 字面量，是不同的端点，会建立各自独立的隧道与会话。参见 [WireGuard 隧道](../design/outbound.md#wireguard-隧道)。
+
+一个进程内所有隧道从同一份内存预算分配隧道内流的缓冲：RAM 的八分之一，限制在 64 MiB 到 4 GiB 之间（RAM 未知时 256 MiB）。每条被接纳的 TCP 流在接纳时预留约 33 KiB，因此仅按预算计算，64 MiB 下限（RAM 不超过 512 MiB）约容纳 2,000 条并发内部流，256 MiB（2 GiB RAM）约 8,000 条，1 GiB（8 GiB RAM）约 32,000 条；流超出该保底的窗口也取自同一预算，所以少数高速下载会先于大量空闲流耗尽预算。单条隧道最多承载 4,096 条流，并运行在一个核上。活动隧道的数量另由其固定开销限制（每条 4 MiB，最多 128 条）：RAM 不超过 512 MiB 时 16 条，2 GiB 时 64 条，4 GiB 及以上 128 条。达到上限时，未被使用的隧道会被回收以腾出位置；所有隧道都在使用时，新拨号以本地容量拒绝，这不是节点失败。
 
 SOCKS5 UDP ASSOCIATE 为每个客户端 source 保持一条控制 TCP 连接和一个中继 socket，该 source 的所有目的地共用它，并返回每个应答头中的真实远端 peer。从未联系过的 peer 能否到达客户端取决于服务器：Dante 默认的 `udp.connectdst: yes` 仅在只使用过单一目的地期间才会连接其出站 socket。
 
@@ -323,6 +337,24 @@ node {
 
 Duration 接受裸秒数以及 `ms`、`s`、`m`、`h` 后缀。
 
+### WireGuard
+
+`wireguard://` 和 `wg://` 同时接受 v2rayN 的 userinfo 私钥形式及 Hiddify 的 `pk` query 形式。所有 key 字段接受标准或 URL-safe base64，可带或不带 padding，解码后必须恰好 32 字节；序列化统一为带 padding 的标准 base64。请对 userinfo 和 query 中的 key 做百分号编码，尤其是 `/` 与 `+`；query 中未编码的 `+` 也会保留为 key 数据。错误和诊断不会回显凭据。重复键和别名必须在类型规范化后相同。每个节点恰好一个 peer；多 peer 条目会拒绝，订阅中的其他有效条目仍可保留。
+
+| 分享链接 query | 规范字段 | 接受的别名 / 规则 |
+| --- | --- | --- |
+| userinfo 或 `privatekey` | `wg_private_key` | `private_key`、`private-key`、`privateKey`、`pk`；userinfo 与 query 必须一致 |
+| `publickey` | `wg_public_key` | `public_key`、`public-key`、`publicKey`、`peer_pk`、`peer_public_key` |
+| `presharedkey` | `wg_preshared_key` | `preshared_key`、`pre_shared_key`、`pre-shared-key`、`presharedKey`、`psk` |
+| `address` | `wg_addresses` | `local_address`、`local-address`；逗号分隔的主机 IP，可带前缀；独立 `selfIP` / `selfIPv6` 声明必须一致 |
+| `mtu` | `wg_mtu` | 默认值及按地址族区分的范围见上表；格式错误不会静默回退默认值 |
+| `keepalive` | `wg_keepalive` | `keep-alive`、`persistent-keepalive`、`persistent_keepalive`、`persistent_keepalive_interval`；无符号 16 位整数秒数 |
+| `reserved` | `wg_reserved` | `client_id`、`client-id`；三个逗号分隔的十进制字节，或解码后恰好三个字节的 base64 |
+| `allowedips` | `wg_allowed_ips` | `allowed_ips`、`allowed-ips`；逗号分隔 IP/CIDR，省略时默认两个全路由前缀 |
+| `udp` | `network` | `1`/`true` 允许，`0`/`false` 关闭；若同时给出数据包 `network` 则必须一致 |
+
+WireGuard query 别名忽略 ASCII 大小写。缺少本地地址时不会编造地址。URI `peers` payload 与 AmneziaWG 线协议混淆参数不受支持，不会静默降级。端点使用既有 Node host/port 字段。Mihomo `peers` 与 sing-box endpoint 映射见[订阅参考](./subscription.md)。
+
 ## VLESS
 
 <a id="vless-udp-and-multiplexing"></a>
@@ -456,6 +488,7 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。target TLS record 的缓冲�
 | `tuic://` | 上述 TUIC userinfo 与 QUIC 调优 |
 | `juicity://` | Juicity userinfo 与共用 QUIC/TLS query |
 | `socks5://` | SOCKS userinfo；`socks4://` 与 `socks4a://` 也导入同一种节点协议 |
+| `wireguard://`、`wg://` | 单 peer WireGuard userinfo/query key、隧道地址、路由及 WARP reserved 字节；必须显式提供端点端口 |
 
 对于写成 `a -> b` 的链，只解析 `a`。自动名称只来自解码后的 `#fragment`、VMess `ps` 或 `{scheme}-{host}`；解析器绝不以原始 URI 或 userinfo 作为回退，因此生成名称不会泄漏凭据。显式 tag、fragment 与 `ps` 值仍由用户控制。
 

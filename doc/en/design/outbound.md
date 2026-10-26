@@ -169,6 +169,7 @@ refusal; it is not interchangeable with missing UDP support.
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
+| `wireguard` | Inner TCP flow in a userspace WireGuard tunnel | One inner UDP socket per client source, addressing every allowed destination |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server, one
@@ -1146,6 +1147,135 @@ enqueue, and `admitted` is set when the frame is queued to the session writer. T
 credit limits are those of a single transport, so queue saturation or EOF retires every
 destination sharing the SID. Domain-target flows (`RewriteTo`) keep one scope per original
 destination.
+
+## WireGuard tunnel
+
+WireGuard (`proxy/wireguard/`) is a layer-3 userspace tunnel: boringtun 0.7.1 provides the Noise transport and
+`honk-netstack` the inner TCP/UDP stack. Both live behind one `Mutex<Inner { stack, tunn, .. }>` per tunnel,
+following quinn's connection-state model: application flows (`FlowIo` for TCP, `WgUdpTransport` for UDP) lock it
+directly for `tcp_read`/`tcp_write`/`udp_send`, register their waker under that same lock, and wake the owner task
+through a `Notify` when `take_tx_wakeup()` says they produced something to send.
+
+### Driver
+
+One owner task per tunnel runs the outer socket, decryption, transmit pulls and timers:
+
+- The outer socket is a marked UDP socket (`util::marked_udp_socket`, the bypass mark) driven through quinn-udp:
+  `recvmmsg` batches, GRO receive and GSO send. Runs of equal-size ciphertexts become one GSO send.
+- The receive queue is requested at the process memory share (the most a tunnel's windows can hold), capped at 64 MiB (`SO_RCVBUFFORCE`, so the
+  kernel enforces twice that, 128 MiB; without `CAP_NET_ADMIN` the plain option, clamped by `rmem_max`). All flows
+  share this one socket and their receive windows together may hold far more than the 8 MiB a marked socket starts
+  with: 200 concurrent 16 MiB downloads overflowed it (1.4–2.4 % of the datagrams dropped, each a loss signal to a
+  random flow and a lost SYN a one-second stall) and at 64 MiB lose 0–0.6 %. The cap bounds both the kernel memory
+  unauthenticated junk can pin (`FORCE` ignores `rmem_max`) and the standing latency of a saturated owner (a full
+  128 MiB queue is ~150 ms at 5 Gbit/s; a 256 MiB request never drops but queues 200+ ms). The effective size is
+  logged at debug level.
+- Each receive batch takes one `Instant`; every `Stack::receive` of that batch uses it. `decapsulate` runs per
+  datagram (looping on `WriteToNetwork`), the inner source must lie inside the peer's allowed IPs, then the packet
+  enters the stack. `Rx::Datagram` payloads are copied into the association's bounded queue (256 datagrams, full
+  drops, buffers recycled). The lock is held for at most 64 packets, in both directions.
+- After a batch the owner drains `poll_event` to wake flow wakers, pulls `poll_transmit` (at most 64 per pass),
+  encrypts into one back-to-back output buffer and sends it. It sleeps until the earlier of the stack's
+  `poll_timeout()` and the next 250 ms boringtun timer tick.
+- WARP reserved bytes are written into header bytes 1..3 of every outgoing datagram after encryption and zeroed on
+  every incoming datagram before `decapsulate`; the Noise MACs never see them.
+- A datagram from a new source address that authenticates updates the outer endpoint (roaming). A handshake cookie
+  reply (sent under load for a merely mac1-valid message) is neither answered nor counted as authentic.
+- Before a session exists the owner resends the initiation 1 s after the first send and 2 s after that, then leaves
+  retries to boringtun (`REKEY_TIMEOUT` 5 s, 90 s in total). This is a deliberate deviation from boringtun's first
+  retry at 5 s, so one lost datagram does not fail the 3 s default dial; the rate stays at most one initiation per
+  second and three per attempt before boringtun's cadence resumes. All resolved endpoint addresses are candidates
+  (families alternate; a dual-stack IPv6 socket carries IPv4 peers mapped); each resend goes to the next one. A tunnel
+  that has no session and whose handshake timed out re-resolves a name on the next acquire. A session is live for
+  180 s; after that `is_warm` is false and `warm` handshakes again.
+- AllowedIps are aggregated into sorted disjoint networks per family at tunnel creation and looked up by binary
+  search, both inbound (under the tunnel lock) and per outbound UDP packet.
+- Scratch, output and receive buffers are reused, so the steady path allocates nothing per packet.
+
+### Tunnel registry
+
+Two WireGuard sessions with the same keys to the same peer invalidate each other's handshakes, so a tunnel registry keeps
+exactly one live tunnel per (our private key, peer public key, endpoint host, endpoint port). The registry belongs to
+the owner of the runtimes: the first `OutboundRuntimeRegistry` of a control plane creates it, and its reload successors
+(`build_reusing*`), DNS forks (`fork_for_dns`) and cold-probe runtimes inherit it, so they share tunnels exactly as one
+process-wide table would for a single plane. Two planes in one process (an embedder, tests) never see or close each
+other's tunnels; dials with no runtime (honk-tool, hand-built nodes) share a separate process-wide registry. The memory
+budget below stays process-wide, while the tunnel-count cap applies per registry. Subscription lists
+routinely reuse one key pair across many endpoints (WARP-style); those are different peers and each gets its own
+tunnel. A runtime acquiring a tunnel gets the live one when the tunnel settings are identical, and otherwise
+replaces it: the incumbent is closed and its flows see `RuntimeClosed`, not a `NodeFailure` (a reload that changes
+only MTU or keepalive keeps the node ID, so the previous generation's draining flows must not be scored against it).
+Settings are everything except `network` (which only gates UDP flows): endpoint, keys, addresses, MTU, keepalive,
+reserved bytes and allowed IPs.
+
+This deliberately includes reload successors and DNS-fork runtimes, which otherwise own fresh protocol state: a fork
+opening its own session would knock the business runtime's tunnel over. The owner task belongs to the registry, not to
+any node's task owner (with or without `owned-tasks`): it ends on failure, replacement, the plane's
+`shutdown_wireguard_tunnels`, immediately when the last runtime using it closes and nothing that can carry data is
+left, or after 120 s with no flow and no warm owner.
+A `NodeRuntime` holds a slot caching its tunnel and is recorded as a user of it. Warm retention holds the tunnel (a
+counted hold, so installing the same tunnel into the slot again keeps the pin) so an idle warm tunnel does not
+expire; the last retention release drops the hold and the slot without cutting flows. Closing the runtime (including
+dropping an ephemeral runtime guard) fails only the flows that runtime opened, with `RuntimeClosed`. A tunnel
+acquired for a call whose runtime closed meanwhile is released at once.
+
+Terminal teardown of a plane (`ControlPlane::shutdown_runtime`, after the runtime registry is shut down) calls
+`OutboundRuntimeRegistry::shutdown_wireguard_tunnels()` on its current runtime registry: every tunnel of that plane's
+registry is closed, its flows fail with `RuntimeClosed`, and the owner tasks are joined, replaced ones included. It is
+terminal-only (a candidate epoch's cleanup must not end the running generation's tunnels) and it never closes or
+waits for another plane's tunnels. The process-wide standalone registry has no owner and is not closed: its tunnels
+end by idling out, and production only reaches it through dials that carry no runtime.
+
+### Flows and failure provenance
+
+- TCP dials connect to the numeric target. A target outside the allowed IPs is refused before any packet as a
+  `TargetFailure`; so is an inner RST or ICMP unreachable in answer to the SYN. A SYN that times out is a
+  `TargetFailure` only if the peer delivered other inner packets during the dial; otherwise it stays an untyped
+  timeout, which Score treats node-conservatively. `dial_with_tcp` is refused: there are no TCP pools.
+- UDP uses `with_shared`: one inner socket per prepared source serves every destination, receives report the real
+  inner peer, oversize is `InvalidSize`, flow-table exhaustion `Capacity`. A target outside the allowed IPs, or in a
+  family without a tunnel address, is a `TargetFailure` (`HostUnreachable`) when the association opens, like TCP; a
+  later per-packet send to another disallowed destination is a `Policy` rejection. A `confirmed` send waits until the
+  owner has handed the datagram to the socket, and `admitted` is set then (at enqueue for unconfirmed sends). A
+  speculative preparation acquires the tunnel but publishes it to its runtime only in `commit`.
+- A waiter whose own budget runs out before the handshake completes gets a node failure, but the tunnel is not
+  failed: it keeps retrying for waiters with a longer budget. Waiters timing out on the same handshake attempt share
+  one `SharedError::fanout` episode (cleared when a new attempt starts or the session is established). So do a
+  boringtun session expiry while flows exist and any unexpected end of the owner task. Datagrams that fail
+  authentication are dropped silently, as the kernel does (the source address is spoofable, so a flood of junk must
+  not be able to end a tunnel). Local flow exhaustion (`FlowLimit`, `Memory`, `AddrInUse`) is a `Capacity`
+  rejection, not a node failure. A tunnel closed by its owner (runtime close, replaced settings, process shutdown)
+  fails its flows with `RuntimeClosed` (`ConnectionAborted`, never a node failure). Handlers report no Score or health
+  themselves.
+- `warm` completes the handshake. `test_connectivity` performs a real handshake rather than a TCP connect.
+
+### Limits
+
+Per-flow limits are the `Stack` defaults: 8 MiB receive and 6 MiB send buffers; an idle flow holds at most one lazily
+allocated chunk per direction. The stack's `max_flows` (4096, shared by TCP and UDP) is further bounded by the
+per-flow floors (about 33 KiB each) that fit in the process budget. The outer output buffer carries at most 256
+datagrams per pass and is capped at 256 KiB, so a jumbo MTU does not pin megabytes per tunnel.
+
+Memory is bounded process-wide. honk-core sets the share once at startup (`proxy::wireguard::init_memory_share`,
+from `ResourceBudget.wireguard_memory`: one eighth of RAM, within 64 MiB..4 GiB, 256 MiB if RAM is unknown). The
+share becomes one `honk_netstack::MemoryBudget` that every tunnel's stack uses (`Config::shared_budget`), and each
+stack's own `memory_limit` is the share too: flows are charged lock-free to the budget wherever they are, so one busy
+tunnel may use all of it while many idle ones cost only their floors, and the stacks' commitments together never
+exceed the share. A flow admitted under the budget keeps its floor, so it progresses when the budget is exhausted;
+a new flow then fails with a local `Capacity` rejection.
+
+What the budget cannot see is a tunnel's fixed cost, so the registry also bounds live tunnels at `share / 4 MiB`,
+between 1 and 128. The cost is computed from the code: the receive scratch (64 KiB), the GRO batch (8 x 64 KiB), the
+output batch (64 x about 1.5 KiB) and the segment table total about 0.7 MiB, a stack without flows holds nothing
+else, and 4 MiB leaves room for the socket, the task and the tunnel state. That is 16 tunnels at the 64 MiB minimum
+share, 64 at 256 MiB and 128 from 512 MiB (the cap is there because each tunnel holds a descriptor outside the control
+plane's partition). The kernel receive queue is not counted: it is a limit, not an allocation, and what honest peers
+have in flight is bounded by the budget. Junk from the network can fill it, up to 128 MiB of kernel memory per
+tunnel (the 64 MiB request is enforced at twice that), which is the price of not dropping bursts of legitimate
+traffic. At the tunnel bound the oldest unused tunnel (no flow that can still carry data, no warm owner, no runtime
+caching it) is retired to make room; when every tunnel is in use the new dial fails with a local `Capacity`
+rejection. Without an initialized share (embedders, tests) the share is the stack default of 256 MiB. There is one
+lock per tunnel; per-flow staging is the upgrade path if profiles show contention.
 
 ## Cold URLTest speculative preparation
 

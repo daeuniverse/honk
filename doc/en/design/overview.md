@@ -20,13 +20,14 @@ Its configuration syntax and TC datapath derive from dae and remain dae-compatib
 
 ## Crate map
 
-The root workspace contains six crates. `honk-ebpf` is a separate Cargo project because it targets `bpfel-unknown-none`; it is excluded from the workspace and keeps its own `Cargo.lock`.
+The root workspace contains seven crates. `honk-ebpf` is a separate Cargo project because it targets `bpfel-unknown-none`; it is excluded from the workspace and keeps its own `Cargo.lock`.
 
 | Crate | Workspace | Responsibility |
 | --- | --- | --- |
 | `honk-config` | member | Shared configuration model, dae-syntax parser, include handling, share-link parsing, and subscription decoding. |
 | `honk-ebpf-common` | member | `no_std`, `#[repr(C)]` constants and ABI types shared by kernel programs and userspace map writers. |
 | `honk-nfqueue` | member | Raw `NETLINK_NETFILTER` queue `320`, verdict ownership, and the owned nftables transaction. |
+| `honk-netstack` | member | Sans-I/O IPv4/IPv6 TCP/UDP stack used as the inner network of the WireGuard tunnel; depends only on `blake3` and `thiserror`. See [Userspace network stack](./netstack.md). |
 | `honk-outbound` | member | Protocol handlers, per-node runtimes, outbound groups, health state, URLTest probing, and the always-compiled Score scorer. |
 | `honk-core` | member | Engine library and binary: eBPF/NFQUEUE runtime, control plane, DNS, routing, relay, and Clash API. |
 | `honk-tool` | member | CLI toolbox for subscription/node probing, datapath diagnostics, pinned-map inspection, and geo-asset queries. |
@@ -40,6 +41,7 @@ flowchart LR
   COMMON --> OUT
   COMMON --> EBPF[honk-ebpf]
   CORE --> OUT
+  OUT --> NS[honk-netstack]
   CORE -->|optional ebpf feature| NFQ[honk-nfqueue]
   CORE -->|build.rs embeds object| EBPF
   TOOL[honk-tool] --> CFG
@@ -56,7 +58,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 - Standalone Node serde reports ignored protocol-incompatible fields once, even when later conversion fails. Diagnostics contain schema field names, not node names or values. `node::NodeSeed` returns the same warnings through a caller-owned sink without logging; `FlatNode` remains the only flat wire adapter.
 - `ConfigSeed` uses the Node seed for every original array element. Structured failures retain original node, group and subscription indices in map or declaration-order sequence input, safe schema paths and decoder-provided line/column, never decoder error prose. Detailed file/JSON loaders preserve the caller's diagnostic prefix on failure; a successful format fallback removes only abandoned attempts. When every format fails, attempted diagnostics remain ordered with one terminal cause. A dae semantic failure is final unless the complete document decodes as a YAML, TOML or JSON mapping with at least one known Config root key; then the structured loaders report their own outcome. Include and unsupported-policy errors remain final.
 - Parser and share-link data entrypoints retain safe diagnostics without logging. Scalar values, names, links and raw error payloads are withheld; static failure causes and migration guidance remain available, including replacing `dns.hosts_file` with `dns.use_host`. Group/filter/subscription/entry positions use original ordinals. Detailed dae diagnostics share a metadata-only source table with include-parent links and available physical line numbers. Only the outer attempt appends a terminal cause.
-- `src/node/validation.rs` owns collection admission and shared checks; `src/node/vless.rs` exclusively owns canonical `VlessConfig` normalization, path selection, and combination validation. `src/node/protocol.rs` owns the other protocol configs and shared TLS/stream/QUIC options. Detailed loaders retain typed causes and original one-based node coordinates.
+- `src/node/validation.rs` owns collection admission and shared checks; `src/node/vless.rs` exclusively owns canonical `VlessConfig` normalization, path selection, and combination validation. `src/node/wireguard.rs` owns single-peer WireGuard keys, address/route normalization and identity material. `src/node/protocol.rs` owns the remaining protocol configs and shared TLS/stream/QUIC options. Detailed loaders retain typed causes and original one-based node coordinates.
 - `src/parser/` — `mod.rs` owns file-aware `include` and ordered root dispatch. `lexer.rs` and `cursor.rs` retain source-backed tokens, comment spans and bounded segments; `read.rs` shares scalar and expression access. Section readers live in `scalars.rs`, `experimental.rs`, `entries.rs`, `groups.rs`, `dns.rs` and `routing.rs`. Includes resolve entry-relative globs inside the canonical entry directory and reject duplicates/cycles. Permissive readers skip unknown nested blocks without applying descendants; node/subscription compatibility wrappers still traverse, while outer experimental and NFQUEUE errors remain fatal.
   Readers propagate typed errors; only the outer attempt publishes a terminal diagnostic. Notice ordering is finalized per attempt with source-local prefix-maxima indexes, preserving legacy append order and the caller's prefix without repeated vector insertion.
   Segments distinguish accepted/ignored statements and compact/braced blocks; readers do not infer structure from a trailing token. Statement admission precedes compact splitting and continuation updates. Dynamic group headers remain distinct from entry values, which stop early declaration splitting once populated. Structural comment-brace notices use the live cursor scope and are emitted once before EOF checks. Filter diagnostics retain original-token error provenance; sibling node, subscription and group traversal resets semantic notice ownership.
@@ -65,7 +67,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 - `src/node/wire.rs` is the sole flat serde adapter. It rejects the removed VLESS legacy field by raw presence, including `null`; the same field on non-VLESS input remains only a compatibility artifact. `VlessConfig.network`, `udp_encoding`, and `multiplex` determine identity, so a canonical cutover can change a VLESS `Node.id` without changing VMess behavior or identity.
 - Canonical VLESS behavior is summarized in [Outbound design](./outbound.md#vless-wire-contracts); field-level syntax and URI values belong in the [node reference](../reference/nodes.md).
 - `src/experimental.rs`: `ExperimentalConfig` owns `clash_api`, `native_api`, and `cache_file`. Native settings are strict, independent and require a restart. Opt-in `native-api` (build with `--features native-api` or `native-ui`; the full and `-native-api` release artifacts include it) provides userspace observations, bounded histories, source-owned Group PATCH and main-entry administration, plus verified-geodata activation. Its listener is disabled by default. `.dae` remains authoritative. Per-network automatic-policy pin/clear is enabled; pins belong to the current GroupManager and disappear on activation. Credential-bearing sources are read-only. Returned content masks listener-secret values rather than omitting bodies. Native mode and full kernel transparency stay gated. Default-off `native-ui` embeds licensed pinned doona assets obtained at packaging time through `ci/fetch-doona.sh` and `.github/ci/pins.env`. `build.rs` reads the absolute `HONK_DOONA_DIR`, with no runtime fetching or frontend build. The dae parser explicitly whitelists the nested sections. It accepts the deprecated `udp_nfqueue` section only as a migration input and warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
-- `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 11 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
+- `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 12 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ## High-level data path
 

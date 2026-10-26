@@ -11,7 +11,7 @@ honk is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapa
 ## Capabilities
 
 - Transparent TCP/UDP: LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing on Linux 6.12+.
-- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS, plus built-in `direct` and `block`. Trojan/VMess/VLESS support the H2 XHTTP profile (`packet-up`, `stream-up`, `stream-one`); VMess remains TCP-only. Protocol-specific limits are in the [node reference](doc/en/reference/nodes.md).
+- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, and single-peer WireGuard (a userspace tunnel over the built-in `honk-netstack` TCP/UDP stack), plus built-in `direct` and `block`. Trojan/VMess/VLESS support the H2 XHTTP profile (`packet-up`, `stream-up`, `stream-one`); VMess remains TCP-only. Protocol-specific limits are in the [node reference](doc/en/reference/nodes.md) and the [network stack design](doc/en/design/netstack.md).
 - Groups: Selector, URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; select it with `policy: score`. Omitted policy remains Selector. See the [group reference](doc/en/reference/groups.md#score-policy).
 - DNS: UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
 - Configuration and control: dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.
@@ -63,6 +63,7 @@ Most userspace subsystems were largely AI-authored with partial maintainer revie
 - [x] Control plane
 - [x] AnyTLS / Shadowsocks (including 2022) / SOCKS5
 - [x] RPRX (VLESS / XTLS / XHTTP / WSS / REALITY) exclude XHTTP
+- [ ] WireGuard / `honk-netstack` (new userspace TCP/UDP stack, entirely AI-authored)
 - [ ] Trojan-GFW (needs UoT implementation)
 - [x] DNS logic
 - [ ] Configuration parser (dae extensions)

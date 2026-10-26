@@ -131,7 +131,7 @@ Blank lines, comments, and Shadowrocket `REMARKS=` / `STATUS=` metadata lines ar
 
 A full profile or provider payload must contain a top-level `proxies` sequence. Entries without a supported `type`, server address, valid nonzero port, or required credentials are skipped. Ports may be integers or numeric strings. JSON is decoded natively, including UTF-16 surrogate-pair escapes in display names.
 
-Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vless`, `hysteria2`/`hysteria`, `tuic`, `juicity`, and `anytls`. Unrelated client metadata is ignored; unsupported wire transports, proxy plugins, and contradictory security settings are not silently reinterpreted.
+Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vless`, `hysteria2`/`hysteria`, `tuic`, `juicity`, `anytls`, and `wireguard`. Unrelated client metadata is ignored; unsupported wire transports, proxy plugins, and contradictory security settings are not silently reinterpreted.
 
 #### Common proxy fields
 
@@ -152,6 +152,22 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 #### Protocol-specific options
 
 Hysteria2 imports `password`/`auth`, `obfs: salamander` with `obfs-password`, upload/download bandwidth, `ports`/`mport` hopping ranges, `hop-interval`/`mhop`, receive windows, MTU, and MTU-discovery settings. TUIC imports UUID/password, congestion control, ALPN, receive windows, and MTU. AnyTLS imports `idle-session-check-interval`, `idle-session-timeout`, and `min-idle-session`. Supported spelling aliases are normalized before node identity is derived.
+
+WireGuard uses a dedicated single-peer adapter, including a one-element Mihomo `peers` array. Parent and peer claims must agree after typed conversion; zero/multiple peers, malformed keys/addresses/MTU/reserved bytes and empty allowed-IP lists reject only that entry. `udp: false` maps to `network: tcp`. WARP `reserved` accepts three integer bytes or base64, without dropping the value. Active AmneziaWG options, stream/TLS wrappers and `dialer-proxy` chaining reject instead of producing a plain/direct substitute.
+
+| Meaning | Clash/Mihomo | sing-box legacy outbound | sing-box endpoint |
+| --- | --- | --- | --- |
+| Our private key | `private-key` | `private_key` | `private_key` |
+| Peer endpoint | `server`, `port` on parent or sole peer | `server`, `server_port` on parent or sole peer | sole peer `address`, `port` |
+| Peer public key / PSK | `public-key`, `pre-shared-key` on parent or sole peer | `peer_public_key`, `pre_shared_key`, or sole peer `public_key`, `pre_shared_key` | sole peer `public_key`, `pre_shared_key` |
+| Local addresses | `ip`, `ipv6`, or `local-address`/`local_address`/`address` string/list | `local_address` string/list | `address` string/list |
+| MTU | `mtu` | `mtu` | `mtu` |
+| Keepalive seconds | `persistent-keepalive` on parent or sole peer | `persistent_keepalive_interval` on parent or sole peer | sole peer `persistent_keepalive_interval` |
+| WARP client identifier | `reserved` on parent or sole peer | `reserved` on parent or sole peer | sole peer `reserved` |
+| Allowed IPs | `allowed-ips` on parent or sole peer | `allowed_ips` on parent or sole peer | sole peer `allowed_ips` |
+| UDP permission | `udp`, or agreeing packet `network` | packet `network` | packet `network` |
+
+Key decoding, interface-prefix stripping, allowed-IP canonicalization and MTU bounds are shared with [WireGuard share links and flat nodes](./nodes.md#wireguard). Missing allowed IPs default to both full routes; no tunnel address is synthesized. URI lists delegate to the same canonical parser. Surge-style WireGuard section references are not URI links and remain unsupported.
 
 Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols; an explicit UDP restriction is rejected where the node model cannot preserve it. TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection; Juicity receive windows remain fixed at 8 MiB, so non-default overrides are rejected.
 
@@ -209,6 +225,8 @@ Canonical VLESS share links use exact `packetEncoding=auto|none|xudp|uot-v2`, `m
 SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. Empty plugin fields are harmless; active plugins remain unsupported.
 
 sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet choices, and supported protocol tuning are normalized through the common node builder. A sing-box VLESS entry defaults specifically to Single XUDP with UDP permitted when no enabled H2MUX/UoT wrapper or explicit `packet_encoding` selects another path. This is a sing-box import default, not the global meaning of Auto. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, or authentication requirements are not silently discarded, and per-node uTLS fingerprint hints do not override honk's process-wide TLS selection.
+
+WireGuard additionally imports the legacy `type: wireguard` outbound and the newer `endpoints` array. A profile can contain both `outbounds` and `endpoints`; valid entries in both survive invalid neighbors, with diagnostics retaining their original section and one-based position. Endpoints must describe exactly one peer. `system: true`, `system_interface: true`, nonzero `listen_port`, peer wire extensions and detour chaining are unsupported; honk's tunnel is userspace-owned. Worker-count hints do not change the protocol model.
 
 In sing-box input, `network` is packet capability, not a stream type; `transport.type` selects the stream. Unsupported stream names such as `h2` reject the entry rather than becoming raw TCP.
 

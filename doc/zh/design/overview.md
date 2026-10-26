@@ -20,13 +20,14 @@
 
 ## Crate 分工
 
-根 workspace 包含六个 crate。`honk-ebpf` 因面向 `bpfel-unknown-none` 而作为独立 Cargo 项目：它被排除在 workspace 外，并维护自己的 `Cargo.lock`。
+根 workspace 包含七个 crate。`honk-ebpf` 因面向 `bpfel-unknown-none` 而作为独立 Cargo 项目：它被排除在 workspace 外，并维护自己的 `Cargo.lock`。
 
 | Crate | Workspace | 职责 |
 | --- | --- | --- |
 | `honk-config` | 成员 | 共享配置模型、dae 语法解析器、include 处理、分享链接解析和订阅解码。 |
 | `honk-ebpf-common` | 成员 | 内核程序与用户态 map 写入端共享的 `no_std`、`#[repr(C)]` 常量和 ABI 类型。 |
 | `honk-nfqueue` | 成员 | raw `NETLINK_NETFILTER` 队列 `320`、verdict 所有权和自有 nftables 事务。 |
+| `honk-netstack` | 成员 | sans-I/O 的 IPv4/IPv6 TCP/UDP 栈，作为 WireGuard 隧道的内层网络；只依赖 `blake3` 和 `thiserror`。见[用户态网络栈](./netstack.md)。 |
 | `honk-outbound` | 成员 | 协议 Handler、逐节点 runtime、出站组、健康状态、URLTest 探测和始终编译的 Score 评分器。 |
 | `honk-core` | 成员 | 引擎库与二进制：eBPF/NFQUEUE runtime、控制面、DNS、路由、中继和 Clash API。 |
 | `honk-tool` | 成员 | 用于订阅/节点探测、数据路径诊断、已固定 map 检查和 geo 资源查询的 CLI 工具箱。 |
@@ -40,6 +41,7 @@ flowchart LR
   COMMON --> OUT
   COMMON --> EBPF[honk-ebpf]
   CORE --> OUT
+  OUT --> NS[honk-netstack]
   CORE -->|optional ebpf feature| NFQ[honk-nfqueue]
   CORE -->|build.rs embeds object| EBPF
   TOOL[honk-tool] --> CFG
@@ -60,7 +62,7 @@ flowchart LR
 
 解析器和分享链接的数据接口保留安全诊断，不自行记录日志。标量值、名称、链接和原始错误内容不对外输出，但保留固定错误原因和 `dns.hosts_file` → `dns.use_host` 等迁移说明。组、过滤器、订阅和条目使用原始序号定位。详细 dae 诊断共用只含元数据的来源表，保留 include 父来源关联及可取得的物理行号；只有最外层加载尝试追加终止错误。
 
-`src/node/validation.rs` 负责集合准入与共享检查；`src/node/vless.rs` 独占规范 `VlessConfig` 的 normalization、path selection 与组合校验；`src/node/protocol.rs` 持有其他协议配置及共享 TLS/stream/QUIC options。详细 loader 保留类型化 cause 与原始 one-based 节点坐标。
+`src/node/validation.rs` 负责集合准入与共享检查；`src/node/vless.rs` 独占规范 `VlessConfig` 的 normalization、path selection 与组合校验；`src/node/wireguard.rs` 持有单 peer WireGuard key、地址/路由规范化与身份材料；`src/node/protocol.rs` 持有其余协议配置及共享 TLS/stream/QUIC options。详细 loader 保留类型化 cause 与原始 one-based 节点坐标。
 
 `src/parser/mod.rs` 负责文件级 `include` 和有序顶层分派。`lexer.rs` 与 `cursor.rs` 保留引用源文本的词法单元、注释范围及有界片段，`read.rs` 提供共享的标量与表达式读取接口；各节由 `scalars.rs`、`experimental.rs`、`entries.rs`、`groups.rs`、`dns.rs` 和 `routing.rs` 读取。包含文件的 glob 模式以入口文件所在目录为基准解析；匹配文件的规范化路径不得超出入口目录。重复包含和循环包含均被拒绝。允许忽略未知内容的读取器整块跳过未知嵌套块，不应用其子项；节点和订阅的兼容包装块仍会遍历，`experimental` 外层和 NFQUEUE 错误仍会终止解析。
 
@@ -73,7 +75,7 @@ flowchart LR
 `src/share_link.rs` 是唯一的 `Node::from_share_link` 解析器；`src/share_link/options.rs` 把 URI 报文编码与独立的多路复用控制项归入规范协议模型，先执行规范化与校验，再派生身份，不保留第二套 VLESS mode 模型。`src/node/wire.rs` 是唯一的 flat serde adapter；VLESS 输入只要含有已移除的旧字段，即使值为 `null`，也会被拒绝。同一字段在非 VLESS 输入上仅为兼容 artifact 而保留。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity 派生，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 
 - `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }。dae parser 显式允许当前两个嵌套节，旧 `udp_nfqueue` 仅作为迁移输入：发出告警，仅在未配置 `global.nfqueue_enable` 时将 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
-- `src/subscription.rs`、`src/types.rs`（`NodeProtocol` 有 11 个变体，Direct/Block 留给内建节点；`DialMode` 为 ip/domain/domain+/domain++；另有 `SubscriptionType`、`DnsProtocol` 与共享 `default_true`/`parse_duration_secs` helper）、`src/error.rs`（`ConfigError`）。
+- `src/subscription.rs`、`src/types.rs`（`NodeProtocol` 有 12 个变体，Direct/Block 留给内建节点；`DialMode` 为 ip/domain/domain+/domain++；另有 `SubscriptionType`、`DnsProtocol` 与共享 `default_true`/`parse_duration_secs` helper）、`src/error.rs`（`ConfigError`）。
 
 `src/experimental.rs` 的 `ExperimentalConfig` 持有 `clash_api`、`native_api` 与 `cache_file`。原生设置严格校验、独立启用且均需重启。需显式编译的 `native-api`（以 `--features native-api` 或 `native-ui` 构建；full 与 `-native-api` 发布产物包含）提供用户态观测、有界历史、由源文件管理的组 PATCH/主文件条目管理，以及已验证 geodata 激活；listener 仍默认关闭。`.dae` 仍是唯一配置权威，原文披露与写入权限独立。凭据源只读，返回正文时遮蔽 listener secret 值，而非省略正文。自动策略已支持按网络 pin/clear 成员，pin 属于当前 GroupManager，激活后失效；原生 mode 与完整内核透明仍未开放。默认关闭的 `native-ui` 在打包时通过 `ci/fetch-doona.sh` 与 `.github/ci/pins.env` 获取带许可及版本记录的 doona 发行资产。`build.rs` 读取绝对路径 `HONK_DOONA_DIR`，不在运行时获取资产或构建前端。弃用的 `udp_nfqueue` 块仅将 `enabled` 迁移到 `GlobalConfig::nfqueue_enable` 并告警。
 

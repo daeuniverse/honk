@@ -29,6 +29,7 @@ How honk works, by subsystem. / honk 的工作原理，按子系统划分。
 | DNS subsystem | [en/design/dns.md](./en/design/dns.md) | [zh/design/dns.md](./zh/design/dns.md) |
 | Outbound stack | [en/design/outbound.md](./en/design/outbound.md) | [zh/design/outbound.md](./zh/design/outbound.md) |
 | Groups, health, warm-up | [en/design/groups.md](./en/design/groups.md) | [zh/design/groups.md](./zh/design/groups.md) |
+| Userspace network stack and WireGuard tunnel | [en/design/netstack.md](./en/design/netstack.md) | [zh/design/netstack.md](./zh/design/netstack.md) |
 
 ## Reference / 参考
 

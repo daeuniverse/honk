@@ -131,7 +131,7 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 
 完整配置或 provider 正文必须包含顶层 `proxies` sequence。缺少受支持的 `type`、服务器地址、有效非零端口或必需凭据的条目会被跳过。端口可以是整数或数字字符串。JSON 使用原生解码，支持显示名称中的 UTF-16 代理对转义。
 
-接受的 `type` 值包括 `socks5`、`ss`/`shadowsocks`、`trojan`、`vmess`、`vless`、`hysteria2`/`hysteria`、`tuic`、`juicity` 与 `anytls`。无关的客户端元信息会被忽略；不支持的线协议传输、代理插件和相互矛盾的安全设置不会被静默替换。
+接受的 `type` 值包括 `socks5`、`ss`/`shadowsocks`、`trojan`、`vmess`、`vless`、`hysteria2`/`hysteria`、`tuic`、`juicity`、`anytls` 与 `wireguard`。无关的客户端元信息会被忽略；不支持的线协议传输、代理插件和相互矛盾的安全设置不会被静默替换。
 
 #### 通用代理字段
 
@@ -152,6 +152,22 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 #### 协议专属选项
 
 Hysteria2 导入 `password`/`auth`、`obfs: salamander` 与 `obfs-password`、上传/下载带宽、`ports`/`mport` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。TUIC 导入 UUID/password、拥塞控制、ALPN、接收窗口和 MTU。AnyTLS 导入 `idle-session-check-interval`、`idle-session-timeout` 和 `min-idle-session`。支持的拼写别名会在派生节点身份前规范化。
+
+WireGuard 使用独立的单 peer adapter，接受仅含一个元素的 Mihomo `peers` 数组。父条目与 peer 声明在类型转换后必须相同；空/多 peer、无效 key/地址/MTU/reserved 及空 allowed-IP 列表仅拒绝该条目。`udp: false` 映射为 `network: tcp`。WARP `reserved` 接受三个整数字节或 base64，不会丢弃该值。有效的 AmneziaWG 参数、stream/TLS wrapper 和 `dialer-proxy` 链式代理会拒绝，不会替换成普通 WireGuard 或直连。
+
+| 含义 | Clash/Mihomo | sing-box 旧 outbound | sing-box endpoint |
+| --- | --- | --- | --- |
+| 本地私钥 | `private-key` | `private_key` | `private_key` |
+| Peer 端点 | 父条目或唯一 peer 的 `server`、`port` | 父条目或唯一 peer 的 `server`、`server_port` | 唯一 peer 的 `address`、`port` |
+| Peer 公钥 / PSK | 父条目或唯一 peer 的 `public-key`、`pre-shared-key` | `peer_public_key`、`pre_shared_key`，或唯一 peer 的 `public_key`、`pre_shared_key` | 唯一 peer 的 `public_key`、`pre_shared_key` |
+| 本地地址 | `ip`、`ipv6`，或 `local-address`/`local_address`/`address` 字符串/列表 | `local_address` 字符串/列表 | `address` 字符串/列表 |
+| MTU | `mtu` | `mtu` | `mtu` |
+| Keepalive 秒数 | 父条目或唯一 peer 的 `persistent-keepalive` | 父条目或唯一 peer 的 `persistent_keepalive_interval` | 唯一 peer 的 `persistent_keepalive_interval` |
+| WARP 客户端标识 | 父条目或唯一 peer 的 `reserved` | 父条目或唯一 peer 的 `reserved` | 唯一 peer 的 `reserved` |
+| Allowed IPs | 父条目或唯一 peer 的 `allowed-ips` | 父条目或唯一 peer 的 `allowed_ips` | 唯一 peer 的 `allowed_ips` |
+| UDP 权限 | `udp`，或与其一致的数据包 `network` | 数据包 `network` | 数据包 `network` |
+
+Key 解码、接口前缀移除、allowed-IP 规范化与 MTU 范围和 [WireGuard 分享链接及扁平节点](./nodes.md#wireguard) 共用实现。省略 allowed IPs 时使用两个全路由前缀；不会合成隧道地址。URI 列表调用同一个规范解析器。Surge 的 WireGuard section 引用不是 URI 分享链接，仍不受支持。
 
 显式关闭的功能 block 按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；节点模型无法保留显式 UDP 限制时会拒绝导入。TUIC 允许省略 password 或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN；Juicity 接收窗口固定为 8 MiB，因此拒绝非默认覆盖值。
 
@@ -209,6 +225,8 @@ VLESS 字段会在派生节点身份前应用：
 SIP008 version 1/2 wrapper（`{"servers":[...]}`）及裸服务器数组会导入 Shadowsocks 的 `server`、`server_port`、`method`、`password` 和 `remarks`。空插件字段不会导致拒绝；有效的插件配置仍不受支持。
 
 sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet 选择和受支持的协议调优会通过共同的节点构建逻辑规范化。未启用 H2MUX/UoT wrapper 且没有显式 `packet_encoding` 选择其他路径时，sing-box VLESS 条目特定地默认使用 Single XUDP 并允许 UDP；这是 sing-box 导入默认值，不是 Auto 的全局含义。gRPC service name 为空或省略时保留 sing-box 的空 service，不套用 honk 的 `GunService` 默认值。Hysteria2 可以只提供 `server_ports`，以第一个跳跃端口作为名义端点。不支持的链式代理、wire 功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
+
+WireGuard 还可从旧 `type: wireguard` outbound 和新的 `endpoints` 数组导入。一个配置可以同时包含 `outbounds` 与 `endpoints`；两个列表中的有效条目都可在无效邻居存在时保留，诊断保留原 section 和从 1 开始的位置。Endpoint 必须恰好一个 peer。`system: true`、`system_interface: true`、非零 `listen_port`、peer 线协议扩展及 detour 链式代理不受支持；honk 隧道由用户态管理。Worker 数量提示不改变协议模型。
 
 在 sing-box 输入中，`network` 表示数据包网络能力，不是流传输类型；`transport.type` 选择流传输方式。`h2` 等不支持的名称会使条目被拒绝，不会被当作裸 TCP。
 

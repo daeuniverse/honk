@@ -41,6 +41,8 @@ The credential fingerprint follows each handler's field precedence. The dial sha
 
 For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
 
+WireGuard identity includes the normalized endpoint host/port, decoded private/public/preshared keys, local tunnel host addresses, reserved bytes, masked/sorted/deduplicated allowed IPs, and effective UDP permission. Numeric endpoint spellings and DNS ASCII case normalize; interface prefixes do not change identity. An all-zero preshared key or reserved value is equivalent to omission. MTU and persistent keepalive are excluded because they tune the same authenticated peer rather than select another dial path; display names, tags, marks and provenance are also excluded. Other protocols' existing identity rules are unchanged.
+
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
 **Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. Other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
@@ -53,7 +55,7 @@ Identity is stable across rename, reload, and subscription refresh when the dial
 
 ## Node fields
 
-The Node model exposes the fields below. Share links populate operator-facing fields from their scheme, userinfo, authority, fragment, and query; structured loaders, import, or runtime own the rows explicitly marked as metadata. None are separate keys inside dae `node {}`. Defaults below are model defaults; a URL-shaped share link defaults an omitted port to `443`, while a v2rayN VMess payload requires a valid port.
+The Node model exposes the fields below. Share links populate operator-facing fields from their scheme, userinfo, authority, fragment, and query; structured loaders, import, or runtime own the rows explicitly marked as metadata. None are separate keys inside dae `node {}`. Defaults below are model defaults; a URL-shaped share link defaults an omitted port to `443`, except WireGuard requires an explicit nonzero port. A v2rayN VMess payload also requires a valid port.
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -62,7 +64,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `protocol` | enum | `ss` | Derived from the share-link scheme |
 | `address` | string | `""` | Parsed links store `host:port` |
 | `host` | string | `""` | Explicit server host; otherwise `Node::host()` derives it from `address` |
-| `port` | u16 | `0` | Server port; URL-shaped links use `443` when omitted |
+| `port` | u16 | `0` | Server port; URL-shaped links use `443` when omitted, except WireGuard requires an explicit port |
 | `username` / `password` | string? | null | Authentication, UUID, or secret from userinfo |
 | `encryption` | string? | null | SS/VMess cipher or VLESS Encryption client string; Shadowsocks falls back to `aes-128-gcm` at dial time when omitted |
 | `packet_encoding` | `VlessUdpEncoding` | `auto` for VLESS | Structured VLESS fallback encoding: `auto`, `native`, `xudp`, or `uot-v2`; canonical URI `packetEncoding=none` maps to `native` |
@@ -99,6 +101,13 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `anytls_min_idle_session` | usize? | null | Requested idle-session floor from `min_idle_session`; effective default 0, bounded by the eight-session pool cap |
 | `anytls_idle_session_check_interval` | u64? | null | Parsed `idle_session_check_interval` seconds; current runtime janitor cadence remains fixed at 30 s |
 | `anytls_idle_session_timeout` | u64? | null | Idle eviction from `idle_session_timeout`; effective default 30 s |
+| `wg_private_key` / `wg_public_key` | base64 string | required for WireGuard | Our private key and the single peer's public key; each decodes to exactly 32 bytes |
+| `wg_preshared_key` | base64 string? | null | Optional 32-byte peer PSK; all-zero means absent |
+| `wg_addresses` | string[] | required for WireGuard | At least one tunnel address, at most one IPv4 and one IPv6; valid prefix suffixes are accepted and removed without masking the host |
+| `wg_mtu` | u16 | `1420` | Inner IP MTU; `1280..=65472` with a local IPv6 address, `576..=65472` for IPv4 only (65472 is the largest value whose padded, encrypted datagram fits one IPv4 UDP payload); zero and out-of-range input reject |
+| `wg_keepalive` | u16? | null | Persistent keepalive seconds; `0` disables it |
+| `wg_reserved` | byte[3]? | null | WARP client identifier; the driver preserves it in header bytes 1–3; all-zero means absent |
+| `wg_allowed_ips` | CIDR string[] | `["0.0.0.0/0", "::/0"]` | Single-peer destination/source prefixes; mask host bits, sort and deduplicate before identity; an explicit empty list rejects |
 | `mark` | u32? | null | Structured-model outbound `SO_MARK`; not a dae share-link query |
 | `tags` | string[] | `[]` | Classification metadata; not a dae share-link query |
 | `subscription_id` / `group_id` | UUID? | null | Import/runtime ownership metadata |
@@ -149,10 +158,15 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `tuic` | — | Yes | Yes | TUIC v5 over QUIC |
 | `juicity` | — | Yes | Yes | Juicity over QUIC |
 | `anytls` | — | Yes | Yes* | Multiplexed TLS sessions and UoT v2 |
+| `wireguard` | `wg` | Yes | Yes* | Single-peer IPv4/IPv6 userspace tunnel; targets are dialed by address inside the peer's allowed IPs |
 | `direct` | — | Yes | Yes | Reserved built-in bypass outbound; no share-link scheme |
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
 
 `network` may disable packet dialing for Trojan, AnyTLS, and VLESS independently of their stream transport. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. AnyTLS UDP uses non-connect UoT v2: every datagram carries its destination and the server's real source address, so one stream serves all destinations of a client source and an unsolicited reply keeps its real source. Trojan UDP uses one associate stream per client source for all destinations and returns each reply's real source, so a cooperating server can give EIM/EIF behavior; destinations share that stream's head-of-line blocking and failure fate. VMess UDP is not implemented.
+
+WireGuard uses the same `network` packet-permission gate: absent, `udp` or `tcp,udp` permits UDP, while `tcp` disables it. This does not prohibit TCP. The inner network is layer 3: a TCP or UDP target is connected by its numeric address (a target domain is metadata and never resolved remotely) and must lie inside `wg_allowed_ips`, otherwise the flow is refused as a target failure (TCP) or a policy rejection (UDP) without sending anything. A TCP or UDP association open to a target in an IP family for which the node has no tunnel address is refused the same way, as a target failure, before any handshake starts. Datagrams the peer sends from outside `wg_allowed_ips` are dropped. An inner RST or ICMP unreachable is the target's refusal; a handshake that does not complete, or a session that expires or a tunnel that is lost while flows use it, is a node failure. Datagrams that fail authentication are dropped silently and never count against the node. A tunnel is identified by the pair of keys plus the endpoint host and port as written: all runtimes whose tunnel settings are identical share one live tunnel, including MTU and keepalive, because two sessions with the same key pair to the same peer would invalidate each other. A node with the same key pair and endpoint but different settings replaces the live tunnel and closes its flows with a runtime-closed error, which is not a node failure; nodes that share key pair and endpoint therefore must agree on every tunnel setting or they keep replacing each other. The same key pair at different endpoints (a WARP-style list) gives independent tunnels. The endpoint is compared as written, so a hostname and the IP address it resolves to, or an IPv4 and an IPv6 literal of one server, are different endpoints and create separate tunnels with separate sessions. See [WireGuard tunnel](../design/outbound.md#wireguard-tunnel).
+
+All tunnels of a process draw their inner-flow buffers from one memory budget: one eighth of RAM, between 64 MiB and 4 GiB (256 MiB when RAM is unknown). Each admitted TCP flow reserves about 33 KiB at admission, so the budget alone admits roughly 2,000 concurrent inner flows at the 64 MiB minimum (512 MiB of RAM or less), 8,000 at 256 MiB (2 GiB of RAM) and 32,000 at 1 GiB (8 GiB of RAM); a flow's window beyond that floor is taken from the same budget while it lasts, so a few fast downloads use it up before many idle flows do. One tunnel carries at most 4,096 flows and runs on one core. The number of live tunnels is bounded separately by their fixed cost (4 MiB each, at most 128): 16 tunnels at 512 MiB of RAM or less, 64 at 2 GiB, 128 from 4 GiB. Past the bound an unused tunnel is retired to make room; when every tunnel is in use the new dial is refused as local capacity, which is not a node failure.
 
 SOCKS5 UDP ASSOCIATE keeps one control TCP connection and one relay socket per client source, shared by every destination of that source, and returns the real remote peer named in each reply header. Whether a peer the client never contacted can reach it depends on the server: Dante's default `udp.connectdst: yes` connects its outbound socket only while a single destination has been used.
 
@@ -327,6 +341,24 @@ Original Clash/Mihomo `proxies` entries materialize `h3` when TUIC `alpn` is mis
 
 Durations accept bare seconds plus `ms`, `s`, `m`, and `h` suffixes.
 
+### WireGuard
+
+Both `wireguard://` and `wg://` accept the v2rayN-style private key in userinfo and the Hiddify-style `pk` query. All key fields accept standard or URL-safe base64, with or without padding, decode to exactly 32 bytes, and serialize as padded standard base64. Percent-encode userinfo and query keys, especially `/` and `+`; literal query `+` is also retained as key data. Key errors and diagnostics never echo credentials. Repeated keys/aliases must agree after typed normalization. There is exactly one peer; multi-peer records are rejected and valid subscription siblings survive.
+
+| Share-link query | Canonical field | Accepted aliases / rule |
+| --- | --- | --- |
+| userinfo or `privatekey` | `wg_private_key` | `private_key`, `private-key`, `privateKey`, `pk`; userinfo and query must agree |
+| `publickey` | `wg_public_key` | `public_key`, `public-key`, `publicKey`, `peer_pk`, `peer_public_key` |
+| `presharedkey` | `wg_preshared_key` | `preshared_key`, `pre_shared_key`, `pre-shared-key`, `presharedKey`, `psk` |
+| `address` | `wg_addresses` | `local_address`, `local-address`; comma-separated host IPs with optional prefixes; separate `selfIP` / `selfIPv6` claims must agree |
+| `mtu` | `wg_mtu` | Default and family-dependent range above; malformed values reject rather than default |
+| `keepalive` | `wg_keepalive` | `keep-alive`, `persistent-keepalive`, `persistent_keepalive`, `persistent_keepalive_interval`; unsigned 16-bit integer seconds |
+| `reserved` | `wg_reserved` | `client_id`, `client-id`; exactly three comma-separated decimal bytes or base64-decoded bytes |
+| `allowedips` | `wg_allowed_ips` | `allowed_ips`, `allowed-ips`; comma-separated IPs/CIDRs, omission defaults to both full routes |
+| `udp` | `network` | `1`/`true` permits, `0`/`false` disables; an explicit packet `network` must agree |
+
+WireGuard query aliases are ASCII case-insensitive. No local address is invented when missing. `peers` URI payloads and AmneziaWG wire-obfuscation parameters are unsupported rather than silently downgraded. Endpoint hosts use the existing Node host/port fields. See the [subscription reference](./subscription.md) for Mihomo `peers` and sing-box endpoint mappings.
+
 ## VLESS
 
 <a id="vless-udp-and-multiplexing"></a>
@@ -460,6 +492,7 @@ A static config offers real ECH and ECH rejection fails the handshake closed. Di
 | `tuic://` | TUIC userinfo and QUIC tuning above |
 | `juicity://` | Juicity userinfo and shared QUIC/TLS queries |
 | `socks5://` | SOCKS userinfo; `socks4://` and `socks4a://` are accepted into the same node protocol |
+| `wireguard://`, `wg://` | Single-peer WireGuard userinfo/query keys, tunnel addresses, routes and WARP reserved bytes; explicit endpoint port required |
 
 For a chain written as `a -> b`, only `a` is parsed. Automatic names come only from a decoded `#fragment`, VMess `ps`, or `{scheme}-{host}`; the parser never uses the raw URI or userinfo as a fallback, so credentials do not leak into generated names. Explicit tags, fragments, and `ps` values remain user-controlled.
 

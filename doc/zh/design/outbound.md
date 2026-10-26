@@ -160,6 +160,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 每个客户端源一条长度分帧 QUIC bi stream，承载所有目的地 |
+| `wireguard` | WireGuard 用户态隧道内的 TCP 流 | 每个客户端 source 一个隧道内 UDP socket，可寻址所有被允许的目的地 |
 
 Shadowsocks（传统 AEAD 与 2022）用一个 `MultiTargetTransport` 承载同一客户端
 source 的所有目的地：一个连接到服务端的带标记 socket、一份加密状态；2022 还
@@ -963,6 +964,92 @@ IPv4 `0`、IPv6 `1`、域名 `2`（不同于 request 地址的 SOCKS5 编号）�
 未知 ATYP 是终止错误。发送时每个 datagram 只写入拨号域名，其他名字以数值目标发出。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
 `admitted` 在 frame 入 session writer 队列时设置。队列与 credit 上限仍是单个 transport 的上限，
 因此队列饱和或 EOF 会退役共享该 SID 的所有目的地。域名目标流（`RewriteTo`）仍按原始目的地各自成 scope。
+
+## WireGuard 隧道
+
+WireGuard（`proxy/wireguard/`）是三层用户态隧道：boringtun 0.7.1 提供 Noise 传输，`honk-netstack` 提供隧道内的 TCP/UDP 栈。
+二者位于每条隧道一把的 `Mutex<Inner { stack, tunn, .. }>` 之后，沿用 quinn 的连接状态模型：应用流（TCP 为 `FlowIo`，
+UDP 为 `WgUdpTransport`）直接加锁调用 `tcp_read`/`tcp_write`/`udp_send`，在同一把锁内登记 waker，并在
+`take_tx_wakeup()` 表示产生了待发送内容时通过 `Notify` 唤醒 owner 任务。
+
+### Driver
+
+每条隧道一个 owner 任务，负责外层 socket、解密、transmit 拉取与定时器：
+
+- 外层 socket 是带 bypass mark 的 UDP socket（`util::marked_udp_socket`），经 quinn-udp 使用 `recvmmsg` 批量接收、GRO 接收与 GSO 发送；
+  连续等长的密文合并为一次 GSO 发送。
+- 接收队列请求为进程内存份额（一条隧道的窗口所能占用的上限），最多 64 MiB（`SO_RCVBUFFORCE`，内核实际按两倍即 128 MiB 执行；无
+  `CAP_NET_ADMIN` 时退回普通选项，受 `rmem_max` 限制）。所有流共用这一个 socket，它们的接收窗口合计可远超带 mark socket
+  初始的 8 MiB：200 个并发 16 MiB 下载曾使其溢出（丢掉 1.4–2.4 % 的数据报，每次都是对随机某条流的丢包信号，丢 SYN 则停顿一秒），
+  64 MiB 时仅丢 0–0.6 %。上限同时约束了未认证垃圾包能占用的内核内存（`FORCE` 无视 `rmem_max`）与 owner 饱和时的常驻延迟
+  （128 MiB 队列满时在 5 Gbit/s 下约 150 ms；请求 256 MiB 虽不丢包，但排队 200 ms 以上）。生效大小以 debug 级别记录。
+- 每个接收批次只取一次 `Instant`，该批次所有 `Stack::receive` 共用它。逐个数据报 `decapsulate`（遇 `WriteToNetwork` 循环），
+  内层源地址必须落在 peer 的 allowed IPs 内，随后进入栈。`Rx::Datagram` 载荷被复制到关联自己的有界队列（256 个数据报，满则丢弃，缓冲复用）。
+  两个方向每次持锁最多处理 64 个包。
+- 批次之后 owner 排空 `poll_event` 唤醒流的 waker，拉取 `poll_transmit`（每轮最多 64 个），加密到同一块连续输出缓冲后发送；
+  睡眠到栈的 `poll_timeout()` 与下一次 250 ms boringtun 定时器 tick 中较早者。
+- WARP reserved 字节在加密之后写入每个外发数据报的头部第 1..3 字节，并在每个入站数据报 `decapsulate` 之前清零；Noise MAC 从不看到它们。
+- 来自新源地址且通过认证的数据报会更新外层端点（漫游）。握手 cookie reply（负载过高时对仅 mac1 有效的消息回复）既不回应，也不算认证。
+- 会话建立之前，owner 在第一次发送后 1 秒、再过 2 秒重发 initiation，之后交给 boringtun（`REKEY_TIMEOUT` 5 秒，总共 90 秒）。
+  这是对 boringtun 首次重试在 5 秒的刻意偏离，使一个丢失的数据报不会让 3 秒的默认拨号失败；速率最多每秒一个 initiation，
+  在 boringtun 的节奏恢复前每次尝试最多三个。所有解析出的端点地址都是候选（地址族交替；双栈 IPv6 socket 以映射地址承载 IPv4 peer），
+  每次重发发往下一个。没有会话且握手超时的隧道，在下一次获取时重新解析域名。会话有效期 180 秒；超过后 `is_warm` 为假，`warm` 重新握手。
+- Allowed IPs 在隧道创建时聚合为每个地址族有序、不相交的网络，并以二分查找判定，入站（持隧道锁时）与每个出站 UDP 包都是如此。
+- scratch、输出与接收缓冲复用，因此稳态路径每包零分配。
+
+### 隧道 registry
+
+同密钥、同 peer 的两个 WireGuard 会话会使彼此的握手失效，所以隧道 registry 对（本地私钥，peer 公钥，端点主机，端点端口）恰好保留一条活动隧道。
+registry 归 runtime 的所有者：control plane 的第一个 `OutboundRuntimeRegistry` 创建它，其重载后继代（`build_reusing*`）、DNS fork（`fork_for_dns`）与冷探测 runtime 继承它，
+所以单个 plane 内与过去的进程级表完全一样地共享隧道。同一进程中的两个 plane（嵌入方、测试）互不可见，也不会关闭对方的隧道；不带 runtime 的拨号（honk-tool、手工构造的节点）共用一个单独的进程级 registry。
+下文的内存预算仍是进程级的，隧道数量上限则按 registry 计。订阅列表常常在许多端点之间复用同一对密钥（WARP 风格），它们是不同的 peer，各有自己的隧道。runtime 获取隧道时，设置完全相同则共享现有隧道，
+否则替换它：旧隧道被关闭，其上的流看到 `RuntimeClosed` 而不是 `NodeFailure`（只改 MTU 或 keepalive 的重载保持节点 ID，
+上一代还在排空的流不应记到该节点头上）。“设置”是除 `network`（只限制 UDP 流）以外的全部内容：端点、密钥、地址、MTU、keepalive、reserved 字节与 allowed IPs。
+
+这里刻意包含重载后继代与 DNS fork runtime（它们对其他协议拥有全新的协议状态）：fork 另开会话会把业务 runtime 的隧道顶掉。
+owner 任务属于 registry 而不属于任何节点的 task owner（无论是否启用 `owned-tasks`）：它在失败、被替换、该 plane 的 `shutdown_wireguard_tunnels`、
+最后一个使用它的 runtime 关闭且没有可承载数据的流时（立即），或 120 秒内没有流且没有 warm 持有者时结束。
+`NodeRuntime` 持有缓存隧道的 slot，并被记为该隧道的使用者。warm 保留会持有隧道（计数持有，因此把同一隧道再次装入 slot 不会丢失钉住），
+空闲的 warm 隧道不会过期；最后一次保留释放时丢弃持有与 slot，但不切断流。关闭 runtime（包括丢弃临时 runtime guard）只会以 `RuntimeClosed`
+使该 runtime 打开的流失败。为已在期间关闭的 runtime 获取的隧道会立即释放。
+
+一个 plane 的终止流程（`ControlPlane::shutdown_runtime`，在 runtime registry 关闭之后）对其当前 runtime registry 调用 `OutboundRuntimeRegistry::shutdown_wireguard_tunnels()`：
+关闭该 plane 的 registry 中所有隧道，其上的流以 `RuntimeClosed` 失败，并 join 全部 owner 任务（含被替换的）。只在终止路径调用：候选 epoch 的清理不能结束正在运行的那一代的隧道；它也绝不会关闭或等待另一个 plane 的隧道。进程级的 standalone registry 没有所有者，不会被关闭：其隧道靠空闲超时结束，生产环境只有不带 runtime 的拨号会用到它。
+
+### 流与失败归因
+
+- TCP 拨号连接数字目标。目标在 allowed IPs 之外时，在发送任何报文之前以 `TargetFailure` 拒绝；对 SYN 的隧道内 RST 或 ICMP 不可达同样是
+  `TargetFailure`。SYN 超时仅当 peer 在拨号期间送达过其他隧道内报文时才是 `TargetFailure`，否则保持无类型超时，由 Score 按节点保守处理。
+  `dial_with_tcp` 被拒绝：没有 TCP 池。
+- UDP 使用 `with_shared`：每个已准备的 source 一个隧道内 socket 服务所有目的地，接收返回真实的隧道内对端；超大为 `InvalidSize`，
+  流表耗尽为 `Capacity`。目标在 allowed IPs 之外，或所在地址族没有隧道地址时，打开关联时与 TCP 一样是 `TargetFailure`（`HostUnreachable`）；
+  之后对其他不被允许目的地的逐包发送是 `Policy` 拒绝。`confirmed` 发送会等到 owner 把数据报交给 socket 才完成，并在此时设置 `admitted`
+  （非 confirmed 发送在入队时设置）。speculative preparation 会获取隧道，但只在 `commit` 时才把它发布到 runtime。
+- 等待者自己的预算在握手完成前耗尽时得到节点失败，但隧道本身不失败：它继续为预算更长的等待者重试。同一次握手尝试上超时的等待者共享一个
+  `SharedError::fanout` episode（新尝试开始或会话建立时清除）。存在流时 boringtun 会话过期以及 owner 任务意外结束会让隧道对所有等待者失败。
+  认证失败的数据报被静默丢弃，与内核一致（源地址可伪造，大量垃圾包不能结束隧道）。本地资源耗尽（`FlowLimit`、`Memory`、`AddrInUse`）是
+  `Capacity` 拒绝而不是节点失败。隧道被其所有者关闭（runtime 关闭、设置被替换、进程关闭）时，其上的流以 `RuntimeClosed`
+  （`ConnectionAborted`，绝不是节点失败）失败。handler 自己不上报 Score 或健康状态。
+- `warm` 完成握手。`test_connectivity` 执行真实握手，而不是 TCP 连接。
+
+### 限制
+
+每流限制沿用 `Stack` 默认值：8 MiB 接收与 6 MiB 发送缓冲；空闲流每方向最多持有一个惰性分配的 chunk。栈的 `max_flows`（4096，TCP 与 UDP 共享）
+还受进程预算里能放下的每流 floor（各约 33 KiB）数限制。外层输出缓冲每轮最多承载 256 个数据报，并限制在 256 KiB，大 MTU 不会让每条隧道固定占用数 MB。
+
+内存在进程级有界。honk-core 启动时设置一次份额（`proxy::wireguard::init_memory_share`，取自 `ResourceBudget.wireguard_memory`：
+内存的 1/8，限制在 64 MiB..4 GiB，内存未知时 256 MiB）。该份额成为一个 `honk_netstack::MemoryBudget`，所有隧道的栈都使用它
+（`Config::shared_budget`），每个栈自己的 `memory_limit` 也等于份额：流无论位于哪条隧道，都无锁地向预算计费，因此一条繁忙的隧道可以用满它，
+许多空闲隧道只占各自的 floor，各栈的承诺之和永远不会超过份额。预算内被接纳的流保有自己的 floor，预算耗尽时仍能推进；
+此后的新流以本地 `Capacity` 拒绝失败。
+
+预算看不到的是隧道的固定开销，所以 registry 另把活动隧道数限制为 `share / 4 MiB`，并夹在 1 到 128 之间。该开销按代码计算：接收 scratch（64 KiB）、
+GRO 批次（8 x 64 KiB）、输出批次（64 x 约 1.5 KiB）与分段表合计约 0.7 MiB，没有流的栈不再持有其他东西，4 MiB 为 socket、任务与隧道状态留出余量。
+即 64 MiB 最小份额下 16 条，256 MiB 下 64 条，512 MiB 起 128 条（设上限是因为每条隧道在控制面描述符分区之外占用一个描述符）。
+内核接收队列不计入：它是上限而不是分配，诚实 peer 的在途数据又受预算约束。来自网络的垃圾包可以把它填满，每条隧道最多 128 MiB 内核内存
+（64 MiB 的请求被内核按两倍执行），这是不丢弃合法突发流量的代价。到达隧道上限时，最旧的未使用隧道（没有还能承载数据的流、没有 warm 持有者、
+没有缓存它的 runtime）被回收让位；所有隧道都在使用时，新的拨号以本地 `Capacity` 拒绝失败。未初始化份额时（嵌入方、测试），份额为栈默认的 256 MiB。
+每条隧道一把锁；若 profile 显示竞争，升级路径是按流暂存。
 
 ## 冷 URLTest speculative preparation
 
