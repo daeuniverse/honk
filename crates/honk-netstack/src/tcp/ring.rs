@@ -4,11 +4,28 @@
 //! capacity. Each admitted flow reserves its progress floor before using shared space.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+use crate::budget::MemoryBudget;
 
 pub const CHUNK: usize = 16 * 1024;
+/// What admission reserves for one TCP flow: a TX and an RX chunk and the descriptor floor.
+pub const FLOOR: usize = 2 * CHUNK + super::sent::FLOOR_BYTES;
+/// Free chunks kept for reuse at most, so a bulk flow does not return a chunk to the allocator and
+/// take one back for every 16 KiB. An idle pool keeps one (see `free`).
 const FREE_CACHE: usize = 64;
+/// Chunk-list slots an emptied ring keeps, so a flow draining a few chunks per batch does not
+/// reallocate its list each time; a ring that once held a whole window gives the rest back.
+const KEEP_SLOTS: usize = 4;
 
-pub type Chunk = Box<[u8]>;
+fn trim<T>(chunks: &mut VecDeque<T>) {
+    if chunks.capacity() > KEEP_SLOTS {
+        chunks.shrink_to(KEEP_SLOTS);
+    }
+}
+
+/// A thin pointer: the chunk lists of idle rings stay half the size of fat `Box<[u8]>` ones.
+pub type Chunk = Box<[u8; CHUNK]>;
 
 pub struct Pool {
     free: Vec<Chunk>,
@@ -17,6 +34,10 @@ pub struct Pool {
     live: usize,
     metadata: usize,
     total_limit: usize,
+    /// Process-wide budget, charged for floors and shared reservations next to this pool's own
+    /// limits; `held` is what this pool owes it back.
+    budget: Option<Arc<MemoryBudget>>,
+    held: usize,
 }
 
 impl Pool {
@@ -33,6 +54,41 @@ impl Pool {
             live: 0,
             metadata: 0,
             total_limit,
+            budget: None,
+            held: 0,
+        }
+    }
+
+    pub fn with_budget(mut self, budget: Option<Arc<MemoryBudget>>) -> Pool {
+        self.budget = budget;
+        self
+    }
+
+    /// Charges one flow's floor to the process budget (the pool's own floors are carved out of
+    /// its limit up front). Pair with `release_floor` when the flow retires.
+    pub fn admit_floor(&mut self) -> bool {
+        self.charge(FLOOR)
+    }
+
+    pub fn release_floor(&mut self) {
+        self.refund(FLOOR);
+    }
+
+    fn charge(&mut self, bytes: usize) -> bool {
+        if let Some(b) = &self.budget {
+            if !b.try_charge(bytes) {
+                return false;
+            }
+            self.held += bytes;
+        }
+        true
+    }
+
+    fn refund(&mut self, bytes: usize) {
+        if let Some(b) = &self.budget {
+            debug_assert!(bytes <= self.held);
+            b.refund(bytes);
+            self.held -= bytes;
         }
     }
 
@@ -41,7 +97,7 @@ impl Pool {
     }
 
     pub fn reserve_bytes(&mut self, bytes: usize) -> bool {
-        if bytes > self.shared_limit.saturating_sub(self.shared_used) {
+        if bytes > self.shared_limit.saturating_sub(self.shared_used) || !self.charge(bytes) {
             return false;
         }
         self.shared_used += bytes;
@@ -54,11 +110,14 @@ impl Pool {
 
     pub fn release_bytes(&mut self, bytes: usize) {
         debug_assert!(bytes <= self.shared_used);
-        self.shared_used = self.shared_used.saturating_sub(bytes);
+        let bytes = bytes.min(self.shared_used);
+        self.shared_used -= bytes;
+        self.refund(bytes);
     }
 
     pub fn shared_free(&self) -> usize {
-        (self.shared_limit - self.shared_used) / CHUNK
+        let own = self.shared_limit - self.shared_used;
+        self.budget.as_ref().map_or(own, |b| own.min(b.available())) / CHUNK
     }
 
     #[cfg(test)]
@@ -79,11 +138,22 @@ impl Pool {
     #[cfg(feature = "fuzz-checks")]
     pub fn assert_idle(&self) {
         assert_eq!(
-            (self.shared_used, self.live, self.metadata),
-            (0, 0, 0),
+            (self.shared_used, self.live, self.metadata, self.held),
+            (0, 0, 0, 0),
             "pool charges leaked"
         );
-        assert!(self.free.len() <= FREE_CACHE);
+        assert!(
+            self.free.len() <= 1,
+            "an idle pool caches one chunk at most"
+        );
+    }
+
+    /// With a budget, this pool owes exactly its floors and shared reservations.
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_held(&self, floors: usize) {
+        if self.budget.is_some() {
+            assert_eq!(self.held, floors * FLOOR + self.shared_used);
+        }
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -104,16 +174,30 @@ impl Pool {
 
     pub fn alloc(&mut self) -> Chunk {
         self.live += 1;
-        self.free
-            .pop()
-            .unwrap_or_else(|| vec![0u8; CHUNK].into_boxed_slice())
+        self.free.pop().unwrap_or_else(|| {
+            vec![0u8; CHUNK]
+                .into_boxed_slice()
+                .try_into()
+                .expect("exactly one chunk")
+        })
     }
 
     pub fn free(&mut self, chunk: Chunk) {
         self.live -= 1;
-        if self.free.len() < FREE_CACHE {
+        // While anything is in use, bursts (a write of 64 packets, then its ACK) refill from the
+        // cache. A pool with nothing in use keeps one spare, the chunk a request/response flow
+        // takes back on its next segment, and returns the rest to the allocator.
+        let cap = if self.live == 0 { 1 } else { FREE_CACHE };
+        if self.free.len() < cap {
             self.free.push(chunk);
         }
+        self.free.truncate(cap);
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.refund(self.held);
     }
 }
 
@@ -181,10 +265,7 @@ impl SendRing {
         self.head += n;
         self.len -= n;
         if self.len == 0 {
-            while self.chunks.len() > 1 {
-                self.pop_front(pool);
-            }
-            self.head = 0;
+            self.clear(pool);
             return;
         }
         while self.head >= CHUNK {
@@ -197,6 +278,7 @@ impl SendRing {
         while !self.chunks.is_empty() {
             self.pop_front(pool);
         }
+        trim(&mut self.chunks);
         self.head = 0;
         self.len = 0;
     }
@@ -308,32 +390,27 @@ impl RecvRing {
         done
     }
 
-    /// Retain the lazy floor once used: request/response traffic must not allocate a
-    /// fresh chunk every time the application drains its ring.
+    /// The ring is empty and holds nothing out of order: give every chunk back. The progress floor
+    /// stays an accounting guarantee (admission), not resident memory; the pool's small free
+    /// cache keeps request/response traffic from calling the allocator on every drain.
     pub fn compact(&mut self, pool: &mut Pool, right: u32) {
-        let retained = self
-            .chunks
-            .pop_front()
-            .flatten()
-            .unwrap_or_else(|| pool.alloc());
-        while let Some(c) = self.chunks.pop_front() {
-            if let Some(c) = c {
-                pool.free(c);
-            }
-        }
-        self.chunks.push_back(Some(retained));
-        self.head = 0;
+        self.free_chunks(pool);
         self.shrink(pool, right);
     }
 
     pub fn release_all(&mut self, pool: &mut Pool) {
+        self.free_chunks(pool);
+        pool.release(self.charged);
+        self.charged = 0;
+    }
+
+    fn free_chunks(&mut self, pool: &mut Pool) {
         while let Some(c) = self.chunks.pop_front() {
             if let Some(c) = c {
                 pool.free(c);
             }
         }
-        pool.release(self.charged);
-        self.charged = 0;
+        trim(&mut self.chunks);
         self.head = 0;
     }
 
@@ -369,9 +446,25 @@ mod tests {
         assert_eq!(pool.shared_used(), 1);
         assert_eq!(ring.slices(0, 50).0[0], &data[CHUNK + 5..CHUNK + 55]);
         ring.consume(&mut pool, ring.len());
-        assert_eq!((pool.shared_used(), pool.live_chunks()), (0, 1));
-        ring.clear(&mut pool);
-        assert_eq!(pool.live_chunks(), 0);
+        assert_eq!(
+            (pool.shared_used(), pool.live_chunks(), ring.chunk_count()),
+            (0, 0, 0),
+            "a fully acknowledged ring holds no chunk"
+        );
+    }
+
+    #[test]
+    fn send_ring_keeps_its_floor_accounting_across_a_drain() {
+        let mut pool = Pool::new(2);
+        let mut ring = SendRing::default();
+        let data = pattern(CHUNK * 3, 5);
+        for _ in 0..2 {
+            assert_eq!(ring.write(&mut pool, &data), data.len());
+            assert_eq!(pool.shared_used(), 2, "first chunk is the free floor");
+            ring.consume(&mut pool, data.len());
+            assert_eq!((pool.shared_used(), pool.live_chunks()), (0, 0));
+        }
+        assert_eq!(ring.tail_room(), CHUNK);
     }
 
     #[test]
@@ -405,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn recv_ring_compact_retains_only_the_progress_floor() {
+    fn recv_ring_compact_releases_every_chunk_and_keeps_the_charge_floor() {
         let mut pool = Pool::new(8);
         let mut ring = RecvRing::new(5);
         let right = 5 + 2 * CHUNK as u32;
@@ -414,8 +507,14 @@ mod tests {
         let mut out = [0u8; 10];
         assert_eq!(ring.read(&mut pool, &mut out, 10), 10);
         ring.compact(&mut pool, right + 10);
-        assert_eq!(pool.live_chunks(), 1);
-        assert_eq!(ring.charged(), 1);
+        assert_eq!(pool.live_chunks(), 0, "a drained ring holds no chunk");
+        assert_eq!(ring.charged(), 1, "the window stays committed");
+        ring.write_at(&mut pool, 15, &pattern(10, 5));
+        assert_eq!(
+            pool.live_chunks(),
+            1,
+            "the next segment allocates lazily again"
+        );
         ring.release_all(&mut pool);
         assert_eq!((pool.live_chunks(), pool.shared_used()), (0, 0));
     }
@@ -443,6 +542,41 @@ mod tests {
         pool.free(a);
         pool.free(b);
         pool.metadata_shrink(64);
-        assert_eq!(pool.allocated_bytes(), 2 * CHUNK);
+        assert_eq!(
+            pool.allocated_bytes(),
+            CHUNK,
+            "an idle pool caches one chunk"
+        );
+    }
+
+    #[test]
+    fn free_cache_follows_the_chunks_in_use() {
+        let mut pool = Pool::new(0);
+        let chunks: Vec<Chunk> = (0..200).map(|_| pool.alloc()).collect();
+        for c in chunks {
+            pool.free(c);
+        }
+        assert_eq!(pool.live_chunks(), 0);
+        assert_eq!(
+            pool.allocated_bytes(),
+            CHUNK,
+            "drained pool keeps one spare"
+        );
+        let mut held: Vec<Chunk> = (0..40).map(|_| pool.alloc()).collect();
+        let last = held.pop().unwrap();
+        for c in held {
+            pool.free(c);
+        }
+        assert_eq!(
+            pool.allocated_bytes(),
+            40 * CHUNK,
+            "bursts refill from the cache while a chunk is in use"
+        );
+        pool.free(last);
+        assert_eq!(pool.allocated_bytes(), CHUNK);
+        // A refill after a drain is served from the cache, not the allocator.
+        let c = pool.alloc();
+        assert_eq!(pool.allocated_bytes(), CHUNK);
+        pool.free(c);
     }
 }

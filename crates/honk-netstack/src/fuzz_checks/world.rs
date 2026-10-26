@@ -73,6 +73,9 @@ impl World {
         cfg.max_flows = 16;
         // Small enough that the shared pool runs out under a few busy flows.
         cfg.memory_limit = 2 * 1024 * 1024;
+        // Tighter than the stack's own limit, and exclusive to this world so that "everything
+        // returned" can be asserted against the budget itself.
+        cfg.shared_budget = Some(crate::MemoryBudget::new(1024 * 1024));
         cfg.tcp_rcv_buf_max = 256 * 1024;
         cfg.tcp_snd_buf_max = 256 * 1024;
         World {

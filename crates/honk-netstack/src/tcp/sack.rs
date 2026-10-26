@@ -82,6 +82,10 @@ impl OooTable {
             rcv_nxt = super::seq::max(rcv_nxt, r.end);
             self.ranges.remove(0);
         }
+        // A reordering episode ends with an empty table; an idle flow keeps no range storage.
+        if self.ranges.is_empty() {
+            self.ranges.shrink_to_fit();
+        }
         rcv_nxt
     }
 

@@ -55,6 +55,10 @@ impl Timers {
         if self.heap.peek().is_some_and(|v| v.0.0 <= now) {
             self.heap.pop().map(|v| v.0)
         } else {
+            // A connection burst leaves room for the burst; give it back once the heap is sparse.
+            if self.heap.capacity() > 64 && self.heap.len() < self.heap.capacity() / 4 {
+                self.heap.shrink_to(self.heap.len() * 2);
+            }
             None
         }
     }

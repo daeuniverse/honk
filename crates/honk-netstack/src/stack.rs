@@ -3,11 +3,13 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::{BitOr, BitOrAssign, Range};
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::MemoryBudget;
 use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::tcp::output::Output;
-use crate::tcp::ring::{CHUNK, Pool};
+use crate::tcp::ring::{FLOOR, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
 use crate::timer::Timers;
 use crate::wire::{self, ParseError};
@@ -22,6 +24,9 @@ pub struct Config {
     pub max_flows: u32,
     pub tcp_rcv_buf_max: usize,
     pub tcp_snd_buf_max: usize,
+    /// Process-wide limit on top of `memory_limit`: floors and shared commitments are charged to
+    /// both. Stacks sharing one budget cannot exceed it together; a dropped stack returns its share.
+    pub shared_budget: Option<Arc<MemoryBudget>>,
 }
 
 impl Config {
@@ -35,6 +40,7 @@ impl Config {
             max_flows: 4096,
             tcp_rcv_buf_max: 8 * 1024 * 1024,
             tcp_snd_buf_max: 6 * 1024 * 1024,
+            shared_budget: None,
         }
     }
 }
@@ -202,12 +208,12 @@ pub struct Stack {
 impl Stack {
     pub fn new(mut cfg: Config, now: Instant) -> Stack {
         cfg.mtu = cfg.mtu.max(if cfg.local_v6.is_some() { 1280 } else { 68 });
-        let floor_cap = cfg.max_flows.min(
-            (cfg.memory_limit / (2 * CHUNK + crate::tcp::sent::FLOOR_BYTES)).min(u32::MAX as usize)
-                as u32,
-        );
-        let reserved = floor_cap as usize * (2 * CHUNK + crate::tcp::sent::FLOOR_BYTES);
-        let pool = Pool::with_limits(cfg.memory_limit.saturating_sub(reserved), cfg.memory_limit);
+        let floor_cap = cfg
+            .max_flows
+            .min((cfg.memory_limit / FLOOR).min(u32::MAX as usize) as u32);
+        let reserved = floor_cap as usize * FLOOR;
+        let pool = Pool::with_limits(cfg.memory_limit.saturating_sub(reserved), cfg.memory_limit)
+            .with_budget(cfg.shared_budget.clone());
         let ports = Ports::new(&cfg.secret);
         Stack {
             cfg,
@@ -561,6 +567,9 @@ impl Stack {
             port = flow::next_port(port);
         }
         let (tuple, iss) = choice.ok_or(ConnectError::AddrInUse)?;
+        if !self.pool.admit_floor() {
+            return Err(ConnectError::Memory);
+        }
         let mut t = Tcb::new(tuple, &self.cfg, now, self.epoch, iss, offset);
         t.init_window(&mut self.pool);
         let id = self.table.insert(Flow::Tcp(Box::new(t)));
@@ -645,9 +654,7 @@ impl Stack {
 
     pub fn stats(&self) -> StackStats {
         StackStats {
-            memory_committed: self.table.tcp_active as usize
-                * (2 * CHUNK + crate::tcp::sent::FLOOR_BYTES)
-                + self.pool.shared_bytes(),
+            memory_committed: self.table.tcp_active as usize * FLOOR + self.pool.shared_bytes(),
             memory_allocated: self.pool.allocated_bytes(),
             flows: self.table.active,
             timewait_entries: self.table.timewait.len(),
@@ -698,10 +705,12 @@ impl Stack {
         if remove {
             if let Some(Flow::Tcp(mut t)) = self.table.remove(index) {
                 t.release(&mut self.pool);
+                self.pool.release_floor();
             }
         } else if let Some(tw) = compact {
             if let Some(Flow::Tcp(t)) = self.table.slots[index as usize].flow.as_mut() {
                 t.release(&mut self.pool);
+                self.pool.release_floor();
             }
             self.table.compact(index, tw);
         }
@@ -771,6 +780,7 @@ impl Stack {
     #[cfg(feature = "fuzz-checks")]
     pub(crate) fn check(&self) {
         self.table.check();
+        self.pool.check_held(self.table.tcp_active as usize);
         for slot in &self.table.slots {
             let deadline = match &slot.flow {
                 Some(Flow::Tcp(t)) => {
@@ -815,6 +825,9 @@ impl Stack {
         assert_eq!(self.table.timewait.len(), 0);
         assert_eq!(self.stats().memory_committed, 0);
         self.pool.assert_idle();
+        if let Some(budget) = &self.cfg.shared_budget {
+            assert_eq!(budget.used(), 0, "the shared budget still holds a charge");
+        }
     }
 
     fn control(&mut self, tuple: FourTuple, seq: u32, ack: u32, flags: u8) {

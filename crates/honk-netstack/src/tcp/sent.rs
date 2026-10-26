@@ -187,17 +187,13 @@ impl Sent {
         true
     }
 
+    /// Nothing in flight: give the storage back, floor included. The floor is reserved at
+    /// admission, so regrowing to it later cannot fail; it just must not stay resident per idle flow.
     pub fn shrink_idle(&mut self, pool: &mut super::ring::Pool) {
-        if !self.queue.is_empty() || self.capacity_charged <= FLOOR_SLOTS {
-            return;
+        if self.queue.is_empty() && self.capacity_charged != 0 {
+            self.release(pool);
+            self.check();
         }
-        self.queue.shrink_to(FLOOR_SLOTS);
-        let released =
-            (self.capacity_charged - self.queue.capacity()) * std::mem::size_of::<Descriptor>();
-        pool.release_bytes(released);
-        pool.metadata_shrink(released);
-        self.capacity_charged = self.queue.capacity();
-        self.check();
     }
 
     pub fn release(&mut self, pool: &mut super::ring::Pool) {
@@ -206,6 +202,7 @@ impl Sent {
         pool.metadata_shrink(self.capacity_charged * size);
         self.capacity_charged = 0;
         self.queue = VecDeque::new();
+        self.runs = None;
     }
 
     pub fn pipe(&self) -> u32 {

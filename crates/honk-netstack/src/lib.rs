@@ -33,9 +33,13 @@
 //! Chunk storage is 16 KiB. Admission reserves one TX and one RX chunk plus a minimum
 //! send-descriptor capacity per TCP flow; excess chunks and descriptor capacity share
 //! the configured budget. Receive windows are committed before advertising space,
-//! although physical chunks are allocated lazily. Allocation statistics include cached
-//! free chunks, so ACKing all data need not make `memory_allocated` zero. Per-flow buffer
-//! maxima are bounded to the modular-sequence safe range and at least one chunk.
+//! although physical chunks are allocated lazily. A ring that empties (everything read or
+//! acknowledged) returns all its chunks, and descriptor storage is released when nothing is
+//! in flight: the floor is a guarantee, not resident memory. Allocation statistics include
+//! the pool's cached free chunks (up to 64 while any chunk is in use, one otherwise).
+//! [`Config::shared_budget`] lets stacks of one process share an additional limit, charged
+//! for floors and commitments and refunded as flows retire and when a stack is dropped.
+//! Per-flow buffer maxima are bounded to the modular-sequence safe range and at least one chunk.
 //!
 //! UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and
 //! [`Stack::udp_send`] writes straight into the caller's output buffer. Datagram payloads
@@ -47,6 +51,7 @@
 
 pub mod wire;
 
+mod budget;
 mod flow;
 mod icmp;
 mod stack;
@@ -54,6 +59,7 @@ mod tcp;
 mod timer;
 mod udp;
 
+pub use budget::MemoryBudget;
 pub use stack::{
     BindError, Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StackStats, StreamError,
     UdpError,
