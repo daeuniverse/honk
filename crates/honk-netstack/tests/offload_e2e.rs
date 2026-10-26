@@ -27,9 +27,16 @@ struct Pair {
 }
 
 fn pair(caps: TxCaps, lose: fn(u64) -> bool) -> Pair {
+    pair_chunk(caps, lose, None)
+}
+
+fn pair_chunk(caps: TxCaps, lose: fn(u64) -> bool, chunk: Option<usize>) -> Pair {
     let t0 = Instant::now();
-    let server = Stack::new(transparent(), t0);
+    let mut scfg = transparent();
+    scfg.tcp_chunk = chunk;
+    let server = Stack::new(scfg, t0);
     let mut cfg = transparent();
+    cfg.tcp_chunk = chunk;
     cfg.local_v4 = Some("10.0.0.2".parse().unwrap());
     cfg.secret = [3; 32];
     let mut client = Stack::new(cfg, t0);
@@ -228,4 +235,17 @@ fn a_long_burst_of_loss_recovers_too() {
     let t = p.server.tcp_stats(p.sid).unwrap();
     assert!(t.retrans_segments >= 100, "{t:?}");
     let _ = Config::new([0; 32]);
+}
+
+#[test]
+fn throughput_paths_work_at_every_chunk_size() {
+    // A TSO packet spans 16 chunks of 4 KiB, one of 64 KiB; the stream must not care.
+    for chunk in [4096, 8192, 16384, 65536] {
+        let mut p = pair_chunk(TxCaps::ALL, |n| n % 500 == 123, Some(chunk));
+        p.transfer(3 << 20, 400_000);
+        assert!(p.tso_packets > 0 && p.super_packets > 0, "chunk {chunk}");
+        let s = p.server.stats();
+        let c = p.client.stats();
+        assert!(s.memory_committed <= 256 << 20 && c.memory_committed <= 256 << 20);
+    }
 }
