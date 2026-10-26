@@ -299,24 +299,30 @@ fn inspect(pkt: &[u8]) -> Option<Original<'_>> {
             if pkt.len() < ipv6::HEADER_LEN {
                 return None;
             }
-            let walk = ipv6::walk_ext_headers(pkt, ipv6::HEADER_LEN, pkt.len(), pkt[6]).ok()?;
+            let mut walk = ipv6::walk_ext_headers(pkt, ipv6::HEADER_LEN, pkt.len(), pkt[6]).ok()?;
             let (src, dst) = ipv6::addrs(pkt);
-            let (proto, non_first_fragment, l4) = if walk.proto == 44 {
+            if walk.proto == 44 {
                 let h = pkt.get(walk.off..walk.off + ipv6::FRAGMENT_HEADER_LEN)?;
-                (
+                if u16::from_be_bytes([h[2], h[3]]) & 0xFFF8 != 0 {
+                    return None;
+                }
+                walk = ipv6::walk_ext_headers(
+                    pkt,
+                    walk.off + ipv6::FRAGMENT_HEADER_LEN,
+                    pkt.len(),
                     h[0],
-                    u16::from_be_bytes([h[2], h[3]]) & 0xFFF8 != 0,
-                    &pkt[walk.off + ipv6::FRAGMENT_HEADER_LEN..],
                 )
-            } else {
-                (walk.proto, false, &pkt[walk.off..])
-            };
+                .ok()?;
+                if walk.proto == 44 {
+                    return None;
+                }
+            }
             Some(Original {
                 src: IpAddr::V6(src),
                 dst: IpAddr::V6(dst),
-                proto,
-                non_first_fragment,
-                l4,
+                proto: walk.proto,
+                non_first_fragment: false,
+                l4: &pkt[walk.off..],
             })
         }
         _ => None,
@@ -496,6 +502,35 @@ mod tests {
         }
         // A quote that cannot be decoded.
         assert_suppressed(&[0x45, 0, 0], "truncated header");
+    }
+
+    #[test]
+    fn first_fragment_inspection_continues_through_extensions_and_truncation() {
+        let mut packet = vec![0; 64];
+        ipv6::emit(
+            &mut packet,
+            "fd00::2".parse().unwrap(),
+            "fd00::7".parse().unwrap(),
+            44,
+            24,
+        ).unwrap();
+        ipv6::emit_fragment_header(&mut packet[40..], 60, 0, true, 1).unwrap();
+        packet[48] = wire::PROTO_ICMPV6;
+        packet[56] = 1;
+        assert_suppressed(&packet, "ICMPv6 error behind Fragment and Destination Options");
+        for end in 48..=56 {
+            assert_suppressed(&packet[..end], "truncated extension or absent ICMPv6 type");
+        }
+        packet[56] = 128;
+        let (result, _) = emit(
+            &mut IcmpOut::default(),
+            Instant::now(),
+            Reject::Unreachable,
+            &packet,
+        );
+        assert!(matches!(result, IcmpEmit::Sent(_)), "an inspectable echo is answerable");
+        packet[48] = 44;
+        assert_suppressed(&packet, "nested Fragment header");
     }
 
     #[test]

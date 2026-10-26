@@ -87,3 +87,30 @@ fn expiry_quotes_remain_funded_through_blocked_sent_and_rate_limited_output() {
         }
     }
 }
+
+#[test]
+fn expiry_never_answers_icmpv6_behind_fragment_and_destination_options() {
+    let now = Instant::now();
+    let budget = MemoryBudget::new(20 * 1024);
+    let mut r = Reassembler::default().with_budget(Some(budget.clone()));
+    let mut packet = vec![0; 64];
+    ipv6::emit(
+        &mut packet,
+        "fd00::2".parse().unwrap(),
+        "fd00::7".parse().unwrap(),
+        44,
+        24,
+    ).unwrap();
+    ipv6::emit_fragment_header(&mut packet[40..], 60, 0, true, 1).unwrap();
+    packet[48] = wire::PROTO_ICMPV6;
+    packet[56] = 1;
+    pending(push(&mut r, now, &packet));
+    let late = now + Duration::from_secs(30);
+    r.expire(late);
+    assert!(r.pending_icmp());
+    let mut icmp = IcmpOut::default();
+    assert!(matches!(r.poll_icmp(late, &mut icmp, &mut [0; 1500]), Output::None));
+    assert_eq!(icmp.suppressed, 1);
+    assert_eq!(budget.used(), 0);
+    r.assert_idle();
+}

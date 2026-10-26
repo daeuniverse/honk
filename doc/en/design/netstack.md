@@ -172,7 +172,7 @@ Errors are generated only by transparent-mode paths: `Refuse::IcmpUnreachable`/`
 | reassembly timeout | 11/1 | 3/1 |
 | `packet_too_big` | 3/4 (MTU in the low 16 bits, capped at 65535) | 2/0 |
 
-- **Suppression** (no error, no rate-limit charge): the original is a non-first fragment, its source or destination is unspecified, multicast or broadcast, it is itself an ICMP error (IPv4 types 3, 4, 5, 11, 12 and above 18; IPv6 types below 128) or an ICMP packet with no type byte, or the quote cannot be parsed.
+- **Suppression** (no error, no rate-limit charge): the original is a non-first fragment, its source or destination is unspecified, multicast or broadcast, it is itself an ICMP error (IPv4 types 3, 4, 5, 11, 12 and above 18; IPv6 types below 128) or an ICMP packet with no type byte, or the quote cannot be parsed. IPv6 inspection continues through extension headers after the first Fragment header; another Fragment header or truncation before the upper-layer protocol/type can be inspected suppresses the error too.
 - **Size.** The whole error stays within 576 bytes (IPv4) or 1280 bytes (IPv6); the quote of the original is truncated to fit.
 - **Rate limits** (`IcmpLimits`, Linux-style): a global bucket of `per_sec` 1000 messages per second with `burst` 50, and a per-target bucket keyed by the original source address of one message per `target_interval` (1 s) with `target_burst` 6 intervals of burst, remembering `max_targets` 128 targets (least recently used replaced). Both must agree before either is charged. Packet-too-big is exempt, as on Linux.
 - A too-small output buffer leaves every limiter untouched so the call can be retried.
