@@ -1,0 +1,24 @@
+[package]
+name = "honk-netstack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Pinned: the Phase 0 baseline must keep measuring the same implementation. `std` supplies the owned
+# socket buffers; CUBIC is compiled in so the baseline is not Reno-by-default.
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+    "std",
+    "proto-ipv4",
+    "proto-ipv6",
+    "medium-ip",
+    "socket-tcp",
+    "socket-tcp-cubic",
+    "socket-udp",
+] }
