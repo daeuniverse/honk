@@ -125,7 +125,7 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 | `poll_accept() -> Option<SynInfo>` | 每个新流上报一次：`id`、`client`、`original_dst`、客户端的 `mss`（缺失时 536 或 1220，至少 48）、`wscale`、`sack`、`timestamps`。 |
 | `tcp_accept(id, AcceptOpts)` | `when: AcceptWhen::Now` 排队发送 SYN-ACK；`AcceptWhen::Deferred { deadline }` 持有 SYN-ACK 直到 `tcp_complete`（上游拨号之后）；若 `deadline` 先到，流以 `TimedOut` 失败且不发送任何内容。`max_mss` 在两个方向上限制 MSS（下限 48）；应使用客户端真实的出口 MTU，tun 的 MTU 不能说明它。`keepalive` 启用 [Keepalive](#keepalive)。默认值（`AcceptOpts::default()`）：`Now`、不限制、无 keepalive。流已死亡时返回该流的错误（例如 `TimedOut`），已决定过则返回 `Closed`，旧句柄返回 `Stale`。 |
 | `tcp_complete(id)` | 放行被延迟流的 SYN-ACK。流不在被持有状态时返回 `Closed`。 |
-| `tcp_refuse(id, Refuse)` | 只在 SYN-ACK 发出之前有效（之后被忽略，改用 `tcp_abort`）。遗忘该流并释放句柄。`Refuse::Rst` 回 RST\|ACK，`Drop` 什么也不回，`IcmpUnreachable` 回 host unreachable，`IcmpAdminProhibited` 回 administratively prohibited（见 [ICMP 生成](#icmp-生成)）。RST 和 ICMP 回复经过容量 128 的控制队列。 |
+| `tcp_refuse(id, Refuse)` | 在 `poll_transmit` 真正输出被动 SYN-ACK 之前有效，包括 `tcp_accept(Now)` 或 `tcp_complete` 之后，以及因 buffer 过小而未能输出之后（输出后和主动打开的流上被忽略，改用 `tcp_abort`）。遗忘该流并释放句柄。`Refuse::Rst` 回 RST\|ACK，`Drop` 什么也不回，`IcmpUnreachable` 回 host unreachable，`IcmpAdminProhibited` 回 administratively prohibited（见 [ICMP 生成](#icmp-生成)）。RST 和 ICMP 回复经过容量 128 的控制队列。 |
 
 `MAX_DEFERRED` 为 25 秒，使栈先于边缘 classifier 自己 30 秒的交接过期放弃。`poll_accept` 从未上报的 SYN 在到达 25 秒后被静默遗忘（客户端会重试）；已上报或被延迟、但到截止时间（不晚于 SYN 之后 25 秒）仍未被接受或完成的流，以 `TimedOut` 失败且不发送任何内容，并产生 `ERROR`，应用仍须关闭自己的句柄。
 

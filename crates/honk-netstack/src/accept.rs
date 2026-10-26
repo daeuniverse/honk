@@ -153,7 +153,7 @@ impl Stack {
         let Some(Flow::Tcp(t)) = self.table.get_mut(id) else {
             return;
         };
-        if t.gate == Gate::Open {
+        if t.gate == Gate::Open && (!t.half_open || t.syn_sent.is_some()) {
             return;
         }
         let (tuple, seq) = (t.tuple, t.irs);
