@@ -69,6 +69,7 @@ jobs:
               - 'doc/**'
             parser:
               - 'crates/honk-config/**'
+              - 'crates/honk-netstack/**'
               - 'tools/dae-parse/**'
               - 'fuzz/**'
               - 'doc/en/reference/dialect.md'
@@ -154,7 +155,7 @@ jobs:
   parser:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.parser == 'true' || needs.changes.outputs.full == 'true') }}
-    name: dae-config parser (conformance + fuzz replay)
+    name: dae-config parser + netstack (conformance + fuzz replay)
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
@@ -196,6 +197,9 @@ jobs:
         env:
           FUZZ_REPLAY_RESULT: ${{ runner.temp }}/fuzz-replay-result.json
         run: env -u DAE_PARSE_BIN cargo test -p honk-config --features fuzz-checks --test fuzz_replay -- --nocapture
+      - name: Replay netstack fuzz inputs on stable
+        if: ${{ !cancelled() }}
+        run: cargo test -p honk-netstack --features fuzz-checks --test fuzz_replay -- --nocapture
       - name: Write parser CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

@@ -52,13 +52,7 @@ impl Tcb {
             let mss = self.send_mss();
             pipe = self.recovery.pipe(&self.sent, self.sack);
             let budget = self.recovery.budget(pipe, self.cc.cwnd()) as usize;
-            let can_send_new = matches!(
-                self.state,
-                TcpState::Established
-                    | TcpState::CloseWait
-                    | TcpState::FinWait1
-                    | TcpState::LastAck
-            );
+            let can_send_new = self.may_send_new();
             let sent_offset = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
             let unsent = self.tx.len().saturating_sub(sent_offset);
             let rwnd = self
@@ -325,9 +319,13 @@ impl Tcb {
         rwnd: usize,
         can_send_new: bool,
     ) -> Option<Kind> {
-        if can_send_new && unsent != 0 && rwnd != 0 && self.sent.ensure_room(pool, 2) {
-            let data = unsent.min(cap).min(rwnd);
-            return Some(Kind::New { data, fin: false });
+        // `cap` can be zero (tiny path MTU under large options): an empty segment is no probe.
+        let new = unsent.min(cap).min(rwnd);
+        if can_send_new && new != 0 && self.sent.ensure_room(pool, 2) {
+            return Some(Kind::New {
+                data: new,
+                fin: false,
+            });
         }
         let (index, start, len, fin) = self.sent.last_unsacked()?;
         let data = (len as usize - usize::from(fin)).min(cap);
@@ -342,6 +340,19 @@ impl Tcb {
         })
     }
 
+    /// Whether queued data and our FIN may still leave. CLOSING counts: the peer's FIN can arrive
+    /// while ours is still queued behind a closed window, and that data is owed.
+    pub(super) fn may_send_new(&self) -> bool {
+        matches!(
+            self.state,
+            TcpState::Established
+                | TcpState::CloseWait
+                | TcpState::FinWait1
+                | TcpState::Closing
+                | TcpState::LastAck
+        )
+    }
+
     /// F-RTO step 2b holds retransmissions only while new data can go out in their place. When the
     /// ACK just processed leaves none (nothing unsent, or no window for it) the sender falls back to
     /// conventional recovery instead of idling until the next timeout (RFC 5682 §3, Linux
@@ -351,10 +362,7 @@ impl Tcb {
             return;
         }
         let flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
-        let can_send_new = matches!(
-            self.state,
-            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::LastAck
-        );
+        let can_send_new = self.may_send_new();
         if !(can_send_new && self.tx.len() > flight && self.snd_wnd as usize > flight) {
             self.recovery.end_frto();
         }

@@ -75,6 +75,17 @@ impl Pool {
         self.live
     }
 
+    /// Every reservation, chunk and descriptor charge has been returned.
+    #[cfg(feature = "fuzz-checks")]
+    pub fn assert_idle(&self) {
+        assert_eq!(
+            (self.shared_used, self.live, self.metadata),
+            (0, 0, 0),
+            "pool charges leaked"
+        );
+        assert!(self.free.len() <= FREE_CACHE);
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         (self.live + self.free.len()) * CHUNK + self.metadata
     }

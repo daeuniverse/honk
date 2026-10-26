@@ -6,6 +6,19 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Exposes `fuzz_checks`: replayable properties shared by the cargo-fuzz targets and the stable
+# replay test. It also compiles the whole-stack recount assertions they call.
+fuzz-checks = []
+
+[[test]]
+name = "fuzz_replay"
+required-features = ["fuzz-checks"]
+
+[[example]]
+name = "fuzz_seeds"
+required-features = ["fuzz-checks"]
+
 [dependencies]
 blake3.workspace = true
 thiserror.workspace = true
@@ -22,3 +35,8 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
     "socket-tcp-cubic",
     "socket-udp",
 ] }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "stack"
+harness = false

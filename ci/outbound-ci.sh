@@ -2,10 +2,11 @@
 # outbound-ci — full test gate for honk-outbound after any change.
 #
 # Runs, in order and with early exit on failure:
-#   1. fmt check
-#   2. clippy (all targets, warnings denied, rprx off and on separately)
+#   1. fmt check (honk-outbound and honk-netstack, the WireGuard driver's stack)
+#   2. clippy (all targets, warnings denied; honk-netstack once, honk-outbound rprx off and on separately)
 #   3. honk-config tests (node/share-link fields change together)
-#   4. honk-outbound test suites (rprx off and on separately)
+#   4. honk-netstack tests (the WireGuard driver depends on its behaviour)
+#   5. honk-outbound test suites (rprx off and on separately)
 #
 # Optional live-server e2e (skipped by default):
 #   HONK_HY2_SERVER=host:port HONK_HY2_PASSWORD=... [HONK_HY2_MPORT=.. HONK_HY2_MHOP=..]
@@ -20,7 +21,10 @@ cd "$(dirname "$0")/.."
 step() { printf '\n==> %s\n' "$1"; }
 
 step "cargo fmt --check"
-cargo fmt -p honk-outbound -- --check
+cargo fmt -p honk-outbound -p honk-netstack -- --check
+
+step "cargo clippy -p honk-netstack --all-targets -D warnings"
+cargo clippy -p honk-netstack --all-targets -- -D warnings
 
 step "cargo clippy --all-targets --no-default-features -D warnings"
 cargo clippy -p honk-outbound --all-targets --no-default-features -- -D warnings
@@ -30,6 +34,9 @@ cargo clippy -p honk-outbound --all-targets --no-default-features --features rpr
 
 step "cargo test -p honk-config"
 cargo test -p honk-config
+
+step "cargo test -p honk-netstack"
+cargo test -p honk-netstack
 
 step "cargo test -p honk-outbound --no-default-features"
 cargo test -p honk-outbound --no-default-features

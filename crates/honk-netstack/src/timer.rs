@@ -42,6 +42,11 @@ impl Timers {
         }
     }
 
+    #[cfg(feature = "fuzz-checks")]
+    pub fn len(&self) -> usize {
+        self.heap.len()
+    }
+
     pub fn next(&self) -> Option<Instant> {
         self.heap.peek().map(|v| v.0.0)
     }

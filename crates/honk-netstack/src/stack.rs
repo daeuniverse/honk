@@ -766,6 +766,57 @@ impl Stack {
         }
     }
 
+    /// Cross-checks every incrementally maintained structure against a recount; the fuzz targets
+    /// run it after each operation.
+    #[cfg(feature = "fuzz-checks")]
+    pub(crate) fn check(&self) {
+        self.table.check();
+        for slot in &self.table.slots {
+            let deadline = match &slot.flow {
+                Some(Flow::Tcp(t)) => {
+                    t.check_invariants();
+                    t.next_deadline()
+                }
+                Some(Flow::TimeWait(t)) => Some(t.expiry),
+                _ => None,
+            };
+            if let Some(deadline) = deadline {
+                assert!(
+                    slot.scheduled.is_some_and(|s| s <= deadline),
+                    "a flow deadline is not covered by a timer entry, so the owner could oversleep it"
+                );
+            }
+        }
+        let bound = 3 * self.table.slots.len().max(16);
+        for queue in [
+            &self.events,
+            &self.ready,
+            &self.writers,
+            &self.timewait_ready,
+        ] {
+            assert!(
+                queue.len() <= bound,
+                "stale queue nodes outgrew the sweep bound"
+            );
+        }
+        assert!(
+            self.timers.len() <= 2 * self.table.slots.len().max(16) + 1,
+            "the timer heap outgrew its rebuild bound"
+        );
+        assert!(self.controls.len() <= CONTROL_LIMIT);
+        assert!(self.stats().memory_committed <= self.cfg.memory_limit);
+    }
+
+    /// After every flow, handle and TIME_WAIT entry is gone, nothing may remain charged.
+    #[cfg(feature = "fuzz-checks")]
+    pub(crate) fn assert_released(&self) {
+        self.check();
+        assert_eq!(self.table.active, 0);
+        assert_eq!(self.table.timewait.len(), 0);
+        assert_eq!(self.stats().memory_committed, 0);
+        self.pool.assert_idle();
+    }
+
     fn control(&mut self, tuple: FourTuple, seq: u32, ack: u32, flags: u8) {
         if self.controls.len() == CONTROL_LIMIT {
             self.counters.control_dropped += 1;

@@ -230,7 +230,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/fuzz/target
     steps:
@@ -258,7 +258,7 @@ jobs:
           cargo +"$FUZZ_NIGHTLY" install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
           rustc +"$FUZZ_NIGHTLY" -V | tee -a "$GITHUB_STEP_SUMMARY"
           cargo +"$FUZZ_NIGHTLY" fuzz --version | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Fuzz parser inputs
+      - name: Fuzz parser and netstack inputs
         working-directory: fuzz
         env:
           FUZZ_NIGHTLY: ${{ steps.toolchain.outputs.nightly }}
@@ -267,7 +267,7 @@ jobs:
           failed=0
           # New inputs go to a scratch directory (libFuzzer writes to the first
           # corpus argument); the committed seeds under fuzz/corpus stay seeds.
-          for target in document share_link lexer; do
+          for target in document share_link lexer netstack_packet netstack_schedule; do
             mkdir -p "$RUNNER_TEMP/fuzz-grown/$target"
             if cargo +"$FUZZ_NIGHTLY" fuzz run "$target" \
               "$RUNNER_TEMP/fuzz-grown/$target" "corpus/$target" -- \

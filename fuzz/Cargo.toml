@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 honk-config = { path = "../crates/honk-config", features = ["fuzz-checks"] }
+honk-netstack = { path = "../crates/honk-netstack", features = ["fuzz-checks"] }
 
 [workspace]
 members = ["."]
@@ -32,6 +33,20 @@ bench = false
 [[bin]]
 name = "lexer"
 path = "fuzz_targets/lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netstack_packet"
+path = "fuzz_targets/netstack_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netstack_schedule"
+path = "fuzz_targets/netstack_schedule.rs"
 test = false
 doc = false
 bench = false

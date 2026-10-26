@@ -604,13 +604,7 @@ impl Tcb {
             || self.recovery.state() != recovery::State::Open
             || self.sent.outstanding == 0
             || self.recovery.rack.tlp.is_some()
-            || !matches!(
-                self.state,
-                TcpState::Established
-                    | TcpState::CloseWait
-                    | TcpState::FinWait1
-                    | TcpState::LastAck
-            )
+            || !self.may_send_new()
         {
             return;
         }
@@ -716,6 +710,34 @@ impl Tcb {
         if self.snd_una != self.iss {
             self.sent.check_bounds(self.snd_una, self.snd_nxt);
         }
+    }
+
+    /// The slower whole-flow invariants the fuzz targets assert after every operation.
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_invariants(&self) {
+        self.sent.check();
+        assert!(
+            self.cc.cwnd() > 0,
+            "a zero congestion window stalls the flow"
+        );
+        assert!(self.rtt.rto() <= rtt::MAX_RTO);
+        assert!(self.pmtu >= 68);
+        if self.state == TcpState::SynSent {
+            return;
+        }
+        assert!(
+            seq::le(self.rcv_nxt, self.max_adv_right)
+                && seq::le(self.max_adv_right, self.committed_right),
+            "receive window edges: rcv_nxt {} <= max_adv_right {} <= committed_right {}",
+            self.rcv_nxt,
+            self.max_adv_right,
+            self.committed_right
+        );
+        assert!(seq::le(self.rx.rd_seq, self.rcv_nxt));
+        assert!(
+            self.snd_una == self.iss || self.sent.outstanding as usize <= self.tx.len() + 1,
+            "more unacknowledged sequence space than queued bytes plus a FIN"
+        );
     }
 
     pub fn release(&mut self, pool: &mut Pool) {

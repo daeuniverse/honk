@@ -100,9 +100,9 @@ test-ci:
     # Without nextest: cargo test --workspace --features honk-core/native-ui --no-fail-fast
     HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo nextest run --workspace --features honk-core/native-ui --profile ci
 
-# Run core + outbound tests
+# Run core + outbound + netstack tests
 test-core:
-    cargo test -p honk-core -p honk-outbound
+    cargo test -p honk-core -p honk-outbound -p honk-netstack
 
 # Run config unit and integration tests
 test-config:
@@ -124,6 +124,7 @@ parser-ci:
 # Replay saved inputs with stable Rust; no Go or nightly required.
 fuzz-replay:
     env -u DAE_PARSE_BIN cargo test -p honk-config --features fuzz-checks --test fuzz_replay -- --nocapture
+    cargo test -p honk-netstack --features fuzz-checks --test fuzz_replay -- --nocapture
 
 # Fuzz one parser target for a while (needs the eBPF nightly and cargo-fuzz);
 # grown inputs go under fuzz/target, the committed seeds stay seeds.
@@ -143,7 +144,7 @@ test-routing:
 # Root-cgroup hooks are not isolated by netns; share the complete disposable VM gate.
 test-netns: test-routing
 
-# Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
+# Full honk-outbound gate after outbound or netstack changes (fmt + clippy + config, netstack & outbound suites)
 outbound-ci:
     ci/outbound-ci.sh
 

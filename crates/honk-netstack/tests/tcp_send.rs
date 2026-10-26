@@ -1402,3 +1402,30 @@ fn ptb_after_a_timeout_retransmission_splits_the_oversize_segment_at_once() {
         "the dropped retransmission is sent again at the new size without waiting"
     );
 }
+
+#[test]
+fn data_and_fin_queued_behind_a_zero_window_still_leave_after_the_peers_fin() {
+    let mut now = Instant::now();
+    let mut stack = Stack::new(config(), now);
+    let mut peer = open(&mut stack, &mut now, remote(false), false, false);
+    peer.window = 0;
+    peer.ack(&mut stack, now, peer.start);
+    assert_eq!(stack.tcp_write(peer.id, b"queued"), Ok(6));
+    assert_eq!(stack.tcp_shutdown(peer.id), Ok(()));
+    assert!(
+        pull(&mut stack, now).is_none(),
+        "a closed window sends nothing"
+    );
+    // The peer's FIN arrives first: this side is CLOSING with its own FIN still unsent.
+    let mut fin = peer.header(now, peer.start);
+    fin.flags |= tcp::FIN;
+    assert_eq!(stack.receive(now, &peer.packet(&fin, &[])), Rx::Consumed);
+    peer.next = peer.next.wrapping_add(1);
+    assert_eq!(stack.tcp_state(peer.id), Some(TcpState::Closing));
+    pull(&mut stack, now); // the ACK of the FIN
+    peer.window = 60_000;
+    peer.ack(&mut stack, now, peer.start);
+    let data = pull(&mut stack, now).expect("the queued data leaves once the window opens");
+    assert_eq!(data.data(), b"queued");
+    assert!(data.h.flags & tcp::FIN != 0, "with the FIN behind it");
+}

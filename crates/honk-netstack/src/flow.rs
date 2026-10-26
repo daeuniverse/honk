@@ -153,6 +153,43 @@ impl Table {
         slot.scheduled = None;
     }
 }
+#[cfg(feature = "fuzz-checks")]
+impl Table {
+    /// Recounts what `active`, `tcp_active`, the lookup maps and the free list claim.
+    pub fn check(&self) {
+        let (mut tcp, mut udp, mut timewait) = (0, 0, 0);
+        for (i, slot) in self.slots.iter().enumerate() {
+            let i = i as u32;
+            match &slot.flow {
+                Some(Flow::Tcp(t)) => {
+                    tcp += 1;
+                    assert_eq!(self.tcp.get(&t.tuple), Some(&i));
+                }
+                Some(Flow::Udp { port }) => {
+                    udp += 1;
+                    assert_eq!(self.udp.get(port), Some(&i));
+                }
+                Some(Flow::TimeWait(t)) => {
+                    timewait += 1;
+                    assert_eq!(self.timewait.get(&t.tuple), Some(&i));
+                }
+                None => assert!(
+                    self.free.contains(&i),
+                    "empty slot {i} is not on the free list"
+                ),
+            }
+        }
+        assert_eq!((self.tcp_active, self.active), (tcp, tcp + udp));
+        assert_eq!(
+            (self.tcp.len(), self.udp.len(), self.timewait.len()),
+            (tcp as usize, udp as usize, timewait)
+        );
+        assert_eq!(
+            self.free.len() + tcp as usize + udp as usize + timewait,
+            self.slots.len()
+        );
+    }
+}
 
 pub struct TimeWait {
     pub tuple: FourTuple,

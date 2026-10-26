@@ -59,3 +59,8 @@ pub use stack::{
     UdpError,
 };
 pub use tcp::{TcpState, TcpStats};
+
+/// Property checks behind the `fuzz/` targets and `tests/fuzz_replay.rs`; not part of the API.
+#[cfg(feature = "fuzz-checks")]
+#[doc(hidden)]
+pub mod fuzz_checks;
