@@ -96,8 +96,8 @@ impl Tcb {
             AcceptWhen::Now => self.open_gate(),
             AcceptWhen::Deferred { deadline } => {
                 self.gate = Gate::Held;
-                // Never later than the undecided deadline set by the SYN: 25 s in total.
-                let at = now + deadline.min(MAX_DEFERRED);
+                // The SYN's own deadline (25 s) is the ceiling.
+                let at = now + deadline;
                 self.close_deadline = Some(self.close_deadline.map_or(at, |d| d.min(at)));
             }
         }

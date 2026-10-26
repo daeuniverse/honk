@@ -4,11 +4,11 @@ use crate::wire::tcp::{ACK, FIN, Header, RST, SYN};
 use crate::{Ready, StreamError};
 
 use super::cc::CcAck;
+use super::passive::Gate;
 use super::recovery;
 use super::ring::Pool;
 use super::sack::Insert;
 use super::sent::Acked;
-use super::passive::Gate;
 use super::{DATA, DELAY_ACK, FIN_ACK, OOO, PROBE_RESPONSE, Tcb, TcpState, seq};
 
 impl Tcb {

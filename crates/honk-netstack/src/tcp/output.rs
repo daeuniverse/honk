@@ -35,9 +35,6 @@ enum Kind {
 
 impl Tcb {
     pub fn output(&mut self, now: Instant, out: &mut [u8], pool: &mut super::ring::Pool) -> Output {
-        if self.gate != super::passive::Gate::Open {
-            return Output::None;
-        }
         let syn = matches!(self.state, TcpState::SynSent | TcpState::SynReceived);
         let mut options = self.options(now, syn);
         let mut kind = if self.rst_pending {

@@ -8,12 +8,11 @@ use std::time::Instant;
 
 use crate::MemoryBudget;
 use crate::accept::Refuse;
+use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::fragment::{FragmentLimits, Push};
 use crate::icmp_out::IcmpLimits;
 use crate::mode::{Mode, is_unicast};
-use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::tcp::output::Output;
-use crate::tcp::passive::Gate;
 use crate::tcp::ring::{FLOOR, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
 use crate::timer::Timers;
@@ -812,7 +811,7 @@ impl Stack {
                         self.events.push_back(id);
                     }
                 }
-                if tx && !slot.on_tx && t.gate == Gate::Open {
+                if tx && !slot.on_tx {
                     slot.on_tx = true;
                     self.ready.push_back(id);
                 }
@@ -961,9 +960,11 @@ impl Stack {
         assert_eq!(self.table.timewait.len(), 0);
         assert_eq!(self.half_open, 0);
         assert!(self.half_open_by_source.is_empty());
-        assert!(self.accept_q.iter().all(|id| {
-            self.table.slots[id.idx as usize].generation != id.generation
-        }));
+        assert!(
+            self.accept_q
+                .iter()
+                .all(|id| { self.table.slots[id.idx as usize].generation != id.generation })
+        );
         assert_eq!(self.stats().memory_committed, 0);
         self.pool.assert_idle();
         if let Some(budget) = &self.cfg.shared_budget {

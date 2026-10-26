@@ -36,7 +36,7 @@ pub enum AcceptWhen {
     /// Send the SYN-ACK now.
     Now,
     /// Hold the SYN-ACK until [`Stack::tcp_complete`]; the flow is refused silently when `deadline`
-    /// (clamped to [`MAX_DEFERRED`], counted from the SYN) passes first.
+    /// (never beyond [`MAX_DEFERRED`] after the SYN) passes first.
     Deferred { deadline: Duration },
 }
 
