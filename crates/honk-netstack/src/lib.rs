@@ -51,15 +51,20 @@
 
 pub mod wire;
 
+mod accept;
 mod budget;
 mod flow;
+mod mode;
 mod icmp;
+mod icmp_out;
 mod stack;
 mod tcp;
 mod timer;
 mod udp;
 
+pub use accept::{AcceptOpts, AcceptWhen, Keepalive, MAX_DEFERRED, Refuse, SynInfo};
 pub use budget::MemoryBudget;
+pub use mode::{ExcludeSet, Mode};
 pub use stack::{
     BindError, Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StackStats, StreamError,
     UdpError,

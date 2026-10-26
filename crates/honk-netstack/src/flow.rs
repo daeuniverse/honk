@@ -226,6 +226,18 @@ impl TimeWait {
             && crate::tcp::seq::gt(new_ts, self.ts_last)
             && crate::tcp::seq::gt(new_isn, self.snd_nxt)
     }
+
+    /// Whether a SYN may replace this TIME_WAIT entry (RFC 9293 §3.6.1, RFC 6191, as Linux does):
+    /// its sequence number is beyond everything the old incarnation received, or its timestamp is
+    /// newer; a timestamp older than the last one seen is a stray old duplicate either way.
+    pub fn syn_reopens(&self, syn_seq: u32, ts: Option<u32>) -> bool {
+        use crate::tcp::seq;
+        match (self.ts_recent, ts) {
+            (Some(recent), Some(ts)) if seq::lt(ts, recent) => false,
+            (Some(recent), Some(ts)) if seq::gt(ts, recent) => true,
+            _ => seq::gt(syn_seq, self.rcv_nxt),
+        }
+    }
 }
 
 pub struct Ports {

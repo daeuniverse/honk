@@ -9,6 +9,7 @@ mod pacing;
 mod prr;
 mod rack;
 pub(crate) mod recovery;
+pub(crate) mod passive;
 pub(crate) mod ring;
 pub(crate) mod rtt;
 pub(crate) mod sack;
@@ -18,6 +19,7 @@ pub(crate) mod seq;
 use std::time::{Duration, Instant};
 
 use crate::flow::FourTuple;
+use crate::accept::Keepalive;
 use crate::{Config, Ready, StreamError};
 use cc::Cc;
 use pacing::Pacer;
@@ -180,6 +182,15 @@ pub struct Tcb {
     /// for the idle restart (RFC 5681 §4.1).
     last_data_tx: Instant,
     stats: Counters,
+    /// Passive open: whether the application has let the SYN-ACK go; see [`passive::Gate`].
+    pub(crate) gate: passive::Gate,
+    /// Counted against the stack's half-open caps until the handshake completes or the flow dies.
+    pub(crate) half_open: bool,
+    pub(crate) keepalive: Option<Keepalive>,
+    ka_deadline: Option<Instant>,
+    /// Last accepted segment from the peer; keepalive idleness is measured from here.
+    ka_rx: Instant,
+    ka_probes: u8,
 }
 
 impl Tcb {
@@ -284,6 +295,12 @@ impl Tcb {
             first_tx_ts: now,
             last_data_tx: now,
             stats: Counters::default(),
+            gate: passive::Gate::Open,
+            half_open: false,
+            keepalive: None,
+            ka_deadline: None,
+            ka_rx: now,
+            ka_probes: 0,
         }
     }
 
@@ -300,6 +317,7 @@ impl Tcb {
             self.tlp_deadline,
             self.recovery.reo_deadline(),
             self.pacing_deadline,
+            self.ka_deadline,
         ]
         .into_iter()
         .flatten()
@@ -464,6 +482,7 @@ impl Tcb {
         self.delack_deadline = None;
         self.close_deadline = None;
         self.ack_due = 0;
+        self.ka_deadline = None;
     }
 
     pub fn fail(&mut self, error: StreamError) {
@@ -473,6 +492,7 @@ impl Tcb {
         self.delack_deadline = None;
         self.close_deadline = None;
         self.ack_due = 0;
+        self.ka_deadline = None;
         self.ready |= Ready::ERROR | Ready::READABLE | Ready::WRITABLE | Ready::READ_CLOSED;
     }
 
@@ -480,6 +500,7 @@ impl Tcb {
         self.state = TcpState::TimeWait;
         self.close_deadline = Some(now + TIME_WAIT);
         self.rto_deadline = None;
+        self.ka_deadline = None;
         self.ready |= Ready::READ_CLOSED;
     }
 
@@ -529,6 +550,9 @@ impl Tcb {
                 } else {
                     self.state = TcpState::Closed;
                 }
+            } else if self.gate == passive::Gate::Queued {
+                // No application ever saw this SYN: forget it silently, the client retries.
+                self.abort();
             } else {
                 self.fail(StreamError::TimedOut);
             }
@@ -553,6 +577,7 @@ impl Tcb {
             self.tlp_deadline = None;
             self.tlp_due = true;
         }
+        self.keepalive_timer(now);
     }
 
     fn rto_expired(&mut self, now: Instant) {
@@ -721,6 +746,15 @@ impl Tcb {
             "a zero congestion window stalls the flow"
         );
         assert!(self.rtt.rto() <= rtt::MAX_RTO);
+        assert!(
+            self.gate == passive::Gate::Open
+                || (matches!(self.state, TcpState::SynReceived | TcpState::Closed)
+                    && self.syn_sent.is_none()
+                    && !self.syn_due),
+            "a gated flow has answered or is due to answer"
+        );
+        assert!(!self.half_open || self.state == TcpState::SynReceived);
+        assert!(self.keepalive.is_some() || self.ka_deadline.is_none());
         assert!(self.pmtu >= 68);
         if self.state == TcpState::SynSent {
             return;
