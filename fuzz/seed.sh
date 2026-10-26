@@ -9,7 +9,7 @@ seed() { # target file
   local sum; sum=$(sha1sum < "$2" | cut -c1-40)
   cp "$2" "fuzz/corpus/$1/$sum"
 }
-rm -rf fuzz/corpus/document fuzz/corpus/lexer fuzz/corpus/share_link fuzz/corpus/netstack_packet fuzz/corpus/netstack_schedule
+rm -rf fuzz/corpus/document fuzz/corpus/lexer fuzz/corpus/share_link fuzz/corpus/netstack_packet fuzz/corpus/netstack_schedule fuzz/corpus/netstack_transparent
 mkdir -p fuzz/corpus/document fuzz/corpus/lexer fuzz/corpus/share_link
 while IFS= read -r f; do seed document "$f"; seed lexer "$f"; done < <(
   find crates/honk-config/conformance/cases crates/honk-config/tests/fixtures -name '*.dae' | sort

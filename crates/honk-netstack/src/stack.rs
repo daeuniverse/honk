@@ -958,6 +958,7 @@ impl Stack {
         self.check();
         assert_eq!(self.table.active, 0);
         assert_eq!(self.table.timewait.len(), 0);
+        self.reasm.assert_idle();
         assert_eq!(self.half_open, 0);
         assert!(self.half_open_by_source.is_empty());
         assert!(
