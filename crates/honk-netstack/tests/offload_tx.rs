@@ -221,7 +221,7 @@ fn caps_off_is_byte_identical_to_poll_transmit() {
         let data = pattern(600_000, 11);
         let mut written = 0;
         let mut seen = Vec::new();
-        let mut buf = vec![0u8; 2000];
+        let mut buf = vec![0u8; 70_000];
         let mut acked = c.snd;
         for _ in 0..4000 {
             if written < data.len() {
@@ -650,4 +650,75 @@ fn max_mss_caps_each_segment_not_the_super_packet() {
         assert!(segment.payload.len() <= 588);
         assert!(segment.raw.len() <= 600 + 20 + 20);
     }
+}
+
+#[test]
+fn plain_udp_fragments_never_adopt_offload_metadata() {
+    for (src, dst) in [(addr(DST), addr(CLIENT)), (addr(DST6), addr(CLIENT6))] {
+        let now = Instant::now();
+        let mut stack = Stack::new(transparent(), now);
+        let mut packet = [0; 2000];
+        let first = stack
+            .udp_send_from(src, dst, &pattern(5000, 17), &mut packet)
+            .unwrap();
+        assert!(first <= 1420);
+        assert_eq!(
+            wire::parse_ip(&packet[..first]),
+            Err(wire::ParseError::Fragment)
+        );
+        let mut fragments = 1;
+        while let Some(tx) = stack.poll_transmit_with(now, &mut packet, TxCaps::ALL) {
+            assert_eq!(
+                tx,
+                plain(tx.len),
+                "IP fragmentation is not UDP segmentation"
+            );
+            assert!(tx.len <= 1420);
+            assert_eq!(
+                wire::parse_ip(&packet[..tx.len]),
+                Err(wire::ParseError::Fragment)
+            );
+            fragments += 1;
+        }
+        assert!(fragments >= 4);
+        assert_eq!(stack.stats().tx_packets, fragments);
+    }
+}
+
+#[test]
+fn uso_reserves_the_ipv4_id_run_before_plain_and_fragmented_sends() {
+    let now = Instant::now();
+    let mut stack = Stack::new(transparent(), now);
+    let pair = (addr(DST), addr(CLIENT));
+    let mut packet = [0; 70_000];
+    let id = |packet: &[u8]| u16::from_be_bytes([packet[4], packet[5]]);
+    let data = pattern(3000, 1);
+    let tx = stack
+        .udp_send_gso_from(pair, &data, 1000, TxCaps::ALL, &mut packet)
+        .unwrap();
+    let first = id(&packet[..tx.len]);
+    // A rejected super-packet must not consume IDs.
+    assert_eq!(
+        stack.udp_send_gso_from(pair, &data, 1000, TxCaps::ALL, &mut packet[..100]),
+        Err(UdpError::BufferTooSmall)
+    );
+    let n = stack
+        .udp_send_from(pair.0, pair.1, b"plain", &mut packet)
+        .unwrap();
+    assert_eq!(id(&packet[..n]), first.wrapping_add(3));
+    let tx = stack
+        .udp_send_gso_from(pair, &data[..2000], 1000, TxCaps::ALL, &mut packet)
+        .unwrap();
+    assert_eq!(id(&packet[..tx.len]), first.wrapping_add(4));
+    let n = stack
+        .udp_send_from(pair.0, pair.1, &data, &mut packet)
+        .unwrap();
+    assert_eq!(id(&packet[..n]), first.wrapping_add(6));
+    while let Some(tx) = stack.poll_transmit_with(now, &mut packet, TxCaps::ALL) {
+        assert_eq!(id(&packet[..tx.len]), first.wrapping_add(6));
+    }
+    let n = stack
+        .udp_send_from(pair.0, pair.1, b"next", &mut packet)
+        .unwrap();
+    assert_eq!(id(&packet[..n]), first.wrapping_add(7));
 }

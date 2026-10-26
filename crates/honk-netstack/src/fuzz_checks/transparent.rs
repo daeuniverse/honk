@@ -1,13 +1,14 @@
-//! Transparent-mode operation sequences: SYNs, retransmitted SYNs, admission (immediate and
-//! deferred), refusal, handshake ACKs, data, FIN/RST, keepalive, time and raw/UDP packets.
-//! Every byte string decodes to some sequence; after each operation the whole stack is recounted.
+//! Transparent operation sequences: admission, shutdown, keepalive, checksum provenance, TCP
+//! GRO/TSO, UDP USO, bounded fragments and raw input. Every byte string decodes to some sequence;
+//! after each operation the whole stack is recounted.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, tcp};
 use crate::{
-    AcceptOpts, AcceptWhen, Config, ExcludeSet, FlowId, Keepalive, Mode, Refuse, Rx, Stack,
+    AcceptOpts, AcceptWhen, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Keepalive, Mode,
+    Refuse, Rx, RxMeta, Stack, Transmit, TxCaps, TxCsum,
 };
 
 const MAX_OPS: usize = 192;
@@ -57,6 +58,14 @@ pub(super) mod op {
     pub const UDP: u8 = 10;
     /// `[length, bytes..]`
     pub const RAW: u8 = 11;
+    /// `[slot, length * 256, offset, size-index, checksum-flags]`
+    pub const TCP_GSO: u8 = 12;
+    /// `[kind, length * 256, size-index, checksum-flags]`
+    pub const UDP_GSO: u8 = 13;
+    /// `[mask]`: TSO4, TSO6, USO4, USO6 capability bits.
+    pub const CAPS: u8 = 14;
+    /// `[kind, length, behavior]`: valid UDP fragments, reordered/duplicated/incomplete/corrupt.
+    pub const FRAGMENTS: u8 = 15;
 }
 
 /// One (client, destination) tuple the script plays the client of.
@@ -77,6 +86,10 @@ struct World {
     base: Instant,
     now: Instant,
     slots: Vec<Slot>,
+    caps: TxCaps,
+    rx_gso_packets: usize,
+    tx_gso_packets: usize,
+    reassembled: usize,
 }
 
 fn client(i: usize) -> SocketAddr {
@@ -101,6 +114,82 @@ fn destination(v6: bool, j: usize) -> SocketAddr {
     }
 }
 
+/// Provenance and segment-size choices, including contradictory driver claims.
+fn metadata(flags: u8, size: u8, proto: u8, start: u16) -> (RxMeta, bool) {
+    let field = if proto == wire::PROTO_TCP { 16 } else { 6 };
+    let csum = match flags & 7 {
+        0 | 6 => Csum::Verify,
+        1 | 7 => Csum::Valid,
+        2 | 5 => Csum::Partial {
+            start,
+            offset: field,
+        },
+        3 => Csum::Partial {
+            start: start + 4,
+            offset: field,
+        },
+        _ => Csum::Partial {
+            start,
+            offset: field + 1,
+        },
+    };
+    let tcp = (proto == wire::PROTO_TCP) ^ (flags & 16 != 0);
+    let gso = (size & 128 == 0).then_some(GsoRx {
+        kind: if tcp { GsoKind::Tcp } else { GsoKind::UdpL4 },
+        size: [0, 1, 48, 512, 1368, u16::MAX][usize::from(size) % 6],
+    });
+    (RxMeta { csum, gso }, flags & 8 != 0)
+}
+
+/// Check the bytes and metadata together, including the seed required by CHECKSUM_PARTIAL.
+fn check_transmit(tx: &Transmit, packet: &[u8]) {
+    assert_eq!(tx.len, packet.len());
+    let ip = match wire::parse_ip(packet) {
+        Ok(ip) => ip,
+        Err(wire::ParseError::Fragment) => {
+            assert_eq!(tx.gso, None);
+            assert_eq!(tx.csum, TxCsum::Full);
+            wire::frag::parse(packet).expect("well-formed output fragment");
+            return;
+        }
+        other => panic!("malformed output: {other:?}"),
+    };
+    let l4 = &packet[ip.payload.clone()];
+    match (tx.gso, tx.csum) {
+        (Some(gso), TxCsum::Partial { start, offset }) => {
+            assert_eq!(usize::from(start), ip.payload.start);
+            assert_ne!(gso.size, 0);
+            assert!(tx.len <= usize::from(u16::MAX));
+            let (header, field) = match gso.kind {
+                GsoKind::Tcp => {
+                    assert_eq!(ip.proto, wire::PROTO_TCP);
+                    (tcp::parse(l4).expect("well-formed TSO header").1, 16)
+                }
+                GsoKind::UdpL4 => {
+                    assert_eq!(ip.proto, wire::PROTO_UDP);
+                    wire::udp::parse(l4).expect("well-formed USO header");
+                    (8, 6)
+                }
+            };
+            assert_eq!(offset, field as u16);
+            assert_eq!(usize::from(gso.hdr_len), ip.payload.start + header);
+            let segments = (l4.len() - header).div_ceil(usize::from(gso.size));
+            assert!(segments >= 2);
+            if gso.kind == GsoKind::UdpL4 {
+                assert!(segments <= crate::offload::MAX_USO_TX);
+            }
+            let seed = wire::checksum::Checksum::pseudo(ip.src, ip.dst, ip.proto, l4.len()).fold();
+            assert_eq!(u16::from_be_bytes([l4[field], l4[field + 1]]), seed);
+        }
+        (None, TxCsum::Full) => match ip.proto {
+            wire::PROTO_TCP => assert!(tcp::verify_checksum(ip.src, ip.dst, l4)),
+            wire::PROTO_UDP => assert!(wire::udp::verify_checksum(ip.src, ip.dst, l4)),
+            _ => {}
+        },
+        _ => panic!("segmentation and checksum metadata disagree: {tx:?}"),
+    }
+}
+
 impl World {
     fn new() -> World {
         let base = Instant::now();
@@ -120,6 +209,10 @@ impl World {
             base,
             now: base,
             slots: Vec::new(),
+            caps: TxCaps::NONE,
+            rx_gso_packets: 0,
+            tx_gso_packets: 0,
+            reassembled: 0,
         }
     }
 
@@ -135,11 +228,11 @@ impl World {
     fn send(
         &mut self,
         s: usize,
-        seq: u32,
-        ack: u32,
+        (seq, ack): (u32, u32),
         flags: u8,
         options: tcp::Options,
         data: &[u8],
+        metadata: (RxMeta, bool),
     ) {
         let p = &self.slots[s];
         let mut out = vec![0u8; data.len() + 128];
@@ -154,8 +247,28 @@ impl World {
             options,
         };
         if let Some(n) = tcp::emit_packet(&mut out, p.client.ip(), p.dst.ip(), &hdr, [data, &[]]) {
-            self.stack.receive(self.now, &out[..n]);
+            self.ingest(&mut out[..n], metadata);
         }
+    }
+
+    /// Seeds a partial checksum as a kernel would, optionally damages it, and ingests the packet.
+    fn ingest(&mut self, packet: &mut [u8], (meta, corrupt): (RxMeta, bool)) -> Rx {
+        let ip = wire::parse_ip(packet).expect("the harness just built a complete packet");
+        let offset = if ip.proto == wire::PROTO_TCP { 16 } else { 6 };
+        let field = ip.payload.start + offset;
+        if matches!(meta.csum, Csum::Partial { .. }) {
+            let seed =
+                wire::checksum::Checksum::pseudo(ip.src, ip.dst, ip.proto, ip.payload.len()).fold();
+            packet[field..field + 2].copy_from_slice(&seed.to_be_bytes());
+        }
+        if corrupt {
+            packet[field] ^= 0x55;
+        }
+        let rx = self.stack.receive_with(self.now, packet, meta);
+        if meta.gso.is_some() && matches!(rx, Rx::Consumed | Rx::TransparentSplit { .. }) {
+            self.rx_gso_packets += 1;
+        }
+        rx
     }
 
     fn plain(&self) -> tcp::Options {
@@ -167,12 +280,26 @@ impl World {
 
     /// Pulls everything the stack will send and learns the stack's sequence numbers from it.
     fn drain(&mut self) {
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 70_000];
         for _ in 0..4096 {
-            let Some(n) = self.stack.poll_transmit(self.now, &mut buf) else {
+            let Some(tx) = self.stack.poll_transmit_with(self.now, &mut buf, self.caps) else {
                 return;
             };
-            let ip = wire::parse_ip(&buf[..n]).expect("well-formed output");
+            let packet = &buf[..tx.len];
+            let ip = match wire::parse_ip(packet) {
+                Ok(ip) => ip,
+                Err(wire::ParseError::Fragment) => {
+                    assert_eq!(tx.gso, None);
+                    assert_eq!(tx.csum, TxCsum::Full);
+                    wire::frag::parse(packet).expect("well-formed output fragment");
+                    continue;
+                }
+                other => panic!("malformed output: {other:?}"),
+            };
+            if tx.gso.is_some() {
+                self.tx_gso_packets += 1;
+            }
+            check_transmit(&tx, packet);
             if ip.proto == wire::PROTO_TCP {
                 let seg = &buf[ip.payload.clone()];
                 let (h, _) = tcp::parse(seg).expect("well-formed TCP");
@@ -240,6 +367,95 @@ impl World {
     }
 }
 
+/// Build actual IPv4/IPv6 fragments, not just random input that the IP parser discards.
+fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
+    let src = client(usize::from(kind) % CLIENTS);
+    let dst = destination(src.is_ipv6(), usize::from(kind / 8) % DSTS);
+    let payload = vec![0x71; (usize::from(len) + 1) * 32];
+    let mut whole = vec![0; payload.len() + 64];
+    let n = wire::udp::emit_packet(&mut whole, src, dst, &payload).expect("bounded UDP packet");
+    let ip = wire::parse_ip(&whole[..n]).expect("harness UDP packet");
+    let mut datagram = whole[ip.payload].to_vec();
+    if how & 8 != 0 {
+        datagram[6] ^= 0x55;
+    }
+    let chunk = [64, 256, 1200][usize::from(how >> 5) % 3];
+    let mut packets = Vec::new();
+    let ident = (u32::from(kind) << 16) | u32::from(len);
+    for (index, part) in datagram.chunks(chunk).enumerate() {
+        let offset = index * chunk;
+        let more = offset + part.len() < datagram.len();
+        let mut packet = vec![0; part.len() + 48];
+        let header = match (src.ip(), dst.ip()) {
+            (IpAddr::V4(s), IpAddr::V4(d)) => wire::ipv4::emit_fragment(
+                &mut packet,
+                s,
+                d,
+                wire::PROTO_UDP,
+                part.len(),
+                (ident as u16, offset, more),
+            )
+            .expect("bounded IPv4 fragment"),
+            (IpAddr::V6(s), IpAddr::V6(d)) => {
+                let ip = wire::ipv6::emit(&mut packet, s, d, 44, 8 + part.len())
+                    .expect("bounded IPv6 fragment");
+                let frag = wire::ipv6::emit_fragment_header(
+                    &mut packet[ip..],
+                    wire::PROTO_UDP,
+                    offset,
+                    more,
+                    ident,
+                )
+                .expect("fragment header fits");
+                ip + frag
+            }
+            _ => unreachable!(),
+        };
+        packet[header..header + part.len()].copy_from_slice(part);
+        packet.truncate(header + part.len());
+        packets.push(packet);
+    }
+    if how & 1 != 0 {
+        packets.reverse();
+    }
+    let omit = (how & 4 != 0).then_some(packets.len() / 2);
+    let meta = RxMeta {
+        csum: if how & 16 != 0 {
+            Csum::Valid
+        } else {
+            Csum::Verify
+        },
+        gso: None,
+    };
+    for (index, packet) in packets.iter().enumerate() {
+        if omit == Some(index) {
+            continue;
+        }
+        let rx = w.stack.receive_with(w.now, packet, meta);
+        if let Rx::TransparentOwned {
+            src: got_src,
+            dst: got_dst,
+            packet,
+            payload: range,
+        } = rx
+        {
+            assert_eq!(
+                how & 8,
+                0,
+                "a corrupt reassembled checksum must never be trusted"
+            );
+            assert_eq!((got_src, got_dst), (src, dst));
+            assert_eq!(&packet[range], payload);
+            w.reassembled += 1;
+        }
+        w.stack.check();
+        if how & 2 != 0 {
+            w.stack.receive_with(w.now, packet, meta);
+            w.stack.check();
+        }
+    }
+}
+
 pub fn check(data: &[u8]) {
     let mut r = Reader(data);
     let mut w = World::new();
@@ -254,7 +470,8 @@ pub fn check(data: &[u8]) {
 }
 
 fn step(w: &mut World, r: &mut Reader) {
-    match r.u8() % 12 {
+    let opcode = r.u8() % 16;
+    match opcode {
         op::SYN => {
             let (c, d, mss) = (usize::from(r.u8()) % CLIENTS, usize::from(r.u8()), r.u8());
             let dst = destination(c % 2 == 1, d % DSTS);
@@ -292,7 +509,7 @@ fn step(w: &mut World, r: &mut Reader) {
             };
             let isn = w.slots[s].isn;
             w.slots[s].syn_sent = true;
-            w.send(s, isn, 0, tcp::SYN, options, &[]);
+            w.send(s, (isn, 0), tcp::SYN, options, &[], (RxMeta::VERIFY, false));
             w.drain();
         }
         op::ACCEPT => {
@@ -348,12 +565,25 @@ fn step(w: &mut World, r: &mut Reader) {
                 && let Some(snd) = w.slots[s].snd
             {
                 let (next, options) = (w.slots[s].next, w.plain());
-                w.send(s, next, snd, tcp::ACK, options, &[]);
+                w.send(
+                    s,
+                    (next, snd),
+                    tcp::ACK,
+                    options,
+                    &[],
+                    (RxMeta::VERIFY, false),
+                );
                 w.drain();
             }
         }
-        op::DATA => {
-            let (s, len, off) = (w.slot(r), usize::from(r.u8()) * 8, r.u8());
+        op::DATA | op::TCP_GSO => {
+            let (s, len, off) = (w.slot(r), usize::from(r.u8()), r.u8());
+            let len = len * if opcode == op::TCP_GSO { 256 } else { 8 };
+            let (size, provenance) = if opcode == op::TCP_GSO {
+                (r.u8(), r.u8())
+            } else {
+                (128, 0)
+            };
             let Some(s) = s else { return };
             let Some(snd) = w.slots[s].snd else { return };
             let data: Vec<u8> = (0..len).map(|k| k as u8).collect();
@@ -364,7 +594,13 @@ fn step(w: &mut World, r: &mut Reader) {
                 _ => next.wrapping_sub(u32::from(off)),
             };
             let options = w.plain();
-            w.send(s, seq, snd, tcp::ACK, options, &data);
+            let meta = metadata(
+                provenance,
+                size,
+                wire::PROTO_TCP,
+                wire::ip_header_len(w.slots[s].client.is_ipv6()) as u16,
+            );
+            w.send(s, (seq, snd), tcp::ACK, options, &data, meta);
             if seq == next {
                 w.slots[s].next = next.wrapping_add(len as u32);
             }
@@ -375,7 +611,14 @@ fn step(w: &mut World, r: &mut Reader) {
                 && let Some(snd) = w.slots[s].snd
             {
                 let (next, options) = (w.slots[s].next, w.plain());
-                w.send(s, next, snd, tcp::ACK | tcp::FIN, options, &[]);
+                w.send(
+                    s,
+                    (next, snd),
+                    tcp::ACK | tcp::FIN,
+                    options,
+                    &[],
+                    (RxMeta::VERIFY, false),
+                );
                 w.slots[s].next = next.wrapping_add(1);
                 w.drain();
             }
@@ -391,11 +634,11 @@ fn step(w: &mut World, r: &mut Reader) {
                 };
                 w.send(
                     s,
-                    seq,
-                    snd,
+                    (seq, snd),
                     tcp::RST | tcp::ACK,
                     tcp::Options::default(),
                     &[],
+                    (RxMeta::VERIFY, false),
                 );
                 w.drain();
             }
@@ -420,7 +663,14 @@ fn step(w: &mut World, r: &mut Reader) {
                     // Answer a keepalive probe (or anything) with a bare in-window ACK.
                     if let Some(snd) = w.slots[s].snd {
                         let (next, options) = (w.slots[s].next, w.plain());
-                        w.send(s, next, snd, tcp::ACK, options, &[]);
+                        w.send(
+                            s,
+                            (next, snd),
+                            tcp::ACK,
+                            options,
+                            &[],
+                            (RxMeta::VERIFY, false),
+                        );
                     }
                 }
             }
@@ -433,26 +683,74 @@ fn step(w: &mut World, r: &mut Reader) {
             w.advance(Duration::from_millis(ms));
             w.drain();
         }
-        op::UDP => {
-            let (kind, len) = (r.u8(), usize::from(r.u8()) * 4);
+        op::UDP | op::UDP_GSO => {
+            let (kind, len) = (r.u8(), usize::from(r.u8()));
+            let len = len * if opcode == op::UDP_GSO { 256 } else { 4 };
+            let (size, provenance) = if opcode == op::UDP_GSO {
+                (r.u8(), r.u8())
+            } else {
+                (128, 0)
+            };
             let c = client(usize::from(kind) % CLIENTS);
             let d = destination(c.is_ipv6(), usize::from(kind / 8) % DSTS);
             let payload = vec![0xa5; len];
             let mut out = vec![0; len + 64];
             if let Some(n) = wire::udp::emit_packet(&mut out, c, d, &payload) {
-                match w.stack.receive(w.now, &out[..n]) {
+                let meta = metadata(
+                    provenance,
+                    size,
+                    wire::PROTO_UDP,
+                    wire::ip_header_len(c.is_ipv6()) as u16,
+                );
+                match w.ingest(&mut out[..n], meta) {
                     Rx::Transparent { src, dst, payload } => {
                         assert_eq!((src, dst), (c, d));
                         assert_eq!(out[payload].len(), len);
+                    }
+                    Rx::TransparentSplit {
+                        src,
+                        dst,
+                        payload,
+                        size,
+                    } => {
+                        assert_eq!((src, dst), (c, d));
+                        assert_eq!(out[payload.clone()].len(), len);
+                        for datagram in out[payload].chunks(usize::from(size)) {
+                            assert!(datagram.iter().all(|&byte| byte == 0xa5));
+                        }
                     }
                     Rx::Dropped(_) => {}
                     other => panic!("unexpected UDP result {other:?}"),
                 }
             }
-            let mut reply = vec![0; 2048];
-            if let Ok(n) = w.stack.udp_send_from(d, c, &payload, &mut reply) {
+            let mut reply = vec![0; 70_000];
+            if opcode == op::UDP_GSO {
+                let segment = [0, 1, 48, 512, 1368, u16::MAX][usize::from(size) % 6];
+                if let Ok(tx) =
+                    w.stack
+                        .udp_send_gso_from((d, c), &payload, segment, w.caps, &mut reply)
+                {
+                    check_transmit(&tx, &reply[..tx.len]);
+                    w.tx_gso_packets += usize::from(tx.gso.is_some());
+                }
+            } else if let Ok(n) = w.stack.udp_send_from(d, c, &payload, &mut reply) {
                 assert!(wire::parse_ip(&reply[..n]).is_ok());
             }
+            w.drain();
+        }
+        op::CAPS => {
+            let mask = r.u8();
+            w.caps = TxCaps {
+                tso4: mask & 1 != 0,
+                tso6: mask & 2 != 0,
+                uso4: mask & 4 != 0,
+                uso6: mask & 8 != 0,
+            };
+            w.drain();
+        }
+        op::FRAGMENTS => {
+            let (kind, len, how) = (r.u8(), r.u8(), r.u8());
+            fragments(w, kind, len, how);
             w.drain();
         }
         _ => {
@@ -493,12 +791,46 @@ pub fn seeds() -> Vec<Vec<u8>> {
     ]);
     let caps = (0..10).flat_map(|i| [SYN, i % 5, i, 3]).collect();
     let udp = vec![UDP, 0, 40, UDP, 9, 255, RAW, 8, 0x45, 0, 0, 20, 0, 0, 0x40, 0];
-    vec![bulk, keepalive, deferred, refuse, close, caps, udp]
+    let mut offloads = open.clone();
+    offloads.extend([
+        CAPS, 15, TCP_GSO, 0, 32, 0, 4, 2, APP, 0, 0, 255,
+        UDP_GSO, 0, 30, 3, 2, UDP_GSO, 1, 20, 3, 1,
+        FRAGMENTS, 0, 90, 0, FRAGMENTS, 1, 90, 1,
+        FRAGMENTS, 0, 90, 20, FRAGMENTS, 1, 90, 24,
+        TCP_GSO, 0, 10, 2, 3, 3, UDP_GSO, 0, 20, 0, 0,
+        CAPS, 0, APP, 0, 1, 255,
+    ]);
+    vec![bulk, keepalive, deferred, refuse, close, caps, udp, offloads]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_walks_gro_tso_uso_and_valid_fragment_reassembly() {
+        let seeds = seeds();
+        let mut r = Reader(&seeds[7]);
+        let mut w = World::new();
+        while !r.done() {
+            step(&mut w, &mut r);
+            w.adopt();
+            w.stack.check();
+        }
+        assert!(
+            w.rx_gso_packets >= 3,
+            "GRO and both USO families reached receive_with"
+        );
+        assert!(
+            w.tx_gso_packets >= 3,
+            "TSO and both USO families reached transmit"
+        );
+        assert!(
+            w.reassembled >= 2,
+            "both fragment families were fully reassembled"
+        );
+        w.finish();
+    }
 
     /// The seeds must drive real termination, or the target would only fuzz the decoder.
     #[test]
@@ -548,7 +880,7 @@ mod tests {
                 data.push(if x.is_multiple_of(5) {
                     (x >> 8) as u8
                 } else {
-                    ((x >> 8) % 12) as u8
+                    ((x >> 8) % 16) as u8
                 });
             }
             check(&data);

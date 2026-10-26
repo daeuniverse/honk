@@ -231,7 +231,9 @@ impl UdpTx {
         .ok_or(UdpError::BufferTooSmall)?;
         wire::udp::emit_datagram_partial(&mut out[ip_len..], src, dst, payload)
             .ok_or(UdpError::TooLarge)?;
-        self.ident = self.ident.wrapping_add(1);
+        // IPv4 GSO assigns consecutive IDs to its non-DF datagrams. Reserve the whole run so the
+        // next plain or fragmented send cannot reuse one while those datagrams are in flight.
+        self.ident = self.ident.wrapping_add(payload.len().div_ceil(size) as u32);
         Ok(Transmit {
             len: packet,
             gso: Some(GsoTx {

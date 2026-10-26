@@ -61,8 +61,12 @@
 //! retransmitted FIN reaches the real server instead of the tombstone and is answered with RST.
 //!
 //! UDP is stateless: [`Rx::Transparent`] carries both addresses, [`Stack::udp_send_from`]
-//! answers from any source and fragments oversized replies. Fragmented packets are reassembled
-//! within bounded limits ([`FragmentLimits`]) and ICMP errors are rate limited ([`IcmpLimits`]).
+//! answers from any source and fragments oversized replies. [`Rx::Transparent`] and
+//! [`Rx::TransparentSplit`] index the borrowed input: consume or copy every datagram before
+//! recycling a driver buffer (for AF_XDP, before returning its frame to FILL). Reassembled UDP
+//! instead yields [`Rx::TransparentOwned`], whose payload indexes its owned packet. Fragmented
+//! packets are reassembled within bounded limits ([`FragmentLimits`]); ICMP errors are rate limited
+//! ([`IcmpLimits`]). TCP data has already been copied into the ring when `receive_with` returns.
 //!
 //! # Offload
 //!
@@ -97,9 +101,11 @@
 //! Chunk storage is 16 KiB in [`Mode::Endpoint`] and 4 KiB in [`Mode::Transparent`]
 //! ([`Config::tcp_chunk`] overrides it, 4 to 64 KiB). Admission reserves one TX and one RX chunk
 //! plus a minimum send-descriptor capacity per TCP flow; excess chunks and descriptor capacity share
-//! the configured budget. Receive windows are committed before advertising space,
-//! although physical chunks are allocated lazily. A ring that empties (everything read or
-//! acknowledged) returns all its chunks, and descriptor storage is released when nothing is
+//! the configured budget. The initial window too is committed before its SYN or SYN-ACK advertises
+//! it (`tcp_connect` / `tcp_accept` may consume shared space immediately), so admitting an idle flow
+//! need not commit only its floor. Physical chunks are allocated lazily. A ring that empties
+//! (everything read or acknowledged) returns all its chunks, and descriptor storage is released
+//! when nothing is
 //! in flight: the floor is a guarantee, not resident memory. Allocation statistics include
 //! the pool's cached free chunks (up to 64 while any chunk is in use, one otherwise).
 //! [`Config::shared_budget`] lets stacks of one process share an additional limit, charged
