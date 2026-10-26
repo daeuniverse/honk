@@ -1,27 +1,81 @@
 //! honk-netstack as a transparent terminator: accepts whatever the client dials (`10.0.0.2:8000+i`)
-//! and plays the server side of the plan. Flow `i` is identified by the destination port.
+//! and plays the server side of the plan. Flow `i` is identified by the destination port; with
+//! `ServerOpts::per_source` it is `source index * per_source + port - 8000`, where the source index
+//! is the last two octets of the client address `10.1.hi.lo` (see `source_addr`).
 
 use super::app::{Driver, Plan, Role, StreamError, StreamIo};
 use super::engine::{Host, epoch};
 use super::smol::Family;
+use honk_netstack::wire::{self, tcp};
 use honk_netstack::{
     AcceptOpts, AcceptWhen, Config, ExcludeSet, FlowId, Mode, Stack, StreamError as NsError,
     TcpState,
 };
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
+
+/// The address of client source `k` in a multi-source run.
+pub fn source_addr(k: usize) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(10, 1, (k >> 8) as u8, k as u8))
+}
+
+#[derive(Default)]
+pub struct ServerOpts {
+    /// Several client sources with this many flows each (see the module comment).
+    pub per_source: Option<usize>,
+    /// Close the application handle of a flow as soon as the server side of the plan completed
+    /// (the compact TIME_WAIT entry then outlives the handle).
+    pub close_when_done: bool,
+    /// Adjusts the stack configuration (budget, limits).
+    pub config: Option<Box<dyn FnOnce(&mut Config)>>,
+}
+
+/// What the terminator emitted: the transparency check ("a reply is sourced from the original
+/// destination") and the resets it sent.
+#[derive(Debug, Default)]
+pub struct Audit {
+    pub tcp_packets: u64,
+    pub rsts: u64,
+    /// Packets whose source was not the original destination of an accepted flow.
+    pub foreign: u64,
+}
 
 pub struct HonkServerIo {
     pub stack: Stack,
     ids: Vec<Option<FlowId>>,
+    /// When each flow was reported by `poll_accept`.
+    pub admitted: Vec<Option<Instant>>,
+    closed: Vec<bool>,
     /// Deferred flows waiting for their (simulated) upstream dial.
     held: Vec<(FlowId, Instant)>,
     defer: Option<Duration>,
+    per_source: Option<usize>,
+    close_when_done: bool,
+    dsts: HashSet<(IpAddr, u16)>,
+    pub audit: Audit,
 }
 
 impl HonkServerIo {
     pub fn close_all(&mut self) {
         for id in self.ids.iter().flatten() {
             self.stack.tcp_close(*id);
+        }
+    }
+
+    pub fn id(&self, i: usize) -> Option<FlowId> {
+        self.ids[i]
+    }
+
+    fn index_of(&self, client: IpAddr, dst_port: u16) -> usize {
+        let port = usize::from(dst_port - 8000);
+        match (self.per_source, client) {
+            (Some(per), IpAddr::V4(a)) => {
+                let o = a.octets();
+                assert_eq!(&o[..2], &[10, 1], "unexpected client {a}");
+                (usize::from(o[2]) << 8 | usize::from(o[3])) * per + port
+            }
+            _ => port,
         }
     }
 }
@@ -40,15 +94,15 @@ impl StreamIo for HonkServerIo {
 
     fn read(&mut self, i: usize, out: &mut [u8]) -> Result<usize, StreamError> {
         match self.ids[i] {
-            Some(id) => self.stack.tcp_read(id, out).map_err(map_err),
-            None => Err(StreamError::WouldBlock),
+            Some(id) if !self.closed[i] => self.stack.tcp_read(id, out).map_err(map_err),
+            _ => Err(StreamError::WouldBlock),
         }
     }
 
     fn write(&mut self, i: usize, data: &[u8]) -> Result<usize, StreamError> {
         match self.ids[i] {
-            Some(id) => self.stack.tcp_write(id, data).map_err(map_err),
-            None => Err(StreamError::WouldBlock),
+            Some(id) if !self.closed[i] => self.stack.tcp_write(id, data).map_err(map_err),
+            _ => Err(StreamError::WouldBlock),
         }
     }
 
@@ -75,19 +129,38 @@ pub struct HonkServerHost {
 
 impl HonkServerHost {
     /// `defer`: hold every SYN-ACK this long (a simulated upstream dial) before completing.
-    pub fn new(_family: Family, buffer: usize, plan: Plan, defer: Option<Duration>) -> Self {
+    pub fn new(family: Family, buffer: usize, plan: Plan, defer: Option<Duration>) -> Self {
+        Self::with(family, buffer, plan, defer, ServerOpts::default())
+    }
+
+    pub fn with(
+        _family: Family,
+        buffer: usize,
+        plan: Plan,
+        defer: Option<Duration>,
+        opts: ServerOpts,
+    ) -> Self {
         let mut cfg = Config::new([8; 32]);
         cfg.mode = Mode::Transparent {
             exclude: ExcludeSet::default(),
         };
         cfg.tcp_rcv_buf_max = buffer;
         cfg.tcp_snd_buf_max = buffer;
+        if let Some(f) = opts.config {
+            f(&mut cfg);
+        }
         let flows = plan.flows;
         let io = HonkServerIo {
             stack: Stack::new(cfg, epoch()),
             ids: vec![None; flows],
+            admitted: vec![None; flows],
+            closed: vec![false; flows],
             held: Vec::new(),
             defer,
+            per_source: opts.per_source,
+            close_when_done: opts.close_when_done,
+            dsts: HashSet::new(),
+            audit: Audit::default(),
         };
         HonkServerHost {
             io,
@@ -102,7 +175,16 @@ impl Host for HonkServerHost {
     }
 
     fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
-        self.io.stack.poll_transmit(now, out)
+        let n = self.io.stack.poll_transmit(now, out)?;
+        let ip = wire::parse_ip(&out[..n]).expect("the terminator emits valid IP");
+        if ip.proto == wire::PROTO_TCP {
+            let (h, _) = tcp::parse(&out[ip.payload.clone()]).expect("valid TCP");
+            let audit = &mut self.io.audit;
+            audit.tcp_packets += 1;
+            audit.rsts += u64::from(h.flags & tcp::RST != 0);
+            audit.foreign += u64::from(!self.io.dsts.contains(&(ip.src, h.src_port)));
+        }
+        Some(n)
     }
 
     fn poll_timeout(&self) -> Option<Instant> {
@@ -120,9 +202,12 @@ impl Host for HonkServerHost {
     fn poll_app(&mut self, now: Instant) {
         let io = &mut self.io;
         while let Some(info) = io.stack.poll_accept() {
-            let i = usize::from(info.original_dst.port() - 8000);
+            let i = io.index_of(info.client.ip(), info.original_dst.port());
             assert!(io.ids[i].is_none(), "flow {i} reported twice");
             io.ids[i] = Some(info.id);
+            io.admitted[i] = Some(now);
+            io.dsts
+                .insert((info.original_dst.ip(), info.original_dst.port()));
             let when = match io.defer {
                 Some(d) => {
                     io.held.push((info.id, now + d));
@@ -149,6 +234,15 @@ impl Host for HonkServerHost {
         }
         while io.stack.poll_event().is_some() {}
         self.app.poll(&mut self.io, now);
-        self.io.stack.take_tx_wakeup();
+        let io = &mut self.io;
+        if io.close_when_done {
+            for (i, f) in self.app.flows.iter().enumerate() {
+                if f.completed.is_some() && !io.closed[i] {
+                    io.closed[i] = true;
+                    io.stack.tcp_close(io.ids[i].unwrap());
+                }
+            }
+        }
+        io.stack.take_tx_wakeup();
     }
 }

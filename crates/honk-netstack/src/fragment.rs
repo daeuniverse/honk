@@ -754,7 +754,11 @@ mod tests {
         assert!(budget.used() <= budget.limit());
         r.check();
         drop(r);
-        assert_eq!(budget.used(), 100_000, "dropping the table refunds its bytes");
+        assert_eq!(
+            budget.used(),
+            100_000,
+            "dropping the table refunds its bytes"
+        );
     }
 
     #[test]

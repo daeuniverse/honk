@@ -13,15 +13,26 @@ pub struct HonkTcp {
 
 impl HonkTcp {
     pub fn new(family: Family, buffer: usize) -> Self {
+        Self::at(family.address(Role::Client).into(), buffer, epoch())
+    }
+
+    /// A client stack whose source address is `local`.
+    pub fn at(local: IpAddr, buffer: usize, now: Instant) -> Self {
         let mut cfg = Config::new([7; 32]);
-        match family.address(Role::Client).into() {
+        match local {
             IpAddr::V4(a) => cfg.local_v4 = Some(a),
             IpAddr::V6(a) => cfg.local_v6 = Some(a),
         }
         cfg.tcp_rcv_buf_max = buffer;
         cfg.tcp_snd_buf_max = buffer;
         HonkTcp {
-            stack: Stack::new(cfg, epoch()),
+            stack: Stack::new(cfg, now),
+        }
+    }
+
+    pub fn close_all(&mut self, ids: impl IntoIterator<Item = FlowId>) {
+        for id in ids {
+            self.stack.tcp_close(id);
         }
     }
 }
@@ -64,16 +75,32 @@ pub struct HonkHost {
 
 impl HonkHost {
     pub fn new(family: Family, buffer: usize, plan: Plan) -> Self {
-        let mut io = HonkTcp::new(family, buffer);
         let server: IpAddr = family.address(Role::Server).into();
+        Self::at(
+            family.address(Role::Client).into(),
+            server,
+            buffer,
+            plan,
+            epoch(),
+        )
+    }
+
+    /// A client at `local` that dials `server:8000+i` for each flow `i`.
+    pub fn at(local: IpAddr, server: IpAddr, buffer: usize, plan: Plan, now: Instant) -> Self {
+        let mut io = HonkTcp::at(local, buffer, now);
         let ids: Vec<_> = (0..plan.flows)
             .map(|i| {
                 let remote = SocketAddr::new(server, 8000 + u16::try_from(i).unwrap());
-                io.stack.tcp_connect(epoch(), remote).expect("connect")
+                io.stack.tcp_connect(now, remote).expect("connect")
             })
             .collect();
-        let app = Driver::new(plan, Role::Client, ids, epoch());
+        let app = Driver::new(plan, Role::Client, ids, now);
         HonkHost { io, app }
+    }
+
+    pub fn close_all(&mut self) {
+        let ids: Vec<_> = self.app.flows.iter().map(|f| f.id).collect();
+        self.io.close_all(ids);
     }
 }
 

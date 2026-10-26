@@ -1,5 +1,11 @@
-//! Per-packet cost of the TCP fast paths, driven through the public API against a scripted peer.
-//! Every case reports `Throughput::Elements` so Criterion prints time per packet.
+//! Per-packet cost of the TCP fast paths, driven through the public API against a scripted peer,
+//! for an active-open flow (`tcp`) and for a flow the transparent terminator accepted
+//! (`transparent_tcp`), plus transparent UDP and passive open. Every case reports
+//! `Throughput::Elements` so Criterion prints time per packet.
+//!
+//! Offload comparison: the two seams are `deliver` (how a batch of in-order segments enters the
+//! stack) and `Flow::send` (how a batch of full segments leaves it). Re-pointing them at
+//! super-packet receive/transmit re-runs every case with GSO; nothing else changes.
 
 use std::hint::black_box;
 use std::net::{IpAddr, SocketAddr};
@@ -7,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use honk_netstack::wire::{self, tcp};
-use honk_netstack::{Config, FlowId, Rx, Stack, TcpState};
+use honk_netstack::{AcceptOpts, Config, ExcludeSet, FlowId, Mode, Rx, Stack, TcpState};
 
 /// Config MTU 1420 minus IPv4 and TCP headers; no timestamps are negotiated.
 const MSS: usize = 1380;
@@ -20,10 +26,36 @@ fn remote() -> SocketAddr {
     "198.51.100.2:443".parse().unwrap()
 }
 
+fn client() -> SocketAddr {
+    "10.0.0.2:40000".parse().unwrap()
+}
+
+/// What the client dialed; the terminator answers from it.
+fn original_dst() -> SocketAddr {
+    "203.0.113.9:443".parse().unwrap()
+}
+
+fn transparent() -> Config {
+    let mut cfg = Config::new([0x38; 32]);
+    cfg.mode = Mode::Transparent {
+        exclude: ExcludeSet::default(),
+    };
+    cfg
+}
+
+fn encode(src: SocketAddr, dst: SocketAddr, h: &tcp::Header, payload: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; payload.len() + 128];
+    let n = tcp::emit_packet(&mut buf, src.ip(), dst.ip(), h, [payload, &[]]).unwrap();
+    buf.truncate(n);
+    buf
+}
+
 struct Flow {
     stack: Stack,
     id: FlowId,
     local: SocketAddr,
+    /// The other end: `remote()` for an active open, the client for an accepted flow.
+    peer: SocketAddr,
     now: Instant,
     /// Next sequence number the stack will send.
     snd_nxt: u32,
@@ -49,6 +81,7 @@ impl Flow {
             stack,
             id,
             local: SocketAddr::new(local_ip, syn.src_port),
+            peer: remote(),
             now,
             snd_nxt: syn.seq.wrapping_add(1),
             peer_next: 0x1020_3041,
@@ -69,9 +102,54 @@ impl Flow {
         flow
     }
 
+    /// Passive open through a transparent stack: the scripted client dials `original_dst()` with
+    /// the same SYN options as `connect`'s peer and the application accepts at once.
+    fn accept() -> Flow {
+        let mut now = Instant::now();
+        let mut stack = Stack::new(transparent(), now);
+        let mut syn = tcp::Header {
+            src_port: client().port(),
+            dst_port: original_dst().port(),
+            seq: 0x1020_3040,
+            ack: 0,
+            flags: tcp::SYN,
+            window: u16::MAX,
+            urgent: 0,
+            options: tcp::Options::default(),
+        };
+        syn.options.mss = Some(MSS as u16);
+        syn.options.wscale = Some(7);
+        syn.options.sack_permitted = true;
+        let packet = encode(client(), original_dst(), &syn, &[]);
+        assert_eq!(stack.receive(now, &packet), Rx::Consumed);
+        let info = stack.poll_accept().expect("the SYN is reported");
+        stack.tcp_accept(info.id, AcceptOpts::default()).unwrap();
+        let mut out = vec![0u8; 2048];
+        let n = stack.poll_transmit(now, &mut out).expect("SYN-ACK");
+        let ip = wire::parse_ip(&out[..n]).unwrap();
+        let (synack, _) = tcp::parse(&out[ip.payload.clone()]).unwrap();
+        let mut flow = Flow {
+            stack,
+            id: info.id,
+            local: original_dst(),
+            peer: client(),
+            now,
+            snd_nxt: synack.seq.wrapping_add(1),
+            peer_next: syn.seq.wrapping_add(1),
+            out,
+        };
+        now += 10 * MS;
+        flow.now = now;
+        let ack = flow.encode(&flow.header(flow.snd_nxt), &[]);
+        assert_eq!(flow.stack.receive(now, &ack), Rx::Consumed);
+        assert_eq!(flow.stack.tcp_state(info.id), Some(TcpState::Established));
+        while flow.stack.poll_transmit(now, &mut flow.out).is_some() {}
+        flow
+    }
+
     fn header(&self, ack: u32) -> tcp::Header {
         tcp::Header {
-            src_port: remote().port(),
+            src_port: self.peer.port(),
             dst_port: self.local.port(),
             seq: self.peer_next,
             ack,
@@ -83,11 +161,7 @@ impl Flow {
     }
 
     fn encode(&self, h: &tcp::Header, payload: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; payload.len() + 128];
-        let n =
-            tcp::emit_packet(&mut buf, remote().ip(), self.local.ip(), h, [payload, &[]]).unwrap();
-        buf.truncate(n);
-        buf
+        encode(self.peer, self.local, h, payload)
     }
 
     fn ack_packet(&self, ack: u32, blocks: &[(u32, u32)]) -> Vec<u8> {
@@ -147,56 +221,168 @@ impl Flow {
     }
 }
 
+/// The flavours every TCP case runs for: an active-open client and a transparent terminator.
+const FLAVOURS: [(&str, fn() -> Flow); 2] =
+    [("tcp", Flow::connect), ("transparent_tcp", Flow::accept)];
+
+/// Feeds in-order segments to the stack, reading and answering each (the offload seam for RX).
+fn deliver(f: &mut Flow, packets: &[Vec<u8>], read: &mut [u8]) {
+    for p in packets {
+        assert_eq!(f.stack.receive(f.now, p), Rx::Consumed);
+        black_box(f.stack.tcp_read(f.id, read).unwrap());
+        while f.stack.poll_transmit(f.now, &mut f.out).is_some() {}
+    }
+}
+
 fn receive_and_ack(c: &mut Criterion) {
-    let mut g = c.benchmark_group("tcp");
-    g.throughput(Throughput::Elements(1));
-    g.bench_function("receive_in_order_and_ack", |b| {
-        b.iter_custom(|iters| {
-            let mut f = Flow::connect();
-            let payload = vec![0x5au8; MSS];
-            let mut read = vec![0u8; 64 * 1024];
-            let mut elapsed = Duration::ZERO;
-            let mut left = iters;
-            while left > 0 {
-                let n = left.min(BATCH);
-                let packets: Vec<Vec<u8>> = (0..n).map(|_| f.data_packet(&payload)).collect();
-                let t = Instant::now();
-                for p in &packets {
-                    assert_eq!(f.stack.receive(f.now, p), Rx::Consumed);
-                    black_box(f.stack.tcp_read(f.id, &mut read).unwrap());
-                    while f.stack.poll_transmit(f.now, &mut f.out).is_some() {}
+    for (group, make) in FLAVOURS {
+        let mut g = c.benchmark_group(group);
+        g.throughput(Throughput::Elements(1));
+        g.bench_function("receive_in_order_and_ack", |b| {
+            b.iter_custom(|iters| {
+                let mut f = make();
+                let payload = vec![0x5au8; MSS];
+                let mut read = vec![0u8; 64 * 1024];
+                let mut elapsed = Duration::ZERO;
+                let mut left = iters;
+                while left > 0 {
+                    let n = left.min(BATCH);
+                    let packets: Vec<Vec<u8>> = (0..n).map(|_| f.data_packet(&payload)).collect();
+                    let t = Instant::now();
+                    deliver(&mut f, &packets, &mut read);
+                    elapsed += t.elapsed();
+                    left -= n;
                 }
-                elapsed += t.elapsed();
-                left -= n;
-            }
-            elapsed
-        })
+                elapsed
+            })
+        });
+        g.finish();
+    }
+}
+
+fn transmit_bulk(c: &mut Criterion) {
+    for (group, make) in FLAVOURS {
+        let mut g = c.benchmark_group(group);
+        g.throughput(Throughput::Elements(1));
+        g.bench_function("poll_transmit_full_segments", |b| {
+            b.iter_custom(|iters| {
+                let mut f = make();
+                f.grow(2 * BATCH as u32);
+                let data = vec![0xa5u8; BATCH as usize * MSS];
+                let mut elapsed = Duration::ZERO;
+                let mut left = iters;
+                while left > 0 {
+                    let n = left.min(BATCH) as usize;
+                    assert_eq!(f.stack.tcp_write(f.id, &data[..n * MSS]), Ok(n * MSS));
+                    let t = Instant::now();
+                    f.send(n);
+                    elapsed += t.elapsed();
+                    f.ack_all();
+                    left -= n as u64;
+                }
+                elapsed
+            })
+        });
+        g.finish();
+    }
+}
+
+/// SYN to SYN-ACK for `BATCH` fresh clients: classify, create the pending flow, report it,
+/// accept it and emit the SYN-ACK.
+fn passive_open(c: &mut Criterion) {
+    let mut g = c.benchmark_group("transparent_tcp");
+    g.throughput(Throughput::Elements(BATCH));
+    g.bench_function("syn_accept_synack", |b| {
+        b.iter_batched(
+            || {
+                let syns: Vec<Vec<u8>> = (0..BATCH as u16)
+                    .map(|i| {
+                        // One address each: the per-source half-open cap is not under test.
+                        let ip = std::net::Ipv4Addr::new(10, 0, 1, i as u8);
+                        let src = SocketAddr::new(ip.into(), 20_000 + i);
+                        let h = tcp::Header {
+                            src_port: src.port(),
+                            dst_port: original_dst().port(),
+                            seq: 0x1000 + u32::from(i),
+                            ack: 0,
+                            flags: tcp::SYN,
+                            window: u16::MAX,
+                            urgent: 0,
+                            options: tcp::Options {
+                                mss: Some(MSS as u16),
+                                ..tcp::Options::default()
+                            },
+                        };
+                        encode(src, original_dst(), &h, &[])
+                    })
+                    .collect();
+                (
+                    Stack::new(transparent(), Instant::now()),
+                    syns,
+                    vec![0u8; 2048],
+                )
+            },
+            |(mut stack, syns, mut out)| {
+                let now = Instant::now();
+                for p in &syns {
+                    assert_eq!(stack.receive(now, p), Rx::Consumed);
+                    let info = stack.poll_accept().expect("reported");
+                    stack.tcp_accept(info.id, AcceptOpts::default()).unwrap();
+                    black_box(stack.poll_transmit(now, &mut out).expect("SYN-ACK"));
+                }
+                (stack, syns, out)
+            },
+            BatchSize::PerIteration,
+        )
     });
     g.finish();
 }
 
-fn transmit_bulk(c: &mut Criterion) {
-    let mut g = c.benchmark_group("tcp");
-    g.throughput(Throughput::Elements(1));
-    g.bench_function("poll_transmit_full_segments", |b| {
-        b.iter_custom(|iters| {
-            let mut f = Flow::connect();
-            f.grow(2 * BATCH as u32);
-            let data = vec![0xa5u8; BATCH as usize * MSS];
-            let mut elapsed = Duration::ZERO;
-            let mut left = iters;
-            while left > 0 {
-                let n = left.min(BATCH) as usize;
-                assert_eq!(f.stack.tcp_write(f.id, &data[..n * MSS]), Ok(n * MSS));
-                let t = Instant::now();
-                f.send(n);
-                elapsed += t.elapsed();
-                f.ack_all();
-                left -= n as u64;
-            }
-            elapsed
-        })
-    });
+/// Every packet of a `len`-byte transparent datagram from `original_dst()` to `client()`.
+fn datagram_packets(len: usize) -> Vec<Vec<u8>> {
+    let mut tx = Stack::new(transparent(), Instant::now());
+    let mut out = vec![0u8; 2048];
+    let n = tx
+        .udp_send_from(original_dst(), client(), &vec![0x33u8; len], &mut out)
+        .unwrap();
+    let mut packets = vec![out[..n].to_vec()];
+    while let Some(n) = tx.poll_transmit(Instant::now(), &mut out) {
+        packets.push(out[..n].to_vec());
+    }
+    packets
+}
+
+fn transparent_udp(c: &mut Criterion) {
+    let mut g = c.benchmark_group("transparent_udp");
+    let now = Instant::now();
+    for (name, len) in [("1200_byte", 1200usize), ("4000_byte_fragmented", 4000)] {
+        let packets = datagram_packets(len);
+        let count = packets.len() as u64;
+        assert_eq!(count > 1, len > 1400, "{len}");
+        g.throughput(Throughput::Elements(count));
+        g.bench_function(format!("receive_{name}"), |b| {
+            let mut rx = Stack::new(transparent(), now);
+            b.iter(|| {
+                for p in &packets {
+                    black_box(rx.receive(now, p));
+                }
+            })
+        });
+        g.bench_function(format!("send_from_{name}"), |b| {
+            let mut tx = Stack::new(transparent(), now);
+            let payload = vec![0x33u8; len];
+            let mut out = vec![0u8; 2048];
+            b.iter(|| {
+                black_box(
+                    tx.udp_send_from(original_dst(), client(), &payload, &mut out)
+                        .unwrap(),
+                );
+                while let Some(n) = tx.poll_transmit(now, &mut out) {
+                    black_box(n);
+                }
+            })
+        });
+    }
     g.finish();
 }
 
@@ -261,5 +447,12 @@ fn sack_processing(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, receive_and_ack, transmit_bulk, sack_processing);
+criterion_group!(
+    benches,
+    receive_and_ack,
+    transmit_bulk,
+    sack_processing,
+    passive_open,
+    transparent_udp
+);
 criterion_main!(benches);

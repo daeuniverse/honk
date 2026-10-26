@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod engine;
+pub mod extra;
 pub mod honk;
 pub mod honk_server;
 pub mod link;

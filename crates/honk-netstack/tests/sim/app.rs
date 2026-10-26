@@ -24,7 +24,7 @@ pub trait StreamIo {
     fn shutdown(&mut self, id: Self::Id) -> Result<(), StreamError>;
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Client,
     Server,
@@ -39,6 +39,12 @@ pub struct Plan {
     pub response_after_request: bool,
     pub seed: u64,
     pub app_chunk: usize,
+    /// Added to the flow index in the pattern seed, so several drivers sharing one peer keep
+    /// distinct streams (a cross-source mix-up then fails at the byte where it occurs).
+    pub flow_base: usize,
+    /// This role holds its FIN until the peer's FIN arrived, so the peer closes first (the
+    /// peer is the active closer and keeps TIME_WAIT; this role closes passively).
+    pub fin_after_peer: Option<Role>,
 }
 
 impl Plan {
@@ -50,6 +56,8 @@ impl Plan {
             response_after_request: false,
             seed: 0x416C_6963_6542_6F62,
             app_chunk: 16 * 1024,
+            flow_base: 0,
+            fin_after_peer: None,
         }
     }
 
@@ -93,7 +101,7 @@ impl Plan {
             Role::Client => 0x43,
             Role::Server => 0x53,
         };
-        mix(self.seed ^ ((flow as u64) << 8) ^ direction)
+        mix(self.seed ^ (((flow + self.flow_base) as u64) << 8) ^ direction)
     }
 }
 
@@ -212,7 +220,10 @@ impl<Id: Copy + Debug> Driver<Id> {
                         ),
                     }
                 }
-                if f.sent == send && !f.shutdown {
+                if f.sent == send
+                    && !f.shutdown
+                    && (self.plan.fin_after_peer != Some(self.role) || f.fin)
+                {
                     io.shutdown(f.id)
                         .expect("shutdown after the application queued all bytes");
                     f.shutdown = true;
