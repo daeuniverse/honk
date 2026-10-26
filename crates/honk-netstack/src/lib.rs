@@ -110,6 +110,8 @@
 //! the pool's cached free chunks (up to 64 while any chunk is in use, one otherwise).
 //! [`Config::shared_budget`] lets stacks of one process share an additional limit, charged
 //! for floors and commitments and refunded as flows retire and when a stack is dropped.
+//! Reassembly storage and queued Time Exceeded quote capacities share that budget too;
+//! expiry quotes stay charged until sent, discarded or dropped, including across blocked output.
 //! Per-flow buffer maxima are bounded to the modular-sequence safe range and at least one chunk.
 //!
 //! UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and

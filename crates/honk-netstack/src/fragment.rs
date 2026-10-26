@@ -405,32 +405,38 @@ impl Reassembler {
                 continue;
             }
             let entry = self.entries.remove(i);
-            self.shrink(entry.charged);
+            let mut retained = 0;
             self.stats.timeouts += 1;
             if let Some(live) = entry.live
                 && !live.head.is_empty()
                 && self.expired.len() < MAX_PENDING_ICMP
             {
-                let l4 = QUOTE_L4.min(live.data.len());
+                let cap = crate::icmp_out::quote_limit(entry.key.src.is_ipv6());
+                let l4 = QUOTE_L4
+                    .min(live.data.len())
+                    .min(cap.saturating_sub(live.head.len()));
                 let mut quote = live.head;
+                quote.truncate(cap);
                 quote.extend_from_slice(&live.data[..l4]);
+                let quote = quote.into_boxed_slice().into_vec();
+                retained = quote.capacity();
                 self.expired.push_back(quote);
             }
+            self.shrink(entry.charged - retained);
         }
     }
 
     /// Emits queued Time Exceeded errors, one packet per call.
     pub(crate) fn poll_icmp(&mut self, now: Instant, icmp: &mut IcmpOut, out: &mut [u8]) -> Output {
         while let Some(quote) = self.expired.front() {
-            match icmp.emit(now, Reject::TimeExceeded, quote, out) {
-                IcmpEmit::Sent(n) => {
-                    self.expired.pop_front();
-                    return Output::Sent(n);
-                }
-                IcmpEmit::TooSmall => return Output::Blocked,
-                IcmpEmit::Suppressed | IcmpEmit::RateLimited => {
-                    self.expired.pop_front();
-                }
+            let result = icmp.emit(now, Reject::TimeExceeded, quote, out);
+            if result == IcmpEmit::TooSmall {
+                return Output::Blocked;
+            }
+            let quote = self.expired.pop_front().expect("front");
+            self.shrink(quote.capacity());
+            if let IcmpEmit::Sent(n) = result {
+                return Output::Sent(n);
             }
         }
         Output::None
@@ -457,7 +463,7 @@ impl Reassembler {
         assert!(self.entries.len() <= self.limits.max_entries);
         assert!(self.bytes <= self.limits.max_bytes);
         assert!(self.expired.len() <= MAX_PENDING_ICMP);
-        let mut sum = 0;
+        let mut sum = self.expired.iter().map(Vec::capacity).sum::<usize>();
         for e in &self.entries {
             let expect = e.live.as_ref().map_or(ENTRY_OVERHEAD, Live::charge);
             assert_eq!(e.charged, expect);
@@ -502,6 +508,8 @@ mod tests {
     use crate::wire::testutil::*;
     use crate::wire::{self, ipv4, ipv6, udp};
     use std::net::SocketAddr;
+
+    mod expiry;
 
     /// Independent splitter: cuts a full UDP IP datagram into fragments of `size` data bytes.
     pub(crate) fn split(packet: &[u8], id: u32, size: usize) -> Vec<Vec<u8>> {

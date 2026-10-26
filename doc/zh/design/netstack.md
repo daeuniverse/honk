@@ -154,11 +154,11 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 透明模式重组任意协议的 IPv4 和 IPv6 分片；Endpoint 模式仍然丢弃分片。重组完成的数据报重新进入常规接收路径，因此目的地址过滤和校验和对它同样生效。完成后的 IPv6 数据报若仍含 Fragment 头（包括藏在其他扩展头之后），则以 `Fragment` 丢弃，绝不再次重组。
 
-- `FragmentLimits`（`Config::fragment_limits`）默认值：`max_entries` 64，`max_bytes` 4 MiB（载荷存储、分片 0 保存的头部和区间表的实际保留容量，另加每个数据报 256 B 的固定簿记开销），`max_holes` 32，`timeout` 30 秒，从数据报的第一个分片起算。
+- `FragmentLimits`（`Config::fragment_limits`）默认值：`max_entries` 64，`max_bytes` 4 MiB（载荷存储、分片 0 保存的头部、区间表和排队的超时引用报文的实际保留容量，另加每个数据报 256 B 的固定簿记开销），`max_holes` 32，`timeout` 30 秒，从数据报的第一个分片起算。
 - 重叠分片（包括完全相同的重复分片）会终结该数据报（RFC 5722、RFC 8200 第 4.5 节）：buffer 立即释放，一个无 buffer 的墓碑吸收其余分片（`Fragment`）直到超时。空洞多于 `max_holes`，或长度不一致，同样终结数据报。空分片、长度不是 8 的倍数的非末尾分片，以及超过 64 KiB 的数据报为 `Malformed`。原子分片作为完整数据报交付（RFC 6946）。
 - 表或 `max_bytes` 耗尽时，最旧的数据报被静默驱逐，因此洪泛的首分片无法饿死能够完成的突发。
-- 超时仅当分片 0 已到达时才回 ICMP Time Exceeded（IPv4 type 11 code 1，IPv6 type 3 code 1）；引用内容是保存的头部加至多 8 字节。最多 16 个这样的错误等待 `poll_transmit`；`poll_timeout` 和 `handle_timeout` 覆盖重组 deadline。
-- **共享预算。** 重组字节计入 `Config::shared_budget`（不计入栈自己的 `memory_limit`；没有预算时只受 `FragmentLimits` 限制）。计费被拒绝时驱逐最旧的数据报并重试；没有可驱逐的数据报时丢弃该分片：若它会开启新数据报，丢弃为 `DropReason::Capacity`；若是唯一剩下的现有数据报无法增长，则终结该数据报（`Fragment`）。完成、驱逐、超时、终结以及栈被丢弃时退还。因此，分片洪泛最多可占用共享预算中的 `FragmentLimits::max_bytes`，而新流也是按同一个预算接纳的：请为此留出余量，否则洪泛期间 SYN 会以 `Capacity` 被丢弃。
+- 超时仅当分片 0 已到达时才回 ICMP Time Exceeded（IPv4 type 11 code 1，IPv6 type 3 code 1）；引用内容是保存的头部加至多 8 字节，在入队前截断到 548 字节（IPv4）或 1232 字节（IPv6）。最多 16 个这样的错误等待 `poll_transmit`；`poll_timeout` 和 `handle_timeout` 覆盖重组 deadline。
+- **共享预算。** 重组字节计入 `Config::shared_budget`（不计入栈自己的 `memory_limit`；没有预算时只受 `FragmentLimits` 限制）。计费被拒绝时驱逐最旧的数据报并重试；没有可驱逐的数据报时丢弃该分片：若它会开启新数据报，丢弃为 `DropReason::Capacity`；若是唯一剩下的现有数据报无法增长，则终结该数据报（`Fragment`）。完成、驱逐、终结和栈被丢弃时退还存储费用；超时则将保留引用报文的实际容量费用转移给待发队列，直到发出、被抑制、被限速或丢弃。输出 buffer 过小时费用继续保留。因此，分片洪泛最多可占用共享预算中的 `FragmentLimits::max_bytes`，而新流也是按同一个预算接纳的：请为此留出余量，否则洪泛期间 SYN 会以 `Capacity` 被丢弃。
 
 ### ICMP 生成
 

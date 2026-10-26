@@ -18,6 +18,11 @@ const ICMP_HEADER: usize = 8;
 /// RFC 4443 §3.1 code 1: "communication with destination administratively prohibited".
 const V6_ADMIN_PROHIBITED: u8 = 1;
 
+pub(crate) fn quote_limit(v6: bool) -> usize {
+    let cap = if v6 { MAX_ERROR_V6 } else { MAX_ERROR_V4 };
+    cap - wire::ip_header_len(v6) - ICMP_HEADER
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reject {
     /// Port unreachable: v4 type 3 code 3, v6 type 1 code 4.
@@ -128,8 +133,7 @@ impl IcmpOut {
         }
         let v6 = orig.src.is_ipv6();
         let ip_len = wire::ip_header_len(v6);
-        let cap = if v6 { MAX_ERROR_V6 } else { MAX_ERROR_V4 };
-        let quote = &quoted[..quoted.len().min(cap - ip_len - ICMP_HEADER)];
+        let quote = &quoted[..quoted.len().min(quote_limit(v6))];
         if out.len() < ip_len + ICMP_HEADER + quote.len() {
             return IcmpEmit::TooSmall;
         }
