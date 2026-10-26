@@ -265,3 +265,300 @@ pub(crate) fn receive_transparent(
         payload: ip.payload.start + payload.start..ip.payload.start + payload.end,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fragment::{Push, Reassembler};
+    use crate::wire::testutil::*;
+    use crate::wire::{frag, parse_ip, udp};
+    use crate::{Config, Rx};
+    use std::time::Instant;
+
+    fn stack(mtu: u16) -> Stack {
+        let mut cfg = Config::new([9; 32]);
+        cfg.mtu = mtu;
+        Stack::new(cfg, Instant::now())
+    }
+
+    fn addrs(v6: bool) -> (SocketAddr, SocketAddr) {
+        if v6 {
+            (
+                SocketAddr::new(v6_addr(7), 53),
+                SocketAddr::new(v6_addr(2), 40_000),
+            )
+        } else {
+            (
+                SocketAddr::new(v4(198, 51, 100, 7), 53),
+                SocketAddr::new(v4(10, 0, 0, 2), 40_000),
+            )
+        }
+    }
+
+    fn v6_addr(n: u16) -> IpAddr {
+        v6(n)
+    }
+
+    /// Everything `poll_udp_frag` yields, as separate packets.
+    fn drain(s: &mut Stack, first: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut all = vec![first];
+        let mut out = vec![0u8; 2000];
+        while let Output::Sent(n) = s.poll_udp_frag(&mut out) {
+            all.push(out[..n].to_vec());
+        }
+        all
+    }
+
+    fn reassemble(packets: &[Vec<u8>]) -> Vec<u8> {
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        let mut done = None;
+        for p in packets {
+            match r.push(now, p) {
+                Push::Pending => {}
+                Push::Complete(c) => done = Some(c.packet),
+                Push::Dropped(d) => panic!("dropped {d:?}"),
+            }
+        }
+        r.assert_idle();
+        done.expect("never completed")
+    }
+
+    #[test]
+    fn transparent_reply_comes_from_the_original_destination() {
+        for v6 in [false, true] {
+            let (orig_dst, client) = addrs(v6);
+            let mut s = stack(1400);
+            let mut query = vec![0u8; 200];
+            let n = udp::emit_packet(&mut query, client, orig_dst, b"query").unwrap();
+            let ip = parse_ip(&query[..n]).unwrap();
+            let rx = receive_transparent(&mut s, &ip, &query[..n], true);
+            let Rx::Transparent { src, dst, payload } = rx else {
+                panic!("{rx:?}")
+            };
+            assert_eq!((src, dst), (client, orig_dst));
+            assert_eq!(&query[payload], b"query");
+
+            // The reply swaps the pair: its source is the address the client addressed.
+            let mut out = vec![0u8; 1500];
+            let n = s.udp_send_from(dst, src, b"answer", &mut out).unwrap();
+            let ip = parse_ip(&out[..n]).unwrap();
+            assert_eq!((ip.src, ip.dst), (orig_dst.ip(), client.ip()));
+            let rx = receive_transparent(&mut s, &ip, &out[..n], true);
+            let Rx::Transparent { src, dst, payload } = rx else {
+                panic!("{rx:?}")
+            };
+            assert_eq!((src, dst), (orig_dst, client));
+            assert_eq!(&out[payload], b"answer");
+            assert!(!s.udp_tx.pending());
+            assert!(!s.take_tx_wakeup());
+            assert_eq!(s.stats().tx_packets, 1);
+            // A foreign (full-cone) source works the same.
+            let peer = SocketAddr::new(if v6 { v6_addr(99) } else { v4(203, 0, 113, 9) }, 3478);
+            let n = s.udp_send_from(peer, client, b"p2p", &mut out).unwrap();
+            assert_eq!(parse_ip(&out[..n]).unwrap().src, peer.ip());
+        }
+    }
+
+    #[test]
+    fn receive_checks_checksum_unless_vouched() {
+        for v6 in [false, true] {
+            let (orig_dst, client) = addrs(v6);
+            let mut s = stack(1400);
+            let mut p = vec![0u8; 200];
+            let n = udp::emit_packet(&mut p, client, orig_dst, b"x").unwrap();
+            let ip = parse_ip(&p[..n]).unwrap();
+            p[ip.payload.start + 8] ^= 0xFF;
+            assert_eq!(
+                receive_transparent(&mut s, &ip, &p[..n], true),
+                Rx::Dropped(DropReason::Checksum)
+            );
+            assert!(matches!(
+                receive_transparent(&mut s, &ip, &p[..n], false),
+                Rx::Transparent { .. }
+            ));
+            // A UDP length beyond the IP payload.
+            let at = ip.payload.start + 4;
+            p[at..at + 2].copy_from_slice(&500u16.to_be_bytes());
+            assert_eq!(
+                receive_transparent(&mut s, &ip, &p[..n], true),
+                Rx::Dropped(DropReason::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_replies_fragment_and_reassemble_both_families() {
+        let mtu = 1280usize;
+        for v6 in [false, true] {
+            let (src, dst) = addrs(v6);
+            let ip_len = if v6 { 40 } else { 20 };
+            let max = if v6 { 65_527 } else { 65_507 };
+            let mut s = stack(mtu as u16);
+            let mut seen_ids = Vec::new();
+            for len in [
+                mtu - ip_len - 8,
+                mtu - ip_len - 7,
+                2_000,
+                8_192,
+                30_000,
+                max,
+            ] {
+                let payload = Rng::new(len as u64).bytes(len);
+                let mut out = vec![0u8; mtu];
+                let n = s.udp_send_from(src, dst, &payload, &mut out).unwrap();
+                let fragmented = len > mtu - ip_len - 8;
+                assert_eq!(s.udp_tx.pending(), fragmented);
+                assert_eq!(s.take_tx_wakeup(), fragmented);
+                let packets = drain(&mut s, out[..n].to_vec());
+                assert_eq!(packets.len() > 1, fragmented, "{len}");
+                assert!(!s.udp_tx.pending());
+                s.udp_tx.check();
+                assert!(packets.iter().all(|p| p.len() <= mtu));
+                if !fragmented {
+                    // Unfragmented replies carry no DF and a fresh identification, like a UDP socket.
+                    if !v6 {
+                        assert_eq!(packets[0][6] & 0x40, 0);
+                        seen_ids.push(u16::from_be_bytes([packets[0][4], packets[0][5]]));
+                    }
+                } else {
+                    let mut next = 0;
+                    for (i, p) in packets.iter().enumerate() {
+                        let f = frag::parse(p).unwrap();
+                        assert_eq!(f.offset, next, "fragments are in order");
+                        assert_eq!(f.more, i + 1 < packets.len());
+                        let extra = if v6 { 8 } else { 0 };
+                        if f.more {
+                            assert_eq!(f.data.len(), (mtu - ip_len - extra) & !7, "full fragments");
+                        }
+                        if !v6 {
+                            assert_eq!(p[6] & 0x40, 0, "no DF");
+                        }
+                        next += f.data.len();
+                    }
+                    if !v6 {
+                        let id = u16::from_be_bytes([packets[0][4], packets[0][5]]);
+                        assert!(packets.iter().all(|p| p[4..6] == id.to_be_bytes()));
+                        seen_ids.push(id);
+                    }
+                }
+                let whole = if fragmented {
+                    reassemble(&packets)
+                } else {
+                    packets[0].clone()
+                };
+                let ip = parse_ip(&whole).unwrap();
+                let rx = receive_transparent(&mut s, &ip, &whole, true);
+                let Rx::Transparent {
+                    src: a,
+                    dst: b,
+                    payload: r,
+                } = rx
+                else {
+                    panic!("{rx:?}")
+                };
+                assert_eq!((a, b), (src, dst));
+                assert_eq!(&whole[r], &payload[..], "len {len}");
+            }
+            if !v6 {
+                let mut sorted = seen_ids.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(sorted.len(), seen_ids.len(), "identifications repeat");
+            }
+        }
+    }
+
+    #[test]
+    fn errors_consume_nothing_and_the_queue_is_bounded_without_loss() {
+        for v6 in [false, true] {
+            let (src, dst) = addrs(v6);
+            let mut s = stack(1280);
+            let mut out = vec![0u8; 1280];
+            let big = vec![1u8; 20_000];
+            // Not even the first fragment fits.
+            assert_eq!(
+                s.udp_send_from(src, dst, &big, &mut out[..1000]),
+                Err(UdpError::BufferTooSmall)
+            );
+            assert_eq!(
+                s.udp_send_from(src, dst, b"x", &mut out[..10]),
+                Err(UdpError::BufferTooSmall)
+            );
+            assert!(!s.udp_tx.pending() && !s.take_tx_wakeup());
+            assert_eq!(s.stats().tx_packets, 0);
+            s.udp_tx.check();
+            let too_big = vec![0u8; 65_528];
+            assert_eq!(
+                s.udp_send_from(src, dst, &too_big, &mut out),
+                Err(UdpError::TooLarge)
+            );
+            let other = SocketAddr::new(if v6 { v4(1, 1, 1, 1) } else { v6_addr(1) }, 9);
+            assert_eq!(
+                s.udp_send_from(src, other, b"x", &mut out),
+                Err(UdpError::FamilyMismatch)
+            );
+
+            // Fill the queue: accepted until the byte bound, then Busy, and every accepted
+            // datagram still comes out complete and in order.
+            let mut accepted = Vec::new();
+            let mut firsts = Vec::new();
+            let busy = loop {
+                let payload = Rng::new(accepted.len() as u64).bytes(60_000);
+                match s.udp_send_from(src, dst, &payload, &mut out) {
+                    Ok(n) => {
+                        firsts.push(out[..n].to_vec());
+                        accepted.push(payload);
+                    }
+                    Err(e) => break e,
+                }
+                assert!(accepted.len() < 100);
+            };
+            assert_eq!(busy, UdpError::Busy);
+            assert!(
+                accepted.len() >= 2 && accepted.len() <= 10,
+                "{}",
+                accepted.len()
+            );
+            s.udp_tx.check();
+            let mut by_id: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut all = firsts.clone();
+            all.extend(drain(&mut s, Vec::new()).into_iter().skip(1));
+            // Group by datagram (identification) preserving arrival order.
+            for p in all {
+                let f = frag::parse(&p).unwrap();
+                match by_id
+                    .iter_mut()
+                    .find(|g| frag::parse(&g[0]).unwrap().id == f.id)
+                {
+                    Some(g) => g.push(p),
+                    None => by_id.push(vec![p]),
+                }
+            }
+            assert_eq!(by_id.len(), accepted.len());
+            for (g, payload) in by_id.iter().zip(&accepted) {
+                let whole = reassemble(g);
+                let ip = parse_ip(&whole).unwrap();
+                let (_, _, r) = udp::parse(&whole[ip.payload.clone()]).unwrap();
+                assert_eq!(&whole[ip.payload][r], &payload[..]);
+            }
+            // Room again.
+            assert!(s.udp_send_from(src, dst, &big, &mut out).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_small_poll_buffer_keeps_the_fragment() {
+        let (src, dst) = addrs(false);
+        let mut s = stack(1280);
+        let payload = Rng::new(3).bytes(5000);
+        let mut out = vec![0u8; 1280];
+        let n = s.udp_send_from(src, dst, &payload, &mut out).unwrap();
+        let mut tiny = [0u8; 100];
+        assert!(matches!(s.poll_udp_frag(&mut tiny), Output::Blocked));
+        assert!(s.udp_tx.pending());
+        let packets = drain(&mut s, out[..n].to_vec());
+        assert_eq!(reassemble(&packets).len(), 20 + 8 + 5000);
+        assert!(matches!(s.poll_udp_frag(&mut out), Output::None));
+    }
+}
