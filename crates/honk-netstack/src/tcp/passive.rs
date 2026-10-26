@@ -115,6 +115,9 @@ impl Tcb {
         if let Some(ka) = self.ka.as_mut() {
             ka.rx = now;
             ka.probes = 0;
+            if let Some(deadline) = ka.deadline.as_mut() {
+                *deadline = (*deadline).min(now + ka.cfg.idle);
+            }
         }
     }
 
@@ -125,8 +128,8 @@ impl Tcb {
     }
 
     /// Probes an idle peer with an empty segment at `snd_una - 1` and fails the flow when
-    /// `probes` of them in a row go unanswered. Activity only moves `ka.rx`; an early wakeup
-    /// finds the flow busy and re-arms, so the hot path never touches the timer.
+    /// `probes` of them in a row go unanswered. Activity preserves an early wakeup unless
+    /// the restarted idle period expires before an outstanding probe's interval.
     pub(super) fn keepalive_timer(&mut self, now: Instant) {
         let Some(ka) = self.ka.as_mut() else { return };
         if ka.deadline.is_none_or(|t| t > now) {

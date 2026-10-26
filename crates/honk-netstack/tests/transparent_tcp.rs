@@ -653,33 +653,32 @@ fn keepalive_probes_an_idle_peer_and_fails_the_flow_when_unanswered() {
 
 #[test]
 fn an_answered_probe_restarts_the_idle_period() {
-    let ka = Keepalive {
-        idle: Duration::from_secs(10),
-        interval: Duration::from_secs(2),
-        probes: 2,
-    };
-    let mut c = established(
-        transparent(),
-        AcceptOpts {
-            keepalive: Some(ka),
-            ..AcceptOpts::default()
-        },
-    );
-    c.stack.handle_timeout(c.t0 + ms(10_005));
-    assert_eq!(drain(&mut c.stack, c.t0 + ms(10_005)).len(), 1);
-    let _ = c.stack.poll_event();
-    // The peer answers with a plain ACK.
-    c.client_seg(c.t0 + ms(10_100), ACK, &[]);
-    // Far past what the unanswered schedule would allow: still alive and quiet.
-    for t in [12_005u64, 14_005, 16_005, 20_000] {
-        c.stack.handle_timeout(c.t0 + ms(t));
-        assert!(drain(&mut c.stack, c.t0 + ms(t)).is_empty(), "{t}");
+    for interval in [2, 100] {
+        let ka = Keepalive {
+            idle: Duration::from_secs(10),
+            interval: Duration::from_secs(interval),
+            probes: 2,
+        };
+        let mut c = established(
+            transparent(),
+            AcceptOpts {
+                keepalive: Some(ka),
+                ..AcceptOpts::default()
+            },
+        );
+        c.stack.handle_timeout(c.t0 + ms(10_005));
+        assert_eq!(drain(&mut c.stack, c.t0 + ms(10_005)).len(), 1);
+        let _ = c.stack.poll_event();
+        c.client_seg(c.t0 + ms(10_100), ACK, &[]);
+        for t in [12_005u64, 14_005, 16_005, 20_000, 20_099] {
+            c.stack.handle_timeout(c.t0 + ms(t));
+            assert!(drain(&mut c.stack, c.t0 + ms(t)).is_empty(), "{t}");
+        }
+        assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
+        c.stack.handle_timeout(c.t0 + ms(20_100));
+        assert_eq!(drain(&mut c.stack, c.t0 + ms(20_100)).len(), 1);
+        assert!(c.stack.poll_event().is_none());
     }
-    assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
-    // Idle again: the next probe is one full idle period after the answer.
-    c.stack.handle_timeout(c.t0 + ms(20_200));
-    assert_eq!(drain(&mut c.stack, c.t0 + ms(20_200)).len(), 1);
-    assert!(c.stack.poll_event().is_none());
 }
 
 #[test]
