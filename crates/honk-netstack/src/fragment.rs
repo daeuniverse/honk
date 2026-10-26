@@ -14,12 +14,13 @@
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::icmp_out::{IcmpEmit, IcmpOut, Reject};
 use crate::tcp::output::Output;
 use crate::wire::frag::{self, Fragment};
-use crate::{DropReason, Rx};
+use crate::{DropReason, MemoryBudget, Rx};
 
 /// Bookkeeping charged per datagram next to its buffer (entry, ranges, key).
 const ENTRY_OVERHEAD: usize = 256;
@@ -132,6 +133,8 @@ pub(crate) struct Reassembler {
     /// Oldest first.
     entries: Vec<Entry>,
     bytes: usize,
+    /// The process-wide budget `bytes` is also charged to (and refunded to on drop).
+    budget: Option<Arc<MemoryBudget>>,
     /// Quotes of timed-out datagrams that had fragment 0.
     expired: VecDeque<Vec<u8>>,
     pub(crate) stats: FragmentStats,
@@ -143,14 +146,44 @@ impl Default for Reassembler {
     }
 }
 
+impl Drop for Reassembler {
+    fn drop(&mut self) {
+        self.shrink(self.bytes);
+    }
+}
+
 impl Reassembler {
     pub(crate) fn new(limits: FragmentLimits) -> Reassembler {
         Reassembler {
             limits,
             entries: Vec::new(),
             bytes: 0,
+            budget: None,
             expired: VecDeque::new(),
             stats: FragmentStats::default(),
+        }
+    }
+
+    /// Also charges every buffered byte to `budget` (refunded as datagrams leave and on drop).
+    pub(crate) fn with_budget(mut self, budget: Option<Arc<MemoryBudget>>) -> Self {
+        debug_assert_eq!(self.bytes, 0);
+        self.budget = budget;
+        self
+    }
+
+    /// Charges `n` bytes to the shared budget and this table; `false` leaves both unchanged.
+    fn grow(&mut self, n: usize) -> bool {
+        if self.budget.as_ref().is_some_and(|b| !b.try_charge(n)) {
+            return false;
+        }
+        self.bytes += n;
+        true
+    }
+
+    fn shrink(&mut self, n: usize) {
+        self.bytes -= n;
+        if let Some(b) = &self.budget {
+            b.refund(n);
         }
     }
 
@@ -181,6 +214,12 @@ impl Reassembler {
                 if self.entries.len() >= self.limits.max_entries {
                     self.evict_oldest(None);
                 }
+                while !self.grow(ENTRY_OVERHEAD) {
+                    if self.entries.is_empty() {
+                        return Push::Dropped(DropReason::Capacity);
+                    }
+                    self.evict_oldest(None);
+                }
                 self.entries.push(Entry {
                     key,
                     created: now,
@@ -192,7 +231,6 @@ impl Reassembler {
                     }),
                     charged: ENTRY_OVERHEAD,
                 });
-                self.bytes += ENTRY_OVERHEAD;
                 self.entries.len() - 1
             }
         };
@@ -243,7 +281,8 @@ impl Reassembler {
         let growth =
             end.saturating_sub(live.data.len()) + if f.offset == 0 { f.head.len() } else { 0 };
         let mut idx = idx;
-        while self.bytes + growth > self.limits.max_bytes {
+        // `grow` charges the shared budget too: a refusal evicts like the local limit does.
+        while self.bytes + growth > self.limits.max_bytes || !self.grow(growth) {
             let key = self.entries[idx].key;
             if self.entries.len() == 1 {
                 self.stats.invalid += 1;
@@ -269,14 +308,14 @@ impl Reassembler {
             live.head = f.head.to_vec();
         }
         let charge = live.charge();
-        self.bytes = self.bytes - entry.charged + charge;
+        debug_assert_eq!(charge, entry.charged + growth);
         entry.charged = charge;
         if live.total == Some(live.data.len())
             && live.ranges.len() == 1
             && live.ranges[0] == (0, live.data.len())
         {
             let entry = self.entries.remove(idx);
-            self.bytes -= entry.charged;
+            self.shrink(entry.charged);
             let live = entry.live.expect("live entry");
             return Ok(Some(self.finish(&live.head, &live.data, f.is_v6())));
         }
@@ -297,8 +336,9 @@ impl Reassembler {
     fn kill(&mut self, idx: usize) {
         let entry = &mut self.entries[idx];
         entry.live = None;
-        self.bytes = self.bytes - entry.charged + ENTRY_OVERHEAD;
+        let freed = entry.charged - ENTRY_OVERHEAD;
         entry.charged = ENTRY_OVERHEAD;
+        self.shrink(freed);
     }
 
     /// Silently evicts the oldest entry other than `keep`.
@@ -307,7 +347,7 @@ impl Reassembler {
             return;
         };
         let entry = self.entries.remove(i);
-        self.bytes -= entry.charged;
+        self.shrink(entry.charged);
         self.stats.evicted += 1;
     }
 
@@ -329,7 +369,7 @@ impl Reassembler {
                 continue;
             }
             let entry = self.entries.remove(i);
-            self.bytes -= entry.charged;
+            self.shrink(entry.charged);
             self.stats.timeouts += 1;
             if let Some(live) = entry.live
                 && !live.head.is_empty()
@@ -673,6 +713,48 @@ mod tests {
         let f = split(&datagram(src, dst, 64_000, 4), 1, 1400);
         assert!(matches!(tiny.push(t, f.last().unwrap()), Push::Dropped(_)));
         tiny.check();
+    }
+
+    #[test]
+    fn bytes_are_charged_to_the_shared_budget_and_refunded_on_every_exit() {
+        let t = Instant::now();
+        let (src, dst) = families()[0];
+        let budget = MemoryBudget::new(150_000);
+        let mut r = Reassembler::default().with_budget(Some(budget.clone()));
+        let held = |r: &Reassembler, other: usize| {
+            assert_eq!(budget.used(), r.bytes() + other);
+            r.bytes()
+        };
+        let f = split(&datagram(src, dst, 3000, 1), 1, 1000);
+        // Completion refunds everything.
+        pending(r.push(t, &f[1]));
+        assert!(held(&r, 0) > 3000 - 1000);
+        pending(r.push(t, &f[0]));
+        pending(r.push(t, &f[2]));
+        complete(r.push(t, &f[3]));
+        assert_eq!(held(&r, 0), 0);
+        // A killed datagram keeps only its tombstone, which expiry then refunds.
+        pending(r.push(t, &f[0]));
+        assert!(matches!(r.push(t, &f[0]), Push::Dropped(_)));
+        assert_eq!(held(&r, 0), ENTRY_OVERHEAD);
+        r.expire(t + Duration::from_secs(30));
+        assert_eq!(held(&r, 0), 0);
+        // Another stack holds most of the budget: eviction makes room, refusal drops the rest.
+        let hog = budget.try_charge(100_000);
+        assert!(hog);
+        for id in 0..3u32 {
+            let f = split(&datagram(src, dst, 20_000, 2), id, 1400);
+            pending(r.push(t, f.last().unwrap()));
+            assert!(budget.used() <= budget.limit());
+            held(&r, 100_000);
+        }
+        assert_eq!((r.len(), r.stats.evicted), (2, 1));
+        let f = split(&datagram(src, dst, 64_000, 3), 9, 1400);
+        assert!(matches!(r.push(t, f.last().unwrap()), Push::Dropped(_)));
+        assert!(budget.used() <= budget.limit());
+        r.check();
+        drop(r);
+        assert_eq!(budget.used(), 100_000, "dropping the table refunds its bytes");
     }
 
     #[test]

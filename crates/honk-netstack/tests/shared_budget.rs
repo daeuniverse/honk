@@ -6,7 +6,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use honk_netstack::wire::{self, tcp};
-use honk_netstack::{Config, ConnectError, FlowId, MemoryBudget, Rx, Stack, StreamError};
+use honk_netstack::{
+    Config, ConnectError, ExcludeSet, FlowId, FragmentLimits, MemoryBudget, Mode, Rx, Stack,
+    StreamError,
+};
 
 const CHUNK: usize = 16 * 1024;
 const MS: Duration = Duration::from_millis(1);
@@ -213,4 +216,85 @@ fn shared_commitments_are_charged_and_exhaustion_leaves_the_floor_working() {
         budget.limit(),
         "progress needed nothing beyond the floors"
     );
+}
+
+fn terminator(budget: &std::sync::Arc<MemoryBudget>, max_bytes: usize) -> Stack {
+    let mut cfg = Config::new([0x38; 32]);
+    cfg.mode = Mode::Transparent {
+        exclude: ExcludeSet::default(),
+    };
+    cfg.shared_budget = Some(budget.clone());
+    cfg.fragment_limits = FragmentLimits {
+        max_bytes,
+        ..FragmentLimits::default()
+    };
+    Stack::new(cfg, Instant::now())
+}
+
+/// Sends a `len`-byte datagram (a fresh IP identification each time) and returns its last
+/// fragment: alone it forces the whole reassembly buffer.
+fn last_fragment(tx: &mut Stack, len: usize) -> Vec<u8> {
+    let (src, dst): (SocketAddr, SocketAddr) = (
+        "203.0.113.9:53".parse().unwrap(),
+        "10.0.0.2:5353".parse().unwrap(),
+    );
+    let mut out = vec![0u8; 2048];
+    tx.udp_send_from(src, dst, &vec![7u8; len], &mut out)
+        .unwrap();
+    let mut last = Vec::new();
+    while let Some(n) = tx.poll_transmit(Instant::now(), &mut out) {
+        last = out[..n].to_vec();
+    }
+    last
+}
+
+/// Reassembly buffers are process memory: they are charged to the shared budget, so they can
+/// neither exceed it nor hide from it, and every exit path refunds them.
+#[test]
+fn reassembly_is_charged_to_the_shared_budget_and_bounded_by_it() {
+    let now = Instant::now();
+    let mut tx = terminator(&MemoryBudget::new(usize::MAX / 2), 0);
+    let mut flood = |stack: &mut Stack, n: u16| {
+        for _ in 0..n {
+            let p = last_fragment(&mut tx, 60_000);
+            // Once the budget is gone a datagram is refused, never buffered past it.
+            let rx = stack.receive(now, &p);
+            assert!(matches!(rx, Rx::Consumed | Rx::Dropped(_)), "{rx:?}");
+        }
+    };
+
+    // The table's own cap (256 KiB) is below the budget: the budget sees exactly the buffered
+    // bytes, a sibling stack still completes a datagram and still admits a flow.
+    let budget = MemoryBudget::new(1024 * 1024);
+    let mut a = terminator(&budget, 256 * 1024);
+    flood(&mut a, 40);
+    let held = budget.used();
+    assert!(
+        (128 * 1024..=256 * 1024).contains(&held),
+        "uncharged reassembly leaves the budget at {held}"
+    );
+    let mut b = Side::new(Some(&budget));
+    assert!(b.connect().is_ok(), "the sibling keeps its floor");
+    // Timeout and drop refund it.
+    a.handle_timeout(now + Duration::from_secs(31));
+    assert!(budget.used() < held);
+    flood(&mut a, 4);
+    drop(a);
+    drop(b);
+    assert_eq!(budget.used(), 0);
+
+    // The budget is below the table's cap (4 MiB default): the budget is the bound.
+    let budget = MemoryBudget::new(128 * 1024);
+    let mut a = terminator(&budget, 4 * 1024 * 1024);
+    flood(&mut a, 40);
+    assert!(
+        (64 * 1024..=128 * 1024).contains(&budget.used()),
+        "{}",
+        budget.used()
+    );
+    let mut b = terminator(&budget, 4 * 1024 * 1024);
+    flood(&mut b, 40);
+    assert!(budget.used() <= budget.limit(), "{}", budget.used());
+    drop((a, b));
+    assert_eq!(budget.used(), 0);
 }

@@ -303,7 +303,8 @@ impl Stack {
         Stack {
             udp_tx: crate::udp_t::UdpTx::new(&cfg.secret),
             icmp_out: crate::icmp_out::IcmpOut::new(cfg.icmp_limits),
-            reasm: crate::fragment::Reassembler::new(cfg.fragment_limits),
+            reasm: crate::fragment::Reassembler::new(cfg.fragment_limits)
+                .with_budget(cfg.shared_budget.clone()),
             cfg,
             now,
             epoch: now,
