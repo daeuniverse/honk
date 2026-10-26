@@ -53,11 +53,14 @@ pub mod wire;
 
 mod budget;
 mod flow;
+mod fragment;
 mod icmp;
+mod icmp_out;
 mod stack;
 mod tcp;
 mod timer;
 mod udp;
+mod udp_t;
 
 pub use budget::MemoryBudget;
 pub use stack::{

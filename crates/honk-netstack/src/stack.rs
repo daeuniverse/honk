@@ -87,6 +87,19 @@ pub enum Rx {
         src: SocketAddr,
         payload: Range<usize>,
     },
+    /// Transparent-mode UDP: stateless, no flow; `payload` indexes the input packet.
+    Transparent {
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Range<usize>,
+    },
+    /// A transparent datagram that was reassembled from fragments; `payload` indexes `packet`.
+    TransparentOwned {
+        src: SocketAddr,
+        dst: SocketAddr,
+        packet: Vec<u8>,
+        payload: Range<usize>,
+    },
     Dropped(DropReason),
 }
 
@@ -158,6 +171,10 @@ pub enum UdpError {
     Stale,
     #[error("datagram exceeds the path MTU")]
     TooLarge,
+    #[error("pending fragment queue is full")]
+    Busy,
+    #[error("source and destination address families differ")]
+    FamilyMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -199,10 +216,15 @@ pub struct Stack {
     writers: VecDeque<FlowId>,
     timewait_ready: VecDeque<FlowId>,
     controls: VecDeque<Control>,
-    tx_wakeup: bool,
+    pub(crate) tx_wakeup: bool,
     class: u8,
     cache: Option<(FourTuple, FlowId)>,
     pub(crate) counters: StackStats,
+    pub(crate) udp_tx: crate::udp_t::UdpTx,
+    #[allow(dead_code)] // read once transparent mode is wired
+    pub(crate) icmp_out: crate::icmp_out::IcmpOut,
+    #[allow(dead_code)]
+    pub(crate) reasm: crate::fragment::Reassembler,
 }
 
 impl Stack {
@@ -216,6 +238,9 @@ impl Stack {
             .with_budget(cfg.shared_budget.clone());
         let ports = Ports::new(&cfg.secret);
         Stack {
+            udp_tx: crate::udp_t::UdpTx::new(&cfg.secret),
+            icmp_out: crate::icmp_out::IcmpOut::default(),
+            reasm: crate::fragment::Reassembler::default(),
             cfg,
             now,
             epoch: now,
