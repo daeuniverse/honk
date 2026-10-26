@@ -8,10 +8,10 @@ use crate::{Config, FlowId, Stack};
 
 pub(super) const MTU: u16 = 1420;
 pub(super) const MAX_PEERS: usize = 12;
-/// One drain at a fixed `now` cannot exceed what memory admits: `memory_limit` (2 MiB) over the
-/// smallest payload a 48-byte peer MSS leaves next to a full option block (4 bytes: fuzz input
-/// `crash-0abd999e` legitimately emits ~2000 such packets). A scheduler loop or a window
-/// violation never stops, so any finite bound separates them.
+/// One fixed-time drain is bounded by the 2 MiB memory limit divided by the smallest positive
+/// payload: at IPv4 PMTU 68 a 44-byte TCP header (timestamps/SACK) leaves four bytes.
+/// `crash-0abd999e` legitimately emits more than 2048 such packets with a small-MSS peer.
+/// Keep a finite bound to catch a scheduler loop without rejecting that valid traffic.
 const MAX_DRAIN: usize = 2 * 1024 * 1024 / 4;
 
 fn after(a: u32, b: u32) -> bool {
