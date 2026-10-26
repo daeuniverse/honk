@@ -425,6 +425,7 @@ fn soak_a_syn_herd_beyond_the_budget_is_served_in_retry_waves_without_loss() {
     let r = soak(&flows, 3 * MIB, Duration::ZERO, secs(600));
     eprintln!("syn herd: {r:?}");
     assert!(r.syn_drops > 0, "no SYN was refused: {r:?}");
+    assert!(r.peak_budget > 2 * MIB, "{r:?}");
     assert!(r.elapsed < secs(60), "{r:?}");
 }
 

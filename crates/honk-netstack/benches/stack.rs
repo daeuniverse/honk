@@ -222,8 +222,8 @@ impl Flow {
 }
 
 /// The flavours every TCP case runs for: an active-open client and a transparent terminator.
-const FLAVOURS: [(&str, fn() -> Flow); 2] =
-    [("tcp", Flow::connect), ("transparent_tcp", Flow::accept)];
+type Make = fn() -> Flow;
+const FLAVOURS: [(&str, Make); 2] = [("tcp", Flow::connect), ("transparent_tcp", Flow::accept)];
 
 /// Feeds in-order segments to the stack, reading and answering each (the offload seam for RX).
 fn deliver(f: &mut Flow, packets: &[Vec<u8>], read: &mut [u8]) {

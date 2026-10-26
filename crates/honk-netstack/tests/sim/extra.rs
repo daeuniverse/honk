@@ -10,11 +10,13 @@ use honk_netstack::wire;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+pub type DropIf = Box<dyn FnMut(&[u8]) -> bool>;
+
 /// Wraps a host and discards every packet it emits for which `drop_if` returns true (the packet is
 /// consumed from the stack, exactly as if the link lost it).
 pub struct Tap<H> {
     pub host: H,
-    pub drop_if: Box<dyn FnMut(&[u8]) -> bool>,
+    pub drop_if: DropIf,
     pub dropped: u64,
 }
 

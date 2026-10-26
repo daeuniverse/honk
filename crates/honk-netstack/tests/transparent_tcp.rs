@@ -972,7 +972,7 @@ fn icmp_refusals_are_sourced_from_the_original_destination_and_rate_limited() {
     let t0 = Instant::now();
     for (client, dst, how, v4_code, v6_code) in [
         (CLIENT, DST, Refuse::IcmpUnreachable, 1u8, 3u8),
-        (CLIENT, DST, Refuse::IcmpAdminProhibited, 13, 5),
+        (CLIENT, DST, Refuse::IcmpAdminProhibited, 13, 1),
         (
             "[2001:db8::2]:40000",
             "[2001:db8:1::9]:443",
@@ -985,7 +985,7 @@ fn icmp_refusals_are_sourced_from_the_original_destination_and_rate_limited() {
             "[2001:db8:1::9]:443",
             Refuse::IcmpAdminProhibited,
             13,
-            5,
+            1,
         ),
     ] {
         let mut stack = Stack::new(transparent(), t0);

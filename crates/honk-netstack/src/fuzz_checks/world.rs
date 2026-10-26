@@ -8,9 +8,11 @@ use crate::{Config, FlowId, Stack};
 
 pub(super) const MTU: u16 = 1420;
 pub(super) const MAX_PEERS: usize = 12;
-/// One drain at a fixed `now` cannot legitimately exceed what the windows admit: 16 flows of
-/// 256 KiB send buffers are far below this, a scheduler loop or a window violation is not.
-const MAX_DRAIN: usize = 2048;
+/// One drain at a fixed `now` cannot exceed what memory admits: `memory_limit` (2 MiB) over the
+/// smallest payload a 48-byte peer MSS leaves next to a full option block (4 bytes: fuzz input
+/// `crash-0abd999e` legitimately emits ~2000 such packets). A scheduler loop or a window
+/// violation never stops, so any finite bound separates them.
+const MAX_DRAIN: usize = 2 * 1024 * 1024 / 4;
 
 fn after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) > 0

@@ -20,6 +20,8 @@ pub fn source_addr(k: usize) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(10, 1, (k >> 8) as u8, k as u8))
 }
 
+pub type ConfigHook = Box<dyn FnOnce(&mut Config)>;
+
 #[derive(Default)]
 pub struct ServerOpts {
     /// Several client sources with this many flows each (see the module comment).
@@ -28,7 +30,7 @@ pub struct ServerOpts {
     /// (the compact TIME_WAIT entry then outlives the handle).
     pub close_when_done: bool,
     /// Adjusts the stack configuration (budget, limits).
-    pub config: Option<Box<dyn FnOnce(&mut Config)>>,
+    pub config: Option<ConfigHook>,
 }
 
 /// What the terminator emitted: the transparency check ("a reply is sourced from the original
