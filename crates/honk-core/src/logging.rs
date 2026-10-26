@@ -23,13 +23,17 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
 /// quinn logs every endpoint-driver death at ERROR; probe/warm endpoints over
 /// retiring AnyTLS sessions die as a matter of course (the SYNACK watchdog
 /// kills them on purpose), so that target is silenced unless `RUST_LOG` says
-/// otherwise.
-pub(crate) const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off";
+/// otherwise. boringtun logs its handshake retries at WARN (every few seconds per
+/// dead peer) and session expiry at ERROR (every few minutes per idle tunnel), none
+/// with a node name; honk reports the same lifecycle once, with context.
+pub(crate) const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off,boringtun=off";
 
-/// The target [`QUIET_LOG_TARGETS`] silences; Clash and native log capture
-/// always exclude it.
+/// The targets [`QUIET_LOG_TARGETS`] silences; Clash and native log capture
+/// always exclude them.
 #[cfg(any(feature = "clash-api", feature = "native-api"))]
-pub(crate) const QUIET_TARGET: &str = "quinn::endpoint";
+pub(crate) fn is_quiet_target(target: &str) -> bool {
+    target == "quinn::endpoint" || target == "boringtun" || target.starts_with("boringtun::")
+}
 
 /// WARN when a persisting state is entered, DEBUG for its repeats, so a
 /// failure retried every tick reports once per episode. The caller decides
@@ -244,6 +248,44 @@ mod local_time_tests {
         assert_eq!(&offset[3..4], ":", "{out}");
         let expected = chrono::Local::now().format("%:z").to_string();
         assert_eq!(offset, expected, "{out}");
+    }
+
+    /// The default filter drops boringtun's untagged retry/expiry lines but keeps honk's own.
+    #[test]
+    fn test_default_filter_silences_boringtun_but_not_honk() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_filter(tracing_subscriber::EnvFilter::new(format!(
+                    "info,{}",
+                    super::QUIET_LOG_TARGETS
+                ))),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "boringtun::noise::timers", "HANDSHAKE(REKEY_TIMEOUT)");
+            tracing::error!(target: "boringtun::noise", "CONNECTION_EXPIRED");
+            tracing::warn!(target: "honk_outbound::proxy::wireguard::tunnel", "kept");
+        });
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("REKEY_TIMEOUT"), "{logged}");
+        assert!(!logged.contains("CONNECTION_EXPIRED"), "{logged}");
+        assert!(logged.contains("kept"), "{logged}");
     }
 
     /// `--disable-timestamp` drops the stamp from the console line only.

@@ -122,7 +122,11 @@ impl Node {
                 return;
             }
             self.host = normalized_wireguard_host(self.host()).into_owned();
-            self.address = format!("{}:{}", self.host, self.port);
+            self.address = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("[{}]:{}", self.host, self.port)
+            } else {
+                format!("{}:{}", self.host, self.port)
+            };
         }
     }
 

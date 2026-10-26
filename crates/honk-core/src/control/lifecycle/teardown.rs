@@ -250,6 +250,18 @@ impl ControlPlane {
             retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
         }
         retain_error(&mut fatal, self.stop_network_epoch(epoch).await);
+        // Terminal only: tunnels are shared by the plane's generations, so a candidate-epoch
+        // cleanup must not end the running generation's. Every runtime is closed by now; this
+        // joins the owner tasks of this plane's tunnels and leaves any other plane's alone.
+        let registry = self.runtime_registry.read().clone();
+        retain_error(
+            &mut fatal,
+            cleanup_stage(async {
+                registry.shutdown_wireguard_tunnels().await;
+                Ok(())
+            })
+            .await,
+        );
         if let Some(flags) = &self.datapath_flags {
             retain_error(&mut fatal, flags.disable().await);
         }

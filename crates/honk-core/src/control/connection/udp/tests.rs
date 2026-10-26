@@ -39,6 +39,7 @@ fn source_path_selects_shared_exactly_for_the_registered_slots() {
         (NodeProtocol::Socks5, true),
         (NodeProtocol::Juicity, true),
         (NodeProtocol::AnyTLS, true),
+        (NodeProtocol::WireGuard, true),
         (NodeProtocol::Direct, false),
         (NodeProtocol::Block, false),
     ] {

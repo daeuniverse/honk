@@ -15,11 +15,13 @@ mod admission;
 pub mod flow_observation;
 mod pooled;
 mod tasks;
+mod wireguard;
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
 pub(crate) use tasks::{
     RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
 };
+pub use wireguard::WireGuardRuntime;
 #[cfg(any(feature = "rprx", test))]
 mod vless;
 
@@ -32,6 +34,7 @@ pub use admission::{DialPermit, DialScope};
 #[cfg(any(feature = "rprx", test))]
 pub use vless::VlessRuntime;
 
+use crate::proxy::wireguard::TunnelRegistry;
 use honk_config::node::Node;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -54,6 +57,7 @@ pub enum GenerationRuntime {
     AnyTls,
     Vless,
     Quic,
+    WireGuard,
 }
 
 impl GenerationRuntime {
@@ -62,6 +66,7 @@ impl GenerationRuntime {
         node: &Node,
         metrics_enabled: bool,
         quality: Arc<crate::transport_quality::TransportQuality>,
+        wireguard: &Arc<TunnelRegistry>,
     ) -> ProtocolRuntime {
         match self {
             Self::None => ProtocolRuntime::None,
@@ -76,6 +81,9 @@ impl GenerationRuntime {
                 ProtocolRuntime::None
             }
             Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new(metrics_enabled, quality)),
+            Self::WireGuard => {
+                ProtocolRuntime::WireGuard(WireGuardRuntime::new(Arc::clone(wireguard)))
+            }
         }
     }
 }
@@ -94,6 +102,8 @@ pub enum ProtocolRuntime {
     /// Type-erased TUIC, Juicity, or Hysteria2 client slot. Policy warm
     /// ownership may release the cached client before generation retirement.
     Quic(QuicRuntime),
+    /// Slot caching the process-shared WireGuard tunnel for this node.
+    WireGuard(WireGuardRuntime),
 }
 
 /// A protocol client stored in [`QuicRuntime`]. Implemented by the
@@ -378,6 +388,7 @@ impl NodeRuntime {
         node: &Node,
         ephemeral: bool,
         #[cfg(feature = "owned-tasks")] task_owner: Option<Arc<tasks::TaskOwner>>,
+        wireguard: Arc<TunnelRegistry>,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
     ) -> Arc<Self> {
         let transport_quality = Arc::new(crate::transport_quality::TransportQuality::default());
@@ -387,7 +398,7 @@ impl NodeRuntime {
                 udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
                 runtime: crate::descriptor::descriptor(node.protocol())
                     .generation_runtime
-                    .build(node, !ephemeral, Arc::clone(&transport_quality)),
+                    .build(node, !ephemeral, Arc::clone(&transport_quality), &wireguard),
                 xhttp: Self::build_xhttp(node),
                 ephemeral,
                 transport_quality,
@@ -404,8 +415,9 @@ impl NodeRuntime {
         build()
     }
 
-    fn build_ephemeral_with_vless_carriers(
+    fn build_ephemeral_with(
         node: &Node,
+        wireguard: Arc<TunnelRegistry>,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
     ) -> Arc<Self> {
         Self::build(
@@ -413,14 +425,17 @@ impl NodeRuntime {
             true,
             #[cfg(feature = "owned-tasks")]
             Some(Arc::new(tasks::TaskOwner::default())),
+            wireguard,
             #[cfg(any(feature = "rprx", test))]
             vless_carriers,
         )
     }
 
+    /// A runtime outside any plane shares tunnels through the process-wide standalone registry.
     fn build_ephemeral(node: &Node) -> Arc<Self> {
-        Self::build_ephemeral_with_vless_carriers(
+        Self::build_ephemeral_with(
             node,
+            TunnelRegistry::standalone(),
             #[cfg(any(feature = "rprx", test))]
             Arc::clone(&STANDALONE_VLESS_CARRIERS),
         )
@@ -590,6 +605,12 @@ impl NodeRuntime {
         };
         Ok(runtime.flow_control_profiles())
     }
+    pub(crate) fn wireguard(&self) -> anyhow::Result<&WireGuardRuntime> {
+        let ProtocolRuntime::WireGuard(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no WireGuard runtime", self.node.name);
+        };
+        Ok(runtime)
+    }
 
     pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let ProtocolRuntime::AnyTls(runtime) = &self.runtime else {
@@ -619,6 +640,7 @@ impl NodeRuntime {
             sessions: self.pooled_session_count(),
             clients: match &self.runtime {
                 ProtocolRuntime::Quic(runtime) => runtime.client_count(),
+                ProtocolRuntime::WireGuard(runtime) => Some(runtime.client_count()),
                 _ => Some(0),
             },
         }
@@ -628,7 +650,10 @@ impl NodeRuntime {
     pub(crate) fn tls_connector_loaded(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
-            ProtocolRuntime::None | ProtocolRuntime::Vless(_) | ProtocolRuntime::Quic(_) => false,
+            ProtocolRuntime::None
+            | ProtocolRuntime::Vless(_)
+            | ProtocolRuntime::Quic(_)
+            | ProtocolRuntime::WireGuard(_) => false,
         }
     }
 }
@@ -761,6 +786,10 @@ pub struct OutboundRuntimeRegistry {
     background_tasks: std::sync::LazyLock<Arc<tasks::TaskOwner>>,
     #[cfg(any(feature = "rprx", test))]
     vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
+    /// The plane's WireGuard tunnels, shared by its generations and DNS forks: two sessions with
+    /// the same keys to the same peer would invalidate each other, but another plane's tunnels
+    /// are none of this generation's business (see `shutdown_wireguard_tunnels`).
+    wireguard: Arc<TunnelRegistry>,
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -791,8 +820,9 @@ impl OutboundRuntimeRegistry {
 
     pub(crate) fn ephemeral_guarded_after_admission(&self, node: &Node) -> EphemeralRuntimeGuard {
         EphemeralRuntimeGuard {
-            runtime: Some(NodeRuntime::build_ephemeral_with_vless_carriers(
+            runtime: Some(NodeRuntime::build_ephemeral_with(
                 node,
+                Arc::clone(&self.wireguard),
                 #[cfg(any(feature = "rprx", test))]
                 Arc::clone(&self.vless_carrier_semaphore),
             )),
@@ -824,6 +854,9 @@ impl OutboundRuntimeRegistry {
             dial_ceiling_limit,
             #[cfg(any(feature = "rprx", test))]
             vless_carriers,
+            previous.map_or_else(TunnelRegistry::new, |previous| {
+                Arc::clone(&previous.wireguard)
+            }),
             previous.is_some_and(Self::owns_tasks),
             previous,
         )
@@ -846,6 +879,7 @@ impl OutboundRuntimeRegistry {
             self.dial_ceiling_limit,
             #[cfg(any(feature = "rprx", test))]
             Arc::clone(&self.vless_carrier_semaphore),
+            Arc::clone(&self.wireguard),
             self.owns_tasks(),
             None,
         )?;
@@ -881,6 +915,9 @@ impl OutboundRuntimeRegistry {
         );
         #[cfg(not(any(feature = "rprx", test)))]
         let _ = startup_vless_carrier_ceiling;
+        let wireguard = previous.map_or_else(TunnelRegistry::new, |previous| {
+            Arc::clone(&previous.wireguard)
+        });
         Self::build_reusing_with_admission(
             nodes,
             max_concurrent_dials,
@@ -888,17 +925,20 @@ impl OutboundRuntimeRegistry {
             dial_ceiling_limit,
             #[cfg(any(feature = "rprx", test))]
             vless_carrier_semaphore,
+            wireguard,
             own_tasks,
             previous,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_reusing_with_admission(
         nodes: &[Node],
         max_concurrent_dials: usize,
         dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
         dial_ceiling_limit: usize,
         #[cfg(any(feature = "rprx", test))] vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
+        wireguard: Arc<TunnelRegistry>,
         own_tasks: bool,
         previous: Option<&Self>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
@@ -948,6 +988,7 @@ impl OutboundRuntimeRegistry {
                     false,
                     #[cfg(feature = "owned-tasks")]
                     own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
+                    Arc::clone(&wireguard),
                     #[cfg(any(feature = "rprx", test))]
                     Arc::clone(&vless_carrier_semaphore),
                 ),
@@ -973,6 +1014,7 @@ impl OutboundRuntimeRegistry {
                 }),
                 #[cfg(any(feature = "rprx", test))]
                 vless_carrier_semaphore,
+                wireguard,
             },
             reused,
         ))
@@ -1102,6 +1144,14 @@ impl OutboundRuntimeRegistry {
                 quic.release_warm().await;
             }
         }
+    }
+
+    /// Close and join every WireGuard tunnel of this generation's control plane, which every
+    /// generation chained from it and every DNS fork also shares. Terminal teardown only, after
+    /// every runtime of the plane has been shut down; tunnels of another plane and the
+    /// process-wide standalone registry are untouched. Returns how many live tunnels it closed.
+    pub async fn shutdown_wireguard_tunnels(&self) -> usize {
+        self.wireguard.shutdown().await
     }
 
     /// Force-close every owned runtime. Used only after process-level flow

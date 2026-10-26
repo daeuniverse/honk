@@ -105,6 +105,7 @@ async fn xhttp_physical_warm_retention_maintenance_and_shutdown() {
         Arc::new(tokio::sync::Semaphore::new(1)),
         1,
         Arc::new(tokio::sync::Semaphore::new(4)),
+        crate::proxy::wireguard::TunnelRegistry::new(),
         false,
         None,
     )
@@ -447,6 +448,7 @@ async fn cancelled_speculative_udp_tls_establishment_releases_socket_and_carrier
             Arc::new(tokio::sync::Semaphore::new(1)),
             1,
             carriers.clone(),
+            crate::proxy::wireguard::TunnelRegistry::new(),
             false,
             None,
         )
@@ -524,6 +526,7 @@ async fn exhausted_xhttp_admission_preserves_capacity_and_cancellation_feedback(
             ceiling.clone(),
             1,
             Arc::new(tokio::sync::Semaphore::new(4)),
+            crate::proxy::wireguard::TunnelRegistry::new(),
             false,
             None,
         )
@@ -770,6 +773,7 @@ async fn one_dial_credit_opens_two_limit_one_carriers_without_retaining_setup_ad
             Arc::new(tokio::sync::Semaphore::new(1)),
             1,
             Arc::new(tokio::sync::Semaphore::new(4)),
+            crate::proxy::wireguard::TunnelRegistry::new(),
             false,
             None,
         )

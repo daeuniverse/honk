@@ -47,6 +47,10 @@ impl<'de> Deserialize<'de> for WireGuardKey {
     }
 }
 
+/// Largest inner MTU whose encrypted datagram still fits one IPv4 UDP payload (65507 bytes):
+/// 16-byte data header, payload padded to 16, 16-byte tag.
+pub const WIREGUARD_MAX_MTU: u16 = 65_472;
+
 /// One userspace tunnel and exactly one remote peer. Endpoint/provenance live on Node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireGuardConfig {
@@ -143,10 +147,11 @@ impl WireGuardConfig {
                 "WireGuard requires at least one local tunnel address",
             ));
         }
-        if self.mtu < if self.local_v6.is_some() { 1280 } else { 576 } {
+        let minimum = if self.local_v6.is_some() { 1280 } else { 576 };
+        if !(minimum..=WIREGUARD_MAX_MTU).contains(&self.mtu) {
             return Err((
                 "wg_mtu",
-                "WireGuard MTU must be 1280..=65535 with IPv6 or 576..=65535 for IPv4 only",
+                "WireGuard MTU must be 1280..=65472 with IPv6 or 576..=65472 for IPv4 only",
             ));
         }
         if self.network.as_deref().is_some_and(|network| {

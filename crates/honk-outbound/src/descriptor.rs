@@ -189,13 +189,15 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::AnyTls,
         share_link_schemes: &["anytls"],
     },
+    // The tunnel is shared per control plane and UDP-only: a pooled bare TCP is meaningless, and
+    // the runtime slot only caches/holds the plane registry's tunnel. Warming completes the handshake.
     ProtocolDescriptor {
         protocol: NodeProtocol::WireGuard,
         supports_udp: network_allows_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        supports_warm: no_warm,
-        generation_runtime: GenerationRuntime::None,
+        supports_warm: pooled_supports_warm,
+        generation_runtime: GenerationRuntime::WireGuard,
         share_link_schemes: &["wireguard", "wg"],
     },
     // Each direct flow owns a socket carrying its own rule or global mark; a
@@ -379,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn wireguard_declares_udp_permission_without_registering_a_handler() {
+    fn wireguard_is_a_warmable_udp_tunnel_without_tcp_pools() {
         let descriptor = descriptor(NodeProtocol::WireGuard);
         let mut node = Node {
             outbound: honk_config::node::OutboundConfig::WireGuard(Default::default()),
@@ -392,13 +394,16 @@ mod tests {
         assert!((descriptor.supports_udp)(&node));
         assert!(!(descriptor.pool_ready_streams)(&node));
         assert!(!(descriptor.pool_bare_tcp)(&node));
+        assert!(descriptor.supports_warm(&node, WarmRequirement::Session));
+        assert!(descriptor.supports_warm(&node, WarmRequirement::Udp));
+        node.wireguard_mut().unwrap().network = Some("tcp".into());
+        assert!(descriptor.supports_warm(&node, WarmRequirement::Session));
         assert!(!descriptor.supports_warm(&node, WarmRequirement::Udp));
-        assert!(
-            crate::proxy::ProxyRegistry::default_resolver()
-                .unwrap()
-                .find(NodeProtocol::WireGuard)
-                .is_none()
-        );
+        assert_eq!(descriptor.generation_runtime, GenerationRuntime::WireGuard);
+        let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+        let entry = registry.find(NodeProtocol::WireGuard).unwrap();
+        assert!(entry.packet.is_some() && entry.shared.is_some());
+        assert!(entry.warmable.is_some() && entry.probeable.is_some());
     }
 
     #[test]

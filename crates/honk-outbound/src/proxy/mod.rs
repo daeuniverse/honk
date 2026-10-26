@@ -18,6 +18,7 @@ pub(crate) mod uot;
 pub mod vless;
 #[cfg(feature = "rprx")]
 pub mod vmess;
+pub mod wireguard;
 
 mod error;
 mod outbound;

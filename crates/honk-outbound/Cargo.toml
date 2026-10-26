@@ -49,6 +49,10 @@ quinn-proto.workspace = true
 # HTTP/2 client for the urltest latency probe (urltest.rs)
 h2.workspace = true
 http.workspace = true
+# WireGuard outbound: userspace Noise transport and the inner TCP/UDP stack
+honk-netstack.workspace = true
+boringtun = { version = "0.7.1", default-features = false }
+ipnet.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
@@ -61,6 +65,16 @@ stats_alloc = "0.1.10"
 # rustls: test-only — loopback TLS/QUIC servers prove wire interop with the
 # BoringSSL client stack (and cross-check the QUIC crypto backend)
 tokio-rustls.workspace = true
+# WireGuard peer: the in-process far side of the tunnel (same pin as honk-netstack's baseline)
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+    "std",
+    "proto-ipv4",
+    "proto-ipv6",
+    "medium-ip",
+    "socket-tcp",
+    "socket-tcp-cubic",
+    "socket-udp",
+] }
 
 [features]
 # VLESS (xtls-rprx-vision flow) / VMess proxy handlers. Off by default:

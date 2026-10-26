@@ -17,6 +17,7 @@ use super::tuic::TuicHandler;
 use super::vless::VLessHandler;
 #[cfg(feature = "rprx")]
 use super::vmess::VmessHandler;
+use super::wireguard::WireGuardHandler;
 use super::{
     DirectMark, MultiTargetTransport, PacketOutbound, PacketRejection, PacketTransport,
     PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound,
@@ -193,6 +194,14 @@ impl ProxyRegistry {
                 .with_shared(juicity.clone())
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
+        );
+        let wireguard = Arc::new(WireGuardHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::WireGuard, wireguard.clone())
+                .with_packet(wireguard.clone())
+                .with_shared(wireguard.clone())
+                .with_warmable(wireguard.clone())
+                .with_probeable(wireguard),
         );
         for entry in &registry.entries {
             entry.validate_consistency();

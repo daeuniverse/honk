@@ -212,7 +212,7 @@ fn mtu_limits_follow_the_configured_local_family_and_do_not_silently_default() {
         (json!(["10.0.0.2/32"]), 576),
         (json!(["fd00::2/128"]), 1280),
     ] {
-        for mtu in [minimum, 1420, 65535] {
+        for mtu in [minimum, 1420, 65472] {
             let mut value = flat_value();
             value["wg_addresses"] = addresses.clone();
             value["wg_mtu"] = json!(mtu);
@@ -221,7 +221,8 @@ fn mtu_limits_follow_the_configured_local_family_and_do_not_silently_default() {
                 mtu
             );
         }
-        for mtu in [0, minimum - 1, 65536] {
+        // 65472 is the last MTU whose padded, encrypted datagram fits one IPv4 UDP payload.
+        for mtu in [0, minimum - 1, 65473, 65535, 65536] {
             let mut value = flat_value();
             value["wg_addresses"] = addresses.clone();
             value["wg_mtu"] = json!(mtu);
@@ -246,6 +247,8 @@ fn malformed_keys_addresses_routes_and_peer_shapes_are_rejected_safely() {
         ("reserved", "1,2,256", "wg_reserved"),
         ("reserved", "AQI=", "wg_reserved"),
         ("mtu", "1279", "wg_mtu"),
+        ("mtu", "65473", "wg_mtu"),
+        ("mtu", "65535", "wg_mtu"),
         ("mtu", "65536", "wg_mtu"),
         ("keepalive", "65536", "wg_keepalive"),
         ("keepalive", "-1", "wg_keepalive"),
@@ -347,6 +350,18 @@ fn wireguard_preserves_address_only_ipv6_rejection_before_host_normalization() {
     ipv4["address"] = json!("192.0.2.1:51820");
     let ipv4 = flat(ipv4).unwrap();
     assert_eq!(ipv4.host, "192.0.2.1");
+}
+
+#[test]
+fn normalizing_an_ipv6_wireguard_endpoint_keeps_the_address_bracketed() {
+    let mut value = flat_value();
+    value["host"] = json!("2001:DB8::1");
+    value["address"] = json!("[2001:db8::1]:51820");
+    let node = flat(value).unwrap();
+    assert_eq!(node.host, "2001:db8::1");
+    assert_eq!(node.address, "[2001:db8::1]:51820");
+    let parsed = node.address.parse::<std::net::SocketAddr>().unwrap();
+    assert_eq!((parsed.ip().to_string(), parsed.port()), (node.host, 51820));
 }
 
 #[test]

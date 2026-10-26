@@ -409,6 +409,113 @@ async fn shutdown_detaches_hooks_only_after_udp_cleanup() -> anyhow::Result<()> 
     Ok(())
 }
 
+fn wireguard_node(peer: SocketAddr) -> anyhow::Result<honk_config::node::Node> {
+    use base64::Engine as _;
+    use honk_config::node::{Node, OutboundConfig, WireGuardConfig, WireGuardKey};
+
+    let key = |byte: u8| -> WireGuardKey {
+        base64::engine::general_purpose::STANDARD
+            .encode([byte; 32])
+            .parse()
+            .unwrap()
+    };
+    let mut node = Node {
+        name: "wg-teardown".into(),
+        host: "127.0.0.1".into(),
+        port: peer.port(),
+        outbound: OutboundConfig::WireGuard(WireGuardConfig {
+            private_key: Some(key(7)),
+            public_key: Some(key(8)),
+            local_v4: Some("10.0.0.2".parse()?),
+            ..WireGuardConfig::default()
+        }),
+        ..Node::default()
+    };
+    node.normalize_wireguard();
+    node.id = node.derive_id();
+    Ok(node)
+}
+
+/// A plane whose runtime generation is warming a WireGuard tunnel to `peer` (which never
+/// answers), returned once the tunnel's first initiation reaches `peer` from an outer address
+/// other than `known`. Warming through the plane's runtime is what puts the tunnel in the plane's
+/// own registry.
+async fn plane_warming_a_tunnel(
+    node: &honk_config::node::Node,
+    peer: &tokio::net::UdpSocket,
+    known: Option<SocketAddr>,
+) -> anyhow::Result<(
+    ControlPlane,
+    tokio::task::JoinHandle<anyhow::Result<honk_outbound::proxy::WarmOutcome>>,
+    SocketAddr,
+)> {
+    let plane = mock_plane(crate::ebpf::mock::MockEbpfBackend::new()).await;
+    let generation = Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(
+        std::slice::from_ref(node),
+    )?);
+    *plane.runtime_registry.write() = Arc::clone(&generation);
+    let proxy = ProxyRegistry::default_resolver()?;
+    let id = node.id;
+    let warm = tokio::spawn(async move { proxy.warm_session(generation, id, WAIT).await });
+    let mut buffer = [0; 2048];
+    let outer = tokio::time::timeout(WAIT, async {
+        loop {
+            let (_, from) = peer.recv_from(&mut buffer).await?;
+            if Some(from) != known {
+                return anyhow::Ok(from);
+            }
+        }
+    })
+    .await??;
+    Ok((plane, warm, outer))
+}
+
+/// Whether the tunnel that owned the outer UDP port `outer` has ended and released its socket.
+fn tunnel_socket_released(outer: SocketAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], outer.port()))).is_ok()
+}
+
+/// WireGuard tunnels own marked UDP sockets; the terminal teardown must close and join its plane's
+/// tunnels, not leave them to idle out.
+#[tokio::test]
+async fn shutdown_closes_and_joins_the_planes_wireguard_tunnels() -> anyhow::Result<()> {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let node = wireguard_node(peer.local_addr()?)?;
+    let (mut plane, warm, outer) = plane_warming_a_tunnel(&node, &peer, None).await?;
+    assert!(!tunnel_socket_released(outer), "the tunnel is running");
+    plane.shutdown_runtime(None, None).await?;
+    assert!(
+        tunnel_socket_released(outer),
+        "teardown left a live tunnel behind"
+    );
+    let _ = tokio::time::timeout(WAIT, warm).await??;
+    Ok(())
+}
+
+/// Two planes (one embedder, or tests in one process) with the same WireGuard node each have their
+/// own tunnel; one plane's teardown neither ends nor waits for the other's.
+#[tokio::test]
+async fn shutdown_leaves_another_planes_wireguard_tunnels_alone() -> anyhow::Result<()> {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let node = wireguard_node(peer.local_addr()?)?;
+    let (mut first, first_warm, first_outer) = plane_warming_a_tunnel(&node, &peer, None).await?;
+    let (mut second, second_warm, second_outer) =
+        plane_warming_a_tunnel(&node, &peer, Some(first_outer)).await?;
+    assert_ne!(first_outer, second_outer, "one tunnel per plane");
+
+    first.shutdown_runtime(None, None).await?;
+    assert!(tunnel_socket_released(first_outer));
+    assert!(
+        !tunnel_socket_released(second_outer) && !second_warm.is_finished(),
+        "the other plane's tunnel is still running"
+    );
+
+    second.shutdown_runtime(None, None).await?;
+    assert!(tunnel_socket_released(second_outer));
+    let _ = tokio::time::timeout(WAIT, async { tokio::join!(first_warm, second_warm) }).await?;
+    Ok(())
+}
+
 #[cfg(feature = "clash-api")]
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_a_slow_ui_download_past_the_stage_deadline() -> anyhow::Result<()> {

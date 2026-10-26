@@ -139,12 +139,12 @@ impl<S> Filter<S> for ClashLogFilter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _cx: &Context<'_, S>) -> bool {
         // Same suppression as the default console filter: endpoint-driver
         // death is lifecycle noise, not an operator event.
-        metadata.target() != crate::logging::QUIET_TARGET
+        !crate::logging::is_quiet_target(metadata.target())
             && self.interest.includes(*metadata.level())
     }
 
     fn callsite_enabled(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
-        if metadata.target() == crate::logging::QUIET_TARGET {
+        if crate::logging::is_quiet_target(metadata.target()) {
             Interest::never()
         } else if self.interest.includes(*metadata.level()) {
             Interest::always()

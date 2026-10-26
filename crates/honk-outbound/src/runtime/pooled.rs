@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use super::{AnyTlsRuntime, CapturedDialAdmission, NodeRuntime, ProtocolRuntime, WarmRetention};
+use super::{
+    AnyTlsRuntime, CapturedDialAdmission, NodeRuntime, ProtocolRuntime, WarmRetention,
+    WireGuardRuntime,
+};
 use crate::proxy::transport::xhttp::XhttpRuntime;
 
 trait PooledLifecycle {
@@ -37,6 +40,30 @@ impl PooledLifecycle for AnyTlsRuntime {
     }
     fn is_warm_or_stateless_for(&self, _: crate::proxy::WarmRequirement) -> bool {
         self.pool.has_usable_session()
+    }
+}
+
+/// The tunnel is process-shared, so nothing here is pooled: lifecycle only maps warm retention to
+/// a hold on the tunnel and terminal shutdown to failing this runtime's own flows.
+impl PooledLifecycle for WireGuardRuntime {
+    fn sync_warm_retention(&self, retention: u8, _was_unretained: bool) {
+        self.set_retained(retention != 0);
+    }
+    fn retire(&self) {
+        self.set_retained(false);
+    }
+    fn shutdown(&self) {
+        WireGuardRuntime::shutdown(self);
+    }
+    fn bind_dial_admission(&self, _: &CapturedDialAdmission) {}
+    fn reap_unretained_idle(&self) -> usize {
+        0
+    }
+    fn live_session_count(&self) -> usize {
+        0
+    }
+    fn is_warm_or_stateless_for(&self, _: crate::proxy::WarmRequirement) -> bool {
+        self.is_warm()
     }
 }
 
@@ -93,6 +120,7 @@ impl NodeRuntime {
             ProtocolRuntime::AnyTls(runtime) => Some(runtime),
             #[cfg(any(feature = "rprx", test))]
             ProtocolRuntime::Vless(runtime) => Some(runtime),
+            ProtocolRuntime::WireGuard(runtime) => Some(runtime),
             ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
         }
     }

@@ -1006,6 +1006,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+    honk_outbound::proxy::wireguard::init_memory_share(resource_budget.wireguard_memory)?;
 
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular
