@@ -1084,11 +1084,10 @@ fn transparent_udp_and_fragments_reach_the_driver_with_both_addresses() {
     exclude.insert(client.ip(), 32);
     cfg.mode = Mode::Transparent { exclude };
     let mut filtered = Stack::new(cfg, t0);
-    let mut last = Rx::Consumed;
     for p in &packets {
-        last = filtered.receive(t0, p);
+        assert_eq!(filtered.receive(t0, p), Rx::Dropped(DropReason::NotForUs));
     }
-    assert_eq!(last, Rx::Dropped(DropReason::NotForUs));
+    assert!(filtered.poll_timeout().is_none());
     // Endpoint mode still drops fragments.
     let mut cfg = Config::new([1; 32]);
     cfg.local_v4 = Some(client.ip().to_string().parse().unwrap());

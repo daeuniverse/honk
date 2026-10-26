@@ -366,7 +366,14 @@ impl Stack {
                 if meta.gso.is_some() {
                     return self.drop_packet(DropReason::Malformed);
                 }
-                return match self.reasm.push(now, packet) {
+                let fragment = match wire::frag::parse(packet) {
+                    Ok(fragment) => fragment,
+                    Err(e) => return self.drop_packet(e.into()),
+                };
+                if let Some(reason) = self.refuses(fragment.dst) {
+                    return self.drop_packet(reason);
+                }
+                return match self.reasm.push(now, fragment) {
                     Push::Pending => Rx::Consumed,
                     Push::Dropped(reason) => self.drop_packet(reason),
                     // The whole datagram goes through the normal checks, destination included,

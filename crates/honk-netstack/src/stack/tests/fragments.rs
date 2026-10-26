@@ -1,5 +1,6 @@
 use super::*;
 use crate::wire::{ipv6, udp};
+use std::time::Duration;
 
 fn terminator(now: Instant) -> Stack {
     let mut cfg = Config::new([7; 32]);
@@ -63,5 +64,34 @@ fn nested_ipv6_fragment_headers_are_dropped_even_behind_extensions() {
             assert_eq!(stack.reasm.bytes(), 0);
             assert!(stack.poll_timeout().is_none());
         }
+    }
+}
+
+#[test]
+fn excluded_fragments_never_acquire_reassembly_state_or_emit_time_exceeded() {
+    for (src, dst) in [
+        ("10.0.0.2:5000", "203.0.113.7:53"),
+        ("[fd00::2]:5000", "[fd00::7]:53"),
+    ] {
+        let now = Instant::now();
+        let (src, dst): (SocketAddr, SocketAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+        let budget = crate::MemoryBudget::new(20 * 1024);
+        let mut exclude = crate::ExcludeSet::default();
+        exclude.insert(dst.ip(), if dst.is_ipv6() { 128 } else { 32 });
+        let mut cfg = Config::new([7; 32]);
+        cfg.mode = Mode::Transparent { exclude };
+        cfg.shared_budget = Some(budget.clone());
+        let mut rx = Stack::new(cfg, now);
+        let mut tx = terminator(now);
+        let mut out = [0; 1500];
+        let n = tx.udp_send_from(src, dst, &[7; 4000], &mut out).unwrap();
+        assert_eq!(rx.receive(now, &out[..n]), Rx::Dropped(DropReason::NotForUs));
+        assert_eq!(rx.reasm.len(), 0);
+        assert_eq!(budget.used(), 0);
+        assert!(rx.poll_timeout().is_none());
+        let late = now + Duration::from_secs(31);
+        rx.handle_timeout(late);
+        assert!(rx.poll_transmit(late, &mut out).is_none());
+        assert_eq!(budget.used(), 0);
     }
 }

@@ -23,7 +23,7 @@ fn large_expiry_quotes_are_truncated_and_stay_within_the_shared_budget() {
     let frag = 40 + 8 * 2048;
     for id in 0..20 {
         ipv6::emit_fragment_header(&mut packet[frag..], wire::PROTO_UDP, 0, true, id).unwrap();
-        assert!(matches!(r.push(now, &packet), Push::Pending | Push::Dropped(_)));
+        assert!(matches!(push(&mut r, now, &packet), Push::Pending | Push::Dropped(_)));
         now += Duration::from_secs(30);
         r.expire(now);
         assert!(!r.expired.is_empty());
@@ -54,7 +54,7 @@ fn expiry_quotes_remain_funded_through_blocked_sent_and_rate_limited_output() {
             let late = now + Duration::from_secs(30);
             for id in 0..17 {
                 let packets = split(&datagram(src, dst, 1000, 1), id, 400);
-                pending(r.push(now, &packets[0]));
+                pending(push(&mut r, now, &packets[0]));
                 r.expire(late);
             }
             assert_eq!(r.expired.len(), MAX_PENDING_ICMP);
@@ -79,7 +79,7 @@ fn expiry_quotes_remain_funded_through_blocked_sent_and_rate_limited_output() {
             r.assert_idle();
             assert_eq!(budget.used(), 0);
             let packets = split(&datagram(src, dst, 1000, 1), 99, 400);
-            pending(r.push(now, &packets[0]));
+            pending(push(&mut r, now, &packets[0]));
             r.expire(late);
             assert!(budget.used() > 0);
             drop(r);

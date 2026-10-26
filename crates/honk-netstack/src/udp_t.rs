@@ -445,7 +445,7 @@ mod tests {
         let now = Instant::now();
         let mut done = None;
         for p in packets {
-            match r.push(now, p) {
+            match r.push(now, wire::frag::parse(p).unwrap()) {
                 Push::Pending => {}
                 Push::Complete(c) => done = Some(c.packet),
                 Push::Dropped(d) => panic!("dropped {d:?}"),

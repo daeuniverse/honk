@@ -201,12 +201,8 @@ impl Reassembler {
         }
     }
 
-    /// Feeds one received IP packet that `wire::parse_ip` rejected as `Fragment`.
-    pub(crate) fn push(&mut self, now: Instant, packet: &[u8]) -> Push {
-        let f = match frag::parse(packet) {
-            Ok(f) => f,
-            Err(e) => return Push::Dropped(e.into()),
-        };
+    /// Feeds one decoded fragment after the stack applies its destination filter.
+    pub(crate) fn push(&mut self, now: Instant, f: Fragment<'_>) -> Push {
         let end = f.offset + f.data.len();
         if f.data.is_empty() || (f.more && f.data.len() % 8 != 0) || end > f.max_total() {
             self.stats.invalid += 1;
@@ -568,6 +564,13 @@ mod tests {
         assert!(matches!(r, Push::Pending), "{r:?}");
     }
 
+    fn push(r: &mut Reassembler, now: Instant, packet: &[u8]) -> Push {
+        match frag::parse(packet) {
+            Ok(fragment) => r.push(now, fragment),
+            Err(e) => Push::Dropped(e.into()),
+        }
+    }
+
     #[test]
     fn roundtrip_any_order_both_families() {
         let t = Instant::now();
@@ -596,7 +599,7 @@ mod tests {
                     });
                     let mut done = None;
                     for (n, &i) in order.iter().enumerate() {
-                        let res = r.push(t, &frags[i]);
+                        let res = push(&mut r, t, &frags[i]);
                         r.check();
                         if n + 1 == order.len() {
                             done = Some(complete(res));
@@ -625,11 +628,11 @@ mod tests {
             // Partial overlap: re-cut with a different size so a fragment straddles old ranges.
             let g = split(&whole, 5, 408);
             let mut r = Reassembler::default();
-            pending(r.push(t, &f[0]));
-            pending(r.push(t, &f[1]));
+            pending(push(&mut r, t, &f[0]));
+            pending(push(&mut r, t, &f[1]));
             assert!(r.bytes() > 0);
             assert!(matches!(
-                r.push(t, &g[1]),
+                push(&mut r, t, &g[1]),
                 Push::Dropped(DropReason::Fragment)
             ));
             assert_eq!(r.stats.overlaps, 1);
@@ -638,7 +641,7 @@ mod tests {
             assert_eq!(r.bytes(), ENTRY_OVERHEAD);
             // Later fragments, even valid ones, never complete it.
             for p in &f[2..] {
-                assert!(matches!(r.push(t, p), Push::Dropped(DropReason::Fragment)));
+                assert!(matches!(push(&mut r, t, p), Push::Dropped(DropReason::Fragment)));
             }
             r.check();
             // The tombstone expires with no ICMP.
@@ -654,9 +657,9 @@ mod tests {
         let (src, dst) = families()[0];
         let f = split(&datagram(src, dst, 1000, 1), 5, 400);
         let mut r = Reassembler::default();
-        pending(r.push(t, &f[0]));
+        pending(push(&mut r, t, &f[0]));
         assert!(matches!(
-            r.push(t, &f[0]),
+            push(&mut r, t, &f[0]),
             Push::Dropped(DropReason::Fragment)
         ));
         assert_eq!(r.stats.overlaps, 1);
@@ -673,8 +676,8 @@ mod tests {
 
             // Without fragment 0: silent.
             let mut r = Reassembler::default();
-            pending(r.push(t, &f[1]));
-            pending(r.push(t, &f[2]));
+            pending(push(&mut r, t, &f[1]));
+            pending(push(&mut r, t, &f[2]));
             assert_eq!(r.poll_timeout(), Some(late));
             r.expire(late - Duration::from_millis(1));
             assert_eq!(r.len(), 1, "not yet");
@@ -688,8 +691,8 @@ mod tests {
 
             // With fragment 0: Time Exceeded code 1 to the sender, quoting the first fragment.
             let mut r = Reassembler::default();
-            pending(r.push(t, &f[0]));
-            pending(r.push(t, &f[2]));
+            pending(push(&mut r, t, &f[0]));
+            pending(push(&mut r, t, &f[2]));
             r.expire(late);
             let Output::Sent(n) = r.poll_icmp(late, &mut icmp, &mut out) else {
                 panic!("no Time Exceeded")
@@ -719,17 +722,17 @@ mod tests {
             ..FragmentLimits::default()
         });
         let victim = split(&datagram(src, dst, 2000, 1), 100, 800);
-        pending(r.push(t, &victim[0]));
+        pending(push(&mut r, t, &victim[0]));
         for id in 0..8u32 {
             let f = split(&datagram(src, dst, 2000, 2), id, 800);
-            pending(r.push(t, &f[0]));
+            pending(push(&mut r, t, &f[0]));
             assert!(r.len() <= 4);
             r.check();
         }
         assert_eq!(r.stats.evicted, 5);
         // The victim was evicted: its remaining fragments restart a datagram and cannot finish it.
-        pending(r.push(t, &victim[2]));
-        pending(r.push(t, &victim[1]));
+        pending(push(&mut r, t, &victim[2]));
+        pending(push(&mut r, t, &victim[1]));
     }
 
     #[test]
@@ -744,7 +747,7 @@ mod tests {
         for id in 0..6u32 {
             // A last fragment at the far end forces the whole 64 KiB buffer.
             let f = split(&datagram(src, dst, 64_000, 4), id, 1400);
-            pending(r.push(t, f.last().unwrap()));
+            pending(push(&mut r, t, f.last().unwrap()));
             assert!(r.bytes() <= 140_000, "{}", r.bytes());
             r.check();
         }
@@ -755,7 +758,7 @@ mod tests {
             ..FragmentLimits::default()
         });
         let f = split(&datagram(src, dst, 64_000, 4), 1, 1400);
-        assert!(matches!(tiny.push(t, f.last().unwrap()), Push::Dropped(_)));
+        assert!(matches!(push(&mut tiny, t, f.last().unwrap()), Push::Dropped(_)));
         tiny.check();
     }
 
@@ -771,10 +774,10 @@ mod tests {
         };
         let f = split(&datagram(src, dst, 3000, 1), 1, 1000);
         // Completion refunds everything.
-        pending(r.push(t, &f[1]));
+        pending(push(&mut r, t, &f[1]));
         assert!(held(&r, 0) > 3000 - 1000);
-        pending(r.push(t, &f[0]));
-        pending(r.push(t, &f[2]));
+        pending(push(&mut r, t, &f[0]));
+        pending(push(&mut r, t, &f[2]));
         let live = r.entries[0].live.as_ref().unwrap();
         assert_eq!(
             live.data.capacity(),
@@ -786,11 +789,11 @@ mod tests {
             ENTRY_OVERHEAD + 3000 + 20 + std::mem::size_of::<(usize, usize)>(),
             "the coalesced range also holds memory"
         );
-        complete(r.push(t, &f[3]));
+        complete(push(&mut r, t, &f[3]));
         assert_eq!(held(&r, 0), 0);
         // A killed datagram keeps only its tombstone, which expiry then refunds.
-        pending(r.push(t, &f[0]));
-        assert!(matches!(r.push(t, &f[0]), Push::Dropped(_)));
+        pending(push(&mut r, t, &f[0]));
+        assert!(matches!(push(&mut r, t, &f[0]), Push::Dropped(_)));
         assert_eq!(held(&r, 0), ENTRY_OVERHEAD);
         r.expire(t + Duration::from_secs(30));
         assert_eq!(held(&r, 0), 0);
@@ -799,13 +802,13 @@ mod tests {
         assert!(hog);
         for id in 0..3u32 {
             let f = split(&datagram(src, dst, 20_000, 2), id, 1400);
-            pending(r.push(t, f.last().unwrap()));
+            pending(push(&mut r, t, f.last().unwrap()));
             assert!(budget.used() <= budget.limit());
             held(&r, 100_000);
         }
         assert_eq!((r.len(), r.stats.evicted), (2, 1));
         let f = split(&datagram(src, dst, 64_000, 3), 9, 1400);
-        assert!(matches!(r.push(t, f.last().unwrap()), Push::Dropped(_)));
+        assert!(matches!(push(&mut r, t, f.last().unwrap()), Push::Dropped(_)));
         assert!(budget.used() <= budget.limit());
         r.check();
         drop(r);
@@ -828,7 +831,7 @@ mod tests {
         ] {
             let mut r = Reassembler::new(limits).with_budget(Some(budget.clone()));
             assert!(matches!(
-                r.push(t, &f[0]),
+                push(&mut r, t, &f[0]),
                 Push::Dropped(DropReason::Capacity)
             ));
             r.assert_idle();
@@ -848,7 +851,7 @@ mod tests {
         // Every other fragment: each one opens another gap.
         let mut dropped = false;
         for p in f.iter().step_by(2) {
-            if matches!(r.push(t, p), Push::Dropped(DropReason::Fragment)) {
+            if matches!(push(&mut r, t, p), Push::Dropped(DropReason::Fragment)) {
                 dropped = true;
                 break;
             }
@@ -867,14 +870,14 @@ mod tests {
             let short = split(&datagram(src, dst, 3000, 7), 1, 1004);
             let mut r = Reassembler::default();
             assert!(matches!(
-                r.push(t, &short[0]),
+                push(&mut r, t, &short[0]),
                 Push::Dropped(DropReason::Malformed)
             ));
             // Fragment past the end of the datagram announced by the last fragment.
-            pending(r.push(t, f.last().unwrap()));
+            pending(push(&mut r, t, f.last().unwrap()));
             let longer = split(&datagram(src, dst, 5000, 7), 1, 1000);
             assert!(matches!(
-                r.push(t, &longer[4]),
+                push(&mut r, t, &longer[4]),
                 Push::Dropped(DropReason::Fragment)
             ));
             // Offset + length beyond 64 KiB.
@@ -888,19 +891,19 @@ mod tests {
                 huge[42..44].copy_from_slice(&0xFFF9u16.to_be_bytes());
             }
             assert!(matches!(
-                Reassembler::default().push(t, &huge),
+                push(&mut Reassembler::default(), t, &huge),
                 Push::Dropped(DropReason::Malformed)
             ));
             // Truncated and corrupt headers.
             assert!(matches!(
-                Reassembler::default().push(t, &f[0][..30]),
+                push(&mut Reassembler::default(), t, &f[0][..30]),
                 Push::Dropped(_)
             ));
             if src.is_ipv4() {
                 let mut bad = f[0].clone();
                 bad[11] ^= 1;
                 assert!(matches!(
-                    Reassembler::default().push(t, &bad),
+                    push(&mut Reassembler::default(), t, &bad),
                     Push::Dropped(DropReason::Checksum)
                 ));
             }
@@ -915,7 +918,7 @@ mod tests {
         let atomic = split(&whole, 9, 1000);
         assert_eq!(atomic.len(), 1);
         let mut r = Reassembler::default();
-        let got = complete(r.push(t, &atomic[0]));
+        let got = complete(push(&mut r, t, &atomic[0]));
         r.assert_idle();
         let ip = wire::parse_ip(&got).unwrap();
         let orig = wire::parse_ip(&whole).unwrap();
@@ -951,10 +954,10 @@ mod tests {
             frags.push(p);
         }
         let mut r = Reassembler::default();
-        pending(r.push(t, &frags[3]));
-        pending(r.push(t, &frags[2]));
-        pending(r.push(t, &frags[0]));
-        let got = complete(r.push(t, &frags[1]));
+        pending(push(&mut r, t, &frags[3]));
+        pending(push(&mut r, t, &frags[2]));
+        pending(push(&mut r, t, &frags[0]));
+        let got = complete(push(&mut r, t, &frags[1]));
         let ip = wire::parse_ip(&got).unwrap();
         assert_eq!(ip.proto, wire::PROTO_UDP);
         assert_eq!(&got[ip.payload], data);
@@ -975,7 +978,7 @@ mod tests {
                 let f = split(&datagram(src, dst, 3000, 1), id, 1000);
                 // Every byte but the head has arrived, the end included.
                 for p in f[1..].iter().rev() {
-                    pending(r.push(t, p));
+                    pending(push(&mut r, t, p));
                 }
             }
             assert_eq!(r.len(), 10);
