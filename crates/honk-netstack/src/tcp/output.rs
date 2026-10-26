@@ -272,7 +272,9 @@ impl Tcb {
                 self.syn_due = false;
                 self.syn_sent.get_or_insert(now);
                 self.snd_nxt = self.iss.wrapping_add(1);
-                self.rto_deadline = Some(now + self.rtt.rto());
+                if self.rto_deadline.is_none() {
+                    self.rto_deadline = Some(now + self.rtt.rto());
+                }
             }
             Kind::Ack => {}
             Kind::Probe => self.probe_due = false,

@@ -9,6 +9,9 @@ use honk_netstack::{
     Rx, Stack, StreamError, SynInfo, TcpState,
 };
 
+#[path = "transparent_tcp/admission.rs"]
+mod admission;
+
 const DST: &str = "203.0.113.9:443";
 const CLIENT: &str = "10.0.0.2:40000";
 
