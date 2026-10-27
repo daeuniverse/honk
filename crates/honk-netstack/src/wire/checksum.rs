@@ -1,9 +1,37 @@
 //! RFC 1071 Internet checksum with a 64-bit accumulator.
 //!
 //! 2^16 ≡ 1 (mod 0xFFFF), so summing big-endian 64-bit words with end-around carry and
-//! folding once at the end equals the 16-bit one's-complement sum.
+//! folding once at the end equals the 16-bit one's-complement sum. Whole 32-byte blocks are
+//! summed as native-endian words into four 128-bit lanes instead, with no byte swap or carry
+//! chain in the loop: a one's-complement sum commutes with byte swapping (RFC 1071 §2(B)), so
+//! the lanes are folded and swapped once.
 
 use std::net::IpAddr;
+
+const BLOCK: usize = 32;
+
+/// Folded one's-complement sum of `blocks` read as native-endian words. The four lanes are
+/// separate locals: an array or iterator here defeats the size-optimized shipping build.
+fn sum_blocks(blocks: &[[u8; BLOCK]]) -> u16 {
+    let (mut l0, mut l1, mut l2, mut l3) = (0u128, 0u128, 0u128, 0u128);
+    for block in blocks {
+        let (w, _) = block.as_chunks::<8>();
+        l0 += u128::from(u64::from_ne_bytes(w[0]));
+        l1 += u128::from(u64::from_ne_bytes(w[1]));
+        l2 += u128::from(u64::from_ne_bytes(w[2]));
+        l3 += u128::from(u64::from_ne_bytes(w[3]));
+    }
+    let sum = l0 + l1 + l2 + l3;
+    let (low, carry) = (sum as u64).overflowing_add((sum >> 64) as u64);
+    fold16(low + u64::from(carry))
+}
+
+fn fold16(mut a: u64) -> u16 {
+    while a >> 16 != 0 {
+        a = (a & 0xFFFF) + (a >> 16);
+    }
+    a as u16
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Checksum {
@@ -20,6 +48,20 @@ impl Checksum {
     fn accumulate(&mut self, v: u64) {
         let (s, carry) = self.acc.overflowing_add(v);
         self.acc = s + u64::from(carry);
+    }
+
+    /// Sums `data` starting at an even stream offset.
+    fn add_even(&mut self, data: &[u8]) {
+        let (blocks, rest) = data.as_chunks::<BLOCK>();
+        if !blocks.is_empty() {
+            let native = sum_blocks(blocks);
+            self.accumulate(u64::from(u16::from_be_bytes(native.to_ne_bytes())));
+        }
+        let (chunks, rem) = rest.as_chunks::<8>();
+        for &c in chunks {
+            self.accumulate(u64::from_be_bytes(c));
+        }
+        self.tail(rem);
     }
 
     fn tail(&mut self, rem: &[u8]) {
@@ -44,11 +86,7 @@ impl Checksum {
             self.complete_odd(lo);
             data = rest;
         }
-        let (chunks, rem) = data.as_chunks::<8>();
-        for &c in chunks {
-            self.accumulate(u64::from_be_bytes(c));
-        }
-        self.tail(rem);
+        self.add_even(data);
     }
 
     /// Must only be called at an even stream offset (no pending odd byte); for pseudo headers.
@@ -63,26 +101,11 @@ impl Checksum {
         self.accumulate(u64::from(v));
     }
 
-    /// Copies `src` into `dst` while summing it, with the same odd-byte carry as [`add`](Self::add).
+    /// Copies `src` into `dst` and sums it while it is still in cache, with the same odd-byte
+    /// carry as [`add`](Self::add).
     pub fn copy_add(&mut self, dst: &mut [u8], src: &[u8]) {
-        assert_eq!(dst.len(), src.len());
-        let mut off = 0;
-        if self.odd.is_some() {
-            let Some(&lo) = src.first() else {
-                return;
-            };
-            dst[0] = lo;
-            self.complete_odd(lo);
-            off = 1;
-        }
-        let (d, dst_rem) = dst[off..].as_chunks_mut::<8>();
-        let (s, rem) = src[off..].as_chunks::<8>();
-        for (dc, &sc) in d.iter_mut().zip(s) {
-            *dc = sc;
-            self.accumulate(u64::from_be_bytes(sc));
-        }
-        dst_rem.copy_from_slice(rem);
-        self.tail(rem);
+        dst.copy_from_slice(src);
+        self.add(src);
     }
 
     /// Folded and complemented; a packet that carries its own checksum finishes as 0.
@@ -97,11 +120,7 @@ impl Checksum {
         if let Some(hi) = c.odd.take() {
             c.accumulate(u64::from(hi) << 8);
         }
-        let mut a = c.acc;
-        while a >> 16 != 0 {
-            a = (a & 0xFFFF) + (a >> 16);
-        }
-        a as u16
+        fold16(c.acc)
     }
 
     /// Callers must pass addresses of one family; a mismatch is a bug, not input.
@@ -241,6 +260,29 @@ mod tests {
         c.copy_add(&mut out, &data[21..]);
         assert_eq!(&out[..], &data[21..]);
         assert_eq!(c.finish(), want);
+    }
+
+    #[test]
+    fn large_buffers_at_every_offset_match_naive() {
+        let len = 65_535 + 8;
+        let random = Rng::new(0x5EED).bytes(len);
+        for pattern in [vec![0u8; len], vec![0xFF; len], random] {
+            for start in 0..8 {
+                for len in [31usize, 32, 33, 63, 64, 65, 1380, 1381, 8948, 65_535] {
+                    let data = &pattern[start..start + len];
+                    let want = naive_checksum(data);
+                    assert_eq!(checksum(data), want, "len {len} at {start}");
+                    // An odd prefix leaves `copy_add` to start its blocks after the carried byte.
+                    let cut = (len / 3) | 1;
+                    let mut out = vec![0u8; len - cut];
+                    let mut c = Checksum::new();
+                    c.add(&data[..cut]);
+                    c.copy_add(&mut out, &data[cut..]);
+                    assert_eq!(out, &data[cut..]);
+                    assert_eq!(c.finish(), want, "copy len {len} at {start}");
+                }
+            }
+        }
     }
 
     #[test]
