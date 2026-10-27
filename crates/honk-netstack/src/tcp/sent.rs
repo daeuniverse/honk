@@ -453,6 +453,10 @@ impl Sent {
     }
 
     pub fn next_retransmit(&mut self) -> Option<(usize, u32, u32, bool)> {
+        // Every candidate is counted in `lost`; a flow without loss skips the scan.
+        if self.lost == 0 {
+            return None;
+        }
         let mut i = self
             .queue
             .partition_point(|d| seq::le(d.end_seq, self.retrans_cursor));
@@ -899,7 +903,20 @@ mod tests {
                 }
                 4 if !s.queue.is_empty() => s.mark_lost_index(next(s.queue.len() as u32) as usize),
                 5 => {
-                    if let Some((i, start, len, _)) = s.next_retransmit() {
+                    // The first descriptor that is lost and neither SACKed nor in flight again.
+                    let mut left = s.start;
+                    let want = s.queue.iter().enumerate().find_map(|(i, d)| {
+                        let start = std::mem::replace(&mut left, d.end_seq);
+                        (d.flags & (SACKED | LOST | RETRANS) == LOST)
+                            .then(|| (i, start, d.end_seq.wrapping_sub(start)))
+                    });
+                    let got = s.next_retransmit();
+                    assert_eq!(
+                        got.map(|(i, start, len, _)| (i, start, len)),
+                        want,
+                        "step {step}"
+                    );
+                    if let Some((i, start, len, _)) = got {
                         s.split(i, start + len.min(1 + next(len)));
                         s.retransmitted(i, now, &stamp(now));
                     }
