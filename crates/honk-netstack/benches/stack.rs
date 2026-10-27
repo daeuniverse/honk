@@ -388,8 +388,8 @@ fn passive_open(c: &mut Criterion) {
 
 const MANY_FLOWS: usize = 10_000;
 
-/// Accepted transparent flows from distinct clients, driven the way a device driver would: the
-/// clock advances one microsecond per packet and `handle_timeout` runs every 64 packets.
+/// Accepted transparent flows from distinct clients. Each 64-packet driver batch shares one
+/// timestamp, advances virtual time by 64 microseconds and services protocol deadlines.
 struct Fleet {
     stack: Stack,
     flows: Vec<Member>,
@@ -471,9 +471,9 @@ impl Fleet {
         }
     }
 
-    /// One full segment per flow in flow order. With `holes`, every hundredth segment of a flow
-    /// arrives after its successor: a loss repaired by retransmission, seen from the receiver.
-    fn round(&mut self, holes: bool, payload: &[u8]) -> Vec<(usize, Vec<u8>)> {
+    /// One full segment per flow. `holes` swaps each hundredth segment with its successor;
+    /// this measures receiver OOO/SACK/gap-fill cost, not sender loss detection or retransmission.
+    fn round(&mut self, holes: bool, payload: &[u8]) -> Vec<(usize, Vec<u8>, usize)> {
         let mut packets = Vec::with_capacity(self.flows.len() * 102 / 100);
         for (i, f) in self.flows.iter_mut().enumerate() {
             let hole = holes && f.segments % 100 == 99;
@@ -485,28 +485,31 @@ impl Fleet {
             };
             if hole {
                 let late = next();
-                packets.push((i, next()));
-                packets.push((i, late));
+                packets.push((i, next(), 0));
+                packets.push((i, late, 2 * payload.len()));
             } else {
-                packets.push((i, next()));
+                packets.push((i, next(), payload.len()));
             }
         }
         packets
     }
 
-    fn deliver(&mut self, flow: usize, packet: &[u8]) {
-        self.now += Duration::from_micros(1);
+    fn deliver(&mut self, flow: usize, packet: &[u8], expected_read: usize) {
+        if self.delivered.is_multiple_of(64) {
+            self.now += Duration::from_micros(64);
+            self.stack.handle_timeout(self.now);
+        }
         assert_eq!(self.stack.receive(self.now, packet), Rx::Consumed);
-        // An out-of-order segment leaves nothing to read until its hole is filled.
         match self.stack.tcp_read(self.flows[flow].id, &mut self.read) {
-            Ok(n) => _ = black_box(n),
-            Err(e) => assert_eq!(e, StreamError::WouldBlock),
+            Ok(n) => assert_eq!(black_box(n), expected_read),
+            Err(e) => {
+                assert_eq!(e, StreamError::WouldBlock);
+                assert_eq!(expected_read, 0);
+            }
         }
         while self.stack.poll_transmit(self.now, &mut self.out).is_some() {}
         self.delivered += 1;
         if self.delivered.is_multiple_of(64) {
-            self.stack.handle_timeout(self.now);
-            while self.stack.poll_transmit(self.now, &mut self.out).is_some() {}
             black_box(self.stack.poll_timeout());
         }
     }
@@ -537,8 +540,8 @@ fn many_flows(c: &mut Criterion) {
                     }
                     let n = left.min(packets.len() - cursor);
                     let t = Instant::now();
-                    for (flow, p) in &packets[cursor..cursor + n] {
-                        fleet.deliver(*flow, p);
+                    for (flow, p, expected_read) in &packets[cursor..cursor + n] {
+                        fleet.deliver(*flow, p, *expected_read);
                     }
                     elapsed += t.elapsed();
                     cursor += n;

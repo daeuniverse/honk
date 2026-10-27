@@ -266,18 +266,19 @@ mod tests {
     fn large_buffers_at_every_offset_match_naive() {
         let len = 65_535 + 8;
         let random = Rng::new(0x5EED).bytes(len);
+        let mut copied = vec![0u8; len];
         for pattern in [vec![0u8; len], vec![0xFF; len], random] {
             for start in 0..8 {
-                for len in [31usize, 32, 33, 63, 64, 65, 1380, 1381, 8948, 65_535] {
+                for len in (0..=9000).chain([65_535]) {
                     let data = &pattern[start..start + len];
                     let want = naive_checksum(data);
                     assert_eq!(checksum(data), want, "len {len} at {start}");
                     // An odd prefix leaves `copy_add` to start its blocks after the carried byte.
-                    let cut = (len / 3) | 1;
-                    let mut out = vec![0u8; len - cut];
+                    let cut = ((len / 3) | 1).min(len);
+                    let out = &mut copied[..len - cut];
                     let mut c = Checksum::new();
                     c.add(&data[..cut]);
-                    c.copy_add(&mut out, &data[cut..]);
+                    c.copy_add(out, &data[cut..]);
                     assert_eq!(out, &data[cut..]);
                     assert_eq!(c.finish(), want, "copy len {len} at {start}");
                 }

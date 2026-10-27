@@ -48,7 +48,7 @@ flowchart LR
 
 ### 定时器
 
-每个流给出 RTO/persist、延迟 ACK、tail loss probe、RACK reorder、pacing 和关闭 deadline 的最小值。全局最小堆中每个流最多一个有效条目：只有 deadline 提前时才 push；推迟则沿用旧条目，弹出时重新检查。改变流状态的调用只标记该流；被标记的流（至多 64 个，各一次）在 `handle_timeout` 运行或列表装满时才重算并入堆，因此一个包在同一流上引起的多次调用只重算一次，`poll_timeout` 直接读取被标记的流。堆超过流 slab 大小的两倍（至少 32 项）时整体重建；上限跟随 slab，因为重建要遍历每个槽位。TIME_WAIT 过期使用同一个堆。
+每个流给出 RTO/persist、延迟 ACK、tail loss probe、RACK reorder、pacing 和关闭 deadline 的最小值。全局最小堆中每个流最多一个有效条目：只有 deadline 提前时才 push；推迟则沿用旧条目，弹出时重新检查。改变流状态的调用把堆刷新请求合并到标记列表（至多 64 个不同槽位），在处理定时器前或向已满列表加入另一槽位前刷新。`poll_timeout` 同时直接计算被标记流的 deadline，因此延后刷新不会导致晚醒。堆超过流 slab 大小的两倍（至少 32 项）时整体重建；上限跟随 slab，因为重建要遍历每个槽位。TIME_WAIT 过期使用同一个堆。
 
 ## 报文处理
 
@@ -56,7 +56,7 @@ flowchart LR
 - 普通出站 IPv4 包设置 DF、TTL/hop limit 为 64，不带选项；透明模式的 `udp_send_from`/`udp_send_gso_from` 不设置 DF，IPv6 UDP 分片会添加 Fragment 头。
 - Endpoint 模式下，目的地址不是本族已配置本地地址的包为 `NotForUs`。没有本地地址的地址族完全不可用（`NoLocalAddress`）。透明模式改为接受任意单播目的地址（见[范围与寻址](#范围与寻址)）。
 - `StackStats` 按原因计数丢包：`Malformed`、`Checksum`、`Fragment`、`NotForUs`、`NoFlow`、`Unsupported`，透明模式下还有 `HalfOpen` 和 `Capacity`。（`Stale` 已定义但从未产生。）
-- **普通接收在两种模式下都验证校验和**（IPv4 头、TCP、UDP、ICMP），且发生在流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 在验证路径上无效。只有透明模式的 `receive_with` 才能信任 driver 的 TCP/UDP `Csum::Valid`/`Partial`；IPv4 头、ICMP 和重组后的数据报仍然验证。Endpoint 模式拒绝此类元数据，所以 WireGuard 总会验证内层包：它认证的是隧道对端，而不是发送方的 inner 校验和。完整的发送校验和在复制载荷的同一遍中计算；卸载输出改为携带部分校验和（见[校验和信任](#校验和信任)）。
+- **普通接收在两种模式下都验证校验和**（IPv4 头、TCP、UDP、ICMP），且发生在流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 在验证路径上无效。只有透明模式的 `receive_with` 才能信任 driver 的 TCP/UDP `Csum::Valid`/`Partial`；IPv4 头、ICMP 和重组后的数据报仍然验证。Endpoint 模式拒绝此类元数据，所以 WireGuard 总会验证内层包：它认证的是隧道对端，而不是发送方的 inner 校验和。完整发送输出先复制载荷，再使用本机字节序的并行累加道计算校验和；卸载输出改为携带部分校验和（见[校验和信任](#校验和信任)）。
 - **ICMP 在两种模式下都会被消费，只有透明模式才发送。** packet-too-big（RFC 1191/8201）或 destination-unreachable 仅在报文地址族与流一致、且被引用的 TCP 序号落在未确认窗口内时才生效：PTB 降低该流的路径 MTU（只减不增），并让所有变得过大的段重新可发，包括已按旧尺寸重传过的段；`SYN_SENT` 流收到 unreachable 时 connect 以 `Unreachable` 失败。不带 MTU 的旧式 PTB 使用 RFC 1191 plateau 表。ICMP echo 和其他 ICMP 一律忽略。Endpoint 模式下栈从不生成 ICMP；生成见 [ICMP 生成](#icmp-生成)。
 - **Endpoint 模式的 UDP** 没有接收队列，也没有发送队列。发往未绑定端口的数据报为 `NoFlow`（不发 ICMP 错误）。`udp_send` 直接把一个 IP 包序列化进调用方的 buffer；超过 MTU 的数据报返回 `TooLarge`。透明 UDP 是无状态的，见[透明 UDP](#透明-udp)。
 

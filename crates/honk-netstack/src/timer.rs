@@ -1,6 +1,6 @@
-//! One live timer per flow; later deadlines reuse the old entry until it is popped. A flow that
-//! changed is only marked; its deadline is computed once per driver batch, when `flush` runs
-//! before timers fire or the batch list fills, so several calls on one flow cost one recompute.
+//! One live timer per flow; later deadlines reuse the old entry until it is popped. State
+//! changes coalesce in a bounded dirty list before heap refresh. Deadline queries include that
+//! list, so deferring the refresh cannot make the owner sleep past a live deadline.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
