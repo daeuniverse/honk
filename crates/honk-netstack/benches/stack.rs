@@ -7,14 +7,14 @@
 //! wire segments, not super-packets. Endpoint/WireGuard and IP-fragmented UDP stay plain.
 
 use std::hint::black_box;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use honk_netstack::wire::{self, tcp};
 use honk_netstack::{
     AcceptOpts, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Mode, Rx, RxMeta, Stack,
-    TcpState, TxCaps,
+    StreamError, TcpState, TxCaps,
 };
 
 /// Config MTU 1420 minus IPv4 and TCP headers; no timestamps are negotiated.
@@ -386,6 +386,171 @@ fn passive_open(c: &mut Criterion) {
     g.finish();
 }
 
+const MANY_FLOWS: usize = 10_000;
+
+/// Accepted transparent flows from distinct clients, driven the way a device driver would: the
+/// clock advances one microsecond per packet and `handle_timeout` runs every 64 packets.
+struct Fleet {
+    stack: Stack,
+    flows: Vec<Member>,
+    now: Instant,
+    delivered: u64,
+    out: Vec<u8>,
+    read: Vec<u8>,
+}
+
+struct Member {
+    id: FlowId,
+    client: SocketAddr,
+    /// The stack's next sequence number, which every client segment acknowledges.
+    ack: u32,
+    /// The client's next sequence number.
+    next: u32,
+    segments: u32,
+}
+
+fn client_header(client: SocketAddr, seq: u32, ack: u32, flags: u8) -> tcp::Header {
+    tcp::Header {
+        src_port: client.port(),
+        dst_port: original_dst().port(),
+        seq,
+        ack,
+        flags,
+        window: u16::MAX,
+        urgent: 0,
+        options: tcp::Options::default(),
+    }
+}
+
+impl Fleet {
+    fn new() -> Fleet {
+        let mut cfg = transparent();
+        cfg.max_flows = MANY_FLOWS as u32;
+        // Accepted flows commit their initial window beyond the floor; keep admission out of it.
+        cfg.memory_limit = 1 << 30;
+        let now = Instant::now();
+        let mut stack = Stack::new(cfg, now);
+        let mut out = vec![0u8; 2048];
+        let flows = (0..MANY_FLOWS)
+            .map(|i| {
+                let ip = Ipv4Addr::new(10, 1, (i / 250) as u8, (i % 250 + 1) as u8);
+                let client = SocketAddr::new(ip.into(), 40_000);
+                let mut syn = client_header(client, 0x1000, 0, tcp::SYN);
+                syn.options.mss = Some(MSS as u16);
+                syn.options.wscale = Some(7);
+                syn.options.sack_permitted = true;
+                let packet = encode(client, original_dst(), &syn, &[]);
+                assert_eq!(stack.receive(now, &packet), Rx::Consumed);
+                let info = stack.poll_accept().expect("the SYN is reported");
+                stack.tcp_accept(info.id, AcceptOpts::default()).unwrap();
+                let n = stack.poll_transmit(now, &mut out).expect("SYN-ACK");
+                let ip = wire::parse_ip(&out[..n]).unwrap();
+                let (synack, _) = tcp::parse(&out[ip.payload.clone()]).unwrap();
+                let member = Member {
+                    id: info.id,
+                    client,
+                    ack: synack.seq.wrapping_add(1),
+                    next: syn.seq.wrapping_add(1),
+                    segments: 0,
+                };
+                let h = client_header(client, member.next, member.ack, tcp::ACK);
+                let packet = encode(client, original_dst(), &h, &[]);
+                assert_eq!(stack.receive(now, &packet), Rx::Consumed);
+                assert_eq!(stack.tcp_state(info.id), Some(TcpState::Established));
+                member
+            })
+            .collect();
+        while stack.poll_transmit(now, &mut out).is_some() {}
+        Fleet {
+            stack,
+            flows,
+            now,
+            delivered: 0,
+            out,
+            read: vec![0u8; 64 * 1024],
+        }
+    }
+
+    /// One full segment per flow in flow order. With `holes`, every hundredth segment of a flow
+    /// arrives after its successor: a loss repaired by retransmission, seen from the receiver.
+    fn round(&mut self, holes: bool, payload: &[u8]) -> Vec<(usize, Vec<u8>)> {
+        let mut packets = Vec::with_capacity(self.flows.len() * 102 / 100);
+        for (i, f) in self.flows.iter_mut().enumerate() {
+            let hole = holes && f.segments % 100 == 99;
+            let mut next = || {
+                let h = client_header(f.client, f.next, f.ack, tcp::ACK);
+                f.next = f.next.wrapping_add(payload.len() as u32);
+                f.segments += 1;
+                encode(f.client, original_dst(), &h, payload)
+            };
+            if hole {
+                let late = next();
+                packets.push((i, next()));
+                packets.push((i, late));
+            } else {
+                packets.push((i, next()));
+            }
+        }
+        packets
+    }
+
+    fn deliver(&mut self, flow: usize, packet: &[u8]) {
+        self.now += Duration::from_micros(1);
+        assert_eq!(self.stack.receive(self.now, packet), Rx::Consumed);
+        // An out-of-order segment leaves nothing to read until its hole is filled.
+        match self.stack.tcp_read(self.flows[flow].id, &mut self.read) {
+            Ok(n) => _ = black_box(n),
+            Err(e) => assert_eq!(e, StreamError::WouldBlock),
+        }
+        while self.stack.poll_transmit(self.now, &mut self.out).is_some() {}
+        self.delivered += 1;
+        if self.delivered.is_multiple_of(64) {
+            self.stack.handle_timeout(self.now);
+            while self.stack.poll_transmit(self.now, &mut self.out).is_some() {}
+            black_box(self.stack.poll_timeout());
+        }
+    }
+}
+
+/// Per-segment receive cost when the flow table, TCBs and timers no longer fit in cache.
+fn many_flows(c: &mut Criterion) {
+    let mut g = c.benchmark_group("transparent_tcp_many");
+    g.throughput(Throughput::Elements(1));
+    let payload = vec![0x5au8; MSS];
+    for (name, holes) in [
+        ("receive_10k_flows", false),
+        ("receive_10k_flows_1pct_holes", true),
+    ] {
+        // Built on first use: a filtered-out case must not pay for ten thousand handshakes.
+        let mut fleet = None;
+        let mut packets = Vec::new();
+        let mut cursor = 0;
+        g.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                let fleet = fleet.get_or_insert_with(Fleet::new);
+                let mut elapsed = Duration::ZERO;
+                let mut left = iters as usize;
+                while left > 0 {
+                    if cursor == packets.len() {
+                        packets = fleet.round(holes, &payload);
+                        cursor = 0;
+                    }
+                    let n = left.min(packets.len() - cursor);
+                    let t = Instant::now();
+                    for (flow, p) in &packets[cursor..cursor + n] {
+                        fleet.deliver(*flow, p);
+                    }
+                    elapsed += t.elapsed();
+                    cursor += n;
+                    left -= n;
+                }
+                elapsed
+            })
+        });
+    }
+    g.finish();
+}
+
 /// Every packet of a `len`-byte transparent datagram from `original_dst()` to `client()`.
 fn datagram_packets(len: usize) -> Vec<Vec<u8>> {
     let mut tx = Stack::new(transparent(), Instant::now());
@@ -520,6 +685,7 @@ criterion_group!(
     transmit_bulk,
     sack_processing,
     passive_open,
+    many_flows,
     transparent_udp
 );
 criterion_main!(benches);
