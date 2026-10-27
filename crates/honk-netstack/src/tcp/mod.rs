@@ -3,7 +3,7 @@
 pub(crate) mod cc;
 mod cubic;
 mod input;
-pub(crate) use input::valid_timewait_fin;
+pub(crate) use input::{valid_timewait_fin, valid_timewait_old_data};
 pub(crate) mod output;
 mod pacing;
 pub(crate) mod passive;

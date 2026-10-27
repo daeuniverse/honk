@@ -465,21 +465,28 @@ impl Stack {
             && let Some(&index) = self.table.timewait.get(&tuple)
         {
             let slot = &mut self.table.slots[index as usize];
-            if let Some(Flow::TimeWait(t)) = slot.flow.as_mut()
-                && crate::tcp::valid_timewait_fin(
-                    &h,
+            if let Some(Flow::TimeWait(t)) = slot.flow.as_mut() {
+                let args = (
                     seg.len() - off,
                     t.snd_nxt,
                     t.rcv_nxt,
                     t.max_snd_wnd,
                     t.ts_recent,
-                )
-            {
-                t.expiry = now + crate::tcp::TIME_WAIT;
-                if t.ts_recent.is_some() {
-                    t.ts_recent = h.options.timestamps.map(|v| v.0);
+                );
+                let fin =
+                    crate::tcp::valid_timewait_fin(&h, args.0, args.1, args.2, args.3, args.4);
+                if fin {
+                    t.expiry = now + crate::tcp::TIME_WAIT;
+                    if t.ts_recent.is_some() {
+                        t.ts_recent = h.options.timestamps.map(|v| v.0);
+                    }
                 }
-                if !t.ack_due {
+                if (fin
+                    || crate::tcp::valid_timewait_old_data(
+                        &h, args.0, args.1, args.2, args.3, args.4,
+                    ))
+                    && !t.ack_due
+                {
                     t.ack_due = true;
                     self.timewait_ready.push_back(FlowId {
                         idx: index,

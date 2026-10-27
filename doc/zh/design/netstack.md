@@ -39,7 +39,7 @@ flowchart LR
 `poll_transmit` 按五个类别轮转服务，并跨调用记住轮转位置，因此没有哪一类会饿死其他类：
 
 1. **控制回复**：对未知流的包回复 RST。队列容量 128，满了就丢弃并计数（`control_dropped`），语义上等同链路丢包。透明模式下，被拒绝 SYN 的 ICMP 错误也走这个队列。
-2. **TIME_WAIT 回复**（对重传 FIN 的 ACK），按位合并在条目上，不会丢失。
+2. **TIME_WAIT 回复**（对重传 FIN 或旧的重复数据的 ACK），按位合并在条目上，不会丢失。
 3. **就绪的 TCP 流**，按 deficit round robin 调度，quantum 为一个 MTU。同一个流内 ACK 和重传先于新数据。
 4. **排队的 UDP 分片**：`udp_send_from` 发送超长数据报时剩余的分片（透明模式），按 FIFO 输出。
 5. **ICMP Time Exceeded**：重组超时产生（透明模式）。
@@ -73,7 +73,7 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 ### 关闭与生命周期
 
 - `tcp_shutdown` 只关闭写半边。`tcp_close` 立即释放应用句柄，由协议继续完成（排队数据之后发 FIN）；**带未读数据关闭，或处于 `SYN_RECEIVED` 时关闭，会发 RST**，与 Linux 一致。处于 `FIN_WAIT_2` 的孤儿流有 60 秒超时。
-- TIME_WAIT 与应用句柄分离。流保留 slab 槽（环、就绪位），直到应用读完所有数据并关闭句柄、最后一个 ACK 已发出；之后才压缩为不占 chunk 的小表项 `{tuple, snd_nxt, rcv_nxt, ts_recent, expiry, ack_due}`，持续 60 秒。收到合法的重传 FIN 时回 ACK 并重启计时。到同一四元组的新连接只有在 RFC 6191 的时间戳与序号比较证明对端能区分两个化身时才可复用该表项，否则继续搜索端口（最多 32768 个候选，之后 `AddrInUse`）。哪一方保留 TIME_WAIT，以及透明模式的 SYN 如何重开四元组，见[关闭语义](#关闭语义)。
+- TIME_WAIT 与应用句柄分离。流保留 slab 槽（环、就绪位），直到应用读完所有数据并关闭句柄、最后一个 ACK 已发出；之后才压缩为不占 chunk 的小表项 `{tuple, snd_nxt, rcv_nxt, ts_recent, expiry, ack_due}`，持续 60 秒。收到合法的重传 FIN 时回 ACK 并重启计时；旧的重复数据段只回 ACK（[关闭语义](#关闭语义)）。到同一四元组的新连接只有在 RFC 6191 的时间戳与序号比较证明对端能区分两个化身时才可复用该表项，否则继续搜索端口（最多 32768 个候选，之后 `AddrInUse`）。哪一方保留 TIME_WAIT，以及透明模式的 SYN 如何重开四元组，见[关闭语义](#关闭语义)。
 - 终止错误：`Reset`、`TimedOut`（6 次 SYN 重传、15 次连续 RTO 退避、连续 15 次无 ACK 应答的零窗口探测、孤儿超时，或对启用了 keepalive 的透明模式已接受流，keepalive 探测无应答）和 `Unreachable`。TCP keepalive 默认关闭，只有 `AcceptOpts::keepalive` 设置后才启用（[Keepalive](#keepalive)）。
 
 ### 接收侧
@@ -137,7 +137,7 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 ### 关闭语义
 
 - 先关闭的一方（主动关闭，含同时关闭）经 `FIN_WAIT_1`/`FIN_WAIT_2`/`CLOSING` 进入 TIME_WAIT，保留 60 秒的紧凑墓碑表项（RFC 9293）。后关闭的一方走 `LAST_ACK` 到 `CLOSED`，不保留任何东西。由于先关闭者总会保留 TIME_WAIT，服务端的 TIME_WAIT 绝不会被跳过。
-- 墓碑对合法的重传 FIN 回 ACK 并重启 60 秒计时；其他段被忽略。同一四元组的新 SYN 只有在 RFC 6191 检查通过时才会取代墓碑：其时间戳比最后一次见到的更新，或在没有可用时间戳时，其序号超出旧的 `rcv_nxt`；时间戳更旧的 SYN 被视为游离的重复包并被忽略。新流的 ISS 被强制置于旧 `snd_nxt` 之后。
+- 墓碑对合法的重传 FIN 回 ACK 并重启 60 秒计时。完全位于已消费 FIN 之前的数据段（带 ACK，允许 PSH，无 SYN/RST/FIN，ACK 号与时间戳通过与 FIN 相同的检查）可能是对端在我方最终 ACK 丢失后重传其未确认的尾部：它只换来一个合并的 ACK，使对端离开 `CLOSING`。接收该数据不重置过期时间，也不更新 `ts_recent`。既有的待发送义务仍有效：处理过期时若 ACK 尚未输出，计时器会重新延后 60 秒而非丢弃待发输出，因此 driver 必须继续拉取。其他段被忽略。同一四元组的新 SYN 只有在 RFC 6191 检查通过时才会取代墓碑：其时间戳比最后一次见到的更新，或在没有可用时间戳时，其序号超出旧的 `rcv_nxt`；时间戳更旧的 SYN 被视为游离的重复包并被忽略。新流的 ISS 被强制置于旧 `snd_nxt` 之后。
 - **Driver 约定。** 该表项在最后一次 FIN 交换之后至少在栈内存活 60 秒。这段时间内 driver 必须继续把该四元组的包送给 `receive`：栈前面的任何投递状态（eBPF redirect 表项、流表）都必须比流活得更久，否则客户端重传的 FIN 会到达真实服务器而不是墓碑，并被回以 RST。`StackStats::timewait_entries` 统计存活的墓碑。
 
 ### 透明 UDP

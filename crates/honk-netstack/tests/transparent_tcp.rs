@@ -760,6 +760,93 @@ fn active_close_keeps_time_wait_and_a_late_fin_reaches_the_tombstone() {
 }
 
 #[test]
+fn a_tombstone_acks_old_data_without_extending_time_wait() {
+    // Both sides closed and the client's tail data was already acknowledged by the ACK that was
+    // lost: the client keeps retransmitting data (not its FIN), which only an ACK can end.
+    let mut c = established(transparent(), AcceptOpts::default());
+    let _ = c.stack.poll_event();
+    c.stack.tcp_close(c.id);
+    let out = drain(&mut c.stack, c.t0 + ms(10));
+    let fin = out.iter().find(|p| p.h.flags & FIN != 0).unwrap().h;
+    let our_end = fin.seq.wrapping_add(1);
+    let tsval = fin.options.timestamps.unwrap().0;
+    let mut peer = Peer::new(CLIENT, DST, c.peer.seq);
+    peer.ts = c.peer.ts;
+    peer.seg(&mut c.stack, c.t0 + ms(20), our_end, ACK, tsval, &[]);
+    peer.seg(&mut c.stack, c.t0 + ms(30), our_end, ACK | FIN, tsval, &[]);
+    drain(&mut c.stack, c.t0 + ms(30));
+    assert_eq!(c.stack.stats().timewait_entries, 1);
+    let fin_seq = peer.seq.wrapping_sub(1);
+    let seg = |seq: u32, flags: u8, ack: u32, ts: u32, data: &[u8]| {
+        build(
+            addr(CLIENT),
+            addr(DST),
+            seq,
+            ack,
+            flags,
+            Options {
+                timestamps: Some((ts, tsval)),
+                ..Options::default()
+            },
+            data,
+        )
+    };
+    let now = c.t0 + ms(2_000);
+    // Arbitrary or malformed packets are silent: no ACK, no RST, no restart of the 60 s timer.
+    for bad in [
+        seg(fin_seq.wrapping_sub(4), ACK, our_end, peer.ts + 1, &[]), // bare ACK
+        seg(fin_seq.wrapping_sub(3), ACK, our_end, peer.ts + 1, b"tail"), // overlaps the FIN
+        seg(fin_seq, ACK, our_end, peer.ts + 1, b"tail"),             // past the FIN
+        seg(
+            fin_seq.wrapping_sub(4),
+            ACK | RST,
+            our_end,
+            peer.ts + 1,
+            b"tail",
+        ),
+        seg(
+            fin_seq.wrapping_sub(4),
+            ACK,
+            our_end.wrapping_add(1),
+            peer.ts + 1,
+            b"tail",
+        ),
+        seg(fin_seq.wrapping_sub(4), ACK, our_end, peer.ts - 1, b"tail"), // PAWS
+        seg(fin_seq.wrapping_sub(4), 0, 0, peer.ts + 1, b"tail"),         // no ACK
+    ] {
+        assert_eq!(c.stack.receive(now, &bad), Rx::Consumed);
+        assert!(drain(&mut c.stack, now).is_empty());
+    }
+    // An old duplicate: one ACK, however many arrive before it leaves; the stored timestamp is
+    // not advanced and the timer is not restarted.
+    let old = seg(
+        fin_seq.wrapping_sub(4),
+        ACK,
+        our_end,
+        peer.ts + 1_000_000,
+        b"tail",
+    );
+    for _ in 0..3 {
+        assert_eq!(c.stack.receive(now, &old), Rx::Consumed);
+    }
+    let out = drain(&mut c.stack, now);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        (out[0].h.flags, out[0].h.seq, out[0].h.ack),
+        (ACK, our_end, peer.seq)
+    );
+    assert_eq!(out[0].h.options.timestamps.unwrap().1, peer.ts);
+    assert_eq!(c.stack.stats().timewait_entries, 1);
+    assert_eq!(c.stack.stats().flows, 0);
+    c.stack.handle_timeout(c.t0 + ms(30 + 60_000));
+    assert_eq!(
+        c.stack.stats().timewait_entries,
+        0,
+        "old data does not restart TIME_WAIT"
+    );
+}
+
+#[test]
 fn a_syn_reopens_time_wait_only_when_it_is_safe() {
     let mut c = established(transparent(), AcceptOpts::default());
     let _ = c.stack.poll_event();

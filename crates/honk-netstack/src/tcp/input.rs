@@ -84,6 +84,15 @@ impl Tcb {
                 {
                     self.ts_recent = Some((ts, now));
                 }
+            } else if valid_timewait_old_data(
+                h,
+                data.len(),
+                self.snd_nxt,
+                self.rcv_nxt,
+                self.snd_wnd_max,
+                self.ts_recent.map(|v| v.0),
+            ) {
+                self.ack_due |= FIN_ACK;
             }
             return None;
         }
@@ -645,7 +654,33 @@ pub(crate) fn valid_timewait_fin(
     h.flags & (FIN | ACK) == (FIN | ACK)
         && h.flags & (RST | SYN) == 0
         && h.seq.wrapping_add(data_len as u32) == rcv_nxt.wrapping_sub(1)
-        && seq::le(h.ack, snd_nxt)
+        && timewait_peer_ok(h, snd_nxt, max_snd_wnd, ts_recent)
+}
+
+/// A data segment lying wholly before the peer's consumed FIN: the peer never saw our final ACK
+/// and retransmits its unacknowledged tail (RFC 9293 §3.10.7.4: an unacceptable segment is
+/// answered with an ACK). It earns that ACK only; it neither restarts the 2MSL timer nor
+/// updates `ts_recent`, since a half-space of sequence numbers qualifies; only a FIN at exactly
+/// `rcv_nxt - 1` (the existing FIN validation) does. PSH is allowed; SYN, RST and FIN are not.
+pub(crate) fn valid_timewait_old_data(
+    h: &Header,
+    data_len: usize,
+    snd_nxt: u32,
+    rcv_nxt: u32,
+    max_snd_wnd: u32,
+    ts_recent: Option<u32>,
+) -> bool {
+    let before_fin = rcv_nxt.wrapping_sub(1).wrapping_sub(h.seq);
+    h.flags & (ACK | SYN | RST | FIN) == ACK
+        && data_len != 0
+        && before_fin >= data_len as u32
+        && before_fin < 1 << 31
+        && timewait_peer_ok(h, snd_nxt, max_snd_wnd, ts_recent)
+}
+
+/// The ACK number lies in the range ever sent, and with timestamps negotiated the TSval passes PAWS.
+fn timewait_peer_ok(h: &Header, snd_nxt: u32, max_snd_wnd: u32, ts_recent: Option<u32>) -> bool {
+    seq::le(h.ack, snd_nxt)
         && seq::ge(h.ack, snd_nxt.wrapping_sub(max_snd_wnd))
         && ts_recent.is_none_or(|recent| {
             h.options

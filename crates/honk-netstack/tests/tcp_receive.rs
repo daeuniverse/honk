@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use honk_netstack::wire::tcp::{self, ACK, FIN, Header, Options, RST, SYN};
+use honk_netstack::wire::tcp::{self, ACK, FIN, Header, Options, PSH, RST, SYN};
 use honk_netstack::{Config, FlowId, Ready, Rx, Stack, StreamError, TcpState};
 
 fn config(v6: bool) -> Config {
@@ -1304,6 +1304,107 @@ fn retransmitted_data_and_fin_at_the_original_fin_position_restart_time_wait() {
             }
             assert_time_wait_expiry(&mut s, compact, now + Duration::from_secs(60));
         }
+    }
+}
+
+/// An old duplicate of the peer's data (all before its FIN) arriving after the final ACK was
+/// lost: `reply` expects one ACK echoing the stored timestamp, otherwise silence; either way the
+/// 60 s expiry stays where the FIN left it.
+fn old_data_in_time_wait(
+    compact: bool,
+    timestamps: bool,
+    reply: bool,
+    mutate: impl Fn(&mut Header, &mut Vec<u8>),
+) {
+    let (mut s, closed) = time_wait_script(compact, timestamps, b"tail");
+    let now = closed + Duration::from_secs(30);
+    let mut data = b"tail".to_vec();
+    let mut h = Header {
+        src_port: s.peer.port(),
+        dst_port: s.local.port(),
+        seq: s.rcv_nxt.wrapping_sub(5),
+        ack: s.snd_nxt,
+        flags: ACK,
+        window: 32768,
+        urgent: 0,
+        options: Options {
+            timestamps: s
+                .peer_ts
+                .map(|ts| (ts.wrapping_add(1_000), s.timestamp(now))),
+            ..Options::default()
+        },
+    };
+    mutate(&mut h, &mut data);
+    let mut bytes = [0; 2000];
+    let n = tcp::emit_packet(&mut bytes, s.peer.ip(), s.local.ip(), &h, [&data, &[]]).unwrap();
+    for _ in 0..2 {
+        assert_eq!(s.stack.receive(now, &bytes[..n]), Rx::Consumed);
+    }
+    if reply {
+        // The stored timestamp is not advanced by an unauthenticated old segment.
+        let before = s.peer_ts;
+        s.ack(now, s.rcv_nxt, before, &[]);
+    }
+    s.quiet(now);
+    assert!(s.stack.poll_event().is_none());
+    if !compact {
+        let mut unread = [0; 16];
+        assert_eq!(s.stack.tcp_read(s.id, &mut unread), Ok(4));
+        assert_eq!(&unread[..4], b"tail");
+        assert_eq!(s.stack.tcp_read(s.id, &mut unread), Ok(0));
+    }
+    assert_time_wait_expiry(&mut s, compact, closed + Duration::from_secs(60));
+}
+
+#[test]
+fn time_wait_acks_old_data_once_without_restarting_expiry() {
+    for compact in [false, true] {
+        for timestamps in [false, true] {
+            old_data_in_time_wait(compact, timestamps, true, |_, _| {});
+            old_data_in_time_wait(compact, timestamps, true, |h, _| h.flags |= PSH);
+            // A larger segment further before the FIN.
+            old_data_in_time_wait(compact, timestamps, true, |h, d| {
+                h.seq = h.seq.wrapping_sub(1_000);
+                *d = vec![7; 999];
+            });
+        }
+    }
+}
+
+#[test]
+fn time_wait_stays_silent_for_data_that_is_not_a_valid_old_duplicate() {
+    for compact in [false, true] {
+        for timestamps in [false, true] {
+            old_data_in_time_wait(compact, timestamps, false, |h, _| h.flags = RST | ACK);
+            old_data_in_time_wait(compact, timestamps, false, |h, _| h.flags = SYN | ACK);
+            old_data_in_time_wait(compact, timestamps, false, |h, _| h.flags = 0);
+            old_data_in_time_wait(compact, timestamps, false, |_, d| d.clear());
+            old_data_in_time_wait(compact, timestamps, false, |h, _| {
+                h.seq = h.seq.wrapping_add(1)
+            });
+            old_data_in_time_wait(compact, timestamps, false, |h, _| {
+                h.ack = h.ack.wrapping_add(1)
+            });
+            old_data_in_time_wait(compact, timestamps, false, |h, _| {
+                // Script advertises 32768 with peer_options' shift of three.
+                h.ack = h.ack.wrapping_sub((32768 << 3) + 1)
+            });
+            old_data_in_time_wait(compact, timestamps, false, |h, _| {
+                h.ack = h.ack.wrapping_sub(1 << 31)
+            });
+            old_data_in_time_wait(compact, timestamps, false, |h, _| {
+                h.seq = h.seq.wrapping_add(4).wrapping_sub(1 << 31)
+            });
+            old_data_in_time_wait(compact, timestamps, false, |h, _| {
+                h.flags |= FIN;
+                h.seq = h.seq.wrapping_add(1);
+            });
+        }
+        old_data_in_time_wait(compact, true, false, |h, _| h.options.timestamps = None);
+        old_data_in_time_wait(compact, true, false, |h, _| {
+            let ts = h.options.timestamps.as_mut().unwrap();
+            ts.0 = ts.0.wrapping_sub(2_000);
+        });
     }
 }
 
