@@ -702,16 +702,25 @@ impl Stack {
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {
-        [self.timers.next(), self.reasm.poll_timeout()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.timers.next(),
+            self.timers.pending(&self.table),
+            self.reasm.poll_timeout(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
         self.now = now;
         self.reasm.expire(now);
-        while let Some((deadline, index, generation)) = self.timers.pop_due(now) {
+        // Flushed before every pop: a timer that fires can arm another one that is already due.
+        loop {
+            self.timers.flush(&mut self.table);
+            let Some((deadline, index, generation)) = self.timers.pop_due(now) else {
+                break;
+            };
             let slot = &mut self.table.slots[index as usize];
             if slot.generation != generation || slot.scheduled != Some(deadline) {
                 continue;
@@ -959,7 +968,7 @@ impl Stack {
         if retired {
             self.purge_stale();
         }
-        self.timers.refresh(&mut self.table, index);
+        self.timers.mark(&mut self.table, index);
         self.wake_writers();
     }
 
@@ -1036,6 +1045,7 @@ impl Stack {
         assert_eq!(half_open, self.half_open);
         assert_eq!(by_source, self.half_open_by_source);
         assert!(self.half_open <= self.cfg.half_open_max);
+        let wake = self.poll_timeout();
         for slot in &self.table.slots {
             let deadline = match &slot.flow {
                 Some(Flow::Tcp(t)) => {
@@ -1047,11 +1057,16 @@ impl Stack {
             };
             if let Some(deadline) = deadline {
                 assert!(
-                    slot.scheduled.is_some_and(|s| s <= deadline),
+                    slot.dirty || slot.scheduled.is_some_and(|s| s <= deadline),
                     "a flow deadline is not covered by a timer entry, so the owner could oversleep it"
+                );
+                assert!(
+                    wake.is_some_and(|t| t <= deadline),
+                    "poll_timeout is later than a flow deadline"
                 );
             }
         }
+        self.timers.check_dirty(&self.table);
         let bound = 3 * self.table.slots.len().max(16);
         for queue in [
             &self.events,

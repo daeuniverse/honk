@@ -1,13 +1,28 @@
-//! One live timer per flow; later deadlines reuse the old entry until it is popped.
+//! One live timer per flow; later deadlines reuse the old entry until it is popped. A flow that
+//! changed is only marked; its deadline is computed once per driver batch, when `flush` runs
+//! before timers fire or the batch list fills, so several calls on one flow cost one recompute.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use crate::flow::{Flow, Table};
+use crate::flow::{Flow, Slot, Table};
+
+/// Changed flows between flushes; a full list flushes, so `pending` stays bounded.
+const DIRTY_MAX: usize = 64;
+
+fn deadline(slot: &Slot) -> Option<Instant> {
+    match slot.flow.as_ref() {
+        Some(Flow::Tcp(t)) => t.next_deadline(),
+        Some(Flow::TimeWait(t)) => Some(t.expiry),
+        _ => None,
+    }
+}
 
 pub struct Timers {
     heap: BinaryHeap<Reverse<(Instant, u32, u32)>>,
+    /// Slots marked since the last flush, each once (`Slot::dirty`).
+    dirty: Vec<u32>,
     /// Full rebuilds so far; lets tests assert that a burst of flows leaves them rare.
     #[cfg(test)]
     rebuilds: usize,
@@ -17,18 +32,42 @@ impl Timers {
     pub fn new() -> Timers {
         Timers {
             heap: BinaryHeap::new(),
+            dirty: Vec::with_capacity(DIRTY_MAX),
             #[cfg(test)]
             rebuilds: 0,
         }
     }
 
+    /// Defers [`Self::refresh`] of a changed flow to the next [`Self::flush`].
+    pub fn mark(&mut self, table: &mut Table, index: u32) {
+        if table.slots[index as usize].dirty {
+            return;
+        }
+        if self.dirty.len() == DIRTY_MAX {
+            self.flush(table);
+        }
+        table.slots[index as usize].dirty = true;
+        self.dirty.push(index);
+    }
+
+    pub fn flush(&mut self, table: &mut Table) {
+        while let Some(index) = self.dirty.pop() {
+            table.slots[index as usize].dirty = false;
+            self.refresh(table, index);
+        }
+    }
+
+    /// Earliest deadline of the marked flows, which the heap may not cover yet.
+    pub fn pending(&self, table: &Table) -> Option<Instant> {
+        self.dirty
+            .iter()
+            .filter_map(|&index| deadline(&table.slots[index as usize]))
+            .min()
+    }
+
     pub fn refresh(&mut self, table: &mut Table, index: u32) {
         let slot = &mut table.slots[index as usize];
-        let next = match slot.flow.as_ref() {
-            Some(Flow::Tcp(t)) => t.next_deadline(),
-            Some(Flow::TimeWait(t)) => Some(t.expiry),
-            _ => None,
-        };
+        let next = deadline(slot);
         if let Some(next) = next
             && slot.scheduled.is_none_or(|old| next < old)
         {
@@ -45,6 +84,21 @@ impl Timers {
     #[cfg(feature = "fuzz-checks")]
     pub fn len(&self) -> usize {
         self.heap.len()
+    }
+
+    /// The marked list holds exactly the slots flagged dirty, each once, within its bound.
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_dirty(&self, table: &Table) {
+        assert!(self.dirty.len() <= DIRTY_MAX);
+        assert!(
+            self.dirty
+                .iter()
+                .all(|&index| table.slots[index as usize].dirty)
+        );
+        assert_eq!(
+            table.slots.iter().filter(|slot| slot.dirty).count(),
+            self.dirty.len()
+        );
     }
 
     pub fn next(&self) -> Option<Instant> {
@@ -70,11 +124,7 @@ impl Timers {
         }
         self.heap.clear();
         for (index, slot) in table.slots.iter_mut().enumerate() {
-            let next = match slot.flow.as_ref() {
-                Some(Flow::Tcp(t)) => t.next_deadline(),
-                Some(Flow::TimeWait(t)) => Some(t.expiry),
-                _ => None,
-            };
+            let next = deadline(slot);
             slot.scheduled = next;
             if let Some(next) = next {
                 self.heap

@@ -27,6 +27,8 @@ pub struct Slot {
     pub on_tx: bool,
     pub deficit: usize,
     pub scheduled: Option<Instant>,
+    /// Listed in `Timers`' batch of flows to refresh; only `Timers` changes it.
+    pub dirty: bool,
 }
 
 pub struct Table {
@@ -63,6 +65,7 @@ impl Table {
                 on_tx: false,
                 deficit: 0,
                 scheduled: None,
+                dirty: false,
             });
             idx
         });
