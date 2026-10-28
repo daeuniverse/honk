@@ -8,6 +8,8 @@ body:
       value: |
         Write in English or Chinese. Remove passwords, UUIDs, subscription URLs and API tokens from everything you paste.
         中英文均可。粘贴的内容请先删除密码、UUID、订阅地址与 API token。
+        If the problem appears only in the web interface (doona or doona lite) while honk's logs and API responses look correct, report it at https://github.com/Zakkaus/doona/issues.
+        如果问题只出现在网页界面（doona 或 doona lite），honk 的日志与 API 返回都正常，请到 https://github.com/Zakkaus/doona/issues 提交。
   - type: textarea
     id: version
     attributes:

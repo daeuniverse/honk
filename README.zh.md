@@ -39,6 +39,8 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 `.dae` 仍是唯一配置权威。启动时捕获的源支持元数据读取、离线校验、授权源 PUT 和受限组 PATCH。主文件节点/provider 的创建与删除在实际激活后才返回成功，geodata 更新 operation 激活已验证的内容。编辑已有条目继续使用源 PUT；`--store db` 将已接受的源记录为状态数据库中的 revision。凭据源只读，返回正文时遮蔽 listener secret 值。启用原生 API 时，与 Clash 共用非持久化模式；成功的显式激活（含 no-op）重置 Rule 与设置，provider/network refresh 保留它们。原生 runtime mode、暂停/恢复与完整内核 flow 观测仍未开放。详见[原生 API 参考](doc/zh/reference/api.md#原生-api)。
 
+原生 API 的网页界面是 [doona](https://github.com/Zakkaus/doona)（[文档](https://doona.daeuniverse.org/zh-CN/)、[演示](https://demo.daeuniverse.org/)）；doona lite 是较轻量的预览版。
+
 ## 版本与兼容性
 
 - 自 `v0.1.0` 起，发布遵循 [SemVer](https://semver.org/lang/zh-CN/)；带 `-alpha.N`、`-beta.N` 或 `-rc.N` 后缀的 tag 为预发布。`1.0` 之前，次版本可能改变配置或行为，其发布说明会列出升级前需要处理的事项。
@@ -79,7 +81,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 - [ ] 在 Clash 兼容 API 之外添加 honk 专用 REST API
 - [ ] 添加入站支持
 
-其他工作见 [Issues](https://github.com/daeuniverse/honk/issues) 和 [Discussions](https://github.com/daeuniverse/honk/discussions)。
+其他工作见 [Issues](https://github.com/daeuniverse/honk/issues) 和 [Discussions](https://github.com/daeuniverse/honk/discussions)。网页界面的问题请到 [doona issues](https://github.com/Zakkaus/doona/issues) 提交。
 
 ## 致谢
 

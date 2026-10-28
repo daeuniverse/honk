@@ -3,3 +3,6 @@ contact_links:
   - name: Questions and usage help / 使用问题
     url: https://github.com/daeuniverse/honk/discussions
     about: Ask how to configure or deploy honk in Discussions. / 配置与部署问题请到 Discussions 提问。
+  - name: Web interface (doona) problems / 网页界面（doona）问题
+    url: https://github.com/Zakkaus/doona/issues
+    about: Report problems in the doona or doona lite web interface to doona. / doona 与 doona lite 网页界面的问题请到 doona 提交。
