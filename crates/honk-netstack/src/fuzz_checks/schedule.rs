@@ -55,7 +55,7 @@ pub(super) mod op {
     pub const ABORT: u8 = 10;
     /// `[exponent]`
     pub const ADVANCE: u8 = 11;
-    /// `[budget]`
+    /// `[budget | 32 tiny-buffer | 64 paused | 128 control-only]`; persists across auto-drains.
     pub const PULL: u8 = 12;
     /// `[flow, mtu, seq]`
     pub const PTB: u8 = 13;
@@ -230,8 +230,9 @@ fn step(w: &mut World, r: &mut Reader) {
             w.drain();
         }
         op::PULL => {
-            // Budgets 0, 1 and N: nothing may be lost by stopping early.
-            let n = [0, 1, 2, 8, 64][usize::from(r.u8()) % 5];
+            let flags = r.u8();
+            let n = [0, 1, 2, 8, 64][usize::from(flags & 31) % 5];
+            w.pull_flags = flags;
             w.pull(n);
         }
         op::PTB => {
@@ -339,6 +340,16 @@ pub fn seeds() -> Vec<Vec<u8>> {
     ]);
     let mut udp = vec![UDP, 0, 0, UDP, 2, 40, UDP, 1, 20, UDP, 3, 0];
     udp.extend([RAW, 8, 0x45, 0, 0, 20, 0, 0, 0x40, 0]);
+    let mut control = handshake(0);
+    control.extend([
+        PULL, 132, WRITE, 0, 7, 208, DATA, 0, 0, 3, 0, CONNECT, 1, SYN_ACK, 1, 3, 0, 1, WRITE, 1,
+        3, 232, PULL, 164, DATA, 1, 0, 3, 0, PULL, 132, PULL, 4, ACK, 0, 0, 3, 0, ACK, 1, 0, 3, 0,
+    ]);
+    let mut control_tlp = handshake(0);
+    control_tlp.extend([
+        WRITE, 0, 7, 208, ADVANCE, 1, PULL, 132, ADVANCE, 5, PULL, 132, PULL, 4, ACK, 0, 0, 3, 0,
+        PULL, 68, WRITE, 0, 0, 40, PULL, 4,
+    ]);
     vec![
         bulk,
         loss,
@@ -347,12 +358,40 @@ pub fn seeds() -> Vec<Vec<u8>> {
         icmp,
         udp,
         vec![CONNECT, 0, CONNECT, 1, ABORT, 0],
+        control,
+        control_tlp,
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_seed_defers_both_bulk_flows_then_resumes_real_payload() {
+        let seed = &seeds()[7];
+        let mut r = Reader(seed);
+        let mut w = World::new();
+        let mut deferred = false;
+        while !r.done() {
+            step(&mut w, &mut r);
+            w.stack.check();
+            if w.pull_flags & 128 != 0 {
+                assert!(w.peers.iter().all(|p| p.last_data.is_empty()));
+                deferred |= w.peers.len() == 2;
+            }
+        }
+        assert!(deferred);
+        assert_eq!(w.peers.len(), 2);
+        for p in &w.peers {
+            assert!(!p.last_data.is_empty(), "resumed bulk reached the wire");
+            let mut received = [0; 32];
+            assert_eq!(w.stack.tcp_read(p.id, &mut received), Ok(24));
+            assert_eq!(&received[..24], &(0..24).collect::<Vec<u8>>());
+            assert_eq!(w.stack.tcp_stats(p.id).unwrap().outstanding_bytes, 0);
+        }
+        w.finish();
+    }
 
     /// The seeds must drive real traffic, or the target would only fuzz the decoder.
     #[test]

@@ -6,11 +6,11 @@ async fn quic_source_reuses_one_association_across_targets() {
         for ipv6 in [false, true] {
             let mut f = Fixture::new(mode, ipv6).await;
             let (a, b, c) = (f.target(0), f.target(1), f.target(2));
-            let lease_a = f.reserve(f.client(), a, b"to-a");
-            let lease_b = f.reserve(f.client(), b, b"to-b");
+            let lease_a = f.reserve(honk_datapath::ScopeId::HOST, f.client(), a, b"to-a");
+            let lease_b = f.reserve(honk_datapath::ScopeId::HOST, f.client(), b, b"to-b");
             let (pa, pb) = tokio::join!(
-                f.prepare(f.client(), a, None, false),
-                f.prepare(f.client(), b, None, false)
+                f.prepare(ScopeId::HOST, f.client(), a, None, false),
+                f.prepare(ScopeId::HOST, f.client(), b, None, false)
             );
             let (aa, ab) = tokio::join!(pa.commit(&f.pool), pb.commit(&f.pool));
             let (ea, mut da) = f.install(lease_a, aa.unwrap(), f.client(), a, a).await;
@@ -53,9 +53,11 @@ async fn quic_source_reuses_one_association_across_targets() {
                 ScoreVerificationState::Provisional
             );
             assert!(
-                !f.pool
-                    .endpoints
-                    .contains_key(&EndpointKey::new(f.client(), c)),
+                !f.pool.endpoints.contains_key(&EndpointKey::new(
+                    honk_datapath::ScopeId::HOST,
+                    f.client(),
+                    c
+                )),
                 "foreign replies cannot create flow authority"
             );
             for (index, payload) in [(0, b"reply-a".as_slice()), (1, b"reply-b".as_slice())] {
@@ -86,9 +88,14 @@ async fn quic_source_partitions_clients_runtimes_and_rewrites() {
         let second_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = second_client.local_addr().unwrap();
         let target = f.target(0);
-        let lease = f.reserve(client, target, b"other-client");
+        let lease = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            client,
+            target,
+            b"other-client",
+        );
         let attachment = f
-            .prepare(client, target, None, false)
+            .prepare(honk_datapath::ScopeId::HOST, client, target, None, false)
             .await
             .commit(&f.pool)
             .await
@@ -115,10 +122,16 @@ async fn quic_source_partitions_clients_runtimes_and_rewrites() {
             Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&f.peer.node)).unwrap());
         let runtime = replacement.get(&f.peer.node.id).unwrap();
         let target_b = f.target(1);
-        let lease = f.reserve(f.client(), target_b, b"other-runtime");
+        let lease = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            f.client(),
+            target_b,
+            b"other-runtime",
+        );
         let attachment = f
             .pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&replacement),
                 runtime,
@@ -152,9 +165,20 @@ async fn quic_source_partitions_clients_runtimes_and_rewrites() {
         let mut rewritten = Vec::new();
         for index in [3, 4] {
             let original = f.target(index);
-            let lease = f.reserve(f.client(), original, b"rewritten");
+            let lease = f.reserve(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                original,
+                b"rewritten",
+            );
             let attachment = f
-                .prepare(f.client(), target, Some(original), false)
+                .prepare(
+                    honk_datapath::ScopeId::HOST,
+                    f.client(),
+                    target,
+                    Some(original),
+                    false,
+                )
                 .await
                 .commit(&f.pool)
                 .await
@@ -180,7 +204,8 @@ async fn quic_source_partitions_clients_runtimes_and_rewrites() {
                 .await
                 .unwrap();
             assert_eq!(received(&f.client).await, (b"projected".to_vec(), original));
-            f.pool.remove(f.client(), original);
+            f.pool
+                .remove(honk_datapath::ScopeId::HOST, f.client(), original);
             f.targets[2]
                 .send_to(b"no-foreign-rewrite", packet.mapping)
                 .await
@@ -206,7 +231,12 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
         f.packet().await;
         let (removed_tx, mut removed_rx) = mpsc::channel(16);
         f.pool.set_remove_sink(removed_tx);
-        let initializing = f.reserve(f.client(), f.target(2), b"initializing");
+        let initializing = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            f.client(),
+            f.target(2),
+            b"initializing",
+        );
         f.targets[2]
             .send_to(b"blocked-initializing", packet.mapping)
             .await
@@ -217,10 +247,16 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
             Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&f.peer.node)).unwrap());
         let runtime = replacement.get(&f.peer.node.id).unwrap();
         let target = f.target(3);
-        let lease = f.reserve(f.client(), target, b"different-owner");
+        let lease = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            f.client(),
+            target,
+            b"different-owner",
+        );
         let attachment = f
             .pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&replacement),
                 runtime,
@@ -263,7 +299,8 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
             .await
             .unwrap();
         no_reply(&f.client).await;
-        f.pool.remove(f.client(), f.target(0));
+        f.pool
+            .remove(honk_datapath::ScopeId::HOST, f.client(), f.target(0));
         f.targets[0]
             .send_to(b"retiring", packet.mapping)
             .await
@@ -277,6 +314,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                 .unwrap();
             assert!(f.pool.wait_removal_io(&removed).await);
             assert!(f.pool.complete_removal(
+                removed.scope,
                 removed.client,
                 removed.dst,
                 removed.owner,
@@ -306,6 +344,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
             while let Some(removed) = removed_rx.recv().await {
                 assert!(pool.wait_removal_io(&removed).await);
                 assert!(pool.complete_removal(
+                    removed.scope,
                     removed.client,
                     removed.dst,
                     removed.owner,
@@ -331,8 +370,8 @@ async fn quic_source_preparation_publishes_only_winner() {
         let (winner, loser) = {
             let operation = std::pin::pin!(async {
                 tokio::join!(
-                    f.prepare(f.client(), a, None, true),
-                    f.prepare(f.client(), b, None, true)
+                    f.prepare(ScopeId::HOST, f.client(), a, None, true),
+                    f.prepare(ScopeId::HOST, f.client(), b, None, true)
                 )
             });
             outer.task_scope().scope(operation).await
@@ -350,7 +389,7 @@ async fn quic_source_preparation_publishes_only_winner() {
             .expect("losing preparation did not close its detached carrier")
             .unwrap();
         let attachment = winner.commit(&f.pool).await.unwrap();
-        let lease = f.reserve(f.client(), a, b"winner");
+        let lease = f.reserve(honk_datapath::ScopeId::HOST, f.client(), a, b"winner");
         let (endpoint, mut driver) = f.install(lease, attachment, f.client(), a, a).await;
         driver.wait_first_ack().await.unwrap();
         let first = f.packet().await;

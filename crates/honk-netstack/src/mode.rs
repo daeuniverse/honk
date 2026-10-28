@@ -26,6 +26,17 @@ pub struct ExcludeSet {
 }
 
 impl ExcludeSet {
+    pub(crate) fn overhead_bound(&self) -> Option<usize> {
+        self.v4
+            .capacity()
+            .checked_mul(std::mem::size_of::<(Ipv4Addr, u8)>())?
+            .checked_add(
+                self.v6
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(Ipv6Addr, u8)>())?,
+            )
+    }
+
     /// Adds a prefix; `len` is clamped to the address width.
     pub fn insert(&mut self, addr: IpAddr, len: u8) -> &mut Self {
         match addr {

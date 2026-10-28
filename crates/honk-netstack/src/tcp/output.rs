@@ -41,7 +41,7 @@ enum Kind {
 impl Tcb {
     #[cfg(test)]
     pub fn output(&mut self, now: Instant, out: &mut [u8], pool: &mut super::ring::Pool) -> Output {
-        self.output_with(now, out, pool, 0, &mut Transmit::plain(0))
+        self.output_with(now, out, pool, 0, &mut Transmit::plain(0), true)
     }
 
     /// [`Tcb::output`] that may build one TSO packet: up to `tso` payload bytes (`0`: never) as
@@ -54,6 +54,7 @@ impl Tcb {
         pool: &mut super::ring::Pool,
         tso: usize,
         tx: &mut Transmit,
+        payload_allowed: bool,
     ) -> Output {
         let syn = matches!(self.state, TcpState::SynSent | TcpState::SynReceived);
         let mut options = self.options(now, syn);
@@ -91,13 +92,15 @@ impl Tcb {
                     .max(1)
             };
             if self.tlp_due {
-                self.tlp_due = false;
-                kind = self.tlp_kind(pool, cap, unsent, rwnd, can_send_new);
+                kind = self.tlp_kind(pool, cap, unsent, rwnd, can_send_new, payload_allowed);
                 probe = kind.is_some();
+                if payload_allowed && kind.is_none() {
+                    self.tlp_due = false;
+                }
             }
             if kind.is_none()
                 && !self.recovery.hold_retransmits()
-                && let Some((i, start, len, fin)) = self.sent.next_retransmit()
+                && let Some((i, start, len, fin)) = self.sent.next_retransmit(payload_allowed)
             {
                 let data = (len as usize - usize::from(fin)).min(cap);
                 let fin = fin && data as u32 + 1 == len;
@@ -125,7 +128,7 @@ impl Tcb {
                     });
                 }
             }
-            if kind.is_none() && can_send_new {
+            if kind.is_none() && can_send_new && (payload_allowed || unsent == 0) {
                 let data = unsent.min(cap).min(rwnd);
                 let fin = self.fin_requested
                     && self.fin_seq.is_none()
@@ -232,6 +235,12 @@ impl Tcb {
             Kind::New { segs, .. } | Kind::Retransmit { segs, .. } => segs,
             _ => 1,
         };
+        if self.sack
+            && matches!(kind, Kind::Retransmit { .. })
+            && !self.recovery.rack.ensure_room(pool, segs)
+        {
+            return Output::Blocked;
+        }
         // Every segment but the last is a full payload; they share one header.
         let seg_size = if segs > 1 {
             self.payload_cap(&hdr.options)
@@ -259,6 +268,7 @@ impl Tcb {
                     start: wire::ip_header_len(self.tuple.local.is_ipv6()) as u16,
                     offset: 16,
                 },
+                flow: None,
             };
         }
         if flags & (ACK | SYN) != 0 && flags & RST == 0 {
@@ -385,6 +395,7 @@ impl Tcb {
             }
         }
         if probe {
+            self.tlp_due = false;
             self.recovery.counters.tlp_probes += 1;
             self.rto_deadline = Some(now + self.rtt.rto());
         }
@@ -415,10 +426,11 @@ impl Tcb {
         unsent: usize,
         rwnd: usize,
         can_send_new: bool,
+        payload_allowed: bool,
     ) -> Option<Kind> {
         // `cap` can be zero (tiny path MTU under large options): an empty segment is no probe.
         let new = unsent.min(cap).min(rwnd);
-        if can_send_new && new != 0 && self.sent.ensure_room(pool, 2) {
+        if payload_allowed && can_send_new && new != 0 && self.sent.ensure_room(pool, 2) {
             return Some(Kind::New {
                 data: new,
                 fin: false,
@@ -428,7 +440,8 @@ impl Tcb {
         let (index, start, len, fin) = self.sent.last_unsacked()?;
         let data = (len as usize - usize::from(fin)).min(cap);
         let fin = fin && data as u32 + 1 == len;
-        ((data != 0 || fin)
+        ((payload_allowed || data == 0)
+            && (data != 0 || fin)
             && (data as u32 + u32::from(fin) == len || self.sent.ensure_room(pool, 1)))
         .then_some(Kind::Retransmit {
             index,

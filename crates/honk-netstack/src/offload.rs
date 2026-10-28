@@ -4,8 +4,8 @@
 //! Only a [`Mode::Transparent`](crate::Mode) stack accepts any of it (a TUN driver reading from the
 //! kernel); an endpoint stack, i.e. the WireGuard driver, only ever sees verified, single packets.
 
-use crate::DropReason;
 use crate::wire::{PROTO_TCP, PROTO_UDP};
+use crate::{DropReason, FlowId};
 
 /// Where the L4 checksum of a received packet stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +159,10 @@ pub struct Transmit {
     pub len: usize,
     pub gso: Option<GsoTx>,
     pub csum: TxCsum,
+    /// Original TCP handle, including output retained after application close or compaction.
+    /// Local to the producing Stack; `None` for stateless or unknown-flow output.
+    /// Register the packet's in-flight ownership before checking `Stack::tcp_retained`.
+    pub flow: Option<FlowId>,
 }
 
 impl Transmit {
@@ -167,6 +171,7 @@ impl Transmit {
             len,
             gso: None,
             csum: TxCsum::Full,
+            flow: None,
         }
     }
 }

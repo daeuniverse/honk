@@ -554,6 +554,7 @@ impl NodeRuntime {
     #[cfg(any(feature = "rprx", test))]
     pub fn vless_source_id(
         &self,
+        scope: u64,
         client: std::net::SocketAddr,
         path: honk_config::node::VlessUdpPath,
         reply_destination: Option<std::net::SocketAddr>,
@@ -561,7 +562,7 @@ impl NodeRuntime {
         let ProtocolRuntime::Vless(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };
-        Ok(runtime.source_id(client, path, reply_destination))
+        Ok(runtime.source_id(scope, client, path, reply_destination))
     }
 
     #[cfg(any(feature = "rprx", test))]

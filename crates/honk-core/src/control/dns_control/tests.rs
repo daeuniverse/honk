@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
 mod fixtures;
+mod packet;
 mod singleflight;
 mod snapshots;
 mod tcp;

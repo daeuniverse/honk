@@ -22,30 +22,28 @@ impl ControlPlane {
 
     /// Stop the retained DNS/persistence owners and clean up backend state.
     pub(super) async fn finalize_shutdown(&mut self) -> anyhow::Result<()> {
-        let state_tick = self.state_tick.stop_and_join().await;
-        info!("shutdown: stopping DNS controller");
-        self.dns_controller.shutdown(STAGE_TIMEOUT).await;
-        let dns_cache = self.dns_controller.cache().await;
-        let persistence = dns_cache.lock().await.persistence();
-        if let Some(persistence) = persistence {
-            // The worker is a std thread that cannot be aborted, but the
-            // Shutdown command is queued before the join starts, and the
-            // spawn_blocking join keeps owning the thread handle even if
-            // this future is dropped on timeout — no detached writer.
-            match tokio::time::timeout(STAGE_TIMEOUT, persistence.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(%error, "DNS persistence shutdown failed"),
-                Err(_) => warn!(
-                    "DNS persistence shutdown exceeded {:?}; continuing",
-                    STAGE_TIMEOUT
-                ),
-            }
-        }
+        let userspace = self.finalize_userspace_shutdown().await;
         info!("shutdown: cleaning up eBPF backend");
         let backend = self.ebpf.write().await.cleanup().await;
-        state_tick?;
+        userspace?;
         backend?;
         info!("Control plane stopped");
         Ok(())
+    }
+
+    pub(in crate::control) async fn finalize_userspace_shutdown(&mut self) -> anyhow::Result<()> {
+        let state_tick = self.state_tick.stop_and_join().await;
+        info!("shutdown: stopping DNS controller");
+        self.dns_controller.shutdown(STAGE_TIMEOUT).await;
+        let dns = self.dns_controller.runtime_provider().finish_pause().await;
+        let dns_cache = self.dns_controller.cache().await;
+        let persistence = dns_cache.lock().await.persistence();
+        let persistence = match persistence {
+            Some(persistence) => persistence.shutdown().await.map_err(anyhow::Error::from),
+            None => Ok(()),
+        };
+        state_tick?;
+        dns?;
+        persistence
     }
 }

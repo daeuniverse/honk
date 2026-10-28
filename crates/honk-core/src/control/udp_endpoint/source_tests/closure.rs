@@ -20,7 +20,10 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let target_b = raw_b.local_addr().unwrap();
         let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
             4,
-            Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+            Arc::new(SourceReplySocketFactory::new(
+                [ScopeId::HOST],
+                [raw_a, raw_b],
+            )),
         ));
         let stats = Arc::new(StatsManager::new());
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -41,6 +44,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         );
         let attach = async |target| {
             pool.prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
@@ -72,6 +76,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let endpoint_b = install_source(&pool, lease_b, attachment_b, target_b, &stats, node.id);
         let id = pool
             .register_ready_tracker(
+                honk_datapath::ScopeId::HOST,
                 client_addr,
                 target_a,
                 identity_a.0,
@@ -152,7 +157,13 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             &stats,
             node.id,
         );
-        assert!(!pool.close_exact(client_addr, target_a, identity_a.0, identity_a.1));
+        assert!(!pool.close_exact(
+            honk_datapath::ScopeId::HOST,
+            client_addr,
+            target_a,
+            identity_a.0,
+            identity_a.1
+        ));
         replacement
             .send_packet(b"replacement", false)
             .await

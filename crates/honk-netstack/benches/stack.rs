@@ -586,11 +586,21 @@ fn transparent_udp(c: &mut Criterion) {
                         assert_eq!(result, Rx::Consumed);
                     } else {
                         match result {
-                            Rx::Transparent { src, dst, payload }
+                            Rx::Transparent {
+                                src,
+                                dst,
+                                dscp,
+                                payload,
+                            }
                             | Rx::TransparentOwned {
-                                src, dst, payload, ..
+                                src,
+                                dst,
+                                dscp,
+                                payload,
+                                ..
                             } => {
                                 assert_eq!((src, dst), endpoints);
+                                assert_eq!(dscp, 0);
                                 assert_eq!(payload.len(), len);
                                 black_box(payload);
                             }

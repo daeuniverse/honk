@@ -20,11 +20,15 @@ const ATYP_IPV4: u8 = 1;
 
 #[derive(Debug)]
 struct SourceReplySocketFactory {
+    scopes: HashSet<ScopeId>,
     sockets: Mutex<HashMap<SocketAddr, VecDeque<std::net::UdpSocket>>>,
 }
 
 impl SourceReplySocketFactory {
-    fn new(sockets: impl IntoIterator<Item = std::net::UdpSocket>) -> Self {
+    fn new(
+        scopes: impl IntoIterator<Item = ScopeId>,
+        sockets: impl IntoIterator<Item = std::net::UdpSocket>,
+    ) -> Self {
         let mut by_addr: HashMap<_, VecDeque<_>> = HashMap::new();
         for socket in sockets {
             by_addr
@@ -33,13 +37,20 @@ impl SourceReplySocketFactory {
                 .push_back(socket);
         }
         Self {
+            scopes: scopes.into_iter().collect(),
             sockets: Mutex::new(by_addr),
         }
     }
 }
 
 impl UdpReplySocketFactory for SourceReplySocketFactory {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
+    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
+        if !self.scopes.contains(&scope) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unreserved test scope",
+            ));
+        }
         let socket = self
             .sockets
             .lock()
@@ -50,7 +61,7 @@ impl UdpReplySocketFactory for SourceReplySocketFactory {
             None => std::net::UdpSocket::bind(source)?,
         };
         socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket)
+        UdpSocket::from_std(socket).map(ReplySocketFd::Kernel)
     }
 }
 
@@ -264,6 +275,7 @@ async fn attach_source(
     stats: &Arc<StatsManager>,
 ) -> SourceAttachment {
     pool.prepare_source(
+        honk_datapath::ScopeId::HOST,
         &honk_outbound::proxy::ProxyRegistry::new(),
         Arc::clone(generation),
         Arc::clone(runtime),
@@ -297,7 +309,7 @@ fn source_endpoint(
         attachment,
         target,
         None,
-        Arc::new(pool.create_reply_socket(target).unwrap()),
+        Arc::new(pool.create_reply_socket(ScopeId::HOST, target).unwrap()),
         stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
         node_id,
         honk_outbound::alive::IpVersion::V4,
@@ -323,7 +335,14 @@ fn reserve_source(
     node_id: uuid::Uuid,
 ) -> UdpInitLease {
     let slow = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, target, b"held", slow, stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        target,
+        b"held",
+        slow,
+        stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("source test expected a fresh endpoint"),
     };
@@ -339,7 +358,7 @@ fn install_source(
     stats: &StatsManager,
     node_id: uuid::Uuid,
 ) -> Arc<UdpEndpoint> {
-    let reply_socket = Arc::new(pool.create_reply_socket(target).unwrap());
+    let reply_socket = Arc::new(pool.create_reply_socket(lease.scope(), target).unwrap());
     let endpoint = Arc::new(UdpEndpoint::new_source_scored(
         attachment,
         target,
@@ -430,6 +449,7 @@ fn scope_normalizes_client_and_partitions_owners() {
     let mapped_rewritten: SocketAddr = "[::ffff:198.51.100.8]:53".parse().unwrap();
 
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &first_runtime,
         client,
         SourcePath::Vless(VlessUdpPath::Xudp),
@@ -438,6 +458,7 @@ fn scope_normalizes_client_and_partitions_owners() {
     assert_eq!(
         scope,
         SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &first_runtime,
             mapped_client,
             SourcePath::Vless(VlessUdpPath::Xudp),
@@ -447,6 +468,7 @@ fn scope_normalizes_client_and_partitions_owners() {
     assert_ne!(
         scope,
         SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &second_runtime,
             client,
             SourcePath::Vless(VlessUdpPath::Xudp),
@@ -456,6 +478,7 @@ fn scope_normalizes_client_and_partitions_owners() {
     assert_ne!(
         scope,
         SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &first_runtime,
             client,
             SourcePath::Vless(VlessUdpPath::CoolShared),
@@ -465,6 +488,7 @@ fn scope_normalizes_client_and_partitions_owners() {
     assert_ne!(
         scope,
         SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &first_runtime,
             client,
             SourcePath::Vless(VlessUdpPath::Xudp),
@@ -473,12 +497,14 @@ fn scope_normalizes_client_and_partitions_owners() {
     );
     assert_eq!(
         SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &first_runtime,
             client,
             SourcePath::Vless(VlessUdpPath::Xudp),
             Some(rewritten)
         ),
         SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &first_runtime,
             client,
             SourcePath::Vless(VlessUdpPath::Xudp),
@@ -518,7 +544,10 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let target_d = raw_d.local_addr().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         8,
-        Arc::new(SourceReplySocketFactory::new([raw_a, raw_b, raw_c, raw_d])),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            [raw_a, raw_b, raw_c, raw_d],
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -529,6 +558,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
     let registry = honk_outbound::proxy::ProxyRegistry::new();
     let prepare_a = pool.prepare_source(
+        honk_datapath::ScopeId::HOST,
         &registry,
         Arc::clone(&generation),
         Arc::clone(&runtime),
@@ -544,6 +574,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         false,
     );
     let prepare_b = pool.prepare_source(
+        honk_datapath::ScopeId::HOST,
         &registry,
         Arc::clone(&generation),
         Arc::clone(&runtime),
@@ -568,6 +599,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let owner = attachment_a.owner();
     assert!(Arc::ptr_eq(&owner, &attachment_b.owner()));
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
@@ -642,6 +674,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_two = reserve_source(&pool, &stats, client_two_addr, target_c, node.id);
     let prepared_two = pool
         .prepare_source(
+            honk_datapath::ScopeId::HOST,
             &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
@@ -662,6 +695,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let owner_two = attachment_two.owner();
     assert!(!Arc::ptr_eq(&owner, &owner_two));
     let scope_two = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_two_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
@@ -685,12 +719,13 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     );
     let identity_two = endpoint_identity(&pool, client_two_addr, target_c).unwrap();
     assert!(pool.retire_if_same(
-        EndpointKey::new(client_two_addr, target_c),
+        EndpointKey::new(honk_datapath::ScopeId::HOST, client_two_addr, target_c),
         identity_two.0,
         identity_two.1,
     ));
     let removed_two = removed_rx.recv().await.unwrap();
     assert!(pool.complete_removal(
+        removed_two.scope,
         client_two_addr,
         target_c,
         removed_two.owner,
@@ -717,6 +752,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
 
     let cancelled = pool
         .prepare_source(
+            honk_datapath::ScopeId::HOST,
             &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
@@ -745,7 +781,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         "cancelled attachment must not emit NEW"
     );
 
-    pool.remove(client_addr, target_a);
+    pool.remove(honk_datapath::ScopeId::HOST, client_addr, target_a);
     assert!(matches!(
         pool.classify_source_reply(&owner, target_a),
         SourceReplyTarget::Drop
@@ -755,7 +791,13 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         .unwrap();
     assert_no_reply(&client).await;
     let removed_a = removed_rx.recv().await.unwrap();
-    assert!(pool.complete_removal(client_addr, target_a, removed_a.owner, removed_a.generation));
+    assert!(pool.complete_removal(
+        removed_a.scope,
+        client_addr,
+        target_a,
+        removed_a.owner,
+        removed_a.generation
+    ));
     drop(endpoint_a);
     assert!(matches!(
         pool.classify_source_reply(&owner, target_a),
@@ -811,7 +853,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         SourceReplyTarget::Drop
     ));
     assert!(pool.retire_if_same(
-        EndpointKey::new(client_addr, target_a),
+        EndpointKey::new(honk_datapath::ScopeId::HOST, client_addr, target_a),
         flow_identity.0,
         flow_identity.1
     ));
@@ -821,6 +863,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     assert_no_reply(&client).await;
     let removed_flow = removed_rx.recv().await.unwrap();
     assert!(pool.complete_removal(
+        removed_flow.scope,
         client_addr,
         target_a,
         removed_flow.owner,
@@ -830,6 +873,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_d = reserve_source(&pool, &stats, client_addr, target_d, node.id);
     let prepared_d = pool
         .prepare_source(
+            honk_datapath::ScopeId::HOST,
             &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
@@ -855,7 +899,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     endpoint_b.mark_source_send_active_for_test();
     let identity_b = endpoint_identity(&pool, client_addr, target_b).unwrap();
     assert!(pool.retire_if_same(
-        EndpointKey::new(client_addr, target_b),
+        EndpointKey::new(honk_datapath::ScopeId::HOST, client_addr, target_b),
         identity_b.0,
         identity_b.1,
     ));
@@ -883,6 +927,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     for _ in 0..2 {
         let removed = removed_rx.recv().await.unwrap();
         assert!(pool.complete_removal(
+            removed.scope,
             removed.client,
             removed.dst,
             removed.owner,
@@ -896,6 +941,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_c = reserve_source(&pool, &stats, client_addr, target_c, node.id);
     let prepared_c = pool
         .prepare_source(
+            honk_datapath::ScopeId::HOST,
             &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
@@ -935,12 +981,18 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
 
     let identity_c = endpoint_identity(&pool, client_addr, target_c).unwrap();
     assert!(pool.retire_if_same(
-        EndpointKey::new(client_addr, target_c),
+        EndpointKey::new(honk_datapath::ScopeId::HOST, client_addr, target_c),
         identity_c.0,
         identity_c.1
     ));
     let removed_c = removed_rx.recv().await.unwrap();
-    assert!(pool.complete_removal(client_addr, target_c, removed_c.owner, removed_c.generation));
+    assert!(pool.complete_removal(
+        removed_c.scope,
+        client_addr,
+        target_c,
+        removed_c.owner,
+        removed_c.generation
+    ));
     drop(endpoint_c);
     drop(replacement);
     assert!(pool.shutdown().await.joined);
@@ -955,7 +1007,11 @@ fn endpoint_identity(
     target: SocketAddr,
 ) -> Option<(u32, u64)> {
     pool.endpoints
-        .get(&EndpointKey::new(client, target))
+        .get(&EndpointKey::new(
+            honk_datapath::ScopeId::HOST,
+            client,
+            target,
+        ))
         .and_then(|entry| match entry.value() {
             EndpointEntry::Ready(ready) => Some((ready.owner.token, ready.generation)),
             EndpointEntry::Initializing(_) | EndpointEntry::Retiring { .. } => None,

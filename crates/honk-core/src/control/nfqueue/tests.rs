@@ -8,6 +8,7 @@ mod retirement;
 
 fn identity(token: u32, generation: u64) -> PendingUdpIdentity {
     PendingUdpIdentity::new(
+        honk_datapath::ScopeId::HOST,
         FlowKey::new(
             "192.0.2.10:40000".parse().unwrap(),
             "198.51.100.20:443".parse().unwrap(),
@@ -202,6 +203,7 @@ fn pending_fixture_with(
     );
     pending.open_admission();
     let lease = match endpoints.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         key.client,
         key.destination,
         bytes::Bytes::from_static(b"first"),
@@ -236,6 +238,22 @@ fn pending_fixture_with(
         stats,
         fatal,
     }
+}
+
+#[tokio::test]
+async fn foreign_scope_cannot_cancel_a_host_pending_decision() {
+    let fixture = pending_fixture(51);
+    let mut foreign = fixture.identity;
+    foreign.scope = honk_datapath::ScopeId::allocate().unwrap();
+    assert!(matches!(
+        fixture.pending.cancel(foreign).await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+    assert!(fixture.lease.still_initializing());
+    assert!(fixture.sink.lock().is_empty());
+    fixture.pending.cancel(fixture.identity).await.unwrap();
+    assert!(!fixture.lease.still_initializing());
+    assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
 }
 
 #[test]

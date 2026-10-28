@@ -199,6 +199,7 @@ impl PendingUdpVerdicts {
         cell.changed.notify_waiters();
         self.drop_many(verdicts, DropOutcome::Cancel);
         self.endpoints.retire_staged_identity(
+            identity.scope,
             identity.client(),
             identity.destination(),
             identity.owner.token,
@@ -274,6 +275,7 @@ impl PendingUdpVerdicts {
         cell.changed.notify_waiters();
         self.drop_many(verdicts, DropOutcome::Cancel);
         self.endpoints.retire_staged_identity(
+            identity.scope,
             identity.client(),
             identity.destination(),
             identity.owner.token,

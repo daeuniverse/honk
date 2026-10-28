@@ -11,13 +11,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use honk_netstack::wire::{self, tcp};
-use honk_netstack::{Config, FlowId, Rx, Stack, TcpState};
+use honk_netstack::{
+    Config, ExcludeSet, FlowId, MemoryBudget, Mode, Refuse, Rx, Stack, TcpState, UdpError,
+    UdpRefuse,
+};
+
+#[path = "alloc_free/accounted.rs"]
+mod accounted;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     // Only the test thread counts: the libtest harness thread allocates on its own schedule.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static HEAP_COUNTING: Cell<bool> = const { Cell::new(false) };
+    static LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
+    static PEAK_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 struct Counting;
@@ -28,24 +37,44 @@ fn count() {
     }
 }
 
+fn heap_alloc(bytes: usize) {
+    if HEAP_COUNTING.get() {
+        let live = LIVE_BYTES.get() + bytes;
+        LIVE_BYTES.set(live);
+        PEAK_BYTES.set(PEAK_BYTES.get().max(live));
+    }
+}
+
+fn heap_free(bytes: usize) {
+    if HEAP_COUNTING.get() {
+        LIVE_BYTES.set(LIVE_BYTES.get() - bytes);
+    }
+}
+
 // SAFETY: every method forwards unchanged to `System`; counting touches no allocator state.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count();
+        heap_alloc(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count();
+        heap_alloc(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         count();
+        // Include the old-plus-new backing peak even when System can grow in place.
+        heap_alloc(new_size);
+        heap_free(layout.size());
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        heap_free(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -88,11 +117,25 @@ struct Flow {
 impl Flow {
     /// Handshake with a 10 ms RTT, SACK and a window-scale-7 peer.
     fn connect() -> Flow {
+        Self::configured(None)
+    }
+
+    fn configured(budget: Option<std::sync::Arc<MemoryBudget>>) -> Flow {
         let mut cfg = Config::new([0x37; 32]);
         cfg.local_v4 = Some("192.0.2.1".parse().unwrap());
         let local_ip = IpAddr::V4(cfg.local_v4.unwrap());
         let mut now = Instant::now();
-        let mut stack = Stack::new(cfg, now);
+        let mut stack = if let Some(budget) = budget {
+            cfg.memory_limit = 2 * 1024 * 1024;
+            cfg.max_flows = 4;
+            cfg.tcp_chunk = Some(4096);
+            cfg.tcp_snd_buf_max = 512 * 1024;
+            cfg.tcp_rcv_buf_max = 512 * 1024;
+            cfg.shared_budget = Some(budget);
+            Stack::new_accounted(cfg, now, 64).unwrap()
+        } else {
+            Stack::new(cfg, now)
+        };
         let id = stack.tcp_connect(now, remote()).unwrap();
         let mut out = vec![0u8; 2048];
         let n = stack.poll_transmit(now, &mut out).expect("SYN");
@@ -203,7 +246,11 @@ fn receive_phase() -> usize {
     let mut step = |f: &mut Flow, p: &[u8]| {
         assert_eq!(f.stack.receive(f.now, p), Rx::Consumed);
         assert_eq!(f.stack.tcp_read(f.id, &mut read), Ok(MSS));
-        while f.stack.poll_transmit(f.now, &mut f.out).is_some() {}
+        while let Some(tx) = f.stack.poll_control_transmit(f.now, &mut f.out) {
+            let ip = wire::parse_ip(&f.out[..tx.len]).unwrap();
+            let (_, hlen) = tcp::parse(&f.out[ip.payload.clone()]).unwrap();
+            assert_eq!(ip.payload.len(), hlen, "ACK-only pull");
+        }
     };
     let (warm, measured) = packets.split_at(WARMUP);
     for p in warm {
@@ -233,6 +280,7 @@ fn transmit_phase() -> usize {
         .collect();
     let round = |f: &mut Flow, ack: &[u8]| {
         assert_eq!(f.stack.tcp_write(f.id, &data), Ok(data.len()));
+        assert!(f.stack.poll_control_transmit(f.now, &mut f.out).is_none());
         f.send(ROUND);
         f.now += 10 * MS;
         assert_eq!(f.stack.receive(f.now, ack), Rx::Consumed);
@@ -258,4 +306,5 @@ fn steady_state_data_movement_allocates_nothing() {
         0,
         "tcp_write + full-segment transmit + ACK receive"
     );
+    accounted::stress();
 }

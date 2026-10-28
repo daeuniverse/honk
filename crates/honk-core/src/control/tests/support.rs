@@ -211,10 +211,20 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
 pub(in crate::control) struct UdpTestReplySocketFactory;
 
 impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketFactory {
-    fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: honk_datapath::ScopeId,
+        _original_dst: SocketAddr,
+    ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
+        if scope != honk_datapath::ScopeId::HOST {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unreserved test scope",
+            ));
+        }
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket)
+        UdpSocket::from_std(socket).map(crate::control::udp_endpoint::ReplySocketFd::Kernel)
     }
 }
 
@@ -224,7 +234,17 @@ pub(super) struct KernelUdpReplySocketFactory;
 
 #[cfg(feature = "ebpf")]
 impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocketFactory {
-    fn create(&self, original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: honk_datapath::ScopeId,
+        original_dst: SocketAddr,
+    ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
+        if scope != honk_datapath::ScopeId::HOST {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "kernel replies require HOST scope",
+            ));
+        }
         let domain = if original_dst.is_ipv4() {
             socket2::Domain::IPV4
         } else {
@@ -240,7 +260,7 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocke
         }
         socket.set_mark(DAE_BYPASS_MARK)?;
         socket.bind(&original_dst.into())?;
-        UdpSocket::from_std(socket.into())
+        UdpSocket::from_std(socket.into()).map(crate::control::udp_endpoint::ReplySocketFd::Kernel)
     }
 }
 
@@ -248,7 +268,17 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocke
 pub(super) struct FailingUdpTestReplySocketFactory;
 
 impl crate::control::udp_endpoint::UdpReplySocketFactory for FailingUdpTestReplySocketFactory {
-    fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: honk_datapath::ScopeId,
+        _original_dst: SocketAddr,
+    ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
+        if scope != honk_datapath::ScopeId::HOST {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unreserved test scope",
+            ));
+        }
         Err(std::io::Error::other("scripted anyfrom setup failure"))
     }
 }
@@ -563,10 +593,14 @@ pub(super) async fn serve_test_udp_to(
     let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .expect("test slow permit");
-    let reservation =
-        handle
-            .udp_pool
-            .reserve_or_enqueue(client, dst, payload, slow_permit, &handle.stats);
+    let reservation = handle.udp_pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        payload,
+        slow_permit,
+        &handle.stats,
+    );
     match reservation {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => {
             handle.serve_udp_connection(lease).await

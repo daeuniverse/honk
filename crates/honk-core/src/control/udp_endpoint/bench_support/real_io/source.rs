@@ -161,6 +161,7 @@ impl IoHarness {
         let preparation = self
             .pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &source.registry,
                 Arc::clone(&source.generation),
                 Arc::clone(&source.runtime),
@@ -192,10 +193,17 @@ impl IoHarness {
         self.source_runtime(Backend::Mock, ([127, 0, 0, 1], 1).into())?;
         let target = self.targets[destination];
         let source = self.source.as_ref().expect("source runtime just created");
-        let scope = SourceScope::new(&source.runtime, self.client_addr, SourcePath::Shared, None);
+        let scope = SourceScope::new(
+            honk_datapath::ScopeId::HOST,
+            &source.runtime,
+            self.client_addr,
+            SourcePath::Shared,
+            None,
+        );
         let preparation = if self.pool.sources.contains_key(&scope) {
             self.pool
                 .prepare_source(
+                    honk_datapath::ScopeId::HOST,
                     &source.registry,
                     Arc::clone(&source.generation),
                     Arc::clone(&source.runtime),
@@ -245,7 +253,7 @@ impl IoHarness {
             .commit(&self.pool)
             .await
             .map_err(io::Error::other)?;
-        let reply = Arc::new(self.pool.create_reply_socket(target)?);
+        let reply = Arc::new(self.pool.create_reply_socket(lease.scope(), target)?);
         let endpoint = Arc::new(UdpEndpoint::new_source_scored(
             attachment,
             target,

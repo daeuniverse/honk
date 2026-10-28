@@ -55,6 +55,7 @@ impl ControlPlaneHandle {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_udp_candidates(
         &self,
+        scope: honk_datapath::ScopeId,
         plan: ResolvedUdpPlan,
         mark: Option<honk_outbound::proxy::DirectMark>,
         client_addr: SocketAddr,
@@ -153,6 +154,7 @@ impl ControlPlaneHandle {
                             })?;
                             udp_pool
                                 .prepare_source(
+                                    scope,
                                     &registry,
                                     Arc::clone(&runtime_generation),
                                     runtime,

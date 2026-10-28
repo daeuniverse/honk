@@ -50,7 +50,11 @@ impl Retirement {
 
     fn request(&self, pins: &TcpFlowPins, now_ns: Option<u64>) -> Option<RetireRequest<'static>> {
         let request = match self {
-            Self::Udp(removal) if removal.reason == RemovalReason::UserspaceEndpointRetired => {
+            Self::Udp(removal)
+                if removal.reason == RemovalReason::UserspaceEndpointRetired
+                    && removal.owner.has_kernel_capture()
+                    && removal.scope == honk_datapath::ScopeId::HOST =>
+            {
                 RetireRequest {
                     key: connection::build_tuples_key(
                         removal.dst.ip(),
@@ -229,26 +233,54 @@ pub(in crate::control) fn spawn_retirement_worker(
     tcp_flow_pins: Arc<TcpFlowPins>,
     port: Arc<RetirementPort>,
 ) -> RetirementWorker {
-    const REMOVAL_QUEUE_CAPACITY: usize = 1024;
-    let (remove_tx, remove_rx) = mpsc::channel(REMOVAL_QUEUE_CAPACITY);
-    let (tcp_tx, tcp_rx) = mpsc::channel(REMOVAL_QUEUE_CAPACITY);
-    udp_pool.set_remove_sink(remove_tx);
+    let (tcp_tx, tcp_rx) = mpsc::channel(1024);
     *port.sink.lock() = Some(tcp_tx);
     *port.pin_errors.lock() = Some(fatal_tx.clone());
     let retained_hints = port.hints.lock().take();
+    spawn_worker(
+        udp_pool,
+        tracker,
+        fatal_tx,
+        Some((ebpf, tcp_flow_pins)),
+        Some(tcp_rx),
+        retained_hints,
+    )
+}
+
+pub(in crate::control) fn spawn_packet_retirement_worker(
+    udp_pool: Arc<UdpEndpointPool>,
+    tracker: Arc<ConnectionTracker>,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+) -> RetirementWorker {
+    spawn_worker(udp_pool, tracker, fatal_tx, None, None, None)
+}
+
+type KernelRetirement = (Arc<RwLock<Box<dyn EbpfBackend>>>, Arc<TcpFlowPins>);
+
+fn spawn_worker(
+    udp_pool: Arc<UdpEndpointPool>,
+    tracker: Arc<ConnectionTracker>,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+    kernel: Option<KernelRetirement>,
+    tcp: Option<mpsc::Receiver<TcpRetirement>>,
+    retained_hints: Option<mpsc::Receiver<FlowExpiryHint>>,
+) -> RetirementWorker {
+    let (remove_tx, remove_rx) = mpsc::channel(1024);
+    udp_pool.set_remove_sink(remove_tx);
     tokio::spawn(async move {
         let mut exit = super::runtime::CriticalTaskExit {
             name: "flow_retirement_worker",
             fatal_tx: fatal_tx.clone(),
             expected: false,
         };
-        let hints = match retained_hints {
-            Some(receiver) => Some(receiver),
-            None => ebpf.write().await.take_expiry_hints(),
+        let hints = match (retained_hints, kernel.as_ref()) {
+            (Some(receiver), _) => Some(receiver),
+            (None, Some((backend, _))) => backend.write().await.take_expiry_hints(),
+            (None, None) => None,
         };
         let mut ingress = Ingress {
             udp: Some(remove_rx),
-            tcp: Some(tcp_rx),
+            tcp,
             hints,
             fatal: fatal_tx.clone(),
         };
@@ -264,7 +296,10 @@ pub(in crate::control) fn spawn_retirement_worker(
                     let _ = fatal_tx.send(error);
                 }
             }
-            let mut backend = ebpf.write().await;
+            let mut backend = match &kernel {
+                Some((backend, _)) => Some(backend.write().await),
+                None => None,
+            };
             // Both local and native pins leave under W before checking any
             // external owner; adoption retains both under continuous backendR.
             for slot in &mut slots {
@@ -290,12 +325,24 @@ pub(in crate::control) fn spawn_retirement_worker(
             };
             for slot in &mut slots {
                 if slot.ok {
-                    slot.request = slot.job.request(&tcp_flow_pins, hint_time);
+                    if let Some((_, pins)) = &kernel {
+                        slot.request = slot.job.request(pins, hint_time);
+                    } else if !matches!(&slot.job, Retirement::Udp(removal) if !removal.owner.has_kernel_capture())
+                    {
+                        slot.ok = false;
+                        let _ = fatal_tx.send(anyhow::anyhow!(
+                            "packet retirement received kernel-owned work"
+                        ));
+                    }
                 }
             }
             requests.extend(slots.iter().filter_map(|slot| slot.request));
             let batch_ok = requests.is_empty()
-                || match backend.retire_batch(&requests, &mut outcomes[..requests.len()]) {
+                || match backend
+                    .as_mut()
+                    .expect("kernel requests require kernel authority")
+                    .retire_batch(&requests, &mut outcomes[..requests.len()])
+                {
                     Ok(_) => true,
                     Err(error) => {
                         let _ = fatal_tx.send(
@@ -343,6 +390,55 @@ mod tests {
     use crate::ebpf::{TcpPin, mock::MockEbpfBackend};
     use honk_ebpf_common::conn::{ConnState, TcpState};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn packet_retirement_cannot_delete_a_coincident_kernel_flow() {
+        use crate::ebpf::UdpFlowOwner;
+        use honk_datapath::ScopeId;
+        let client: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let key =
+            connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+        let mut backend = MockEbpfBackend::new();
+        let state = ConnState {
+            decision_token: 71,
+            incarnation: 99,
+            state: honk_ebpf_common::UdpDecisionState::Proxy as u8,
+            ..Default::default()
+        };
+        backend.udp_conn_state_store(&key, &state).unwrap();
+        let captured = backend.udp_flow_owner(71, Some(state)).unwrap();
+        let mut packet = UdpFlowOwner::packet();
+        packet.token = captured.token;
+        packet.incarnation = captured.incarnation;
+        assert!(backend.verify_udp_admission(&key, packet).is_err());
+        let pins = TcpFlowPins::default();
+        let foreign = ScopeId::allocate().unwrap();
+        for (scope, owner, allowed) in [
+            (ScopeId::HOST, packet, false),
+            (foreign, packet, false),
+            (foreign, captured, false),
+            (ScopeId::HOST, captured, true),
+        ] {
+            let job = Retirement::Udp(EndpointRemoval {
+                scope,
+                client,
+                dst,
+                owner,
+                generation: 1,
+                conn_id: None,
+                reason: RemovalReason::UserspaceEndpointRetired,
+            });
+            let request = job.request(&pins, None);
+            assert_eq!(request.is_some(), allowed);
+            if let Some(request) = request {
+                let mut outcome = [RetireOutcome::NotRun];
+                backend.retire_batch(&[request], &mut outcome).unwrap();
+                assert_eq!(outcome[0], RetireOutcome::ConnRetired);
+            }
+            assert_eq!(backend.conn_state_lookup(&key).unwrap().is_some(), !allowed);
+        }
+    }
 
     #[tokio::test]
     async fn ingress_reports_closed_hints_until_real_producers_drain() {

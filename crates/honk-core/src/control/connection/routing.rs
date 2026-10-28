@@ -9,14 +9,29 @@ pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &st
 }
 
 #[derive(Debug)]
-pub(super) struct RoutingDecision {
-    pub(super) outbound: String,
-    pub(super) must: bool,
-    pub(super) mark: Option<honk_outbound::proxy::DirectMark>,
-    pub(super) matched_rule: Option<(String, String)>,
-    pub(super) reroute_by_sniffed_domain: bool,
+pub(in crate::control) struct RoutingDecision {
+    pub(in crate::control) outbound: String,
+    pub(in crate::control) must: bool,
+    pub(in crate::control) mark: Option<honk_outbound::proxy::DirectMark>,
+    pub(in crate::control) matched_rule: Option<(String, String)>,
+    pub(in crate::control) reroute_by_sniffed_domain: bool,
     #[cfg(feature = "native-api")]
     pub(super) native_route: Option<super::observation::RouteObservation>,
+}
+
+pub(in crate::control) struct PacketRoutingSnapshot {
+    pub(in crate::control) decision: RoutingDecision,
+    pub(in crate::control) config: Arc<Config>,
+    pub(in crate::control) group_manager: Arc<honk_outbound::group::GroupManager>,
+    pub(in crate::control) runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) native: Option<(u64, Arc<crate::observe::catalog::CatalogIdentity>)>,
+}
+
+impl PacketRoutingSnapshot {
+    pub(in crate::control) fn final_before_sniff(&self) -> bool {
+        self.decision.must || self.decision.outbound == "block"
+    }
 }
 
 impl RoutingDecision {
@@ -184,6 +199,81 @@ impl ControlPlaneHandle {
             || handoff
                 .map(|handoff| handoff.outbound == OutboundIndex::ControlPlaneRouting as u8)
                 .unwrap_or(true)
+    }
+
+    pub(in crate::control) async fn prepare_packet_routing_snapshot(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+        protocol: &'static str,
+        dscp: u8,
+        #[cfg(feature = "native-api")] record_route: bool,
+    ) -> anyhow::Result<PacketRoutingSnapshot> {
+        let config = Arc::clone(&*self.config.read().await);
+        let mut input = build_connection_info(None, destination, client, protocol, None);
+        input.dscp = Some(dscp);
+        let decision = self
+            .prepare_routing(
+                DialMode::Ip,
+                &input,
+                false,
+                None,
+                #[cfg(feature = "native-api")]
+                record_route,
+            )
+            .await;
+        let current = self.config.read().await;
+        anyhow::ensure!(
+            Arc::ptr_eq(&config, &current),
+            "packet routing generation changed"
+        );
+        Ok(PacketRoutingSnapshot {
+            decision,
+            config,
+            group_manager: self.group_manager.read().clone(),
+            runtime: self.runtime_registry.read().clone(),
+            #[cfg(feature = "native-api")]
+            native: self.native.as_ref().map(|native| {
+                (
+                    self.diagnostics.read().generation,
+                    native.catalog.snapshot(),
+                )
+            }),
+        })
+    }
+
+    pub(in crate::control) async fn route_packet_with_sniffed(
+        &self,
+        snapshot: &mut PacketRoutingSnapshot,
+        dial_mode: DialMode,
+        conn_info: &ConnectionInfo,
+        domain_verified: bool,
+        #[cfg(feature = "native-api")] record_route: bool,
+    ) -> anyhow::Result<()> {
+        if snapshot.final_before_sniff()
+            || !Self::should_route_with_sniffed_domain(
+                dial_mode,
+                conn_info.domain.as_deref(),
+                domain_verified,
+            )
+        {
+            return Ok(());
+        }
+        snapshot.decision = self
+            .prepare_routing(
+                dial_mode,
+                conn_info,
+                domain_verified,
+                None,
+                #[cfg(feature = "native-api")]
+                record_route,
+            )
+            .await;
+        anyhow::ensure!(
+            Arc::ptr_eq(&snapshot.config, &*self.config.read().await),
+            "packet routing generation changed during sniffing"
+        );
+        Ok(())
     }
 
     pub(super) async fn prepare_routing(

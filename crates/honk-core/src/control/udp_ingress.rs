@@ -40,6 +40,8 @@ pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOri
 }
 
 /// Owns admitted work after routing publication guards have been released.
+// Keep the lease inline, as in EndpointReservation, without a per-flow allocation.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum UdpSlowPathWork {
     Initialize(UdpInitLease),
     #[cfg(feature = "ebpf")]
@@ -149,6 +151,7 @@ pub(super) fn begin_udp_slow_path_at(
         return UdpSlowPathWork::Done;
     };
     match pool.reserve_or_enqueue_at(
+        honk_datapath::ScopeId::HOST,
         src_addr,
         original_dst,
         data,
@@ -392,9 +395,9 @@ impl UdpLoopState {
             return work;
         }
         let work = match data {
-            DatagramPayload::Borrowed(data) => {
+            data @ (DatagramPayload::Borrowed(_) | DatagramPayload::Funded(_)) => {
                 self.admit_datagram_at(
-                    data,
+                    data.as_slice(),
                     src_addr,
                     original_dst,
                     None,
@@ -529,6 +532,7 @@ impl UdpLoopState {
                 }
                 if let EndpointReservation::Initializing(lease) =
                     self.udp_pool.reserve_payload_or_enqueue_at(
+                        honk_datapath::ScopeId::HOST,
                         src_addr,
                         original_dst,
                         DatagramPayload::Owned(data),
@@ -591,6 +595,7 @@ impl UdpLoopState {
                                 src_addr,
                                 original_dst,
                                 validated,
+                                super::dns_control::DnsUdpReply::Kernel,
                             )
                             .await;
                     };
@@ -857,6 +862,7 @@ fn udp_fast_path_at(
         return false;
     }
     let Some(result) = udp_pool.fast_path_enqueue_at(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         original_dst,
         data,

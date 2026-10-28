@@ -20,7 +20,7 @@
 
 ## Crate 分工
 
-根 workspace 包含七个 crate。`honk-ebpf` 因面向 `bpfel-unknown-none` 而作为独立 Cargo 项目：它被排除在 workspace 外，并维护自己的 `Cargo.lock`。
+根 workspace 包含八个 crate。`honk-ebpf` 因面向 `bpfel-unknown-none` 而作为独立 Cargo 项目：它被排除在 workspace 外，并维护自己的 `Cargo.lock`。
 
 | Crate | Workspace | 职责 |
 | --- | --- | --- |
@@ -28,6 +28,7 @@
 | `honk-ebpf-common` | 成员 | 内核程序与用户态 map 写入端共享的 `no_std`、`#[repr(C)]` 常量和 ABI 类型。 |
 | `honk-nfqueue` | 成员 | raw `NETLINK_NETFILTER` 队列 `320`、verdict 所有权和自有 nftables 事务。 |
 | `honk-netstack` | 成员 | sans-I/O 的 IPv4/IPv6 TCP/UDP 栈，作为 WireGuard 隧道的内层网络；只依赖 `blake3` 和 `thiserror`。见[用户态网络栈](./netstack.md)。 |
+| `honk-datapath` | 成员 | core 显式 packet Endpoint 嵌入所用的 scope 身份与有界 frame/descriptor 所有权；不提供抓包后端配置。 |
 | `honk-outbound` | 成员 | 协议 Handler、逐节点 runtime、出站组、健康状态、URLTest 探测和始终编译的 Score 评分器。 |
 | `honk-core` | 成员 | 引擎库与二进制：eBPF/NFQUEUE runtime、控制面、DNS、路由、中继和 Clash API。 |
 | `honk-tool` | 成员 | 用于订阅/节点探测、数据路径诊断、已固定 map 检查和 geo 资源查询的 CLI 工具箱。 |

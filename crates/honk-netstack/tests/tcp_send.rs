@@ -8,6 +8,11 @@ use honk_netstack::{
     Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StreamError, TcpState, UdpError,
 };
 
+#[path = "tcp_send/accounted.rs"]
+mod accounted;
+#[path = "tcp_send/control.rs"]
+mod control;
+
 const CHUNK: usize = 16 * 1024;
 const MSS: u16 = 1000;
 
@@ -47,6 +52,7 @@ fn checksum(bytes: &[u8]) -> u16 {
 fn verify_packet(bytes: &[u8], proto: u8) -> wire::IpPacket {
     let ip = wire::parse_ip(bytes).unwrap();
     assert_eq!(ip.proto, proto);
+    assert_eq!(ip.dscp, 0);
     assert_eq!(ip.payload.end, bytes.len());
     let mut pseudo = Vec::new();
     match (ip.src, ip.dst) {

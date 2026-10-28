@@ -5,6 +5,7 @@ members = [
     "crates/honk-config",
     "crates/honk-ebpf-common",
     "crates/honk-netstack",
+    "crates/honk-datapath",
     "crates/honk-nfqueue",
     "crates/honk-outbound",
     "crates/honk-core",
@@ -24,6 +25,7 @@ authors = ["glassyiris <honk@catmint.cc> and honk contributors"]
 honk-config = { path = "crates/honk-config" }
 honk-ebpf-common = { path = "crates/honk-ebpf-common" }
 honk-netstack = { path = "crates/honk-netstack" }
+honk-datapath = { path = "crates/honk-datapath" }
 honk-nfqueue = { path = "crates/honk-nfqueue" }
 honk-outbound = { path = "crates/honk-outbound" }
 

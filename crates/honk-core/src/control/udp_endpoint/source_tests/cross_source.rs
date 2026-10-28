@@ -40,7 +40,10 @@ async fn different_sources_share_only_aggregated_carriers() {
             .map(|socket| socket.local_addr().unwrap());
         let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
             8,
-            Arc::new(SourceReplySocketFactory::new(reply_sockets)),
+            Arc::new(SourceReplySocketFactory::new(
+                [ScopeId::HOST],
+                reply_sockets,
+            )),
         ));
         let stats = Arc::new(StatsManager::new());
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -52,6 +55,7 @@ async fn different_sources_share_only_aggregated_carriers() {
             let lease = reserve_source(&pool, &stats, client, target, node.id);
             let attachment = pool
                 .prepare_source(
+                    honk_datapath::ScopeId::HOST,
                     &honk_outbound::proxy::ProxyRegistry::new(),
                     Arc::clone(&generation),
                     Arc::clone(&runtime),
@@ -126,7 +130,10 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
     let remote: SocketAddr = "192.0.2.10:9999".parse().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         8,
-        Arc::new(SourceReplySocketFactory::new(reply_sockets)),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            reply_sockets,
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -137,6 +144,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
         let mut lease = reserve_source(&pool, &stats, client_addr, original, node.id);
         let attachment = pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
@@ -160,7 +168,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
             attachment,
             remote,
             None,
-            Arc::new(pool.create_reply_socket(original).unwrap()),
+            Arc::new(pool.create_reply_socket(lease.scope(), original).unwrap()),
             stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,
@@ -181,6 +189,85 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
             .unwrap();
         assert_eq!(receive_reply(&client).await, (b"reply".to_vec(), original));
     }
+    endpoints.clear();
+    assert!(pool.shutdown().await.joined);
+    generation.shutdown().await;
+    wire_task.abort();
+    let _ = wire_task.await;
+}
+
+#[tokio::test]
+async fn overlapping_scopes_send_distinct_vless_source_ids_on_the_wire() {
+    let (server, mut events, wire_task) = start_wire_peer().await;
+    let node = vless_node(server);
+    let generation = Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap());
+    let runtime = generation.get(&node.id).unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let reply_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let target = reply_socket.local_addr().unwrap();
+    let scopes = [ScopeId::HOST, ScopeId::allocate().unwrap()];
+    let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+        2,
+        Arc::new(SourceReplySocketFactory::new(
+            scopes,
+            [reply_socket.try_clone().unwrap(), reply_socket],
+        )),
+    ));
+    let stats = Arc::new(StatsManager::new());
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    let mut endpoints = Vec::new();
+    let mut frames = Vec::new();
+    let mut replies = HashMap::new();
+    for scope in scopes {
+        let EndpointReservation::Initializing(lease) = pool.reserve_or_enqueue(
+            scope,
+            client_addr,
+            target,
+            b"held",
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        ) else {
+            panic!("overlapping scoped tuple must reserve");
+        };
+        let attachment = pool
+            .prepare_source(
+                scope,
+                &honk_outbound::proxy::ProxyRegistry::new(),
+                Arc::clone(&generation),
+                Arc::clone(&runtime),
+                client_addr,
+                SourcePath::Vless(VlessUdpPath::Xudp),
+                None,
+                target,
+                None,
+                Duration::from_secs(2),
+                Arc::clone(&alive),
+                Arc::clone(&stats),
+                honk_outbound::alive::IpVersion::V4,
+                false,
+            )
+            .await
+            .unwrap()
+            .commit(&pool)
+            .await
+            .unwrap();
+        let endpoint = install_source(&pool, lease, attachment, target, &stats, node.id);
+        endpoint.send_packet(b"same-tuple", true).await.unwrap();
+        let frame = next_data_frame(&mut events, &mut replies).await;
+        assert_eq!((frame.status, frame.target), (STATUS_NEW, Some(target)));
+        assert_eq!(frame.payload.as_deref(), Some(b"same-tuple".as_slice()));
+        frames.push(frame);
+        endpoints.push(endpoint);
+    }
+    assert!(frames[0].global_id.is_some());
+    assert_ne!(frames[0].global_id, frames[1].global_id);
+    replies[&frames[0].connection]
+        .send((target, b"scope-a".to_vec()))
+        .unwrap();
+    assert_eq!(receive_reply(&client).await, (b"scope-a".to_vec(), target));
+    assert!(endpoints[0].has_reply());
+    assert!(!endpoints[1].has_reply());
     endpoints.clear();
     assert!(pool.shutdown().await.joined);
     generation.shutdown().await;

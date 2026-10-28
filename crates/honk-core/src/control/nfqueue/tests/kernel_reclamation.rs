@@ -75,6 +75,7 @@ impl Fixture {
             .udp_conn_state_store(&key.tuples(), &kernel)
             .unwrap();
         match self.endpoints.reserve_owned_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             key.client,
             key.destination,
             bytes::Bytes::from_static(b"old flow"),
@@ -91,7 +92,10 @@ impl Fixture {
 
     async fn wait_until_endpoint_gone(&self, key: FlowKey) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while self.endpoints.contains(key.client, key.destination) {
+            while self
+                .endpoints
+                .contains(honk_datapath::ScopeId::HOST, key.client, key.destination)
+            {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -204,11 +208,11 @@ async fn hint_retirement_preserves_foreign_endpoint_incarnations() {
         }
         // Hints settle in order, so the sentinel's retirement proves the first was handled.
         fixture.wait_until_endpoint_gone(sentinel).await;
-        assert!(
-            fixture
-                .endpoints
-                .contains(foreign.client, foreign.destination)
-        );
+        assert!(fixture.endpoints.contains(
+            honk_datapath::ScopeId::HOST,
+            foreign.client,
+            foreign.destination
+        ));
         assert_eq!(
             fixture
                 .backend

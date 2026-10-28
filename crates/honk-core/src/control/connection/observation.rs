@@ -147,7 +147,7 @@ impl ConnectionObservation {
         }
     }
 
-    pub(super) fn is_recording(&self) -> bool {
+    pub(in crate::control) fn is_recording(&self) -> bool {
         self.recorded.is_some()
     }
 
@@ -182,7 +182,7 @@ impl ConnectionObservation {
         plan
     }
 
-    pub(super) fn routing_started(&self) {
+    pub(in crate::control) fn routing_started(&self) {
         if let Some(flow) = self.flow() {
             flow.transition(
                 ConnectionState::Routing,
@@ -375,7 +375,7 @@ impl ConnectionObservation {
         }
     }
 
-    pub(super) fn routed(&mut self, decision: &mut RoutingDecision) {
+    pub(in crate::control) fn routed(&mut self, decision: &mut RoutingDecision) {
         let Some(record) = &mut self.recorded else {
             return;
         };

@@ -299,6 +299,7 @@ const RELAY_BUF_SIZE: usize = u16::MAX as usize;
 // Idle and chatty flows keep this small buffer; one saturated read marks a
 // bulk flow, which uses the full frame size for the rest of its life.
 const RELAY_BUF_MIN: usize = 8 * 1024;
+pub(crate) const COPY_BUFFER_MEMORY: usize = 2 * (RELAY_BUF_SIZE + RELAY_BUF_MIN);
 
 /// Stops both copy directions where neither holds unwritten bytes, so the
 /// relay can hand the connection to another engine without cancelling a

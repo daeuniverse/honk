@@ -238,7 +238,7 @@ fn caps_off_is_byte_identical_to_poll_transmit() {
                     c.stack
                         .poll_transmit_with(c.now, &mut buf, TxCaps::NONE)
                         .map(|t| {
-                            assert_eq!(t, plain(t.len));
+                            assert_eq!(t, plain(t.len, Some(c.id)));
                             t.len
                         })
                 } else {
@@ -505,7 +505,11 @@ fn an_endpoint_stack_ignores_tx_caps() {
     let mut buf = vec![0u8; 70_000];
     let mut n = 0;
     while let Some(t) = s.poll_transmit_with(now, &mut buf, TxCaps::ALL) {
-        assert_eq!(t, plain(t.len), "endpoint packets are complete and single");
+        assert_eq!(
+            t,
+            plain(t.len, Some(id)),
+            "endpoint packets are complete and single"
+        );
         assert!(t.len <= 1420);
         n += 1;
     }
@@ -617,7 +621,7 @@ fn uso_errors_consume_nothing_and_respect_the_limits() {
     );
     // One datagram's worth is an ordinary send.
     let t = try_send(&mut s, 1000, TxCaps::NONE, &big[..900], &mut out).unwrap();
-    assert_eq!(t, plain(t.len));
+    assert_eq!(t, plain(t.len, None));
     assert_eq!(s.stats().tx_packets, 2);
     // An endpoint stack never takes offload.
     let mut e = Stack::new(Config::new([1; 32]), Instant::now());
@@ -670,7 +674,7 @@ fn plain_udp_fragments_never_adopt_offload_metadata() {
         while let Some(tx) = stack.poll_transmit_with(now, &mut packet, TxCaps::ALL) {
             assert_eq!(
                 tx,
-                plain(tx.len),
+                plain(tx.len, None),
                 "IP fragmentation is not UDP segmentation"
             );
             assert!(tx.len <= 1420);

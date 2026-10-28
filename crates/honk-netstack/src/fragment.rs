@@ -13,14 +13,14 @@
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::icmp_out::{IcmpEmit, IcmpOut, Reject};
 use crate::tcp::output::Output;
 use crate::wire::frag::{self, Fragment};
-use crate::{DropReason, MemoryBudget, Rx};
+use crate::{DropReason, MemoryBudget, MemoryReservation, Rx};
 
 /// Fixed bookkeeping charged per datagram next to its data, header and range storage.
 const ENTRY_OVERHEAD: usize = 256;
@@ -49,6 +49,44 @@ impl Default for FragmentLimits {
     }
 }
 
+/// Reassembled bytes whose capacity charge follows their lifetime, including beyond Stack drop.
+#[derive(Debug)]
+pub struct OwnedPacket {
+    bytes: Box<[u8]>,
+    _reservation: Option<MemoryReservation>,
+}
+
+impl OwnedPacket {
+    /// Whether these retained bytes are funded by this exact shared budget.
+    pub fn charged_to(&self, budget: &Arc<MemoryBudget>) -> bool {
+        self._reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.belongs_to(budget))
+    }
+}
+
+impl Deref for OwnedPacket {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl AsRef<[u8]> for OwnedPacket {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl PartialEq for OwnedPacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for OwnedPacket {}
+
 #[derive(Debug)]
 pub(crate) enum Push {
     /// Stored (or absorbed by a tombstone); nothing to process yet.
@@ -60,7 +98,7 @@ pub(crate) enum Push {
 /// A complete datagram as a normal IP packet that `wire::parse_ip` accepts.
 #[derive(Debug)]
 pub(crate) struct Reassembled {
-    pub packet: Vec<u8>,
+    pub packet: OwnedPacket,
 }
 
 impl Reassembled {
@@ -68,9 +106,15 @@ impl Reassembled {
     /// borrow from its own input: borrowed transparent UDP becomes the owned variant.
     pub(crate) fn wrap(self, rx: Rx) -> Rx {
         match rx {
-            Rx::Transparent { src, dst, payload } => Rx::TransparentOwned {
+            Rx::Transparent {
                 src,
                 dst,
+                dscp,
+                payload,
+            } => Rx::TransparentOwned {
+                src,
+                dst,
+                dscp,
                 packet: self.packet,
                 payload,
             },
@@ -143,6 +187,23 @@ pub(crate) struct Reassembler {
     pub(crate) stats: FragmentStats,
 }
 
+impl Reassembler {
+    pub(crate) fn overhead_bound(limits: FragmentLimits) -> Option<usize> {
+        crate::budget::collection_peak::<Entry>(limits.max_entries)?
+            .checked_add(crate::budget::collection_peak::<Vec<u8>>(MAX_PENDING_ICMP)?)
+    }
+
+    pub(crate) fn scratch_bound(limits: FragmentLimits) -> Option<usize> {
+        // A dry-run range insertion can double the cloned range backing before validation.
+        crate::budget::collection_peak::<(usize, usize)>(limits.max_holes.checked_add(2)?)?
+            .checked_add(
+                usize::from(u16::MAX)
+                    .checked_mul(2)?
+                    .checked_add(crate::icmp_out::quote_limit(true) + QUOTE_L4)?,
+            )
+    }
+}
+
 impl Default for Reassembler {
     fn default() -> Self {
         Self::new(FragmentLimits::default())
@@ -151,6 +212,8 @@ impl Default for Reassembler {
 
 impl Drop for Reassembler {
     fn drop(&mut self) {
+        self.entries.clear();
+        self.expired.clear();
         self.shrink(self.bytes);
     }
 }
@@ -347,21 +410,40 @@ impl Reassembler {
         }
         if complete {
             let entry = self.entries.remove(idx);
-            self.shrink(entry.charged);
+            let charged = entry.charged;
             let live = entry.live.expect("live entry");
-            return Ok(Some(self.finish(&live.head, &live.data, f.is_v6())));
+            let result = self.finish(&live.head, &live.data, f.is_v6());
+            drop(live);
+            self.shrink(charged);
+            return Ok(Some(result));
         }
         Ok(None)
     }
 
     fn finish(&mut self, head: &[u8], data: &[u8], v6: bool) -> Push {
-        let Some(mut packet) = frag::seal_head(head, v6, data.len()) else {
+        let Some(len) = frag::reassembled_len(head.len(), v6, data.len()) else {
             self.stats.invalid += 1;
             return Push::Dropped(DropReason::Fragment);
         };
-        packet.extend_from_slice(data);
+        let reservation = match &self.budget {
+            Some(budget) => match budget.reserve(len) {
+                Some(reservation) => Some(reservation),
+                None => return Push::Dropped(DropReason::Capacity),
+            },
+            None => None,
+        };
+        let Some(bytes) = frag::seal_packet(head, v6, data) else {
+            self.stats.invalid += 1;
+            return Push::Dropped(DropReason::Fragment);
+        };
+        debug_assert_eq!(bytes.len(), len);
         self.stats.completed += 1;
-        Push::Complete(Reassembled { packet })
+        Push::Complete(Reassembled {
+            packet: OwnedPacket {
+                bytes,
+                _reservation: reservation,
+            },
+        })
     }
 
     /// Frees the buffer; the entry stays as a tombstone until its timeout.
@@ -379,7 +461,9 @@ impl Reassembler {
             return;
         };
         let entry = self.entries.remove(i);
-        self.shrink(entry.charged);
+        let charged = entry.charged;
+        drop(entry);
+        self.shrink(charged);
         self.stats.evicted += 1;
     }
 
@@ -389,6 +473,10 @@ impl Reassembler {
             .iter()
             .map(|e| e.created + self.limits.timeout)
             .min()
+    }
+
+    pub(crate) fn is_quiescent(&self) -> bool {
+        self.entries.is_empty() && self.expired.is_empty()
     }
 
     /// Drops datagrams older than the timeout; those with fragment 0 queue an ICMP quote.
@@ -430,7 +518,9 @@ impl Reassembler {
                 return Output::Blocked;
             }
             let quote = self.expired.pop_front().expect("front");
-            self.shrink(quote.capacity());
+            let charged = quote.capacity();
+            drop(quote);
+            self.shrink(charged);
             if let IcmpEmit::Sent(n) = result {
                 return Output::Sent(n);
             }
@@ -506,6 +596,7 @@ mod tests {
     use std::net::SocketAddr;
 
     mod expiry;
+    mod ownership;
 
     /// Independent splitter: cuts a full UDP IP datagram into fragments of `size` data bytes.
     pub(crate) fn split(packet: &[u8], id: u32, size: usize) -> Vec<Vec<u8>> {
@@ -555,7 +646,7 @@ mod tests {
 
     fn complete(r: Push) -> Vec<u8> {
         match r {
-            Push::Complete(r) => r.packet,
+            Push::Complete(r) => r.packet.to_vec(),
             other => panic!("expected a complete datagram, got {other:?}"),
         }
     }

@@ -493,6 +493,7 @@ fn a_uso_super_packet_splits_into_datagrams_by_size() {
         let Rx::TransparentSplit {
             src,
             dst,
+            dscp,
             payload: range,
             size,
         } = c.stack.receive_with(c.now, &pkt, meta)
@@ -500,6 +501,7 @@ fn a_uso_super_packet_splits_into_datagrams_by_size() {
             panic!("expected a split for {csum:?}")
         };
         assert_eq!((src, dst), (addr(CLIENT), addr(DST)));
+        assert_eq!(dscp, 0);
         assert_eq!(size, 1000);
         let chunks: Vec<&[u8]> = pkt[range].chunks(usize::from(size)).collect();
         assert_eq!(chunks.len(), 6);

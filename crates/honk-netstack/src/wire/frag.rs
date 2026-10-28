@@ -107,29 +107,47 @@ fn parse_v6(pkt: &[u8]) -> Result<Fragment<'_>, ParseError> {
     })
 }
 
-/// Turns the first fragment's `head` into the header of the reassembled datagram carrying
-/// `data_len` bytes: IPv4 loses MF/offset, IPv6 loses the fragment header. Returns `None` when
-/// the result would exceed a 16-bit length.
-pub fn seal_head(head: &[u8], v6: bool, data_len: usize) -> Option<Vec<u8>> {
-    if v6 {
-        let keep = head.len() - FRAGMENT_HEADER_LEN;
-        let next = head[keep];
-        let nh_off = ipv6::walk_ext_headers(head, ipv6::HEADER_LEN, keep, head[6])
-            .ok()?
-            .nh_off;
-        let mut h = head[..keep].to_vec();
-        h[nh_off] = next;
-        let len = u16::try_from(keep - ipv6::HEADER_LEN + data_len).ok()?;
-        h[4..6].copy_from_slice(&len.to_be_bytes());
-        Some(h)
+/// Size of a complete packet after removing the fragmentation header/flags.
+pub fn reassembled_len(head_len: usize, v6: bool, data_len: usize) -> Option<usize> {
+    let keep = if v6 {
+        head_len.checked_sub(FRAGMENT_HEADER_LEN)?
     } else {
-        let mut h = head.to_vec();
-        let total = u16::try_from(h.len() + data_len).ok()?;
-        h[2..4].copy_from_slice(&total.to_be_bytes());
-        h[6..8].fill(0);
-        h[10..12].fill(0);
-        let ck = checksum(&h);
-        h[10..12].copy_from_slice(&ck.to_be_bytes());
-        Some(h)
+        head_len
+    };
+    let minimum = if v6 {
+        ipv6::HEADER_LEN
+    } else {
+        ipv4::HEADER_LEN
+    };
+    if keep < minimum || (!v6 && keep > 60) {
+        return None;
     }
+    let total = keep.checked_add(data_len)?;
+    u16::try_from(if v6 { total - ipv6::HEADER_LEN } else { total }).ok()?;
+    Some(total)
+}
+
+/// Seals a decoded fragment header and its complete payload into one exact-sized owned packet.
+pub fn seal_packet(head: &[u8], v6: bool, data: &[u8]) -> Option<Box<[u8]>> {
+    let total = reassembled_len(head.len(), v6, data.len())?;
+    let keep = total - data.len();
+    let nh_off = if v6 {
+        ipv6::walk_ext_headers(head, ipv6::HEADER_LEN, keep, head[6])
+            .ok()?
+            .nh_off
+    } else {
+        0
+    };
+    let mut packet: Box<[u8]> = head[..keep].iter().chain(data).copied().collect();
+    if v6 {
+        packet[nh_off] = head[keep];
+        packet[4..6].copy_from_slice(&((total - ipv6::HEADER_LEN) as u16).to_be_bytes());
+    } else {
+        packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        packet[6..8].fill(0);
+        packet[10..12].fill(0);
+        let ck = checksum(&packet[..keep]);
+        packet[10..12].copy_from_slice(&ck.to_be_bytes());
+    }
+    Some(packet)
 }

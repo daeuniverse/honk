@@ -346,12 +346,14 @@ impl ControlPlane {
     /// driver-ready work before `run()` has created listener tasks.
     pub(super) fn install_node_death_callback(&self) {
         let pool = self.connection_pool.clone();
-        let udp_pool = self.udp_pool.clone();
+        let udp_pool = Arc::downgrade(&self.udp_pool);
         let config_for_purge = self.config.clone();
         let runtime_registry = self.runtime_registry.clone();
         self.alive_set.set_death_callback(Some(Box::new(
             move |node_id: uuid::Uuid, _name: &str| {
-                udp_pool.remove_by_node(node_id);
+                if let Some(udp_pool) = udp_pool.upgrade() {
+                    udp_pool.remove_by_node(node_id);
+                }
                 let generation = runtime_registry.read().generation();
                 let node_addr = config_for_purge.try_read().ok().and_then(|c| {
                     c.nodes

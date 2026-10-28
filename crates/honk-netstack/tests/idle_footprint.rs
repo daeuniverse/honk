@@ -221,8 +221,7 @@ fn idle_established_flows_hold_no_chunks_or_descriptors() {
         "drained rings must not keep chunks or descriptors: {} B allocated",
         stats.memory_allocated
     );
-    // Tcb 1 KiB (asserted in the crate), slab slot 144 B, flow-table bucket and timer entry, two
-    // chunk-list stubs of 48 B. Rings and descriptors are gone; what is left is the state itself.
+    // Protocol state and retained shared backing must fit the idle-flow budget.
     assert!(
         per_flow <= 1536.0,
         "idle flow footprint {per_flow:.0} B exceeds 1.5 KiB"

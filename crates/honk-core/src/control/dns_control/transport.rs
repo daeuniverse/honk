@@ -9,14 +9,20 @@ use tracing::debug;
 
 pub(super) const TCP_DNS_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub(in crate::control) enum DnsUdpReply<'a> {
+    Kernel,
+    Packet(&'a crate::control::netstack::DatagramSender),
+}
+
 impl DnsController {
-    pub(crate) async fn handle_udp_dns_admitted(
+    pub(in crate::control) async fn handle_udp_dns_admitted(
         &self,
         admission: &super::AdmittedDnsQuery,
         data: &[u8],
         client_addr: SocketAddr,
         original_dst: SocketAddr,
         validated: ValidatedDnsQuery,
+        reply: DnsUdpReply<'_>,
     ) {
         let operation = self.handle_udp_dns_admitted_inner(
             admission,
@@ -24,6 +30,7 @@ impl DnsController {
             client_addr,
             original_dst,
             validated,
+            reply,
         );
         crate::observe::scope_pin!(operation);
         let operation = crate::observe::flows::dns::client_scope(
@@ -42,6 +49,7 @@ impl DnsController {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
         validated: ValidatedDnsQuery,
+        reply: DnsUdpReply<'_>,
     ) {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
@@ -55,11 +63,21 @@ impl DnsController {
             )
             .await;
         let delivery = admission
-            .run_reply(super::super::send_udp_reply_from_orig_dst(
-                response.wire(),
-                client_addr,
-                original_dst,
-            ))
+            .run_reply(async {
+                match reply {
+                    DnsUdpReply::Kernel => {
+                        super::super::send_udp_reply_from_orig_dst(
+                            response.wire(),
+                            client_addr,
+                            original_dst,
+                        )
+                        .await
+                    }
+                    DnsUdpReply::Packet(sender) => {
+                        sender.send_to(response.wire(), client_addr).await
+                    }
+                }
+            })
             .await;
         crate::observe::flows::dns::reply_delivery(
             &delivery,
@@ -77,7 +95,7 @@ impl DnsController {
         );
     }
 
-    /// Handle a TCP DNS-over-TCP connection from TPROXY.
+    /// Handle a transparent DNS-over-TCP stream after traffic-policy admission.
     pub async fn handle_tcp_dns(
         &self,
         stream: &mut TcpStream,
@@ -87,7 +105,18 @@ impl DnsController {
         if original_dst.port() != 53 {
             return Ok(false);
         }
-        self.serve_tcp_frames(stream, client_addr, Some(original_dst))
+        stream.set_nodelay(true)?;
+        self.serve_tcp_frames(stream, client_addr, Some(original_dst), true)
+            .await
+    }
+
+    pub(in crate::control) async fn handle_packet_tcp_dns(
+        &self,
+        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+        client_addr: SocketAddr,
+        original_dst: SocketAddr,
+    ) -> anyhow::Result<bool> {
+        self.serve_tcp_frames(stream, client_addr, Some(original_dst), false)
             .await
     }
 
@@ -97,7 +126,10 @@ impl DnsController {
         stream: &mut TcpStream,
         client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        let _ = self.serve_tcp_frames(stream, client_addr, None).await?;
+        stream.set_nodelay(true)?;
+        let _ = self
+            .serve_tcp_frames(stream, client_addr, None, true)
+            .await?;
         Ok(())
     }
 
@@ -106,11 +138,11 @@ impl DnsController {
     /// frames close the connection rather than falling through after consuming bytes.
     async fn serve_tcp_frames(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
         client_addr: SocketAddr,
         original_dst: Option<SocketAddr>,
+        project_kernel: bool,
     ) -> anyhow::Result<bool> {
-        stream.set_nodelay(true)?;
         let metadata = DnsRequestMeta::new(Some(client_addr.ip()), original_dst);
         let mut query = Vec::new();
         if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
@@ -118,26 +150,28 @@ impl DnsController {
         }
 
         debug!(%client_addr, "DNS controller (TCP): forwarding query");
-        self.process_tcp_query(stream, &query, client_addr, metadata)
+        self.process_tcp_query(stream, &query, client_addr, metadata, project_kernel)
             .await?;
 
         loop {
             if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
                 return Ok(true);
             }
-            self.process_tcp_query(stream, &query, client_addr, metadata)
+            self.process_tcp_query(stream, &query, client_addr, metadata, project_kernel)
                 .await?;
         }
     }
 
     async fn process_tcp_query(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
         query: &[u8],
         client_addr: SocketAddr,
         metadata: DnsRequestMeta,
+        project_kernel: bool,
     ) -> anyhow::Result<()> {
-        let operation = self.process_tcp_query_inner(stream, query, client_addr, metadata);
+        let operation =
+            self.process_tcp_query_inner(stream, query, client_addr, metadata, project_kernel);
         crate::observe::scope_pin!(operation);
         let operation = crate::observe::flows::dns::client_scope(
             query,
@@ -150,17 +184,22 @@ impl DnsController {
 
     async fn process_tcp_query_inner(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
         query: &[u8],
         client_addr: SocketAddr,
         metadata: DnsRequestMeta,
+        project_kernel: bool,
     ) -> anyhow::Result<()> {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
         #[cfg(not(feature = "native-api"))]
         let _ = client_addr;
         // Each persistent frame gets the current generation independently.
-        let admission = match self.try_admit_query(false) {
+        let admission = match if project_kernel {
+            self.try_admit_query(false)
+        } else {
+            self.try_admit_packet_query(false)
+        } {
             Ok(admission) => admission,
             Err(_) => {
                 crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
@@ -217,7 +256,7 @@ impl DnsController {
 }
 
 async fn write_tcp_dns_response(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     response: &[u8],
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -227,7 +266,7 @@ async fn write_tcp_dns_response(
 }
 
 async fn read_tcp_dns_query(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
     query: &mut Vec<u8>,
     read_timeout: Option<Duration>,
 ) -> bool {

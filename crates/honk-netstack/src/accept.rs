@@ -24,6 +24,8 @@ pub struct SynInfo {
     pub client: SocketAddr,
     /// The destination the client dialed; replies are sourced from it.
     pub original_dst: SocketAddr,
+    /// DSCP of the first admitted SYN, excluding ECN.
+    pub dscp: u8,
     /// The client's MSS option (536/1220 when absent).
     pub mss: u16,
     pub wscale: Option<u8>,
@@ -100,6 +102,7 @@ impl Stack {
                 id,
                 client: t.tuple.remote,
                 original_dst: t.tuple.local,
+                dscp: t.dscp,
                 mss: t.peer_mss,
                 wscale: t.wscale.then_some(t.snd_shift),
                 sack: t.sack,
@@ -161,9 +164,9 @@ impl Stack {
         let ack = seq.wrapping_add(1);
         match how {
             Refuse::Drop => {}
-            Refuse::Rst => self.control(tuple, 0, ack, wire::tcp::RST | wire::tcp::ACK),
+            Refuse::Rst => self.control(tuple, 0, ack, wire::tcp::RST | wire::tcp::ACK, Some(id)),
             Refuse::IcmpUnreachable | Refuse::IcmpAdminProhibited => {
-                self.refusal(tuple, seq, how);
+                self.refusal(id, tuple, seq, how);
             }
         }
         self.tx_wakeup = true;
@@ -177,6 +180,7 @@ impl Stack {
         now: Instant,
         tuple: FourTuple,
         h: &wire::tcp::Header,
+        dscp: u8,
         reopen: Option<(u32, u32)>,
     ) -> Option<Rx> {
         if h.flags & (wire::tcp::SYN | wire::tcp::ACK | wire::tcp::RST | wire::tcp::FIN)
@@ -187,6 +191,9 @@ impl Stack {
             || tuple.local.port() == 0
         {
             return None;
+        }
+        if !self.accepting {
+            return Some(self.drop_packet(DropReason::Capacity));
         }
         let source = tuple.remote.ip();
         if self.half_open >= self.cfg.half_open_max
@@ -199,6 +206,7 @@ impl Stack {
         }
         if self.table.active >= self.cfg.max_flows
             || self.table.tcp_active >= self.floor_cap
+            || !self.table.can_insert(reopen.map(|(index, _)| index))
             || !self.pool.admit_floor()
         {
             return Some(self.drop_packet(DropReason::Capacity));
@@ -217,7 +225,8 @@ impl Stack {
             }
         }
         let offset = flow::ts_offset(&self.cfg.secret, tuple.local.ip(), source);
-        let t = Tcb::new_passive(tuple, &self.cfg, now, self.epoch, iss, offset, h);
+        let mut t = Tcb::new_passive(tuple, &self.cfg, now, self.epoch, iss, offset, h);
+        t.dscp = dscp;
         let id = self.table.insert(Flow::Tcp(Box::new(t)));
         self.half_open += 1;
         *self.half_open_by_source.entry(source).or_default() += 1;
@@ -266,13 +275,14 @@ impl Stack {
     }
 
     /// Queues the ICMP error for a refused SYN.
-    fn refusal(&mut self, tuple: FourTuple, seq: u32, how: Refuse) {
+    fn refusal(&mut self, id: FlowId, tuple: FourTuple, seq: u32, how: Refuse) {
         self.queue_control(Control {
             tuple,
             seq,
             ack: 0,
             flags: 0,
             icmp: Some(how),
+            flow: Some(id),
         });
     }
 }

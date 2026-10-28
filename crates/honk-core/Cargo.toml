@@ -17,6 +17,8 @@ bench = false
 [dependencies]
 honk-config.workspace = true
 honk-ebpf-common.workspace = true
+honk-datapath.workspace = true
+honk-netstack.workspace = true
 honk-outbound.workspace = true
 honk-nfqueue = { workspace = true, optional = true }
 

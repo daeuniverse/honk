@@ -27,6 +27,7 @@ impl FlowKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::control) struct PendingUdpIdentity {
+    pub(in crate::control) scope: honk_datapath::ScopeId,
     pub(super) key: FlowKey,
     pub(super) owner: crate::ebpf::UdpFlowOwner,
     pub(super) endpoint_generation: u64,
@@ -34,11 +35,13 @@ pub(in crate::control) struct PendingUdpIdentity {
 
 impl PendingUdpIdentity {
     pub(super) fn new(
+        scope: honk_datapath::ScopeId,
         key: FlowKey,
         owner: crate::ebpf::UdpFlowOwner,
         endpoint_generation: u64,
     ) -> Self {
         Self {
+            scope,
             key,
             owner,
             endpoint_generation,

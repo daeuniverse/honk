@@ -70,9 +70,10 @@ impl QuicSniffOutcome {
     }
 }
 
-/// A key identifying a QUIC flow family: (src, dst).
+/// A scoped QUIC flow family; identical tuples in other domains share no state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketSnifferKey {
+    pub scope: honk_datapath::ScopeId,
     pub src_ip: [u8; 16],
     pub src_port: u16,
     pub dst_ip: [u8; 16],
@@ -80,7 +81,7 @@ pub struct PacketSnifferKey {
 }
 
 impl PacketSnifferKey {
-    pub fn new(src: SocketAddr, dst: SocketAddr) -> Self {
+    pub fn new(scope: honk_datapath::ScopeId, src: SocketAddr, dst: SocketAddr) -> Self {
         let mut src_ip = [0u8; 16];
         let mut dst_ip = [0u8; 16];
         match src.ip() {
@@ -100,6 +101,7 @@ impl PacketSnifferKey {
             std::net::IpAddr::V6(ip) => dst_ip.copy_from_slice(&ip.octets()),
         }
         Self {
+            scope,
             src_ip,
             src_port: src.port(),
             dst_ip,
@@ -339,6 +341,15 @@ impl PacketSnifferPool {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::control) fn expire_for_test(&self) {
+        for shard in &self.sessions {
+            for session in shard.lock().values_mut() {
+                session.expires_at = Instant::now() - Duration::from_secs(1);
+            }
+        }
+    }
+
     /// Run a janitor cycle: remove expired sessions.
     pub fn janitor_cycle(&self) -> usize {
         let now = Instant::now();
@@ -386,9 +397,32 @@ mod tests {
 
     fn test_key() -> PacketSnifferKey {
         PacketSnifferKey::new(
+            honk_datapath::ScopeId::HOST,
             "10.0.0.1:12345".parse().unwrap(),
             "8.8.8.8:443".parse().unwrap(),
         )
+    }
+
+    #[test]
+    fn completed_sni_is_not_reused_in_another_scope() {
+        let pool = PacketSnifferPool::new();
+        let first = test_key();
+        let second = PacketSnifferKey {
+            scope: honk_datapath::ScopeId::allocate().unwrap(),
+            ..first
+        };
+        assert_eq!(
+            pool.feed_quic_initial(first, &test_utils::rfc9001_client_initial()),
+            QuicSniffOutcome::Domain("example.com".into())
+        );
+        assert_eq!(
+            pool.feed_quic_initial(second, b"not QUIC"),
+            QuicSniffOutcome::NotQuic
+        );
+        assert_eq!(
+            pool.feed_quic_initial(first, b"not QUIC"),
+            QuicSniffOutcome::Domain("example.com".into())
+        );
     }
 
     /// A datagram that looks like a QUIC Initial header but carries a

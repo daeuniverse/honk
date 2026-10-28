@@ -102,6 +102,7 @@ impl QueuedBatch {
         let (client, destination) = bench_addresses();
         let enqueued_at = super::queue_now();
         let lease = match pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             destination,
             first,
@@ -133,6 +134,7 @@ impl QueuedBatch {
 
     fn enqueue(&mut self, payload: &[u8]) -> EndpointReservation {
         self.pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             self.client,
             self.destination,
             payload,
@@ -200,6 +202,7 @@ impl ReadyBatch {
     fn enqueue(&self, payload: &[u8]) -> EndpointReservation {
         self.pool
             .fast_path_enqueue_at(
+                honk_datapath::ScopeId::HOST,
                 self.client,
                 self.destination,
                 payload,
@@ -219,11 +222,13 @@ impl ReadyBatch {
     fn release_and_assert(self) {
         let (remove_tx, mut remove_rx) = mpsc::channel(1);
         self.pool.set_remove_sink(remove_tx);
-        self.pool.remove(self.client, self.destination);
+        self.pool
+            .remove(honk_datapath::ScopeId::HOST, self.client, self.destination);
         let removal = remove_rx
             .try_recv()
             .unwrap_or_else(|error| panic!("benchmark removal must be published: {error}"));
         assert!(self.pool.complete_removal(
+            removal.scope,
             removal.client,
             removal.dst,
             removal.owner,
@@ -268,6 +273,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
 
     for _ in 0..iterations {
         let lease = match pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             destination,
             b"rollback",
@@ -286,6 +292,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
             .try_recv()
             .unwrap_or_else(|error| panic!("rollback removal must be published: {error}"));
         assert!(pool.complete_removal(
+            removal.scope,
             removal.client,
             removal.dst,
             removal.owner,

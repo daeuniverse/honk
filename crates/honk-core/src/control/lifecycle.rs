@@ -213,7 +213,7 @@ impl ControlPlane {
         })
     }
 
-    async fn configure_health_loop(&mut self) {
+    pub(in crate::control) async fn configure_health_loop(&mut self) {
         let alive_set = self.alive_set.clone();
         let interval_secs = {
             let c = self.config.read().await;
@@ -508,10 +508,15 @@ impl ControlPlane {
     }
 
     async fn start_epoch_maintenance(&self, epoch: &mut RuntimeEpoch) {
+        epoch.maintenance = self.start_userspace_maintenance().await;
+    }
+
+    pub(in crate::control) async fn start_userspace_maintenance(&self) -> OwnedTasks {
+        let mut maintenance = OwnedTasks::default();
         let registry = self.runtime_registry.clone();
         let dns = self.dns_controller.runtime_provider();
         let groups = self.group_manager.clone();
-        let tasks = &mut epoch.maintenance.0;
+        let tasks = &mut maintenance.0;
         tasks.push(self.udp_pool.spawn_janitor());
         tasks.push(self.sniffer_pool.spawn_janitor());
         tasks.push(super::tcp_sniff::spawn_sniff_neg_cache_janitor(
@@ -546,6 +551,7 @@ impl ControlPlane {
         let generation = self.runtime_registry.read().clone();
         self.start_udp_warm_coordinator(generation.clone()).await;
         self.start_selector_warm_coordinator(generation).await;
+        maintenance
     }
 }
 
@@ -676,7 +682,10 @@ impl Drop for OwnedTasks {
     }
 }
 
-fn retain_error(target: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
+pub(in crate::control) fn retain_error(
+    target: &mut Option<anyhow::Error>,
+    result: anyhow::Result<()>,
+) {
     if let Err(error) = result {
         target.get_or_insert(error);
     }

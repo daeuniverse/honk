@@ -71,22 +71,8 @@ fn duplicate_send_error(error: &mut io::Error) -> io::Error {
     io::Error::new(kind, shared)
 }
 
-pub(super) struct TaskRegistry {
-    pub(super) closed: bool,
-    pub(super) tasks: tokio::task::JoinSet<()>,
-}
-
-impl Default for TaskRegistry {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            tasks: tokio::task::JoinSet::new(),
-        }
-    }
-}
-
 async fn drain_registered_tasks(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TaskRegistry,
     label: &str,
     disposition: &mut UdpShutdown,
 ) {
@@ -102,7 +88,7 @@ async fn drain_registered_tasks(
 }
 
 pub(super) async fn join_registered_tasks(
-    mut tasks: tokio::task::JoinSet<()>,
+    mut tasks: TaskRegistry,
     label: &str,
     graceful_timeout: Duration,
     abort_first: bool,
@@ -138,8 +124,16 @@ pub(super) async fn join_registered_tasks(
         .await
         .is_err()
         {
-            debug!("Timed out joining aborted UDP {} tasks", label);
-            disposition.joined = false;
+            if tasks.is_accounted() {
+                tracing::warn!(
+                    label,
+                    "Packet task cleanup exceeded its deadline; retaining allocation credit until join"
+                );
+                drain_registered_tasks(&mut tasks, label, &mut disposition).await;
+            } else {
+                debug!("Timed out joining aborted UDP {} tasks", label);
+                disposition.joined = false;
+            }
         }
     }
     disposition
@@ -157,6 +151,7 @@ pub(in crate::control) struct UdpDriverHandle {
     ready: Option<oneshot::Receiver<()>>,
     start: Option<oneshot::Sender<UdpDriverStart>>,
     first_ack: Option<oneshot::Receiver<io::Result<()>>>,
+    admission_error: Option<io::Error>,
     /// Test-only cancellation handle; production ownership remains in the
     /// pool's driver registry until terminal shutdown joins every task.
     #[cfg(test)]
@@ -223,11 +218,11 @@ impl From<Arc<UdpSocket>> for DriverReplySocket {
 }
 
 impl DriverReplySocket {
-    fn into_socket(self) -> Arc<ReplySocket> {
+    fn into_socket(self, _scope: ScopeId) -> Arc<ReplySocket> {
         match self {
             Self::Bounded(socket) => socket,
             #[cfg(test)]
-            Self::Untracked(socket) => Arc::new(ReplySocket::untracked(socket)),
+            Self::Untracked(socket) => Arc::new(ReplySocket::untracked(_scope, socket)),
         }
     }
 }
@@ -262,6 +257,9 @@ impl Drop for UdpDriverCleanupGuard {
 
 impl UdpDriverHandle {
     pub(in crate::control) async fn wait_ready(&mut self) -> io::Result<()> {
+        if let Some(error) = self.admission_error.take() {
+            return Err(error);
+        }
         self.ready
             .take()
             .ok_or_else(|| io::Error::other("UDP endpoint driver ready already consumed"))?
@@ -389,6 +387,7 @@ impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn spawn_driver(
         self: &Arc<Self>,
+        scope: ScopeId,
         client_addr: SocketAddr,
         client_dst: SocketAddr,
         generation: u64,
@@ -400,14 +399,14 @@ impl UdpEndpointPool {
         stats: Arc<StatsManager>,
         outbound_tracker: OutboundTracker,
     ) -> UdpDriverHandle {
-        let reply_socket = reply_socket.into().into_socket();
-        let key = EndpointKey::new(client_addr, client_dst);
+        let reply_socket = reply_socket.into().into_socket(scope);
+        let key = EndpointKey::new(scope, client_addr, client_dst);
         let (ready_tx, ready) = oneshot::channel();
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();
         let pool = Arc::clone(self);
         let mut drivers = self.drivers.lock();
-        while let Some(result) = drivers.tasks.try_join_next() {
+        while let Some(result) = drivers.try_join_next() {
             if let Err(error) = result {
                 debug!("UDP endpoint driver join failed: {}", error);
             }
@@ -420,57 +419,71 @@ impl UdpEndpointPool {
                 ready: Some(ready),
                 start: Some(start),
                 first_ack: Some(first_ack),
+                admission_error: None,
                 #[cfg(test)]
                 task: None,
             };
         }
-        let mut io = endpoint.retirement.0.start_driver();
-        let task = drivers.tasks.spawn(async move {
+        let future = move || {
+            let mut io = endpoint.retirement.0.start_driver();
             async move {
-                // Construct before every await so abort and panic take the same
-                // cleanup path as an ordinary driver return.
-                let mut _cleanup = UdpDriverCleanupGuard::new(
-                    Arc::clone(&pool),
-                    key,
-                    generation,
-                    decision_token,
-                    Arc::clone(&endpoint),
-                );
-                let _ = ready_tx.send(());
-                let initial = match start_rx.await {
-                    Ok(initial) => initial,
-                    Err(_) => return,
-                };
-                let driver_result = run_endpoint_driver(
-                    UdpDriverContext {
-                        endpoint: Arc::clone(&endpoint),
-                        queue_rx,
-                        reply_socket,
-                        foreign_replies: Arc::clone(&pool.foreign_replies),
-                        client_addr,
-                        client_dst,
-                        alive_set,
-                        stats,
-                        outbound_tracker,
-                        health_family: endpoint.health_family,
-                    },
-                    initial,
-                    first_ack_tx,
-                )
-                .await;
-                let UdpDriverResult { result, outcome } = driver_result;
-                _cleanup.set_outcome(outcome);
-                if let Err(error) = result {
-                    debug!(
-                        "UDP endpoint driver {} -> {} stopped: {}",
-                        client_addr, client_dst, error
+                async move {
+                    // Construct before every await so abort and panic take the same
+                    // cleanup path as an ordinary driver return.
+                    let mut _cleanup = UdpDriverCleanupGuard::new(
+                        Arc::clone(&pool),
+                        key,
+                        generation,
+                        decision_token,
+                        Arc::clone(&endpoint),
                     );
+                    let _ = ready_tx.send(());
+                    let initial = match start_rx.await {
+                        Ok(initial) => initial,
+                        Err(_) => return,
+                    };
+                    let driver_result = run_endpoint_driver(
+                        UdpDriverContext {
+                            endpoint: Arc::clone(&endpoint),
+                            queue_rx,
+                            reply_socket,
+                            foreign_replies: Arc::clone(&pool.foreign_replies),
+                            client_addr,
+                            client_dst,
+                            alive_set,
+                            stats,
+                            outbound_tracker,
+                            health_family: endpoint.health_family,
+                        },
+                        initial,
+                        first_ack_tx,
+                    )
+                    .await;
+                    let UdpDriverResult { result, outcome } = driver_result;
+                    _cleanup.set_outcome(outcome);
+                    if let Err(error) = result {
+                        debug!(
+                            "UDP endpoint driver {} -> {} stopped: {}",
+                            client_addr, client_dst, error
+                        );
+                    }
                 }
+                .await;
+                io.completed = true;
+                drop(io);
             }
-            .await;
-            io.completed = true;
-            drop(io);
-        });
+        };
+        let (task, admission_error) = match drivers.spawn_with(future, super::budget::RECEIVE_BYTES)
+        {
+            Ok(task) => (Some(task), None),
+            Err(_) => (
+                None,
+                Some(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    honk_outbound::proxy::PacketRejection::Capacity,
+                )),
+            ),
+        };
         drop(drivers);
         #[cfg(not(test))]
         drop(task);
@@ -478,8 +491,9 @@ impl UdpEndpointPool {
             ready: Some(ready),
             start: Some(start),
             first_ack: Some(first_ack),
+            admission_error,
             #[cfg(test)]
-            task: Some(task),
+            task,
         }
     }
 }

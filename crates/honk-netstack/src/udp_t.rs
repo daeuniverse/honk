@@ -99,6 +99,7 @@ pub(crate) struct UdpTx {
 
 impl Drop for UdpTx {
     fn drop(&mut self) {
+        self.queue.clear();
         if let Some(budget) = &self.budget
             && self.bytes != 0
         {
@@ -108,6 +109,12 @@ impl Drop for UdpTx {
 }
 
 impl UdpTx {
+    pub(crate) fn overhead_bound(mtu: usize) -> Option<usize> {
+        // IPv6's larger header gives the smallest UDP datagram that needs queueing.
+        let min_datagram = mtu.checked_sub(wire::ip_header_len(true))?.checked_add(1)?;
+        crate::budget::collection_peak::<Pending>(MAX_PENDING_BYTES / min_datagram)
+    }
+
     pub(crate) fn new(secret: &[u8; 32], budget: Option<Arc<MemoryBudget>>) -> UdpTx {
         let h = blake3::keyed_hash(secret, b"honk-netstack udp ident");
         UdpTx {
@@ -265,6 +272,7 @@ impl UdpTx {
                 start: ip_len as u16,
                 offset: 6,
             },
+            flow: None,
         })
     }
 
@@ -408,7 +416,12 @@ pub(crate) fn receive_transparent(
     let (src, dst) = (SocketAddr::new(ip.src, src), SocketAddr::new(ip.dst, dst));
     let payload = ip.payload.start + payload.start..ip.payload.start + payload.end;
     if size == 0 || payload.len() <= usize::from(size) {
-        return Rx::Transparent { src, dst, payload };
+        return Rx::Transparent {
+            src,
+            dst,
+            dscp: ip.dscp,
+            payload,
+        };
     }
     if payload.len().div_ceil(usize::from(size)) > MAX_USO_RX {
         return stack.drop_packet(DropReason::Malformed);
@@ -416,6 +429,7 @@ pub(crate) fn receive_transparent(
     Rx::TransparentSplit {
         src,
         dst,
+        dscp: ip.dscp,
         payload,
         size,
     }
@@ -471,7 +485,7 @@ mod tests {
         for p in packets {
             match r.push(now, wire::frag::parse(p).unwrap()) {
                 Push::Pending => {}
-                Push::Complete(c) => done = Some(c.packet),
+                Push::Complete(c) => done = Some(c.packet.to_vec()),
                 Push::Dropped(d) => panic!("dropped {d:?}"),
             }
         }
@@ -488,10 +502,17 @@ mod tests {
             let n = udp::emit_packet(&mut query, client, orig_dst, b"query").unwrap();
             let ip = parse_ip(&query[..n]).unwrap();
             let rx = receive_transparent(&mut s, &ip, &query[..n], RxMeta::VERIFY);
-            let Rx::Transparent { src, dst, payload } = rx else {
+            let Rx::Transparent {
+                src,
+                dst,
+                dscp,
+                payload,
+            } = rx
+            else {
                 panic!("{rx:?}")
             };
             assert_eq!((src, dst), (client, orig_dst));
+            assert_eq!(dscp, 0);
             assert_eq!(&query[payload], b"query");
 
             // The reply swaps the pair: its source is the address the client addressed.
@@ -500,10 +521,17 @@ mod tests {
             let ip = parse_ip(&out[..n]).unwrap();
             assert_eq!((ip.src, ip.dst), (orig_dst.ip(), client.ip()));
             let rx = receive_transparent(&mut s, &ip, &out[..n], RxMeta::VERIFY);
-            let Rx::Transparent { src, dst, payload } = rx else {
+            let Rx::Transparent {
+                src,
+                dst,
+                dscp,
+                payload,
+            } = rx
+            else {
                 panic!("{rx:?}")
             };
             assert_eq!((src, dst), (orig_dst, client));
+            assert_eq!(dscp, 0);
             assert_eq!(&out[payload], b"answer");
             assert!(!s.udp_tx.pending());
             assert!(!s.take_tx_wakeup());
@@ -615,12 +643,14 @@ mod tests {
                 let Rx::Transparent {
                     src: a,
                     dst: b,
+                    dscp,
                     payload: r,
                 } = rx
                 else {
                     panic!("{rx:?}")
                 };
                 assert_eq!((a, b), (src, dst));
+                assert_eq!(dscp, 0);
                 assert_eq!(&whole[r], &payload[..], "len {len}");
             }
             if !v6 {

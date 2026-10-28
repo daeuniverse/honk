@@ -62,6 +62,7 @@ pub(super) struct World {
     pub now: Instant,
     pub peers: Vec<Peer>,
     pub udp: Option<FlowId>,
+    pub pull_flags: u8,
     buf: Vec<u8>,
 }
 
@@ -86,6 +87,7 @@ impl World {
             now: base,
             peers: Vec::new(),
             udp: None,
+            pull_flags: 0,
             buf: vec![0; 2048],
         }
     }
@@ -179,13 +181,28 @@ impl World {
 
     /// Pulls up to `max` packets and returns how many came out.
     pub fn pull(&mut self, max: usize) -> usize {
+        if self.pull_flags & 64 != 0 {
+            return 0;
+        }
         let mut n = 0;
         while n < max {
-            let Some(len) = self.stack.poll_transmit(self.now, &mut self.buf) else {
+            let limit = if self.pull_flags & 32 != 0 {
+                31
+            } else {
+                self.buf.len()
+            };
+            let len = if self.pull_flags & 128 != 0 {
+                super::control_transmit(&mut self.stack, self.now, &mut self.buf[..limit])
+                    .map(|tx| tx.len)
+            } else {
+                self.stack.poll_transmit(self.now, &mut self.buf[..limit])
+            };
+            let Some(len) = len else {
                 break;
             };
             let pkt = self.buf[..len].to_vec();
             self.observe(&pkt);
+            self.stack.check();
             n += 1;
         }
         n
@@ -349,6 +366,7 @@ impl World {
 
     /// Aborts every handle still open, then lets the silent remote time everything out.
     pub fn finish(&mut self) {
+        self.pull_flags = 0;
         for i in 0..self.peers.len() {
             self.stack.tcp_abort(self.peers[i].id);
         }

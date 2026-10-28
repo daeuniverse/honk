@@ -148,6 +148,10 @@ pub struct Sent {
 }
 
 impl Sent {
+    pub(super) fn overhead_bound() -> usize {
+        std::mem::size_of::<Runs>()
+    }
+
     pub fn new(start: u32) -> Sent {
         Sent {
             queue: VecDeque::new(),
@@ -198,11 +202,11 @@ impl Sent {
 
     pub fn release(&mut self, pool: &mut super::ring::Pool) {
         let size = std::mem::size_of::<Descriptor>();
+        self.queue = VecDeque::new();
+        self.runs = None;
         pool.release_bytes(self.capacity_charged.saturating_sub(FLOOR_SLOTS) * size);
         pool.metadata_shrink(self.capacity_charged * size);
         self.capacity_charged = 0;
-        self.queue = VecDeque::new();
-        self.runs = None;
     }
 
     pub fn pipe(&self) -> u32 {
@@ -452,7 +456,7 @@ impl Sent {
         self.check();
     }
 
-    pub fn next_retransmit(&mut self) -> Option<(usize, u32, u32, bool)> {
+    pub fn next_retransmit(&mut self, payload_allowed: bool) -> Option<(usize, u32, u32, bool)> {
         // Every candidate is counted in `lost`; a flow without loss skips the scan.
         if self.lost == 0 {
             return None;
@@ -464,11 +468,18 @@ impl Sent {
         while i < self.queue.len() {
             let d = &self.queue[i];
             if d.flags & (SACKED | LOST | RETRANS) == LOST {
+                let len = d.end_seq.wrapping_sub(start);
+                let fin = d.flags & FIN != 0;
+                if !payload_allowed && !(len == 1 && fin) {
+                    return None;
+                }
                 self.retrans_cursor = start;
-                return Some((i, start, d.end_seq.wrapping_sub(start), d.flags & FIN != 0));
+                return Some((i, start, len, fin));
             }
             start = d.end_seq;
-            self.retrans_cursor = start;
+            if payload_allowed {
+                self.retrans_cursor = start;
+            }
             i += 1;
         }
         None
@@ -673,16 +684,16 @@ mod tests {
     fn retransmission_split_preserves_counters() {
         let (mut s, now) = sent(3);
         s.mark_first_lost();
-        assert_eq!(s.next_retransmit(), Some((0, 1000, 100, false)));
+        assert_eq!(s.next_retransmit(true), Some((0, 1000, 100, false)));
         s.split(0, 1040);
         s.retransmitted(0, now, &stamp(now));
         assert_eq!(
             (s.outstanding, s.lost, s.retrans, s.pipe()),
             (300, 100, 40, 240)
         );
-        assert_eq!(s.next_retransmit(), Some((1, 1040, 60, false)));
+        assert_eq!(s.next_retransmit(true), Some((1, 1040, 60, false)));
         s.retransmitted(1, now, &stamp(now));
-        assert!(s.next_retransmit().is_none());
+        assert!(s.next_retransmit(true).is_none());
         let mut a = acked(now + Duration::from_secs(1));
         s.ack(1100, &mut a);
         assert_eq!((s.outstanding, s.lost, s.retrans), (200, 0, 0));
@@ -758,11 +769,14 @@ mod tests {
     fn pmtu_drop_makes_an_already_retransmitted_oversize_segment_sendable() {
         let (mut s, now) = sent(3);
         s.mark_first_lost();
-        let (i, ..) = s.next_retransmit().unwrap();
+        let (i, ..) = s.next_retransmit(true).unwrap();
         s.retransmitted(i, now, &stamp(now));
-        assert!(s.next_retransmit().is_none(), "in flight at the old size");
+        assert!(
+            s.next_retransmit(true).is_none(),
+            "in flight at the old size"
+        );
         s.pmtu_changed(60);
-        assert_eq!(s.next_retransmit(), Some((0, 1000, 100, false)));
+        assert_eq!(s.next_retransmit(true), Some((0, 1000, 100, false)));
         assert_eq!((s.retrans, s.lost), (0, 300));
     }
 
@@ -910,7 +924,7 @@ mod tests {
                         (d.flags & (SACKED | LOST | RETRANS) == LOST)
                             .then(|| (i, start, d.end_seq.wrapping_sub(start)))
                     });
-                    let got = s.next_retransmit();
+                    let got = s.next_retransmit(true);
                     assert_eq!(
                         got.map(|(i, start, len, _)| (i, start, len)),
                         want,

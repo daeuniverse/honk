@@ -40,6 +40,7 @@ use tracing::debug;
 /// Maximum bytes buffered while sniffing TLS ClientHello or HTTP headers.
 /// This is a hard bound: untrusted length fields never grow the buffer.
 const MAX_CLIENT_HELLO_SIZE: usize = 4096;
+pub(crate) const SNIFF_MEMORY: usize = 2 * MAX_CLIENT_HELLO_SIZE;
 
 /// Supported traffic types detected by sniffing; the domain lives in
 /// [`SniffResult::domain`].

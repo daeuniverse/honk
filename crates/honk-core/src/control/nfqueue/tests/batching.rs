@@ -22,6 +22,7 @@ fn pair(mut mock: MockEbpfBackend) -> (DecisionFixture, UdpInitLease, PendingUdp
     );
     let fixture = pending_fixture_with(41, mock);
     let lease = match fixture.pending.endpoints.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         key.client,
         key.destination,
         bytes::Bytes::from_static(b"second"),

@@ -310,7 +310,7 @@ async fn tcp_connection_handles_multiple_frames() {
                 "127.0.0.1:53".parse().expect("original destination"),
             )
             .await?;
-        Ok::<_, anyhow::Error>((handled, server.nodelay()?))
+        Ok::<_, anyhow::Error>(handled)
     });
 
     let first = query_with_txid("example.com", 0x1111);
@@ -322,7 +322,7 @@ async fn tcp_connection_handles_multiple_frames() {
     assert_eq!(&read_tcp_response(&mut client).await[0..2], &second[0..2]);
 
     drop(client);
-    assert_eq!(task.await.expect("task").expect("handler"), (true, true));
+    assert!(task.await.expect("task").expect("handler"));
 }
 
 #[tokio::test]

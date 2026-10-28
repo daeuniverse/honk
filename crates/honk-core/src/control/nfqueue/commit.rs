@@ -411,6 +411,7 @@ fn commit_queue_rejects_work_beyond_its_hard_bound() {
         .take()
         .unwrap();
     let identity = PendingUdpIdentity::new(
+        honk_datapath::ScopeId::HOST,
         FlowKey::new(
             "192.0.2.1:40000".parse().unwrap(),
             "198.51.100.1:443".parse().unwrap(),

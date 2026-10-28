@@ -25,7 +25,9 @@ pub struct Slot {
     pub ready: Ready,
     pub on_event: bool,
     pub on_tx: bool,
-    pub deficit: usize,
+    pub on_control: bool,
+    /// Refilled only below the u16 MTU, so credit stays below twice that MTU.
+    pub deficit: u32,
     pub scheduled: Option<Instant>,
     /// Listed in `Timers`' batch of flows to refresh; only `Timers` changes it.
     pub dirty: bool,
@@ -39,6 +41,7 @@ pub struct Table {
     free: Vec<u32>,
     pub active: u32,
     pub tcp_active: u32,
+    max_slots: Option<usize>,
 }
 
 impl Table {
@@ -51,10 +54,40 @@ impl Table {
             free: Vec::new(),
             active: 0,
             tcp_active: 0,
+            max_slots: None,
         }
     }
 
+    pub fn bounded(max_slots: usize) -> Self {
+        Self {
+            max_slots: Some(max_slots),
+            ..Self::new()
+        }
+    }
+
+    pub fn can_insert(&self, replacing: Option<u32>) -> bool {
+        !self.free.is_empty()
+            || replacing.is_some_and(|index| {
+                let generation = self.slots[index as usize].generation;
+                generation != 0 && generation != u32::MAX
+            })
+            || self.max_slots.is_none_or(|max| self.slots.len() < max)
+    }
+
+    pub fn overhead_bound(slots: usize) -> Option<usize> {
+        use crate::budget::{collection_peak, map_peak};
+        collection_peak::<Slot>(slots)?
+            .checked_add(collection_peak::<u32>(slots)?)?
+            .checked_add(map_peak::<FourTuple, u32>(slots)?.checked_mul(2)?)?
+            .checked_add(map_peak::<u16, u32>(slots)?)?
+            .checked_add(map_peak::<IpAddr, u32>(slots)?)
+    }
+
     pub fn insert(&mut self, flow: Flow) -> FlowId {
+        assert!(
+            self.can_insert(None),
+            "flow slab capacity must be checked before admission"
+        );
         let idx = self.free.pop().unwrap_or_else(|| {
             let idx = self.slots.len() as u32;
             self.slots.push(Slot {
@@ -63,6 +96,7 @@ impl Table {
                 ready: Ready::default(),
                 on_event: false,
                 on_tx: false,
+                on_control: false,
                 deficit: 0,
                 scheduled: None,
                 dirty: false,
@@ -84,6 +118,7 @@ impl Table {
             }
         }
         let slot = &mut self.slots[idx as usize];
+        debug_assert_ne!(slot.generation, 0);
         slot.flow = Some(flow);
         FlowId {
             idx,
@@ -132,13 +167,18 @@ impl Table {
                 self.timewait.remove(&t.tuple);
             }
         }
-        slot.generation = slot.generation.wrapping_add(1).max(1);
+        if slot.generation != 0 {
+            slot.generation = slot.generation.checked_add(1).unwrap_or(0);
+        }
         slot.on_event = false;
         slot.on_tx = false;
+        slot.on_control = false;
         slot.ready = Ready::default();
         slot.deficit = 0;
         slot.scheduled = None;
-        self.free.push(idx);
+        if slot.generation != 0 {
+            self.free.push(idx);
+        }
         Some(flow)
     }
 
@@ -149,10 +189,13 @@ impl Table {
         self.active -= 1;
         self.tcp_active -= 1;
         slot.flow = Some(Flow::TimeWait(tw));
-        slot.generation = slot.generation.wrapping_add(1).max(1);
+        if slot.generation != 0 {
+            slot.generation = slot.generation.checked_add(1).unwrap_or(0);
+        }
         slot.ready = Ready::default();
         slot.on_event = false;
         slot.on_tx = false;
+        slot.on_control = false;
         slot.scheduled = None;
     }
 }
@@ -160,21 +203,29 @@ impl Table {
 impl Table {
     /// Recounts what `active`, `tcp_active`, the lookup maps and the free list claim.
     pub fn check(&self) {
-        let (mut tcp, mut udp, mut timewait) = (0, 0, 0);
+        assert!(self.max_slots.is_none_or(|max| self.slots.len() <= max));
+        let (mut tcp, mut udp, mut timewait, mut exhausted) = (0, 0, 0, 0);
         for (i, slot) in self.slots.iter().enumerate() {
             let i = i as u32;
             match &slot.flow {
                 Some(Flow::Tcp(t)) => {
+                    assert_ne!(slot.generation, 0);
                     tcp += 1;
                     assert_eq!(self.tcp.get(&t.tuple), Some(&i));
                 }
                 Some(Flow::Udp { port }) => {
+                    assert_ne!(slot.generation, 0);
                     udp += 1;
                     assert_eq!(self.udp.get(port), Some(&i));
                 }
                 Some(Flow::TimeWait(t)) => {
+                    assert_ne!(t.handle_generation, 0);
                     timewait += 1;
                     assert_eq!(self.timewait.get(&t.tuple), Some(&i));
+                }
+                None if slot.generation == 0 => {
+                    assert!(!self.free.contains(&i));
+                    exhausted += 1;
                 }
                 None => assert!(
                     self.free.contains(&i),
@@ -188,7 +239,7 @@ impl Table {
             (tcp as usize, udp as usize, timewait)
         );
         assert_eq!(
-            self.free.len() + tcp as usize + udp as usize + timewait,
+            self.free.len() + tcp as usize + udp as usize + timewait + exhausted,
             self.slots.len()
         );
     }
@@ -196,6 +247,7 @@ impl Table {
 
 pub struct TimeWait {
     pub tuple: FourTuple,
+    pub handle_generation: u32,
     pub snd_nxt: u32,
     pub rcv_nxt: u32,
     pub max_snd_wnd: u32,
@@ -208,9 +260,10 @@ pub struct TimeWait {
 }
 
 impl TimeWait {
-    pub fn from_tcb(t: &Tcb, now: Instant) -> TimeWait {
+    pub fn from_tcb(t: &Tcb, now: Instant, handle_generation: u32) -> TimeWait {
         TimeWait {
             tuple: t.tuple,
+            handle_generation,
             snd_nxt: t.snd_nxt,
             rcv_nxt: t.rcv_nxt,
             max_snd_wnd: t.snd_wnd_max,

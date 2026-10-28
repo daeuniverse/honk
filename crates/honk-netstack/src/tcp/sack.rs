@@ -28,6 +28,10 @@ pub struct OooTable {
 }
 
 impl OooTable {
+    pub(super) fn overhead_bound() -> Option<usize> {
+        crate::budget::collection_peak::<Range>(MAX_RANGES)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }

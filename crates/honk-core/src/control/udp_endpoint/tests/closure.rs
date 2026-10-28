@@ -72,6 +72,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             endpoint.record_pending_reply_peer(destination);
             let weak = Arc::downgrade(&endpoint);
             let mut lease = match pool.reserve_owned_or_enqueue(
+                honk_datapath::ScopeId::HOST,
                 source,
                 destination,
                 Bytes::from_static(b"live"),
@@ -105,6 +106,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 .unwrap();
             let queue = lease.take_queue_receiver().unwrap();
             let mut driver = pool.spawn_driver(
+                honk_datapath::ScopeId::HOST,
                 source,
                 destination,
                 generation,
@@ -120,6 +122,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             assert!(lease.commit_ready(Arc::clone(&endpoint)));
             let id = pool
                 .register_ready_tracker(
+                    honk_datapath::ScopeId::HOST,
                     source,
                     destination,
                     101,
@@ -155,7 +158,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     .unwrap();
             }
             if already_retiring {
-                pool.remove(source, destination);
+                pool.remove(honk_datapath::ScopeId::HOST, source, destination);
             }
             let pending = tracker.start_close(selected);
             let mut duplicate = Box::pin(tracker.close_id(&id));
@@ -179,7 +182,11 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 assert!(failures.recv().await.is_some());
                 assert!(matches!(
                     pool.endpoints
-                        .get(&EndpointKey::new(source, destination))
+                        .get(&EndpointKey::new(
+                            honk_datapath::ScopeId::HOST,
+                            source,
+                            destination
+                        ))
                         .unwrap()
                         .value(),
                     EndpointEntry::Retiring { .. }
@@ -208,6 +215,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                         .is_none()
                 );
                 let replacement = match pool.reserve_owned_or_enqueue(
+                    honk_datapath::ScopeId::HOST,
                     source,
                     destination,
                     Bytes::from_static(b"new"),
@@ -219,7 +227,13 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     EndpointReservation::Initializing(lease) => lease,
                     _ => panic!("acknowledged retirement permits tuple reuse"),
                 };
-                assert!(!pool.close_exact(source, destination, 101, generation));
+                assert!(!pool.close_exact(
+                    honk_datapath::ScopeId::HOST,
+                    source,
+                    destination,
+                    101,
+                    generation
+                ));
                 assert!(replacement.still_initializing());
                 drop(replacement);
                 assert!(pool.shutdown().await.joined);
@@ -252,6 +266,7 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
                     signal: Arc::clone(&signal),
                     action: CloseAction::Udp {
                         pool: weak_pool,
+                        scope: ScopeId::HOST,
                         client: source,
                         destination,
                         token: 101,
@@ -333,6 +348,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             uuid::Uuid::new_v4(),
         ));
         let mut lease = match pool.reserve_owned_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             source,
             destination,
             Bytes::from_static(b"live"),
@@ -347,6 +363,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
         let generation = lease.generation();
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         pool.register_ready_tracker(
+            honk_datapath::ScopeId::HOST,
             source,
             destination,
             101,
@@ -403,8 +420,20 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             .unwrap();
         assert_eq!(outcomes[0], crate::ebpf::RetireOutcome::ConnRetired);
         tracker.remove("acknowledged");
-        assert!(pool.complete_removal(source, destination, removal.owner, generation));
-        assert!(!pool.close_exact(source, destination, 101, generation));
+        assert!(pool.complete_removal(
+            removal.scope,
+            source,
+            destination,
+            removal.owner,
+            generation
+        ));
+        assert!(!pool.close_exact(
+            honk_datapath::ScopeId::HOST,
+            source,
+            destination,
+            101,
+            generation
+        ));
         assert_eq!(pending.wait().await, CloseOutcome::Closed);
         signal.finish(false);
         assert_eq!(
@@ -469,6 +498,7 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             Arc::clone(&port),
         );
         let lease = match pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             source,
             destination,
             b"old",

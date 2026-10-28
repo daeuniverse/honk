@@ -15,7 +15,10 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
     let targets = [raw_a.local_addr().unwrap(), raw_b.local_addr().unwrap()];
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         2,
-        Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            [raw_a, raw_b],
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -34,6 +37,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
         let mut lease = reserve_source(&pool, &stats, client_addr, target, node.id);
         let attachment = pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
@@ -57,7 +61,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             attachment,
             target,
             None,
-            Arc::new(pool.create_reply_socket(target).unwrap()),
+            Arc::new(pool.create_reply_socket(lease.scope(), target).unwrap()),
             stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,

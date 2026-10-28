@@ -12,6 +12,15 @@ use honk_netstack::{
 #[path = "transparent_tcp/admission.rs"]
 mod admission;
 
+#[path = "transparent_tcp/retirement.rs"]
+mod retirement;
+
+#[path = "transparent_tcp/control.rs"]
+mod control;
+
+#[path = "transparent_tcp/accounted.rs"]
+mod accounted;
+
 const DST: &str = "203.0.113.9:443";
 const CLIENT: &str = "10.0.0.2:40000";
 
@@ -80,6 +89,7 @@ struct Out {
 fn decode(bytes: &[u8]) -> Out {
     let ip = honk_netstack::wire::parse_ip(bytes).unwrap();
     assert_eq!(ip.proto, honk_netstack::wire::PROTO_TCP);
+    assert_eq!(ip.dscp, 0);
     let seg = &bytes[ip.payload.clone()];
     assert!(tcp::verify_checksum(ip.src, ip.dst, seg));
     let (h, off) = tcp::parse(seg).unwrap();
@@ -222,6 +232,7 @@ fn a_syn_makes_a_pending_flow_that_emits_nothing() {
     let info = info_of(&mut stack);
     assert_eq!(info.client, addr(CLIENT));
     assert_eq!(info.original_dst, addr(DST));
+    assert_eq!(info.dscp, 0);
     assert_eq!(info.mss, 1460);
     assert_eq!(info.wscale, Some(7));
     assert!(info.sack && info.timestamps);
@@ -1134,8 +1145,14 @@ fn transparent_udp_and_fragments_reach_the_driver_with_both_addresses() {
         .udp_send_from(server, client, b"hello", &mut out)
         .unwrap();
     match rx.receive(t0, &out[..n]) {
-        Rx::Transparent { src, dst, payload } => {
+        Rx::Transparent {
+            src,
+            dst,
+            dscp,
+            payload,
+        } => {
             assert_eq!((src, dst), (server, client));
+            assert_eq!(dscp, 0);
             assert_eq!(&out[payload], b"hello");
         }
         other => panic!("{other:?}"),
@@ -1155,9 +1172,11 @@ fn transparent_udp_and_fragments_reach_the_driver_with_both_addresses() {
             Rx::TransparentOwned {
                 src,
                 dst,
+                dscp,
                 packet,
                 payload,
             } => {
+                assert_eq!(dscp, 0);
                 delivered = Some((src, dst, packet[payload].to_vec()));
             }
             other => panic!("{other:?}"),

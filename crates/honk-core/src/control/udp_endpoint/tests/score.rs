@@ -89,11 +89,19 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
     let stats = Arc::new(StatsManager::new());
     let payload = vec![0x5a; 32 * 1024];
     let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client_addr, target, &payload, permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client_addr,
+        target,
+        &payload,
+        permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("live flow must reserve a fresh endpoint"),
     };
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         target,
         lease.generation(),
@@ -115,7 +123,14 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
         if index != 0 {
             let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
             assert!(matches!(
-                pool.reserve_or_enqueue(client_addr, target, &payload, permit, &stats),
+                pool.reserve_or_enqueue(
+                    honk_datapath::ScopeId::HOST,
+                    client_addr,
+                    target,
+                    &payload,
+                    permit,
+                    &stats
+                ),
                 EndpointReservation::Enqueued
             ));
         }
@@ -147,7 +162,14 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
         }
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         assert!(matches!(
-            pool.reserve_or_enqueue(client_addr, target, b"!", permit, &stats),
+            pool.reserve_or_enqueue(
+                honk_datapath::ScopeId::HOST,
+                client_addr,
+                target,
+                b"!",
+                permit,
+                &stats
+            ),
             EndpointReservation::Enqueued
         ));
         let (len, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
@@ -160,7 +182,14 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
             for _ in 0..4 {
                 let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
                 assert!(matches!(
-                    pool.reserve_or_enqueue(client_addr, target, &payload, permit, &stats),
+                    pool.reserve_or_enqueue(
+                        honk_datapath::ScopeId::HOST,
+                        client_addr,
+                        target,
+                        &payload,
+                        permit,
+                        &stats
+                    ),
                     EndpointReservation::Enqueued
                 ));
                 let (len, _) =
@@ -280,11 +309,19 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
             Some(reporter),
         ));
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client_addr, target, b"q", permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client_addr,
+            target,
+            b"q",
+            permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("each recovery flow must reserve a distinct endpoint"),
         };
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client_addr,
             target,
             lease.generation(),
@@ -464,11 +501,19 @@ async fn four_live_udp_drivers_establish_observed_usability_before_retirement() 
             Some(reporter),
         ));
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client_addr, target, b"q", permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client_addr,
+            target,
+            b"q",
+            permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("each client must reserve a distinct scored endpoint"),
         };
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client_addr,
             target,
             lease.generation(),
@@ -497,7 +542,14 @@ async fn four_live_udp_drivers_establish_observed_usability_before_retirement() 
                 tokio::time::sleep(Duration::from_millis(1100)).await;
                 let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
                 assert!(matches!(
-                    pool.reserve_or_enqueue(client_addr, target, b"q", permit, &stats),
+                    pool.reserve_or_enqueue(
+                        honk_datapath::ScopeId::HOST,
+                        client_addr,
+                        target,
+                        b"q",
+                        permit,
+                        &stats
+                    ),
                     EndpointReservation::Enqueued
                 ));
             }
@@ -641,7 +693,10 @@ async fn quic_stall_terminal_invalidates_aggregate_without_changing_alive_conges
         UdpDriverContext {
             endpoint: Arc::clone(&endpoint),
             queue_rx,
-            reply_socket: Arc::new(ReplySocket::untracked(test_reply_socket().await)),
+            reply_socket: Arc::new(ReplySocket::untracked(
+                ScopeId::HOST,
+                test_reply_socket().await,
+            )),
             foreign_replies: ForeignReplySockets::for_one_endpoint(),
             client_addr: client,
             client_dst: target,

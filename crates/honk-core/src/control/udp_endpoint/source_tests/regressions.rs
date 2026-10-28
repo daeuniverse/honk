@@ -15,7 +15,10 @@ async fn queued_source_view_timeout_is_local_congestion() {
     let target_c = raw_c.local_addr().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         3,
-        Arc::new(SourceReplySocketFactory::new([raw_a, raw_b, raw_c])),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            [raw_a, raw_b, raw_c],
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -57,6 +60,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
     assert!(Arc::ptr_eq(&owner, &attachment_b.owner()));
     assert!(Arc::ptr_eq(&owner, &attachment_c.owner()));
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
@@ -88,6 +92,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
 
     let queue_rx = lease_c.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         target_c,
         lease_c.generation(),
@@ -134,7 +139,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
     );
 
     for target in [target_a, target_b, target_c] {
-        pool.remove(client_addr, target);
+        pool.remove(honk_datapath::ScopeId::HOST, client_addr, target);
     }
 
     drop(endpoint_a);
@@ -157,7 +162,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
     let target = raw.local_addr().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         1,
-        Arc::new(SourceReplySocketFactory::new([raw])),
+        Arc::new(SourceReplySocketFactory::new([ScopeId::HOST], [raw])),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -264,7 +269,10 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     let target_b = raw_b.local_addr().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         2,
-        Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            [raw_a, raw_b],
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -282,6 +290,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
     let stale = pool
         .prepare_source(
+            honk_datapath::ScopeId::HOST,
             &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
@@ -299,6 +308,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
         .await
         .unwrap();
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
@@ -330,7 +340,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
             honk_outbound::alive::IpVersion::V4,
         );
     }
-    pool.remove(client_addr, target_a);
+    pool.remove(honk_datapath::ScopeId::HOST, client_addr, target_a);
     drop(endpoint_a);
     assert!(pool.shutdown().await.joined);
     wait_source_removed(&pool, &scope).await;
@@ -411,7 +421,10 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     let target_b = raw_b.local_addr().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         2,
-        Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            [raw_a, raw_b],
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -492,6 +505,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     let queue_a = lease_a.take_queue_receiver().unwrap();
     let queue_b = lease_b.take_queue_receiver().unwrap();
     let mut driver_a = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         target_a,
         lease_a.generation(),
@@ -504,6 +518,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     let mut driver_b = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         target_b,
         lease_b.generation(),
@@ -536,7 +551,14 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     assert_eq!(first.connection, second.connection);
     let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(client_addr, target_a, b"second-a", permit, &stats),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client_addr,
+            target_a,
+            b"second-a",
+            permit,
+            &stats
+        ),
         EndpointReservation::Enqueued
     ));
     let followup = next_data_frame(&mut events, &mut replies).await;
@@ -608,6 +630,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     );
 
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
@@ -638,7 +661,10 @@ async fn post_admission_view_cancel_is_health_neutral() {
         let target_b = raw_b.local_addr().unwrap();
         let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
             2,
-            Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+            Arc::new(SourceReplySocketFactory::new(
+                [ScopeId::HOST],
+                [raw_a, raw_b],
+            )),
         ));
         let stats = Arc::new(StatsManager::new());
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -649,6 +675,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
         let prepared_a = pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
@@ -709,6 +736,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         let owner = attachment_a.owner();
         assert!(Arc::ptr_eq(&owner, &attachment_b.owner()));
         let scope = SourceScope::new(
+            honk_datapath::ScopeId::HOST,
             &runtime,
             client_addr,
             SourcePath::Vless(VlessUdpPath::Xudp),
@@ -751,7 +779,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         );
         let identity_b = endpoint_identity(&pool, client_addr, target_b).unwrap();
         assert!(pool.retire_if_same(
-            EndpointKey::new(client_addr, target_b),
+            EndpointKey::new(honk_datapath::ScopeId::HOST, client_addr, target_b),
             identity_b.0,
             identity_b.1,
         ));
@@ -781,6 +809,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         for _ in 0..2 {
             let removed = removed_rx.recv().await.unwrap();
             assert!(pool.complete_removal(
+                removed.scope,
                 removed.client,
                 removed.dst,
                 removed.owner,
@@ -811,7 +840,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
         .map(|socket| socket.local_addr().unwrap());
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         3,
-        Arc::new(SourceReplySocketFactory::new(sockets)),
+        Arc::new(SourceReplySocketFactory::new([ScopeId::HOST], sockets)),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -868,6 +897,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
     let second = next_data_frame(&mut events, &mut replies).await;
     assert_eq!(first.connection, second.connection);
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),

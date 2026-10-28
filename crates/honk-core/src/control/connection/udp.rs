@@ -35,6 +35,10 @@ impl ControlPlaneHandle {
         &self,
         lease: UdpInitLease,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "native-api")]
+        let mut lease = lease;
+        #[cfg(feature = "native-api")]
+        let captured = lease.packet_observation.take();
         #[cfg(feature = "ebpf")]
         let pending_cleanup = if lease.decision_token() == 0 {
             None
@@ -52,13 +56,18 @@ impl ControlPlaneHandle {
         if lease.decision_token() != 0 {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
-        #[cfg_attr(not(feature = "native-api"), allow(unused_mut))]
-        let mut observation = ConnectionObservation::begin(
-            self.native.as_deref(),
-            crate::observe::vocab::Network::Udp,
-            lease.client_addr(),
-            lease.original_dst(),
-        );
+        let begin = || {
+            ConnectionObservation::begin(
+                self.native.as_deref(),
+                crate::observe::vocab::Network::Udp,
+                lease.client_addr(),
+                lease.original_dst(),
+            )
+        };
+        #[cfg(feature = "native-api")]
+        let mut observation = captured.unwrap_or_else(begin);
+        #[cfg(not(feature = "native-api"))]
+        let observation = begin();
         let native_terminal = lease.set_native_flow(observation.flow().cloned());
         let mut initializer = native_terminal
             .as_ref()
@@ -133,6 +142,26 @@ impl ControlPlaneHandle {
         let original_dst = lease.original_dst();
         let data = lease.first_payload();
         let raw_dns_route = lease.raw_dns_route();
+        let mut packet_routing = if lease.owner().has_kernel_capture() {
+            None
+        } else {
+            Some(match lease.packet_routing.take() {
+                Some(snapshot) => snapshot,
+                None => {
+                    self.prepare_packet_routing_snapshot(
+                        client_addr,
+                        original_dst,
+                        "udp",
+                        lease
+                            .packet_dscp
+                            .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
+                        #[cfg(feature = "native-api")]
+                        observation.is_recording(),
+                    )
+                    .await?
+                }
+            })
+        };
         #[cfg(feature = "ebpf")]
         let pending = if lease.decision_token() == 0 {
             None
@@ -165,7 +194,13 @@ impl ControlPlaneHandle {
             );
             DialMode::Ip
         } else {
-            let config = self.config.read().await;
+            let current_config;
+            let config = if let Some(snapshot) = &packet_routing {
+                &snapshot.config
+            } else {
+                current_config = self.config.read().await;
+                &*current_config
+            };
             config
                 .global
                 .dial_mode
@@ -203,7 +238,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let handoff = if raw_dns_route.is_some() {
+        let handoff = if raw_dns_route.is_some() || !lease.owner().has_kernel_capture() {
             None
         } else {
             let tuples = build_tuples_key(
@@ -231,8 +266,14 @@ impl ControlPlaneHandle {
             }
             handoff
         });
-        observation.handoff(handoff.as_ref(), raw_dns_route.is_none());
+        observation.handoff(
+            handoff.as_ref(),
+            raw_dns_route.is_none() && lease.owner().has_kernel_capture(),
+        );
         let skip_sniff = matches!(dial_mode, DialMode::Ip)
+            || packet_routing
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.final_before_sniff())
             || handoff.as_ref().is_some_and(|ho| {
                 ho.must != 0
                     || matches!(
@@ -248,8 +289,11 @@ impl ControlPlaneHandle {
             None
         } else {
             use crate::control::packet_sniffer::QuicSniffOutcome;
-            let sniffer_key =
-                crate::control::packet_sniffer::PacketSnifferKey::new(client_addr, original_dst);
+            let sniffer_key = crate::control::packet_sniffer::PacketSnifferKey::new(
+                lease.scope(),
+                client_addr,
+                original_dst,
+            );
             let mut outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
             // A fragmented ClientHello: collect the rest of the Initial
             // flight before deciding which outbound owns the flow.
@@ -283,7 +327,32 @@ impl ControlPlaneHandle {
 
         let route_started_at = std::time::Instant::now();
         observation.routing_started();
-        let mut route = if let Some(raw_dns_route) = raw_dns_route {
+        let mut route = if let Some(snapshot) = &mut packet_routing {
+            let mut input =
+                build_connection_info(quic_domain.clone(), original_dst, client_addr, "udp", None);
+            input.dscp = lease.packet_dscp;
+            self.route_packet_with_sniffed(
+                snapshot,
+                dial_mode,
+                &input,
+                domain_verified,
+                #[cfg(feature = "native-api")]
+                observation.is_recording(),
+            )
+            .await?;
+            std::mem::replace(
+                &mut snapshot.decision,
+                RoutingDecision {
+                    outbound: String::new(),
+                    must: false,
+                    mark: None,
+                    matched_rule: None,
+                    reroute_by_sniffed_domain: false,
+                    #[cfg(feature = "native-api")]
+                    native_route: None,
+                },
+            )
+        } else if let Some(raw_dns_route) = raw_dns_route {
             let (outbound, mark) = match raw_dns_route {
                 RawDnsRoute::Group(name) => (name.to_string(), None),
                 RawDnsRoute::Direct(mark) => (
@@ -426,7 +495,13 @@ impl ControlPlaneHandle {
             IpVersion::V4
         };
         let (plan, close_group_ids, outbound_kind) = {
-            let config = self.config.read().await;
+            let current_config;
+            let config = if let Some(snapshot) = &packet_routing {
+                &snapshot.config
+            } else {
+                current_config = self.config.read().await;
+                &*current_config
+            };
             #[cfg(feature = "native-api")]
             let mode_constraint = if mode_decision.group_id.as_ref().is_some_and(|expected| {
                 self.native
@@ -453,14 +528,20 @@ impl ControlPlaneHandle {
                 observation.pin_selection(
                     self.diagnostics.read().generation,
                     &native.catalog.snapshot(),
-                    &config,
+                    config,
                 );
             }
-            let gm = self.group_manager.read();
+            let current_group;
+            let gm = if let Some(snapshot) = &packet_routing {
+                &snapshot.group_manager
+            } else {
+                current_group = self.group_manager.read();
+                &*current_group
+            };
             let select = || {
                 crate::control::reload::resolve_udp_outbound_plan_for_target(
-                    &config,
-                    &gm,
+                    config,
+                    gm,
                     &outbound_name,
                     &crate::group::ScoreSelectionContext {
                         network: SelectionNetwork::Udp,
@@ -511,7 +592,7 @@ impl ControlPlaneHandle {
                 } else {
                     std::collections::HashMap::new()
                 };
-            let kind = crate::stats::OutboundKind::routed(&gm, &outbound_name);
+            let kind = crate::stats::OutboundKind::routed(gm, &outbound_name);
             (plan, close_group_ids, kind)
         };
         let outbound_tracker = self.stats.outbound_tracker(&outbound_name, outbound_kind);
@@ -536,7 +617,13 @@ impl ControlPlaneHandle {
         let all_block = super::tcp::only_block_nodes(&plan.nodes);
 
         let (connect_timeout, transport_deadline) = {
-            let config = self.config.read().await;
+            let current_config;
+            let config = if let Some(snapshot) = &packet_routing {
+                &snapshot.config
+            } else {
+                current_config = self.config.read().await;
+                &*current_config
+            };
             let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
             (
                 connect_timeout,
@@ -545,10 +632,14 @@ impl ControlPlaneHandle {
         };
 
         let scheduler_ipver = plan.ipver;
-        let runtime_generation = self.runtime_registry.read().clone();
+        let runtime_generation = packet_routing
+            .as_ref()
+            .map(|snapshot| Arc::clone(&snapshot.runtime))
+            .unwrap_or_else(|| self.runtime_registry.read().clone());
         observation.udp_preparing();
         let Some((node, prepared)) = self
             .prepare_udp_candidates(
+                lease.scope(),
                 plan,
                 mark,
                 client_addr,
@@ -700,7 +791,10 @@ impl ControlPlaneHandle {
         // after the winner is finalized and before the only first send. Any
         // failure is fail-closed; there is no listener-socket fallback.
         let reply_ready_started = std::time::Instant::now();
-        let reply_socket = match self.udp_pool.create_reply_socket(original_dst) {
+        let reply_socket = match self
+            .udp_pool
+            .create_reply_socket(lease.scope(), original_dst)
+        {
             Ok(socket) => Arc::new(socket),
             Err(error) => {
                 if let Some(terminal) = &native_terminal {
@@ -763,6 +857,7 @@ impl ControlPlaneHandle {
             })?,
         };
         let mut driver = self.udp_pool.spawn_driver(
+            lease.scope(),
             client_addr,
             original_dst,
             lease.generation(),
@@ -811,6 +906,7 @@ impl ControlPlaneHandle {
         let tracker_id = self
             .udp_pool
             .register_ready_tracker(
+                lease.scope(),
                 client_addr,
                 original_dst,
                 lease.decision_token(),

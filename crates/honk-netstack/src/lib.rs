@@ -23,12 +23,22 @@
 //! early wakeup. Drain coalesced [`Ready`] events to wake application streams. After an
 //! application read/write/shutdown/close/abort, check [`Stack::take_tx_wakeup`] so a
 //! window update or FIN cannot sleep behind an otherwise idle driver.
+//! [`Stack::poll_control_transmit`] preserves ordinary readiness, DRR and payload TLP work
+//! using a lazy separate queue/cursor and the shared emitter. Reserve control credit first;
+//! also offer ordinary pulls for payload progress. Unused control-only queues allocate nothing.
 //!
 //! Reads drain buffered data before EOF or a sticky terminal error. Shutdown closes only
 //! the write half; close releases the handle immediately and finishes the protocol in
 //! the background. Closing with unread data sends RST. TIME_WAIT retains unread data
 //! and an open application handle; once both are gone and the final ACK is sent, its
 //! compact entry holds no chunk reservations and expires after 60 seconds.
+//!
+//! [`Stack::tcp_retained`] checks the original handle through application close, compact
+//! TIME_WAIT and queued refusal output. Drivers retaining delivery state use
+//! [`Stack::poll_transmit_with`] and save [`Transmit::flow`] before consulting that query:
+//! returned packets, device completions and cross-owner work have separate lifetimes.
+//! A [`FlowId`] is local to its Stack, not a network-scope or kernel incarnation. Its
+//! generation never wraps into a new handle; an exhausted slot is not reused.
 //!
 //! # Transparent termination
 //!
@@ -113,6 +123,11 @@
 //! Reassembly storage, queued Time Exceeded quotes and pending UDP fragment datagram capacities
 //! share that budget too. Queued storage stays charged across blocked output until sent or dropped.
 //! Per-flow buffer maxima are bounded to the modular-sequence safe range and at least one chunk.
+//! [`Stack::new_accounted`] also reserves conservative metadata/growth/cache capacity and bounds
+//! slab slots before construction. [`Stack::overhead_reserved`] is not resident memory or RSS.
+//! [`Stack::set_accepting`] closes new passive admission without disabling existing delivery.
+//! Completed reassembly returns [`OwnedPacket`], whose [`MemoryReservation`] remains owned
+//! through consumer release, even if the Stack has already been dropped.
 //!
 //! Endpoint UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and
 //! [`Stack::udp_send`] writes straight into the caller's output buffer. Datagram payloads
@@ -140,14 +155,14 @@ mod udp;
 mod udp_t;
 
 pub use accept::{AcceptOpts, AcceptWhen, Keepalive, MAX_DEFERRED, Refuse, SynInfo};
-pub use budget::MemoryBudget;
-pub use fragment::FragmentLimits;
+pub use budget::{MemoryBudget, MemoryReservation};
+pub use fragment::{FragmentLimits, OwnedPacket};
 pub use icmp_out::IcmpLimits;
 pub use mode::{ExcludeSet, Mode};
 pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, Transmit, TxCaps, TxCsum};
 pub use stack::{
-    BindError, Config, ConnectError, DropReason, FlowId, Ready, Rx, Stack, StackStats, StreamError,
-    UdpError,
+    BindError, Config, ConnectError, ConstructionError, DropReason, FlowId, Ready, Rx, Stack,
+    StackStats, StreamError, UdpError,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

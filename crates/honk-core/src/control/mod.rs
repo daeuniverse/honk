@@ -8,10 +8,12 @@ pub mod dns_control;
 mod dns_listener;
 pub mod drain;
 pub mod janitor;
+pub mod netstack;
 #[cfg(feature = "ebpf")]
 pub(crate) mod nfqueue;
 #[cfg(feature = "ebpf")]
 mod nfqueue_runtime;
+pub mod packet_endpoint;
 #[cfg(all(test, feature = "ebpf"))]
 use nfqueue_runtime::{
     NFQUEUE_INGEST_BYTE_BUDGET, NFQUEUE_INGEST_QUEUE_LEN, NfqueueActorQueue, NfqueueRuntimeFatal,
@@ -30,6 +32,7 @@ mod reload_tests;
 mod resource_budget;
 mod runtime;
 mod shutdown;
+mod task_registry;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

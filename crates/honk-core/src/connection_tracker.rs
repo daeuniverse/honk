@@ -98,6 +98,7 @@ pub(crate) enum CloseAction {
     Tcp,
     Udp {
         pool: std::sync::Weak<crate::control::udp_endpoint::UdpEndpointPool>,
+        scope: honk_datapath::ScopeId,
         client: SocketAddr,
         destination: SocketAddr,
         token: u32,
@@ -469,6 +470,7 @@ impl ConnectionTracker {
         let owner = selected.owner.expect("claimed transport owner");
         if let CloseAction::Udp {
             pool,
+            scope,
             client,
             destination,
             token,
@@ -479,7 +481,7 @@ impl ConnectionTracker {
                 owner.signal.finish(false);
                 return CloseRequest::Pending(Arc::clone(&owner.signal));
             };
-            if !pool.close_exact(*client, *destination, *token, *generation) {
+            if !pool.close_exact(*scope, *client, *destination, *token, *generation) {
                 owner.signal.finish(false);
             }
         }

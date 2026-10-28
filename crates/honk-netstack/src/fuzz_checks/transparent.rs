@@ -62,7 +62,7 @@ pub(super) mod op {
     pub const TCP_GSO: u8 = 12;
     /// `[kind, length * 256, size-index, checksum-flags]`
     pub const UDP_GSO: u8 = 13;
-    /// `[mask]`: TSO4, TSO6, USO4, USO6 capability bits.
+    /// `[mask]`: low bits TSO4/TSO6/USO4/USO6; 32 tiny-buffer, 64 paused, 128 control-only.
     pub const CAPS: u8 = 14;
     /// `[kind, length, behavior]`: valid UDP fragments, reordered/duplicated/incomplete/corrupt.
     pub const FRAGMENTS: u8 = 15;
@@ -87,6 +87,8 @@ struct World {
     now: Instant,
     slots: Vec<Slot>,
     caps: TxCaps,
+    pull_flags: u8,
+    control_packets: usize,
     rx_gso_packets: usize,
     tx_gso_packets: usize,
     reassembled: usize,
@@ -210,6 +212,8 @@ impl World {
             now: base,
             slots: Vec::new(),
             caps: TxCaps::NONE,
+            pull_flags: 0,
+            control_packets: 0,
             rx_gso_packets: 0,
             tx_gso_packets: 0,
             reassembled: 0,
@@ -280,11 +284,29 @@ impl World {
 
     /// Pulls everything the stack will send and learns the stack's sequence numbers from it.
     fn drain(&mut self) {
+        if self.pull_flags & 64 != 0 {
+            return;
+        }
         let mut buf = vec![0u8; 70_000];
         for _ in 0..4096 {
-            let Some(tx) = self.stack.poll_transmit_with(self.now, &mut buf, self.caps) else {
+            let limit = if self.pull_flags & 32 != 0 {
+                31
+            } else {
+                buf.len()
+            };
+            let tx = if self.pull_flags & 128 != 0 {
+                super::control_transmit(&mut self.stack, self.now, &mut buf[..limit])
+            } else {
+                self.stack
+                    .poll_transmit_with(self.now, &mut buf[..limit], self.caps)
+            };
+            let Some(tx) = tx else {
                 return;
             };
+            self.stack.check();
+            if self.pull_flags & 128 != 0 {
+                self.control_packets += 1;
+            }
             let packet = &buf[..tx.len];
             let ip = match wire::parse_ip(packet) {
                 Ok(ip) => ip,
@@ -336,6 +358,7 @@ impl World {
     }
 
     fn finish(&mut self) {
+        self.pull_flags = 0;
         self.adopt();
         for p in &self.slots {
             if let Some(id) = p.id {
@@ -435,6 +458,7 @@ fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
         if let Rx::TransparentOwned {
             src: got_src,
             dst: got_dst,
+            dscp,
             packet,
             payload: range,
         } = rx
@@ -445,6 +469,7 @@ fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
                 "a corrupt reassembled checksum must never be trusted"
             );
             assert_eq!((got_src, got_dst), (src, dst));
+            assert_eq!(dscp, 0);
             assert_eq!(&packet[range], payload);
             w.reassembled += 1;
         }
@@ -703,17 +728,25 @@ fn step(w: &mut World, r: &mut Reader) {
                     wire::ip_header_len(c.is_ipv6()) as u16,
                 );
                 match w.ingest(&mut out[..n], meta) {
-                    Rx::Transparent { src, dst, payload } => {
+                    Rx::Transparent {
+                        src,
+                        dst,
+                        dscp,
+                        payload,
+                    } => {
                         assert_eq!((src, dst), (c, d));
+                        assert_eq!(dscp, 0);
                         assert_eq!(out[payload].len(), len);
                     }
                     Rx::TransparentSplit {
                         src,
                         dst,
+                        dscp,
                         payload,
                         size,
                     } => {
                         assert_eq!((src, dst), (c, d));
+                        assert_eq!(dscp, 0);
                         assert_eq!(out[payload.clone()].len(), len);
                         for datagram in out[payload].chunks(usize::from(size)) {
                             assert!(datagram.iter().all(|&byte| byte == 0xa5));
@@ -740,6 +773,7 @@ fn step(w: &mut World, r: &mut Reader) {
         }
         op::CAPS => {
             let mask = r.u8();
+            w.pull_flags = mask;
             w.caps = TxCaps {
                 tso4: mask & 1 != 0,
                 tso6: mask & 2 != 0,
@@ -800,12 +834,50 @@ pub fn seeds() -> Vec<Vec<u8>> {
         TCP_GSO, 0, 10, 2, 3, 3, UDP_GSO, 0, 20, 0, 0,
         CAPS, 0, APP, 0, 1, 255,
     ]);
-    vec![bulk, keepalive, deferred, refuse, close, caps, udp, offloads]
+    let mut control = open.clone();
+    control.extend([
+        CAPS, 128, APP, 0, 0, 32, DATA, 0, 3, 0,
+        SYN, 2, 1, 3, ACCEPT, 1, 0, 0, 0, HANDSHAKE_ACK, 1,
+        APP, 1, 2, 0, FRAGMENTS, 0, 90, 4, ADVANCE, 15,
+        CAPS, 160, DATA, 0, 3, 0, CAPS, 128,
+        CAPS, 64, APP, 0, 0, 8, CAPS, 0,
+    ]);
+    vec![bulk, keepalive, deferred, refuse, close, caps, udp, offloads, control]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_seed_reaches_ack_fin_and_fragment_timeout_then_resumes_bulk() {
+        let seed = &seeds()[8];
+        let mut r = Reader(seed);
+        let mut w = World::new();
+        while !r.done() {
+            step(&mut w, &mut r);
+            w.adopt();
+            w.stack.check();
+            if w.pull_flags & 128 != 0 {
+                let id = w.slots[0].id.unwrap();
+                assert_eq!(w.stack.tcp_stats(id).unwrap().outstanding_bytes, 0);
+            }
+        }
+        assert!(
+            w.control_packets >= 5,
+            "SYN-ACK, data ACKs, FIN and reassembly ICMP use control credit"
+        );
+        let id = w.slots[0].id.unwrap();
+        assert!(
+            w.stack.tcp_stats(id).unwrap().outstanding_bytes > 0,
+            "bulk resumes"
+        );
+        let mut received = [0; 256];
+        assert_eq!(w.stack.tcp_read(id, &mut received), Ok(48));
+        let expected: Vec<u8> = (0..24).chain(0..24).collect();
+        assert_eq!(&received[..48], expected);
+        w.finish();
+    }
 
     #[test]
     fn seed_walks_gro_tso_uso_and_valid_fragment_reassembly() {

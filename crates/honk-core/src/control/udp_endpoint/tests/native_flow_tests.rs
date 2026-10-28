@@ -28,7 +28,14 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
         );
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"first",
+            permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("retired tuple must allow a new initializer"),
         };
@@ -73,6 +80,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
         }
         let queue = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             lease.generation(),
@@ -125,7 +133,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
                 recv_and_ack(&pool, &mut removed_rx).await.unwrap();
             }
             "intentional_retirement" => {
-                pool.remove(client, dst);
+                pool.remove(honk_datapath::ScopeId::HOST, client, dst);
                 recv_and_ack(&pool, &mut removed_rx).await.unwrap();
             }
             "shutdown" => {
@@ -273,6 +281,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
     );
     let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match handle.udp_pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         destination,
         &packet,
@@ -294,7 +303,10 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
                 .unwrap()
                 .unwrap();
         assert_eq!(&received[..length], packet.as_slice());
-        let endpoint = handle.udp_pool.get(client_addr, destination).unwrap();
+        let endpoint = handle
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client_addr, destination)
+            .unwrap();
         assert_eq!(
             endpoint.byte_counters().0.load(Ordering::Relaxed),
             packet.len() as u64
@@ -464,11 +476,17 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         );
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease =
-            match pool.reserve_or_enqueue(client, destination, b"request", permit, &stats) {
-                EndpointReservation::Initializing(lease) => lease,
-                _ => panic!("new loopback flow must be admitted"),
-            };
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            destination,
+            b"request",
+            permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("new loopback flow must be admitted"),
+        };
         let (removed_tx, mut removed_rx) = mpsc::channel(1);
         pool.set_remove_sink(removed_tx);
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -477,6 +495,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             destination,
             lease.generation(),
@@ -548,6 +567,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         );
         if !cleanup_succeeded {
             assert!(pool.complete_removal(
+                removal.scope,
                 removal.client,
                 removal.dst,
                 removal.owner,

@@ -1,6 +1,6 @@
 //! UDP endpoint pool — NAT mapping and connection tracking for UDP relay.
 //!
-//! Each UDP "connection" (identified by client address + destination address)
+//! Each UDP "connection" (identified by scope + client + destination)
 //! gets a pooled endpoint that handles bidirectional forwarding and
 //! NAT timeout management. Mirrors the Go `udp_endpoint_pool.go`.
 //!
@@ -9,10 +9,12 @@
 
 #[cfg(test)]
 use self::driver::TRANSPORT_SEND_TIMEOUT;
+use crate::control::task_registry::TaskRegistry;
 use crate::ebpf::UdpFlowOwner;
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
+use honk_datapath::ScopeId;
 use honk_outbound::group::{ScoreOutcome, ScoreReporter};
 use parking_lot::Mutex;
 pub(in crate::control) use source::UplinkStall;
@@ -112,6 +114,7 @@ impl UdpTerminal {
 }
 
 mod admission;
+mod budget;
 mod foreign_reply;
 #[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
 mod observation;
@@ -133,7 +136,8 @@ pub mod bench_support;
 #[cfg(feature = "ebpf")]
 pub(in crate::control) use admission::OwnedEnqueueError;
 pub(in crate::control) use admission::{
-    DatagramPayload, EndpointReservation, QueuedDatagram, RawDnsRoute, UdpInitLease, queue_now,
+    DatagramPayload, EndpointReservation, FundedDatagram, QueuedDatagram, RawDnsRoute,
+    UdpInitLease, queue_now,
 };
 use admission::{EndpointEntry, EndpointKey, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY};
 #[cfg(test)]
@@ -372,6 +376,12 @@ impl UdpEndpoint {
 
     pub fn is_expired(&self) -> bool {
         monotonic_nanos() > self.expires_at.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) fn expire_for_test(&self) {
+        self.expires_at
+            .store(monotonic_nanos() - 1, Ordering::Relaxed);
     }
 
     pub fn refresh(&self) {
@@ -622,54 +632,78 @@ impl UdpEndpoint {
     }
 }
 
-/// A synchronously-created anyfrom socket. The default factory calls the
-/// daens-scoped production helper so eager and lazy sockets preserve the same
-/// network-namespace and source-address invariants.
+/// Creates a reply transport for the explicitly supplied scope and source.
+/// The pool reserves descriptor credit before invoking FD-using factories.
 pub(super) trait UdpReplySocketFactory: Send + Sync + std::fmt::Debug {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket>;
+    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd>;
+
+    /// False only when creation and transport lifetime require no socket FD.
+    fn uses_fd(&self) -> bool {
+        true
+    }
 }
 
 pub(super) struct ReplySocket {
+    scope: ScopeId,
     socket: ReplySocketFd,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
-enum ReplySocketFd {
-    Bounded(UdpSocket),
+#[derive(Debug)]
+pub(super) enum ReplySocketFd {
+    Kernel(UdpSocket),
+    Packet(crate::control::netstack::DatagramSender),
     #[cfg(test)]
     Untracked(Arc<UdpSocket>),
-}
-
-impl std::ops::Deref for ReplySocket {
-    type Target = UdpSocket;
-
-    fn deref(&self) -> &Self::Target {
-        match &self.socket {
-            ReplySocketFd::Bounded(socket) => socket,
-            #[cfg(test)]
-            ReplySocketFd::Untracked(socket) => socket,
-        }
-    }
 }
 
 impl ReplySocket {
     fn create(
         factory: &dyn UdpReplySocketFactory,
         slots: &Arc<Semaphore>,
+        scope: ScopeId,
         source: SocketAddr,
     ) -> io::Result<Self> {
-        let permit = Arc::clone(slots)
-            .try_acquire_owned()
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "UDP reply socket capacity"))?;
+        let permit = if factory.uses_fd() {
+            Some(Arc::clone(slots).try_acquire_owned().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "UDP reply socket capacity")
+            })?)
+        } else {
+            None
+        };
+        let socket = factory.create(scope, source)?;
+        if let ReplySocketFd::Packet(sender) = &socket
+            && sender.scope() != scope
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP reply sender belongs to another scope",
+            ));
+        }
         Ok(Self {
-            socket: ReplySocketFd::Bounded(factory.create(source)?),
-            _permit: Some(permit),
+            scope,
+            socket,
+            _permit: permit,
         })
     }
 
+    pub(super) fn scope(&self) -> ScopeId {
+        self.scope
+    }
+
+    pub(super) async fn send_to(&self, payload: &[u8], client: SocketAddr) -> io::Result<usize> {
+        match &self.socket {
+            ReplySocketFd::Kernel(socket) => socket.send_to(payload, client).await,
+            ReplySocketFd::Packet(sender) => sender.send_to(payload, client).await,
+            #[cfg(test)]
+            ReplySocketFd::Untracked(socket) => socket.send_to(payload, client).await,
+        }
+    }
+
     #[cfg(test)]
-    fn untracked(socket: Arc<UdpSocket>) -> Self {
+    fn untracked(scope: ScopeId, socket: Arc<UdpSocket>) -> Self {
         Self {
+            scope,
             socket: ReplySocketFd::Untracked(socket),
             _permit: None,
         }
@@ -680,8 +714,14 @@ impl ReplySocket {
 struct SystemUdpReplySocketFactory;
 
 impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
-        super::new_udp_reply_socket(source)
+    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
+        if scope != ScopeId::HOST {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel UDP reply sockets require the HOST scope",
+            ));
+        }
+        super::new_udp_reply_socket(source).map(ReplySocketFd::Kernel)
     }
 }
 
@@ -690,8 +730,8 @@ pub(in crate::control) struct UdpShutdown {
     pub graceful: bool,
 }
 
-/// Pool state is a single map entry per tuple: Initializing, Ready, or the
-/// exact Retiring identity that fences reuse until cleanup is acknowledged.
+/// Pool state is a single map entry per scoped tuple: Initializing, Ready, or
+/// the exact Retiring identity that fences reuse until cleanup is acknowledged.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, EndpointEntry>,
     endpoint_slots: Arc<Semaphore>,
@@ -733,6 +773,10 @@ pub struct UdpEndpointPool {
     reservation_publication_hook: Mutex<Option<Arc<ReservationPublicationHook>>>,
     #[cfg(test)]
     reservation_gate_hook: Mutex<Option<Arc<ReservationGateHook>>>,
+    memory_budget: Option<Arc<honk_netstack::MemoryBudget>>,
+    metadata_slots: Option<Arc<Semaphore>>,
+    completed_tasks: Option<Arc<AtomicUsize>>,
+    _map_memory: Option<honk_netstack::MemoryReservation>,
 }
 
 impl UdpEndpointPool {
@@ -749,26 +793,70 @@ impl UdpEndpointPool {
         )
     }
 
-    /// Dependency injection seam for synchronous anyfrom creation. The primary
-    /// socket is created before the driver starts; foreign reply sources use
-    /// the same factory lazily through the shared pool.
+    /// The primary reply transport is created before the driver starts; foreign
+    /// reply sources use the same factory lazily through the shared pool.
     pub(super) fn with_reply_socket_factory(
         capacity_limit: usize,
         reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
     ) -> Self {
+        Self::build_pool(capacity_limit, reply_socket_factory, None)
+    }
+
+    fn build_pool(
+        capacity_limit: usize,
+        reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
+        memory: Option<budget::PoolMemory>,
+    ) -> Self {
+        let accounted = memory.is_some();
+        let (
+            memory_budget,
+            metadata_slots,
+            completed_tasks,
+            map_memory,
+            source_tasks,
+            drivers,
+            slow_tasks,
+        ) = match memory {
+            Some(memory) => (
+                Some(memory.budget),
+                Some(memory.slots),
+                Some(memory.completed_tasks),
+                Some(memory.maps),
+                memory.source_tasks,
+                memory.drivers,
+                memory.slow_tasks,
+            ),
+            None => (
+                None,
+                None,
+                None,
+                None,
+                TaskRegistry::default(),
+                TaskRegistry::default(),
+                TaskRegistry::default(),
+            ),
+        };
         let (cancel_epoch, _) = watch::channel(0u64);
         Self {
-            endpoints: DashMap::new(),
+            endpoints: if accounted {
+                DashMap::with_shard_amount(budget::MAP_SHARDS)
+            } else {
+                DashMap::new()
+            },
             endpoint_slots: Arc::new(Semaphore::new(capacity_limit)),
             global_payload_bytes: Arc::new(Semaphore::new(GLOBAL_PAYLOAD_CAPACITY)),
             foreign_replies: Arc::new(ForeignReplySockets::new(
                 capacity_limit,
                 reply_socket_factory,
             )),
-            sources: DashMap::new(),
+            sources: if accounted {
+                DashMap::with_shard_amount(budget::MAP_SHARDS)
+            } else {
+                DashMap::new()
+            },
             source_slots: Arc::new(Semaphore::new(capacity_limit)),
             next_source_owner: AtomicU64::new(1),
-            source_tasks: Mutex::new(TaskRegistry::default()),
+            source_tasks: Mutex::new(source_tasks),
             source_changed: Notify::new(),
             node_binding_gate: Mutex::new(()),
             next_generation: AtomicU64::new(1),
@@ -777,8 +865,8 @@ impl UdpEndpointPool {
             active_initializers: AtomicUsize::new(0),
             initializers_empty: Notify::new(),
             terminal: AtomicBool::new(false),
-            slow_tasks: Mutex::new(TaskRegistry::default()),
-            drivers: Mutex::new(TaskRegistry::default()),
+            slow_tasks: Mutex::new(slow_tasks),
+            drivers: Mutex::new(drivers),
             remove_sink: Mutex::new(None),
             removal_dirty: Mutex::new(HashSet::new()),
             active_retirements: AtomicUsize::new(0),
@@ -787,11 +875,28 @@ impl UdpEndpointPool {
             reservation_publication_hook: Mutex::new(None),
             #[cfg(test)]
             reservation_gate_hook: Mutex::new(None),
+            memory_budget,
+            metadata_slots,
+            completed_tasks,
+            _map_memory: map_memory,
         }
     }
 
-    pub(super) fn create_reply_socket(&self, source: SocketAddr) -> io::Result<ReplySocket> {
-        self.foreign_replies.create_primary(source)
+    pub(in crate::control) fn with_packet_reply_factory(
+        capacity: usize,
+        factory: Arc<dyn UdpReplySocketFactory>,
+        budget: Arc<honk_netstack::MemoryBudget>,
+    ) -> io::Result<Self> {
+        let memory = budget::PoolMemory::new(capacity, budget)?;
+        Ok(Self::build_pool(capacity, factory, Some(memory)))
+    }
+
+    pub(super) fn create_reply_socket(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+    ) -> io::Result<ReplySocket> {
+        self.foreign_replies.create_primary(scope, source)
     }
 
     #[cfg(test)]
@@ -805,8 +910,9 @@ impl UdpEndpointPool {
     }
 
     #[cfg(test)]
-    pub(super) fn contains(&self, client: SocketAddr, dst: SocketAddr) -> bool {
-        self.endpoints.contains_key(&EndpointKey::new(client, dst))
+    pub(super) fn contains(&self, scope: ScopeId, client: SocketAddr, dst: SocketAddr) -> bool {
+        self.endpoints
+            .contains_key(&EndpointKey::new(scope, client, dst))
     }
 
     #[cfg(test)]
@@ -816,12 +922,12 @@ impl UdpEndpointPool {
 
     #[cfg(test)]
     fn slow_task_count(&self) -> usize {
-        self.slow_tasks.lock().tasks.len()
+        self.slow_tasks.lock().len()
     }
 
     #[cfg(test)]
     fn driver_count(&self) -> usize {
-        self.drivers.lock().tasks.len()
+        self.drivers.lock().len()
     }
 }
 
@@ -836,7 +942,7 @@ mod driver;
 #[cfg(test)]
 use driver::score_driver_outcome;
 use driver::{
-    DRIVER_ABORT_TIMEOUT, DRIVER_SHUTDOWN_TIMEOUT, TRAFFIC_ALIVE_REPORT_INTERVAL, TaskRegistry,
+    DRIVER_ABORT_TIMEOUT, DRIVER_SHUTDOWN_TIMEOUT, TRAFFIC_ALIVE_REPORT_INTERVAL,
     join_registered_tasks, monotonic_nanos, nanos_from_dur,
 };
 #[cfg(test)]

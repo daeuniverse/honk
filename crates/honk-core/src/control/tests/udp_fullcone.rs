@@ -265,8 +265,12 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                     "stateless source53 traffic created ordinary conn-state"
                                 );
                             }
-                            ensure!(udp_pool.get(client_addr, destination).is_some());
-                            udp_pool.remove(client_addr, destination);
+                            ensure!(
+                                udp_pool
+                                    .get(honk_datapath::ScopeId::HOST, client_addr, destination)
+                                    .is_some()
+                            );
+                            udp_pool.remove(honk_datapath::ScopeId::HOST, client_addr, destination);
                         }
                         tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                             while !udp_pool.is_empty() {

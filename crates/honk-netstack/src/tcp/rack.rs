@@ -12,6 +12,29 @@ use std::time::{Duration, Instant};
 use super::sent::{EVER_RETRANS, LOST, Newest, RETRANS, SACKED, Sent};
 use super::seq;
 
+const FIFO_FLOOR: usize = super::sent::FLOOR_SLOTS;
+type Retransmit = (u32, Instant);
+
+#[derive(Default)]
+struct Retransmits {
+    entries: VecDeque<Retransmit>,
+    reservation: Option<crate::MemoryReservation>,
+}
+
+impl std::ops::Deref for Retransmits {
+    type Target = VecDeque<Retransmit>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for Retransmits {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
 /// Linux's `TCP_DELACK_MAX`: a lone segment may wait this long for its ACK.
 pub const MAX_ACK_DELAY: Duration = Duration::from_millis(200);
 /// Reorder-window growth is bounded by SRTT; this bounds the multiplier itself.
@@ -34,9 +57,7 @@ pub struct Rack {
     /// Reorder timer, as the time it was computed for (not when it is processed).
     pub timer: Option<Instant>,
     cursor: u32,
-    // Boxed so a flow that never retransmits does not carry an inline deque.
-    #[allow(clippy::box_collection)]
-    retransmits: Option<Box<VecDeque<(u32, Instant)>>>,
+    retransmits: Option<Box<Retransmits>>,
     pub tlp: Option<Tlp>,
     /// A DSACK arrived since the probe was sent.
     tlp_dsack: bool,
@@ -59,6 +80,41 @@ pub enum TlpOutcome {
 }
 
 impl Rack {
+    pub(super) fn overhead_bound() -> usize {
+        std::mem::size_of::<Retransmits>() + 3 * FIFO_FLOOR * std::mem::size_of::<Retransmit>()
+    }
+
+    pub(super) fn ensure_room(&mut self, pool: &super::ring::Pool, extra: usize) -> bool {
+        let Some(budget) = pool.index_budget() else {
+            return true;
+        };
+        let q = self.retransmits.get_or_insert_default();
+        let Some(needed) = q.len().checked_add(extra) else {
+            return false;
+        };
+        if needed <= q.capacity() {
+            return true;
+        }
+        let Some(capacity) = needed.max(FIFO_FLOOR).checked_next_power_of_two() else {
+            return false;
+        };
+        let Some(bytes) = capacity
+            .saturating_sub(FIFO_FLOOR)
+            .checked_mul(std::mem::size_of::<Retransmit>())
+            .and_then(|n| n.checked_mul(3))
+        else {
+            return false;
+        };
+        let Some(reservation) = budget.reserve(bytes) else {
+            return false;
+        };
+        let len = q.len();
+        q.reserve_exact(capacity - len);
+        assert!(q.capacity() <= capacity, "unfunded RACK FIFO capacity");
+        q.reservation = Some(reservation);
+        true
+    }
+
     pub fn new(start: u32) -> Rack {
         Rack {
             steps: 1,
@@ -359,7 +415,7 @@ mod tests {
             s.retrans, 0,
             "the lost retransmission is no longer in flight"
         );
-        assert_eq!(s.next_retransmit().map(|v| v.1), Some(1000));
+        assert_eq!(s.next_retransmit(true).map(|v| v.1), Some(1000));
     }
 
     #[test]
@@ -437,5 +493,34 @@ mod tests {
             TlpOutcome::Done,
             "new-data probe is never a loss"
         );
+    }
+
+    #[test]
+    fn fifo_growth_is_funded_before_retransmission_and_refunded_after_storage_drop() {
+        let budget = crate::MemoryBudget::new(64 * 1024);
+        let pool = super::super::ring::Pool::with_limits(0, 0)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut rack = Rack::new(1000);
+        let now = Instant::now();
+        assert!(rack.ensure_room(&pool, FIFO_FLOOR));
+        for end in 0..FIFO_FLOOR {
+            rack.on_retransmit(end as u32, now);
+        }
+        assert_eq!(budget.used(), 0, "fixed FIFO floor is in stack overhead");
+        let held = budget.reserve(budget.limit()).unwrap();
+        assert!(!rack.ensure_room(&pool, 1));
+        assert_eq!(rack.pending_retransmits(), FIFO_FLOOR);
+        drop(held);
+        assert!(rack.ensure_room(&pool, 1));
+        rack.on_retransmit(100, now);
+        assert!(budget.used() >= FIFO_FLOOR * std::mem::size_of::<Retransmit>());
+        rack.trim(99);
+        assert!(
+            budget.used() != 0,
+            "a partially drained backing retains its charge"
+        );
+        rack.trim(100);
+        assert_eq!(budget.used(), 0);
     }
 }

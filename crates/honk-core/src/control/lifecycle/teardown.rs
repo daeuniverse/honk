@@ -69,7 +69,19 @@ impl ControlPlane {
     // Runs after `quiesce_udp_epoch`.
     pub(super) async fn stop_network_epoch(
         &mut self,
+        epoch: Option<&mut RuntimeEpoch>,
+    ) -> anyhow::Result<()> {
+        self.stop_network_epoch_with_backend(epoch, true).await
+    }
+
+    pub(in crate::control) async fn stop_packet_epoch(&mut self) -> anyhow::Result<()> {
+        self.stop_network_epoch_with_backend(None, false).await
+    }
+
+    async fn stop_network_epoch_with_backend(
+        &mut self,
         mut epoch: Option<&mut RuntimeEpoch>,
+        owns_backend: bool,
     ) -> anyhow::Result<()> {
         let mut error = None;
         if let Some(epoch) = epoch.as_mut() {
@@ -84,13 +96,22 @@ impl ControlPlane {
             retain_error(&mut error, epoch.maintenance.abort_and_join().await);
         }
         // The tracker covers published UUIDs; the epoch also owns pre-ID TCP work.
-        if let Ok(summary) = self
+        match self
             .connection_tracker
             .close_matching(Some("tcp"), None, usize::MAX)
             .await
-            && summary.failed
         {
-            error.get_or_insert_with(|| anyhow::anyhow!("TCP retirement could not be confirmed"));
+            Ok(summary) if summary.failed => {
+                error.get_or_insert_with(|| {
+                    anyhow::anyhow!("TCP retirement could not be confirmed")
+                });
+            }
+            Err(close_error) => {
+                error.get_or_insert_with(|| {
+                    anyhow::anyhow!("TCP retirement failed: {close_error:?}")
+                });
+            }
+            _ => {}
         }
         if let Some(epoch) = epoch.as_mut() {
             epoch.tcp.abort_all();
@@ -143,15 +164,22 @@ impl ControlPlane {
                 error.get_or_insert(fatal);
             }
         }
-        retain_error(&mut error, self.ebpf.write().await.clear_listener_sockets());
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                registry.shutdown().await;
-                Ok(())
-            })
-            .await,
-        );
+        if owns_backend {
+            retain_error(&mut error, self.ebpf.write().await.clear_listener_sockets());
+            retain_error(
+                &mut error,
+                cleanup_stage(async {
+                    registry.shutdown().await;
+                    Ok(())
+                })
+                .await,
+            );
+        } else {
+            registry.shutdown().await;
+            if registry.tasks_failed() {
+                error.get_or_insert_with(|| anyhow::anyhow!("outbound runtime cleanup failed"));
+            }
+        }
         self.connection_pool.clear();
         for runtime in registry.values() {
             for reason in [

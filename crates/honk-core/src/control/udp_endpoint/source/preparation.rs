@@ -74,7 +74,7 @@ impl SourcePreparation {
 
                     {
                         let mut tasks = pool.source_tasks.lock();
-                        while let Some(result) = tasks.tasks.try_join_next() {
+                        while let Some(result) = tasks.try_join_next() {
                             if let Err(error) = result {
                                 debug!("UDP source receiver join failed: {}", error);
                             }
@@ -108,12 +108,17 @@ impl SourcePreparation {
                                     ),
                                     stats,
                                     source_permit,
+                                )?;
+                                let receiver =
+                                    run_source_receiver(Arc::clone(pool), Arc::clone(&owner));
+                                drop(
+                                    tasks
+                                        .spawn(receiver, super::super::budget::RECEIVE_BYTES)
+                                        .map_err(|_| {
+                                            honk_outbound::proxy::PacketRejection::Capacity
+                                        })?,
                                 );
                                 entry.insert(Arc::clone(&owner));
-                                drop(tasks.tasks.spawn(run_source_receiver(
-                                    Arc::clone(pool),
-                                    Arc::clone(&owner),
-                                )));
                                 drop(tasks);
                                 return Ok(SourceAttachment {
                                     owner,

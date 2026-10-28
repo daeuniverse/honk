@@ -39,6 +39,7 @@ pub fn parse(pkt: &[u8]) -> Result<IpPacket, ParseError> {
     Ok(IpPacket {
         src: IpAddr::V6(src),
         dst: IpAddr::V6(dst),
+        dscp: ((pkt[0] & 0x0F) << 4 | pkt[1] >> 4) >> 2,
         proto,
         hop_limit: pkt[7],
         payload: off..end,
@@ -172,9 +173,24 @@ mod tests {
         let p = parse(&b).unwrap();
         assert_eq!(p.src, IpAddr::V6(SRC));
         assert_eq!(p.dst, IpAddr::V6(DST));
+        assert_eq!(p.dscp, 0);
         assert_eq!(p.proto, 6);
         assert_eq!(p.hop_limit, 64);
         assert_eq!(&b[p.payload], b"segment");
+    }
+
+    #[test]
+    fn dscp_excludes_ecn_and_the_flow_label() {
+        for dscp in 0..=63 {
+            for ecn in 0..=3 {
+                let mut b = packet(&[(0, 8), (60, 8)], 6, b"data");
+                let traffic_class = dscp << 2 | ecn;
+                b[0] = 0x60 | traffic_class >> 4;
+                b[1] = traffic_class << 4 | 0x0F;
+                b[2..4].fill(0xFF);
+                assert_eq!(parse(&b).unwrap().dscp, dscp);
+            }
+        }
     }
 
     #[test]

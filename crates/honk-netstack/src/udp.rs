@@ -11,7 +11,7 @@ impl Stack {
         if self.cfg.local_v4.is_none() && self.cfg.local_v6.is_none() {
             return Err(BindError::NoLocalAddress);
         }
-        if self.table.active >= self.cfg.max_flows {
+        if self.table.active >= self.cfg.max_flows || !self.table.can_insert(None) {
             return Err(BindError::FlowLimit);
         }
         let port = match local_port {

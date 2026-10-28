@@ -19,6 +19,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, TryAcquireError};
 use tracing::warn;
 
 mod transport;
+pub(in crate::control) use transport::DnsUdpReply;
 
 #[cfg(test)]
 mod tests;
@@ -72,6 +73,7 @@ pub(crate) struct AdmittedDnsQuery {
     runtime: crate::dns::runtime::RuntimeLease,
     _query_permit: OwnedSemaphorePermit,
     _udp_permit: Option<OwnedSemaphorePermit>,
+    project_kernel: bool,
 }
 
 pub(crate) struct DnsAdmissionError {
@@ -256,6 +258,17 @@ impl DnsController {
             runtime,
             _query_permit: query_permit,
             _udp_permit: udp_permit,
+            project_kernel: true,
+        })
+    }
+
+    pub(in crate::control) fn try_admit_packet_query(
+        &self,
+        udp: bool,
+    ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        self.try_admit_query(udp).map(|mut query| {
+            query.project_kernel = false;
+            query
         })
     }
 
@@ -288,7 +301,9 @@ impl DnsController {
             .await
         {
             Ok(outcome) => {
-                self.submit_projection(admission.runtime.runtime(), &outcome);
+                if admission.project_kernel {
+                    self.submit_projection(admission.runtime.runtime(), &outcome);
+                }
                 DnsClientAnswer(Ok(outcome))
             }
             Err(error)

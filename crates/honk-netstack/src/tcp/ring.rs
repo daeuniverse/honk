@@ -37,10 +37,52 @@ const FREE_CACHE: usize = 64;
 /// reallocate its list each time; a ring that once held a whole window gives the rest back.
 const KEEP_SLOTS: usize = 4;
 
+pub(super) const fn index_floor_bytes() -> usize {
+    KEEP_SLOTS * (std::mem::size_of::<Chunk>() + std::mem::size_of::<Option<Chunk>>())
+}
+
 fn trim<T>(chunks: &mut VecDeque<T>) {
     if chunks.capacity() > KEEP_SLOTS {
         chunks.shrink_to(KEEP_SLOTS);
     }
+}
+
+fn index_cells(needed: usize) -> usize {
+    needed.max(KEEP_SLOTS).next_power_of_two()
+}
+
+fn fund_indices<T>(pool: &mut Pool, reserved: &mut u32, needed: usize) -> bool {
+    if !pool.account_indices {
+        return true;
+    }
+    let old = (*reserved as usize).max(KEEP_SLOTS);
+    let new = index_cells(needed).max(old);
+    if !pool.charge_indices((new - old) * std::mem::size_of::<T>()) {
+        return false;
+    }
+    *reserved = new as u32;
+    true
+}
+
+fn materialize_indices<T>(chunks: &mut VecDeque<T>, reserved: u32, needed: usize) {
+    if needed > chunks.capacity() && reserved != 0 {
+        chunks.reserve_exact(index_cells(needed) - chunks.len());
+        assert!(
+            chunks.capacity() <= reserved as usize,
+            "unfunded ring capacity"
+        );
+    }
+}
+
+fn retain_indices<T>(pool: &mut Pool, reserved: &mut u32, needed: usize) {
+    if !pool.account_indices {
+        return;
+    }
+    let old = (*reserved as usize).max(KEEP_SLOTS);
+    let new = index_cells(needed);
+    debug_assert!(new <= old);
+    pool.refund_indices((old - new) * std::mem::size_of::<T>());
+    *reserved = new as u32;
 }
 
 /// `Box<[u8]>` of the pool's chunk size.
@@ -58,6 +100,8 @@ pub struct Pool {
     /// limits; `held` is what this pool owes it back.
     budget: Option<Arc<MemoryBudget>>,
     held: usize,
+    account_indices: bool,
+    index_held: usize,
 }
 
 impl Pool {
@@ -77,12 +121,44 @@ impl Pool {
             total_limit,
             budget: None,
             held: 0,
+            account_indices: false,
+            index_held: 0,
         }
     }
 
     pub fn with_budget(mut self, budget: Option<Arc<MemoryBudget>>) -> Pool {
         self.budget = budget;
         self
+    }
+
+    pub fn with_index_accounting(mut self) -> Self {
+        self.account_indices = true;
+        self
+    }
+
+    pub fn index_budget(&self) -> Option<&Arc<MemoryBudget>> {
+        if self.account_indices {
+            self.budget.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn overhead_bound(memory_limit: usize) -> Option<usize> {
+        crate::budget::collection_peak::<Chunk>(FREE_CACHE)?.checked_add(memory_limit)
+    }
+
+    fn charge_indices(&mut self, bytes: usize) -> bool {
+        if !self.charge(bytes) {
+            return false;
+        }
+        self.index_held += bytes;
+        true
+    }
+
+    fn refund_indices(&mut self, bytes: usize) {
+        self.index_held -= bytes;
+        self.refund(bytes);
     }
 
     /// Chunk size for every chunk this pool hands out; call before the first allocation.
@@ -187,7 +263,10 @@ impl Pool {
     #[cfg(feature = "fuzz-checks")]
     pub fn check_held(&self, floors: usize) {
         if self.budget.is_some() {
-            assert_eq!(self.held, floors * self.floor() + self.shared_used);
+            assert_eq!(
+                self.held,
+                floors * self.floor() + self.shared_used + self.index_held
+            );
         }
     }
 
@@ -229,6 +308,7 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        self.free.clear();
         self.refund(self.held);
     }
 }
@@ -238,12 +318,13 @@ impl Drop for Pool {
 pub struct SendRing {
     chunks: VecDeque<Chunk>,
     head: usize,
-    len: usize,
+    len: u32,
+    index_reserved: u32,
 }
 
 impl SendRing {
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     pub fn tail_room(&self, pool: &Pool) -> usize {
@@ -251,27 +332,55 @@ impl SendRing {
         if self.chunks.is_empty() {
             chunk
         } else {
-            self.chunks.len() * chunk - self.head - self.len
+            self.chunks.len() * chunk - self.head - self.len as usize
         }
+    }
+
+    pub fn can_append(&self, pool: &Pool, bytes: usize) -> bool {
+        let chunk = pool.chunk();
+        let extra = bytes.saturating_sub(self.tail_room(pool)).div_ceil(chunk);
+        let needed = self.chunks.len().max(1) + extra;
+        let payload = extra * chunk;
+        let indices = if pool.account_indices {
+            let old = (self.index_reserved as usize).max(KEEP_SLOTS);
+            index_cells(needed).saturating_sub(old) * std::mem::size_of::<Chunk>()
+        } else {
+            0
+        };
+        payload <= pool.shared_limit - pool.shared_used
+            && pool
+                .budget
+                .as_ref()
+                .is_none_or(|budget| payload + indices <= budget.available())
     }
 
     pub fn write(&mut self, pool: &mut Pool, data: &[u8]) -> usize {
         let chunk = pool.chunk();
         let mut done = 0;
         while done < data.len() {
-            let end = self.head + self.len;
+            let end = self.head + self.len as usize;
             let (ci, co) = (end / chunk, end % chunk);
             if ci == self.chunks.len() {
+                if !self.can_append(pool, 1) {
+                    break;
+                }
                 // The first chunk is the free floor; later ones are shared.
                 if !self.chunks.is_empty() && !pool.reserve(1) {
                     break;
                 }
+                if !fund_indices::<Chunk>(pool, &mut self.index_reserved, self.chunks.len() + 1) {
+                    if !self.chunks.is_empty() {
+                        pool.release(1);
+                    }
+                    break;
+                }
+                materialize_indices(&mut self.chunks, self.index_reserved, ci + 1);
                 self.chunks.push_back(pool.alloc());
             }
             let n = (chunk - co).min(data.len() - done);
             self.chunks[ci][co..co + n].copy_from_slice(&data[done..done + n]);
             done += n;
-            self.len += n;
+            self.len += n as u32;
         }
         done
     }
@@ -279,7 +388,7 @@ impl SendRing {
     /// A maximum-size IP packet spans at most [`MAX_PARTS`] chunks, including an unaligned first
     /// chunk. The unused array slots never reach the checksum loop.
     pub fn slices(&self, off: usize, len: usize) -> ([&[u8]; MAX_PARTS], usize) {
-        debug_assert!(off + len <= self.len && len <= usize::from(u16::MAX));
+        debug_assert!(off + len <= self.len as usize && len <= usize::from(u16::MAX));
         let mut parts: [&[u8]; MAX_PARTS] = [&[]; MAX_PARTS];
         let mut pos = self.head + off;
         let (mut left, mut count) = (len, 0);
@@ -296,9 +405,9 @@ impl SendRing {
     }
 
     pub fn consume(&mut self, pool: &mut Pool, n: usize) {
-        debug_assert!(n <= self.len);
+        debug_assert!(n <= self.len as usize);
         self.head += n;
-        self.len -= n;
+        self.len -= n as u32;
         if self.len == 0 {
             self.clear(pool);
             return;
@@ -315,6 +424,7 @@ impl SendRing {
             self.pop_front(pool);
         }
         trim(&mut self.chunks);
+        retain_indices::<Chunk>(pool, &mut self.index_reserved, self.chunks.capacity());
         self.head = 0;
         self.len = 0;
     }
@@ -325,6 +435,13 @@ impl SendRing {
         }
         if let Some(c) = self.chunks.pop_front() {
             pool.free(c);
+        }
+    }
+
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_indices(&self) {
+        if self.index_reserved != 0 {
+            assert!(self.chunks.capacity() <= self.index_reserved as usize);
         }
     }
 
@@ -341,6 +458,7 @@ pub struct RecvRing {
     head: usize,
     charged: usize,
     pub rd_seq: u32,
+    index_reserved: u32,
 }
 
 impl RecvRing {
@@ -350,6 +468,7 @@ impl RecvRing {
             head: 0,
             charged: 0,
             rd_seq,
+            index_reserved: 0,
         }
     }
 
@@ -369,12 +488,15 @@ impl RecvRing {
     /// Reserve shared chunks so the window may extend to `right`.
     pub fn grow(&mut self, pool: &mut Pool, right: u32) -> bool {
         let want = self.want_charge(pool.chunk(), right);
-        if want > self.charged {
-            if !pool.reserve(want - self.charged) {
-                return false;
-            }
-            self.charged = want;
+        let extra = want.saturating_sub(self.charged);
+        if !pool.reserve(extra) {
+            return false;
         }
+        if !fund_indices::<Option<Chunk>>(pool, &mut self.index_reserved, want + 1) {
+            pool.release(extra);
+            return false;
+        }
+        self.charged += extra;
         true
     }
 
@@ -384,6 +506,11 @@ impl RecvRing {
             pool.release(self.charged - want);
             self.charged = want;
         }
+        retain_indices::<Option<Chunk>>(
+            pool,
+            &mut self.index_reserved,
+            self.chunks.capacity().max(want + 1),
+        );
     }
 
     /// `seq` must be inside the committed window.
@@ -393,6 +520,7 @@ impl RecvRing {
         let mut rest = data;
         while !rest.is_empty() {
             let (ci, co) = (pos / chunk_len, pos % chunk_len);
+            materialize_indices(&mut self.chunks, self.index_reserved, ci + 1);
             while self.chunks.len() <= ci {
                 self.chunks.push_back(None);
             }
@@ -439,6 +567,7 @@ impl RecvRing {
         self.free_chunks(pool);
         pool.release(self.charged);
         self.charged = 0;
+        retain_indices::<Option<Chunk>>(pool, &mut self.index_reserved, self.chunks.capacity());
     }
 
     fn free_chunks(&mut self, pool: &mut Pool) {
@@ -449,6 +578,14 @@ impl RecvRing {
         }
         trim(&mut self.chunks);
         self.head = 0;
+    }
+
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_indices(&self) {
+        if self.index_reserved != 0 {
+            assert!(self.chunks.capacity() <= self.index_reserved as usize);
+            assert!(self.charged < self.index_reserved as usize);
+        }
     }
 
     pub fn charged(&self) -> usize {
@@ -615,5 +752,89 @@ mod tests {
         let c = pool.alloc();
         assert_eq!(pool.allocated_bytes(), CHUNK);
         pool.free(c);
+    }
+
+    #[test]
+    fn failed_tx_index_credit_rolls_back_the_tentative_payload_charge() {
+        let budget = MemoryBudget::new(4 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = SendRing::default();
+        assert_eq!(ring.write(&mut pool, &[1; 4 * CHUNK]), 4 * CHUNK);
+        assert_eq!(budget.used(), 3 * CHUNK);
+        assert_eq!(ring.write(&mut pool, &[2]), 0);
+        assert_eq!(ring.len(), 4 * CHUNK);
+        assert_eq!(budget.used(), 3 * CHUNK);
+        ring.clear(&mut pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn partially_drained_tx_keeps_its_actual_index_high_water_funded() {
+        let budget = MemoryBudget::new(32 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = SendRing::default();
+        assert_eq!(ring.write(&mut pool, &[1; 9 * CHUNK]), 9 * CHUNK);
+        let indices = (16 - KEEP_SLOTS) * std::mem::size_of::<Chunk>();
+        assert_eq!(budget.used(), 8 * CHUNK + indices);
+        ring.consume(&mut pool, 8 * CHUNK);
+        assert_eq!(ring.chunks.capacity(), 16);
+        assert_eq!(budget.used(), indices);
+        let held = budget.reserve(budget.limit() - budget.used()).unwrap();
+        assert_eq!(ring.write(&mut pool, &[2]), 0);
+        drop(held);
+        ring.clear(&mut pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn lazy_rx_backing_and_remaining_promises_keep_their_index_credit() {
+        let budget = MemoryBudget::new(32 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = RecvRing::new(1000);
+        let right = 1000 + 9 * CHUNK as u32;
+        assert!(ring.grow(&mut pool, right));
+        let indices = (16 - KEEP_SLOTS) * std::mem::size_of::<Option<Chunk>>();
+        assert_eq!(budget.used(), 8 * CHUNK + indices);
+        assert_eq!(
+            ring.chunks.capacity(),
+            0,
+            "window funding is not eager allocation"
+        );
+        let held = budget.reserve(budget.limit() - budget.used()).unwrap();
+        ring.write_at(&mut pool, 1000, &[3; 9 * CHUNK]);
+        let mut read = [0; 8 * CHUNK];
+        assert_eq!(ring.read(&mut pool, &mut read, 8 * CHUNK), 8 * CHUNK);
+        ring.shrink(&mut pool, right);
+        assert_eq!(budget.used(), held.bytes() + indices);
+        assert_eq!(ring.chunks.capacity(), 16);
+        drop(held);
+        ring.release_all(&mut pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn receive_index_failure_refunds_optional_payload_growth_and_keeps_the_floor() {
+        let budget = MemoryBudget::new(8 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = RecvRing::new(1000);
+        assert!(ring.grow(&mut pool, 1000 + CHUNK as u32));
+        assert!(!ring.grow(&mut pool, 1000 + 9 * CHUNK as u32));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(ring.charged(), 0);
+        let held = budget.reserve(budget.limit()).unwrap();
+        ring.write_at(&mut pool, 1000, &[1; CHUNK]);
+        let mut read = [0; CHUNK];
+        assert_eq!(ring.read(&mut pool, &mut read, CHUNK), CHUNK);
+        ring.release_all(&mut pool);
+        assert_eq!(budget.used(), held.bytes());
+        drop(held);
     }
 }

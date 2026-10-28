@@ -214,13 +214,15 @@ impl VlessRuntime {
 
     pub(super) fn source_id(
         &self,
+        scope: u64,
         client: SocketAddr,
         path: VlessUdpPath,
         reply_destination: Option<SocketAddr>,
     ) -> [u8; 8] {
         let key = self.source_key.get_or_init(rand::random);
         let mut hash = blake3::Hasher::new_keyed(key);
-        hash.update(b"honk-vless-xudp-source-v1");
+        hash.update(b"honk-vless-xudp-source-v2");
+        hash.update(&scope.to_be_bytes());
         hash_socket(&mut hash, normalize_socket(client));
         hash.update(&[match path {
             VlessUdpPath::Native => 1,

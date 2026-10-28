@@ -193,6 +193,7 @@ impl PendingUdpVerdicts {
         cell.changed.notify_waiters();
         self.drop_many(verdicts, DropOutcome::Cancel);
         self.endpoints.retire_staged_identity(
+            identity.scope,
             identity.client(),
             identity.destination(),
             identity.owner.token,
@@ -228,7 +229,7 @@ impl PendingUdpVerdicts {
         owner: crate::ebpf::UdpFlowOwner,
         flow_slot: OwnedSemaphorePermit,
     ) {
-        let identity = PendingUdpIdentity::new(key, owner, 0);
+        let identity = PendingUdpIdentity::new(honk_datapath::ScopeId::HOST, key, owner, 0);
         vacant.insert(Arc::new(FlowCell::terminal(
             identity,
             CellState::Dead {

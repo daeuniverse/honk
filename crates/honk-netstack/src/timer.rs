@@ -29,6 +29,12 @@ pub struct Timers {
 }
 
 impl Timers {
+    pub fn overhead_bound(slots: usize) -> Option<usize> {
+        let high_water = slots.max(16).checked_mul(2)?.checked_add(1)?;
+        crate::budget::collection_peak::<Reverse<(Instant, u32, u32)>>(high_water)?
+            .checked_add(DIRTY_MAX.checked_mul(std::mem::size_of::<u32>())?)
+    }
+
     pub fn new() -> Timers {
         Timers {
             heap: BinaryHeap::new(),
@@ -146,6 +152,7 @@ mod tests {
                 local: "192.0.2.1:40000".parse().unwrap(),
                 remote: "198.51.100.1:443".parse().unwrap(),
             },
+            handle_generation: 1,
             snd_nxt: 100,
             rcv_nxt: 200,
             max_snd_wnd: u16::MAX.into(),

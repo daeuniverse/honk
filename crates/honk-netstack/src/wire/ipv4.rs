@@ -26,6 +26,7 @@ pub fn parse(pkt: &[u8]) -> Result<IpPacket, ParseError> {
     Ok(IpPacket {
         src: IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])),
         dst: IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19])),
+        dscp: pkt[1] >> 2,
         proto: pkt[9],
         hop_limit: pkt[8],
         payload: ihl..total,
@@ -116,9 +117,24 @@ mod tests {
         let p = parse(&b).unwrap();
         assert_eq!(p.src, IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)));
         assert_eq!(p.dst, IpAddr::V4(Ipv4Addr::new(10, 4, 5, 6)));
+        assert_eq!(p.dscp, 0);
         assert_eq!(p.proto, 17);
         assert_eq!(p.hop_limit, 64);
         assert_eq!(&b[p.payload], b"hello");
+    }
+
+    #[test]
+    fn dscp_excludes_ecn_and_still_requires_the_header_checksum() {
+        for dscp in 0..=63 {
+            for ecn in 0..=3 {
+                let mut b = packet(b"data");
+                b[1] = dscp << 2 | ecn;
+                reseal(&mut b);
+                assert_eq!(parse(&b).unwrap().dscp, dscp);
+                b[1] ^= 4;
+                assert_eq!(parse(&b), Err(ParseError::Checksum));
+            }
+        }
     }
 
     #[test]

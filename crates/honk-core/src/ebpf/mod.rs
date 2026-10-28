@@ -61,14 +61,16 @@ impl TcpPin {
 use async_trait::async_trait;
 use honk_ebpf_common::*;
 
-/// Captured once at admission; `None` is reserved for stateless or model flows.
+/// Admission identity. Packet-owned flows carry no kernel mutation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct UdpFlowOwner {
     pub token: u32,
     pub incarnation: Option<std::num::NonZeroU64>,
+    kernel_capture: bool,
 }
 
 impl UdpFlowOwner {
+    /// Captured by a kernel intake or its model, never by packet ingress.
     pub fn new(token: u32, incarnation: Option<u64>) -> anyhow::Result<Self> {
         let incarnation = incarnation
             .map(|incarnation| {
@@ -80,7 +82,23 @@ impl UdpFlowOwner {
                     .ok_or_else(|| anyhow::anyhow!("UDP flow incarnation must be nonzero"))
             })
             .transpose()?;
-        Ok(Self { token, incarnation })
+        Ok(Self {
+            token,
+            incarnation,
+            kernel_capture: true,
+        })
+    }
+
+    pub(crate) fn packet() -> Self {
+        Self {
+            token: 0,
+            incarnation: None,
+            kernel_capture: false,
+        }
+    }
+
+    pub(crate) fn has_kernel_capture(self) -> bool {
+        self.kernel_capture
     }
 
     pub fn incarnation(self) -> Option<u64> {
@@ -679,6 +697,10 @@ pub trait EbpfBackend: Send + Sync {
         tuples: &TuplesKey,
         owner: UdpFlowOwner,
     ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+        anyhow::ensure!(
+            owner.has_kernel_capture(),
+            "packet-owned UDP has no kernel admission authority"
+        );
         let entry = self.routing_handoff_lookup(tuples)?;
         if !owner.is_stateless(tuples.src_port, tuples.dst_port) {
             let current = self.udp_flow_owner(owner.token, self.conn_state_lookup(tuples)?)?;

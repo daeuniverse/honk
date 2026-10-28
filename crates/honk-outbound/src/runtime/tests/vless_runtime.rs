@@ -157,27 +157,52 @@ fn vless_source_id_normalizes_client_and_partitions_scope() {
     let mapped = "[::ffff:192.0.2.1]:53000".parse().unwrap();
     let reply = "198.51.100.2:53".parse().unwrap();
     let id = runtime
-        .vless_source_id(ipv4, VlessUdpPath::Xudp, None)
+        .vless_source_id(0, ipv4, VlessUdpPath::Xudp, None)
         .unwrap();
     assert_ne!(id, [0; 8]);
 
     assert_eq!(
         id,
         runtime
-            .vless_source_id(mapped, VlessUdpPath::Xudp, None)
+            .vless_source_id(0, mapped, VlessUdpPath::Xudp, None)
             .unwrap()
     );
     assert_ne!(
         id,
         runtime
-            .vless_source_id(ipv4, VlessUdpPath::CoolShared, None)
+            .vless_source_id(0, ipv4, VlessUdpPath::CoolShared, None)
             .unwrap()
     );
     assert_ne!(
         id,
         runtime
-            .vless_source_id(ipv4, VlessUdpPath::Xudp, Some(reply))
+            .vless_source_id(0, ipv4, VlessUdpPath::Xudp, Some(reply))
             .unwrap()
+    );
+    assert_ne!(
+        id,
+        runtime
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None)
+            .unwrap()
+    );
+    assert_eq!(
+        runtime
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None)
+            .unwrap(),
+        runtime
+            .vless_source_id(1, mapped, VlessUdpPath::Xudp, None)
+            .unwrap(),
+    );
+    let successor = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+    assert_ne!(
+        runtime
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None)
+            .unwrap(),
+        successor
+            .get(&node.id)
+            .unwrap()
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None)
+            .unwrap(),
     );
 }
 

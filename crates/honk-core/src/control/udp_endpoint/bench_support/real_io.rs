@@ -8,8 +8,8 @@
 
 use super::super::driver::UdpDriverHandle;
 use super::super::{
-    EndpointReservation, ReplySocket, UdpEndpoint, UdpEndpointPool, UdpInitLease,
-    UdpReplySocketFactory, queue_now,
+    EndpointReservation, ReplySocket, ReplySocketFd, ScopeId, UdpEndpoint, UdpEndpointPool,
+    UdpInitLease, UdpReplySocketFactory, queue_now,
 };
 use crate::stats::StatsManager;
 use honk_outbound::alive::{AliveDialerSet, IpVersion};
@@ -37,14 +37,20 @@ const FLOW_NODE: uuid::Uuid = uuid::Uuid::from_u128(1);
 struct BoundReplies(HashMap<SocketAddr, std::net::UdpSocket>);
 
 impl UdpReplySocketFactory for BoundReplies {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
+    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
+        if scope != ScopeId::HOST {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unreserved bench scope",
+            ));
+        }
         let socket = self
             .0
             .get(&source)
             .ok_or_else(|| io::Error::other("unreserved reply source"))?
             .try_clone()?;
         socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket)
+        UdpSocket::from_std(socket).map(ReplySocketFd::Kernel)
     }
 }
 
@@ -120,13 +126,14 @@ impl IoHarness {
             IpVersion::V4,
             None,
         ));
-        let reply = Arc::new(self.pool.create_reply_socket(target)?);
+        let reply = Arc::new(self.pool.create_reply_socket(lease.scope(), target)?);
         self.start(lease, endpoint, target, reply).await
     }
 
     /// Production steady-state entry: the listener's Ready fast path.
     pub fn enqueue(&self, destination: usize, payload: &[u8]) -> Enqueue {
         match self.pool.fast_path_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             self.client_addr,
             self.targets[destination],
             payload,
@@ -145,6 +152,7 @@ impl IoHarness {
             .try_acquire_owned()
             .map_err(io::Error::other)?;
         let lease = match self.pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             self.client_addr,
             target,
             FIRST_PAYLOAD,
@@ -177,6 +185,7 @@ impl IoHarness {
             .take_queue_receiver()
             .ok_or_else(|| io::Error::other("lease has no queue"))?;
         let mut driver: UdpDriverHandle = self.pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             self.client_addr,
             target,
             lease.generation(),
@@ -217,7 +226,8 @@ impl IoHarness {
 impl Drop for IoHarness {
     fn drop(&mut self) {
         for target in &self.targets {
-            self.pool.remove(self.client_addr, *target);
+            self.pool
+                .remove(honk_datapath::ScopeId::HOST, self.client_addr, *target);
         }
     }
 }

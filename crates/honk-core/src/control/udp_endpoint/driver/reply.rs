@@ -30,7 +30,7 @@ pub(super) async fn receive_loop(
         .flow_transport()
         .expect("ordinary UDP receive loop requires a PacketTransport");
     // Heap, not inline: an inline array adds 64 KiB to every endpoint task.
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; super::super::budget::RECEIVE_BYTES];
     let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
     tokio::pin!(reply_idle_timeout);
     loop {
@@ -84,7 +84,7 @@ pub(super) async fn receive_loop(
         let reply_socket = if source == client_dst {
             reply_socket.as_ref()
         } else {
-            match foreign_replies.get(source) {
+            match foreign_replies.get(reply_socket.scope(), source) {
                 Ok(socket) => {
                     foreign = socket;
                     foreign.as_ref()

@@ -579,7 +579,14 @@ async fn ready_udp_endpoint(
     let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"bootstrap", slow_permit, stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"bootstrap",
+        slow_permit,
+        stats,
+    ) {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("test endpoint must reserve a fresh lease"),
     };
@@ -587,6 +594,7 @@ async fn ready_udp_endpoint(
     let queue_rx = lease.take_queue_receiver().unwrap();
     let reply_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -630,7 +638,10 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
         .unwrap()
         .unwrap();
     assert_eq!(&packet[..len], b"first");
-    let first = plane.udp_pool.get(client, target).unwrap();
+    let first = plane
+        .udp_pool
+        .get(honk_datapath::ScopeId::HOST, client, target)
+        .unwrap();
     assert!(
         plane
             .reload_runtime_config(config.clone(), Default::default())
@@ -669,7 +680,12 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
             .reload_runtime_config(config, Default::default())
             .await
     );
-    assert!(plane.udp_pool.get(client, target).is_none());
+    assert!(
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, target)
+            .is_none()
+    );
     serve_test_udp_to(&handle, client, target, b"new mark")
         .await
         .unwrap();
@@ -680,7 +696,10 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
     assert_eq!(&packet[..len], b"new mark");
     assert!(!Arc::ptr_eq(
         &first,
-        &plane.udp_pool.get(client, target).unwrap()
+        &plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, target)
+            .unwrap()
     ));
     assert!(plane.udp_pool.shutdown().await.joined);
 }
@@ -1543,7 +1562,9 @@ async fn udp_domain_reality_uses_client_source() -> anyhow::Result<()> {
         .next()
         .expect("ready UDP endpoint must be tracked");
     assert_eq!(tracked.domain.as_deref(), Some("source.test"));
-    handle.udp_pool.remove(client, original_dst);
+    handle
+        .udp_pool
+        .remove(honk_datapath::ScopeId::HOST, client, original_dst);
     Ok(())
 }
 
@@ -1579,7 +1600,9 @@ async fn udp_domain_plus_passes_sniffed_proxy_target_without_rerouting() -> anyh
         .expect("UDP transport dial was captured");
     assert_eq!(target, original_dst);
     assert_eq!(domain.as_deref(), Some("source.test"));
-    handle.udp_pool.remove(client, original_dst);
+    handle
+        .udp_pool
+        .remove(honk_datapath::ScopeId::HOST, client, original_dst);
     Ok(())
 }
 
@@ -1869,7 +1892,9 @@ async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
         assert_eq!(body["udp"][0]["download_bytes"], "6");
         let totals = handle.stats.snapshot();
         assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (12, 14));
-        handle.udp_pool.remove(source, target);
+        handle
+            .udp_pool
+            .remove(honk_datapath::ScopeId::HOST, source, target);
         native.shutdown().await;
     }
     retirement.join(&handle).await?;
@@ -2447,9 +2472,11 @@ async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
         .expect("ready UDP endpoint must be tracked");
     assert_eq!(tracked.proxy, "udp-node");
     assert_eq!(tracked.chains, vec!["udp-node", "traffic"]);
-    handle
-        .udp_pool
-        .remove(addr("10.0.0.2:53000"), addr("203.0.113.2:443"));
+    handle.udp_pool.remove(
+        honk_datapath::ScopeId::HOST,
+        addr("10.0.0.2:53000"),
+        addr("203.0.113.2:443"),
+    );
     Ok(())
 }
 
@@ -3332,8 +3359,15 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
-                .await;
+            dns.handle_udp_dns_admitted(
+                &admission,
+                &data,
+                client,
+                dst,
+                validated,
+                super::dns_control::DnsUdpReply::Kernel,
+            )
+            .await;
         }
         _ => panic!("strict DNS must not enter the Ready endpoint queue"),
     }
@@ -3363,7 +3397,14 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"bootstrap", init_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"bootstrap",
+        init_permit,
+        &stats,
+    ) {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("DNS+Initializing fixture must reserve"),
     };
@@ -3397,8 +3438,15 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
-                .await;
+            dns.handle_udp_dns_admitted(
+                &admission,
+                &data,
+                client,
+                dst,
+                validated,
+                super::dns_control::DnsUdpReply::Kernel,
+            )
+            .await;
         }
         _ => panic!("strict DNS must not enter the Initializing endpoint queue"),
     }
@@ -3425,7 +3473,14 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", init_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        init_permit,
+        &stats,
+    ) {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("follower fixture must initialize"),
     };
@@ -4559,6 +4614,7 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
         .try_acquire_owned()
         .unwrap();
     let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"legacy first datagram",
@@ -4618,6 +4674,7 @@ async fn retirement_worker_acknowledges_superseding_token() {
         Arc::clone(&port),
     );
     let lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held datagram"),
@@ -4691,6 +4748,7 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
         Arc::clone(&port),
     );
     let lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held datagram"),

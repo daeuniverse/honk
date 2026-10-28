@@ -1,6 +1,6 @@
 use super::handoff::RetireAck;
 use super::overall_dial_timeout;
-use super::routing::{build_connection_info, connection_chains};
+use super::routing::{PacketRoutingSnapshot, build_connection_info, connection_chains};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
@@ -12,12 +12,13 @@ use crate::connection_tracker::{
 };
 
 use super::observation::ConnectionObservation;
-#[cfg(feature = "native-api")]
-use crate::observe::catalog::CatalogIdentity;
 
 mod dial;
+mod input;
 mod score;
 mod terminal;
+
+use input::{TcpFlow, TcpInput};
 
 use score::{
     tcp_relay_score_outcome, tcp_score_context, timeout_started_score_reporters,
@@ -26,15 +27,6 @@ use score::{
 #[cfg(feature = "native-api")]
 use terminal::TcpTerminal;
 use terminal::{wait_for_close, write_sniff_prefix};
-
-struct TcpDnsRoute {
-    decision: super::routing::RoutingDecision,
-    config: Arc<Config>,
-    group_manager: Arc<honk_outbound::group::GroupManager>,
-    runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    #[cfg(feature = "native-api")]
-    native: Option<(u64, Arc<CatalogIdentity>)>,
-}
 
 /// Block nodes "dial" by failing and the dial path reports no other signal,
 /// so a failure where every tried node is a block node is the policy's doing.
@@ -49,7 +41,7 @@ impl ControlPlaneHandle {
         &self,
         handoff: &super::handoff::HandoffResult,
         #[cfg(feature = "native-api")] record_route: bool,
-    ) -> anyhow::Result<TcpDnsRoute> {
+    ) -> anyhow::Result<PacketRoutingSnapshot> {
         let config = self.config.read().await;
         let backend = self.ebpf.read().await;
         anyhow::ensure!(
@@ -79,7 +71,7 @@ impl ControlPlaneHandle {
             native_route: record_route.then(super::observation::RouteObservation::kernel),
         };
         drop(backend);
-        Ok(TcpDnsRoute {
+        Ok(PacketRoutingSnapshot {
             decision,
             config: Arc::clone(&config),
             group_manager: self.group_manager.read().clone(),
@@ -132,6 +124,30 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
+        self.serve_tcp_input(TcpInput::Kernel(stream), client_addr, original_dst)
+            .await
+    }
+
+    pub(in crate::control) async fn serve_packet_connection(
+        &self,
+        stream: crate::control::netstack::FlowIo,
+    ) -> anyhow::Result<()> {
+        let client = stream.peer_addr();
+        let destination = stream.local_addr();
+        self.serve_tcp_input(TcpInput::Packet(stream), client, destination)
+            .await
+    }
+
+    async fn serve_tcp_input(
+        &self,
+        input: TcpInput,
+        client_addr: SocketAddr,
+        original_dst: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let packet_dscp = match &input {
+            TcpInput::Packet(stream) => Some(stream.dscp()),
+            TcpInput::Kernel(_) => None,
+        };
         let mut observation = ConnectionObservation::begin(
             self.native.as_deref(),
             crate::observe::vocab::Network::Tcp,
@@ -148,33 +164,55 @@ impl ControlPlaneHandle {
             .connection_tracker
             .is_enabled()
             .then(|| CloseCompletion(CloseSignal::new()));
+        let close_signal = close.as_ref().map(|close| Arc::clone(&close.0));
         let result = {
             let operation = async {
-                let tuples = build_tuples_key(
-                    original_dst.ip(),
-                    original_dst.port(),
-                    client_addr.ip(),
-                    client_addr.port(),
-                    6, // TCP
-                );
-                let (mut flow, handoff) = self
-                    .adopt_tcp_flow(
-                        stream,
-                        tuples,
-                        #[cfg(feature = "native-api")]
-                        &observation,
-                    )
-                    .await?;
-                observation.handoff(handoff.as_ref(), true);
+                let (mut flow, handoff) = match input {
+                    TcpInput::Kernel(stream) => {
+                        let tuples = build_tuples_key(
+                            original_dst.ip(),
+                            original_dst.port(),
+                            client_addr.ip(),
+                            client_addr.port(),
+                            6,
+                        );
+                        let (flow, handoff) = self
+                            .adopt_tcp_flow(
+                                stream,
+                                tuples,
+                                #[cfg(feature = "native-api")]
+                                &observation,
+                            )
+                            .await?;
+                        (TcpFlow::Kernel(flow), handoff)
+                    }
+                    TcpInput::Packet(stream) => (
+                        TcpFlow::packet(stream, Arc::clone(&self.connection_tracker)),
+                        None,
+                    ),
+                };
+                if flow.is_kernel() {
+                    observation.handoff(handoff.as_ref(), true);
+                }
                 observation.routing_started();
 
-                let pinned_dns_route = if original_dst.port() == 53 {
+                let pinned_route = if !flow.is_kernel() {
+                    Some(
+                        self.prepare_packet_routing_snapshot(
+                            client_addr,
+                            original_dst,
+                            "tcp",
+                            packet_dscp.expect("packet stream carries admitted DSCP"),
+                            #[cfg(feature = "native-api")]
+                            observation.is_recording(),
+                        )
+                        .await?,
+                    )
+                } else if original_dst.port() == 53 {
                     let handoff = handoff.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("transparent TCP DNS has no routing handoff")
                     })?;
-                    if handoff.outbound == OutboundIndex::Block as u8 {
-                        None
-                    } else if handoff.must != 0 {
+                    if handoff.outbound != OutboundIndex::Block as u8 && handoff.must != 0 {
                         Some(
                             self.pin_tcp_dns_route(
                                 handoff,
@@ -184,30 +222,39 @@ impl ControlPlaneHandle {
                             .await?,
                         )
                     } else {
-                        self.dns_controller
-                            .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
-                            .await?;
-                        #[cfg(feature = "native-api")]
-                        {
-                            terminal = Some(TcpTerminal::DnsInterceptCompleted);
-                        }
-                        anyhow::ensure!(
-                            flow.retire(RetireAck {
-                                close: close.take(),
-                                outbound: None
-                            })
-                            .await,
-                            "TCP DNS retirement failed"
-                        );
-                        return Ok(());
+                        None
                     }
                 } else {
                     None
                 };
+                if original_dst.port() == 53
+                    && !pinned_route.as_ref().is_some_and(|route| {
+                        route.decision.must || route.decision.outbound == "block"
+                    })
+                    && !handoff
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.outbound == OutboundIndex::Block as u8)
+                {
+                    flow.serve_dns(&self.dns_controller, client_addr, original_dst)
+                        .await?;
+                    #[cfg(feature = "native-api")]
+                    {
+                        terminal = Some(TcpTerminal::DnsInterceptCompleted);
+                    }
+                    anyhow::ensure!(
+                        flow.retire(RetireAck {
+                            close: close.take(),
+                            outbound: None
+                        })
+                        .await,
+                        "TCP DNS retirement failed"
+                    );
+                    return Ok(());
+                }
 
                 let (dial_mode, connect_timeout, overall_dial_timeout) = {
                     let current_config;
-                    let config = if let Some(snapshot) = &pinned_dns_route {
+                    let config = if let Some(snapshot) = &pinned_route {
                         &snapshot.config
                     } else {
                         current_config = self.config.read().await;
@@ -215,7 +262,7 @@ impl ControlPlaneHandle {
                     };
                     #[cfg(feature = "native-api")]
                     {
-                        observation.pin_dial_mode(if let Some(snapshot) = &pinned_dns_route {
+                        observation.pin_dial_mode(if let Some(snapshot) = &pinned_route {
                             snapshot.native.as_ref().map(|(generation, _)| *generation)
                         } else {
                             observation
@@ -238,6 +285,9 @@ impl ControlPlaneHandle {
                 // Skip sniffing when the datapath already made a final decision.
                 // In ip mode we always dial by original_dst.
                 let mut skip_sniff = matches!(dial_mode, DialMode::Ip);
+                skip_sniff |= pinned_route
+                    .as_ref()
+                    .is_some_and(|route| route.final_before_sniff());
                 if let Some(ref ho) = handoff {
                     let final_handoff = matches!(
                         ho.outbound,
@@ -264,7 +314,7 @@ impl ControlPlaneHandle {
                 let sniff_result = if skip_sniff {
                     sniffing::SniffResult::unknown()
                 } else {
-                    sniffing::sniff_tcp(flow.stream_mut()).await
+                    sniffing::sniff_tcp(&mut flow).await
                 };
                 let sniffed_domain = sniff_result.domain.clone();
                 if let Some(ref domain) = sniffed_domain {
@@ -290,18 +340,32 @@ impl ControlPlaneHandle {
                     }
                 }
 
-                let conn_info = build_connection_info(
+                let mut conn_info = build_connection_info(
                     domain.clone(),
                     original_dst,
                     client_addr,
                     "tcp",
                     handoff.as_ref(),
                 );
+                if let Some(dscp) = packet_dscp {
+                    conn_info.dscp = Some(dscp);
+                }
                 #[cfg(feature = "native-api")]
-                let mut pinned_native = pinned_dns_route
+                let mut pinned_native = pinned_route
                     .as_ref()
                     .and_then(|snapshot| snapshot.native.clone());
-                let (mut route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
+                let (mut route, pinned_generation) = if let Some(mut snapshot) = pinned_route {
+                    if !flow.is_kernel() {
+                        self.route_packet_with_sniffed(
+                            &mut snapshot,
+                            dial_mode,
+                            &conn_info,
+                            domain_verified,
+                            #[cfg(feature = "native-api")]
+                            observation.is_recording(),
+                        )
+                        .await?;
+                    }
                     (
                         snapshot.decision,
                         Some((snapshot.config, snapshot.group_manager, snapshot.runtime)),
@@ -329,7 +393,8 @@ impl ControlPlaneHandle {
                 observation.mode_applied(&outbound_name);
 
                 // Seed current predicate facts so later flows need not repeat sniffing.
-                if let Some(domain) = &domain
+                if flow.is_kernel()
+                    && let Some(domain) = &domain
                     && Self::should_write_sniffed_domain_bitmap(
                         handoff.as_ref(),
                         reroute_by_sniffed_domain,
@@ -381,7 +446,9 @@ impl ControlPlaneHandle {
                 };
                 let outbound_kind =
                     crate::stats::OutboundKind::routed(&generation_group_manager, &outbound_name);
-                let outbound_guard = self.stats.track_connection(&outbound_name, outbound_kind);
+                let mut outbound_guard =
+                    Some(self.stats.track_connection(&outbound_name, outbound_kind));
+                flow.hold_packet_completion(&mut close, &mut outbound_guard)?;
                 #[cfg(feature = "native-api")]
                 let close_catalog = pinned_native
                     .as_ref()
@@ -662,13 +729,13 @@ impl ControlPlaneHandle {
                     observation.release_selection();
                 }
 
-                let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
+                let dscp_val = handoff.as_ref().map(|ho| ho.dscp);
 
                 let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let (outbound_upload, outbound_download) =
                     self.stats.byte_counters(&outbound_name, outbound_kind);
-                if let Some(close) = &close {
+                if let Some(close) = &close_signal {
                     let groups = captured_groups(
                         selection_chains
                             .get(&node.id)
@@ -688,8 +755,7 @@ impl ControlPlaneHandle {
                         },
                     );
                     if let Some(conn_id) = flow.track_if_enabled(
-                        || {
-                            let id = uuid::Uuid::new_v4().to_string();
+                        |id| {
                             let (rule, rule_payload) = matched_rule
                                 .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
                             crate::connection_tracker::ConnectionEntry {
@@ -720,7 +786,7 @@ impl ControlPlaneHandle {
                             }
                         },
                         ConnectionOwner {
-                            signal: Arc::clone(&close.0),
+                            signal: Arc::clone(close),
                             action: CloseAction::Tcp,
                             groups,
                         },
@@ -738,7 +804,7 @@ impl ControlPlaneHandle {
                     dialer = %node.name,
                     sniffed = target_domain.as_deref().unwrap_or(""),
                     ip = %original_dst,
-                    dscp = dscp_val,
+                    dscp = ?dscp_val,
                     src = %client_addr,
                     "TCP connection: {} <-> {}", client_addr, original_dst,
                 );
@@ -748,7 +814,7 @@ impl ControlPlaneHandle {
                     let operation = async {
                         tokio::select! {
                             biased;
-                            _ = wait_for_close(close.as_ref()) => {
+                            _ = wait_for_close(close_signal.as_ref()) => {
                                 intentionally_closed = true;
                                 Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "connection closed"))
                             }
@@ -802,7 +868,7 @@ impl ControlPlaneHandle {
                         anyhow::ensure!(
                             flow.retire(RetireAck {
                                 close: close.take(),
-                                outbound: Some(outbound_guard)
+                                outbound: outbound_guard.take()
                             })
                             .await,
                             "TCP retirement failed"
@@ -855,9 +921,9 @@ impl ControlPlaneHandle {
                     let operation = async {
                         tokio::select! {
                             biased;
-                            _ = wait_for_close(close.as_ref()) => None,
-                            result = relay::relay_proxy(
-                                flow.stream_mut(), proxy_stream, client_addr, original_dst, conn_progress,
+                            _ = wait_for_close(close_signal.as_ref()) => None,
+                            result = flow.relay(
+                                proxy_stream, client_addr, original_dst, conn_progress,
                             ) => Some(result),
                         }
                     };
@@ -881,7 +947,7 @@ impl ControlPlaneHandle {
                     anyhow::ensure!(
                         flow.retire(RetireAck {
                             close: close.take(),
-                            outbound: Some(outbound_guard)
+                            outbound: outbound_guard.take()
                         })
                         .await,
                         "TCP retirement failed"
@@ -929,7 +995,7 @@ impl ControlPlaneHandle {
                 anyhow::ensure!(
                     flow.retire(RetireAck {
                         close: close.take(),
-                        outbound: Some(outbound_guard)
+                        outbound: outbound_guard.take()
                     })
                     .await,
                     "TCP retirement failed"
@@ -993,3 +1059,7 @@ mod tcp_native_flow_tests;
 #[cfg(test)]
 #[path = "tcp_native_accounting_tests.rs"]
 mod native_accounting_tests;
+
+#[cfg(test)]
+#[path = "tcp_packet_tests.rs"]
+mod packet_tests;

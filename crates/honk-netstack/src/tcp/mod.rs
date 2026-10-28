@@ -97,6 +97,7 @@ struct Counters {
 pub struct Tcb {
     pub tuple: FourTuple,
     pub state: TcpState,
+    pub dscp: u8,
     pub app_open: bool,
     pub error: Option<StreamError>,
     pub ready: Ready,
@@ -190,6 +191,16 @@ pub struct Tcb {
 }
 
 impl Tcb {
+    pub(crate) fn overhead_bound() -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(OooTable::overhead_bound()?)?
+            .checked_add(Sent::overhead_bound())?
+            .checked_add(Recovery::overhead_bound())?
+            .checked_add(std::mem::size_of::<passive::Ka>())?
+            .checked_add(rack::Rack::overhead_bound())?
+            .checked_add(ring::index_floor_bytes())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tuple: FourTuple,
@@ -213,6 +224,7 @@ impl Tcb {
         Tcb {
             tuple,
             state: TcpState::SynSent,
+            dscp: 0,
             app_open: true,
             error: None,
             ready: Ready::default(),
@@ -341,6 +353,14 @@ impl Tcb {
         let candidate = self.rx.limit_right(pool, want);
         if seq::gt(candidate, self.committed_right) && self.rx.grow(pool, candidate) {
             self.committed_right = candidate;
+        } else if pool.index_budget().is_some() {
+            // Optional growth cannot take away the already funded progress floor.
+            let floor = self
+                .rx
+                .limit_right(pool, self.rx.rd_seq.wrapping_add(pool.chunk() as u32));
+            if seq::gt(floor, self.committed_right) && self.rx.grow(pool, floor) {
+                self.committed_right = floor;
+            }
         }
     }
 
@@ -385,7 +405,7 @@ impl Tcb {
             && !self.fin_requested
             && matches!(self.state, TcpState::Established | TcpState::CloseWait)
             && limit.saturating_sub(self.tx.len()) >= threshold
-            && (pool.shared_free() != 0 || self.tx.tail_room(pool) >= threshold)
+            && self.tx.can_append(pool, threshold)
     }
 
     pub fn read(
@@ -737,6 +757,8 @@ impl Tcb {
     #[cfg(feature = "fuzz-checks")]
     pub fn check_invariants(&self) {
         self.sent.check();
+        self.tx.check_indices();
+        self.rx.check_indices();
         assert!(
             self.cc.cwnd() > 0,
             "a zero congestion window stalls the flow"

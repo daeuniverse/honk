@@ -340,10 +340,11 @@ impl Conn {
 }
 
 /// An ordinary packet's descriptor.
-pub fn plain(len: usize) -> Transmit {
+pub fn plain(len: usize, flow: Option<FlowId>) -> Transmit {
     Transmit {
         len,
         gso: None,
         csum: TxCsum::Full,
+        flow,
     }
 }

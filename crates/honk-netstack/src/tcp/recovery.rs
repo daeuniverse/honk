@@ -104,6 +104,10 @@ pub struct AckCtx<'a> {
 }
 
 impl Recovery {
+    pub(super) fn overhead_bound() -> usize {
+        std::mem::size_of::<Episode>()
+    }
+
     pub fn new(seq: u32) -> Recovery {
         Recovery {
             state: State::Open,
@@ -531,7 +535,7 @@ mod tests {
         }
 
         fn retransmit(&mut self, ms: u64) -> u32 {
-            let (i, start, len, _) = self.sent.next_retransmit().expect("something is lost");
+            let (i, start, len, _) = self.sent.next_retransmit(true).expect("something is lost");
             let now = self.t0 + Duration::from_millis(ms);
             self.sent.split(i, start + len.min(MSS));
             self.sent.retransmitted(

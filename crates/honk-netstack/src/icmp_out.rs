@@ -101,6 +101,10 @@ impl Default for IcmpOut {
 }
 
 impl IcmpOut {
+    pub(crate) fn overhead_bound(limits: IcmpLimits) -> Option<usize> {
+        crate::budget::collection_peak::<Target>(limits.max_targets)
+    }
+
     pub(crate) fn new(limits: IcmpLimits) -> IcmpOut {
         IcmpOut {
             global: u64::from(limits.burst) * MSG,

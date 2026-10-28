@@ -46,7 +46,7 @@ mod tcp;
 
 mod udp;
 
-mod routing;
+pub(in crate::control) mod routing;
 
 #[cfg(test)]
 pub(in crate::control) use routing::{RealityOutcome, domain_reality_outcome};

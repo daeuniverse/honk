@@ -1779,7 +1779,9 @@ dependencies = [
  "hkdf",
  "hmac 0.13.0",
  "honk-config",
+ "honk-datapath",
  "honk-ebpf-common",
+ "honk-netstack",
  "honk-nfqueue",
  "honk-outbound",
  "http",
@@ -1828,6 +1830,13 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "zip",
+]
+
+[[package]]
+name = "honk-datapath"
+version = "0.1.0"
+dependencies = [
+ "honk-netstack",
 ]
 
 [[package]]

@@ -40,6 +40,7 @@ enum ReplyProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::control) struct SourceScope {
+    domain: ScopeId,
     runtime: usize,
     client: SocketAddr,
     path: SourcePath,
@@ -48,12 +49,14 @@ pub(in crate::control) struct SourceScope {
 
 impl SourceScope {
     pub(super) fn new(
+        domain: ScopeId,
         runtime: &Arc<NodeRuntime>,
         client: SocketAddr,
         path: SourcePath,
         reply_destination: Option<SocketAddr>,
     ) -> Self {
         Self {
+            domain,
             runtime: Arc::as_ptr(runtime) as usize,
             client: normalize_socket_addr(client),
             path,
@@ -140,6 +143,7 @@ pub(super) struct SourceOwner {
     send_timeout_nanos: AtomicU64,
     #[cfg(test)]
     pub(super) foreign_reply_hook: Mutex<Option<Arc<ReplyAdmissionHook>>>,
+    _memory: Option<honk_netstack::MemoryReservation>,
 }
 
 impl SourceOwner {
@@ -156,8 +160,20 @@ impl SourceOwner {
         node_tracker: OutboundTracker,
         stats: Arc<StatsManager>,
         source_permit: OwnedSemaphorePermit,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, honk_outbound::proxy::PacketRejection> {
+        let memory = match &pool.memory_budget {
+            Some(budget) => Some(
+                budget
+                    .reserve(
+                        size_of::<Self>()
+                            + 2 * size_of::<usize>()
+                            + 2 * MAX_RETIRED_REPLY_PEERS * size_of::<SocketAddr>(),
+                    )
+                    .ok_or(honk_outbound::proxy::PacketRejection::Capacity)?,
+            ),
+            None => None,
+        };
+        Ok(Arc::new(Self {
             id,
             scope,
             transport,
@@ -193,7 +209,8 @@ impl SourceOwner {
             send_timeout_nanos: AtomicU64::new(0),
             #[cfg(test)]
             foreign_reply_hook: Mutex::new(None),
-        })
+            _memory: memory,
+        }))
     }
 
     fn attach(self: &Arc<Self>) -> Option<SourceAttachment> {
@@ -501,6 +518,10 @@ impl SourceEndpoint {
         self.owner.state.lock().active_sender = self.view;
     }
 
+    pub(super) fn scope(&self) -> ScopeId {
+        self.owner.scope.domain
+    }
+
     pub(super) fn commit_binding(&self, endpoint_permit: OwnedSemaphorePermit) -> bool {
         let mut binding = self.binding.lock();
         let Some(attachment) = binding.attachment.as_mut() else {
@@ -705,7 +726,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
         owner: Arc::clone(&owner),
     };
     // Heap, not inline: an inline array adds 64 KiB to every source task.
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; super::budget::RECEIVE_BYTES];
 
     loop {
         let retired = owner.retire_notify.notified();
@@ -776,6 +797,7 @@ impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) async fn prepare_source(
         self: &Arc<Self>,
+        domain: ScopeId,
         registry: &ProxyRegistry,
         generation: Arc<OutboundRuntimeRegistry>,
         runtime: Arc<NodeRuntime>,
@@ -790,7 +812,7 @@ impl UdpEndpointPool {
         health_family: honk_outbound::alive::IpVersion,
         speculative: bool,
     ) -> anyhow::Result<SourcePreparation> {
-        let scope = SourceScope::new(&runtime, client, path, reply_destination);
+        let scope = SourceScope::new(domain, &runtime, client, path, reply_destination);
         loop {
             if generation.is_shutdown() || self.terminal.load(Ordering::Acquire) {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
@@ -817,8 +839,12 @@ impl UdpEndpointPool {
                     match path {
                         #[cfg(feature = "rprx")]
                         SourcePath::Vless(path) => {
-                            let global_id =
-                                runtime.vless_source_id(scope.client, path, reply_destination)?;
+                            let global_id = runtime.vless_source_id(
+                                domain.as_u64(),
+                                scope.client,
+                                path,
+                                reply_destination,
+                            )?;
                             VLessHandler::prepare_source_udp(
                                 Arc::clone(&runtime),
                                 target,

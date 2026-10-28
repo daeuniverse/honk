@@ -1,8 +1,8 @@
 use super::*;
 
-pub(super) async fn wait_for_close(close: Option<&CloseCompletion>) {
+pub(super) async fn wait_for_close(close: Option<&Arc<CloseSignal>>) {
     match close {
-        Some(close) => close.0.cancelled().await,
+        Some(close) => close.cancelled().await,
         None => std::future::pending().await,
     }
 }

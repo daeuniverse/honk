@@ -32,6 +32,7 @@ pub enum ParseError {
 pub struct IpPacket {
     pub src: IpAddr,
     pub dst: IpAddr,
+    pub dscp: u8,
     /// Upper-layer protocol after any IPv6 extension headers.
     pub proto: u8,
     pub hop_limit: u8,

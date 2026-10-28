@@ -1,4 +1,5 @@
 use super::*;
+use std::task::Poll;
 
 pub(in crate::control::udp_endpoint) enum SourceReplyTarget {
     Flow {
@@ -28,8 +29,12 @@ impl UdpEndpointPool {
         peer: SocketAddr,
     ) -> SourceReplyTarget {
         let key = match owner.scope.reply {
-            ReplyProjection::ActualPeer => EndpointKey::new(owner.scope.client, peer),
-            ReplyProjection::RewriteTo(original) => EndpointKey::new(owner.scope.client, original),
+            ReplyProjection::ActualPeer => {
+                EndpointKey::new(owner.scope.domain, owner.scope.client, peer)
+            }
+            ReplyProjection::RewriteTo(original) => {
+                EndpointKey::new(owner.scope.domain, owner.scope.client, original)
+            }
         };
         let Some(entry) = self.endpoints.get(&key) else {
             return match owner.scope.reply {
@@ -79,9 +84,11 @@ impl UdpEndpointPool {
         {
             return None;
         }
-        let entry = self
-            .endpoints
-            .entry(EndpointKey::new(owner.scope.client, peer));
+        let entry = self.endpoints.entry(EndpointKey::new(
+            owner.scope.domain,
+            owner.scope.client,
+            peer,
+        ));
         if !matches!(entry, dashmap::mapref::entry::Entry::Vacant(_)) {
             return None;
         }
@@ -105,17 +112,15 @@ pub(super) enum SourceReplyDisposition {
     Drop,
 }
 
-/// Sends one reply within `TRANSPORT_SEND_TIMEOUT`. An immediately writable
-/// socket completes synchronously, so the timer is armed only when the send
-/// would block.
-async fn send_reply(socket: &UdpSocket, data: &[u8], client: SocketAddr) -> bool {
-    match socket.try_send_to(data, client) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => matches!(
-            tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, socket.send_to(data, client)).await,
+async fn send_reply(socket: &ReplySocket, data: &[u8], client: SocketAddr) -> bool {
+    let send = socket.send_to(data, client);
+    tokio::pin!(send);
+    match std::future::poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await {
+        Poll::Ready(result) => result.is_ok(),
+        Poll::Pending => matches!(
+            tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, send).await,
             Ok(Ok(_))
         ),
-        Err(_) => false,
     }
 }
 
@@ -160,7 +165,7 @@ pub(super) async fn deliver_source_reply(
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 return SourceReplyDisposition::Drop;
             }
-            let socket = match pool.foreign_replies.get(source) {
+            let socket = match pool.foreign_replies.get(owner.scope.domain, source) {
                 Ok(socket) => socket,
                 Err(error) => {
                     debug!("UDP foreign reply socket creation failed: {}", error);

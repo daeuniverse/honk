@@ -1841,11 +1841,17 @@ async fn assert_reload_keeps_ready_endpoint(
     let ready_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let mut ready_lease =
-        match pool.reserve_or_enqueue(ready_client, dst, b"ready-first", ready_permit, &stats) {
-            EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("ready fixture must reserve an initializing entry"),
-        };
+    let mut ready_lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        ready_client,
+        dst,
+        b"ready-first",
+        ready_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("ready fixture must reserve an initializing entry"),
+    };
     let transport = Arc::new(ReloadTestTransport {
         relay,
         sent: Mutex::new(Vec::new()),
@@ -1859,6 +1865,7 @@ async fn assert_reload_keeps_ready_endpoint(
     let queue_rx = ready_lease.take_queue_receiver().unwrap();
     let reply_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         ready_client,
         dst,
         ready_lease.generation(),
@@ -1890,6 +1897,7 @@ async fn assert_reload_keeps_ready_endpoint(
         .try_acquire_owned()
         .unwrap();
     let initializing_lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         initializing_client,
         dst,
         b"initializing",
@@ -1921,9 +1929,17 @@ async fn assert_reload_keeps_ready_endpoint(
     .await
     .expect("reload must complete");
     initializer.await.unwrap();
-    assert!(pool.get(initializing_client, dst).is_none());
     assert!(
-        Arc::ptr_eq(&pool.get(ready_client, dst).unwrap(), &ready_endpoint),
+        pool.get(honk_datapath::ScopeId::HOST, initializing_client, dst)
+            .is_none()
+    );
+    assert!(
+        Arc::ptr_eq(
+            &pool
+                .get(honk_datapath::ScopeId::HOST, ready_client, dst)
+                .unwrap(),
+            &ready_endpoint
+        ),
         "a reload without direct marks must not retire Ready endpoint drivers"
     );
 
@@ -1933,7 +1949,14 @@ async fn assert_reload_keeps_ready_endpoint(
         .try_acquire_owned()
         .unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(ready_client, dst, b"after-reload", follower_permit, &stats,),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            ready_client,
+            dst,
+            b"after-reload",
+            follower_permit,
+            &stats,
+        ),
         EndpointReservation::Enqueued
     ));
     tokio::time::timeout(
@@ -1952,6 +1975,7 @@ async fn assert_reload_keeps_ready_endpoint(
         .unwrap();
     assert!(matches!(
         pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             initializing_client,
             dst,
             b"next-generation",
@@ -1964,8 +1988,8 @@ async fn assert_reload_keeps_ready_endpoint(
         cp.config_handle().read().await.global.check_tolerance_ms,
         Config::default().global.check_tolerance_ms + 1
     );
-    pool.remove(ready_client, dst);
-    pool.remove(initializing_client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, ready_client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, initializing_client, dst);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1978,7 +2002,14 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"held", slow_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"held",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("timeout fixture must hold a real initializer lease"),
     };
