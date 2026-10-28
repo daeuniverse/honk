@@ -30,22 +30,4 @@ def main(argv):
     if start < 0 or end < start or root.count(split.ROUTING_START) != 1:
         sys.exit("root must contain exactly one marked task-routing block")
     files[split.ROOT] = root[:start] + root[end + len(split.ROUTING_END) :]
-    cursor = dict.fromkeys(files, 0)
-    rebuilt = []
-    for destination, text in split.fragments(lines):
-        at = cursor[destination]
-        got = files[destination][at : at + len(text)]
-        if got != text:
-            sys.exit(f"{destination}: fragment at byte {at} differs from the pinned blob")
-        cursor[destination] = at + len(text)
-        rebuilt.append(got)
-    for destination, at in cursor.items():
-        if at != len(files[destination]):
-            sys.exit(f"{destination}: {len(files[destination]) - at} bytes beyond the manifest")
-    if b"".join(rebuilt) != original:
-        sys.exit("reassembled text differs from the pinned blob")
-    print(f"ok: {len(original)} bytes, {len(files)} files")
-
-
-if __name__ == "__main__":
-    main(sys.argv)
+    cursor =
