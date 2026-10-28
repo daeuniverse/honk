@@ -229,13 +229,21 @@ impl DatagramPayload<'_> {
 pub(in crate::control) enum RawDnsRoute<S = Arc<str>> {
     Group(S),
     Direct(u32),
+    FallbackGroup(S),
+    FallbackDirect(u32),
 }
 
 impl<S: AsRef<str>> RawDnsRoute<S> {
+    pub(in crate::control) fn is_final(&self) -> bool {
+        matches!(self, Self::Group(_) | Self::Direct(_))
+    }
+
     pub(in crate::control) fn as_ref(&self) -> RawDnsRoute<&str> {
         match self {
             Self::Group(name) => RawDnsRoute::Group(name.as_ref()),
             Self::Direct(mark) => RawDnsRoute::Direct(*mark),
+            Self::FallbackGroup(name) => RawDnsRoute::FallbackGroup(name.as_ref()),
+            Self::FallbackDirect(mark) => RawDnsRoute::FallbackDirect(*mark),
         }
     }
 }
@@ -245,6 +253,8 @@ impl RawDnsRoute<&str> {
         match self {
             Self::Group(name) => RawDnsRoute::Group(Arc::from(name)),
             Self::Direct(mark) => RawDnsRoute::Direct(mark),
+            Self::FallbackGroup(name) => RawDnsRoute::FallbackGroup(Arc::from(name)),
+            Self::FallbackDirect(mark) => RawDnsRoute::FallbackDirect(mark),
         }
     }
 }
@@ -956,8 +966,8 @@ impl UdpEndpointPool {
         };
         let memory =
             match self.reserve_entry_memory(raw_dns_route.as_ref().map_or(0, |route| match route {
-                RawDnsRoute::Group(name) => name.len(),
-                RawDnsRoute::Direct(_) => 0,
+                RawDnsRoute::Group(name) | RawDnsRoute::FallbackGroup(name) => name.len(),
+                RawDnsRoute::Direct(_) | RawDnsRoute::FallbackDirect(_) => 0,
             })) {
                 Ok(memory) => memory,
                 Err(_) => {

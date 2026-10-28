@@ -187,11 +187,17 @@ impl ControlPlaneHandle {
             lease.decision_token()
         );
 
-        let dial_mode = if raw_dns_route.is_some() {
+        if let Some(route) = &raw_dns_route {
             anyhow::ensure!(
                 original_dst.port() == 53 && lease.decision_token() == 0,
                 "raw DNS ownership requires an unstaged UDP/53 lease"
             );
+            anyhow::ensure!(
+                route.is_final() || packet_routing.is_some(),
+                "packet fallback identity requires captured routing"
+            );
+        }
+        let dial_mode = if raw_dns_route.as_ref().is_some_and(RawDnsRoute::is_final) {
             DialMode::Ip
         } else {
             let current_config;
@@ -359,6 +365,9 @@ impl ControlPlaneHandle {
                     "direct".to_owned(),
                     honk_outbound::proxy::DirectMark::new(mark),
                 ),
+                RawDnsRoute::FallbackGroup(_) | RawDnsRoute::FallbackDirect(_) => {
+                    anyhow::bail!("packet fallback identity requires captured routing")
+                }
             };
             RoutingDecision {
                 outbound,

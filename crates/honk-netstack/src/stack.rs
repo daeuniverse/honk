@@ -474,7 +474,7 @@ impl Stack {
                     Ok(fragment) => fragment,
                     Err(e) => return self.drop_packet(e.into()),
                 };
-                if let Some(reason) = self.refuses(fragment.dst) {
+                if let Some(reason) = self.refuses(fragment.src, fragment.dst) {
                     return self.drop_packet(reason);
                 }
                 return match self.reasm.push(now, fragment) {
@@ -497,14 +497,7 @@ impl Stack {
     }
 
     fn receive_ip(&mut self, now: Instant, ip: wire::IpPacket, packet: &[u8], meta: RxMeta) -> Rx {
-        // Mapped addresses represent IPv4 sockets, not IPv6 wire endpoints.
-        if self.transparent()
-            && (matches!(&ip.src, IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some())
-                || matches!(&ip.dst, IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some()))
-        {
-            return self.drop_packet(DropReason::Unsupported);
-        }
-        if let Some(reason) = self.refuses(ip.dst) {
+        if let Some(reason) = self.refuses(ip.src, ip.dst) {
             return self.drop_packet(reason);
         }
         match ip.proto {
@@ -715,7 +708,7 @@ impl Stack {
                     return Some(tx);
                 }
                 Output::Blocked => return None,
-                Output::None => {}
+                Output::Deferred | Output::None => {}
             }
         }
         None
@@ -853,6 +846,7 @@ impl Stack {
                 continue;
             };
             let quantum = u32::from(self.cfg.mtu);
+            let deficit = slot.deficit;
             if !control_only && slot.deficit < quantum {
                 slot.deficit += quantum;
             }
@@ -881,7 +875,7 @@ impl Stack {
                     }
                     return Output::Sent(n);
                 }
-                Output::Blocked if control_only => {
+                Output::Blocked | Output::Deferred if control_only => {
                     slot.on_control = true;
                     self.control_ready.as_mut().unwrap().push_back(id);
                     self.sync_without_tx(id.idx, now);
@@ -890,6 +884,12 @@ impl Stack {
                     slot.on_tx = true;
                     self.ready.push_front(id);
                     return Output::Blocked;
+                }
+                Output::Deferred => {
+                    slot.deficit = deficit;
+                    slot.on_tx = true;
+                    self.ready.push_back(id);
+                    self.sync_without_tx(id.idx, now);
                 }
                 Output::None => self.sync_without_tx(id.idx, now),
             }
@@ -1398,14 +1398,17 @@ impl Stack {
         matches!(self.cfg.mode, Mode::Transparent { .. })
     }
 
-    /// Why a packet to `dst` is not ours, if it is not. A transparent stack answers for every
-    /// unicast address except the excluded ones; multicast, broadcast and unspecified (the
-    /// tun's own RS, MLD and DAD) are `Unsupported`, silently.
-    fn refuses(&self, dst: IpAddr) -> Option<DropReason> {
+    /// Why a packet is not ours, if it is not. A transparent stack answers for every unicast
+    /// destination except the excluded ones, and refuses mapped IPv6 wire endpoints.
+    fn refuses(&self, src: IpAddr, dst: IpAddr) -> Option<DropReason> {
         match &self.cfg.mode {
             Mode::Endpoint => (self.local_for(dst) != Some(dst)).then_some(DropReason::NotForUs),
             Mode::Transparent { exclude } => {
-                if !is_unicast(dst) {
+                // Mapped addresses represent IPv4 sockets, not IPv6 wire endpoints.
+                if matches!(src, IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some())
+                    || matches!(dst, IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some())
+                    || !is_unicast(dst)
+                {
                     Some(DropReason::Unsupported)
                 } else {
                     exclude.contains(dst).then_some(DropReason::NotForUs)

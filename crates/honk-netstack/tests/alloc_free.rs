@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -26,7 +26,8 @@ thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static HEAP_COUNTING: Cell<bool> = const { Cell::new(false) };
     static LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
-    static PEAK_BYTES: Cell<usize> = const { Cell::new(0) };
+    static HEAP_BUDGET: RefCell<Option<std::sync::Arc<MemoryBudget>>> = const { RefCell::new(None) };
+    static UNFUNDED_HEAP: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
 struct Counting;
@@ -41,7 +42,10 @@ fn heap_alloc(bytes: usize) {
     if HEAP_COUNTING.get() {
         let live = LIVE_BYTES.get() + bytes;
         LIVE_BYTES.set(live);
-        PEAK_BYTES.set(PEAK_BYTES.get().max(live));
+        let charged = HEAP_BUDGET.with(|budget| budget.borrow().as_ref().unwrap().used());
+        if live > charged && UNFUNDED_HEAP.get().is_none() {
+            UNFUNDED_HEAP.set(Some((live, charged)));
+        }
     }
 }
 
@@ -236,7 +240,7 @@ impl Flow {
 }
 
 /// The peer streams `WARMUP + MEASURED` full segments; the stack reads them and emits ACKs.
-fn receive_phase() -> usize {
+fn receive_phase(control_only: bool) -> usize {
     let mut f = Flow::connect();
     let payload = vec![0x5au8; MSS];
     let packets: Vec<Vec<u8>> = (0..WARMUP + MEASURED)
@@ -244,23 +248,39 @@ fn receive_phase() -> usize {
         .collect();
     let mut read = vec![0u8; 64 * 1024];
     let mut step = |f: &mut Flow, p: &[u8]| {
+        let input_ip = wire::parse_ip(p).unwrap();
+        let (input, _) = tcp::parse(&p[input_ip.payload]).unwrap();
+        let mut acks = 0;
         assert_eq!(f.stack.receive(f.now, p), Rx::Consumed);
         assert_eq!(f.stack.tcp_read(f.id, &mut read), Ok(MSS));
-        while let Some(tx) = f.stack.poll_control_transmit(f.now, &mut f.out) {
-            let ip = wire::parse_ip(&f.out[..tx.len]).unwrap();
-            let (_, hlen) = tcp::parse(&f.out[ip.payload.clone()]).unwrap();
+        while let Some(n) = if control_only {
+            f.stack
+                .poll_control_transmit(f.now, &mut f.out)
+                .map(|tx| tx.len)
+        } else {
+            f.stack.poll_transmit(f.now, &mut f.out)
+        } {
+            let ip = wire::parse_ip(&f.out[..n]).unwrap();
+            let (ack, hlen) = tcp::parse(&f.out[ip.payload.clone()]).unwrap();
             assert_eq!(ip.payload.len(), hlen, "ACK-only pull");
+            assert_eq!(ack.flags, tcp::ACK);
+            assert_eq!(ack.ack, input.seq.wrapping_add(MSS as u32));
+            acks += 1;
         }
+        acks
     };
     let (warm, measured) = packets.split_at(WARMUP);
     for p in warm {
         step(&mut f, p);
     }
-    allocations_in(|| {
+    let mut acks = 0;
+    let allocations = allocations_in(|| {
         for p in measured {
-            step(&mut f, p);
+            acks += step(&mut f, p);
         }
-    })
+    });
+    assert!(acks > 0, "the measured phase must emit ACKs");
+    allocations
 }
 
 /// The stack writes and transmits rounds of full segments; the peer acknowledges each round except
@@ -300,7 +320,16 @@ fn transmit_phase() -> usize {
 // One test: the counter is process-global, so the phases must not interleave.
 #[test]
 fn steady_state_data_movement_allocates_nothing() {
-    assert_eq!(receive_phase(), 0, "receive + tcp_read + ACK transmit");
+    assert_eq!(
+        receive_phase(false),
+        0,
+        "receive + tcp_read + ordinary ACK transmit"
+    );
+    assert_eq!(
+        receive_phase(true),
+        0,
+        "receive + tcp_read + control-only ACK transmit"
+    );
     assert_eq!(
         transmit_phase(),
         0,

@@ -18,13 +18,16 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
 };
 use std::time::Instant;
 use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc};
 
 const INGRESS_CAPACITY: usize = 64;
 const MAX_SCOPES: usize = 64;
+const STARTING: u8 = 0;
+const READY: u8 = 1;
+const CLOSING: u8 = 2;
 
 fn report_tcp_completion(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result
@@ -71,11 +74,25 @@ struct Shared {
     budget: Arc<MemoryBudget>,
     udp_pool: Arc<UdpEndpointPool>,
     tcp_slots: Arc<tokio::sync::Semaphore>,
-    closing: AtomicBool,
+    admission: AtomicU8,
     changed: Notify,
     closed: Arc<crate::connection_tracker::CloseSignal>,
     supervisor_memory: std::sync::OnceLock<MemoryReservation>,
     _memory: MemoryReservation,
+}
+
+impl Shared {
+    fn is_closing(&self) -> bool {
+        self.admission.load(Ordering::Acquire) == CLOSING
+    }
+
+    fn close(&self) {
+        self.admission.store(CLOSING, Ordering::Release);
+        for scope in self.scopes.iter() {
+            scope.close_admission();
+        }
+        self.changed.notify_one();
+    }
 }
 
 /// A bounded ingress handle. Copies share admission, scopes and one core UDP pool.
@@ -146,7 +163,7 @@ impl PacketEndpoints {
         }
         let scope_tasks = TaskRegistry::accounted(scopes.len(), &budget)?;
         let tcp_tasks = TaskRegistry::accounted(
-            tcp_capacity.min(plane.resource_budget.active_tcp_flows),
+            tcp_capacity.min(plane.resource_budget.elastic_tcp_flows(0, 0)),
             &budget,
         )?;
         let bytes = (INGRESS_CAPACITY + 32)
@@ -172,7 +189,7 @@ impl PacketEndpoints {
             budget,
             udp_pool: Arc::clone(&plane.udp_pool),
             tcp_slots: Arc::clone(&plane.concurrency_limit),
-            closing: AtomicBool::new(false),
+            admission: AtomicU8::new(STARTING),
             changed: Notify::new(),
             closed: crate::connection_tracker::CloseSignal::new(),
             supervisor_memory: std::sync::OnceLock::new(),
@@ -279,7 +296,7 @@ impl PacketEndpoints {
         dscp: u8,
         make: impl FnOnce(&Arc<MemoryBudget>) -> Option<FundedDatagram>,
     ) -> io::Result<()> {
-        if self.shared.closing.load(Ordering::Acquire) {
+        if self.shared.is_closing() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "packet endpoint admission is closed",
@@ -302,7 +319,7 @@ impl PacketEndpoints {
     }
 
     fn accept_ready(&self, scope: &PacketScope) {
-        if self.shared.closing.load(Ordering::Acquire) {
+        if self.shared.is_closing() {
             return;
         }
         for _ in 0..INGRESS_CAPACITY {
@@ -322,11 +339,7 @@ impl PacketEndpoints {
     /// Close new admission. The owner performs explicit abort and joined teardown;
     /// exported output leases must still be released by their actual I/O consumers.
     pub fn close(&self) {
-        self.shared.closing.store(true, Ordering::Release);
-        for scope in self.shared.scopes.iter() {
-            scope.close_admission();
-        }
-        self.shared.changed.notify_one();
+        self.shared.close();
     }
 
     /// Cancellation of this waiter does not detach admitted cleanup.
@@ -355,11 +368,7 @@ impl PacketEndpointOwner {
 impl Drop for PacketEndpointOwner {
     fn drop(&mut self) {
         if self.task.is_some() {
-            self.shared.closing.store(true, Ordering::Release);
-            for scope in self.shared.scopes.iter() {
-                scope.close_admission();
-            }
-            self.shared.changed.notify_one();
+            self.shared.close();
         }
     }
 }
@@ -373,7 +382,7 @@ impl EndpointRuntime {
                 break;
             }
         }
-        let mut maintenance = if failure.is_none() {
+        let mut maintenance = if failure.is_none() && !self.shared.is_closing() {
             maintenance::start(&mut self.plane).await
         } else {
             Default::default()
@@ -390,15 +399,24 @@ impl EndpointRuntime {
             Arc::clone(&self.plane.connection_tracker),
             fatal,
         );
-        if failure.is_none() {
+        if failure.is_none() && !self.shared.is_closing() {
             for scope in self.shared.scopes.iter() {
-                if let Err(error) = scope.open_admission() {
-                    failure = Some(error.into());
+                if let Err(error) = scope.open_admission_if(|| !self.shared.is_closing()) {
+                    if !self.shared.is_closing() {
+                        failure = Some(error.into());
+                    }
                     break;
                 }
             }
         }
-        if failure.is_none() {
+        // This CAS commits readiness; a later close overlaps an already-started runtime.
+        if failure.is_none()
+            && self
+                .shared
+                .admission
+                .compare_exchange(STARTING, READY, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
             #[cfg(feature = "native-api")]
             self.plane.publish_phase(super::EnginePhase::Running);
             let _ = self.startup.take().unwrap().send(());
@@ -406,7 +424,7 @@ impl EndpointRuntime {
             self.startup.take();
         }
         loop {
-            if failure.is_some() || self.shared.closing.load(Ordering::Acquire) {
+            if failure.is_some() || self.shared.is_closing() {
                 break;
             }
             tokio::select! {
@@ -456,7 +474,7 @@ impl EndpointRuntime {
                 }
             }
         }
-        self.shared.closing.store(true, Ordering::Release);
+        self.shared.close();
         self.plane.shutdown_requested.store(true, Ordering::Release);
         self.plane.drain_tracker.start_rejecting();
         #[cfg(feature = "native-api")]
@@ -632,18 +650,21 @@ impl EndpointRuntime {
                 }
                 return;
             }
-            if snapshot.decision.must {
-                raw_route = Some(if snapshot.decision.outbound == "direct" {
-                    RawDnsRoute::Direct(
-                        snapshot
-                            .decision
-                            .mark
-                            .map_or(0, honk_outbound::proxy::DirectMark::get),
-                    )
+            raw_route = Some(if snapshot.decision.outbound == "direct" {
+                let mark = snapshot
+                    .decision
+                    .mark
+                    .map_or(0, honk_outbound::proxy::DirectMark::get);
+                if snapshot.decision.must {
+                    RawDnsRoute::Direct(mark)
                 } else {
-                    RawDnsRoute::Group(snapshot.decision.outbound.clone())
-                });
-            }
+                    RawDnsRoute::FallbackDirect(mark)
+                }
+            } else if snapshot.decision.must {
+                RawDnsRoute::Group(snapshot.decision.outbound.clone())
+            } else {
+                RawDnsRoute::FallbackGroup(snapshot.decision.outbound.clone())
+            });
             packet_routing = Some(snapshot);
         }
         if pool

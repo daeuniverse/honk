@@ -68,6 +68,62 @@ fn completed_packets_outlive_their_stacks_without_releasing_capacity() {
 }
 
 #[test]
+fn independent_stacks_refuse_completion_without_refunding_held_packets() {
+    for (src, dst) in families() {
+        let now = Instant::now();
+        let budget = MemoryBudget::new(8000);
+        let mut a = receiver(&budget, now);
+        let mut b = receiver(&budget, now);
+        let first = datagram(src, dst, 3000, 1);
+        let second = datagram(src, dst, 1800, 2);
+        let a_packet = owned(&mut a, now, &first, 1);
+        let b_packet = owned(&mut b, now, &second, 2);
+        let held = first.len() + second.len();
+        assert_eq!(budget.used(), held);
+
+        let fragments = split(&second, 3, 1000);
+        for fragment in &fragments[..fragments.len() - 1] {
+            assert_eq!(b.receive(now, fragment), Rx::Consumed);
+        }
+        assert!(
+            budget.used() > held,
+            "the second stack retains partial reassembly"
+        );
+        assert_eq!(
+            b.receive(now, fragments.last().unwrap()),
+            Rx::Dropped(DropReason::Capacity)
+        );
+        assert_eq!(b.stats().drops[DropReason::Capacity as usize], 1);
+        assert_eq!(b.stats().flows, 0);
+        assert_eq!(budget.used(), held);
+        assert_eq!(
+            &a_packet[a_packet.len() - 3000..],
+            &first[first.len() - 3000..]
+        );
+        assert_eq!(
+            &b_packet[b_packet.len() - 1800..],
+            &second[second.len() - 1800..]
+        );
+
+        drop(b_packet);
+        assert_eq!(budget.used(), first.len());
+        let retry = owned(&mut b, now, &second, 4);
+        assert_eq!(budget.used(), held);
+        drop(a);
+        drop(b);
+        assert_eq!(budget.used(), held);
+        assert_eq!(
+            &a_packet[a_packet.len() - 3000..],
+            &first[first.len() - 3000..]
+        );
+        drop(retry);
+        assert_eq!(budget.used(), first.len());
+        drop(a_packet);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
 fn completion_reserves_the_copy_before_refunding_fragment_storage() {
     for (src, dst) in families() {
         let now = Instant::now();

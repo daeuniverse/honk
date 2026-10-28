@@ -26,6 +26,7 @@
 //! [`Stack::poll_control_transmit`] preserves ordinary readiness, DRR and payload TLP work
 //! using a lazy separate queue/cursor and the shared emitter. Reserve control credit first;
 //! also offer ordinary pulls for payload progress. Unused control-only queues allocate nothing.
+//! RACK bookkeeping pressure defers only its flow; other funded output remains eligible.
 //!
 //! Reads drain buffered data before EOF or a sticky terminal error. Shutdown closes only
 //! the write half; close releases the handle immediately and finishes the protocol in
@@ -47,6 +48,7 @@
 //! what keeps such traffic out). A flow's local end is the packet's original destination, so
 //! replies are sourced from it. Multicast, broadcast and unspecified destinations (the tun's own
 //! RS/MLD/DAD) are dropped silently as [`DropReason::Unsupported`].
+//! Mapped IPv6 wire endpoints are also rejected before retaining fragment state.
 //!
 //! A SYN creates a pending flow and sends nothing. [`Stack::poll_accept`] reports it once as a
 //! [`SynInfo`]; the application then calls [`Stack::tcp_accept`] (`Now` queues the SYN-ACK,

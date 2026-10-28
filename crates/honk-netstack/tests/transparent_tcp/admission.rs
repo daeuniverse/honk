@@ -354,3 +354,83 @@ fn ipv4_mapped_ipv6_wire_addresses_cannot_alias_ipv4_endpoints() {
         );
     }
 }
+
+#[test]
+fn rejected_mapped_ipv6_fragments_cannot_evict_a_valid_reassembly() {
+    let now = Instant::now();
+    let valid_src = addr("[fd00::2]:40000");
+    let valid_dst = addr("[fd00::7]:53");
+    let payload = b"valid reassembly survives mapped fragments";
+    let mut valid = [0; 128];
+    let valid_len = wire::udp::emit_packet(&mut valid, valid_src, valid_dst, payload).unwrap();
+    let valid_first = fragment_packet(&valid[..valid_len], true);
+    let valid_last = fragment_packet(&valid[..valid_len], false);
+    for (source, destination) in [
+        ("[::ffff:10.0.0.2]:40000", "[2001:db8::9]:443"),
+        ("[fd00::2]:40000", "[::ffff:203.0.113.9]:443"),
+    ] {
+        let (source, destination) = (addr(source), addr(destination));
+        let budget = MemoryBudget::new(20 * 1024);
+        let mut cfg = transparent();
+        cfg.fragment_limits.max_entries = 1;
+        cfg.shared_budget = Some(budget.clone());
+        let mut stack = Stack::new(cfg, now);
+        assert_eq!(stack.receive(now, &valid_first), Rx::Consumed);
+        let retained = budget.used();
+        assert!(retained > 0);
+        let deadline = stack.poll_timeout();
+        let mut packet = [0; 128];
+        let length = wire::udp::emit_packet(&mut packet, source, destination, payload).unwrap();
+        let mut atomic = vec![0; length + 8];
+        atomic[..40].copy_from_slice(&packet[..40]);
+        atomic[4..6].copy_from_slice(&((length - 40 + 8) as u16).to_be_bytes());
+        atomic[6] = 44;
+        atomic[40] = wire::PROTO_UDP;
+        atomic[44..48].copy_from_slice(&18u32.to_be_bytes());
+        atomic[48..].copy_from_slice(&packet[40..length]);
+        for rejected in [
+            packet[..length].to_vec(),
+            fragment_packet(&packet[..length], true),
+            fragment_packet(&packet[..length], false),
+            atomic,
+        ] {
+            assert_eq!(
+                stack.receive(now, &rejected),
+                Rx::Dropped(DropReason::Unsupported)
+            );
+            assert_eq!(budget.used(), retained);
+            assert_eq!(stack.poll_timeout(), deadline);
+            assert!(stack.poll_transmit(now, &mut [0; 1500]).is_none());
+        }
+        let Rx::TransparentOwned {
+            src,
+            dst,
+            packet,
+            payload: range,
+            ..
+        } = stack.receive(now, &valid_last)
+        else {
+            panic!("rejected mapped fragments must not evict the valid datagram")
+        };
+        assert_eq!((src, dst), (valid_src, valid_dst));
+        assert_eq!(&packet[range], payload);
+        assert!(stack.poll_timeout().is_none());
+        drop(packet);
+        drop(stack);
+        assert_eq!(budget.used(), 0);
+
+        let mut cfg = Config::new([9; 32]);
+        cfg.local_v6 = Some(destination.ip().to_string().parse().unwrap());
+        let mut endpoint = Stack::new(cfg, now);
+        let flow = endpoint.udp_bind(Some(destination.port())).unwrap();
+        let length = wire::udp::emit_packet(&mut valid, source, destination, payload).unwrap();
+        assert!(matches!(
+            endpoint.receive(now, &valid[..length]),
+            Rx::Datagram { flow: id, .. } if id == flow
+        ));
+        assert_eq!(
+            endpoint.receive(now, &fragment_packet(&valid[..length], true)),
+            Rx::Dropped(DropReason::Fragment)
+        );
+    }
+}

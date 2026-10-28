@@ -264,19 +264,28 @@ impl AsyncWrite for FlowIo {
 
     /// Accepted bytes belong to the stack's retransmission queue until acknowledged.
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.open {
+        if self.open && self.scope.0.inner.lock().stack.is_some() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Ready(Err(closed()))
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.scope.0.with(|inner| {
             let Some(stack) = &mut inner.stack else {
                 return Poll::Ready(Err(closed()));
             };
-            Poll::Ready(stack.tcp_shutdown(self.id).map_err(stream_error))
+            match stack.tcp_shutdown(self.id) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(StreamError::WouldBlock) => {
+                    if let Some(slot) = inner.slot(self.id) {
+                        register(&mut slot.tx, cx.waker());
+                    }
+                    Poll::Pending
+                }
+                Err(error) => Poll::Ready(Err(stream_error(error))),
+            }
         })
     }
 }

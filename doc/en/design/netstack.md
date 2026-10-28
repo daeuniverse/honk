@@ -50,6 +50,8 @@ A flow's reply obligations are bits (`DATA`, `OOO`, `WINDOW_UPDATE`, `PROBE_RESP
 
 Control-only pulls use a separate, lazily allocated ready queue and class cursor; they cannot rotate ordinary readiness or consume its DRR credit. An adapter must also offer ordinary pulls for payload progress. The explicit core packet runtime alternates the first output class while reserving each class's frame and descriptor before pulling. Callers that never use control-only pulls, including WireGuard, allocate no control-only queue.
 
+An unfunded RACK bookkeeping expansion defers only that flow: pending retransmission and its existing DRR credit survive, while other funded TCP flows and queued UDP fragments remain eligible. A too-small output buffer remains a distinct blocked-output result.
+
 ### Timers
 
 Each flow exposes the minimum of its RTO/persist, delayed-ACK, tail-loss-probe, RACK reorder, pacing and close deadlines. A global min-heap holds at most one live entry per flow: a deadline is pushed only when it moves earlier. A later deadline reuses the old entry and is rechecked when popped. Calls that change a flow coalesce its heap refresh in a marked list (at most 64 distinct slots), flushed before processing timers or admitting another slot to a full list. `poll_timeout` also computes the marked flows' deadlines directly, so it cannot oversleep while refresh is deferred. When the heap exceeds twice the flow slab (at least 32 entries) it is rebuilt; the bound follows the slab because a rebuild walks every slot. TIME_WAIT expiry uses the same heap.
@@ -129,6 +131,10 @@ Startup opens scope admission before reporting readiness and native `Running`; a
 
 A connection-task panic terminates only that TCP flow, not other packet service. TCP task admission reaps completed work and explicitly resets a genuinely refused flow. Periodic UDP maintenance also returns joined task credit during idle periods. Closing ingress waits for already-reserved producer permits and disposes their late messages before joining scope owners; receiver closure alone is not proof that no `FlowIo` can still arrive.
 
+Readiness commits atomically against cancellation; a close that wins before that commit cannot activate native `Running`, and scope gates cannot reopen after close. The task registry funds the elastic admission ceiling, not only its initial floor. An abnormal registry drop transfers its children and reservations to a pre-funded reaper on their owning runtime; even a blocking destructor or a panicking error payload cannot release another live task's credit early. The embedding must keep that runtime alive through cleanup.
+
+Packet TCP write shutdown waits for handshake completion instead of turning temporary `WouldBlock` into reset. Flush remains a local no-op, not an ACK/delivery promise, but explicit scope abort makes it fail. Raw/non-DNS UDP/53 endpoint identity includes the initial outbound/mark and finality: a changed decision cannot reuse the old transport, while non-final fallback still permits configured sniffing. Valid non-must DNS continues through the controller; must remains raw and fixed.
+
 The supplied budget accounts packet storage/reservations, not whole-process RSS or every pre-existing outbound runtime allocation. Kernel socket buffers remain separate. This embedding is an explicit Endpoint path, **not** native forwarding, capture metadata validation, a production backend publication gate or a performance result.
 
 
@@ -141,6 +147,7 @@ The supplied budget accounts packet storage/reservations, not whole-process RSS 
 - A flow's local end is the packet's original destination, so every reply (SYN-ACK, data, RST, ICMP error, UDP) is sourced from it. Incoming packets are not matched against `local_v4`/`local_v6`, and the stack raises the MTU to at least 1280.
 - `ExcludeSet` (`insert(addr, prefix_len)`) lists destination prefixes the stack refuses as `NotForUs`. It is a backstop only: the classifier/capture backend in front of the driver is the real gate, and a packet dropped here is a black hole for that client.
 - Multicast, limited broadcast and unspecified destinations (the tun device's own router solicitation, MLD and DAD) are dropped silently as `Unsupported`.
+- IPv4-mapped IPv6 source or destination addresses are not valid transparent wire endpoints. They are rejected as `Unsupported` before reassembly admission as well as on complete packets, so they cannot evict valid fragment state.
 - A SYN whose source is not unicast, whose source and destination addresses are equal, or whose port is 0 opens no flow and is answered like any stray segment (RST).
 
 ### TCP admission

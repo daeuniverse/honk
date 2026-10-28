@@ -305,6 +305,94 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
 }
 
 #[test]
+fn shutdown_waits_for_handshake_connected_readiness_before_emitting_fin() {
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let client = "10.0.0.2:40000".parse().unwrap();
+    assert_eq!(
+        scope.receive(&segment(client, 100, 0, tcp::SYN, &[]), now),
+        Rx::Consumed
+    );
+    let (_, mut io) = scope.poll_accept().unwrap();
+    scope.drive(now);
+    let synack = output(&scope);
+    let header = decode(&synack).0;
+    assert_eq!(header.flags, tcp::SYN | tcp::ACK);
+    let server_seq = header.seq.wrapping_add(1);
+    synack.release();
+
+    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        std::pin::Pin::new(&mut io)
+            .poll_shutdown(&mut cx)
+            .is_pending()
+    );
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    scope.drive(now);
+    assert!(scope.poll_output(&mut context()).is_pending());
+    assert_eq!(
+        scope.receive(&segment(client, 101, server_seq, tcp::ACK, &[]), now),
+        Rx::Consumed
+    );
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        std::pin::Pin::new(&mut io).poll_shutdown(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    scope.drive(now);
+    let fin = output(&scope);
+    let (header, payload) = decode(&fin);
+    assert_eq!(header.flags, tcp::FIN | tcp::ACK);
+    assert_eq!(header.seq, server_seq);
+    assert_eq!(header.ack, 101);
+    assert!(payload.is_empty());
+}
+
+#[test]
+fn flush_is_a_noop_until_scope_abort_discards_queued_output() {
+    for owner_drop in [false, true] {
+        let now = Instant::now();
+        let (scope, owner, _) = runtime(now);
+        let mut owner = Some(owner);
+        let (mut io, _) = handshake(&scope, now, "10.0.0.2:40000".parse().unwrap(), 100);
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_write(&mut context(), b"unacknowledged"),
+            Poll::Ready(Ok(14))
+        ));
+        scope.drive(now);
+        assert_eq!(scope.0.inner.lock().queued, 1);
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_flush(&mut context()),
+            Poll::Ready(Ok(()))
+        ));
+        scope.shutdown(false);
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_flush(&mut context()),
+            Poll::Ready(Ok(()))
+        ));
+        if owner_drop {
+            drop(owner.take());
+        } else {
+            scope.shutdown(true);
+        }
+        assert_eq!(scope.0.inner.lock().queued, 0);
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_flush(&mut context()),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+    }
+}
+
+#[test]
 fn compact_timewait_and_exported_final_ack_both_gate_retirement() {
     let now = Instant::now();
     let (scope, _owner, _) = runtime(now);

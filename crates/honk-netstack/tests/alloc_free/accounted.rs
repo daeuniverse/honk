@@ -1,28 +1,28 @@
 use super::*;
 
-fn assert_accounted_heap(budget: &MemoryBudget, charged_peak: &mut usize) {
-    *charged_peak = (*charged_peak).max(budget.used());
+fn assert_accounted_heap(budget: &MemoryBudget) {
+    assert_eq!(
+        UNFUNDED_HEAP.get(),
+        None,
+        "allocation exceeds contemporaneous funding (live heap, charged budget)"
+    );
     assert!(
         LIVE_BYTES.get() <= budget.used(),
         "retained allocation exceeds its funding"
-    );
-    assert!(
-        PEAK_BYTES.get() <= *charged_peak,
-        "growth/copy peak exceeds conservative funding"
     );
 }
 
 pub(super) fn stress() {
     let budget = MemoryBudget::new(32 * 1024 * 1024);
     LIVE_BYTES.set(0);
-    PEAK_BYTES.set(0);
+    UNFUNDED_HEAP.set(None);
+    HEAP_BUDGET.with(|tracked| *tracked.borrow_mut() = Some(budget.clone()));
     HEAP_COUNTING.set(true);
-    let mut charged_peak = 0;
     {
         let mut f = Flow::configured(Some(budget.clone()));
-        assert_accounted_heap(&budget, &mut charged_peak);
+        assert_accounted_heap(&budget);
         f.grow(256);
-        assert_accounted_heap(&budget, &mut charged_peak);
+        assert_accounted_heap(&budget);
         let data = vec![0xa5; 128 * MSS];
         for _ in 0..32 {
             assert_eq!(f.stack.tcp_write(f.id, &data), Ok(data.len()));
@@ -32,7 +32,7 @@ pub(super) fn stress() {
             // Retain one segment: ring and scoreboard capacity must stay funded after draining.
             let ack = f.encode(&f.header(f.snd_nxt.wrapping_sub(MSS as u32)), &[]);
             assert_eq!(f.stack.receive(f.now, &ack), Rx::Consumed);
-            assert_accounted_heap(&budget, &mut charged_peak);
+            assert_accounted_heap(&budget);
         }
         let ack = f.ack_all();
         assert_eq!(f.stack.receive(f.now, &ack), Rx::Consumed);
@@ -57,7 +57,7 @@ pub(super) fn stress() {
                     _ => break,
                 }
             }
-            assert_accounted_heap(&budget, &mut charged_peak);
+            assert_accounted_heap(&budget);
         }
         assert!(
             f.stack.tcp_stats(f.id).unwrap().retrans_segments > 16,
@@ -77,7 +77,7 @@ pub(super) fn stress() {
             f.peer_next = f.peer_next.wrapping_add(MSS as u32);
             let mut read = [0; 20_000];
             assert_eq!(f.stack.tcp_read(f.id, &mut read), Ok(read.len()));
-            assert_accounted_heap(&budget, &mut charged_peak);
+            assert_accounted_heap(&budget);
             assert_eq!(f.stack.tcp_read(f.id, &mut read), Ok(MSS));
             while f.stack.poll_control_transmit(f.now, &mut f.out).is_some() {}
             f.now += 10 * MS;
@@ -86,7 +86,7 @@ pub(super) fn stress() {
             let pending = f.stack.tcp_connect(f.now, remote()).unwrap();
             f.stack.tcp_close(pending);
         }
-        assert_accounted_heap(&budget, &mut charged_peak);
+        assert_accounted_heap(&budget);
         f.stack.tcp_close(f.id);
         let n = f.stack.poll_transmit(f.now, &mut f.out).expect("FIN");
         let ip = wire::parse_ip(&f.out[..n]).unwrap();
@@ -98,7 +98,7 @@ pub(super) fn stress() {
         assert_eq!(f.stack.receive(f.now, &packet), Rx::Consumed);
         while f.stack.poll_control_transmit(f.now, &mut f.out).is_some() {}
         assert_eq!(f.stack.stats().timewait_entries, 1);
-        assert_accounted_heap(&budget, &mut charged_peak);
+        assert_accounted_heap(&budget);
 
         let mut cfg = Config::new([0x59; 32]);
         cfg.mode = Mode::Transparent {
@@ -121,7 +121,7 @@ pub(super) fn stress() {
                 Err(UdpError::Busy) => break,
                 other => panic!("unexpected fragment queue result: {other:?}"),
             }
-            assert_accounted_heap(&budget, &mut charged_peak);
+            assert_accounted_heap(&budget);
         }
         assert!(
             queued > 400,
@@ -156,11 +156,11 @@ pub(super) fn stress() {
             packet[10..12].copy_from_slice(&checksum.to_be_bytes());
             packet[h..h + 8].fill(0);
             assert_eq!(stack.receive(f.now, &packet[..h + 8]), Rx::Consumed);
-            assert_accounted_heap(&budget, &mut charged_peak);
+            assert_accounted_heap(&budget);
         }
         f.now += Duration::from_secs(31);
         stack.handle_timeout(f.now);
-        assert_accounted_heap(&budget, &mut charged_peak);
+        assert_accounted_heap(&budget);
         for port in 40000..41000 {
             let header = tcp::Header {
                 src_port: port,
@@ -183,11 +183,12 @@ pub(super) fn stress() {
             assert_eq!(stack.receive(f.now, &packet[..n]), Rx::Consumed);
             let id = stack.poll_accept().unwrap().id;
             stack.tcp_refuse(id, Refuse::Rst);
-            assert_accounted_heap(&budget, &mut charged_peak);
+            assert_accounted_heap(&budget);
         }
         while stack.poll_transmit(f.now, &mut output).is_some() {}
-        assert_accounted_heap(&budget, &mut charged_peak);
+        assert_accounted_heap(&budget);
     }
+    assert_accounted_heap(&budget);
     assert_eq!(
         LIVE_BYTES.get(),
         0,
@@ -195,4 +196,5 @@ pub(super) fn stress() {
     );
     assert_eq!(budget.used(), 0);
     HEAP_COUNTING.set(false);
+    HEAP_BUDGET.with(|tracked| *tracked.borrow_mut() = None);
 }

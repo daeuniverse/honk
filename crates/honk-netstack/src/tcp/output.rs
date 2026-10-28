@@ -12,7 +12,10 @@ use super::{Tcb, TcpState};
 
 pub enum Output {
     Sent(usize),
+    /// The caller's output buffer is too short.
     Blocked,
+    /// This flow needs capacity; other output may still progress.
+    Deferred,
     None,
 }
 
@@ -239,7 +242,7 @@ impl Tcb {
             && matches!(kind, Kind::Retransmit { .. })
             && !self.recovery.rack.ensure_room(pool, segs)
         {
-            return Output::Blocked;
+            return Output::Deferred;
         }
         // Every segment but the last is a full payload; they share one header.
         let seg_size = if segs > 1 {

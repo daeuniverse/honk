@@ -123,7 +123,10 @@ pub(super) async fn shutdown(
     }
     #[cfg(feature = "native-api")]
     if let Some(owner) = &plane.native_owner {
-        retain_error(&mut failure, owner.pause_probes().await);
+        retain_error(
+            &mut failure,
+            wait_owned(std::pin::pin!(owner.pause_probes()), "native probes").await,
+        );
     }
     #[cfg(feature = "clash-api")]
     {

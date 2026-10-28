@@ -50,6 +50,8 @@ flowchart LR
 
 仅控制拉取使用独立、惰性分配的 ready 队列和类别游标，不能轮转普通 readiness 或消耗其 DRR credit。适配器还须提供普通拉取，才能推进载荷。显式 core packet runtime 轮换优先输出类别，每次拉取前先预留该类别的 frame 和 descriptor。从不使用仅控制拉取的调用方（包括 WireGuard）不会分配该队列。
 
+RACK 记账扩容无法获得预算时，只延后该流：保留待重传义务和原有 DRR credit，其他已有预算的 TCP 流及排队 UDP 分片仍可发送。输出 buffer 太小仍是独立的 blocked-output 结果。
+
 ### 定时器
 
 每个流给出 RTO/persist、延迟 ACK、tail loss probe、RACK reorder、pacing 和关闭 deadline 的最小值。全局最小堆中每个流最多一个有效条目：只有 deadline 提前时才 push；推迟则沿用旧条目，弹出时重新检查。改变流状态的调用把堆刷新请求合并到标记列表（至多 64 个不同槽位），在处理定时器前或向已满列表加入另一槽位前刷新。`poll_timeout` 同时直接计算被标记流的 deadline，因此延后刷新不会导致晚醒。堆超过流 slab 大小的两倍（至少 32 项）时整体重建；上限跟随 slab，因为重建要遍历每个槽位。TIME_WAIT 过期使用同一个堆。
@@ -129,6 +131,10 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 单个连接任务 panic 只终止该 TCP 流，不停止其他 packet 服务。TCP 任务接纳先回收已完成工作，确实无法接纳时显式 reset 该流。周期 UDP 维护也会在空闲期间 join 已完成任务并返还 credit。关闭入口后仍须等待此前预留的 producer permit，处置其迟到消息，再 join scope owner；只关闭 receiver 不能证明此后不会再收到 `FlowIo`。
 
+就绪提交与取消使用原子竞争；关闭先于该提交时不能激活 native `Running`，scope 闸门也不能在关闭后重新打开。任务账本按弹性准入上界预留，而不只按初始保底。账本异常析构会将子任务和计费转交给原 runtime 上预先计费的 reaper；即使析构阻塞或错误载荷析构 panic，也不能提前退还另一个存活任务的 credit。嵌入方须让该 runtime 存活到清理完成。
+
+Packet TCP 写半关闭会等待握手完成，不把暂时的 `WouldBlock` 变成 reset。flush 仍是本地 no-op，不承诺 ACK 或交付，但 scope 显式 abort 后会失败。raw/非 DNS UDP/53 的 endpoint 身份包含初始 outbound/mark 和最终性：改变判决不能复用旧 transport，而非最终 fallback 仍保留配置允许的嗅探。有效的非 must DNS 继续走控制器，must 保持固定 raw 路径。
+
 所给预算统计 packet 存储/预留，不是全进程 RSS，也不代表既有 outbound runtime 的全部分配均已计入；内核 socket buffer 另算。该入口是显式 Endpoint 路径，**不是**原生转发、抓包 metadata 校验、生产后端发布门禁或性能结果。
 
 
@@ -141,6 +147,7 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 - 流的本地端是报文的原始目的地址，因此所有回复（SYN-ACK、数据、RST、ICMP 错误、UDP）都以它为源。入站包不与 `local_v4`/`local_v6` 比对，栈会把 MTU 至少提升到 1280。
 - `ExcludeSet`（`insert(addr, prefix_len)`）列出栈以 `NotForUs` 拒绝的目的前缀。它只是兜底：driver 前面的分类/抓包后端才是真正的闸门，在这里被丢弃的包对该客户端是黑洞。
 - 组播、受限广播和未指定目的地址（tun 设备自身的路由器请求、MLD 和 DAD）以 `Unsupported` 静默丢弃。
+- IPv4-mapped IPv6 源或目的地址不是合法的透明线上端点；完整包和重组准入前都以 `Unsupported` 拒绝，不能借此挤掉有效分片状态。
 - 源地址不是单播、源与目的地址相同，或端口为 0 的 SYN 不会开流，像其他游离段一样回 RST。
 
 ### TCP 接纳

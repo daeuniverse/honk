@@ -223,9 +223,12 @@ impl PacketScope {
         })
     }
 
-    pub(in crate::control) fn open_admission(&self) -> io::Result<()> {
+    pub(in crate::control) fn open_admission_if(
+        &self,
+        allowed: impl FnOnce() -> bool,
+    ) -> io::Result<()> {
         self.0.with(|inner| {
-            if inner.closing {
+            if inner.closing || !allowed() {
                 return Err(closed());
             }
             inner.stack.as_mut().ok_or_else(closed)?.set_accepting(true);

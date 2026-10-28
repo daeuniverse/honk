@@ -3,6 +3,9 @@ use super::*;
 use honk_netstack::{Config as StackConfig, ExcludeSet, Mode, wire};
 use std::time::Duration;
 
+mod startup;
+mod udp;
+
 fn scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
     let mut config = StackConfig::new([73; 32]);
     config.mode = Mode::Transparent {
