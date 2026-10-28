@@ -37,6 +37,8 @@ The [documentation index](doc/README.md) links all bilingual guides, references,
 
 Build with `--features native-api` (the full and `-native-api` release artifacts include it) and configure `experimental.native_api` for independent observations and controls on `127.0.0.1:9527`: bounded flows/logs/DNS history, probes, provider status/refresh, per-network Selector control and exact connection closure. Captured `.dae` sources remain authoritative, with opt-in source/Group PATCH transactions, synchronous main-file node/provider creation and removal, and verified-geodata operations; existing entries are edited through source PUT. `--store db` records accepted sources as revisions in a state database instead. A bearer secret or password login is required unless anonymous loopback is explicitly enabled. Serve a trusted directory, or build `--features native-ui` and set `ui: embedded` for the pinned doona build without runtime downloads. Native runtime_mode and full kernel transparency remain unavailable. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api).
 
+The web interface for the native API is [doona](https://github.com/Zakkaus/doona) ([documentation](https://doona.daeuniverse.org/en/), [demo](https://demo.daeuniverse.org/)); doona lite is a lighter preview edition.
+
 ## Versions and compatibility
 
 - Releases follow [SemVer](https://semver.org/) from `v0.1.0`; tags with `-alpha.N`, `-beta.N` or `-rc.N` are prereleases. Before `1.0`, a minor release may change configuration or behaviour, and its notes list what needs action before upgrading.
@@ -77,7 +79,7 @@ No `test.1` release tag will be published until all currently unreviewed code ha
 - [ ] Add a honk-specific REST API beyond Clash compatibility
 - [ ] Add inbound support
 
-Track other work in [Issues](https://github.com/daeuniverse/honk/issues) and [Discussions](https://github.com/daeuniverse/honk/discussions).
+Track other work in [Issues](https://github.com/daeuniverse/honk/issues) and [Discussions](https://github.com/daeuniverse/honk/discussions). Report web interface problems in [doona issues](https://github.com/Zakkaus/doona/issues).
 
 ## Acknowledgments
 
