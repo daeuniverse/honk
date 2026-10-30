@@ -195,10 +195,15 @@ impl SupervisorState {
         true
     }
 
-    fn fail_startup_load(&self, id: uuid::Uuid, error: &'static str) {
-        let mut observations = self.observations.write();
-        let load = &mut observations.get_mut(&id).unwrap().load;
-        load.error = Some(error);
-        load.rejection = None;
+    fn fail_startup_load(&mut self, id: uuid::Uuid, error: &'static str) {
+        {
+            let mut observations = self.observations.write();
+            let load = &mut observations.get_mut(&id).unwrap().load;
+            load.error = Some(error);
+            load.rejection = None;
+        }
+        if let Some(provider) = self.providers.get_mut(&id) {
+            provider.finished(Instant::now(), Some(error));
+        }
     }
 }

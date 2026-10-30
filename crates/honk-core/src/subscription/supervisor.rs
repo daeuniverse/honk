@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{SubscriptionManager, SubscriptionStore, SubscriptionUserinfo};
 use crate::control::ControlCommand;
 use crate::control::ReloadOutcome;
+use schedule::{Provider, ProviderSchedule};
 use tokio::time::Instant;
 
 const MAX_ACTIVE_FETCHES: usize = 4;
@@ -230,41 +231,6 @@ struct Flight {
     operation: Option<Box<dyn RefreshReport>>,
 }
 
-enum ProviderSchedule {
-    #[cfg(feature = "native-api")]
-    Deferred,
-    RefreshEligible(Option<Instant>),
-}
-
-struct Provider {
-    authorized: AuthorizedSubscription,
-    schedule: ProviderSchedule,
-}
-
-impl Provider {
-    fn new(authorized: AuthorizedSubscription) -> Self {
-        let mut provider = Self {
-            authorized,
-            schedule: ProviderSchedule::RefreshEligible(None),
-        };
-        provider.reset_deadline(Instant::now());
-        provider
-    }
-
-    fn reset_deadline(&mut self, now: Instant) {
-        match &mut self.schedule {
-            ProviderSchedule::RefreshEligible(next) => {
-                let interval = self.authorized.subscription.update_interval;
-                *next = (interval > 0)
-                    .then(|| now.checked_add(Duration::from_secs(interval)))
-                    .flatten();
-            }
-            #[cfg(feature = "native-api")]
-            ProviderSchedule::Deferred => {}
-        }
-    }
-}
-
 struct SupervisorState {
     manager: Arc<SubscriptionManager>,
     store: Option<SubscriptionStore>,
@@ -468,6 +434,12 @@ impl SupervisorState {
             _ => ProviderLoad::default(),
         };
         drop(observations);
+        if current {
+            self.providers
+                .get_mut(&id)
+                .unwrap()
+                .finished(Instant::now(), result.as_ref().err().copied());
+        }
         #[cfg(feature = "native-api")]
         if let Some(operation) = flight.operation {
             operation.finish(&flight.authorized.subscription, load, result);
@@ -504,11 +476,24 @@ impl SupervisorState {
                 self.publication_ids.insert(task.id(), id);
             }
             Some(Err(error)) => {
-                warn!(
-                    subscription = %completion.authorized.subscription.name,
-                    %error,
-                    "Subscription refresh failed; keeping active nodes"
-                );
+                let subscription = &completion.authorized.subscription;
+                if self
+                    .providers
+                    .get(&id)
+                    .is_some_and(|provider| provider.failures == 0)
+                {
+                    warn!(
+                        subscription = %subscription.name,
+                        %error,
+                        "Subscription refresh failed; keeping active nodes"
+                    );
+                } else {
+                    debug!(
+                        subscription = %subscription.name,
+                        %error,
+                        "Subscription refresh retry failed; keeping active nodes"
+                    );
+                }
                 self.finish(id, Err(super::failure_code(&error)));
             }
             None => self.finish(id, Err("supervisor_stopped")),
@@ -662,6 +647,7 @@ impl SupervisorState {
                                 self.providers.insert(deferred, Provider {
                                     authorized: provider.clone(),
                                     schedule: ProviderSchedule::Deferred,
+                                    failures: 0,
                                 });
                                 self.reconcile(authorized);
                                 Ok(())
@@ -911,7 +897,7 @@ impl SubscriptionSupervisor {
             .expect("subscription startup state missing");
         let now = Instant::now();
         for provider in state.providers.values_mut() {
-            provider.reset_deadline(now);
+            provider.restart_deadline(now);
         }
         self.command_tx = Some(command_tx);
         self.task = Some(tokio::spawn(state.run(commands, merge_tx)));
@@ -963,6 +949,7 @@ impl SubscriptionSupervisor {
     }
 }
 
+mod schedule;
 mod startup;
 
 #[cfg(test)]

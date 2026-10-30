@@ -158,6 +158,7 @@ On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + h
 Failure handling preserves a usable runtime rather than clearing it:
 
 - HTTP, invalid UTF-8 encoding, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain. Accepted bodies are persisted byte-for-byte, without repairing encoding.
+- Fetch failures retry after 30 seconds, doubling up to the smaller of 10 minutes and `interval`; `interval: 0` disables automatic retries. Publication acceptance or rejection clears existing backoff and resumes the normal interval.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
 - An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based proxy index and a static rejection reason, never the raw record or its credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
 

@@ -315,7 +315,7 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 当 `global.store_subscribe` 启用时，通过校验的原始响应存放在固定状态数据库 `<data_dir>/state/honk.db` 的 `subscription_body` 表，key 由请求 URL、配置的 user-agent 覆盖值与有序 headers 决定。完整正文在一个 SQLite 事务中替换，单份最多 8 MiB、总量最多 32 MiB。启动从 `<data_dir>`、`/var/share/honk`、CWD 下找到的第一个私有旧 `.sub` 目录一次导入已启用订阅正文；已有行优先，已复制文件与临时文件被删除，未导入正文保留供后续符合条件的启动处理。迁移与失败细节见[订阅参考](../reference/subscription.md#拉取持久化与恢复)。
 
-- `src/subscription.rs` 负责拉取与解析；`subscription/store.rs` 持有 SQLite 正文存储与 FD 相对的旧存储导入。`subscription/supervisor.rs` 将当前授权及 deferred/可刷新调度状态放在同一 provider record；`supervisor/startup.rs` 恢复缓存正文并执行仅限 direct 的共用五秒启动宽限。启动与稳态使用同一 supervisor state；在途工作独立保留捕获的 revision 与发布确认，关闭等待其结束，reconcile 不丢弃可能已提交的确认。
+- `src/subscription.rs` 负责拉取与解析；`subscription/store.rs` 持有 SQLite 正文存储与 FD 相对的旧存储导入。`subscription/supervisor.rs` 持有授权与在途工作；`supervisor/schedule.rs` 管理 provider 的刷新期限，`supervisor/startup.rs` 恢复缓存正文并执行仅限 direct 的共用五秒启动宽限。启动与稳态使用同一 supervisor state；在途工作独立保留捕获的 revision 与发布确认，关闭等待其结束，reconcile 不丢弃可能已提交的确认。
 - 守护进程的拉取/恢复路径与 `honk-tool sub` 的本地文件共用正文格式检测。`Simple`/`Custom` 接受 BOM、可换行的标准/URL-safe Base64、原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及 Surge/Surfboard/Loon/Quantumult X 记录。`src/subscription/json.rs` 与 `records.rs` 规范化外部记录，`clash.rs` 构造并校验类型化节点。
   只导入节点，不导入完整配置中的路由、DNS 或组。原生 JSON 保留以 Unicode 代理项对编码的名称。跳过不支持的节点，身份重复时保留首个可用节点，空结果不替换活动订阅。导入的 Trojan/AnyTLS/QUIC 节点必须使用 TLS，不会静默降级为明文。
   Clash 与 sing-box 的 TCP ALPN 归入共享 TLS 模型，而不是 TUIC 的 QUIC 字段。共享构造器的跳过告警只包含从 1 开始的代理序号和静态拒绝原因，不包含原始节点记录或凭据。
