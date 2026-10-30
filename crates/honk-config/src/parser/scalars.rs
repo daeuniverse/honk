@@ -74,6 +74,7 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "log_level",
     "log_file",
     "disable_waiting_network",
+    "shutdown_wait_connections",
     "lan_interface",
     "wan_interface",
     "auto_config_kernel_parameter",
@@ -331,6 +332,16 @@ pub(super) fn parse_global_section(
             "global.disable_waiting_network",
             diagnostics,
         );
+    }
+    if let Some(value) = settings.get("shutdown_wait_connections") {
+        cfg.shutdown_wait_connections = strict_bool(value.unquote().raw()).ok_or_else(|| {
+            scalar_error(
+                *value,
+                "invalid-config-value",
+                "global.shutdown_wait_connections",
+                "expected true/false, yes/no, 1/0 or on/off",
+            )
+        })?;
     }
     if let Some(value) = settings.get("lan_interface") {
         cfg.lan_interface = list_value(*value, ListOptions::INTERFACES, diagnostics);

@@ -77,6 +77,9 @@ pub struct GlobalConfig {
     pub log_file: String,
     #[serde(default)]
     pub disable_waiting_network: bool,
+    /// Give accepted connections up to five seconds to finish on ordinary shutdown.
+    #[serde(default)]
+    pub shutdown_wait_connections: bool,
     #[serde(default)]
     pub lan_interface: Vec<String>,
     #[serde(default)]
@@ -379,6 +382,7 @@ impl Default for GlobalConfig {
             log_level: default_log_level(),
             log_file: String::new(),
             disable_waiting_network: false,
+            shutdown_wait_connections: false,
             lan_interface: vec![],
             wan_interface: vec![],
             auto_config_kernel_parameter: false,

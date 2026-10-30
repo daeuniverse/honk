@@ -247,7 +247,10 @@ impl ControlPlane {
             slot.take();
         }
         if fatal.is_none() && self.is_datapath_healthy() && epoch.is_some() {
-            retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
+            let wait_for_connections = self.config.read().await.global.shutdown_wait_connections;
+            if wait_for_connections {
+                retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
+            }
         }
         retain_error(&mut fatal, self.stop_network_epoch(epoch).await);
         if let Some(flags) = &self.datapath_flags {
@@ -255,5 +258,90 @@ impl ControlPlane {
         }
         retain_error(&mut fatal, self.finalize_shutdown().await);
         fatal.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::tests::support::control_plane;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_wait_connections_controls_tcp_retirement() -> anyhow::Result<()> {
+        for (wait, finish_after, fatal, unhealthy, expected_response, expected_seconds) in [
+            (false, 1, false, false, &b""[..], 0),
+            (true, 1, false, false, &b"finished"[..], 1),
+            (true, 60, false, false, &b""[..], 5),
+            (true, 1, true, false, &b""[..], 0),
+            (true, 1, false, true, &b""[..], 0),
+        ] {
+            let mut config = Config::default();
+            config.global.shutdown_wait_connections = wait;
+            let mut plane = control_plane(config);
+            plane.datapath_healthy.store(!unhealthy, Ordering::Release);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let (client, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr()?),
+                listener.accept()
+            );
+            let mut client = client?;
+            let (mut server, _) = accepted?;
+            let listener = listener.into_std()?;
+            // SAFETY: the owned listener keeps its descriptor stable and nonblocking.
+            let tcp4 = unsafe { tokio::io::unix::AsyncFd::register(listener) }?;
+            let mut epoch = RuntimeEpoch {
+                listeners: BoundListeners {
+                    tcp4,
+                    tcp6: None,
+                    udp4: Vec::new(),
+                    udp6: Vec::new(),
+                    dns: None,
+                    nfqueue_enabled: false,
+                },
+                stop: watch::channel(false).0,
+                ingress: JoinSet::new(),
+                tcp: JoinSet::new(),
+                maintenance: OwnedTasks::default(),
+                dns: None,
+                janitor: None,
+                removals: None,
+                removal_errors: mpsc::unbounded_channel().1,
+                critical_errors: mpsc::unbounded_channel().1,
+                health_updates: None,
+                #[cfg(feature = "ebpf")]
+                queue: None,
+            };
+            let guard = ConnectionGuard::new(plane.drain_tracker.clone());
+            let config = plane.config.clone();
+            epoch.tcp.spawn(async move {
+                let _guard = guard;
+                tokio::time::sleep(Duration::from_secs(finish_after)).await;
+                // Connection completion must not be blocked by shutdown's config read.
+                drop(config.write().await);
+                server.write_all(b"finished").await.unwrap();
+            });
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(8),
+                plane.shutdown_runtime(
+                    Some(&mut epoch),
+                    fatal.then(|| anyhow::anyhow!("fatal shutdown")),
+                ),
+            )
+            .await?;
+            assert_eq!(result.is_err(), fatal);
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_secs(expected_seconds));
+            assert!(elapsed < Duration::from_secs(expected_seconds + 1));
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+                .await??;
+            assert_eq!(response, expected_response);
+            assert!(plane.drain_tracker.should_reject());
+            assert_eq!(plane.drain_tracker.active_count(), 0);
+            assert!(epoch.tcp.is_empty());
+        }
+        Ok(())
     }
 }

@@ -219,8 +219,8 @@ registry 构建 replacement。只有完整节点配置相等时 runtime 才能�
 退役 generation 首先对新工作变成 terminal。未迁移的 AnyTLS 与 VLESS
 pool 进入 draining：不再接收新逻辑 stream，但现有 stream 保留 carrier
 直到结束。QUIC flow 拥有连接 clone，因此 terminal generation 检查会
-拒绝新工作，而当前 flow 自然完成。只有进程级 flow drain 之后，进程
-shutdown 才强制关闭剩余 pool 与 QUIC client。
+拒绝新工作，而当前 flow 自然完成。进程 shutdown 在可选的
+[业务连接宽限等待](../reference/global.md#关闭)之后强制关闭剩余 pool 与 QUIC client。
 
 standalone probe 等无 generation 调用方使用 `EphemeralRuntimeGuard`。
 AnyTLS 或 VLESS stream 与 packet transport 在整个生命周期内保留 guard。

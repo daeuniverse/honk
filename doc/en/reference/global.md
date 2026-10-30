@@ -15,6 +15,7 @@ The dae parser accepts compatibility-only keys and stores them in `GlobalConfig`
 | `log_level` | `log_level` | `"info"` | Startup log filter. A valid `RUST_LOG` takes precedence, followed by `--debug`, then this value. A SIGHUP change is restart-required; a native API `log.level` PATCH replaces the filter until the next activation. `info` covers runtime state (startup, reloads, health, subscriptions); the per-connection routing lines (`TCP connection`, `UDP connection`, eBPF offload) are `debug`, so a router's syslog is not flooded by traffic. To audit routing decisions, run with `debug` or read `/logs?level=debug` from the API. |
 | `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled. SIGHUP requires restart only when the resolved effective destination changes; `--log-file` shadows this value. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
+| `shutdown_wait_connections` | `shutdown_wait_connections` | `false` | Reloadable opt-in business-connection grace; see [Shutdown](#shutdown). |
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. See [Interface semantics](#interface-semantics). |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. That setup pins `net.ipv6.conf.all.forwarding=1` and therefore also writes `net.ipv6.conf.<wan>.accept_ra=2` for every WAN root interface (including one that is also a LAN interface) as soon as that interface is present in the interface topology, at startup or when it appears later, without waiting for its hooks or the link to be up, so an SLAAC/RA-learned IPv6 default route survives the forwarding pin. It also writes `net.ipv4.conf.<lan>.rp_filter=0` for the first resolved LAN name that exists and is not refused, as configured and not canonicalized. Each value is written again about one second later, because udev's `systemd-sysctl` run for a newly added device restores the distribution default right after the first write; after that honk leaves it alone until the device is recreated. Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in the WAN `.network` file. |
@@ -53,6 +54,14 @@ The dae parser accepts compatibility-only keys and stores them in `GlobalConfig`
 HTTP health checks and URLTest send a credential-free authority in `Host`: IPv6 stays bracketed, and non-default ports are retained. Connection and TLS server-name handling use the unbracketed host.
 
 The configured request path and query retain their original dot segments and percent-encoding. URLs with surplus authority slashes, backslashes, or embedded ASCII whitespace/control characters are rejected before building a request; rejected URLs are not echoed in the health-check warning.
+
+## Shutdown
+
+Setting `shutdown_wait_connections: true` gives accepted connections up to five seconds to finish on ordinary, healthy shutdown with an active runtime epoch; remaining connections are then closed and joined. Other cases skip this grace. It does not distinguish short and long connections.
+
+Shutdown uses the latest accepted configuration; rejected reloads preserve the previous value. The flag does not change reload retirement, DNS/state persistence, NFQUEUE/eBPF cleanup or the native API's independent [five-second HTTP grace](./api.md#native-api).
+
+This is neither graceful restart nor a total exit deadline: [owned cleanup and blocking work](../design/control-plane.md#runtime-teardown) still have to finish.
 
 ## Socket marks
 

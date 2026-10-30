@@ -15,6 +15,7 @@
 | `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启；原生 API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
+| `shutdown_wait_connections` | `shutdown_wait_connections` | `false` | 可重载、显式启用的业务连接宽限等待；见[关闭](#关闭)。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
 | `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。WAN 绑定规则见[网卡语义](#网卡语义)。 |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此对每个 WAN 根接口（包括同时也是 LAN 的接口）一出现在网卡拓扑中（启动时，或之后出现时）就写入 `net.ipv6.conf.<wan>.accept_ra=2`，不等待其 hook，也不要求链路 UP，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。同样地，对第一个已解析、存在且未被拒绝的 LAN 名称写入 `net.ipv4.conf.<lan>.rp_filter=0`，按配置原样、不做规范化。新加入设备的 udev `systemd-sysctl` 会在首次写入后立即恢复发行版默认值，因此每个值约一秒后会再写一次；此后 honk 不再改动，直到该设备被重建。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
@@ -53,6 +54,14 @@
 HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：IPv6 保留方括号，非默认端口不会省略。建立连接和处理 TLS 服务端名称时仍使用不带方括号的主机。
 
 请求路径和查询字符串保留配置中的原始点路径段和百分号编码。在构造请求前拒绝 authority 含多余斜杠、包含反斜杠或内嵌 ASCII 空白／控制字符的 URL；健康检查警告不回显被拒绝的 URL。
+
+## 关闭
+
+仅设为 `shutdown_wait_connections: true`，且正常关闭、数据路径健康并存在活动 runtime epoch 时，才给已接受连接最多五秒自然结束，再关闭并 join 剩余连接。其他情况跳过宽限等待，不区分长短连接。
+
+关闭使用最近接受的配置；重载被拒绝时保留旧值。此开关不改变 reload 退役、DNS/状态持久化、NFQUEUE/eBPF 清理或原生 API 独立的[五秒 HTTP 宽限期](./api.md#原生-api)。
+
+这不是优雅重启，也不限制总退出时间：[持有的清理及阻塞工作](../design/control-plane.md#终止所有权)仍须完成。
 
 ## 套接字 mark
 

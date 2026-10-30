@@ -240,7 +240,7 @@ AnyTLS and VLESS pools enter draining: no new logical streams are admitted, but
 existing streams retain their carriers until completion. QUIC flows own
 connection clones, so terminal generation checks reject new work while current
 flows finish naturally. Process shutdown force-closes remaining pools and QUIC
-clients only after the process-level flow drain.
+clients after the optional [business-connection grace](../reference/global.md#shutdown).
 
 Generation-free callers such as standalone probes use
 `EphemeralRuntimeGuard`. AnyTLS or VLESS streams and packet transports retain

@@ -1241,7 +1241,7 @@ If the backend rejects the reset before commit, activation is rejected. After ro
 
 Map capacity may be known while occupancy remains null. Attached hooks alone do not establish active admission, and `full_transparency` is never advertised.
 
-Shutdown keeps its existing flow-drain grace and does not detach unfinished cleanup to claim success. Already-started blocking work is not cancelled by aborting an async wrapper: the StateTick maintenance owner warns after its nominal stop deadline and continues to join the actual SQLite work. Blocking credential KDF/database work and an already-started NSS lookup also retain their real join.
+The optional [business-connection grace](./global.md#shutdown) does not permit detaching unfinished cleanup to claim success. Already-started blocking work is not cancelled by aborting an async wrapper: the StateTick maintenance owner warns after its nominal stop deadline and continues to join the actual SQLite work. Blocking credential KDF/database work and an already-started NSS lookup also retain their real join.
 
 These exceptions can extend total shutdown beyond nominal per-stage or HTTP grace deadlines. See [control-plane ownership](../design/control-plane.md#native-observation-api).
 

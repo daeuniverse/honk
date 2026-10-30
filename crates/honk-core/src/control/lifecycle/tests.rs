@@ -25,10 +25,6 @@ fn free_port() -> u16 {
 }
 
 impl Fixture {
-    async fn start() -> anyhow::Result<Self> {
-        Self::start_with(|_, _| {}).await
-    }
-
     async fn start_with(configure: impl FnOnce(&mut Config, SocketAddr)) -> anyhow::Result<Self> {
         let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let mut config = Config::default();
@@ -281,7 +277,10 @@ async fn complete_socks(stream: &mut TcpStream) {
 #[tokio::test]
 #[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
 async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> anyhow::Result<()> {
-    let mut fixture = Fixture::start().await?;
+    let mut fixture = Fixture::start_with(|config, _| {
+        config.global.shutdown_wait_connections = true;
+    })
+    .await?;
     let mut client = fixture.connect_tcp().await?;
     client.write_all(b"request").await?;
     let mut peer = fixture.socks_peer().await;

@@ -4506,20 +4506,22 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     cp.datapath_flags.as_ref().unwrap().disable().await.unwrap();
 }
 
-/// Shutdown before an epoch exists must still detach the hooks and return in
-/// bounded time, even with a flow that never finishes.
-#[tokio::test]
+/// Startup rollback skips connection grace even when waiting is enabled.
+#[tokio::test(start_paused = true)]
 async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     use std::sync::atomic::Ordering;
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
     let detach = backend.detach_calls.clone();
     let mut cp = link_lifecycle_cp(backend);
+    Arc::make_mut(&mut *cp.config.write().await)
+        .global
+        .shutdown_wait_connections = true;
 
     cp.drain_tracker.increment();
 
-    tokio::time::timeout(Duration::from_secs(30), cp.shutdown_runtime(None, None))
+    tokio::time::timeout(Duration::from_secs(1), cp.shutdown_runtime(None, None))
         .await
-        .expect("shutdown must stay bounded with a stuck flow")
+        .expect("shutdown without an epoch must skip connection grace")
         .unwrap();
     assert!(
         detach.load(Ordering::Relaxed) >= 1,
