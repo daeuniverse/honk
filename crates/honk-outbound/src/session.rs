@@ -576,6 +576,24 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
     {
+        self.offer_inner(dial, false).await
+    }
+
+    /// Like [`Self::offer`], but while the active sessions are below the
+    /// standby floor it dials past a usable session instead of returning it.
+    pub(crate) async fn replenish<F, Fut>(&self, dial: F) -> anyhow::Result<Arc<S>>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
+    {
+        self.offer_inner(dial, true).await
+    }
+
+    async fn offer_inner<F, Fut>(&self, dial: F, replenish: bool) -> anyhow::Result<Arc<S>>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
+    {
         let mut dial = Some(dial);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
@@ -621,11 +639,16 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .iter()
                         .filter(|session| session.state() == SessionState::Active)
                         .count();
+                    // Rechecked per pass: a concurrent dial may already have
+                    // met the floor this replenishment was started for.
+                    let below_floor = replenish
+                        && occupied_slots < pool.base_min_idle.max(usize::from(pool.warm_retained));
                     // A caller whose dial is spent cannot open another session,
                     // so it takes the busy candidate rather than spreading.
-                    let should_spread = self.config.spread_sessions
-                        && dial.is_some()
-                        && candidate.is_some_and(|session| session.active_streams() > 0)
+                    let should_spread = dial.is_some()
+                        && (below_floor
+                            || (self.config.spread_sessions
+                                && candidate.is_some_and(|session| session.active_streams() > 0)))
                         && occupied_slots < self.config.max_sessions;
                     if !should_spread && let Some(candidate) = candidate {
                         Step::Have(Arc::clone(candidate))

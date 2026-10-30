@@ -230,7 +230,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     .dial_admission()
                     .unwrap_or_else(crate::runtime::capture_dial_admission);
                 if let Ok(s) = admission
-                    .scope(self.offer({
+                    .scope(self.replenish({
                         let prewarm = prewarm.clone();
                         move || prewarm()
                     }))
