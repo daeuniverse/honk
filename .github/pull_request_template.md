@@ -32,10 +32,6 @@ Say what you could not verify.
 
 Closes #
 
-### Human responsible / 负责人
-
-Submitted and answered for by: <!-- @your-name / GitHub 用户名 -->
-
 ---
 
 - [ ] I understand this change and answer for every line

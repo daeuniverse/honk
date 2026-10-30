@@ -23,16 +23,14 @@ check_body() {
         gsub("(?:^|\\n)```[^\\n]*\\n[\\s\\S]*?\\n```[^\\n]*"; "") | . as $body |
         # Issues opened from other forms or blank issues carry no human-responsible field.
         if $kind == "issue" and (test("(?:^|\\n)### Human responsible"; "i") | not) then [] else
-        (if $kind == "pr" then
-            [capture("(?:^|\\n)Submitted and answered for by:[ \\t]*(?<human>[^\\n]*)"; "i") | .human][0]
-        else
-            [capture("(?:^|\\n)### Human responsible(?: /[^\\n]*)?\\n(?<human>[\\s\\S]*?)(?:\\n#{1,6} |\\z)"; "i") | .human][0]
-        end // "" | trim | ascii_downcase) as $human |
+        # Pull requests carry no name field; the first required box makes the author answer for the change.
+        ([capture("(?:^|\\n)### Human responsible(?: /[^\\n]*)?\\n(?<human>[\\s\\S]*?)(?:\\n#{1,6} |\\z)"; "i") | .human][0]
+            // "" | trim | ascii_downcase) as $human |
         [
             {test: checked($trap), en: "The unread-checkbox trap is checked.", zh: "勾选了“我没有阅读上面的选项就直接勾选了”。"},
             {test: checked($agent), en: "The AI-agent box says there was no human review.", zh: "勾选了“我是 AI 代理”，表示内容没有经过人工审核。"},
-            {test: ($human == "" or $human == "_no response_" or
-                ($human | test("^@?your-name(?:\\s*/.*)?$|^your github username$"))),
+            {test: ($kind == "issue" and ($human == "" or $human == "_no response_" or
+                ($human | test("^@?your-name(?:\\s*/.*)?$|^your github username$")))),
                 en: "Name the human responsible with a GitHub username.", zh: "请填写负责人的 GitHub 用户名。"},
             {test: ($kind == "pr" and ([$understand, $main, $gates, $commits] |
                 any(. as $box | $body | kept($box) | not))),
