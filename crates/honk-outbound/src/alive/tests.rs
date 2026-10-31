@@ -353,6 +353,19 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
     let set = Arc::new(AliveDialerSet::new());
     let node_id = id(5);
     set.register_node(node_id, "n5".into(), "127.0.0.1:1".into());
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::WarmSuccess(Duration::from_millis(7)),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+    set.register_urltest_group("idle", &[node_id], Some(Duration::from_secs(3600)));
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        set.states.write().get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, ipver)]
+            .cooldown_until = Instant::now() + Duration::from_secs(300);
+    }
     let udp_cooldown = Instant::now() + Duration::from_secs(300);
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
         for ipver in [IpVersion::V4, IpVersion::V6] {
@@ -377,6 +390,14 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
     .expect("emergency probe finishes");
     set.shutdown_health_checks().await.unwrap();
     owner.await.unwrap();
+
+    assert_eq!(
+        set.get_last_latency(node_id, ProbeDomain::Tcp, IpVersion::V4),
+        Some(Duration::from_millis(7))
+    );
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        assert!(set.should_probe(node_id, ProbeDomain::Tcp, ipver));
+    }
 
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
         for ipver in [IpVersion::V4, IpVersion::V6] {
