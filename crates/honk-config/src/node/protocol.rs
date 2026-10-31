@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+
+use super::headers;
 use super::validation::ValidationFailure;
 use crate::types::NodeProtocol;
 
@@ -69,6 +72,8 @@ pub struct StreamTransportOptions {
     pub transport: String,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
+    /// Additional WebSocket upgrade headers (`Host` stays in [`Self::ws_host`]).
+    pub ws_headers: BTreeMap<String, String>,
     pub grpc_service: Option<String>,
     pub xhttp: Option<super::XhttpOptions>,
 }
@@ -79,6 +84,7 @@ impl Default for StreamTransportOptions {
             transport: "tcp".to_string(),
             ws_path: None,
             ws_host: None,
+            ws_headers: BTreeMap::new(),
             grpc_service: None,
             xhttp: None,
         }
@@ -98,8 +104,24 @@ impl StreamTransportOptions {
                 .get_or_insert_with(Default::default)
                 .normalize()?;
         }
+        headers::normalize(&mut self.ws_headers)?;
         self.check().map_err(|(_, message)| message)
     }
+
+    /// Headers tungstenite writes or verifies itself, plus ones that would
+    /// alter framing.
+    const MANAGED_WS_HEADERS: &[&str] = &[
+        "host",
+        "connection",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+        "sec-websocket-accept",
+        "sec-websocket-protocol",
+        "content-length",
+        "transfer-encoding",
+    ];
 
     pub(super) fn check(&self) -> Result<(), (&'static str, &'static str)> {
         let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)
@@ -116,11 +138,25 @@ impl StreamTransportOptions {
                 .ok_or(("xhttp", "XHTTP requires canonical options"))?
                 .validate()
                 .map_err(|message| ("xhttp", message))?;
-            if self.ws_path.is_some() || self.ws_host.is_some() || self.grpc_service.is_some() {
+            if self.ws_path.is_some()
+                || self.ws_host.is_some()
+                || !self.ws_headers.is_empty()
+                || self.grpc_service.is_some()
+            {
                 return Err(("xhttp", "XHTTP cannot use WebSocket or gRPC options"));
             }
         } else if self.xhttp.is_some() {
             return Err(("xhttp", "XHTTP options require XHTTP transport"));
+        }
+        if !self.ws_headers.is_empty() {
+            if kind != "ws" {
+                return Err((
+                    "ws_headers",
+                    "WebSocket headers require WebSocket transport",
+                ));
+            }
+            headers::validate(&self.ws_headers, Self::MANAGED_WS_HEADERS)
+                .map_err(|message| ("ws_headers", message))?;
         }
         Ok(())
     }
@@ -390,6 +426,14 @@ impl OutboundConfig {
         ]
         .map(identity_field)
         .join("|");
+        if let Some(headers) = transport
+            .map(|transport| &transport.ws_headers)
+            .filter(|headers| !headers.is_empty())
+        {
+            fingerprint.push_str("|ws-headers:");
+            fingerprint
+                .push_str(&serde_json::to_string(headers).expect("WebSocket headers serialize"));
+        }
         if let Self::Vless(config) = self {
             fingerprint.push('|');
             fingerprint.push_str(&config.identity_fingerprint());

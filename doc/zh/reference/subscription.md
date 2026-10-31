@@ -292,6 +292,7 @@ VLESS 字段会在派生节点身份前应用：
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
 | `ws-opts.headers.Host` | WebSocket Host 标头，键匹配不区分大小写；依次回退到 scalar `ws-headers`、`ws-host`。 |
+| `ws-opts.headers.<name>` | 附加 WebSocket 升级标头，所有支持 WebSocket 的代理共用；以小写名称导入（例如 `User-Agent`）。null 值忽略，非 scalar 值会使条目被丢弃；保留握手标头会按[节点字段约定](./nodes.md#节点字段)拒绝该条目。 |
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
@@ -337,7 +338,7 @@ sing-box 配置从 `outbounds` 导入受支持的条目：
 - 代理节点：Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity、AnyTLS。
 - 结构性条目，不属于代理节点：`selector`、`urltest`、`direct`、`block`、`dns`。
 
-TLS/SNI、REALITY、WebSocket/gRPC、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
+TLS/SNI、REALITY、WebSocket/gRPC（包括 `Host` 以外的升级标头）、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |

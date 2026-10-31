@@ -476,20 +476,21 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
                 let headers = headers
                     .as_mapping()
                     .ok_or("ws-opts.headers must be a mapping")?;
+                let mut ws_host = None;
                 for (key, value) in headers {
                     let key = key.as_str().ok_or("websocket header name is invalid")?;
-                    if !key.eq_ignore_ascii_case("host")
-                        && !matches!(value, serde_yaml::Value::Null)
-                    {
-                        return Err("unsupported websocket header");
+                    let Some(value) = yaml_text(value)? else {
+                        continue;
+                    };
+                    if key.eq_ignore_ascii_case("host") {
+                        if ws_host.is_none() && !value.trim().is_empty() {
+                            ws_host = Some(value);
+                        }
+                    } else {
+                        transport.ws_headers.insert(key.to_owned(), value);
                     }
                 }
-                transport.ws_host = headers.iter().find_map(|(key, value)| {
-                    key.as_str()
-                        .filter(|key| key.eq_ignore_ascii_case("host"))
-                        .and_then(|_| yaml_text(value).ok().flatten())
-                        .filter(|value| !value.trim().is_empty())
-                });
+                transport.ws_host = ws_host;
             }
         }
         transport.ws_path = transport

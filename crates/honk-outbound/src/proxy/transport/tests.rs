@@ -77,13 +77,22 @@ async fn ws_transport_roundtrip(path: &str, expected: &str) {
         let callback =
             |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
              resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                let host = req
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                };
+                let host = header("host");
+                let user_agent = header("user-agent");
+                let x_test = header("x-test");
                 if let Some(tx) = seen_tx.take() {
-                    let _ = tx.send((req.uri().path_and_query().unwrap().to_string(), host));
+                    let _ = tx.send((
+                        req.uri().path_and_query().unwrap().to_string(),
+                        host,
+                        user_agent,
+                        x_test,
+                    ));
                 }
                 Ok(resp)
             };
@@ -104,6 +113,13 @@ async fn ws_transport_roundtrip(path: &str, expected: &str) {
     transport.transport = "ws".into();
     transport.ws_path = Some(path.into());
     transport.ws_host = Some("cdn.example.com".into());
+    transport.ws_headers.insert(
+        "user-agent".into(),
+        "Mozilla/5.0 (X11; Linux x86_64)".into(),
+    );
+    transport
+        .ws_headers
+        .insert("x-test".into(), "ws-header".into());
 
     let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3))
         .await
@@ -121,9 +137,14 @@ async fn ws_transport_roundtrip(path: &str, expected: &str) {
     .unwrap();
     assert_eq!(&buf, b"pong");
 
-    let (path, host) = seen_rx.await.unwrap();
+    let (path, host, user_agent, x_test) = seen_rx.await.unwrap();
     assert_eq!(path, expected);
     assert_eq!(host.as_deref(), Some("cdn.example.com"));
+    assert_eq!(
+        user_agent.as_deref(),
+        Some("Mozilla/5.0 (X11; Linux x86_64)")
+    );
+    assert_eq!(x_test.as_deref(), Some("ws-header"));
 
     server.await.unwrap();
 }

@@ -220,21 +220,6 @@ fn interval_range<'de, D: Deserializer<'de>>(deserializer: D) -> Result<XhttpRan
     deserialize_range(deserializer, Some(XhttpOptions::DEFAULT_INTERVAL))
 }
 
-fn merge_header(
-    headers: &mut BTreeMap<String, String>,
-    name: String,
-    value: String,
-) -> Result<(), &'static str> {
-    match headers.entry(name.to_ascii_lowercase()) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(value);
-        }
-        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &value => {}
-        _ => return Err("XHTTP header aliases conflict"),
-    }
-    Ok(())
-}
-
 fn xhttp_headers<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
@@ -263,7 +248,8 @@ fn deserialize_headers<'de, D: Deserializer<'de>>(
                     return Err(serde::de::Error::custom("duplicate XHTTP header"));
                 }
                 let value = map.next_value::<String>()?;
-                merge_header(&mut headers, name, value).map_err(serde::de::Error::custom)?;
+                super::headers::merge(&mut headers, name, value)
+                    .map_err(serde::de::Error::custom)?;
             }
             Ok(headers)
         }
@@ -520,6 +506,20 @@ impl XhttpOptions {
     };
     const DEFAULT_INTERVAL: XhttpRange = XhttpRange { min: 30, max: 30 };
     const MAX_PATH_BYTES: usize = 16 * 1024;
+    /// Request headers the transport or its peers manage themselves.
+    const FORBIDDEN_HEADERS: &[&str] = &[
+        "host",
+        "content-type",
+        "content-length",
+        "referer",
+        "connection",
+        "transfer-encoding",
+        "keep-alive",
+        "proxy-connection",
+        "upgrade",
+        "te",
+        "trailer",
+    ];
 
     /// Dot segments and escapes are wire data, not URL resolution instructions.
     pub fn normalize_path(value: &str) -> String {
@@ -555,11 +555,7 @@ impl XhttpOptions {
     pub fn normalize(&mut self) -> Result<(), &'static str> {
         self.path = Self::normalize_path(&self.path);
         self.host = self.host.take().filter(|host| !host.is_empty());
-        let mut headers = BTreeMap::new();
-        for (name, value) in std::mem::take(&mut self.headers) {
-            merge_header(&mut headers, name, value)?;
-        }
-        self.headers = headers;
+        super::headers::normalize(&mut self.headers)?;
         if let Some(download) = &mut self.download {
             download.normalize();
         }
@@ -616,39 +612,7 @@ impl XhttpOptions {
         {
             return Err("invalid XHTTP host");
         }
-        let mut bytes = 0usize;
-        if self.headers.len() > 64 {
-            return Err("too many XHTTP headers");
-        }
-        for (name, value) in &self.headers {
-            if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                return Err("XHTTP headers must be normalized before admission");
-            }
-            if name.parse::<http::header::HeaderName>().is_err()
-                || matches!(
-                    name.as_str(),
-                    "host"
-                        | "content-type"
-                        | "content-length"
-                        | "referer"
-                        | "connection"
-                        | "transfer-encoding"
-                        | "keep-alive"
-                        | "proxy-connection"
-                        | "upgrade"
-                        | "te"
-                        | "trailer"
-                )
-                || http::header::HeaderValue::from_str(value).is_err()
-                || value.bytes().any(|byte| byte < 32 || byte == 127)
-            {
-                return Err("invalid or protocol-managed XHTTP header");
-            }
-            bytes += name.len() + value.len();
-        }
-        if bytes > 16 * 1024 {
-            return Err("XHTTP headers exceed supported bounds");
-        }
+        super::headers::validate(&self.headers, Self::FORBIDDEN_HEADERS)?;
         if let Some(download) = &self.download {
             // Xray and mihomo refuse this combination; the download view validates the rest.
             if self.mode == XhttpMode::StreamOne {

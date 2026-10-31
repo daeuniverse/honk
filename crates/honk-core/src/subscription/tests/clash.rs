@@ -842,3 +842,56 @@ fn c14_feed_duration_aliases_compare_after_ceiling() {
         Some(0)
     );
 }
+
+#[test]
+fn clash_imports_websocket_upgrade_headers() {
+    let yaml = r#"proxies:
+  - name: ws
+    type: vless
+    server: ws.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    tls: true
+    servername: tls.example
+    network: ws
+    ws-opts:
+      path: /path
+      headers:
+        Host: front.example
+        User-Agent: 'Mozilla/5.0 (X11; Linux x86_64)'
+        X-CDN-Token: abc
+        Ignored: null
+  - name: other-ua
+    type: vless
+    server: ws.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    tls: true
+    servername: tls.example
+    network: ws
+    ws-opts:
+      path: /path
+      headers:
+        Host: front.example
+        User-Agent: curl/8
+  - {name: nested, type: vless, server: nested.example, port: 443, uuid: 22222222-2222-4222-8222-222222222222, network: ws, ws-opts: {headers: {X-Nested: {a: b}}}}
+  - {name: managed, type: vless, server: managed.example, port: 443, uuid: 33333333-3333-4333-8333-333333333333, network: ws, ws-opts: {headers: {Connection: Upgrade}}}
+"#;
+    let nodes = parse_clash_subscription(yaml, None).unwrap();
+    assert_eq!(nodes.len(), 2);
+    let transport = &nodes[0].vless().unwrap().transport;
+    assert_eq!(transport.ws_host.as_deref(), Some("front.example"));
+    assert_eq!(
+        transport.ws_headers["user-agent"],
+        "Mozilla/5.0 (X11; Linux x86_64)"
+    );
+    assert_eq!(transport.ws_headers["x-cdn-token"], "abc");
+    assert_eq!(transport.ws_headers.len(), 2);
+    assert_eq!(nodes[0].id, nodes[0].derive_id());
+    // The header joins the dial shape, so it changes node identity.
+    assert_eq!(
+        nodes[1].vless().unwrap().transport.ws_headers["user-agent"],
+        "curl/8"
+    );
+    assert_ne!(nodes[0].id, nodes[1].id);
+}

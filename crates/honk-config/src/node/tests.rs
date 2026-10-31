@@ -328,6 +328,76 @@ fn test_derive_id_is_content_derived() {
     assert_eq!(node.derive_id(), other_insecure.derive_id());
 }
 
+fn ws_candidate(headers: &[(&str, &str)]) -> Node {
+    let mut node = Node::from_share_link(
+        "vless://00000000-0000-4000-8000-000000000001@ws.example:443?type=ws&path=%2Fws#ws",
+    )
+    .unwrap();
+    let transport = node.transport_mut().unwrap();
+    for (name, value) in headers {
+        transport.ws_headers.insert((*name).into(), (*value).into());
+    }
+    node
+}
+
+fn ws_normalized(headers: &[(&str, &str)]) -> Node {
+    let mut node = ws_candidate(headers);
+    node.normalize_stream_transport().unwrap();
+    node.validate_protocol().unwrap();
+    node
+}
+
+#[test]
+fn test_ws_headers_participate_in_identity() {
+    let plain = ws_normalized(&[]);
+    let with_ua = ws_normalized(&[("User-Agent", "Mozilla/5.0")]);
+    assert_eq!(
+        with_ua.transport().unwrap().ws_headers["user-agent"],
+        "Mozilla/5.0"
+    );
+    assert_ne!(plain.derive_id(), with_ua.derive_id());
+
+    // Names are case-insensitive: equal-value aliases collapse and do not
+    // change identity; differing values conflict.
+    assert_eq!(
+        ws_normalized(&[("user-agent", "Mozilla/5.0")]).derive_id(),
+        with_ua.derive_id()
+    );
+    assert_ne!(
+        ws_normalized(&[("user-agent", "curl/8")]).derive_id(),
+        with_ua.derive_id()
+    );
+    let mut conflicting = ws_candidate(&[("User-Agent", "one"), ("user-agent", "two")]);
+    assert!(conflicting.normalize_stream_transport().is_err());
+}
+
+#[test]
+fn test_ws_header_admission_bounds_and_reserved_names() {
+    for (name, value) in [
+        ("host", "cdn.example"),
+        ("Connection", "keep-alive"),
+        ("sec-websocket-key", "x"),
+        ("sec-websocket-protocol", "v2ray"),
+        ("bad name", "x"),
+    ] {
+        let mut candidate = ws_candidate(&[(name, value)]);
+        assert!(
+            candidate.normalize_stream_transport().is_err(),
+            "{name} must be rejected"
+        );
+    }
+    for name in ["origin", "cookie", "x-cdn-token"] {
+        let mut candidate = ws_candidate(&[(name, "value")]);
+        assert!(candidate.normalize_stream_transport().is_ok(), "{name}");
+    }
+
+    let mut grpc = ws_candidate(&[("user-agent", "Mozilla/5.0")]);
+    let transport = grpc.transport_mut().unwrap();
+    transport.transport = "grpc".into();
+    transport.grpc_service = Some("service".into());
+    assert!(grpc.normalize_stream_transport().is_err());
+}
+
 #[test]
 fn test_tls_alpn_identity_is_ordered_and_framed() {
     let legacy = Node::from_share_link("anytls://secret@example.com:443#anytls").unwrap();

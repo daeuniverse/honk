@@ -292,6 +292,7 @@ VLESS fields are applied before node identity is derived:
 | `reality-opts.spider-x` | REALITY spider path; missing or empty becomes `/`. |
 | `ws-opts.path` | WebSocket path; falls back to flat `ws-path`. |
 | `ws-opts.headers.Host` | WebSocket Host header, with case-insensitive key matching; falls back to scalar `ws-headers`, then `ws-host`. |
+| `ws-opts.headers.<name>` | Additional WebSocket upgrade headers, shared by every WebSocket-capable proxy, imported as lowercase names (for example `User-Agent`). Null values are ignored and non-scalar values drop the entry; reserved handshake headers reject it per the [node field contract](./nodes.md#node-fields). |
 | `grpc-opts.grpc-service-name` | gRPC service name; falls back to `grpc-service`. |
 | `client-fingerprint` | Intentionally not imported. TLS fingerprint selection is process-wide through `global.tls_implementation` and `global.utls_imitate`. |
 
@@ -337,7 +338,7 @@ sing-box profiles import supported entries from `outbounds`:
 - Proxy nodes: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS.
 - Structural entries, not proxy nodes: `selector`, `urltest`, `direct`, `block`, and `dns`.
 
-TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet choices, and supported protocol tuning normalize through the common node builder.
+TLS/SNI, REALITY, WebSocket/gRPC (including non-`Host` upgrade headers), VLESS packet choices, and supported protocol tuning normalize through the common node builder.
 
 | Source-specific case | Import behavior |
 | --- | --- |

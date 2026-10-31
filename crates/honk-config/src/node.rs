@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+mod headers;
 mod protocol;
 mod validation;
 mod vless;
@@ -109,12 +110,10 @@ impl Node {
             .is_some_and(StreamTransportOptions::is_xhttp)
     }
 
-    /// Canonicalize XHTTP at every adapter boundary before deriving identity.
+    /// Canonicalize stream transports at every adapter boundary before
+    /// deriving identity.
     pub fn normalize_stream_transport(&mut self) -> Result<(), &'static str> {
-        if let Some(transport) = self.transport_mut()
-            && (crate::options::vocab::xhttp_stream_transport(&transport.transport) == Ok("xhttp")
-                || transport.xhttp.is_some())
-        {
+        if let Some(transport) = self.transport_mut() {
             transport.normalize()?;
         }
         if self.is_xhttp() {

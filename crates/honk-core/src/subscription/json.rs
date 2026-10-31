@@ -324,6 +324,23 @@ mod tests {
     }
 
     #[test]
+    fn sing_box_websocket_headers_are_imported() {
+        let nodes = parse_json_subscription(
+            json(
+                r#"{"outbounds":[{"type":"vmess","tag":"vmess","server":"ws.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000002","security":"auto","alter_id":0,"network":"tcp","transport":{"type":"ws","path":"/socket","headers":{"Host":"ws-host.example","User-Agent":"Mozilla/5.0 (X11; Linux x86_64)"}}}]}"#,
+            ),
+            None,
+        )
+        .unwrap();
+        let transport = nodes[0].transport().unwrap();
+        assert_eq!(transport.ws_host.as_deref(), Some("ws-host.example"));
+        assert_eq!(
+            transport.ws_headers["user-agent"],
+            "Mozilla/5.0 (X11; Linux x86_64)"
+        );
+    }
+
+    #[test]
     fn sing_box_vless_packet_settings_preserve_source_defaults_and_network_gate() {
         let nodes = parse_json_subscription(
             json(

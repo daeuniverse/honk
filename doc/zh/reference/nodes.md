@@ -120,7 +120,7 @@ Node 模型包含下列字段。分享链接从协议方案、用户信息、地
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
 | `flow` | string? | null | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow |
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
-| `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host 标头 |
+| `ws_path` / `ws_host` / `ws_headers` | string? / string? / object? | null | WebSocket `path`、Host 标头，以及以小写名称为键的附加升级标头 map（最多 64 个标头、合计 16 KiB）。保留的握手标头（`host`、`connection`、`upgrade`、`sec-websocket-*`、`content-length`、`transfer-encoding`）与非 WebSocket 流传输会被拒绝；没有流传输的协议会丢弃该字段。只有订阅导入和结构化输入能提供标头：任何分享链接方言都不携带它们。 |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
 | `xhttp` | object? | 省略 | flat 结构化输入/输出中的规范 XHTTP 参数；其他传输携带该对象会被拒绝 |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证与 salamander 密码 |
@@ -294,7 +294,7 @@ Shadowsocks UDP（传统 AEAD 与 2022）为每个客户端源的所有目的地
 | 值 | 传输方式 | 字段映射 |
 | --- | --- | --- |
 | 空文本或 `tcp` | 裸 TCP | — |
-| `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host` |
+| `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host`；升级标头没有分享链接字段 |
 | `grpc` | gRPC | `serviceName` 或 `service_name` → `grpc_service` |
 | `xhttp` 或输入别名 `splithttp` | XHTTP | 见下文的 H2 兼容范围。 |
 

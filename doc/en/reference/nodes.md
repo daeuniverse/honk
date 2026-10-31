@@ -120,7 +120,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
 | `flow` | string? | null | VLESS `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; Shadowrocket `xtls=2` selects the base flow |
 | `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
-| `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
+| `ws_path` / `ws_host` / `ws_headers` | string? / string? / object? | null | WebSocket `path`, Host header, and additional upgrade headers as a lowercase-name string map (at most 64 headers, 16 KiB combined). Reserved handshake headers (`host`, `connection`, `upgrade`, `sec-websocket-*`, `content-length`, `transfer-encoding`) and non-WebSocket stream transports reject; protocols without a stream transport drop the field. Only subscription import and structured input supply headers: no share-link dialect carries them. |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
 | `xhttp` | object? | omitted | Canonical XHTTP options in flat structured input/output; options on another transport reject |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 authentication and salamander password |
@@ -297,7 +297,7 @@ Stream-capable share links select transport with `type=` or its `network=` alias
 | Value | Transport | Field mapping |
 | --- | --- | --- |
 | Empty or `tcp` | Raw TCP | — |
-| `ws` | WebSocket | `path` → `ws_path`; `host` → `ws_host` |
+| `ws` | WebSocket | `path` → `ws_path`; `host` → `ws_host`; upgrade headers have no share-link field |
 | `grpc` | gRPC | `serviceName` or `service_name` → `grpc_service` |
 | `xhttp` or input alias `splithttp` | XHTTP | See the H2 profile below. |
 
