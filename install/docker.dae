@@ -1,0 +1,11 @@
+# Default configuration of the Docker image: direct routing for the host's own traffic.
+# Mount the host's /etc/honk over /etc/honk to replace it.
+global {
+    wan_interface: auto
+    log_level: info
+    auto_config_kernel_parameter: true
+}
+
+routing {
+    fallback: direct
+}

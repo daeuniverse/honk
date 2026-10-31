@@ -1,0 +1,3 @@
+*
+!.github/ci/pins.env
+!install/docker.dae

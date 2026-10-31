@@ -411,6 +411,58 @@ sudo journalctl -xefu honk-core
 
 不要在未验证前添加严格的 capability bounding、只读 `/proc/sys` 或 `NoNewPrivileges=yes`；启动需要 BPF、网络管理、网络命名空间、挂载、sysctl 和 transparent 套接字权限。
 
+## 使用 Docker 运行
+
+[GitHub Container Registry](https://github.com/daeuniverse/honk/pkgs/container/honk) 上的镜像 `ghcr.io/daeuniverse/honk` 包含 musl `full` 发布版二进制以及仓库固定版本的 GeoIP 和 Geosite 文件；构建时会用 SHA-256 校验每个下载文件。每个发布版以去掉 `v` 的版本号作为镜像标签，例如 `ghcr.io/daeuniverse/honk:0.1.0-beta.4`；`latest` 只指向正式版，不包含预发布版。镜像提供 linux/amd64 和 linux/arm64 两种架构，拉取时无需登录。
+
+honk 需要加载并挂载 eBPF 程序、创建 `dae0` 和 `daens` 命名空间、修改 sysctl，并在宿主机的 bpffs 上固定 map，因此容器以特权模式运行，并共享宿主机的网络和 PID 命名空间。它对宿主机的改动与直接安装相同，不提供任何隔离。宿主机必须满足[内核要求](#linux-内核要求)，包括 Linux 6.12+ 和已挂载的 bpffs。
+
+按[最小配置](#最小配置)准备 `/etc/honk/config.dae` 和 `/var/lib/honk`，然后在 `.env` 中写入发布版本号，再启动仓库中的 `docker-compose.yml`：
+
+```shell
+curl -fLO https://raw.githubusercontent.com/daeuniverse/honk/main/docker-compose.yml
+echo 'HONK_VERSION=<version>' > .env   # 例如 0.1.0-beta.4
+sudo touch /run/honk-core.lock
+sudo docker compose up -d
+sudo docker compose logs -f
+```
+
+该文件从宿主机挂载 `/sys`、`/etc/honk` 和 `/var/lib/honk`。配置目录的挂载会覆盖镜像内仅直连的默认配置；`/var/lib/honk` 保存运行时状态，例如原生 API 的管理员账户，重启或升级后仍然保留。重载配置使用 `sudo docker compose exec honk honk-core reload`。镜像自带 iproute2 和 nftables，容器又与宿主机共用网络命名空间，因此 `sudo docker compose exec honk ip rule`、`ip route show table all`、`tc filter show dev <网卡> ingress` 和 `nft list ruleset` 显示的就是宿主机的状态。
+
+锁文件挂载让容器与原生实例共享 `/run/honk-core.lock`，防止容器接管正在运行的数据路径。停止后也应保留此文件；不要删除、替换或截断仍可能被实例持有的锁。每次开机后，必须先创建锁文件，再自动启动容器。使用 systemd 的宿主机可配置不截断已有文件的开机创建规则：
+
+```shell
+echo 'f /run/honk-core.lock 0600 root root -' | sudo tee /etc/tmpfiles.d/honk-container.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/honk-container.conf
+```
+
+其他 init 系统也须在开机启动容器前，以不截断的方式创建该文件。直接使用 `docker run` 或 `podman run` 部署时，同样必须挂载此锁文件。
+
+如果宿主机使用外部原始 BTF 文件，而不是 `/sys/kernel/btf/vmlinux`，将以下内容保存为 `docker-compose.yml` 同目录的 `docker-compose.override.yml`。Compose 的每个命令（包括升级）都会加载它。将 `source` 改为宿主机的原始 BTF 文件路径；环境变量填写容器内的挂载路径：
+
+```yaml
+services:
+  honk:
+    environment:
+      HONK_VMLINUX_BTF: /run/honk-vmlinux
+    volumes:
+      - type: bind
+        source: /usr/lib/debug/boot/vmlinux
+        target: /run/honk-vmlinux
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+升级时修改 `.env` 中的 `HONK_VERSION`，然后重新创建容器：
+
+```shell
+sudo docker compose pull
+sudo docker compose up -d
+```
+
+在仓库检出目录中执行 `sudo docker compose build`，可以从已发布的版本构建同一镜像，而不必拉取。
+
 ## 检查运行状态
 
 进程启动不等于数据路径可用。日志应显示真实 eBPF 后端、接口 hook、监听器和控制面均已就绪。
@@ -494,7 +546,7 @@ cargo run --release -p honk-core -- \
 - `direct` 和 `block` 是内建节点，不要在配置中重复声明。
 - `nfqueue_enable` 默认开启，固定使用队列 320，并独占 `inet honk_nfqueue` / `udp_decision`。同一网络命名空间中的防火墙管理器不能改动这些对象。
 - mock 或未启用 Cargo `ebpf` 特性的构建不会提供透明代理。普通 `cargo build --release` 不包含真实数据路径；必须使用 `--features ebpf`。
-- 当前没有 VMess UDP、无 root 数据路径、Dockerfile 或 docker-compose 配置，也不支持非 Linux 系统。
+- 当前没有 VMess UDP 和无 root 数据路径，也不支持非 Linux 系统。
 
 ## 常见问题
 

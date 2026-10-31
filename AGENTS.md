@@ -56,7 +56,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
     └── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
 ```
 
-Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `Dockerfile`, `docker-compose.yml`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/` — these paths are `.gitignore`d). The old `run` / `deploy` / `docker*` recipes were removed with those missing files; use `run-debug`, `run-dae`, and `deploy-vyos`. `test-routing` and its dependent `test-netns` share one complete disposable-VM gate; prepare its toolchain, objects and environment through `honk-real-ebpf-tests` rather than attaching root-cgroup hooks on a shared host.
+Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/` — these paths are `.gitignore`d). The old `run` / `deploy` / `docker*` recipes were removed with those missing files; use `run-debug`, `run-dae`, and `deploy-vyos`. `test-routing` and its dependent `test-netns` share one complete disposable-VM gate; prepare its toolchain, objects and environment through `honk-real-ebpf-tests` rather than attaching root-cgroup hooks on a shared host.
 
 ## Technology stack
 
