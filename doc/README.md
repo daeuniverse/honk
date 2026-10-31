@@ -48,6 +48,7 @@ Per-release configuration changes that affect an existing configuration. One fil
 | ---------- | --------- | ------ |
 | DNS canary and rollback runbook | [en/operations/dns-rollout.md](./en/operations/dns-rollout.md) | [zh/operations/dns-rollout.md](./zh/operations/dns-rollout.md) |
 | Long connections and keepalive / 长连接与保活 | [en/operations/long-connections.md](./en/operations/long-connections.md) | [zh/operations/long-connections.md](./zh/operations/long-connections.md) |
+| Issue #415 diagnostic build / 诊断构建 | [en/operations/wan-diagnostic-415.md](./en/operations/wan-diagnostic-415.md) | [zh/operations/wan-diagnostic-415.md](./zh/operations/wan-diagnostic-415.md) |
 
 ## Design / 设计
 

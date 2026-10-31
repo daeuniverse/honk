@@ -7,6 +7,9 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(unused_unsafe)]
 
+mod diagnostic;
+use diagnostic::{Reason, record};
+
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::__sk_buff,
@@ -771,7 +774,10 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let scratch_key: u32 = 0;
     let pkt = match unsafe { PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return Err(TC_ACT_SHOT),
+        None => {
+            record(ctx, None, link_h_len, Reason::ScratchUnavailable, 0);
+            return Err(TC_ACT_SHOT);
+        }
     };
 
     // Parse before reading __sk_buff fields: ctx.load() proves to the verifier
@@ -779,11 +785,14 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
+            record(ctx, None, link_h_len, Reason::ParseDrop, ret as i32);
             return Err(TC_ACT_SHOT);
         }
         if local_ndp_redirect(ctx, ret) {
+            record(ctx, None, link_h_len, Reason::ParseDrop, ret as i32);
             return Err(TC_ACT_SHOT);
         }
+        record(ctx, None, link_h_len, Reason::ParsePass, ret as i32);
         // Unsupported or malformed traffic is left untouched.
         return Err(TC_ACT_UNSPEC);
     }
@@ -793,18 +802,22 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         && pkt.tuples.five.dst_port == 53
         && UdpDnsRoute::from_nfqueue_mark(unsafe { (*ctx.skb.skb).mark }).is_some()
     {
+        record(ctx, Some(pkt), link_h_len, Reason::QueueCarrierDrop, 0);
         return Err(TC_ACT_SHOT);
     }
     // After the carrier drop so a VLAN-tagged queue carrier is still shot.
     if is_vlan_tagged(ctx, link_h_len) {
+        record(ctx, Some(pkt), link_h_len, Reason::VlanPass, 0);
         return Err(TC_ACT_UNSPEC);
     }
     if !crate::maps::datapath_ready() {
+        record(ctx, Some(pkt), link_h_len, Reason::NotReadyPass, 0);
         return Err(TC_ACT_UNSPEC);
     }
 
     // Broadcast/multicast is never re-routed into daens.
     if crate::transport::dst_is_special(pkt, link_h_len) {
+        record(ctx, Some(pkt), link_h_len, Reason::SpecialPass, 0);
         return Err(TC_ACT_UNSPEC);
     }
 
@@ -816,6 +829,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let dst_ip = pkt.tuples.five.dst_ip;
         let dst_ipv4 = unsafe { dst_ip.u6_addr32[3] };
         if dst_ip.is_v4_mapped() && dst_ipv4 == param.local_ip {
+            record(ctx, Some(pkt), link_h_len, Reason::LocalDestinationPass, 0);
             return Err(TC_ACT_UNSPEC);
         }
     }
@@ -823,6 +837,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // Pure forwarded traffic stays on the native path here; continue so a
     // downstream external-interface NAT classifier can still translate it.
     if skb_ingress_ifindex(ctx) != NOWHERE_IFINDEX {
+        record(ctx, Some(pkt), link_h_len, Reason::ForwardedPass, 0);
         return Err(TC_ACT_UNSPEC);
     }
 
@@ -833,20 +848,24 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
         || mark & SKB_MARK_RESERVED_MASK == CLASSIFIED_MARK
     {
+        record(ctx, Some(pkt), link_h_len, Reason::MarkedPass, 0);
         return Err(TC_ACT_OK);
     }
     // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
     if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
+        record(ctx, Some(pkt), link_h_len, Reason::TupleFenceDrop, 0);
         return Err(TC_ACT_SHOT);
     }
     let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&pkt.tuples.five);
     if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
         if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+            record(ctx, Some(pkt), link_h_len, Reason::TcpAcquireDrop, 0);
             return Err(TC_ACT_SHOT);
         }
         pkt.incarnation = tcp_publisher.incarnation;
     }
 
+    record(ctx, Some(pkt), link_h_len, Reason::Dispatch, 0);
     match pkt.l4proto {
         IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
         IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
