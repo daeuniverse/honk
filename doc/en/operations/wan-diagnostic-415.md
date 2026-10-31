@@ -1,16 +1,16 @@
 # Issue #415: collect WAN evidence with honk-tool
 
-This branch adds observation only; routing, marks, conntrack and host/forwarded classification are unchanged. The package includes matching static `honk-core`, `honk-tool` and BPF object builds. **No bpftool, tracefs or device-side compiler is needed.**
+This build collects evidence for issue #415 without changing forwarding. **It is not a fix for the SIPA problem.** Use the aarch64 musl archive for this device: it contains matching static `honk-core` and `honk-tool` binaries, with BPF embedded in core. No bpftool, tracefs or device-side compiler is needed.
 
-Root/BPF permissions, Linux TCX, a readable `/sys/devices/system/cpu/possible`, and an engine with these diagnostic maps are required. Curl below triggers the reported problem; the collector does not depend on it. Do not mix the new tool/object with an older engine.
+Root/BPF permissions, Linux TCX and a readable `/sys/devices/system/cpu/possible` are required. Use core/tool from the same diagnostic archive. Curl only generates the test request.
 
 ## Startup and scope
 
-Keep the original executable and configuration. Gracefully stop the original service, confirm no honk process remains, then start the packaged `honk-core --config /etc/honk/config.dae`. Never overwrite a running executable or start a second engine. Preserve the data directory and both `UDP_DECISION_SEQUENCE` and `ROUTING_GENERATION_SEQUENCE`; do not clear bpffs.
+Back up the executable and config, stop the old service, and confirm no honk process remains. Start the packaged `honk-core --config /etc/honk/config.dae`. Do not overwrite a running executable or start a second engine. Keep the data directory, `UDP_DECISION_SEQUENCE` and `ROUTING_GENERATION_SEQUENCE`; do not clear bpffs.
 
-`honk-tool bpf wan-diag` reuses the existing raw `bpf(2)` facilities. It loads no programs and attaches no hooks. It only updates `WAN_DIAG_CFG`, not datapath state or counters. It validates actual map names, types, sizes, entry counts and ownership by the same TCX egress program on the selected interface. Program/link identity is checked at capture boundaries; held old map FDs prevent cleanup from writing a restart's replacement map. Boundary checks do not prove no intermediate update occurred: keep engine configuration unchanged during probing.
+The tool loads no programs or hooks. It writes only the diagnostic switch `WAN_DIAG_CFG`, not datapath state or counters. It checks map layouts and their association with the interface's TCX program. Cleanup uses the original map FDs, never replacement maps after a restart. Program/link checks run only at capture boundaries; do not reload or change configuration during capture.
 
-Sampling defaults off. **Run only one collector per engine; do not race the recovery command against a collector.** Admission is not an atomic ownership claim. A pre-enabled nonzero filter is refused without modification; stop the original collector or explicitly recover first.
+Sampling defaults off. **Run one collector at a time; do not run recovery alongside it.** The initial check is not a concurrency lock. An existing nonzero filter refuses capture: stop the old collector or recover first.
 
 ## IPv4: two terminals
 
@@ -38,31 +38,31 @@ umask 077
 ) > wan4-curl.txt 2>&1
 ```
 
-At the deadline, the tool disables sampling and writes one JSON document containing `before` and `after`; it does not continuously log packets. Check terminal A's successful exit and a parseable file. An empty file from a failed command is not zero-traffic evidence.
+At the deadline, sampling stops and stdout receives one JSON document with `before` / `after`, not per-packet logs. Require successful exit and parseable JSON; an empty file after failure does not mean zero traffic.
 
-`-q` must be curl's first option to ignore `.curlrc`; `--noproxy '*'` excludes proxy environment settings. Do not bind the WAN device, which would change socket semantics relative to the report. A known target can be pinned with `--resolve api.ip.sb:443:ADDRESS` (bracket IPv6 addresses), retaining TLS hostname validation; do not use `-k`. DNS failure or a probe outside the capture window cannot establish that TC was skipped.
+Keep `-q` first to ignore `.curlrc`; `--noproxy '*'` excludes proxy environment settings. Do not bind the WAN device, which changes socket behavior. For a known target IP, add `--resolve api.ip.sb:443:ADDRESS` (bracket IPv6 addresses); do not skip TLS validation with `-k`. DNS failure or a missed capture window cannot show that TC was skipped.
 
-Run IPv6 separately: use **41501** in both commands, change curl to `-6`, and write `wan6.json` / `wan6-curl.txt`. Do not overlap captures. If a port is occupied, choose a new port consistently in both commands and avoid concurrent LAN traffic reusing it.
+After IPv4, test IPv6 separately: change both ports to **41501**, curl to `-6`, and output names to `wan6.json` / `wan6-curl.txt`. If the port is busy, change it in both commands; avoid LAN traffic using the same port.
 
 ## Interruption and recovery
 
-`--seconds` accepts 1–300, default 15. INT/TERM/HUP attempt to disable sampling before producing partial output; `end_reason` and `elapsed_ms` distinguish interruption from expiration. The deadline bounds enabled sampling, not process exit when an output pipe is blocked.
+`--seconds` accepts 1–300, default 15. INT/TERM/HUP attempt to stop sampling and output partial results; `end_reason` and `elapsed_ms` record the reason and duration. The deadline limits sampling, not process exit when output is blocked.
 
-Both capture and `--disable` release their map/program FDs after constructing the owned report and before serializing it to stdout. Output backpressure therefore cannot retain a retired engine's production maps; handled cleanup failures are also returned after owners close, and fallback Drop cleanup performs no stdio.
+The tool releases map/program FDs before writing JSON or reporting cleanup errors. Blocked output cannot keep an old engine's production maps alive.
 
-SIGKILL, system failure or a failed disable update can leave the filter enabled. After confirming the original collector stopped, recover with this standalone command, adding a custom pin root if applicable:
+SIGKILL, system failure or a failed disable write may leave sampling enabled. Once the old collector has stopped, run this command (add your custom pin root if used):
 
 ```sh
 ./honk-tool bpf wan-diag --interface sipa_eth0 --disable
 ```
 
-It is idempotent when already disabled and still checks map/interface ownership. If identity validation fails, do not bypass it with a forced map write: gracefully stop and restart the matching diagnostic engine using the original startup procedure. Never substitute clearing bpffs.
+Safe to repeat when already disabled. If the map/interface check fails, do not force a map write: stop and restart the matching diagnostic engine. Do not clear bpffs.
 
 ## JSON interpretation
 
-Top-level fields identify the interface/ifindex, program/link/maps, selected source port, requested duration, elapsed time, end reason, and `before` / `after`. The two arrays contain nonzero per-reason/per-CPU-slot records only.
+Top-level fields record the interface, program/link/map IDs, source port, duration and end reason. `before` / `after` contain only nonzero reason/CPU-slot rows.
 
-Each row retains cumulative `packets`, monotonic `timestamp_ns`, `socket_cookie`, egress/ingress ifindices, the actual `mark`, host-order EtherType `protocol`, packet length, signed `parse_result` and `first_byte`, `link_h_len`, and a readable `tuple`. `tuple=null` means no tuple attribution; `first_byte=-1` means reading the first header byte failed. IPv4-mapped addresses render as ordinary IPv4; ports are host-order.
+Rows contain cumulative `packets`, monotonic `timestamp_ns`, `socket_cookie`, egress/ingress ifindices, `mark`, EtherType `protocol`, packet length, `parse_result`, `first_byte`, `link_h_len` and `tuple`. `tuple=null` means no tuple; `first_byte=-1` means a failed read. Both result fields are signed; protocol and ports use host byte order, and IPv4-mapped addresses render as IPv4.
 
 | reason_index | reason | Existing path |
 | --- | --- | --- |
@@ -82,15 +82,15 @@ Each row retains cumulative `packets`, monotonic `timestamp_ns`, `socket_cookie`
 
 Limits:
 
-- **Reasons 0/1/2 are interface-wide unparsed evidence, not source-port-filtered evidence attributable to curl.**
-- Counts are cumulative packets; each reason/CPU retains only its latest sample. Historical rows can remain unchanged in a later window. Compare before/after rather than treating an old sample as the new request.
-- `cpu_slot` is a position in the possible-CPU buffer, not necessarily a sparse system's OS CPU ID. Counts may be summed, but sample fields must not be combined across slots.
-- `coherent_snapshot=false`: disabling is not a grace barrier for admitted writers. A final write can race the dump; samples can be overwritten.
-- Matching source ports may include LAN traffic. Match the full tuple, family and window to curl's actual output. Cookie is not host-origin authority; reading it may lazily assign one.
-- Only a `forwarded_pass` sample positively matched to that curl confirms this guard's bypass. `dispatch` requires following the handler. Empty or unmatched evidence is inconclusive.
+- **Reasons 0/1/2 cover unparsed packets across the interface. They are not source-port-filtered and cannot be attributed to curl.**
+- Counts accumulate; each reason/CPU retains one last sample. Compare before/after: an unchanged old sample is not the new request.
+- `cpu_slot` indexes the possible-CPU buffer, not necessarily OS CPU IDs. Sum counts if needed; never combine sample fields across slots.
+- `coherent_snapshot=false`: disabling does not wait for in-flight writers. Writes or sample replacement can still race the read.
+- The source port may also match LAN traffic. Check the full tuple, family and window against curl. A cookie does not prove host origin; reading it may assign one.
+- Only `forwarded_pass` matched to that curl confirms bypass at the ingress_ifindex check. `dispatch` means the TCP/UDP handler was entered, not proxy success. Empty or unmatched samples cannot identify the cause.
 
-Retain and sanitize both JSON files, both curl outputs, both binary versions, package checksums, startup/binding logs and interface information. JSON includes IP addresses, not application payload, configuration or credentials.
+Return both JSON files, both curl outputs, both programs' `--version`, package checksums, startup/binding logs and interface details. JSON contains IPs, not application data, configuration or credentials; sanitize before sharing.
 
 ## Finish
 
-Export evidence and confirm sampling is disabled; gracefully stop the diagnostic engine, restore the original executable and restart the original service. Normal shutdown only attempts to remove owned pins; stale pins do not prove an active hook. Restart creates fresh diagnostic maps, while SIGHUP does not clear them. Never compare captures across restarts as a single counter interval. Preserve persistent allocator pins.
+Export results and confirm sampling is off. Stop the diagnostic engine, restore the original executable and restart the service. Shutdown only attempts to remove owned pins; stale pins do not prove an active hook. Restart creates fresh diagnostic maps; SIGHUP does not clear them. Do not compare counters across restarts. Keep both persistent allocator pins named above.

@@ -106,7 +106,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 - `lan_ingress_l2/l3` — LAN 分类、路由和重定向，以及有序策略下的 DNS 所有权、`CLASSIFIED_MARK` 去重；NFQUEUE 已启用且 ready 时，仅将有歧义的非 DNS UDP 决策以唯一 token 暂存为 Pending；已启用但未 ready 时 fail-closed（`src/ingress.rs`）。
 - `wan_ingress_l2/l3` — 反向 conntrack 刷新，LAN/WAN 共用接口上跳过。
 - `lan_egress_l2/l3`、`wan_egress_l2/l3`（`src/egress.rs`）— 反向 conn state；本机流量路由（经实际 skb socket 的 `SOCKET_IDENTITY` 匹配 pname、控制面旁路、`OUTBOUND_CONNECTIVITY_MAP` 活性及重定向控制面）。存活的非 DNS WAN UDP 条目只查询缓存路由；未命中时求值一次路由，再发布完整 conntrack 元数据。
-- `src/egress/diagnostic.rs` — 本诊断分支默认关闭的 WAN 入口/退出观测；布局与原因标签由 `honk-ebpf-common::wan_diagnostic` 统一持有。只记录既有决定，不选择 verdict；关闭采样时仍有 filter 查找开销。
+- `src/egress/diagnostic.rs` — 本诊断分支的 WAN 入口/退出采样，默认关闭。布局和原因标签在 `honk-ebpf-common::wan_diagnostic` 中定义。它只记录已有决定，不改变放行或丢弃结果；关闭采样后仍会查询 filter。
 - `dae0_ingress` — 重写回复 MAC，并重定向到原 LAN 接口。未知对端的 UDP 回复使用客户端帧信息，不归属任何出站；honk 自身链路源地址从不使用该回退。
 - LAN 与 WAN egress 仅抑制本机发起的 ICMPv6 Redirect，使用扩展头遍历后的 ICMPv6 header；转发的 Redirect 与其他 ICMPv6 仍放行。LAN/WAN 共用接口不挂载 `lan_egress`，该不变式在该接口上由 WAN hook 承担。`honk-core/tests/ebpf_datapath_test.rs` 通过 `BPF_PROG_TEST_RUN` 检查 L2、通过隔离 TUN 接口检查 L3，并覆盖精确 tuple RX 计数与 cached-route 策略。
 - `dae0peer_ingress` — 恢复 UDP53 provenance 与 TCP SYN incarnation；按重定向点的 `cb[4]` 标记 `0x100 | index`，用 `bpf_sk_assign` 分配 UDP，不解析报文字节。缺少标记时 UDP 留给 `sk_lookup`；TCP SYN 保留其 `cb[3]`/`cb[4]` incarnation 载体及原生 established/TIME_WAIT 处理。
@@ -114,7 +114,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 ## Map 清单
 
-`crates/honk-ebpf/src/maps.rs` 持有主要声明；下表的诊断专用 map 位于 `src/egress/diagnostic.rs`。
+主要 map 在 `crates/honk-ebpf/src/maps.rs` 中声明，下表的诊断专用 map 在 `src/egress/diagnostic.rs` 中声明。
 
 | Map | 形状与职责 |
 | --- | --- |
@@ -130,8 +130,8 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `LISTEN_SOCKET_MAP` | 16 槽 `SockMap`；key `0..=9` 保存两个 TCP 和八个 UDP 透明监听器。 |
 | `DATAPATH_STATE_MAP` | 单槽准入数组。零值不改动地放行流量；非零值启用分类与重定向。 |
 | `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
-| `WAN_DIAG_CFG` | 诊断专用单项数组，值为 8 字节的接口/源端口 filter。零 filter 关闭采样；不持有路由或 conntrack 决策权。 |
-| `WAN_DIAG` | 诊断专用的 13 项 per-CPU 数组，每项为 104 字节的累计计数与最后样本。加上 filter，值存储为 `8 + 1352 × possible_CPU_count` 字节，不含 map 开销；不按流增长，也不保存逐包历史。不保证一致快照，未解析原因仍只属于接口级证据。 |
+| `WAN_DIAG_CFG` | 诊断专用单项数组，值为 8 字节的接口/源端口 filter。零 filter 关闭采样，不影响路由或 conntrack。 |
+| `WAN_DIAG` | 诊断专用的 13 项 per-CPU 数组，每个 104 字节的值保存累计计数和最新样本。加上 filter，值共占 `8 + 1352 × possible_CPU_count` 字节，不含 map 自身开销。存储不按流增长，不保留逐包历史。读取不是原子快照，未解析原因覆盖整个接口。 |
 | `SOCKET_IDENTITY` | 不克隆的 `SK_STORAGE`，保存 socket 首次捕获的 PID/可执行文件 basename。存储跟随实际 socket 生命周期，不受固定 hash 项数或用户态过期清理约束。WAN TC 只查询；cgroup create/connect/sendmsg 同步捕获缺失的身份。 |
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 插入/内核删除计数，结合实际用户态删除计数估算占用。此路径不再由内核删除 tuple，故内核删除计数保持零。 |
 | `AUX_OCCUPANCY` | 两槽 per-CPU redirect/handoff 插入计数器；用户态减去实际删除数。 |

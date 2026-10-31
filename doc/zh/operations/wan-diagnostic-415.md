@@ -1,16 +1,16 @@
-# Issue #415：使用 honk-tool 采集 WAN 诊断
+# Issue #415：用 honk-tool 采集 WAN 诊断信息
 
-本分支只增加观测，不修改路由、mark、conntrack 或本机/转发判据。诊断包同时提供匹配版本的静态 `honk-core`、`honk-tool` 和 BPF 对象；**不需要 bpftool、tracefs 或设备端编译器**。
+本构建用于排查 issue #415，只增加采样，不改变转发行为，**不是 SIPA 问题的修复版**。该设备请用 aarch64 musl 包：内含同版本的静态 `honk-core` 和 `honk-tool`，BPF 已嵌入 core。设备上不需要 bpftool、tracefs 或编译器。
 
-需要 root/BPF 权限、Linux TCX、可读的 `/sys/devices/system/cpu/possible`，以及带本次诊断 map 的引擎。下面的 curl 只负责触发原问题，不是采集器依赖。不要把新版 tool/object 与旧版引擎混用。
+需要 root/BPF 权限、Linux TCX 和可读的 `/sys/devices/system/cpu/possible`。core/tool 必须来自同一诊断包。curl 只用来发起测试请求。
 
-## 启动与边界
+## 启动前
 
-保留原二进制和配置，正常停止原服务，确认没有残留 honk 进程，再用包内 `honk-core --config /etc/honk/config.dae` 启动。不要覆盖运行中的二进制或启动第二份引擎；保留原数据目录、`UDP_DECISION_SEQUENCE`、`ROUTING_GENERATION_SEQUENCE`，不要清空 bpffs。
+备份原可执行文件和配置，正常停止原服务，确认没有 honk 进程，再运行包内的 `honk-core --config /etc/honk/config.dae`。不要覆盖运行中的文件或启动第二份引擎。保留原数据目录及 `UDP_DECISION_SEQUENCE`、`ROUTING_GENERATION_SEQUENCE`，不要清空 bpffs。
 
-`honk-tool bpf wan-diag` 复用已有原始 `bpf(2)` 设施，不加载程序、不挂载 hook。它只写 `WAN_DIAG_CFG` 开关，不写数据面状态或清零计数。工具自动校验 map 实际名称、类型、尺寸、条目数，以及它们确实由指定接口同一个 TCX egress 程序使用；捕获开始和结束检查 program/link 身份，持有旧 map FD，绝不把清理写入重启后的替代 map。边界检查不证明整个区间没有发生中间更新；探测期间不要重载或改配置。
+工具不加载程序或挂载 hook，只写诊断开关 `WAN_DIAG_CFG`，不改数据面状态或清零计数。它检查 map 布局及其与接口上 TCX 程序的对应关系，清理只操作原先打开的 map，不会写入重启后的替代 map。program/link 检查只在采集前后进行；采集期间不要重载或改配置。
 
-采样默认关闭。**同一引擎一次只运行一个采集器，关闭命令也不能与采集并发使用**；启用检查不是原子占有协议。已有非零 filter 会被拒绝而不改写，需先结束原采集器或明确恢复。
+采样默认关闭。**一次只运行一个采集器，不要同时执行恢复命令。** 启动检查不是并发锁；遇到已有非零 filter 会拒绝启动，需先停止原采集器或恢复。
 
 ## IPv4：两个终端
 
@@ -38,31 +38,31 @@ umask 077
 ) > wan4-curl.txt 2>&1
 ```
 
-工具到时自动关闭采样，stdout 输出一份包含 `before` / `after` 的 JSON；不持续打印逐包日志。确认终端 A 正常退出，文件可解析，不能把失败产生的空文件当作零流量。
+到时自动关闭采样，stdout 输出一份含 `before` / `after` 的 JSON，不逐包打印。确认命令成功退出且 JSON 可解析；失败产生的空文件不代表没有流量。
 
-`-q` 必须是 curl 的第一个参数，避免 `.curlrc`；`--noproxy '*'` 排除代理环境变量。不绑定 WAN 设备，以免改变原问题的 socket 语义。可用已知目标地址加 `--resolve api.ip.sb:443:ADDRESS`（IPv6 地址加方括号）固定目标，保留 TLS 主机名校验，不使用 `-k`。DNS 失败或未在窗口内发出请求都不能证明 TC 未运行。
+保持 `-q` 为 curl 的首个参数，忽略 `.curlrc`；`--noproxy '*'` 排除代理环境变量。不要绑定 WAN 设备，以免改变 socket 行为。已知目标 IP 时可加 `--resolve api.ip.sb:443:ADDRESS`（IPv6 加方括号），不要用 `-k` 跳过 TLS 校验。DNS 失败或错过采集窗口，不能说明 TC 未运行。
 
-IPv6 顺序再做一轮：工具和 curl 的源端口都改为 **41501**，curl 改 `-6`，输出改为 `wan6.json` / `wan6-curl.txt`。不要并发两轮；端口占用时换新端口，两处保持一致，避免 LAN 客户端复用相同端口。
+IPv4 结束后再测 IPv6：两处端口都改为 **41501**，curl 改 `-6`，输出改为 `wan6.json` / `wan6-curl.txt`。端口被占用时同步换一个，也要避免 LAN 流量使用同一端口。
 
 ## 中断与恢复
 
-`--seconds` 接受 1–300，默认 15。INT/TERM/HUP 会尝试先关闭，再输出部分采集结果；JSON 的 `end_reason` 和 `elapsed_ms` 区分到时与信号中断。时限约束采样启用时间，不保证阻塞的输出管道能在同一期限内退出。
+`--seconds` 接受 1–300，默认 15。INT/TERM/HUP 会尝试关闭采样后输出已有结果；`end_reason` 和 `elapsed_ms` 记录结束原因与耗时。时限限制采样，不保证输出管道阻塞时进程能及时退出。
 
-采集与 `--disable` 都在生成已拥有的报告后、向 stdout 序列化和写入前释放 map/program FD。输出背压因此不会继续保留旧引擎的生产 map；正常错误路径中的关闭失败也在 owner 释放后返回，Drop 的尽力清理不执行标准流 I/O。
+写出 JSON 或报告清理错误前，工具会释放 map/program FD。输出阻塞不会继续保留旧引擎的生产 map。
 
-SIGKILL、系统故障或关闭写入失败可能留下开启的 filter。确认原采集器已停止后，用独立命令恢复（自定义 pin root 时同样添加）：
+SIGKILL、系统故障或关闭写入失败可能留下开启的采样。确认原采集器已停止后执行（自定义 pin root 时加对应参数）：
 
 ```sh
 ./honk-tool bpf wan-diag --interface sipa_eth0 --disable
 ```
 
-已经关闭时可重复执行。该命令仍核对 map/接口归属；归属检查失败时不要绕过检查强写 map，按原启动流程正常停止并重启匹配的诊断引擎。不得用清空 bpffs 代替恢复。
+已关闭时可重复执行。若 map/接口检查失败，不要强写 map；正常停止并重启同版本的诊断引擎，不要清空 bpffs。
 
-## JSON 解释
+## 读取 JSON
 
-顶层包含接口/ifindex、program/link/map ID、选定源端口、请求时长、实际耗时、结束原因和 `before` / `after`。两个数组只输出非零计数的 reason/cpu_slot 行。
+顶层记录接口、program/link/map ID、源端口、时长和结束原因。`before` / `after` 只列出计数非零的 reason/CPU-slot 行。
 
-每行保留累计 `packets`、单调时钟 `timestamp_ns`、`socket_cookie`、出口/入口 ifindex、真实 `mark`、主机序 EtherType `protocol`、包长、带符号 `parse_result` 和 `first_byte`、`link_h_len`，以及可读五元组 `tuple`。`tuple=null` 表示不能归属；`first_byte=-1` 是读取失败。IPv4-mapped 地址显示为普通 IPv4；端口为主机序。
+每行包含累计包数 `packets`、单调时间 `timestamp_ns`、`socket_cookie`、出入口 ifindex、`mark`、EtherType `protocol`、包长、`parse_result`、`first_byte`、`link_h_len` 和五元组 `tuple`。`tuple=null` 表示没有五元组；`first_byte=-1` 表示读取失败。这两个结果字段有符号；protocol 和端口用主机字节序，IPv4-mapped 地址显示为 IPv4。
 
 | reason_index | reason | 现有路径 |
 | --- | --- | --- |
@@ -72,7 +72,7 @@ SIGKILL、系统故障或关闭写入失败可能留下开启的 filter。确认
 | 3 | queue_carrier_drop | NFQUEUE DNS carrier 丢弃 |
 | 4 | vlan_pass | 交给后续 VLAN 设备 |
 | 5 | not_ready_pass | datapath 未 ready，继续 |
-| 6 | special_pass | 广播/组播/特殊地址继续 |
+| 6 | special_pass | 广播/组播/特殊目的地址 |
 | 7 | local_destination_pass | 目的地址匹配 PARAM.local_ip |
 | 8 | forwarded_pass | ingress_ifindex 非零，按转发包继续 |
 | 9 | marked_pass | 精确 bypass/classified mark，PASS |
@@ -80,17 +80,17 @@ SIGKILL、系统故障或关闭写入失败可能留下开启的 filter。确认
 | 11 | tcp_acquire_drop | TCP publication acquire 拒绝 |
 | 12 | dispatch | 进入 TCP/UDP handler，不是已代理成功 |
 
-关键限制：
+注意：
 
-- **0/1/2 是接口级未解析证据，不受源端口筛选，不能直接归属给 curl。**
-- 计数是累计包数，每种原因/CPU 只有最后一个样本，历史样本可以原样出现在新窗口。对比 before/after，不把旧样本当作本次请求。
-- `cpu_slot` 是 possible-CPU 缓冲区的位置，不一定是稀疏系统的 CPU 编号。可以汇总计数，不能跨 slot 拼接样本字段。
-- `coherent_snapshot=false`：关闭不是在途 writer 的 grace barrier；转储仍可能与最后一次写入竞争，且样本可能被覆盖。
-- 源端口匹配也可能包含 LAN 流量。必须与 curl 实测的完整五元组、IP family 和窗口匹配。cookie 不是本机归属判据；读取可能首次分配 cookie。
-- 只有匹配该 curl 的 `forwarded_pass` 样本才能确认 ifindex guard 放行。`dispatch` 需要继续查 handler；空或不匹配的样本均不能下结论。
+- **原因 0/1/2 记录整个接口上未解析的包，不受源端口筛选，不能归到 curl 请求上。**
+- 计数累加，每种原因/CPU 只保留最后一个样本。比较 before/after；未变的旧样本不是本次请求。
+- `cpu_slot` 是 possible-CPU 缓冲区的位置，不一定是 CPU 编号。计数可汇总，样本字段不能跨 slot 拼接。
+- `coherent_snapshot=false`：关闭采样不等待在途写入，读取时仍可能发生写入或样本覆盖。
+- 相同源端口也可能来自 LAN。按 curl 输出核对完整五元组、协议族和时间窗口；cookie 不能证明本机来源，读取时也可能首次分配它。
+- 只有匹配该次 curl 的 `forwarded_pass` 才能确认 ingress_ifindex 判据放行。`dispatch` 只表示进入 TCP/UDP handler，不表示代理成功；空或不匹配的样本无法定因。
 
-请保留并脱敏共享：两个 JSON、两个 curl 文件、两个二进制的 `--version`、包校验和、启动/绑定日志和接口信息。JSON 含 IP 地址，不含应用 payload、配置或认证凭据。
+回传两个 JSON、两份 curl 输出、两个程序的 `--version`、包校验和、启动/绑定日志及接口信息。JSON 含 IP，不含应用数据、配置或凭据；分享前请脱敏。
 
-## 结束
+## 恢复原服务
 
-导出证据、确认采样关闭，再正常停止诊断引擎，恢复原二进制并启动原服务。正常关闭只尝试删除自有 pin，残留 pin 不证明 hook 活跃。重启新建诊断 map，SIGHUP 不清空它们；不要跨重启比较同一计数窗口。保留持久化 allocator pin。
+导出结果、确认采样关闭，正常停止诊断引擎，再换回原可执行文件并启动服务。关闭时只尝试删除自有 pin，残留 pin 不代表 hook 仍活跃。重启会新建诊断 map，SIGHUP 不会清空它们；不要跨重启比较计数。保留上述两个持久化分配器 pin。
