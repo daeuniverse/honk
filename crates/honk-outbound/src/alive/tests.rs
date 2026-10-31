@@ -300,6 +300,70 @@ async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
     assert!(set.is_alive_for(node_id, ProbeDomain::DnsUdp, IpVersion::V6));
 }
 
+#[tokio::test]
+async fn test_periodic_cycle_tcp_cooldown_keeps_due_udp_probe() {
+    let set = Arc::new(AliveDialerSet::new());
+    let node_id = id(4);
+    set.register_node(node_id, "n4".into(), "127.0.0.1:1".into());
+    set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(5))));
+    set.states.write().get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, IpVersion::V4)]
+        .cooldown_until = Instant::now() + Duration::from_secs(300);
+    assert!(set.should_probe(node_id, ProbeDomain::DataUdp, IpVersion::V4));
+
+    set.run_health_check_cycle_concurrent(Duration::from_secs(1), 1)
+        .await;
+
+    assert!(
+        set.get_probe_history(node_id, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
+    assert!(
+        !set.get_probe_history(node_id, ProbeDomain::DataUdp, IpVersion::V4)
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_emergency_probe_keeps_udp_cooldown() {
+    let set = Arc::new(AliveDialerSet::new());
+    let node_id = id(5);
+    set.register_node(node_id, "n5".into(), "127.0.0.1:1".into());
+    let udp_cooldown = Instant::now() + Duration::from_secs(300);
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        for ipver in [IpVersion::V4, IpVersion::V6] {
+            set.states.write().get_mut(&node_id).unwrap()[alive_index(domain, ipver)]
+                .cooldown_until = udp_cooldown;
+        }
+    }
+    let owner = set.spawn_health_check_loop_concurrent(
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+        1,
+    );
+
+    set.trigger_probe(node_id);
+    assert!(set.trigger_pending.lock().contains(&node_id));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while set.trigger_pending.lock().contains(&node_id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("emergency probe finishes");
+    set.shutdown_health_checks().await.unwrap();
+    owner.await.unwrap();
+
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        for ipver in [IpVersion::V4, IpVersion::V6] {
+            assert_eq!(
+                set.read_state(node_id, alive_index(domain, ipver))
+                    .cooldown_until,
+                udp_cooldown
+            );
+        }
+    }
+}
+
 #[test]
 fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
     // Reload takes urltest_group_timeout first and node_urltest_groups last.
