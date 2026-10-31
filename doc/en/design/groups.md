@@ -225,6 +225,8 @@ Go dae's TCP=1 let transient probe loss eject URLTest incumbents before selectio
 
 Probe and traffic failures have separate counters. Probe failures apply exponential cooldown from 5 seconds to 300 seconds. A separate `min(5s, check_interval)` recovery scheduler considers only dead domain/family states whose cooldown is due; deep-backoff states continue at the 300-second cadence rather than stopping permanently.
 
+Periodic checks gate TCP on `Tcp`/IPv4 and the shared UDP probe on `DataUdp`/IPv4; TCP cooldown does not suppress a due UDP probe. Nodes with both gates cooling at dispatch do not create a worker and are reconsidered by later cycles. TCP-only emergency probes clear only the node's TCP IPv4/IPv6 cooldowns, preserving both UDP domains' cooldowns.
+
 A dead state normally needs two consecutive probe successes to recover. `notify_network_change` clears stale cooldowns after a relevant link, address, or route change, primes dead states, and triggers probes so one fresh success can verify recovery. Newly registered nodes receive a 60-second grace period during which non-forced failures are recorded but do not count toward death. Probe history retains 100 entries per node, domain, and address family.
 
 | Probe path | Behavior |

@@ -352,11 +352,10 @@ impl AliveDialerSet {
 
     /// Run health check cycle with concurrent probing.
     ///
-    /// Uses a `JoinSet` with a semaphore to limit concurrency (default 10,
-    /// matching sing-box). Each protocol domain in backoff is skipped on its
-    /// own; the recovery runner revisits due dead states between full cycles.
-    /// Emergency probes triggered via `trigger_probe` use their own bounded
-    /// worker set.
+    /// A semaphore limits concurrent probing (default 10, matching sing-box).
+    /// TCP backoff does not gate the shared UDP probe; nodes with neither path
+    /// due at dispatch are skipped. Recovery revisits due dead states between
+    /// full cycles; emergency TCP probes use their own bounded worker set.
     pub async fn run_health_check_cycle_concurrent(
         self: &Arc<Self>,
         timeout: Duration,
@@ -404,10 +403,8 @@ impl AliveDialerSet {
                 if tcp_due {
                     this.probe_node(id, timeout).await;
                 }
-                // UDP probe (Go: UdpCheck), gated on the UDP domain's own
-                // backoff rather than TCP's, so a chronically broken UDP path
-                // backs off exponentially (and eventually stops) instead of
-                // re-probing every cycle. No-op without an installed UdpProber.
+                // Keep UDP backoff independent of TCP, including after waiting
+                // for the TCP probe. Deep backoff retains its capped cadence.
                 if this.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
                     this.probe_node_udp_registered(id, timeout, Some(registration))
                         .await;
