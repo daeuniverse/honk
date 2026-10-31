@@ -153,6 +153,7 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
         crate::mode::ModeState::new("Rule", "Proxy"),
     )));
     control.start_datapath_flags_coordinator().unwrap();
+    let downgrades = control.startup_downgrades();
 
     let mut enabled = true;
     control
@@ -171,6 +172,31 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     assert_eq!(
         published & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY),
         0
+    );
+
+    let current = control.config_handle().read().await.clone();
+    let mut candidate = current.as_ref().clone();
+    candidate.global.nfqueue_enable = true;
+    candidate.global.check_tolerance_ms += 1;
+    assert!(
+        super::reload::restart_required_fields(
+            &current,
+            &candidate,
+            &control.log_files,
+            &downgrades,
+        )
+        .is_empty()
+    );
+    assert!(
+        control
+            .reload_runtime_config(candidate.clone(), Default::default())
+            .await
+    );
+    let active = control.config_handle().read().await.clone();
+    assert!(!active.global.nfqueue_enable);
+    assert_eq!(
+        active.global.check_tolerance_ms,
+        candidate.global.check_tolerance_ms
     );
 }
 

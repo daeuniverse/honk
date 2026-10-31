@@ -251,6 +251,11 @@ fn nfqueue_disabled_at_startup_is_not_a_restart_only_change() {
 
     downgrades.record_nfqueue_unavailable();
     assert!(changed(&current, &candidate, &downgrades).is_empty());
+    candidate.global.log_level = "debug".into();
+    assert_eq!(
+        changed(&current, &candidate, &downgrades),
+        ["global.log_level"]
+    );
 }
 
 #[tokio::test]
