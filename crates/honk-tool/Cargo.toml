@@ -21,6 +21,7 @@ honk-core = { path = "../honk-core", default-features = false }
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true

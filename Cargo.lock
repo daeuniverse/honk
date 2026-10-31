@@ -1735,6 +1735,7 @@ dependencies = [
  "honk-ebpf-common",
  "honk-outbound",
  "libc",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing-subscriber",

@@ -129,7 +129,7 @@ The current `just build-musl` and `just deploy-vyos` recipes build and deploy on
 | Family | Purpose |
 | --- | --- |
 | `sub` | Fetch or parse nodes and probe TCP-family, URLTest, and supported UDP paths. |
-| `bpf` | Read and decode maps already pinned by the running engine. |
+| `bpf` | Inspect pinned maps and collect opt-in WAN diagnostics. |
 | `diagnose` | Run a read-only engine, network-plumbing, map, and API health check. |
 | `geosite` | List, inspect, and reverse-search `geosite.dat`. |
 | `geoip` | List, inspect, and longest-prefix search `geoip.dat`. |
@@ -232,6 +232,8 @@ Probe failure codes are `resolve`, `timeout`, `exchange`, `handler`, and `admiss
 honk-tool bpf show <conn-state|redirect-track|domain-routing|routing-handoff>
                    [--ip IP] [--limit N] [--pin-root PATH]
 honk-tool bpf stats [--pin-root PATH]
+honk-tool bpf wan-diag --interface DEV --source-port PORT [--seconds SECS] [--pin-root PATH]
+honk-tool bpf wan-diag --interface DEV --disable [--pin-root PATH]
 ```
 
 | Command / option | Default | Meaning |
@@ -249,7 +251,7 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | Learned IP and active-policy domain-predicate bitmap indices, from DNS or sniffed evidence; known-zero entries remain visible. |
 | `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
 
-The commands read pins through raw `bpf(2)` without loading programs or attaching hooks; reads normally require root or suitable BPF capabilities. `stats` prints each counter below on its own labeled line, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counts. `BPF_STATS_MAP` must have nine slots: mixed tool/engine versions fail with `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` (reversed for an older tool), rather than mislabelling counters. Upgrade the tool with the engine/object.
+`show` and `stats` read pins through raw `bpf(2)` without loading programs or attaching hooks; reads normally require root or suitable BPF capabilities. `stats` prints each counter below on its own labeled line, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counts. `BPF_STATS_MAP` must have nine slots: mixed tool/engine versions fail with `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` (reversed for an older tool), rather than mislabelling counters. Upgrade the tool with the engine/object.
 
 | Key | Canonical label | Counts |
 | --- | --- | --- |
@@ -266,6 +268,13 @@ The commands read pins through raw `bpf(2)` without loading programs or attachin
 `routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries; upgrade the tool with the engine/object.
 
 `stats` requires a readable, genuine `/sys/devices/system/cpu/possible` export. It sizes per-CPU buffers from that mask's population, never the present/online CPU count. `CONN_STATE_OCCUPANCY` and `OUTBOUND_STATS` must be per-CPU arrays with 4-byte keys and 8-byte and 32-byte values, respectively. An unreadable or invalid CPU list, or incompatible map metadata, fails before per-CPU lookup; there is no guessed CPU-count fallback.
+
+#### WAN diagnostic capture
+
+The issue #415 diagnostic build adds `wan-diag`, without a bpftool dependency. It validates the diagnostic map names/layouts and their shared TCX egress program/link ownership before enabling the selected interface and source port. Ports are `1..65535`; `--seconds` is `1..300`, default `15`. It disables sampling before emitting JSON `before`/`after` snapshots, including on INT/TERM/HUP. `--disable` is the mutually exclusive, idempotent recovery mode; it cannot be combined with an explicit `--seconds`.
+
+This command writes only `WAN_DIAG_CFG`, not routing or connection state, and never loads or attaches programs. Run one collector at a time and freeze engine configuration. Counts are cumulative packets; rows are latest per-reason/per-CPU-slot samples, not coherent history. Unparsed reasons are interface-wide and cannot be attributed to the selected port. See the [collection and recovery runbook](../operations/wan-diagnostic-415.md) for actual-probe matching and interruption limits.
+
 
 ### `diagnose`
 

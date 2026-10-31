@@ -6,58 +6,15 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use aya_ebpf_bindings::helpers::{bpf_get_socket_cookie, bpf_ktime_get_ns};
+use honk_ebpf_common::wan_diagnostic::{Filter, Reason, Sample};
 
 use crate::transport::ParsedPacket;
-
-#[repr(C)]
-struct Filter {
-    ifindex: u32,
-    source_port: u32,
-}
 
 #[btf_map]
 static WAN_DIAG_CFG: Array<Filter, 1> = Array::new();
 
-#[repr(C)]
-struct Sample {
-    packets: u64,
-    timestamp_ns: u64,
-    socket_cookie: u64,
-    ifindex: u32,
-    ingress_ifindex: u32,
-    mark: u32,
-    protocol: u32,
-    length: u32,
-    parse_result: i32,
-    link_h_len: u32,
-    tuple_valid: u32,
-    l4proto: u32,
-    source_port: u32,
-    destination_port: u32,
-    first_byte: i32,
-    source: [u8; 16],
-    destination: [u8; 16],
-}
-
 #[btf_map]
-static WAN_DIAG: PerCpuArray<Sample, 13> = PerCpuArray::new();
-
-#[repr(u32)]
-pub(super) enum Reason {
-    ScratchUnavailable,
-    ParsePass,
-    ParseDrop,
-    QueueCarrierDrop,
-    VlanPass,
-    NotReadyPass,
-    SpecialPass,
-    LocalDestinationPass,
-    ForwardedPass,
-    MarkedPass,
-    TupleFenceDrop,
-    TcpAcquireDrop,
-    Dispatch,
-}
+static WAN_DIAG: PerCpuArray<Sample, { Reason::ALL.len() }> = PerCpuArray::new();
 
 #[inline(never)]
 pub(super) fn record(

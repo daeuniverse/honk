@@ -3,7 +3,7 @@
 //! honk-tool — CLI toolbox for honk diagnostics.
 //!
 //! Currently implemented: `sub` (subscription availability check),
-//! `bpf` (pinned-map quick reads), `diagnose` (one-shot health check),
+//! `bpf` (map inspection and WAN diagnostics), `diagnose` (one-shot health check),
 //! `geosite` / `geoip` (dat file content search).
 
 mod bpf;
@@ -30,7 +30,7 @@ enum Command {
     /// Fetch a subscription and probe every node: server families, per-family
     /// proxy connectivity, and proxied latency.
     Sub(sub::SubArgs),
-    /// Quick reads of the running engine's pinned eBPF maps.
+    /// Inspect engine maps and collect WAN diagnostics.
     Bpf(bpf::BpfArgs),
     /// One-shot health check of a running honk engine.
     Diagnose(diagnose::DiagnoseArgs),

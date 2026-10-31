@@ -129,7 +129,7 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool root@GATEWAY:/tmp/
 | 命令族 | 用途 |
 | --- | --- |
 | `sub` | 拉取或解析节点，并探测 TCP 地址族、URLTest 与受支持的 UDP 路径。 |
-| `bpf` | 读取并解码运行中引擎已经 pin 的 map。 |
+| `bpf` | 检查 pin map，并采集显式启用的 WAN 诊断。 |
 | `diagnose` | 执行只读的引擎、网络设施、map 与 API 健康检查。 |
 | `geosite` | 列出、检查和反向搜索 `geosite.dat`。 |
 | `geoip` | 列出、检查和最长前缀搜索 `geoip.dat`。 |
@@ -234,6 +234,8 @@ VLESS 承载连接和会话按运行时与规范化的线协议形态复用。�
 honk-tool bpf show <conn-state|redirect-track|domain-routing|routing-handoff>
                    [--ip IP] [--limit N] [--pin-root PATH]
 honk-tool bpf stats [--pin-root PATH]
+honk-tool bpf wan-diag --interface DEV --source-port PORT [--seconds SECS] [--pin-root PATH]
+honk-tool bpf wan-diag --interface DEV --disable [--pin-root PATH]
 ```
 
 | 命令 / 参数 | 默认值 | 含义 |
@@ -251,7 +253,7 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | 从 DNS 或嗅探结果学习的 IP，以及活动 policy 的域名谓词位图索引；已知但全零的条目仍会显示。 |
 | `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
 
-命令通过原始 `bpf(2)` 读取 pin，不加载程序或挂载 hook；通常需要 root 或合适的 BPF capability。`stats` 为下列计数器逐行输出规范标签与计数，并打印 `CONN_STATE_OCCUPANCY` 插入/删除水位计及非零的每出站包/字节计数。`BPF_STATS_MAP` 必须有九个槽位：工具/引擎版本不匹配时以 `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` 失败（旧版工具则相反），不错误标注计数器。请将工具与引擎/对象一起升级。
+`show` 和 `stats` 通过原始 `bpf(2)` 读取 pin，不加载程序或挂载 hook；通常需要 root 或合适的 BPF capability。`stats` 为下列计数器逐行输出规范标签与计数，并打印 `CONN_STATE_OCCUPANCY` 插入/删除水位计及非零的每出站包/字节计数。`BPF_STATS_MAP` 必须有九个槽位：工具/引擎版本不匹配时以 `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` 失败（旧版工具则相反），不错误标注计数器。请将工具与引擎/对象一起升级。
 
 | Key | 规范标签 | 计数对象 |
 | --- | --- | --- |
@@ -268,6 +270,13 @@ honk-tool bpf stats [--pin-root PATH]
 `routing-handoff` 在读取前检查[handoff ABI](../design/datapath.md#map-清单)。
 
 `stats` 要求 `/sys/devices/system/cpu/possible` 可读且为内核的真实导出文件。每 CPU 缓冲区按该掩码中的 CPU 数量分配，不采用 present 或 online CPU 数量。`CONN_STATE_OCCUPANCY` 和 `OUTBOUND_STATS` 必须为每 CPU 数组，键均为 4 字节，值分别为 8 字节和 32 字节。CPU 列表不可读、格式无效或 map 元数据不兼容时，命令在每 CPU 查找前报错，不回退到猜测的 CPU 数量。
+
+#### WAN 诊断采集
+
+Issue #415 诊断构建增加 `wan-diag`，不依赖 bpftool。启用指定接口和源端口前，校验诊断 map 名称、布局及其共同的 TCX egress program/link 归属。端口范围为 `1..65535`；`--seconds` 范围为 `1..300`，默认 `15`。工具先关闭采样，再输出包含 `before` / `after` 的 JSON；INT/TERM/HUP 也走关闭路径。`--disable` 是互斥且幂等的恢复模式，不能与显式 `--seconds` 同用。
+
+命令只写 `WAN_DIAG_CFG`，不写路由或连接状态，也不加载或挂载程序。一次只运行一个采集器，期间不要改引擎配置。计数是累计包数，每行是每原因/CPU slot 的最后样本，不是连贯历史；未解析原因是接口级证据，不能归属给所选端口。实际探测匹配与中断限制见[采集和恢复说明](../operations/wan-diagnostic-415.md)。
+
 
 ### `diagnose`
 

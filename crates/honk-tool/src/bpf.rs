@@ -1,8 +1,11 @@
-//! `honk-tool bpf` — quick reads of the running engine's pinned eBPF maps.
+//! `honk-tool bpf` — pinned-map reads and opt-in WAN diagnostic capture.
 //!
 //! Maps live at `<pin-root>/<NAME>` (default `/sys/fs/bpf`).  These commands
 //! open them via raw `bpf(2)` calls and decode the wire structs — no aya, no
 //! program loading, no attach.
+//! Only `wan-diag` writes, and only to its diagnostic filter map.
+
+mod wan;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -321,6 +324,8 @@ pub enum BpfCommand {
     Show(ShowArgs),
     /// OUTBOUND_STATS per-outbound counters + conn-state occupancy + overflow.
     Stats(StatsArgs),
+    /// Capture issue #415 WAN evidence as JSON, without bpftool.
+    WanDiag(wan::Args),
 }
 
 #[derive(Args)]
@@ -349,6 +354,7 @@ pub async fn run(args: BpfArgs) -> anyhow::Result<()> {
     match args.command {
         BpfCommand::Show(a) => show(a),
         BpfCommand::Stats(a) => stats(a),
+        BpfCommand::WanDiag(a) => wan::run(a).await,
     }
 }
 
@@ -383,31 +389,27 @@ fn map_by_id(id: u32) -> io::Result<OwnedFd> {
     }
 }
 
-fn map_info(fd: RawFd, map_name: &str) -> anyhow::Result<[u32; 6]> {
+/// # Safety
+/// `T` must be an initialized BPF info prefix whose fields accept every bit pattern.
+unsafe fn object_info<T>(fd: RawFd, info: &mut T) -> io::Result<()> {
     #[repr(C)]
     struct InfoAttr {
         fd: u32,
         len: u32,
         info: u64,
     }
-    let mut info = [0u32; 6];
     let mut attr = InfoAttr {
         fd: fd as u32,
-        len: std::mem::size_of_val(&info) as u32,
-        info: info.as_mut_ptr() as u64,
+        len: std::mem::size_of::<T>() as u32,
+        info: info as *mut T as u64,
     };
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            BPF_OBJ_GET_INFO_BY_FD,
-            &mut attr,
-            std::mem::size_of::<InfoAttr>(),
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("query metadata for map {map_name}"));
-    }
+    bpf(BPF_OBJ_GET_INFO_BY_FD, &mut attr).map(|_| ())
+}
+
+fn map_info(fd: RawFd, map_name: &str) -> anyhow::Result<[u32; 6]> {
+    let mut info = [0u32; 6];
+    unsafe { object_info(fd, &mut info) }
+        .with_context(|| format!("query metadata for map {map_name}"))?;
     Ok(info)
 }
 

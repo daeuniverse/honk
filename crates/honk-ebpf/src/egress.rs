@@ -8,7 +8,8 @@
 #![allow(unused_unsafe)]
 
 mod diagnostic;
-use diagnostic::{Reason, record};
+use diagnostic::record;
+use honk_ebpf_common::wan_diagnostic::Reason;
 
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{

@@ -8,6 +8,7 @@ pub mod event;
 pub mod receive_trace;
 pub mod redirect_need;
 pub mod routing_policy;
+pub mod wan_diagnostic;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
 pub use crate::conn::{
