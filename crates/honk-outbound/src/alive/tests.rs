@@ -302,25 +302,50 @@ async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
 
 #[tokio::test]
 async fn test_periodic_cycle_tcp_cooldown_keeps_due_udp_probe() {
-    let set = Arc::new(AliveDialerSet::new());
-    let node_id = id(4);
-    set.register_node(node_id, "n4".into(), "127.0.0.1:1".into());
-    set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(5))));
-    set.states.write().get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, IpVersion::V4)]
-        .cooldown_until = Instant::now() + Duration::from_secs(300);
-    assert!(set.should_probe(node_id, ProbeDomain::DataUdp, IpVersion::V4));
-
-    set.run_health_check_cycle_concurrent(Duration::from_secs(1), 1)
+    for (tcp_cooling, udp_cooling) in [(true, false), (false, true), (true, true)] {
+        let set = Arc::new(AliveDialerSet::new());
+        let node_id = id(4);
+        set.register_node(node_id, "n4".into(), "127.0.0.1:1".into());
+        set.set_http_probe(
+            Arc::new(MockHttpProber {
+                result: HttpProbeResult::WarmSuccess(Duration::from_millis(7)),
+            }),
+            "http://127.0.0.1/".into(),
+            "HEAD".into(),
+        )
         .await;
+        set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(5))));
+        for (domain, cooling) in [
+            (ProbeDomain::Tcp, tcp_cooling),
+            (ProbeDomain::DataUdp, udp_cooling),
+        ] {
+            if cooling {
+                set.states.write().get_mut(&node_id).unwrap()[alive_index(domain, IpVersion::V4)]
+                    .cooldown_until = Instant::now() + Duration::from_secs(300);
+            }
+        }
 
-    assert!(
-        set.get_probe_history(node_id, ProbeDomain::Tcp, IpVersion::V4)
-            .is_empty()
-    );
-    assert!(
-        !set.get_probe_history(node_id, ProbeDomain::DataUdp, IpVersion::V4)
-            .is_empty()
-    );
+        set.run_health_check_cycle_concurrent(Duration::from_secs(1), 1)
+            .await;
+
+        for (domain, cooling, latency) in [
+            (ProbeDomain::Tcp, tcp_cooling, Duration::from_millis(7)),
+            (ProbeDomain::DataUdp, udp_cooling, Duration::from_millis(5)),
+        ] {
+            let history = set.get_probe_history(node_id, domain, IpVersion::V4);
+            if cooling {
+                assert!(
+                    history.is_empty(),
+                    "{domain:?} cooldown must suppress its probe"
+                );
+            } else {
+                assert!(
+                    matches!(history.as_slice(), [record] if record.success && record.latency == Some(latency)),
+                    "{domain:?} probe must publish its successful measurement"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
