@@ -230,6 +230,7 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `tls` | `tls` | 可选 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 默认启用 TLS，并拒绝显式关闭。 |
 | `servername`、`server-name`、`sni` | `sni` | 空值或纯空白名称视为未指定；非空别名必须逐字节一致。 |
 | `skip-cert-verify`、`skip_cert_verify`、`insecure` | `skip_cert_verify` | 须使用原生布尔值；已提供的别名必须一致。 |
+| `fingerprint`、`pin-sha256`、`pin_sha256` | `tls_pin_sha256` | 叶证书 SHA-256 固定值（十六进制，忽略冒号和空白），取代 PKI 与主机名校验。所有 TLS 协议都会导入 Clash 的 `fingerprint`；无 TLS 协议则跳过该条目。已提供的别名必须一致。 |
 | `alpn` | `tls_alpn` | raw TCP TLS 的有序字符串列表或逗号分隔字符串；XHTTP 只接受 H2，省略时规范化为 `["h2"]`。QUIC 保留下文的协议专属规则。 |
 
 #### 协议专属选项
