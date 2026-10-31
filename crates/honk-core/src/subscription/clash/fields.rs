@@ -252,7 +252,7 @@ pub(super) fn active(value: &Value) -> bool {
 }
 
 pub(super) fn active_for_key(key: &str, value: &Value) -> bool {
-    if matches!(key, "pin-sha256" | "pin_sha256") {
+    if matches!(key, "pin-sha256" | "pin_sha256" | "fingerprint") {
         return !matches!(value, Value::Null);
     }
     if matches!(key, "packet-encoding" | "packet_encoding") {

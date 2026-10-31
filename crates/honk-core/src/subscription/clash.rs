@@ -152,6 +152,7 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
                 "insecure",
                 "pin-sha256",
                 "pin_sha256",
+                "fingerprint",
                 "reality-opts",
             ],
         )
@@ -568,7 +569,7 @@ fn apply_tls(
             &["skip-cert-verify", "skip_cert_verify", "insecure"],
         )?
         .unwrap_or(false);
-        tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256"])?;
+        tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256", "fingerprint"])?;
         if !supports_quic(protocol)
             && let Some(alpn) = yaml_value(mapping, "alpn")
         {

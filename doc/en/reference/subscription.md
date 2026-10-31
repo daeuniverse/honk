@@ -230,6 +230,7 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `server-name`, `sni` | `sni` | Empty or whitespace-only names are absent; nonempty aliases must agree byte for byte. |
 | `skip-cert-verify`, `skip_cert_verify`, `insecure` | `skip_cert_verify` | Native booleans; supplied aliases must agree. |
+| `fingerprint`, `pin-sha256`, `pin_sha256` | `tls_pin_sha256` | Leaf-certificate SHA-256 pin (hex; colons and whitespace ignored) that replaces PKI and hostname verification. All TLS protocols import Clash's `fingerprint`; a protocol without TLS skips the entry. Supplied aliases must agree. |
 | `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for raw-TCP TLS; XHTTP accepts only H2 and normalizes omission to `["h2"]`. QUIC retains the protocol-specific rules below. |
 
 #### Protocol-specific options

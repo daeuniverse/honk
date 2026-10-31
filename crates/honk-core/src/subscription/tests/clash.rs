@@ -475,6 +475,35 @@ fn clash_ignores_disabled_features_but_not_malformed_tls_pins() {
 }
 
 #[test]
+fn clash_imports_fingerprint_as_certificate_pin() {
+    const PIN: &str = "84c855b4a09bba0ff518c778c0540da87acb9871dd3ae6dc5e8f78423e7ede05";
+    let yaml = format!(
+        r#"proxies:
+  - {{name: tuic, type: tuic, server: tuic.example, port: 443, uuid: 11111111-1111-4111-8111-111111111111, password: secret, fingerprint: {PIN}}}
+  - {{name: trojan, type: trojan, server: trojan.example, port: 443, password: secret, fingerprint: {PIN}}}
+  - {{name: conflict, type: hysteria2, server: hy2.example, port: 443, password: secret, pin-sha256: 0000000000000000000000000000000000000000000000000000000000000000, fingerprint: {PIN}}}
+  - {{name: socks, type: socks5, server: socks.example, port: 1080, fingerprint: {{enabled: false}}}}
+"#
+    );
+    let nodes = parse_clash_subscription(&yaml, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tuic", "trojan"]
+    );
+    assert_eq!(
+        nodes[0].tuic().unwrap().quic.tls.pin_sha256.as_deref(),
+        Some(PIN)
+    );
+    assert_eq!(
+        nodes[1].trojan().unwrap().tls.pin_sha256.as_deref(),
+        Some(PIN)
+    );
+}
+
+#[test]
 fn clash_accepts_fixed_h3_alpn_and_tuic_empty_password() {
     let yaml = r#"proxies:
   - name: hy2-h3
