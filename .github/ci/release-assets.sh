@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Print the Release notes section that explains each archive in a dist directory.
-# Usage: release-assets.sh <dist-dir>
+# Usage: release-assets.sh <dist-dir> [--toolbox]
 set -euo pipefail
 
-dist=${1:?usage: release-assets.sh <dist-dir>}
+dist=${1:?usage: release-assets.sh <dist-dir> [--toolbox]}
+if (( $# > 2 )) || [[ -n ${2:-} && ${2:-} != --toolbox ]]; then
+  printf 'usage: release-assets.sh <dist-dir> [--toolbox]\n' >&2
+  exit 1
+fi
 rows=()
 others=()
 
@@ -37,9 +41,11 @@ if (( ${#rows[@]} == 0 )); then
   exit 1
 fi
 
+printf '## Downloads\n\n'
+if [[ ${2:-} == --toolbox ]]; then
+  printf 'Each honk-core archive in this isolated diagnostic release contains both `honk-core` and `honk-tool`. The build labels below describe `honk-core`.\n\n'
+fi
 cat <<'EOF'
-## Downloads
-
 Each build is named `{allocator}-{API}-{arch}-{libc}`:
 
 - `mimalloc` favours throughput; `stockalloc` uses the system allocator and keeps the memory peak lower on small devices.

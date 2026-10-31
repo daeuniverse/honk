@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*", "debug.*"]
+    tags: ["v*", "debug.*", "debug-diag.*"]
   workflow_dispatch:
 
 permissions:
@@ -124,7 +124,7 @@ jobs:
       - name: Resolve artifact name
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/debug.* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/debug.* || "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
             prefix=debug
           else
             prefix=${GITHUB_REF_NAME//\//-}
@@ -222,15 +222,24 @@ jobs:
           if [[ "${{ matrix.suffix }}" != "-stock" ]]; then
             features+=,mimalloc
           fi
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            features="honk-core/${features//,/,honk-core/}"
+          fi
           echo "FEATURES=$features" >> "$GITHUB_ENV"
 
       # The root rust-toolchain.toml selects the host compiler whose cross
       # targets were installed above; the eBPF crate has its own nightly pin.
-      - name: Build honk-core (native gnu)
+      - name: Build release binaries (native gnu)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            cargo build --release -p honk-core -p honk-tool --no-default-features --features "$FEATURES,honk-tool/rprx" --target ${{ matrix.target }}
+          else
+            cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target ${{ matrix.target }}
+          fi
 
-      - name: Build honk-core (cross via zig wrappers)
+      - name: Build release binaries (cross via zig wrappers)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
@@ -253,13 +262,22 @@ jobs:
           # point it at zig's target headers, not the host's.
           BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
           export BINDGEN_EXTRA_CLANG_ARGS
-          cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target "$T"
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            cargo build --release -p honk-core -p honk-tool --no-default-features --features "$FEATURES,honk-tool/rprx" --target "$T"
+          else
+            cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target "$T"
+          fi
 
       - name: Package artifact
         run: |
           set -euo pipefail
           name="$ARTIFACT_NAME"
           mkdir -p "dist/$name"
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            test -x "target/${{ matrix.target }}/release/honk-core"
+            test -x "target/${{ matrix.target }}/release/honk-tool"
+            cp "target/${{ matrix.target }}/release/honk-tool" "dist/$name/"
+          fi
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
           # Both editions keep their own notices. Their GPL-3.0-only license must
@@ -286,6 +304,10 @@ jobs:
           trap 'rm -rf "$smoke_dir"' EXIT
           tar -xzf "$ARTIFACT_NAME.tar.gz" -C "$smoke_dir"
           "$smoke_dir/$ARTIFACT_NAME/honk-core" --version
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            "$smoke_dir/$ARTIFACT_NAME/honk-tool" --version
+            "$smoke_dir/$ARTIFACT_NAME/honk-tool" bpf wan-diag --help
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -303,7 +325,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/debug.')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/debug.') || startsWith(github.ref, 'refs/tags/debug-diag.')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -322,7 +344,7 @@ jobs:
       # Retrying only this job after the one-day artifact retention would otherwise publish a partial set.
       - name: Check complete release artifacts
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/debug.* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/debug.* || "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
             bash release-source/.github/ci/check-release-artifacts.sh debug
           else
             bash release-source/.github/ci/check-release-artifacts.sh "$GITHUB_REF_NAME"
@@ -343,9 +365,18 @@ jobs:
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          bash release-source/.github/ci/release-assets.sh dist > assets.md
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            bash release-source/.github/ci/release-assets.sh dist --toolbox > assets.md
+          else
+            bash release-source/.github/ci/release-assets.sh dist > assets.md
+          fi
           source_lines=$(printf "Source tag: \`%s\`\n\nCommit: \`%s\`\n\nBuild: %s" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUN_URL")
-          printf "Debug build of \`%s\`.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            printf "Isolated diagnostic build of \`%s\`. This release does not update rolling Debug.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
+          else
+            printf "Debug build of \`%s\`.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
+          fi
           printf 'Rolling debug build: the newest published debug tag. Each tag also keeps its own release.\n\n%s\n\n' "$source_lines" | cat - assets.md > notes-rolling.md
 
       - name: Write formal release notes
@@ -373,7 +404,7 @@ jobs:
           body_path: notes-formal.md
 
       - name: Publish Debug release
-        if: startsWith(github.ref, 'refs/tags/debug.')
+        if: startsWith(github.ref, 'refs/tags/debug.') || startsWith(github.ref, 'refs/tags/debug-diag.')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ github.ref_name }}
