@@ -236,13 +236,9 @@ impl Capture<'_> {
 
 impl Drop for Capture<'_> {
     fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = self.stop()
-        {
-            let _ = writeln!(
-                io::stderr(),
-                "WAN diagnostic cleanup failed: {error}; sampling may remain enabled; run honk-tool bpf wan-diag --interface DEV --disable with the original --pin-root"
-            );
+        if self.armed {
+            // Awaited exits report errors after owners close; fallback cleanup must not block on IO.
+            let _ = self.stop();
         }
     }
 }
@@ -290,20 +286,22 @@ fn snapshot(fd: RawFd, buffer: &mut [u8]) -> anyhow::Result<Vec<Value>> {
     Ok(rows)
 }
 
-fn print_json(value: &Value) -> anyhow::Result<()> {
+pub async fn run(args: Args) -> anyhow::Result<()> {
+    // Finish the ownership scope before stdout can block.
+    let report = collect_report(args).await?;
     let mut output = io::stdout().lock();
-    serde_json::to_writer_pretty(&mut output, value)?;
+    serde_json::to_writer_pretty(&mut output, &report)?;
     writeln!(output)?;
     output.flush()?;
     Ok(())
 }
 
-pub async fn run(args: Args) -> anyhow::Result<()> {
+async fn collect_report(args: Args) -> anyhow::Result<Value> {
     let target = Target::open(&args)?;
     if args.disable {
         set_filter(target.filter.as_raw_fd(), Filter::default())
             .context("disable WAN diagnostics; sampling may remain enabled")?;
-        return print_json(&json!({"disabled": true, "filter_map_id": target.filter_id}));
+        return Ok(json!({"disabled": true, "filter_map_id": target.filter_id}));
     }
     let port = args.source_port.context("source port is required")?;
     let mut buffer = vec![
@@ -367,7 +365,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let end_reason = outcome.context("write diagnostic readiness")?;
     target.check_attachment()?;
     let after = snapshot(target.samples.as_raw_fd(), &mut buffer)?;
-    print_json(&json!({
+    let mut report = json!({
         "interface": args.interface, "ifindex": target.ifindex, "source_port": port,
         "program_id": target.program_id, "link_id": target.link_id,
         "filter_map_id": target.filter_id, "sample_map_id": target.samples_id,
@@ -380,9 +378,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             "Match the complete tuple to the actual probe; cookies and dispatch do not prove interception.",
             "Disabling is not a grace barrier; a final admitted writer may race this non-atomic snapshot.",
             "Freeze engine configuration and run only one collector; filter admission is not an atomic claim."
-        ],
-        "before": before, "after": after,
-    }))
+        ]
+    });
+    report["before"] = Value::Array(before);
+    report["after"] = Value::Array(after);
+    Ok(report)
 }
 
 #[cfg(test)]

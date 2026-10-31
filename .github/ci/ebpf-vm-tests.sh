@@ -7,6 +7,11 @@ test -x "$HONK_CORE_TEST_BIN"
 test -x "$HONK_DATAPATH_TEST_BIN"
 test -x "$HONK_NFQUEUE_TEST_BIN"
 test -x "$HONK_OUTBOUND_TEST_BIN"
+test -x "$HONK_BPF_CLI_TEST_BIN"
+test -x "$HONK_TOOL_BIN"
+export HONK_TEST_TOOL="$HONK_TOOL_BIN"
+export HONK_TEST_BPF_OBJECT="$repo/crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf"
+test -r "$HONK_TEST_BPF_OBJECT"
 
 cd "$repo"
 test "$(id -u)" -eq 0
@@ -64,6 +69,18 @@ done
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"
 "$HONK_DATAPATH_TEST_BIN" --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/ebpf-datapath.log"
+tool_tests=(
+  capture_releases_kernel_owners_before_output
+  disable_releases_kernel_owners_before_output
+  cleanup_failure_releases_kernel_owners_before_error_output
+)
+for tool_test in "${tool_tests[@]}"; do
+  test "$("$HONK_BPF_CLI_TEST_BIN" "$tool_test" --exact --ignored --list --format terse)" = "$tool_test: test"
+done
+for tool_test in "${tool_tests[@]}"; do
+  "$HONK_BPF_CLI_TEST_BIN" "$tool_test" --exact --ignored --test-threads=1 \
+    2>&1 | tee "$log_dir/honk-tool-$tool_test.log"
+done
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-nfqueue.log"
 # Exact checks keep the substring-selected routing/netns runs from silently omitting a case.

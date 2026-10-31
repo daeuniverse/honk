@@ -104,6 +104,7 @@ A changed link/address/route/interface role updates topology observations, clear
     - `lan_ingress_l2/l3`: LAN classify/route/redirect, ordered-policy DNS ownership, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous non-DNS UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
     - `wan_ingress_l2/l3`: reverse-direction conntrack refresh (skipped on a shared LAN/WAN interface).
     - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`): reverse conn state; locally-originated traffic routing (pname via the actual skb socket's `SOCKET_IDENTITY`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane). Live non-DNS WAN UDP entries take a lookup-only cached-route path; misses route once and then publish complete conntrack metadata.
+    - `src/egress/diagnostic.rs`: default-off WAN entry/exit evidence for this diagnostic branch, with shared layouts and reason labels in `honk-ebpf-common::wan_diagnostic`. It records existing decisions, never chooses a verdict; disabled sampling still performs the filter lookup.
     - `dae0_ingress`: reply MAC rewrite and redirect to the original LAN iface. Unknown-peer UDP replies use client-only framing without outbound attribution; honk's own link sources never use it.
     - LAN and WAN egress suppress only locally originated ICMPv6 Redirects, using the parser's ICMPv6 header after extension traversal; forwarded Redirects and other ICMPv6 remain pass-through. The WAN hook carries this invariant on a shared LAN/WAN interface, where `lan_egress` is not attached. `honk-core/tests/ebpf_datapath_test.rs` checks L2 through `BPF_PROG_TEST_RUN` and L3 on isolated TUN interfaces, alongside exact-tuple RX accounting and cached-route policy.
     - `dae0peer_ingress`: restores UDP53 provenance and TCP SYN incarnation; assigns UDP with `bpf_sk_assign` from the redirect site's `cb[4]` marker `0x100 | index`, without parsing packet bytes. Missing markers leave UDP to `sk_lookup`; TCP SYN retains its `cb[3]`/`cb[4]` incarnation carrier and native established/TIME_WAIT processing.
@@ -111,7 +112,7 @@ A changed link/address/route/interface role updates topology observations, clear
 
 ## Map inventory
 
-`crates/honk-ebpf/src/maps.rs` declares these maps:
+`crates/honk-ebpf/src/maps.rs` owns the main declarations; the diagnostic-only maps below live in `src/egress/diagnostic.rs`.
 
 | Map | Shape and role |
 | --- | --- |
@@ -127,6 +128,8 @@ A changed link/address/route/interface role updates topology observations, clear
 | `LISTEN_SOCKET_MAP` | 16-slot `SockMap`; keys `0..=9` hold the two TCP and eight UDP transparent listeners. |
 | `DATAPATH_STATE_MAP` | One-slot admission array. Zero passes traffic untouched; nonzero enables classification and redirect. |
 | `DATAPATH_FLAGS_MAP` | One-slot runtime policy word: Rule/Direct offload properties plus `global.nfqueue_enable` and NFQUEUE ready fencing. New-flow classification reads it; established direct offload uses cached metadata. |
+| `WAN_DIAG_CFG` | Diagnostic-only one-entry array with an 8-byte interface/source-port filter. A zero filter disables sampling; it has no routing or conntrack authority. |
+| `WAN_DIAG` | Diagnostic-only 13-entry per-CPU array of 104-byte cumulative counters and last samples. Together with the filter, value storage is `8 + 1352 × possible_CPU_count` bytes, excluding map overhead; no per-flow growth or packet history. Reads are noncoherent, and unparsed reasons remain interface-wide. |
 | `SOCKET_IDENTITY` | Non-cloned `SK_STORAGE` containing the socket's first PID/executable basename. Storage follows the actual socket lifetime, without a fixed hash-entry ceiling or userspace expiry. WAN TC performs lookup only; cgroup create/connect/sendmsg capture missing identity synchronously. |
 | `CONN_STATE_OCCUPANCY` | Two-slot per-CPU insert/kernel-delete counters combined with actual userspace delete accounting. Kernel tuple deletion is disabled, so its delete counter remains zero on this path. |
 | `AUX_OCCUPANCY` | Two-slot per-CPU redirect/handoff insert counters; userspace subtracts actual deletes. |

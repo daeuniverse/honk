@@ -48,6 +48,8 @@ Run IPv6 separately: use **41501** in both commands, change curl to `-6`, and wr
 
 `--seconds` accepts 1–300, default 15. INT/TERM/HUP attempt to disable sampling before producing partial output; `end_reason` and `elapsed_ms` distinguish interruption from expiration. The deadline bounds enabled sampling, not process exit when an output pipe is blocked.
 
+Both capture and `--disable` release their map/program FDs after constructing the owned report and before serializing it to stdout. Output backpressure therefore cannot retain a retired engine's production maps; handled cleanup failures are also returned after owners close, and fallback Drop cleanup performs no stdio.
+
 SIGKILL, system failure or a failed disable update can leave the filter enabled. After confirming the original collector stopped, recover with this standalone command, adding a custom pin root if applicable:
 
 ```sh

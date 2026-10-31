@@ -62,8 +62,8 @@ root-cgroup cases, so neither recipe executes ignored tests on the host.
 The VM gate includes compiled routing (its exact-name-guarded `dns_ownership::tcx::unsupported_lan_ingress_frames_continue_tcx_without_marking`), real backend/datapath, NFQUEUE/netns,
 TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership, real VLAN/macsec frame cases,
 bond binding, native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher,
-lazy interface binding and SO_MARK socket checks. Exact nonempty
-selections in the guest gate must remain intact.
+lazy interface binding, toolbox capture/disable output-ownership regressions and SO_MARK socket checks. Exact nonempty
+selections in the guest gate must remain intact. The toolbox cases use the production object, not the routing-test object.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
 x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,

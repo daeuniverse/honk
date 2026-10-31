@@ -1729,6 +1729,7 @@ name = "honk-tool"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aya",
  "clap",
  "honk-config",
  "honk-core",

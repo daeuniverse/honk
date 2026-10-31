@@ -17,14 +17,22 @@ mkdir -p "$kernel_dir" "$log_dir"
   cargo test -p honk-core --features ebpf,native-api --lib --test ebpf_datapath_test --no-run --message-format=json
   cargo test -p honk-nfqueue --lib --no-run --message-format=json
   cargo test -p honk-outbound --lib --no-run --message-format=json
-} | jq -sr '
+  cargo test -p honk-tool --test bpf_cli --no-run --message-format=json
+} | jq -sr --arg tool_manifest "$repo/crates/honk-tool/Cargo.toml" '
   def executable($name):
     [.[] | select(.reason == "compiler-artifact" and .target.name == $name and .executable != null) | .executable]
     | unique | if length == 1 then .[0] else error("missing or ambiguous test executable: " + $name) end;
+  def tool_executable($name; $kind; $testing):
+    [.[] | select(.reason == "compiler-artifact" and .manifest_path == $tool_manifest
+      and .target.name == $name and .target.kind == [$kind] and .profile.test == $testing
+      and .executable != null) | .executable]
+    | unique | if length == 1 then .[0] else error("missing or ambiguous toolbox executable: " + $name) end;
   "HONK_CORE_TEST_BIN=" + (executable("honk_core") | @sh),
   "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
   "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh),
-  "HONK_OUTBOUND_TEST_BIN=" + (executable("honk_outbound") | @sh)
+  "HONK_OUTBOUND_TEST_BIN=" + (executable("honk_outbound") | @sh),
+  "HONK_BPF_CLI_TEST_BIN=" + (tool_executable("bpf_cli"; "test"; true) | @sh),
+  "HONK_TOOL_BIN=" + (tool_executable("honk-tool"; "bin"; false) | @sh)
 ' > "$GITHUB_WORKSPACE/target/kernel-test-bins.env"
 
 if ! test -f "$kernel_dir/$image"; then
