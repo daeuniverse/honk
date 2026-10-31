@@ -43,7 +43,7 @@
 8. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
 9. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环；仅当生效开关仍开启时，才启动 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和独立的队列压力采样器（每秒采样一次）。
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
-`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
+`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查，或随后准入前的队列/规则/健康检查时，会记录 warning 并关闭；该启动降级在重载后仍生效（见[全局配置参考](../reference/global.md)）。持久化 token generation 恢复失败与服务准入后的失败仍为 fatal。
 
 对象准入会在进程名 probe 或任何 Aya loader 运行前拒绝隐式 `ByName` map pinning。外部对象必须声明未 pin 的 map；包括持久分配器在内，所有 pin 路径均由 core 显式提供，避免 loader 创建的别名逃出启动回滚。
 
@@ -252,6 +252,8 @@ NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并�
 
 SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与否，警告都只报告一次；被拒绝的尝试另报告一次脱敏后的原因，不进入运行时发布流程。报告本次诊断不会替换当前运行时状态，也不会新增最近失败尝试的缓存。
 
+公共重载事务在指纹/no-op 和重启检查前归一化候选配置的 NFQUEUE 生效值，保留已记录的早期或较晚的数据路径准入前启动降级。原生 API 的写入前检查与完整校验共用该重启策略，不改写请求的源文本；参见[启动例外](../reference/global.md)与[原生配置 API](../reference/api.md)。
+
 `apply_runtime_config` 首先构建替代 Router、GroupManager、出站 registry、DNS 运行时与路由计划，不修改 live state。提交顺序为：
 
 1. Fence NFQUEUE readiness，并完成同步内核 grace barrier。
@@ -294,7 +296,7 @@ Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./gro
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode`；生效的 `assets.ui.url` 和 `assets.ui.route` |
 | 原生 API | 任意 `experimental.native_api` 变更；生效的 `assets.geodata.geosite`、`assets.geodata.geoip`、`assets.geodata.route` |
 | 持久化 | `experimental.cache_file.enabled`、`store_dns` |
-| NFQUEUE | `global.nfqueue_enable` |
+| NFQUEUE | `global.nfqueue_enable`，已记录数据路径准入前启动降级时除外（[例外说明](../reference/global.md)） |
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |
 
 UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认出口的变更若影响任一启动阶段持有的下载出口，则需重启。`assets.subscription` 默认值与订阅条目设置交由订阅协调处理。

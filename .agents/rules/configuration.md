@@ -33,9 +33,17 @@ global {
 Legacy `experimental { udp_nfqueue { enabled: ... } }` warns and migrates to `global.nfqueue_enable`; never serialize the removed section.
 Removed `experimental.cache_file` keys (`path`, `cache_id`, `store_fakeip`) are `skip_serializing` legacy fields: they warn `legacy-cache-file` at parse and seed, have no effect, and only `legacy_cache_file()` reads `path`/`cache_id`, for the one-time `cache.db` import.
 
-Default on; restart-required. Activation requires the real eBPF backend and an `ebpf` build.
-Mock/no-`ebpf` startup or failed fixed-queue preflight warns and disables staging
-for this process, never rewriting config. Set `false` for unprivileged mock development.
+Default on; restart-required unless an actual early or late pre-admission startup
+downgrade was recorded. Mock/no-`ebpf`, failed fixed-queue preflight, or pre-admission
+queue/rules/health failure warns and disables staging for this process. Common reload
+normalization before fingerprint/no-op and shared native pre-write/full-validation
+policy preserve effective `false`, admit requested `true` (including omitted/default
+`true`), and suppress only the NFQUEUE restart mismatch; never rewrite source intent
+or retry activation automatically. Restart to retry. Without that downgrade, toggles
+remain restart-only. Token-generation recovery and post-admission failures remain
+fatal. Set `false` for unprivileged mock development. See
+[global reference](../../doc/en/reference/global.md) and
+[reload design](../../doc/en/design/control-plane.md#reload-and-runtime-generations).
 Only LAN-forwarded UDP: `inet prerouting` follows LAN TC; host WAN egress stays TPROXY.
 Ordinary staging excludes DNS 53, internal/special, reverse, must/block and safe direct. Fragmented LAN UDP53 needing controller/raw delivery instead uses kernel reassembly followed by the same queue, without ordinary conn-state/tokens. Disabled/unready NFQUEUE drops those fragments; unfragmented DNS and native direct-must remain unchanged.
 No queue/worker/timeout/failure knobs: queue `320` and fail-closed behavior are fixed.
