@@ -394,6 +394,9 @@ impl AliveDialerSet {
             // Stopped nodes are probed too — on their slow max_cooldown
             // cadence — so recovery stays reachable (see `should_probe`).
             let tcp_due = self.should_probe(id, ProbeDomain::Tcp, IpVersion::V4);
+            if !tcp_due && !self.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
+                continue;
+            }
             let this = self.clone();
             let permit = semaphore.clone();
             join_set.spawn(async move {
