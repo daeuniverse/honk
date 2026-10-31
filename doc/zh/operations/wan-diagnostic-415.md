@@ -1,8 +1,8 @@
 # Issue #415：用 honk-tool 采集 WAN 诊断信息
 
-本构建用于排查 issue #415，只增加采样，不改变转发行为，**不是 SIPA 问题的修复版**。该设备请用 aarch64 musl 包：内含同版本的静态 `honk-core` 和 `honk-tool`，BPF 已嵌入 core。设备上不需要 bpftool、tracefs 或编译器。
+本构建用于排查 issue #415，只增加采样，不改变转发行为，**不是 SIPA 问题的修复版**。该设备请用 aarch64 musl 包：`honk-core-*` 内含静态 core/tool，也可单独下载 `honk-tool-debug-aarch64-unknown-linux-musl.tar.gz`。BPF 已嵌入 core。设备上不需要 bpftool、tracefs 或编译器。
 
-需要 root/BPF 权限、Linux TCX 和可读的 `/sys/devices/system/cpu/possible`。core/tool 必须来自同一诊断包。curl 只用来发起测试请求。
+需要 root/BPF 权限、Linux TCX 和可读的 `/sys/devices/system/cpu/possible`。core/tool 必须来自同一诊断 tag，并选择相同的架构和 libc。curl 只用来发起测试请求。
 
 ## 启动前
 

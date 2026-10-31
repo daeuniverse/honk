@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: check-release-artifacts.sh <prefix>, where <prefix> is `debug` or the formal tag (e.g. v0.1.0-rc.1).
-prefix=${1:?usage: check-release-artifacts.sh <debug|tag>}
+# Usage: check-release-artifacts.sh <prefix> [--toolbox].
+prefix=${1:?usage: check-release-artifacts.sh <debug|tag> [--toolbox]}
+if (( $# > 2 )) || [[ -n ${2:-} && ${2:-} != --toolbox ]]; then
+  printf 'usage: check-release-artifacts.sh <debug|tag> [--toolbox]\n' >&2
+  exit 1
+fi
 
 check() {
   local artifact=$1
@@ -12,8 +16,10 @@ check() {
   fi
 }
 
+targets=(x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl)
+
 # Full: both APIs and the embedded UI, gnu and musl.
-for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl; do
+for target in "${targets[@]}"; do
   for suffix in '' -stock; do
     check "dist/honk-core-$prefix-$target$suffix-full.tar.gz"
   done
@@ -26,3 +32,9 @@ for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     check "dist/honk-core-$prefix-$target$suffix-native-api.tar.gz"
   done
 done
+
+if [[ ${2:-} == --toolbox ]]; then
+  for target in "${targets[@]}"; do
+    check "dist/honk-tool-$prefix-$target.tar.gz"
+  done
+fi

@@ -297,6 +297,13 @@ jobs:
             done
           fi
           tar -czf "$name.tar.gz" -C dist "$name"
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* && "${{ matrix.variant }}" == full && -z "${{ matrix.suffix }}" ]]; then
+            tool_name="honk-tool-debug-${{ matrix.target }}"
+            mkdir "dist/$tool_name"
+            cp "dist/$name/honk-tool" LICENSE README.md "dist/$tool_name/"
+            cp -r "dist/$name/doona" "dist/$name/doona-lite" "dist/$tool_name/"
+            tar -czf "$tool_name.tar.gz" -C dist "$tool_name"
+          fi
 
       - name: Start the packaged x86_64 artifact
         if: startsWith(matrix.target, 'x86_64-')
@@ -310,12 +317,20 @@ jobs:
             "$smoke_dir/$ARTIFACT_NAME/honk-tool" --version
             "$smoke_dir/$ARTIFACT_NAME/honk-tool" bpf wan-diag --help
           fi
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* && "${{ matrix.variant }}" == full && -z "${{ matrix.suffix }}" ]]; then
+            tool_name="honk-tool-debug-${{ matrix.target }}"
+            tar -xzf "$tool_name.tar.gz" -C "$smoke_dir"
+            "$smoke_dir/$tool_name/honk-tool" --version
+            "$smoke_dir/$tool_name/honk-tool" bpf wan-diag --help
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: honk-core-${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
-          path: ${{ env.ARTIFACT_NAME }}.tar.gz
+          path: |
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            honk-tool-*.tar.gz
           retention-days: 1
 
   release:
@@ -346,7 +361,9 @@ jobs:
       # Retrying only this job after the one-day artifact retention would otherwise publish a partial set.
       - name: Check complete release artifacts
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/debug.* || "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/debug-diag.* ]]; then
+            bash release-source/.github/ci/check-release-artifacts.sh debug --toolbox
+          elif [[ "$GITHUB_REF" == refs/tags/debug.* ]]; then
             bash release-source/.github/ci/check-release-artifacts.sh debug
           else
             bash release-source/.github/ci/check-release-artifacts.sh "$GITHUB_REF_NAME"

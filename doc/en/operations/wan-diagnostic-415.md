@@ -1,8 +1,8 @@
 # Issue #415: collect WAN evidence with honk-tool
 
-This build collects evidence for issue #415 without changing forwarding. **It is not a fix for the SIPA problem.** Use the aarch64 musl archive for this device: it contains matching static `honk-core` and `honk-tool` binaries, with BPF embedded in core. No bpftool, tracefs or device-side compiler is needed.
+This build collects evidence for issue #415 without changing forwarding. **It is not a fix for the SIPA problem.** Use aarch64 musl for this device: the `honk-core-*` archive contains both static binaries, or download `honk-tool-debug-aarch64-unknown-linux-musl.tar.gz` separately. BPF is embedded in core. No bpftool, tracefs or device-side compiler is needed.
 
-Root/BPF permissions, Linux TCX and a readable `/sys/devices/system/cpu/possible` are required. Use core/tool from the same diagnostic archive. Curl only generates the test request.
+Root/BPF permissions, Linux TCX and a readable `/sys/devices/system/cpu/possible` are required. Use core/tool from the same diagnostic tag and select the same architecture and libc. Curl only generates the test request.
 
 ## Startup and scope
 

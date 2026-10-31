@@ -15,6 +15,13 @@ for path in "$dist"/*.tar.gz; do
   file=${path##*/}
   case $file in
     honk-core-*) ;;
+    honk-tool-*)
+      if [[ ! $file =~ -(x86_64|aarch64)-unknown-linux-(gnu|musl)\.tar\.gz$ ]]; then
+        printf '::error::Unrecognised honk-tool archive name: %s\n' "$file" >&2
+        exit 1
+      fi
+      others+=("| \`$file\` | honk-tool (\`${BASH_REMATCH[1]}-${BASH_REMATCH[2]}\`) |")
+      continue ;;
     doona-source-*) others+=("| \`$file\` | Corresponding source of both embedded doona UI editions (GPL-3.0 section 6) |"); continue ;;
     *) printf '::error::Unknown release archive: %s\n' "$file" >&2; exit 1 ;;
   esac
@@ -43,7 +50,7 @@ fi
 
 printf '## Downloads\n\n'
 if [[ ${2:-} == --toolbox ]]; then
-  printf 'Each honk-core archive in this isolated diagnostic release contains both `honk-core` and `honk-tool`. The build labels below describe `honk-core`.\n\n'
+  printf 'Standalone `honk-tool` downloads are listed below. Each honk-core archive also includes the matching tool. The build labels describe `honk-core`.\n\n'
 fi
 cat <<'EOF'
 Each build is named `{allocator}-{API}-{arch}-{libc}`:

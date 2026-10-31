@@ -24,7 +24,7 @@ create_set() {
 
 expect_rejection() {
   local prefix=$1 status=0
-  bash "$ci_dir/check-release-artifacts.sh" "$prefix" > failure.log 2>&1 || status=$?
+  bash "$ci_dir/check-release-artifacts.sh" "$@" > failure.log 2>&1 || status=$?
   if [[ "$status" != 1 ]]; then
     cat failure.log >&2
     printf 'Expected incomplete %s artifacts to be rejected, got exit %s\n' "$prefix" "$status" >&2
@@ -61,5 +61,20 @@ done
 # A complete set under the other prefix does not satisfy the check.
 create_set debug
 expect_rejection v0.1.0-rc.1
+
+expect_rejection debug --toolbox
+for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl; do
+  printf 'toolbox\n' > "dist/honk-tool-debug-$target.tar.gz"
+done
+bash "$ci_dir/check-release-artifacts.sh" debug --toolbox
+for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl; do
+  artifact=dist/honk-tool-debug-$target.tar.gz
+  mv "$artifact" saved.tar.gz
+  expect_rejection debug --toolbox
+  : > "$artifact"
+  expect_rejection debug --toolbox
+  mv saved.tar.gz "$artifact"
+done
+bash "$ci_dir/check-release-artifacts.sh" debug --toolbox
 
 printf 'Release artifact preflight regression passed\n'
