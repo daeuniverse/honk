@@ -68,7 +68,7 @@ aya = "0.14"
 aya-obj = "0.3"
 aya-log = "0.3"
 aya-ebpf = "0.2"
-aya-ebpf-bindings = "0.2"
+aya-ebpf-bindings = "0.3"
 network-types = "0.2"
 
 # CLI
