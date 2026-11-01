@@ -70,9 +70,11 @@ Tuning and display metadata do not participate, except VLESS multiplex limits th
 
 For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
 
+For WebSocket, a nonempty canonical header map also joins identity. Header-name casing, insertion order and equal-value aliases do not change it; different values do. An absent or empty map preserves the previous identity.
+
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
-**Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. Other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
+**Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. For that migration, other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
 
 **Addressed UDP framing:** VLESS nodes receive another new ID when their effective UDP path on port 53, 443, or 54 is UoT v2 or H2MUX. This covers `packetEncoding=uot-v2`, `mux=h2mux`, and pool fallback reaching either path, because these paths now carry an address per packet.
 
@@ -120,7 +122,8 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
 | `flow` | string? | null | VLESS `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; Shadowrocket `xtls=2` selects the base flow |
 | `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
-| `ws_path` / `ws_host` / `ws_headers` | string? / string? / object? | null | WebSocket `path`, Host header, and additional upgrade headers as a lowercase-name string map (at most 64 headers, 16 KiB combined). Reserved handshake headers (`host`, `connection`, `upgrade`, `sec-websocket-*`, `content-length`, `transfer-encoding`) and non-WebSocket stream transports reject; protocols without a stream transport drop the field. Only subscription import and structured input supply headers: no share-link dialect carries them. |
+| `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
+| `ws_headers` | object | `{}`; omitted on output | Additional upgrade headers as a string map, normalized to lowercase names; equal-value aliases merge and conflicting aliases reject. At most 64 entries and 16 KiB of name+value bytes; control bytes reject. Reserved names: `host`, `connection`, `upgrade`, `sec-websocket-key`, `sec-websocket-version`, `sec-websocket-extensions`, `sec-websocket-accept`, `sec-websocket-protocol`, `content-length`, `transfer-encoding`. Nonempty maps on non-WebSocket stream transports reject; protocols without a stream transport drop the field. Null is invalid. Only subscriptions and structured input supply headers; no share-link dialect carries them. |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
 | `xhttp` | object? | omitted | Canonical XHTTP options in flat structured input/output; options on another transport reject |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 authentication and salamander password |

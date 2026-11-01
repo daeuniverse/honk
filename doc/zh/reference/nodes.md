@@ -70,9 +70,11 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括标头、填充和 POST 间隔。输入别名、标头名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
 
+WebSocket 的非空规范标头 map 也参与身份派生。标头名称大小写、插入顺序与等值别名不改变身份，值不同则改变身份；省略或空 map 保留原有身份。
+
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
-**破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及会话状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
+**破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及会话状态会重新建立。在该次迁移中，其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
 
 **逐包带地址的 UDP 分帧：**有效 UDP 路径在 53、443 或 54 端口使用 UoT v2 或 H2MUX 的 VLESS 节点，会再次获得新 ID。这包括 `packetEncoding=uot-v2`、`mux=h2mux`，以及到达这两条路径的池回退，因为这些路径现在逐包携带地址。
 
@@ -120,7 +122,8 @@ Node 模型包含下列字段。分享链接从协议方案、用户信息、地
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
 | `flow` | string? | null | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow |
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
-| `ws_path` / `ws_host` / `ws_headers` | string? / string? / object? | null | WebSocket `path`、Host 标头，以及以小写名称为键的附加升级标头 map（最多 64 个标头、合计 16 KiB）。保留的握手标头（`host`、`connection`、`upgrade`、`sec-websocket-*`、`content-length`、`transfer-encoding`）与非 WebSocket 流传输会被拒绝；没有流传输的协议会丢弃该字段。只有订阅导入和结构化输入能提供标头：任何分享链接方言都不携带它们。 |
+| `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host 标头 |
+| `ws_headers` | object | `{}`；输出时省略空 map | 附加升级标头的 string map，名称规范化为小写；等值别名合并，冲突别名拒绝。最多 64 项、名称与值合计 16 KiB；控制字节拒绝。保留名称：`host`、`connection`、`upgrade`、`sec-websocket-key`、`sec-websocket-version`、`sec-websocket-extensions`、`sec-websocket-accept`、`sec-websocket-protocol`、`content-length`、`transfer-encoding`。非 WebSocket 流传输携带非空 map 会被拒绝；没有流传输的协议会丢弃该字段。null 无效。只有订阅与结构化输入能提供标头，任何分享链接方言都不携带它们。 |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
 | `xhttp` | object? | 省略 | flat 结构化输入/输出中的规范 XHTTP 参数；其他传输携带该对象会被拒绝 |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证与 salamander 密码 |
