@@ -702,7 +702,8 @@ pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
     tuic_default_alpn: Option<&str>,
-) -> Result<Node, &'static str> {
+) -> Result<Node, (Option<&'static str>, &'static str)> {
+    let entry_error = |message| (None, message);
     let ProxySource {
         protocol,
         name,
@@ -711,7 +712,7 @@ pub(super) fn parse_clash_proxy(
         udp,
         tls_explicit,
         tls_enabled,
-    } = validate_source(mapping)?;
+    } = validate_source(mapping).map_err(entry_error)?;
     let mut node = Node {
         name,
         address: format!("{server}:{port}"),
@@ -722,18 +723,18 @@ pub(super) fn parse_clash_proxy(
         ..Default::default()
     };
 
-    apply_protocol(mapping, &mut node)?;
-    apply_stream(mapping, &mut node, udp)?;
-    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
-    apply_quic(mapping, &mut node, tuic_default_alpn)?;
+    apply_protocol(mapping, &mut node).map_err(entry_error)?;
+    apply_stream(mapping, &mut node, udp).map_err(entry_error)?;
+    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled).map_err(entry_error)?;
+    apply_quic(mapping, &mut node, tuic_default_alpn).map_err(entry_error)?;
     node.normalize_stream_transport()
-        .map_err(|(_, message)| message)?;
+        .map_err(|(field, message)| (Some(field), message))?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
     }
-    validate_imported_node(&node)?;
+    validate_imported_node(&node).map_err(entry_error)?;
     node.validate()
-        .map_err(|_| "invalid imported node protocol settings")?;
+        .map_err(|_| (None, "invalid imported node protocol settings"))?;
     node.id = node.derive_id();
     Ok(node)
 }

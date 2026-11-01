@@ -93,15 +93,11 @@ fn parse_entries(
     for (index, entry) in entries.into_iter().enumerate() {
         let ordinal = index + 1;
         let outcome = match normalize(entry) {
-            Ok(NormalizedEntry::Node(proxy)) => {
-                match super::clash::parse_clash_proxy(&proxy, subscription_id, None) {
-                    Ok(node) => IndexedOutcome::node(ordinal, path, node),
-                    Err(reason) if reason.contains("unsupported") => {
-                        IndexedOutcome::unsupported(ordinal, path, reason)
-                    }
-                    Err(reason) => IndexedOutcome::malformed(ordinal, path, reason),
-                }
-            }
+            Ok(NormalizedEntry::Node(proxy)) => IndexedOutcome::parsed(
+                ordinal,
+                path,
+                super::clash::parse_clash_proxy(&proxy, subscription_id, None),
+            ),
             Ok(NormalizedEntry::Profile(reason)) => IndexedOutcome::profile(ordinal, path, reason),
             Ok(NormalizedEntry::Unsupported(reason)) => {
                 IndexedOutcome::unsupported(ordinal, path, reason)
