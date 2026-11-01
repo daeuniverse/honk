@@ -1412,6 +1412,7 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
         "network" => "network",
         "ws_path" => "ws_path",
         "ws_host" => "ws_host",
+        "ws_headers" => "ws_headers",
         "grpc_service" => "grpc_service",
         "hy2_auth" => "hy2_auth",
         "hy2_obfs" => "hy2_obfs",
