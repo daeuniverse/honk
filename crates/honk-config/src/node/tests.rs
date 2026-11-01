@@ -360,7 +360,7 @@ fn test_ws_headers_participate_in_identity() {
     // Names are case-insensitive: equal-value aliases collapse and do not
     // change identity; differing values conflict.
     assert_eq!(
-        ws_normalized(&[("user-agent", "Mozilla/5.0")]).derive_id(),
+        ws_normalized(&[("user-agent", "Mozilla/5.0"), ("User-Agent", "Mozilla/5.0")]).derive_id(),
         with_ua.derive_id()
     );
     assert_ne!(
@@ -376,9 +376,19 @@ fn test_ws_header_admission_bounds_and_reserved_names() {
     for (name, value) in [
         ("host", "cdn.example"),
         ("Connection", "keep-alive"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-extensions", ""),
+        ("sec-websocket-accept", ""),
+        ("content-length", "0"),
+        ("transfer-encoding", "chunked"),
         ("sec-websocket-key", "x"),
         ("sec-websocket-protocol", "v2ray"),
         ("bad name", "x"),
+        ("x-test", "\r\n"),
+        ("x-test", "\t"),
+        ("x-test", "\0"),
+        ("x-test", "\u{7f}"),
     ] {
         let mut candidate = ws_candidate(&[(name, value)]);
         assert!(
@@ -390,6 +400,15 @@ fn test_ws_header_admission_bounds_and_reserved_names() {
         let mut candidate = ws_candidate(&[(name, "value")]);
         assert!(candidate.normalize_stream_transport().is_ok(), "{name}");
     }
+
+    let mut noncanonical = ws_candidate(&[("User-Agent", "value")]);
+    assert!(noncanonical.validate_protocol().is_err());
+    noncanonical.normalize_stream_transport().unwrap();
+    assert!(noncanonical.validate_protocol().is_ok());
+    noncanonical.transport_mut().unwrap().ws_headers = (0..65)
+        .map(|index| (format!("x-{index}"), "v".into()))
+        .collect();
+    assert!(noncanonical.validate_protocol().is_err());
 
     let mut grpc = ws_candidate(&[("user-agent", "Mozilla/5.0")]);
     let transport = grpc.transport_mut().unwrap();

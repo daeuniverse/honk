@@ -70,10 +70,9 @@ mod tests {
                 .map(|index| (format!("x-{index}"), value.to_string()))
                 .collect()
         };
-        assert_eq!(validate(&map(65, "v"), &[]), Err("too many headers"));
-        assert_eq!(
-            validate(&map(1, &"a".repeat(MAX_HEADER_BYTES)), &[]),
-            Err("headers exceed supported bounds")
-        );
+        assert!(validate(&map(64, "v"), &[]).is_ok());
+        assert!(validate(&map(65, "v"), &[]).is_err());
+        assert!(validate(&map(1, &"a".repeat(16 * 1024 - 3)), &[]).is_ok());
+        assert!(validate(&map(1, &"a".repeat(16 * 1024 - 2)), &[]).is_err());
     }
 }
