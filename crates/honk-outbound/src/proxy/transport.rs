@@ -143,7 +143,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     connect_timeout: std::time::Duration,
 ) -> anyhow::Result<MaybeTls> {
     let tls = node.tls().unwrap();
-    if !tls.alpn.is_empty() {
+    if !tls.alpn.is_empty()
+        || node
+            .transport()
+            .is_some_and(|transport| !transport.ws_headers.is_empty())
+    {
         node.validate_protocol()?;
     }
     let cold = tcp.is_none();
