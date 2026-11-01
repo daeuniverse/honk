@@ -119,7 +119,7 @@ The lean variants fail closed: enabling `experimental.native_api` on `-clash-api
 
 ```shell
 pkg=honk-core-<version>-<target>-full   # or -stock-full, -clash-api, -stock-native-api, as downloaded
-sha256sum -c --ignore-missing SHA256SUMS   # SHA256SUMS comes from the same release
+awk -v file="$pkg.tar.gz" '$2 == file' SHA256SUMS | sha256sum -c -   # SHA256SUMS comes from the same release
 tar -xzf "$pkg.tar.gz"
 sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version

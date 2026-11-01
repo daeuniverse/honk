@@ -62,7 +62,7 @@ Each build is named `{allocator}-{API}-{arch}-{libc}`:
 - `fullapi` has the Clash API, the native API and both embedded doona UI editions; `ui: embedded-lite` selects the lighter doona lite edition (preview). `clashapi` has the Clash API only; `nativeapi` has the native API only, without the UI.
 - `musl` builds are static and suit gateways.
 
-Check a download with `sha256sum -c --ignore-missing SHA256SUMS`, and its origin with `gh attestation verify <file> -R daeuniverse/honk`.
+Check a download with `awk -v file=<file> '$2 == file' SHA256SUMS | sha256sum -c -` (BusyBox has no `--ignore-missing`), and its origin with `gh attestation verify <file> -R daeuniverse/honk`.
 
 | File | Build |
 |---|---|

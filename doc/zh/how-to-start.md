@@ -119,7 +119,7 @@ musl 包是静态二进制，适合网关部署。
 
 ```shell
 pkg=honk-core-<version>-<target>-full   # 或按下载的包改为 -stock-full、-clash-api、-stock-native-api 等
-sha256sum -c --ignore-missing SHA256SUMS   # SHA256SUMS 从同一个 release 下载
+awk -v file="$pkg.tar.gz" '$2 == file' SHA256SUMS | sha256sum -c -   # SHA256SUMS 从同一个 release 下载
 tar -xzf "$pkg.tar.gz"
 sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
