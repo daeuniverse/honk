@@ -833,6 +833,26 @@ fn cached_wan_tcp_survives_a_dead_outbound() {
 }
 
 #[test]
+#[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
+fn wan_egress_l3_redirects_an_ethernet_frame_without_a_second_header() {
+    // Test-run frames are Ethernet, like a device retyped to an L3 link type.
+    let mut fixture = Fixture::load();
+    let key = tuple([10, 0, 0, 3], [198, 51, 100, 3], 42001, 443, IPPROTO_TCP);
+    put_hash(
+        &mut fixture.bpf,
+        "CONN_STATE_MAP",
+        key,
+        cached_state(TEST_OUTBOUND, 0, 0, false, false),
+    )
+    .unwrap();
+    let packet = tcp_packet([10, 0, 0, 3], [198, 51, 100, 3], 42001, 443, 0x10, 7);
+    let run = fixture.run("wan_egress_l3", &packet, SkbInput::default());
+    assert_eq!(run.return_value, TC_ACT_REDIRECT);
+    assert_eq!(run.data_size_out as usize, packet.len());
+    assert_eq!(run.data[14..], packet[14..]);
+}
+
+#[test]
 #[ignore = "requires root, bpffs, TUN, iproute2, and an isolated network namespace"]
 fn ndp_redirect_l3_on_real_tun() {
     std::thread::spawn(|| {

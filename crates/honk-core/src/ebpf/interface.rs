@@ -137,7 +137,8 @@ impl std::fmt::Display for RefusedReason {
 pub(crate) enum Framing {
     /// Ethernet header at the TC hook.
     L2,
-    /// Bare IP at the TC hook.
+    /// No link header declared; the programs still parse an Ethernet header
+    /// the kernel reports in front of the network header.
     L3,
     Unsupported,
 }

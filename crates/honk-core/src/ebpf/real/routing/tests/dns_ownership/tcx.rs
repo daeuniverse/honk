@@ -40,13 +40,6 @@ fn assert_next(backend: &RealEbpfBackend, name: &str, case: &str, bytes: &[u8], 
     assert_eq!(&result.data[..bytes.len()], bytes, "{name} {case}");
 }
 
-fn l3_packet(mut bytes: Vec<u8>) -> Vec<u8> {
-    drop(bytes.drain(..14));
-    bytes.resize(bytes.len().max(14 + 40), 0);
-    bytes
-}
-
-// Test-run reads EtherType at 12..14 even for raw-IP programs.
 const PEERS: [(IpAddr, IpAddr, IpAddr); 2] = [
     (
         IpAddr::V4(Ipv4Addr::new(8, 0, 2, 91)),
@@ -178,14 +171,15 @@ fn pure_passes_continue_tcx_without_changing_marks() {
                 .unwrap();
             assert_next(&backend, "wan_egress_l2", "", &bytes, input);
         }
+        // Test-run frames are Ethernet: an L3-bound program must treat them as L2 does.
         for (src, dst, multicast) in PEERS {
-            let bytes = l3_packet(packet(src, dst, IPPROTO_UDP, 46102, 443, 0, 0));
+            let bytes = packet(src, dst, IPPROTO_UDP, 46102, 443, 0, 0);
             let mut unsupported = bytes.clone();
-            unsupported[if src.is_ipv4() { 9 } else { 6 }] = 47;
+            unsupported[14 + if src.is_ipv4() { 9 } else { 6 }] = 47;
             for name in ["lan_egress_l3", "wan_ingress_l3", "wan_egress_l3"] {
                 assert_next(&backend, name, "", &unsupported, input);
             }
-            let special = l3_packet(packet(src, multicast, IPPROTO_UDP, 46103, 5353, 0, 0));
+            let special = packet(src, multicast, IPPROTO_UDP, 46103, 5353, 0, 0);
             for name in ["lan_egress_l3", "wan_egress_l3"] {
                 assert_next(&backend, name, "", &special, input);
             }
@@ -239,21 +233,13 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
             mark: USER_MARK,
             ..Default::default()
         };
-        for l3 in [false, true] {
-            let name = if l3 {
-                "lan_ingress_l3"
-            } else {
-                "lan_ingress_l2"
-            };
-            let form = |bytes: Vec<u8>| if l3 { l3_packet(bytes) } else { bytes };
-            // Header offsets within the frame handed to this program.
-            let eth = if l3 { 0 } else { 14 };
+        // Test-run frames are Ethernet, so both programs must classify them alike.
+        for name in ["lan_ingress_l2", "lan_ingress_l3"] {
             for (src, dst, _) in PEERS {
                 let v4 = src.is_ipv4();
-                let (proto, l4) = (eth + if v4 { 9 } else { 6 }, eth + if v4 { 20 } else { 40 });
-                let tcp = form(packet(src, dst, IPPROTO_TCP, 46200, 443, 0, 0x02));
-                let udp = form(packet(src, dst, IPPROTO_UDP, 46201, 443, 0, 0));
-                // Test-run derives the EtherType from bytes 12..14 for both framings.
+                let (proto, l4) = (14 + if v4 { 9 } else { 6 }, 14 + if v4 { 20 } else { 40 });
+                let tcp = packet(src, dst, IPPROTO_TCP, 46200, 443, 0, 0x02);
+                let udp = packet(src, dst, IPPROTO_UDP, 46201, 443, 0, 0);
                 let with_ethertype = |ethertype: u16| {
                     let mut bytes = udp.clone();
                     bytes[12..14].copy_from_slice(&ethertype.to_be_bytes());
@@ -284,10 +270,10 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
                 let mut classified = Vec::new();
                 if v4 {
                     let mut fragment = udp.clone();
-                    fragment[eth + 6..eth + 8].copy_from_slice(&[0, 8]);
+                    fragment[14 + 6..14 + 8].copy_from_slice(&[0, 8]);
                     classified.push(("non-initial fragment", fragment));
                     let mut malformed = udp.clone();
-                    malformed[eth] = 0x40;
+                    malformed[14] = 0x40;
                     classified.push(("malformed IPv4", malformed));
                 } else {
                     let mut redirect = with_protocol(libc::IPPROTO_ICMPV6 as u8);

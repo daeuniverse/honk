@@ -64,7 +64,7 @@ Linux 6.12+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追�
 
 属于其他设备的帧同样以 `NEXT` 继续，因此同一设备上排在后面的 TCX 程序以及 legacy `clsact`/`cls_bpf` 过滤器都能看到它们：
 
-- **带 VLAN 标签的帧。** 在以太网（`_l2`）父设备上，`lan_ingress` 与 `wan_egress` 对仍带标签且 VID 非零的帧不处理，留给 VLAN 设备，由其自己的挂钩分类去标签后的帧；若把它们重定向进 `daens`，会在那里按 `PACKET_OTHERHOST` 丢弃。只有这两个 hook 会跳过；反向 hook `lan_egress` 与 `wan_ingress` 仍会刷新连接状态。VID 0 的优先级标签由父设备直接上交，照常分类。`_l3` 程序没有链路层头，不受影响。
+- **带 VLAN 标签的帧。** 在以太网（`_l2`）父设备上，`lan_ingress` 与 `wan_egress` 对仍带标签且 VID 非零的帧不处理，留给 VLAN 设备，由其自己的挂钩分类去标签后的帧；若把它们重定向进 `daens`，会在那里按 `PACKET_OTHERHOST` 丢弃。只有这两个 hook 会跳过；反向 hook `lan_egress` 与 `wan_ingress` 仍会刷新连接状态。VID 0 的优先级标签由父设备直接上交，照常分类。`_l3` 程序只在按以太网头解析的帧上遇到标签（见[帧格式](../reference/global.md#网卡语义)）。
 - **不支持的 LAN 入站帧。** 非 IP EtherType（ARP、MACsec）或不支持的 L4（GRE、IPIP、ESP、ICMPv4、除 Redirect 外的 ICMPv6）以 `NEXT` 返回且不写 `CLASSIFIED_MARK`，使 `macsec0` 等上层设备能分类自己解密后的帧。NDP Redirect、非首分片与畸形包保持终结性的 classified `PASS`；不带标签且已带 `CLASSIFIED_MARK` 或 pending 标记的帧同样如此：所有权 guard 先于解析执行。
 
 ### 接口协调

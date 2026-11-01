@@ -1149,7 +1149,9 @@ pub fn lan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    crate::fragment::record(flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 0)))
+    let ctx = TcContext::new(ctx);
+    let link_h_len = crate::transport::l3_link_h_len(&ctx);
+    crate::fragment::record(flatten(do_tproxy_lan_ingress(&ctx, link_h_len)))
 }
 
 #[unsafe(no_mangle)]
@@ -1161,7 +1163,11 @@ pub fn wan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_ingress(&TcContext::new(ctx), 0))
+    let ctx = TcContext::new(ctx);
+    flatten(do_tproxy_wan_ingress(
+        &ctx,
+        crate::transport::l3_link_h_len(&ctx),
+    ))
 }
 
 #[unsafe(no_mangle)]

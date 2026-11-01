@@ -1,9 +1,9 @@
 use crate::maps::PARSE_CTX_MAP;
 use aya_ebpf::{
-    bindings::{__be16, __be32},
+    bindings::{__be16, __be32, bpf_hdr_start_off::BPF_HDR_START_NET},
     programs::TcContext,
 };
-use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
+use aya_ebpf_bindings::helpers::{bpf_skb_load_bytes, bpf_skb_load_bytes_relative};
 use core::{ffi::c_long, mem, ptr};
 use honk_ebpf_common::{Tuples, conn::ParseTransportCtx, dae_ip::In6Addr};
 use network_types::{
@@ -92,6 +92,39 @@ pub const PASS_UNSUPPORTED: c_long = 1;
 
 /// Parsed ICMPv6 Redirect; egress suppresses it when locally originated.
 pub const PASS_NDP_REDIRECT: c_long = 3;
+
+/// Link-header length for a program bound to a link whose type declares none.
+/// A device set up as Ethernet and then retyped (e.g. to `ARPHRD_RAWIP`) still
+/// carries an Ethernet header, so trust the kernel's network-header position,
+/// never packet contents alone.
+// #[inline(never)]: keeps the probe buffer out of the classifiers' combined stack.
+#[inline(never)]
+pub fn l3_link_h_len(ctx: &TcContext) -> u32 {
+    let skb = ctx.skb.skb as *const _;
+    let head = (ctx.data_end() - ctx.data()) as u32;
+    // ponytail: a linear head outside 15..=65550 bytes keeps bare-IP parsing; pull first if such Ethernet frames appear.
+    if !(ETH_HLEN + 1..=ETH_HLEN + 1 + 0xffff).contains(&head) {
+        return 0;
+    }
+    // The helper reads only up to the linear tail, so at one offset a 1-byte read
+    // succeeds iff the network header is at most 14 bytes in and a 2-byte read
+    // fails iff it is at least 14 bytes in.
+    let offset = head - ETH_HLEN - 1;
+    let mut bytes = [0u8; 2];
+    let to = bytes.as_mut_ptr() as *mut _;
+    if unsafe { bpf_skb_load_bytes_relative(skb, offset, to, 1, BPF_HDR_START_NET) } != 0
+        || unsafe { bpf_skb_load_bytes_relative(skb, offset, to, 2, BPF_HDR_START_NET) } == 0
+    {
+        return 0;
+    }
+    // An AF_PACKET reservation of 14 bytes (e.g. on an L3 bond) can still hold bare IP.
+    if unsafe { bpf_skb_load_bytes(skb, 12, to, 2) } != 0
+        || u16::from_ne_bytes(bytes) != ctx.skb.protocol() as u16
+    {
+        return 0;
+    }
+    ETH_HLEN
+}
 
 /// True when an Ethernet frame still carries a non-zero-VID tag (hwaccel
 /// `vlan_tci`, cleared by `vlan_do_receive` before the VLAN device's own TC).

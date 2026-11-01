@@ -225,9 +225,18 @@ impl NetworkFixture {
     }
 
     pub(super) fn l3_tun(&mut self) -> std::fs::File {
-        let tun = tun("hrtun0");
+        self.l3_link("hrtun0", libc::IFF_TUN, None)
+    }
+
+    /// A TAP retyped to RAWIP: an `_l3` link whose frames keep Ethernet headers.
+    pub(super) fn rawip_tap(&mut self) -> std::fs::File {
+        self.l3_link("hrtap0", libc::IFF_TAP, Some(519))
+    }
+
+    fn l3_link(&mut self, name: &str, flags: libc::c_int, link_type: Option<u16>) -> std::fs::File {
+        let device = tun(name, flags, link_type);
         load_classifier(&mut self.backend, "lan_ingress_l3");
-        aya::programs::tc::qdisc_add_clsact("hrtun0").unwrap();
+        aya::programs::tc::qdisc_add_clsact(name).unwrap();
         let program: &mut SchedClassifier = self
             .backend
             .bpf_mut()
@@ -236,8 +245,8 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach("hrtun0", TcAttachType::Ingress).unwrap();
-        tun
+        program.attach(name, TcAttachType::Ingress).unwrap();
+        device
     }
 
     /// Replaces the daens UDP listeners with distinct sockets per family.
@@ -483,7 +492,7 @@ fn add_default_routes(netns: &OwnedFd, name: &str, v4_gateway: [u8; 4], v6_gatew
     });
 }
 
-fn tun(name: &str) -> std::fs::File {
+fn tun(name: &str, flags: libc::c_int, link_type: Option<u16>) -> std::fs::File {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
@@ -496,13 +505,28 @@ fn tun(name: &str) -> std::fs::File {
     for (byte, value) in request.ifr_name.iter_mut().zip(name.bytes()) {
         *byte = value as libc::c_char;
     }
-    request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+    request.ifr_ifru.ifru_flags = (flags | libc::IFF_NO_PI) as libc::c_short;
     assert_eq!(
         unsafe { libc::ioctl(file.as_raw_fd(), libc::TUNSETIFF, &mut request) },
         0,
         "create TUN: {}",
         std::io::Error::last_os_error()
     );
+    if let Some(link_type) = link_type {
+        // The device is still down; TUNSETLINK takes the ARPHRD value itself.
+        assert_eq!(
+            unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    libc::TUNSETLINK,
+                    libc::c_ulong::from(link_type),
+                )
+            },
+            0,
+            "retype {name}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     let mut netlink = crate::netlink::NlSock::new().unwrap();
     let ifindex = nix::net::if_::if_nametoindex(name).unwrap();
     netlink.set_link_up(ifindex, true).unwrap();
