@@ -595,6 +595,50 @@ fn clash_restores_fallback_names_and_lazy_ws_host_precedence() {
         nodes[3].vless().unwrap().transport.ws_host.as_deref(),
         Some("headers.example")
     );
+    for protocol in ["vless", "vmess", "trojan"] {
+        let credential = if protocol == "trojan" {
+            "password: secret"
+        } else {
+            "uuid: 11111111-1111-4111-8111-111111111111"
+        };
+        for (headers, expected) in [
+            ("{Host: false}", Some("fallback.example")),
+            ("{Host: [ignored]}", Some("fallback.example")),
+            ("{Host: {ignored: true}}", Some("fallback.example")),
+            ("{Host: .nan}", Some("fallback.example")),
+            ("{Host: null, host: '  '}", Some("fallback.example")),
+            ("{Host: false, host: front.example}", Some("front.example")),
+            ("{Host: front.example, host: false}", Some("front.example")),
+            (
+                "{Host: first.example, host: second.example}",
+                Some("first.example"),
+            ),
+            ("{Host: 5}", Some("5")),
+            ("{Host: front.example, X-Bad: false}", None),
+        ] {
+            let input = format!(
+                "proxies: [{{name: host-case, type: {protocol}, server: ws.example, port: 443, {credential}, tls: true, network: ws, ws-opts: {{headers: {headers}}}, ws-headers: fallback.example, ws-host: {{ignored: true}}}}]"
+            );
+            let result = parse_clash_subscription(&input, None);
+            if let Some(expected) = expected {
+                let nodes = result.unwrap();
+                assert_eq!(nodes[0].name, "host-case");
+                assert_eq!(
+                    nodes[0].transport().unwrap().ws_host.as_deref(),
+                    Some(expected)
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{protocol}: invalid non-Host header admitted"
+                );
+            }
+        }
+        let invalid_fallback = format!(
+            "proxies: [{{type: {protocol}, server: ws.example, port: 443, {credential}, tls: true, network: ws, ws-opts: {{headers: {{Host: false}}}}, ws-headers: false, ws-host: fallback.example}}]"
+        );
+        assert!(parse_clash_subscription(&invalid_fallback, None).is_err());
+    }
 }
 
 #[test]

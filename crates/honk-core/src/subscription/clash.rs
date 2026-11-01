@@ -479,14 +479,14 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
                 let mut ws_host = None;
                 for (key, value) in headers {
                     let key = key.as_str().ok_or("websocket header name is invalid")?;
-                    let Some(value) = yaml_text(value)? else {
-                        continue;
-                    };
                     if key.eq_ignore_ascii_case("host") {
-                        if ws_host.is_none() && !value.trim().is_empty() {
-                            ws_host = Some(value);
+                        if ws_host.is_none() {
+                            ws_host = yaml_text(value)
+                                .ok()
+                                .flatten()
+                                .filter(|value| !value.trim().is_empty());
                         }
-                    } else {
+                    } else if let Some(value) = yaml_text(value)? {
                         transport.ws_headers.insert(key.to_owned(), value);
                     }
                 }

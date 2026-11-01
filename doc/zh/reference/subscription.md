@@ -291,7 +291,7 @@ VLESS 字段会在派生节点身份前应用：
 | `reality-opts.short-id` | 可选 REALITY short ID。 |
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
-| `ws-opts.headers.Host` | WebSocket Host 标头，键匹配不区分大小写；依次回退到 scalar `ws-headers`、`ws-host`。 |
+| `ws-opts.headers.Host` | WebSocket Host 标头：键匹配不区分大小写，第一个非空白值优先；字符串保留原始字节，有限数字转为文本。无效或空白的 Host 值会被忽略。依次回退到 scalar `ws-headers`、`ws-host`，仅在之前没有可用值时才检查下一项。 |
 | `ws-opts.headers.<name>` | 附加 WebSocket 升级标头，所有支持 WebSocket 的代理共用；以小写名称导入（例如 `User-Agent`）。null 值忽略，非 scalar 值会使条目被丢弃；保留握手标头会按[节点字段约定](./nodes.md#节点字段)拒绝该条目。 |
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |

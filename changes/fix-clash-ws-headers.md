@@ -4,3 +4,4 @@ Fixed
 - Direct and supplied-TCP WebSocket dials enforce the same header limits and reserved-name rules as subscription admission, before network I/O.
 - sing-box keeps empty WebSocket header strings and rejects invalid or conflicting claims instead of silently dropping them.
 - Structured node errors retain the actual transport or header field instead of being mislabeled as XHTTP errors.
+- Clash WebSocket Host extraction retains its first-usable scalar and lazy fallback behavior while additional headers remain strictly checked.

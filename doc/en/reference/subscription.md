@@ -291,7 +291,7 @@ VLESS fields are applied before node identity is derived:
 | `reality-opts.short-id` | Optional REALITY short ID. |
 | `reality-opts.spider-x` | REALITY spider path; missing or empty becomes `/`. |
 | `ws-opts.path` | WebSocket path; falls back to flat `ws-path`. |
-| `ws-opts.headers.Host` | WebSocket Host header, with case-insensitive key matching; falls back to scalar `ws-headers`, then `ws-host`. |
+| `ws-opts.headers.Host` | WebSocket Host header: the first nonblank case-insensitive Host value wins; strings retain their bytes and finite numbers become text. Invalid or blank Host values are ignored. Falls back to scalar `ws-headers`, then `ws-host`, inspecting each only if no earlier value won. |
 | `ws-opts.headers.<name>` | Additional WebSocket upgrade headers, shared by every WebSocket-capable proxy, imported as lowercase names (for example `User-Agent`). Null values are ignored and non-scalar values drop the entry; reserved handshake headers reject it per the [node field contract](./nodes.md#node-fields). |
 | `grpc-opts.grpc-service-name` | gRPC service name; falls back to `grpc-service`. |
 | `client-fingerprint` | Intentionally not imported. TLS fingerprint selection is process-wide through `global.tls_implementation` and `global.utls_imitate`. |
