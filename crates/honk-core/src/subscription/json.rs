@@ -327,7 +327,7 @@ mod tests {
     fn sing_box_websocket_headers_are_imported() {
         let nodes = parse_json_subscription(
             json(
-                r#"{"outbounds":[{"type":"vmess","tag":"vmess","server":"ws.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000002","security":"auto","alter_id":0,"network":"tcp","transport":{"type":"ws","path":"/socket","headers":{"Host":"ws-host.example","User-Agent":"Mozilla/5.0 (X11; Linux x86_64)"}}}]}"#,
+                r#"{"outbounds":[{"type":"vmess","tag":"vmess","server":"ws.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000002","security":"auto","alter_id":0,"network":"tcp","transport":{"type":"ws","path":"/socket","headers":{"Host":"ws-host.example","User-Agent":"Mozilla/5.0 (X11; Linux x86_64)","user-agent":"Mozilla/5.0 (X11; Linux x86_64)","Origin":"","X-Blank":" ","Ignored":null}}}]}"#,
             ),
             None,
         )
@@ -338,6 +338,39 @@ mod tests {
             transport.ws_headers["user-agent"],
             "Mozilla/5.0 (X11; Linux x86_64)"
         );
+        assert_eq!(transport.ws_headers["origin"], "");
+        assert_eq!(transport.ws_headers["x-blank"], " ");
+        assert_eq!(transport.ws_headers.len(), 3);
+    }
+
+    #[test]
+    fn sing_box_websocket_header_rejections_preserve_valid_siblings() {
+        for headers in [
+            serde_json::json!({"User-Agent": "one", "user-agent": ""}),
+            serde_json::json!({"User-Agent": "one", "Connection": ""}),
+            serde_json::json!({"User-Agent": "one", "X-Test": "\r\n"}),
+            serde_json::json!({"User-Agent": "one", "X-Test": "\t"}),
+            serde_json::json!({"User-Agent": "one", "X-Test": false}),
+            serde_json::json!({"User-Agent": "one", "X-Test": 0}),
+            serde_json::json!({"User-Agent": "one", "X-Test": []}),
+            serde_json::json!({"User-Agent": "one", "X-Test": {}}),
+        ] {
+            let input = serde_json::json!({"outbounds": [
+                {"type": "vless", "tag": "rejected", "server": "ws.example",
+                 "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000001",
+                 "transport": {"type": "ws", "headers": headers}},
+                {"type": "socks", "tag": "survivor", "server": "127.0.0.1",
+                 "server_port": 1080}
+            ]});
+            let nodes = parse_json_subscription(json(&input.to_string()), None).unwrap();
+            assert_eq!(
+                nodes
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["survivor"]
+            );
+        }
     }
 
     #[test]

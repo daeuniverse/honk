@@ -342,6 +342,7 @@ TLS/SNI, REALITY, WebSocket/gRPC (including non-`Host` upgrade headers), VLESS p
 
 | Source-specific case | Import behavior |
 | --- | --- |
+| WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#node-fields). |
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |

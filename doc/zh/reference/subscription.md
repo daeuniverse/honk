@@ -342,6 +342,7 @@ TLS/SNI、REALITY、WebSocket/gRPC（包括 `Host` 以外的升级标头）、VL
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |
+| WebSocket `transport.headers` | `Host` 保留为独立 string 字段，重复 Host 别名拒绝。其他 string 值（包括空字符串）原样保留，null 忽略，其他类型使条目被拒绝；名称与值遵循[节点标头约定](./nodes.md#节点字段)。 |
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义端点。 |
